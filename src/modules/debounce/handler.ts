@@ -50,6 +50,7 @@ import {
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { turnHadTheWords } from "@/modules/chatwoot/webhook";
 import type { AuthContext } from "@/modules/contact-auth/check";
+import { mediaRefusedThrough } from "@/modules/contact-auth/media-refusal";
 import {
   authorizeContact,
   contactAuthFlowEvent,
@@ -535,12 +536,24 @@ async function fillMissingVisuals(args: {
         : !m.imageDescription && !m.extractedText),
   );
   if (alvos.length === 0) return false;
+  // NOTE: Media the contact authorization refused stays unread even when the gate now says yes
+  // (docs/contact-auth.md, "Media waits for the gate").
+  const recusadaAte = await refusalMarkOrClosed(args);
+  const abriveis = alvos.filter(
+    (m) => recusadaAte === null || m.id > recusadaAte,
+  );
+  if (abriveis.length === 0) return false;
 
   // UMA MENSAGEM DE CADA VEZ, e os anexos DENTRO de cada uma em paralelo (é o que
   // `extractMessageVisuals` faz). O paralelo que importa é o de arquivos da mesma mensagem, que é
   // onde o cliente anexa o comprovante, o documento e o print de uma vez; disparar as mensagens
   // todas juntas multiplicaria o teto por mensagem sem nenhum ganho de latência que o cliente veja.
-  for (const m of alvos) {
+  for (const [i, m] of abriveis.entries()) {
+    // NOTE: A refusal can land while an earlier message is being read.
+    if (i > 0) {
+      const agora = await refusalMarkOrClosed(args);
+      if (agora !== null && m.id <= agora) continue;
+    }
     try {
       const lido = await extractMessageVisuals({
         tenantId: args.tenantId,
@@ -549,6 +562,10 @@ async function fillMissingVisuals(args: {
         messageId: m.id,
         visuals: m.visuals,
         cfg,
+        stillAllowed: async () => {
+          const agora = await refusalMarkOrClosed(args);
+          return agora === null || m.id > agora;
+        },
         base: args.base,
         flow: {
           tenantId: args.tenantId,
@@ -588,6 +605,28 @@ async function fillMissingVisuals(args: {
     }
   }
   return true;
+}
+
+// The conversation's media refusal mark, or null without one. Unreadable closes everything.
+async function refusalMarkOrClosed(args: {
+  tenantId: bigint;
+  fill: { convDbId: bigint };
+  base: PrismaClient;
+}): Promise<number | null> {
+  try {
+    return await mediaRefusedThrough(
+      args.tenantId,
+      args.fill.convDbId,
+      args.base,
+    );
+  } catch (err) {
+    logger.warn(
+      "vision fill: media refusal mark unreadable (conv=%s), nothing is read: %s",
+      String(args.fill.convDbId),
+      err instanceof Error ? err.message : String(err),
+    );
+    return Number.POSITIVE_INFINITY;
+  }
 }
 
 // The instant of the newest message in the turn's input, or null when nothing in it carries one

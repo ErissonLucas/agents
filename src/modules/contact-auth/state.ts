@@ -176,10 +176,72 @@ export async function singleFlight(
   return { verdict: await p, shared: false };
 }
 
+// Messages whose media the gate let through, so the `message_updated` Chatwoot sends after a voice
+// note does not ask again. Per message, never a verdict for the next one. Losing an entry costs one
+// more ask; refusals live on the conversation instead, since forgetting one would read the file.
+const MEDIA_ADMISSION_TTL_MS = 15 * 60_000;
+const mediaAdmitted = new Map<string, number>();
+
+export function mediaAdmissionKey(
+  tenantId: bigint,
+  instanceId: bigint,
+  messageId: number,
+): string {
+  return `${tenantId}:${instanceId}:${messageId}`;
+}
+
+export function rememberMediaAdmission(
+  key: string,
+  nowMs: number = Date.now(),
+): void {
+  if (mediaAdmitted.size >= MAX_ENTRIES) {
+    for (const [k, until] of mediaAdmitted) {
+      if (until <= nowMs) mediaAdmitted.delete(k);
+    }
+    if (mediaAdmitted.size >= MAX_ENTRIES) {
+      const first = mediaAdmitted.keys().next().value;
+      if (first !== undefined) mediaAdmitted.delete(first);
+    }
+  }
+  mediaAdmitted.set(key, nowMs + MEDIA_ADMISSION_TTL_MS);
+}
+
+export function mediaAlreadyAdmitted(
+  key: string,
+  nowMs: number = Date.now(),
+): boolean {
+  const until = mediaAdmitted.get(key);
+  if (until === undefined) return false;
+  if (until <= nowMs) {
+    mediaAdmitted.delete(key);
+    return false;
+  }
+  return true;
+}
+
+// Every media refusal this process gave, from before its write: a reader whose query started before
+// the write committed still sees it. Keyed by conversation, holding the newest refused message id.
+// Never evicted, since an entry may be the only record of its refusal; refusals are rare, so the
+// map stays small.
+const mediaRefusedHere = new Map<string, number>();
+
+export function rememberMediaRefusal(key: string, messageId: number): void {
+  mediaRefusedHere.set(
+    key,
+    Math.max(mediaRefusedHere.get(key) ?? 0, messageId),
+  );
+}
+
+export function mediaRefusedHereThrough(key: string): number | null {
+  return mediaRefusedHere.get(key) ?? null;
+}
+
 // NOTE: Test isolation only. Production never clears the state wholesale; the sweep does.
 export function clearContactAuthState(): void {
   notices.clear();
   inFlight.clear();
+  mediaAdmitted.clear();
+  mediaRefusedHere.clear();
   if (sweepTimer) {
     clearTimeout(sweepTimer);
     sweepTimer = undefined;
