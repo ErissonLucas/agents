@@ -11,9 +11,14 @@ import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
-import { mediaAnnotationFor } from "@/modules/chatwoot/annotations";
+import {
+  clearMediaAnnotations,
+  mediaAnnotationFor,
+  stashMediaAnnotation,
+} from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
+import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
 import { mediaRefusalKey } from "@/modules/contact-auth/media-refusal";
 import {
@@ -137,7 +142,11 @@ async function deliver(p: {
   textOnly?: boolean;
   owesMemoryOnly?: boolean;
   // An image an earlier pass already described, alone or beside one nobody read yet.
-  describedImage?: "alone" | "beside-new";
+  describedImage?: "alone" | "beside-new" | "both";
+  // The default audio and image, plus a second image.
+  extraImage?: boolean;
+  // Receives the normalized event, to read what the delivery left on it.
+  seen?: NormalizedChatwootEvent[];
 }) {
   seq += 1;
   const messageId = p.messageId ?? 9000 + seq;
@@ -165,7 +174,16 @@ async function deliver(p: {
                     data_url: `${CW_BASE}/rails/active_storage/blobs/j${messageId}.png`,
                   },
                 ]
-              : []),
+              : p.describedImage === "both"
+                ? [
+                    {
+                      id: messageId * 10 + 3,
+                      file_type: "image",
+                      data_url: `${CW_BASE}/rails/active_storage/blobs/j${messageId}.png`,
+                      meta: { image_description: "Comprovante de pagamento." },
+                    },
+                  ]
+                : []),
           ]
         : [
             {
@@ -178,6 +196,15 @@ async function deliver(p: {
               file_type: "image",
               data_url: `${CW_BASE}/rails/active_storage/blobs/i${messageId}.png`,
             },
+            ...(p.extraImage
+              ? [
+                  {
+                    id: messageId * 10 + 4,
+                    file_type: "image",
+                    data_url: `${CW_BASE}/rails/active_storage/blobs/k${messageId}.png`,
+                  },
+                ]
+              : []),
           ],
     conversation: {
       id: p.convId,
@@ -194,6 +221,7 @@ async function deliver(p: {
     },
   });
   if (!n) throw new Error("unreachable: the fixture is a valid event");
+  p.seen?.push(n);
   const delivery = await suDb.chatwootWebhookDelivery.create({
     data: {
       tenantId,
@@ -351,6 +379,7 @@ describe.skipIf(!dbUp)("contact authorization gate and the media pass", () => {
   });
 
   beforeEach(() => {
+    clearMediaAnnotations();
     clearContactAuthState();
     providers.stt = 0;
     providers.vision = 0;
@@ -788,5 +817,148 @@ describe.skipIf(!dbUp)("contact authorization gate and the media pass", () => {
     expect(providers.auth).toBe(0);
     expect(providers.stt).toBe(1);
     expect(providers.vision).toBe(1);
+  });
+
+  // Chatwoot delivers a voice note as a `message_created` and two `message_updated` almost at once, and
+  // each delivery runs the media pass. One message is read once, whichever delivery gets there first.
+  describe("one message, several deliveries", () => {
+    beforeEach(() => {
+      clearMediaAnnotations();
+      providers.stt = 0;
+      providers.vision = 0;
+      providers.auth = 0;
+      authAnswers.length = 0;
+      clearContactAuthState();
+    });
+
+    // The provider takes a while, as the real one does, so the deliveries overlap while it runs.
+    async function burst(
+      convId: number,
+      inbox: number,
+      messageId: number,
+      humanHeld = false,
+    ) {
+      const seen: NormalizedChatwootEvent[] = [];
+      duringStt = () => Bun.sleep(80);
+      await Promise.all(
+        (
+          ["message_created", "message_updated", "message_updated"] as const
+        ).map((event) =>
+          deliver({
+            convId,
+            chatwootInboxId: inbox,
+            event,
+            messageId,
+            humanHeld,
+            seen,
+          }),
+        ),
+      );
+      return seen;
+    }
+
+    test("three concurrent deliveries of one voice note and image read each file once", async () => {
+      await seedConversation(8930, INBOX_OPEN);
+      const seen = await burst(8930, INBOX_OPEN, 89_300);
+      expect(providers.stt).toBe(1);
+      expect(providers.vision).toBe(1);
+      for (const n of seen) expect(n.message?.transcribedText).toBe(TRANSCRIPT);
+    });
+
+    test("the same on a conversation a person holds", async () => {
+      await seedConversation(8931, INBOX_OPEN);
+      const seen = await burst(8931, INBOX_OPEN, 89_310, true);
+      expect(providers.stt).toBe(1);
+      expect(providers.vision).toBe(1);
+      for (const n of seen) expect(n.message?.transcribedText).toBe(TRANSCRIPT);
+    });
+
+    test("the same behind the contact authorization gate, on a yes", async () => {
+      await seedConversation(8932, INBOX_GATED);
+      authAnswers.push(true, true, true, true, true, true);
+      await burst(8932, INBOX_GATED, 89_320);
+      expect(providers.stt).toBe(1);
+      expect(providers.vision).toBe(1);
+    });
+
+    test("descriptions a later delivery carries on every attachment win over the store", async () => {
+      await seedConversation(8934, INBOX_OPEN);
+      stashMediaAnnotation(
+        { tenantId, instanceId, messageId: 89_340 },
+        { imageDescription: "Print do pedido 21607129." },
+      );
+      const seen: NormalizedChatwootEvent[] = [];
+      await deliver({
+        convId: 8934,
+        chatwootInboxId: INBOX_OPEN,
+        messageId: 89_340,
+        humanHeld: true,
+        describedImage: "both",
+        seen,
+      });
+      expect(providers.vision).toBe(0);
+      expect(seen[0]?.message?.imageDescription).toContain(
+        "Comprovante de pagamento.",
+      );
+    });
+
+    test("a partial read in the store is asked again for the file it missed", async () => {
+      await seedConversation(8935, INBOX_OPEN);
+      stashMediaAnnotation(
+        { tenantId, instanceId, messageId: 89_350 },
+        { imageDescription: "Print do pedido 21607129.", attachmentsUnread: 1 },
+      );
+      await deliver({
+        convId: 8935,
+        chatwootInboxId: INBOX_OPEN,
+        messageId: 89_350,
+        humanHeld: true,
+        describedImage: "beside-new",
+      });
+      expect(providers.vision).toBe(1);
+    });
+
+    test("an update that brings a file the first delivery did not have reads only that file", async () => {
+      await seedConversation(8936, INBOX_OPEN);
+      await deliver({
+        convId: 8936,
+        chatwootInboxId: INBOX_OPEN,
+        messageId: 89_360,
+      });
+      const seen: NormalizedChatwootEvent[] = [];
+      await deliver({
+        convId: 8936,
+        chatwootInboxId: INBOX_OPEN,
+        event: "message_updated",
+        messageId: 89_360,
+        humanHeld: true,
+        extraImage: true,
+        seen,
+      });
+      expect(providers.vision).toBe(2);
+      expect(seen[0]?.message?.imageDescription).toContain("k89360.png");
+      expect(seen[0]?.message?.attachmentsUnread ?? 0).toBe(0);
+    });
+
+    test("an update that arrives after the read reuses it, even without the write-back on the event", async () => {
+      await seedConversation(8933, INBOX_OPEN);
+      await deliver({
+        convId: 8933,
+        chatwootInboxId: INBOX_OPEN,
+        messageId: 89_330,
+      });
+      const seen: NormalizedChatwootEvent[] = [];
+      await deliver({
+        convId: 8933,
+        chatwootInboxId: INBOX_OPEN,
+        event: "message_updated",
+        messageId: 89_330,
+        humanHeld: true,
+        seen,
+      });
+      expect(providers.stt).toBe(1);
+      expect(providers.vision).toBe(1);
+      expect(seen[0]?.message?.transcribedText).toBe(TRANSCRIPT);
+    });
   });
 });

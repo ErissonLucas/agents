@@ -279,6 +279,7 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
 
   beforeEach(() => {
     clearMediaAnnotations();
+    clearMediaAnnotations();
   });
 
   afterAll(async () => {
@@ -821,6 +822,59 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
     // The first batch only: the ornaments gave their slots back, and the refusal took them.
     expect(asked).toBe(1);
     expect(downloads.length).toBe(8);
+  });
+
+  test("a file whose read failed is read again by the next delivery that asks", async () => {
+    await setVision(true);
+    const url = blob(530, "p.jpeg");
+    let calls = 0;
+    const flaky = (async () => {
+      calls++;
+      return calls === 1
+        ? new Response("bad request", { status: 400 })
+        : new Response(
+            JSON.stringify({
+              choices: [{ message: { content: "Foto lida." } }],
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+    }) as unknown as typeof fetch;
+    const read = () =>
+      extractMessageVisuals({
+        tenantId,
+        instanceId,
+        conversationId: 1047,
+        messageId: 53,
+        visuals: [
+          {
+            id: 5301,
+            dataUrl: url,
+            name: "p.jpeg",
+            imageDescription: null,
+            extractedText: null,
+          },
+        ],
+        cfg: {
+          enabled: true,
+          provider: "openai",
+          credentialRef: `vault:${visionKeyId}`,
+        } as never,
+        base: appDb,
+        deps: {
+          makeClient: stub({
+            page: [],
+            sizes: {},
+            downloads: [],
+            metaWrites: [],
+          }),
+          fetchImpl: flaky,
+        },
+      });
+    const first = await read();
+    expect(first?.attachmentsUnread).toBe(1);
+    const second = await read();
+    expect(second?.imageDescription).toBe("Foto lida.");
+    expect(calls).toBe(2);
   });
 
   test("when the instance's address cannot be read, no body image is fetched", async () => {

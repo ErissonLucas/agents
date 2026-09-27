@@ -3,8 +3,13 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { recordDirectUsage } from "@/graph/usage";
 import { AppError, NotFoundError } from "@/lib/errors";
+import { shareInFlight } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { stashMediaAnnotation } from "@/modules/chatwoot/annotations";
+import {
+  fileReadFor,
+  rememberFileRead,
+  stashMediaAnnotation,
+} from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
@@ -347,7 +352,34 @@ export function classifyBodyImage(
   }) as Promise<null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP>;
 }
 
-async function extractInbound(
+// One read per file, however many deliveries of its message ask: a delivery that finds the file
+// being read waits for that read, and one that comes later reuses its result while the annotation
+// store keeps it. A failed read is not kept, so the next delivery tries again.
+function extractInbound(
+  params: ExtractInboundParams & {
+    bodyImage?: boolean;
+    classifyOnly?: boolean;
+  },
+): Promise<
+  ExtractResult | null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP
+> {
+  const key = `vision:${params.tenantId}:${params.instanceId}:${params.messageId}:${params.attachmentId ?? params.dataUrl}:${params.classifyOnly ? "classify" : "read"}`;
+  const kept = fileReadFor(key);
+  if (kept)
+    return Promise.resolve(
+      kept.value as
+        | ExtractResult
+        | typeof BODY_IMAGE_IGNORED
+        | typeof BODY_IMAGE_OVER_CAP,
+    );
+  return shareInFlight(key, async () => {
+    const value = await extractInboundOnce(params);
+    if (value !== null) rememberFileRead(key, value);
+    return value;
+  });
+}
+
+async function extractInboundOnce(
   params: ExtractInboundParams & {
     bodyImage?: boolean;
     classifyOnly?: boolean;

@@ -263,6 +263,7 @@ describe.skipIf(!dbUp)("reengage: vision no anexo que nunca foi lido", () => {
   // por já lida, e nenhuma extração era tentada nem com a cerca removida.
   beforeEach(() => {
     clearMediaAnnotations();
+    clearMediaAnnotations();
   });
 
   afterAll(async () => {
