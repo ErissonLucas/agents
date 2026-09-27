@@ -275,6 +275,8 @@ const FLOWLOG_READERS: Record<string, number> = {
   "tests/modules/reengage-vision.test.ts": 1,
   "tests/modules/reengage.test.ts": 3,
   "tests/modules/model-fallback-turn.test.ts": 1,
+  // #895: the close line of one conversation, read by that conversation.
+  "tests/modules/nothing-to-answer.test.ts": 1,
   // #737: duas leituras, e as duas são tenant-wide de propósito. O sujeito de uma é QUANTAS linhas
   // uma morte escreveu, e o da outra é sob QUAL tenant a linha caiu; nenhuma das unidades que morrem
   // ali tem turno para uma leitura mais estreita se prender.

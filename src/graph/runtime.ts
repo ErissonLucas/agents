@@ -41,6 +41,7 @@ import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import type { AuthContext } from "@/modules/contact-auth/check";
 import { withAuthContextSection } from "@/modules/contact-auth/context";
 import { recordConversationError } from "@/modules/conversations/error";
+import { armNothingToAnswer } from "@/modules/conversations/nothing-to-answer";
 import {
   type ObservedConversation,
   observeBeforeClose,
@@ -3328,6 +3329,55 @@ export interface RunAgentTurnParams {
   authContext?: AuthContext | null;
 }
 
+// NOTHING TO ANSWER, on the direct path (issue #895). The message renders to nothing, so no turn
+// runs, and the word stays `skipped`, which the webhook's settlement already reads. What is new is
+// the delayed judgement it arms, for the inbox's agent on the mirrored conversation; the job decides
+// later whether the conversation is one our side never spoke in, and a switched-off or monitoring
+// agent closes nothing when it runs.
+async function armNothingToAnswerDirect(
+  params: RunAgentTurnParams,
+  conversationId: number,
+  inboxId: number,
+): Promise<void> {
+  const { tenantId, instanceId } = params;
+  const base = params.base ?? basePrisma;
+  const threadId = chatwootThreadId(tenantId, instanceId, conversationId);
+  const found = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const inbox = await db.inbox.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_chatwootInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootInboxId: inboxId,
+        },
+      },
+      select: { agentId: true },
+    });
+    if (!inbox?.agentId) return null;
+    const conv = await db.conversation.findFirst({
+      where: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conversationId,
+      },
+      select: { id: true },
+    });
+    return conv ? { agentId: inbox.agentId, conversationDbId: conv.id } : null;
+  });
+  if (!found) return;
+  await armNothingToAnswer({
+    tenantId,
+    instanceId,
+    threadId,
+    conversationId,
+    conversationDbId: found.conversationDbId,
+    agentId: found.agentId,
+    agentBotId: params.agentBotId,
+    triggerMessageId: params.event.message?.id ?? null,
+    base,
+  });
+}
+
 // Direct (no-debounce) entry: one incoming message → resolve the inbox's Agent → run the turn.
 export async function runAgentTurn(
   params: RunAgentTurnParams,
@@ -3342,7 +3392,10 @@ export async function runAgentTurn(
   // shared with the spend-ceiling gate, which has to ask this same question before it refuses.
   const renderable = incomingRenderable(n);
   let text = renderInboundMessage(renderable);
-  if (!text) return "skipped";
+  if (!text) {
+    await armNothingToAnswerDirect(params, n.conversationId, n.inboxId);
+    return "skipped";
+  }
   const conversationId = n.conversationId;
   const inboxId = n.inboxId;
   const threadId = chatwootThreadId(tenantId, instanceId, conversationId);

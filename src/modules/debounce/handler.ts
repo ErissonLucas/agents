@@ -60,6 +60,7 @@ import {
   recordConversationError,
 } from "@/modules/conversations/error";
 import { announceFailedTurn } from "@/modules/conversations/failure-note";
+import { armNothingToAnswer } from "@/modules/conversations/nothing-to-answer";
 import { emitFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
 import { emitUnroutedMessage } from "@/modules/flowlog/unrouted";
@@ -2742,6 +2743,25 @@ export async function flushDebounceJob(
         tenantId,
         instanceId,
         chatwootConversationId: conversationId,
+        base,
+      });
+    }
+    // NOTHING TO ANSWER (issue #895): the burst held no message a turn could read. On a conversation
+    // our side never spoke in, that used to leave it pending for good. The flush does not decide
+    // that here, on the hot path; it arms the delayed judgement, which reads everything fresh.
+    if (outcome === "empty" && ctx.convDbId !== null) {
+      await armNothingToAnswer({
+        tenantId,
+        instanceId,
+        threadId,
+        conversationId,
+        conversationDbId: ctx.convDbId,
+        agentId: ctx.loaded.agentId,
+        agentBotId: ctx.loaded.agentBotId,
+        triggerMessageId:
+          typeof job.payload.lastMessageId === "number"
+            ? job.payload.lastMessageId
+            : null,
         base,
       });
     }

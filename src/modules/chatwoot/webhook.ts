@@ -99,6 +99,7 @@ import {
   announceFailedTurn,
   readDirectFence,
 } from "@/modules/conversations/failure-note";
+import { retireNothingToAnswer } from "@/modules/conversations/nothing-to-answer";
 import {
   type ReturnToAgentOutcome,
   returnConversationToAgent,
@@ -5825,6 +5826,25 @@ export async function processChatwootDelivery(
     } catch (err) {
       logger.warn(
         "failed to cancel pending follow-up on reply (conv=%s): %s",
+        convLabel,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    // And the delayed nothing-to-answer judgement (issue #895): the customer wrote again, so what
+    // it was armed to judge is no longer the conversation. A new blank message re-arms it from its
+    // own flush. A /reset is a new incoming message too (`command` is only read off one), so this
+    // is also what retires it on a reset. Only by a message newer than the one it judged: another
+    // route's delivery of that same message must not cancel it.
+    try {
+      await retireNothingToAnswer({
+        tenantId: params.tenantId,
+        threadId,
+        messageId: n.message?.id ?? null,
+        base,
+      });
+    } catch (err) {
+      logger.warn(
+        "failed to cancel the nothing-to-answer close on reply (conv=%s): %s",
         convLabel,
         err instanceof Error ? err.message : String(err),
       );
