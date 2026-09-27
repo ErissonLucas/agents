@@ -64,6 +64,9 @@ export interface OpenCaseInput {
   customerMessage: string | null;
   email: string | null;
   labels: string[];
+  // The rendered email subject (the operator's template, see settings.ts). Written only on an email
+  // destination; a continued case keeps the subject it has.
+  subject?: string | null;
   // Asked right before the first write and again right before the create; false ⇒ nothing more is
   // written.
   stillWanted?: () => Promise<boolean>;
@@ -342,6 +345,18 @@ async function run(
         openingBlocked = true;
       }
     }
+    // The subject heads every email of the case and carries the model's summary, so it passes the same
+    // check. A refused one is dropped and the case opens under Chatwoot's default subject.
+    let subject = needs === "email" ? (input.subject ?? null) : null;
+    if (subject && input.screenCustomerMessage) {
+      step = "screen_subject";
+      const verdict = await input.screenCustomerMessage(subject);
+      if (verdict === "handed") return { kind: "handed_by_policy" };
+      if (verdict === "failed") {
+        return { kind: "failed", step: "guardrail_handoff", error: null };
+      }
+      if (verdict === "drop") subject = null;
+    }
 
     // ONE CASE CONTACT AT A TIME, from the listing to the opening message (review round 9 of #881).
     // The queue around this call is per ORIGIN, and two origins of the same contact can both list the
@@ -377,6 +392,7 @@ async function run(
         // inbox does not pick it up and triage it again (shouldBotHandle needs `pending`).
         status: "open",
         customAttributes: { [CROSS_INBOX_CASE_ORIGIN_ATTRIBUTE]: origin },
+        ...(subject ? { additionalAttributes: { mail_subject: subject } } : {}),
       });
       const caseId = created.id;
       const continued = before.has(caseId) || caseId <= newestBefore;
