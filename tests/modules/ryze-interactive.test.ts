@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
+import type { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
-import { bridgeClaims, buttonReplyOf } from "@/modules/ryze/interactive";
+import { AppError } from "@/lib/errors";
+import { RYZE_SOURCE, RyzeClient } from "@/modules/ryze/client";
+import {
+  bridgeClaims,
+  buttonReplyOf,
+  sendRyzeText,
+  validateCard,
+  validateText,
+} from "@/modules/ryze/interactive";
 import { exchangeMessage } from "@/modules/ryze/receiver";
 import { brazilianNinthDigitVariant } from "@/modules/ryze/store";
 
@@ -185,5 +194,80 @@ describe("brazilianNinthDigitVariant", () => {
     ).toBeNull();
     expect(brazilianNinthDigitVariant("14155550100@s.whatsapp.net")).toBeNull();
     expect(brazilianNinthDigitVariant("123456789012345@lid")).toBeNull();
+  });
+});
+
+describe("sendRyzeText — validation", () => {
+  const ok = { to: "5581988236119", text: "Olá" };
+
+  test("a 10 to 15 digit recipient and a 1 to 4000 character text pass", () => {
+    expect(() => validateText(ok)).not.toThrow();
+    expect(() => validateText({ to: "5581988236", text: "x" })).not.toThrow();
+    expect(() =>
+      validateText({ to: "558198823611912", text: "x".repeat(4000) }),
+    ).not.toThrow();
+  });
+
+  test("a short, long or non-digit recipient is refused", () => {
+    for (const to of ["558198823", "5581988236119123", "+5581988236119"]) {
+      expect(() => validateText({ ...ok, to })).toThrow(AppError);
+    }
+  });
+
+  test("an empty, blank or too long text is refused", () => {
+    for (const text of ["", "   ", "x".repeat(4001)]) {
+      expect(() => validateText({ ...ok, text })).toThrow(AppError);
+    }
+  });
+
+  test("the card keeps the same recipient and text rules", () => {
+    const button = { id: "a", title: "Sim" };
+    expect(() => validateCard({ ...ok, buttons: [button] })).not.toThrow();
+    expect(() => validateCard({ ...ok, to: "123", buttons: [button] })).toThrow(
+      AppError,
+    );
+  });
+
+  test("an invalid message is refused before the database is touched", async () => {
+    const touched: string[] = [];
+    const base = new Proxy(
+      {},
+      {
+        get(_t, key) {
+          touched.push(String(key));
+          throw new Error("database touched");
+        },
+      },
+    ) as unknown as PrismaClient;
+    const ctx = { tenantId: 1n, userId: null, role: "TENANT_ADMIN" as const };
+    await expect(
+      sendRyzeText(ctx, 1n, { to: "123", text: "oi" }, { base }),
+    ).rejects.toBeInstanceOf(AppError);
+    expect(touched).toEqual([]);
+  });
+});
+
+describe("RyzeClient.sendText — payload", () => {
+  test("posts the bare number, the text and our source to the instance's text route", async () => {
+    const calls: { url: string; body: unknown }[] = [];
+    const fakeFetch = (async (url: string, init?: RequestInit) => {
+      calls.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(
+        JSON.stringify({ success: true, data: { messageId: "MSG1" } }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const client = new RyzeClient(
+      { baseUrl: "https://ryze.example/", instance: "inst 1", token: "t" },
+      fakeFetch,
+    );
+    const sent = await client.sendText("5581988236119@s.whatsapp.net", "Olá");
+    expect(sent.messageId).toBe("MSG1");
+    expect(calls).toEqual([
+      {
+        url: "https://ryze.example/api/message/text/inst%201",
+        body: { number: "5581988236119", message: "Olá", source: RYZE_SOURCE },
+      },
+    ]);
   });
 });

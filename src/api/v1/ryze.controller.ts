@@ -10,7 +10,7 @@ import {
 } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
-import { sendRyzeCard } from "@/modules/ryze/interactive";
+import { sendRyzeCard, sendRyzeText } from "@/modules/ryze/interactive";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import {
   connectRyzeGateway,
@@ -216,6 +216,40 @@ export const ryzeAdminController = new Elysia({
           }),
           { minItems: 1, maxItems: 3 },
         ),
+      }),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .post(
+    "/gateways/:id/messages",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      message: await sendRyzeText(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        body,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Send RyzeAPI text",
+        "Send a plain text into the contact's conversation on this number. The text is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A Brazilian mobile reuses the conversation stored with or without the ninth digit.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+      }),
+      body: t.Object({
+        to: t.String({
+          description: "Recipient phone, digits only, with country code.",
+        }),
+        text: t.String({
+          minLength: 1,
+          maxLength: 4000,
+          description: "Message text, up to 4000 characters.",
+        }),
       }),
       response: errors(400, 401, 403, 404, 422),
     },

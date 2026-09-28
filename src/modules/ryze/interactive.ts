@@ -10,7 +10,11 @@ import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { AppError, NotFoundError } from "@/lib/errors";
 import type { ScopedDb, TenantContext } from "@/lib/tenancy";
-import { createRyzeClient, type RyzeClient } from "./client";
+import {
+  createRyzeClient,
+  type RyzeClient,
+  type RyzeSentMessage,
+} from "./client";
 import { RYZE_OPERATOR_USER } from "./constants";
 import { emitToBots } from "./emit";
 import { presentMessageWebhook } from "./present";
@@ -174,16 +178,29 @@ export interface CardInput {
   buttons: { id: string; title: string }[];
 }
 
-export interface SentCard {
+export interface TextInput {
+  to: string;
+  text: string;
+}
+
+export interface SentMessage {
   messageId: string | null;
   conversationId: number;
 }
 
-function validateCard(card: CardInput): void {
-  if (!/^\d{10,15}$/.test(card.to))
-    throw new AppError("invalid recipient", 400);
-  if (!card.text.trim() || card.text.length > TEXT_MAX)
-    throw new AppError("invalid card text", 400);
+interface SendDeps {
+  base?: PrismaClient;
+  makeClient?: (gw: RyzeGateway) => Promise<RyzeClient>;
+}
+
+function validateRecipientAndText(to: string, text: string, what: string) {
+  if (!/^\d{10,15}$/.test(to)) throw new AppError("invalid recipient", 400);
+  if (!text.trim() || text.length > TEXT_MAX)
+    throw new AppError(`invalid ${what} text`, 400);
+}
+
+export function validateCard(card: CardInput): void {
+  validateRecipientAndText(card.to, card.text, "card");
   if (card.buttons.length < 1 || card.buttons.length > MAX_BUTTONS)
     throw new AppError("a card takes 1 to 3 buttons", 400);
   for (const b of card.buttons) {
@@ -192,17 +209,22 @@ function validateCard(card: CardInput): void {
   }
 }
 
-// OUT: send a card into the contact's conversation on this number.
-export async function sendRyzeCard(
+export function validateText(msg: TextInput): void {
+  validateRecipientAndText(msg.to, msg.text, "message");
+}
+
+// Stages the agent-owned row in the contact's conversation on this number (a Brazilian mobile
+// reuses the contact stored with or without the ninth digit), sends it, then lands and echoes it.
+// A send that fails removes the staged row, so the history never shows a message that did not go.
+async function sendAsAgent(
   ctx: TenantContext,
   gatewayInstanceId: bigint,
-  card: CardInput,
-  deps: {
-    base?: PrismaClient;
-    makeClient?: (gw: RyzeGateway) => Promise<RyzeClient>;
-  } = {},
-): Promise<SentCard> {
-  validateCard(card);
+  to: string,
+  content: string,
+  contentAttributes: Record<string, unknown>,
+  send: (ryze: RyzeClient, chatJid: string) => Promise<RyzeSentMessage>,
+  deps: SendDeps,
+): Promise<SentMessage> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
   const base = deps.base ?? basePrisma;
@@ -213,30 +235,16 @@ export async function sendRyzeCard(
         where: { chatwootInstanceId: gatewayInstanceId },
       });
       if (!gw) throw new NotFoundError("errors.ryzeGatewayNotFound");
-      const contact = await upsertContact(
-        db,
-        gw,
-        `${card.to}@s.whatsapp.net`,
-        null,
-      );
+      const contact = await upsertContact(db, gw, `${to}@s.whatsapp.net`, null);
       const { conv } = await openConversation(db, gw, contact);
-      const text = [
-        card.header ? `*${card.header}*` : null,
-        card.text,
-        card.footer ?? null,
-      ]
-        .filter(Boolean)
-        .join("\n\n");
-      const row = await storeOutgoing(db, gw, conv, text, {
-        buttons: card.buttons,
-      });
+      const row = await storeOutgoing(db, gw, conv, content, contentAttributes);
       return { gw, conv, row };
     },
     base,
   );
   try {
     const ryze = await (deps.makeClient ?? clientFor)(staged.gw);
-    const sent = await ryze.sendButtons(staged.conv.chatJid, card);
+    const sent = await send(ryze, staged.conv.chatJid);
     await landAndEcho(staged.gw, staged.row, sent.messageId, base);
     return { messageId: sent.messageId, conversationId: staged.conv.displayId };
   } catch (err) {
@@ -247,6 +255,51 @@ export async function sendRyzeCard(
     );
     throw err;
   }
+}
+
+// OUT: send a card into the contact's conversation on this number.
+export async function sendRyzeCard(
+  ctx: TenantContext,
+  gatewayInstanceId: bigint,
+  card: CardInput,
+  deps: SendDeps = {},
+): Promise<SentMessage> {
+  validateCard(card);
+  const content = [
+    card.header ? `*${card.header}*` : null,
+    card.text,
+    card.footer ?? null,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  return sendAsAgent(
+    ctx,
+    gatewayInstanceId,
+    card.to,
+    content,
+    { buttons: card.buttons },
+    (ryze, chatJid) => ryze.sendButtons(chatJid, card),
+    deps,
+  );
+}
+
+// OUT: send a plain text into the contact's conversation on this number, as the agent's own message.
+export async function sendRyzeText(
+  ctx: TenantContext,
+  gatewayInstanceId: bigint,
+  msg: TextInput,
+  deps: SendDeps = {},
+): Promise<SentMessage> {
+  validateText(msg);
+  return sendAsAgent(
+    ctx,
+    gatewayInstanceId,
+    msg.to,
+    msg.text,
+    {},
+    (ryze, chatJid) => ryze.sendText(chatJid, msg.text),
+    deps,
+  );
 }
 
 interface BridgeAnswer {
