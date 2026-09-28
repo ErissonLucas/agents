@@ -9,6 +9,7 @@ import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import {
   connectRyzeGateway,
   listRyzeGateways,
+  pairRyzeGateway,
   refreshRyzeGateway,
   removeRyzeGateway,
 } from "@/modules/ryze/service";
@@ -131,6 +132,40 @@ export const ryzeAdminController = new Elysia({
         }),
       }),
       response: errors(400, 401, 403, 404),
+    },
+  )
+  .post(
+    "/gateways/:id/pair",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      pairing: await pairRyzeGateway(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        { number: body?.number || undefined },
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Pair RyzeAPI number",
+        "Where the number's WhatsApp login stands: connected, or a fresh QR code (PNG data URL) to scan, or an 8-character pairing code when a phone number is given. RyzeAPI holds the call until it has a code (up to about a minute).",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+      }),
+      body: t.Optional(
+        t.Object({
+          number: t.Optional(
+            t.String({
+              description:
+                "Phone in international format, to get a pairing code instead of a QR.",
+            }),
+          ),
+        }),
+      ),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .delete(

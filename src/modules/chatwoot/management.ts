@@ -15,6 +15,7 @@ import {
   type WidgetHealth,
   type WidgetHealthStatus,
 } from "@/modules/channel-redirect/link";
+import { RYZE_EMULATOR_ROOT } from "@/modules/ryze/constants";
 import {
   ChatwootApiError,
   type ChatwootClient,
@@ -149,12 +150,16 @@ export async function getChatwootDeployment(
     const dep = await db.chatwootDeployment.findFirst({
       select: DEPLOYMENT_SELECT,
     });
+    // NOTE: RyzeAPI numbers are listed by the Ryze routes; the placeholder deployment a Ryze-only
+    // tenant carries is not a Chatwoot the operator connected.
     const accounts = await db.chatwootInstance.findMany({
+      where: { kind: "CHATWOOT" },
       select: SELECT,
       orderBy: { id: "asc" },
     });
     return {
-      deployment: dep ? toDeploymentDto(dep) : null,
+      deployment:
+        dep && dep.baseUrl !== RYZE_EMULATOR_ROOT ? toDeploymentDto(dep) : null,
       accounts: accounts.map(toDto),
     };
   });
@@ -301,7 +306,10 @@ export async function assertDeploymentNotSwitching(
   const existing = await runScopedOn(base, ctx, (db) =>
     db.chatwootDeployment.findFirst({ select: { baseUrl: true } }),
   );
-  assertNotADifferentDeployment(existing, baseUrl);
+  assertNotADifferentDeployment(
+    existing?.baseUrl === RYZE_EMULATOR_ROOT ? null : existing,
+    baseUrl,
+  );
 }
 
 export async function assertDeploymentConnectable(
@@ -349,7 +357,10 @@ export async function connectChatwootDeployment(
     const existing = await db.chatwootDeployment.findFirst({
       select: { id: true, baseUrl: true },
     });
-    assertNotADifferentDeployment(existing, data.baseUrl);
+    // NOTE: the placeholder a Ryze-only tenant carries is taken over by the real Chatwoot; the Ryze
+    // accounts under it never read the deployment's URL or token.
+    const placeholder = existing?.baseUrl === RYZE_EMULATOR_ROOT;
+    assertNotADifferentDeployment(placeholder ? null : existing, data.baseUrl);
     if (existing) {
       await db.$queryRaw`SELECT id FROM chatwoot_deployments WHERE id = ${existing.id} FOR NO KEY UPDATE`;
     }
@@ -366,7 +377,10 @@ export async function connectChatwootDeployment(
     const row = existing
       ? await db.chatwootDeployment.update({
           where: { id: existing.id },
-          data: { adminToken: encryptJson(data.adminToken) },
+          data: {
+            adminToken: encryptJson(data.adminToken),
+            ...(placeholder ? { baseUrl: data.baseUrl } : {}),
+          },
           select: DEPLOYMENT_SELECT,
         })
       : await db.chatwootDeployment.create({

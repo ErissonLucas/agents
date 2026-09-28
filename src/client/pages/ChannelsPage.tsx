@@ -47,6 +47,7 @@ import { apiErrorMessage } from "@/client/lib/apiError";
 import { chatwootInboxNewUrl } from "@/client/lib/chatwootLinks";
 import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { RyzeSection } from "@/client/pages/channels/RyzeSection";
 
 type DeploymentData = Awaited<
   ReturnType<typeof api.api.v1.chatwoot.deployment.get>
@@ -1251,6 +1252,21 @@ export function ChannelsPage() {
         onRetry={load}
         skeleton={<ChannelsSkeleton />}
       >
+        <RyzeSection
+          agents={agents}
+          onChanged={() => void refreshInboxes()}
+          renderAgentPicker={(inboxId, agentId, onBound) => (
+            <InboxAgentPicker
+              value={agentId}
+              agents={agents}
+              label={t("channels.bindLabel", "Answering agent")}
+              onChange={async (next) => {
+                await bindInbox(inboxId, next);
+                onBound();
+              }}
+            />
+          )}
+        />
         <section className="flex flex-col gap-3">
           <h2 className="flex items-center gap-2 font-medium text-text-primary">
             <Plug className="h-4 w-4 text-accent" aria-hidden="true" />
@@ -1481,7 +1497,7 @@ export function ChannelsPage() {
               )}
             </p>
           </div>
-          {inboxes.length === 0 ? (
+          {inboxesByAccount.length === 0 ? (
             <Card className="p-0">
               <EmptyState
                 icon={InboxIcon}

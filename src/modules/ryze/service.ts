@@ -30,6 +30,8 @@ export interface RyzeServiceDeps {
 
 export interface RyzeGatewayView {
   instanceId: string;
+  inboxDbId: string | null;
+  agentId: string | null;
   name: string;
   instanceName: string;
   baseUrl: string;
@@ -160,7 +162,16 @@ export async function connectRyzeGateway(
     String(created.instance.id),
     String(tenantId),
   );
-  return viewOf(created.gateway, input.name);
+  const inbox = await runScopedOn(base, ctx, (db) =>
+    db.inbox.findFirst({
+      where: {
+        chatwootInstanceId: created.instance.id,
+        chatwootInboxId: created.gateway.inboxId,
+      },
+      select: { id: true, agentId: true },
+    }),
+  );
+  return viewOf(created.gateway, input.name, inbox);
 }
 
 function viewOf(
@@ -176,9 +187,12 @@ function viewOf(
     createdAt: Date;
   },
   name?: string,
+  inbox?: { id: bigint; agentId: bigint | null } | null,
 ): RyzeGatewayView {
   return {
     instanceId: String(gw.chatwootInstanceId),
+    inboxDbId: inbox ? String(inbox.id) : null,
+    agentId: inbox?.agentId != null ? String(inbox.agentId) : null,
     name: name ?? gw.inboxName,
     instanceName: gw.instanceName,
     baseUrl: gw.baseUrl,
@@ -195,10 +209,33 @@ export async function listRyzeGateways(
   base: PrismaClient = basePrisma,
 ): Promise<RyzeGatewayView[]> {
   requireTenant(ctx);
-  const rows = await runScopedOn(base, ctx, (db) =>
-    db.ryzeGateway.findMany({ orderBy: { createdAt: "asc" } }),
-  );
-  return rows.map((r) => viewOf(r));
+  return runScopedOn(base, ctx, async (db) => {
+    const rows = await db.ryzeGateway.findMany({
+      orderBy: { createdAt: "asc" },
+    });
+    const inboxes = await db.inbox.findMany({
+      where: {
+        chatwootInstanceId: { in: rows.map((r) => r.chatwootInstanceId) },
+      },
+      select: {
+        id: true,
+        agentId: true,
+        chatwootInstanceId: true,
+        chatwootInboxId: true,
+      },
+    });
+    return rows.map((r) =>
+      viewOf(
+        r,
+        undefined,
+        inboxes.find(
+          (i) =>
+            i.chatwootInstanceId === r.chatwootInstanceId &&
+            i.chatwootInboxId === r.inboxId,
+        ) ?? null,
+      ),
+    );
+  });
 }
 
 export async function getRyzeGateway(
@@ -278,4 +315,67 @@ export async function removeRyzeGateway(
     );
   }
   await removeChatwootInstance(ctx, instanceId, base);
+}
+
+export interface RyzePairing {
+  connected: boolean;
+  connectionState: string | null;
+  numberJid: string | null;
+  qrCodeBase64: string | null;
+  pairingCode: string | null;
+}
+
+// Where the console's pairing step stands: already connected, or a fresh QR (or pairing code when a
+// phone number is given) to pair the number now. The state is stored as a side effect.
+export async function pairRyzeGateway(
+  ctx: TenantContext,
+  instanceId: bigint,
+  opts: { number?: string } = {},
+  deps: RyzeServiceDeps = {},
+  base: PrismaClient = basePrisma,
+): Promise<RyzePairing> {
+  const gw = await gatewayOrThrow(ctx, instanceId, base);
+  const make = deps.makeRyzeClient ?? ((c) => createRyzeClient(c));
+  const ryze = await make({
+    baseUrl: gw.baseUrl,
+    instance: gw.instanceName,
+    token: decryptJson<string>(gw.token),
+  });
+  const state = await ryze.connectionState();
+  await runScopedOn(base, ctx, (db) =>
+    db.ryzeGateway.update({
+      where: { id: gw.id },
+      data: {
+        connectionState: state.state,
+        ...(state.numberJid ? { numberJid: state.numberJid } : {}),
+      },
+    }),
+  );
+  if (state.state === "connected") {
+    return {
+      connected: true,
+      connectionState: state.state,
+      numberJid: state.numberJid,
+      qrCodeBase64: null,
+      pairingCode: null,
+    };
+  }
+  let code: Awaited<ReturnType<RyzeClient["pair"]>>;
+  try {
+    code = await ryze.pair(opts.number);
+  } catch (err) {
+    const detail = describe(err);
+    throw new AppError(
+      `could not reach the RyzeAPI instance: ${detail}`,
+      400,
+      "errors.ryzeConnectFailed",
+      { detail },
+    );
+  }
+  return {
+    connected: false,
+    connectionState: state.state,
+    numberJid: state.numberJid,
+    ...code,
+  };
 }

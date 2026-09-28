@@ -80,6 +80,7 @@ export class RyzeClient {
     method: string,
     path: string,
     body?: unknown,
+    timeoutMs: number = REQUEST_TIMEOUT_MS,
   ): Promise<Record<string, unknown>> {
     const endpoint = `${method} ${path.split("?")[0]}`;
     const res = await this.fetchImpl(`${this.root}${path}`, {
@@ -91,7 +92,7 @@ export class RyzeClient {
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
       redirect: "error",
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
     let parsed: unknown = null;
@@ -226,6 +227,24 @@ export class RyzeClient {
       label,
       enabled: false,
     });
+  }
+
+  // Starts the WhatsApp login: a QR (PNG data URL) to scan, or with `number` an 8-character pairing
+  // code to type in WhatsApp. Ryze holds the request until it has one (about a minute at most).
+  async pair(
+    number?: string,
+  ): Promise<{ qrCodeBase64: string | null; pairingCode: string | null }> {
+    const query = number ? `?number=${encodeURIComponent(number)}` : "";
+    const res = await this.call(
+      "GET",
+      `${this.path("/api/instance/connect")}${query}`,
+      undefined,
+      70_000,
+    );
+    return {
+      qrCodeBase64: str(res.qrCodeBase64),
+      pairingCode: str(res.pairingCode),
+    };
   }
 
   async connectionState(): Promise<RyzeConnectionState> {

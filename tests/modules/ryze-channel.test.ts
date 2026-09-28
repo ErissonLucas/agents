@@ -31,9 +31,13 @@ let su: PrismaClient | undefined;
 let app: PrismaClient | undefined;
 if (appUrl && suUrl) {
   try {
-    su = new PrismaClient({ adapter: new PrismaPg({ connectionString: suUrl }) });
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
     await su.$queryRaw`SELECT 1`;
-    app = new PrismaClient({ adapter: new PrismaPg({ connectionString: appUrl }) });
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
   } catch {
@@ -50,9 +54,14 @@ interface RyzeCall {
 
 function fakeRyze(calls: RyzeCall[]): RyzeClient {
   let n = 0;
-  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+  const fetchImpl = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
     const url = new URL(String(input));
-    const body = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+    const body = init?.body
+      ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+      : {};
     calls.push({ path: url.pathname, body });
     if (url.pathname.startsWith("/api/instance/list")) {
       return Response.json({
@@ -61,7 +70,10 @@ function fakeRyze(calls: RyzeCall[]): RyzeClient {
           {
             name: "amanda",
             status: "connected",
-            connection: { state: "connected", numberJid: "5581996796431@s.whatsapp.net" },
+            connection: {
+              state: "connected",
+              numberJid: "5581996796431@s.whatsapp.net",
+            },
             profile: { name: "Amanda" },
           },
         ],
@@ -80,7 +92,11 @@ function fakeRyze(calls: RyzeCall[]): RyzeClient {
 }
 
 let tenantId = 0n;
-const ctx = (): TenantContext => ({ tenantId, userId: null, role: "TENANT_ADMIN" });
+const ctx = (): TenantContext => ({
+  tenantId,
+  userId: null,
+  role: "TENANT_ADMIN",
+});
 
 describe.skipIf(!dbUp)("RyzeAPI channel", () => {
   const calls: RyzeCall[] = [];
@@ -117,7 +133,10 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
   afterAll(async () => {
     setBotDeliverer(restoreDeliverer);
     setRyzeClientFactory(restoreFactory);
-    if (tenantId) await suDb.$executeRawUnsafe(`DELETE FROM tenants WHERE id = ${tenantId}`);
+    if (tenantId)
+      await suDb.$executeRawUnsafe(
+        `DELETE FROM tenants WHERE id = ${tenantId}`,
+      );
     await suDb.$disconnect();
     await appDb.$disconnect();
   });
@@ -125,7 +144,12 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
   test("connecting creates a RYZE account, its gateway and an inbox that reserves echoes", async () => {
     const view = await connectRyzeGateway(
       ctx(),
-      { name: "Amanda Sena", baseUrl: outboundUrl("/"), instanceName: "amanda", token: "tok" },
+      {
+        name: "Amanda Sena",
+        baseUrl: outboundUrl("/"),
+        instanceName: "amanda",
+        token: "tok",
+      },
       { makeRyzeClient: async () => fakeRyze(calls) },
       appDb,
     );
@@ -138,9 +162,15 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     auth = String(webhook?.body.authorization);
 
     const rows = await runScopedOn(appDb, ctx(), async (db) => ({
-      instance: await db.chatwootInstance.findUniqueOrThrow({ where: { id: instanceId } }),
-      gateway: await db.ryzeGateway.findUniqueOrThrow({ where: { chatwootInstanceId: instanceId } }),
-      inbox: await db.inbox.findFirstOrThrow({ where: { chatwootInstanceId: instanceId } }),
+      instance: await db.chatwootInstance.findUniqueOrThrow({
+        where: { id: instanceId },
+      }),
+      gateway: await db.ryzeGateway.findUniqueOrThrow({
+        where: { chatwootInstanceId: instanceId },
+      }),
+      inbox: await db.inbox.findFirstOrThrow({
+        where: { chatwootInstanceId: instanceId },
+      }),
     }));
     gatewayId = rows.gateway.id;
     expect(rows.instance.kind).toBe("RYZE");
@@ -158,8 +188,12 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     );
     await bindInbox(ctx(), inbox.id, agent.id, {}, appDb);
     const rows = await runScopedOn(appDb, ctx(), async (db) => ({
-      bot: await db.chatwootAgentBot.findFirstOrThrow({ where: { chatwootInstanceId: instanceId } }),
-      gateway: await db.ryzeGateway.findUniqueOrThrow({ where: { id: gatewayId } }),
+      bot: await db.chatwootAgentBot.findFirstOrThrow({
+        where: { chatwootInstanceId: instanceId },
+      }),
+      gateway: await db.ryzeGateway.findUniqueOrThrow({
+        where: { id: gatewayId },
+      }),
     }));
     expect(rows.gateway.agentBotId).toBe(rows.bot.chatwootAgentBotId);
     botToken = decryptJson<string>(rows.bot.accessToken);
@@ -223,7 +257,10 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
   });
 
   test("the agent's reply leaves through Ryze and is readable back as an outgoing message", async () => {
-    const client = await loadChatwootClient(tenantId, instanceId, { base: appDb, botToken });
+    const client = await loadChatwootClient(tenantId, instanceId, {
+      base: appDb,
+      botToken,
+    });
     const sent = (await client.sendMessage(conversationId, "Te passo sim!", {
       sendId: "s-1",
     })) as { id: number };
@@ -232,7 +269,11 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     expect(send?.body.number).toBe("5581999990000");
     expect(send?.body.source).toBe(RYZE_SOURCE);
     const page = (await client.getMessages(conversationId)) as {
-      payload: Array<{ id: number; message_type: number; content_attributes: Record<string, unknown> }>;
+      payload: Array<{
+        id: number;
+        message_type: number;
+        content_attributes: Record<string, unknown>;
+      }>;
     };
     const mine = page.payload.find((m) => m.id === sent.id);
     expect(mine?.message_type).toBe(1);
@@ -263,7 +304,9 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
       }),
     });
     expect(tagged.outcome).toBe("ignored");
-    const lastSend = calls.findLast((c) => c.path.startsWith("/api/message/text"));
+    const lastSend = calls.findLast((c) =>
+      c.path.startsWith("/api/message/text"),
+    );
     expect(lastSend).toBeDefined();
     const untaggedSameId = await receiveRyzeWebhook({
       routeToken,
@@ -311,11 +354,18 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
   });
 
   test("status changes are served live and announced to the bot", async () => {
-    const client = await loadChatwootClient(tenantId, instanceId, { base: appDb, botToken });
+    const client = await loadChatwootClient(tenantId, instanceId, {
+      base: appDb,
+      botToken,
+    });
     await client.toggleStatus(conversationId, "open");
-    const live = parseLiveConversation(await client.getConversation(conversationId));
+    const live = parseLiveConversation(
+      await client.getConversation(conversationId),
+    );
     expect(live?.status).toBe("open");
     await drainEmits(gatewayId);
-    expect(delivered.some((e) => e.event === "conversation_status_changed")).toBe(true);
+    expect(
+      delivered.some((e) => e.event === "conversation_status_changed"),
+    ).toBe(true);
   });
 });
