@@ -6,8 +6,9 @@
 //   2. the destination's identity (an email address for an email inbox) is settled on the contact;
 //   3. the conversation is opened in the destination inbox, or continued when the inbox is set to
 //      continue the contact's open case (the fork's `continue_open_conversation`);
-//   4. the case number is written back on the origin conversation, then the opening message, the
-//      notes that link the two sides and the labels.
+//   4. the case number is written back on the origin conversation, then the case is taken from any
+//      agent bot and given to the configured team, then the opening message, the notes that link the
+//      two sides and the labels.
 //
 // It does NOT close the origin conversation. `resolve_conversation` does that, and on the reactive
 // path it defers the close until after delivery and drops it when the customer writes again; closing
@@ -47,6 +48,8 @@ export type CaseClient = Pick<
   | "listLabels"
   | "setConversationCustomAttributes"
   | "toggleStatus"
+  | "unassignConversation"
+  | "assignTeam"
 >;
 
 // What the turn's output check made of the opening message: send it, drop it, or the operator's
@@ -79,6 +82,10 @@ export interface OpenCaseInput {
   signCustomerMessage?: (text: string) => string;
   // The label writers' shared queue is keyed by tenant (see modules/chatwoot/labels.ts).
   tenantId?: bigint | null;
+  // The team the case is given to when it has none: the agent's pinned handoff team, which is where
+  // this agent sends conversations for people to take. Null ⇒ no team is written, and Chatwoot's own
+  // routing decides once the case has no owner.
+  caseTeamId?: number | null;
 }
 
 export type OpenCaseResult =
@@ -88,7 +95,8 @@ export type OpenCaseResult =
       caseUrl: string;
       // How the address that reached the destination was settled, when one had to be.
       identity: "held" | "written" | "merged" | "other_contact" | null;
-      // Writes after the case existed that did not land. The case is open either way.
+      // Writes after the case existed that did not land. The case is open either way. On an
+      // already-open case, only the owner writes (`case_assignee`, `case_team`) can appear.
       partial: string[];
       // The opening message the output guardrail refused, so it was not sent.
       openingBlocked?: boolean;
@@ -97,6 +105,9 @@ export type OpenCaseResult =
       openingOutsideWindow?: boolean;
       // Operator case labels the account does not have, left off the case (issue #901).
       unknownCaseLabels?: string[];
+      // The case could not be read to settle its owner, so nothing past that point was written:
+      // `before_clear` wrote nothing, `before_team` cleared the bot and wrote no team.
+      caseOwnerUnread?: CaseOwnerUnread;
     }
   | { kind: "not_configured" }
   | { kind: "unsupported_channel"; channelType: string | null }
@@ -187,6 +198,69 @@ export function destinationReasonNote(reason: string): string {
   return `Motivo: ${reason}`;
 }
 
+// WHO HOLDS THE CASE, read from the conversation Chatwoot answers with. `human` is a person assigned
+// (`meta.assignee_type` "User"); an agent bot is NOT read from here on purpose, see `settleCaseOwner`.
+type CaseOwnerUnread = "before_clear" | "before_team";
+
+function caseOwner(conv: unknown): { human: boolean; teamId: number | null } {
+  const meta = field(conv, "meta");
+  const team = field(meta, "team");
+  const teamId = Number(field(team, "id"));
+  return {
+    human: field(meta, "assignee_type") === "User",
+    teamId: Number.isInteger(teamId) && teamId > 0 ? teamId : null,
+  };
+}
+
+// A CASE NOBODY HOLDS IS NOT A CASE. It can land in a conversation an agent bot holds: one the
+// destination's own agent left `pending` (continued, or this origin's known case), or a new one the
+// inbox hands its bot on create. Opened, that agent no longer answers it, and the fork counts
+// `assignee_agent_bot_id` as an owner, so no "open with no owner" routing rule matches it either.
+
+// THE BOT IS NOT READ, IT IS CLEARED. An inbox's bot assignment can carry the id without the fork's
+// `ai_assignee_type`, which the JSON shows as no assignee while every rule still sees an owner.
+// `assignee_id: 0` on the assignments endpoint sets both the person and the bot to none.
+
+// A PERSON on the case gets nothing written, the team neither: the fork drops an assignee who is not
+// a member of a newly set team (`ensure_assignee_is_from_team`). A team already there stays, and the
+// case is read again before the team is written, so an owner set during the clear is kept.
+
+// Owner writes skip the withdrawal fence: a reset or takeover on the ORIGIN does not make an open case
+// anyone's. A refused write goes to `partial`; a case that could not be read is returned instead,
+// since nothing was attempted, and each reaches the flow log as its own warning.
+async function settleCaseOwner(
+  client: CaseClient,
+  caseId: number,
+  teamId: number | null,
+  partial: string[],
+): Promise<CaseOwnerUnread | null> {
+  let owner: { human: boolean; teamId: number | null };
+  try {
+    owner = caseOwner(await client.getConversation(caseId));
+  } catch {
+    return "before_clear";
+  }
+  if (owner.human) return null;
+  try {
+    await client.unassignConversation(caseId, { asAdmin: true });
+  } catch {
+    partial.push("case_assignee");
+  }
+  if (teamId === null || owner.teamId !== null) return null;
+  try {
+    owner = caseOwner(await client.getConversation(caseId));
+  } catch {
+    return "before_team";
+  }
+  if (owner.human || owner.teamId !== null) return null;
+  try {
+    await client.assignTeam(caseId, teamId, { asAdmin: true });
+  } catch {
+    partial.push("case_team");
+  }
+  return null;
+}
+
 export function openCaseInInbox(
   client: CaseClient,
   input: OpenCaseInput,
@@ -254,12 +328,20 @@ async function run(
           }
           await client.toggleStatus(known, "open", { asAdmin: true });
         }
+        const partial: string[] = [];
+        const caseOwnerUnread = await settleCaseOwner(
+          client,
+          known,
+          input.caseTeamId ?? null,
+          partial,
+        );
         return {
           kind: "already_open",
           caseId: known,
           caseUrl: client.conversationUrl(known),
           identity: null,
-          partial: [],
+          partial,
+          ...(caseOwnerUnread ? { caseOwnerUnread } : {}),
         };
       }
     }
@@ -446,6 +528,12 @@ async function run(
           { stillWanted: input.stillWanted },
         ),
       );
+      const caseOwnerUnread = await settleCaseOwner(
+        client,
+        caseId,
+        input.caseTeamId ?? null,
+        partial,
+      );
       // A continued case already has its opening: repeating it would send the customer a second
       // "we opened your case" email for the same case.
       // A channel with a reply window (official WhatsApp, Twilio on WhatsApp, an API inbox with one
@@ -551,6 +639,7 @@ async function run(
         ...(openingBlocked ? { openingBlocked } : {}),
         ...(openingOutsideWindow ? { openingOutsideWindow } : {}),
         ...(unknownCaseLabels.length > 0 ? { unknownCaseLabels } : {}),
+        ...(caseOwnerUnread ? { caseOwnerUnread } : {}),
       };
     });
   } catch (error) {
