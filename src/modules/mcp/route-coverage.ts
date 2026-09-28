@@ -130,6 +130,11 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "DELETE /v1/chatwoot/inboxes/:id": { tool: "inbox_remove" },
   "POST /v1/chatwoot/inboxes/:id/reconnect": { tool: "inbox_reconnect" },
   "POST /v1/chatwoot/webhook/:routeToken": { none: INBOUND },
+  "POST /v1/ryze/webhook/:routeToken": { none: INBOUND },
+  "GET /v1/ryze/gateways": { tool: "ryze_list" },
+  "POST /v1/ryze/gateways": { tool: "ryze_connect" },
+  "POST /v1/ryze/gateways/:id/refresh": { tool: "ryze_refresh" },
+  "DELETE /v1/ryze/gateways/:id": { tool: "ryze_remove" },
   "GET /v1/code-tools/": { tool: "code_tool_list" },
   "GET /v1/code-tools/:id": { tool: "code_tool_get" },
   "GET /v1/code-tools/:id/references": {

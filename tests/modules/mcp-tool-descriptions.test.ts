@@ -748,6 +748,9 @@ describe("MCP tool descriptions", () => {
   // ceiling above: this tree measures 64,141, so 64,157 with the same 16. No description changed.
   // SCHEMA RAISED by `crossInboxCase.subjectTemplate`, the same 124 characters as the settings
   // ceiling above: this tree measures 64,265, so 64,281 with the same 16. No description changed.
+  // DESCRIPTIONS RAISED by the four RyzeAPI tools (ryze_list/connect/refresh/remove), trimmed to
+  // what a caller cannot read off the schema: this tree measures 31,879, so 31,895 with the same 16.
+  // Their input schemas cost 708 characters: this tree measures 64,989, so 65,005 with the same 16.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -756,8 +759,8 @@ describe("MCP tool descriptions", () => {
       desc += t.description.length;
       schema += t.schema.length;
     }
-    expect(desc).toBeLessThanOrEqual(31_503);
-    expect(schema).toBeLessThanOrEqual(64_281);
+    expect(desc).toBeLessThanOrEqual(31_895);
+    expect(schema).toBeLessThanOrEqual(65_005);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

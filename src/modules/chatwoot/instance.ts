@@ -2,7 +2,9 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import basePrisma from "@/api/lib/prisma";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { type ChatwootClient, createChatwootClient } from "./client";
+import { ryzeEmulatorBaseUrl } from "@/modules/ryze/constants";
+import { RyzeEmulator } from "@/modules/ryze/emulator";
+import { ChatwootClient, createChatwootClient } from "./client";
 
 // Loads a ChatwootClient for a tenant's instance with both tokens decrypted. Single place that
 // resolves the instance + decrypts creds; reused by the runtime and any admin-token
@@ -43,10 +45,27 @@ export async function loadChatwootClient(
       where: { id: instanceId },
       select: {
         accountId: true,
+        kind: true,
         deployment: { select: { baseUrl: true, adminToken: true } },
       },
     }),
   );
+  // An account of kind RYZE is answered by the in-process emulator; the deployment's token (a real
+  // Chatwoot's, when the tenant has one) never reaches it.
+  if (instance.kind === "RYZE" && !deps.makeClient) {
+    const emulator = new RyzeEmulator(tenantId, instanceId, { base });
+    return new ChatwootClient(
+      {
+        baseUrl: emulator.baseUrl,
+        accountId: instance.accountId,
+        adminToken: "ryze-emulator-admin",
+        botToken: deps.botToken ?? "",
+        ...(deps.mute ? { mute: true } : {}),
+        ...(deps.expiresOn ? { expiresOn: deps.expiresOn } : {}),
+      },
+      emulator.fetch as typeof fetch,
+    );
+  }
   const factory = deps.makeClient ?? createChatwootClient;
   return factory({
     baseUrl: instance.deployment.baseUrl,
@@ -68,10 +87,12 @@ export async function chatwootBaseUrl(
   const instance = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.chatwootInstance.findUniqueOrThrow({
       where: { id: instanceId },
-      select: { deployment: { select: { baseUrl: true } } },
+      select: { kind: true, deployment: { select: { baseUrl: true } } },
     }),
   );
-  return instance.deployment.baseUrl;
+  return instance.kind === "RYZE"
+    ? ryzeEmulatorBaseUrl(instanceId)
+    : instance.deployment.baseUrl;
 }
 
 // Resolves the persona's Chatwoot Agent Bot for an instance: its numeric id (the gate's "our bot")

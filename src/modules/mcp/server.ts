@@ -137,6 +137,7 @@ import {
   documentTemplateUpdate,
 } from "./write-documents";
 import { tenantCreate, tenantGet, tenantList } from "./write-fleet";
+import { ryzeConnect, ryzeList, ryzeRefresh, ryzeRemove } from "./write-ryze";
 
 // `input_schema`, with the one field name that cannot survive being parsed. `z.record` rebuilds the
 // map by assignment, so an own `__proto__` key hits the prototype setter and is GONE before any
@@ -937,6 +938,18 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         inputSchema: {},
       },
       async (_args, eff) => writeContent(await instanceList(eff)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "ryze_list",
+      {
+        description:
+          "List the WhatsApp numbers connected through RyzeAPI (instanceId, inboxId, connectionState). Tokens are never returned.",
+        inputSchema: {},
+      },
+      async (_args, eff) => writeContent(await ryzeList(eff)),
     );
 
     registerTenantTool(
@@ -2147,6 +2160,62 @@ export function buildMcpServer(principal: VerifiedToken): McpServer {
         },
         eff,
       ) => writeContent(await inboxBind(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "ryze_connect",
+      {
+        description:
+          "Connect a RyzeAPI instance as a WhatsApp inbox (then inbox_bind it). Applies only with dry_run:false.",
+        inputSchema: {
+          name: z.string().min(1),
+          base_url: z.string(),
+          instance_name: z.string().min(1),
+          token: z.string().min(1),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (
+        args: {
+          name: string;
+          base_url: string;
+          instance_name: string;
+          token: string;
+          dry_run?: boolean;
+        },
+        eff,
+      ) => writeContent(await ryzeConnect(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "ryze_refresh",
+      {
+        description:
+          "Refresh a RyzeAPI number's live connection state (instance_id from ryze_list).",
+        inputSchema: { instance_id: z.string() },
+      },
+      async (args: { instance_id: string }, eff) =>
+        writeContent(await ryzeRefresh(eff, args)),
+    );
+
+    registerTenantTool(
+      server,
+      principal,
+      "ryze_remove",
+      {
+        description:
+          "Remove a RyzeAPI number and its conversations. Applies only with dry_run:false.",
+        inputSchema: {
+          instance_id: z.string(),
+          dry_run: z.boolean().optional(),
+        },
+      },
+      async (args: { instance_id: string; dry_run?: boolean }, eff) =>
+        writeContent(await ryzeRemove(eff, args)),
     );
 
     registerTenantTool(

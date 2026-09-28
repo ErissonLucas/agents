@@ -15,6 +15,7 @@ import * as writeConversations from "@/modules/mcp/write-conversations";
 import * as writeDocuments from "@/modules/mcp/write-documents";
 import * as writeFleet from "@/modules/mcp/write-fleet";
 import * as writeKnowledge from "@/modules/mcp/write-knowledge";
+import * as writeRyze from "@/modules/mcp/write-ryze";
 import * as writeSettings from "@/modules/mcp/write-settings";
 import * as writeWebhooks from "@/modules/mcp/write-webhooks";
 import { seedChatwootInstance, withRunNamespace } from "../../utils/chatwoot";
@@ -293,6 +294,21 @@ const TABLE: Record<string, Row> = {
     why: "inbox does not exist",
     pastOwnership:
       "measured on an inbox that EXISTS: there is nothing to re-ask — `unobserveInbox` is idempotent on both sides (it asks the fork whether or not a row is there), so it refuses nothing the preview could have caught.",
+  },
+  ryze_connect: {
+    args: {
+      name: "x",
+      base_url: "http://127.0.0.1:1",
+      instance_name: "x",
+      token: "x",
+    },
+    why: "the base URL is refused before any request, by the same precheck the apply runs",
+  },
+  ryze_remove: {
+    args: { instance_id: NOPE },
+    why: "number does not exist",
+    pastOwnership:
+      "measured on a number that EXISTS: coherent — the preview reads the gateway the apply removes, so both accept it.",
   },
   instance_disconnect: {
     args: { instance_id: NOPE },
@@ -581,6 +597,7 @@ const FNS = {
   ...writeDocuments,
   ...writeFleet,
   ...writeKnowledge,
+  ...writeRyze,
   ...writeSettings,
   ...writeWebhooks,
   ...writeRoot,

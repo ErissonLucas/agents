@@ -182,6 +182,16 @@ export async function disconnectChatwootDeployment(
         "errors.chatwootDeploymentNotFound",
       );
     }
+    // NOTE: The cascade below would take the tenant's RyzeAPI numbers with it (they hang off this
+    // deployment row), so it is refused while any exists; they are removed on their own first.
+    const ryze = await db.chatwootInstance.count({ where: { kind: "RYZE" } });
+    if (ryze > 0) {
+      throw new AppError(
+        "remove the RyzeAPI numbers before disconnecting Chatwoot",
+        409,
+        "errors.ryzeGatewaysBlockDisconnect",
+      );
+    }
     // NOTE: The deployment and then every account under it, in that order, BEFORE the counts. This
     // is the outermost of the three levels the module locks, and the reason it is taken here is the
     // count: a sync or a connect committing between the reading and the delete gives the cascade
@@ -841,8 +851,11 @@ export async function setConnectedAccounts(
     // probe failed — proceed with null names (the operator picked these ids deliberately)
   }
   assertAccountsSelectable(wanted, reported);
+  // NOTE: Only the real Chatwoot's accounts are chosen here; an emulated RyzeAPI account is not in
+  // the Chatwoot's account list and must never be soft-disconnected by this choice.
   const current = await runScopedOn(base, ctx, (db) =>
     db.chatwootInstance.findMany({
+      where: { kind: "CHATWOOT" },
       select: { id: true, accountId: true, disconnectedAt: true },
     }),
   );

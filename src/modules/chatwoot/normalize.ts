@@ -633,6 +633,7 @@ export const ECHO_RESERVING_WHATSAPP_PROVIDERS = new Set([
   "baileys",
   "native",
   "uazapi",
+  "ryze",
 ]);
 
 export function providerReservesEchoIds(provider: string | null): boolean {

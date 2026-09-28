@@ -59,9 +59,7 @@ function str(v: unknown): string | null {
 // The recipient as the gateway wants it: a bare number for a phone JID, the JID untouched otherwise
 // (`@lid`, `@g.us`), so a conversation keyed on a lid is answered on the lid it came from.
 export function ryzeRecipient(jid: string): string {
-  return jid.endsWith("@s.whatsapp.net")
-    ? jid.slice(0, -"@s.whatsapp.net".length)
-    : jid;
+  return jid.replace(/@s\.whatsapp\.net$/, "");
 }
 
 export class RyzeClient {
@@ -220,6 +218,13 @@ export class RyzeClient {
       authorization: params.authorization,
       events: ["message.exchange", "instance.state"],
       mediaBase64: true,
+    });
+  }
+
+  async disableWebhook(label = "fazer-ai-agents"): Promise<void> {
+    await this.call("POST", this.path("/api/events/webhook"), {
+      label,
+      enabled: false,
     });
   }
 

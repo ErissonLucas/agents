@@ -36,6 +36,10 @@ import {
   oauthMcpCallbackController,
   oauthMcpVaultController,
 } from "@/api/v1/oauth-mcp.controller";
+import {
+  ryzeAdminController,
+  ryzeWebhookController,
+} from "@/api/v1/ryze.controller";
 import { tenantSettingsController } from "@/api/v1/tenant-settings.controller";
 import { toolsController } from "@/api/v1/tools.controller";
 import { v1Controller } from "@/api/v1/v1.controller";
@@ -253,6 +257,8 @@ const api = new Elysia()
   .use(mcpMeController)
   .use(mcpAdminController)
   .use(chatwootController)
-  .use(chatwootAdminController);
+  .use(chatwootAdminController)
+  .use(ryzeWebhookController)
+  .use(ryzeAdminController);
 
 export default api;
