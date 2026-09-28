@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import config from "@/config";
 import { bridgeClaims, buttonReplyOf } from "@/modules/ryze/interactive";
+import { exchangeMessage } from "@/modules/ryze/receiver";
 
 // The RyzeAPI docs describe a button tap in two shapes that disagree and a list pick in a third;
 // buttonReplyOf reads every one, keeps the id and never takes free text for an id.
@@ -88,6 +89,81 @@ describe("bridgeClaims", () => {
     );
     withBridge({ url: "https://x", secret: "s", prefix: "" }, () =>
       expect(bridgeClaims(tap)).toBe(false),
+    );
+  });
+});
+
+// Shapes captured from a live RyzeAPI WebSocket on 2026-09-28 (values replaced): chat, sender,
+// direction and id sit on `data`, and the text is a plain string in `message.content`.
+describe("the live message.exchange shape", () => {
+  const liveTap = {
+    id: "3EB0LIVETAPID0000000",
+    direction: "incoming",
+    timestamp: "2026-09-28T20:40:00-03:00",
+    chat: {
+      jid: "5581900000000@s.whatsapp.net",
+      lid: "1@lid",
+      name: "Contato",
+      type: "private",
+    },
+    sender: {
+      jid: "5581900000000@s.whatsapp.net",
+      lid: "1@lid",
+      name: "Contato",
+    },
+    recipient: null,
+    message: {
+      type: "buttons_response",
+      content: "",
+      source: "",
+      isForwarded: false,
+      isEdit: false,
+      edit: null,
+      context: null,
+      media: null,
+      reaction: null,
+      interactive: { selectedButtonId: "maria:a:gXvXSwwuGzO1aVgxfIGktxHe" },
+    },
+  };
+
+  test("the envelope fields are read from data, the message fields from data.message", () => {
+    const msg = exchangeMessage(liveTap);
+    expect(msg?.direction).toBe("incoming");
+    expect(msg?.id).toBe("3EB0LIVETAPID0000000");
+    expect((msg?.chat as Record<string, unknown> | undefined)?.type).toBe(
+      "private",
+    );
+    expect(msg?.type).toBe("buttons_response");
+    expect(msg?.edit ?? null).toBeNull(); // ausente: não é um card de edição
+  });
+
+  test("the tapped id is found on the live tap", () => {
+    const msg = exchangeMessage(liveTap) as Record<string, unknown>;
+    expect(buttonReplyOf(msg)?.id).toBe("maria:a:gXvXSwwuGzO1aVgxfIGktxHe");
+  });
+
+  test("an empty inner value does not hide the envelope's", () => {
+    const msg = exchangeMessage({
+      id: "OUTER",
+      message: { id: "", type: "text", content: "oi" },
+    });
+    expect(msg?.id).toBe("OUTER");
+    expect(msg?.content).toBe("oi");
+  });
+
+  test("the documented nested shape still reads the same", () => {
+    const msg = exchangeMessage({
+      id: "X",
+      message: {
+        id: "INNER",
+        direction: "incoming",
+        chat: { jid: "5581@s.whatsapp.net", type: "private" },
+        content: { text: "oi" },
+      },
+    });
+    expect(msg?.id).toBe("INNER");
+    expect((msg?.content as Record<string, unknown> | undefined)?.text).toBe(
+      "oi",
     );
   });
 });

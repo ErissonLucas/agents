@@ -98,12 +98,29 @@ function inboundMedia(msg: Record<string, unknown>): InboundMedia | null {
   };
 }
 
+// A live message.exchange carries chat, sender, direction, id and timestamp on `data`, beside
+// `data.message` (type, content as a plain string, interactive, reaction...); the docs' catalog nests
+// them inside `message`. Both are read: the inner keys win where both have a value.
+export function exchangeMessage(
+  data: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const inner = isRecord(data.message) ? data.message : null;
+  if (!inner) return null;
+  const merged: Record<string, unknown> = { ...data };
+  for (const [k, v] of Object.entries(inner)) {
+    if (v !== null && v !== undefined && v !== "") merged[k] = v;
+  }
+  delete merged.message;
+  return merged;
+}
+
 function textOf(msg: Record<string, unknown>): string | null {
   const content = isRecord(msg.content) ? msg.content : null;
   const media = isRecord(msg.media) ? msg.media : null;
   const location = isRecord(msg.location) ? msg.location : null;
   return (
     str(content?.text) ??
+    str(msg.content) ??
     str(media?.caption) ??
     (location ? str(location.address) : null)
   );
@@ -205,7 +222,7 @@ async function handleMessage(
   data: Record<string, unknown>,
   base: PrismaClient,
 ): Promise<RyzeWebhookResult> {
-  const msg = isRecord(data.message) ? data.message : null;
+  const msg = exchangeMessage(data);
   if (!msg) return { status: 200, outcome: "ignored" };
   const chat = isRecord(msg.chat) ? msg.chat : {};
   if (str(chat.type) && str(chat.type) !== "private") {
