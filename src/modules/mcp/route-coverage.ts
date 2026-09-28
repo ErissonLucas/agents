@@ -137,6 +137,9 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/ryze/gateways/:id/pair": {
     gap: "the QR pairing of a RyzeAPI number, an interactive console step",
   },
+  "POST /v1/ryze/gateways/:id/cards": {
+    gap: "sending a reply-button card on a RyzeAPI number",
+  },
   "DELETE /v1/ryze/gateways/:id": { tool: "ryze_remove" },
   "GET /v1/code-tools/": { tool: "code_tool_list" },
   "GET /v1/code-tools/:id": { tool: "code_tool_get" },

@@ -64,6 +64,9 @@ const {
   TTS_CHECK_MODE,
   TTS_CHECK_TOKEN,
   TTS_CHECK_TIMEOUT_MS,
+  RYZE_BUTTON_BRIDGE_URL,
+  RYZE_BUTTON_BRIDGE_SECRET,
+  RYZE_BUTTON_BRIDGE_PREFIX,
 } = process.env;
 
 // NOTE: Domain entries are trimmed, lowercased, and have a leading "@" stripped
@@ -642,6 +645,15 @@ const config = {
   // and the "new version available" check. Empty string DISABLES all hub communication (air-gapped,
   // or a fork that does not want to talk to fazer.ai). For the Free/open-source edition this is a
   // light update check: it sends the edition + current version + the request IP, never any PII.
+  // NOTE: Button bridge (RyzeAPI channel). A tap on a reply button whose id starts with `prefix` is
+  // POSTed to `url` (authenticated by `secret` in X-Bridge-Key) INSTEAD of starting an agent turn: an
+  // approval must be decided by the click, never by the model reading "Aprovar". Unset url = off, and
+  // every button reply goes to the agent as text, as before.
+  ryzeButtonBridge: {
+    url: (RYZE_BUTTON_BRIDGE_URL ?? "").trim(),
+    secret: (RYZE_BUTTON_BRIDGE_SECRET ?? "").trim(),
+    prefix: (RYZE_BUTTON_BRIDGE_PREFIX ?? "").trim(),
+  },
   hub: {
     // NOTE: trim before stripping trailing slashes so a padded or whitespace-only value resolves to
     // "" (disabled) instead of a malformed URL.

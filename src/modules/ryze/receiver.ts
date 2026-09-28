@@ -12,6 +12,7 @@ import { hashRouteToken } from "@/modules/webhooks/inbound/route-token";
 import { RYZE_SOURCE } from "./client";
 import { RYZE_DEVICE_SENDER_NAME, ryzeEmulatorBaseUrl } from "./constants";
 import { emitToBots } from "./emit";
+import { bridgeClaims, buttonReplyOf, forwardButtonReply } from "./interactive";
 import { presentMessageWebhook, type StoredAttachment } from "./present";
 import {
   conversationBody,
@@ -225,6 +226,8 @@ async function handleMessage(
   const text = textOf(msg);
   const media = inboundMedia(msg);
   const reaction = reactionOf(msg);
+  const buttonReply = outgoing || reaction ? null : buttonReplyOf(msg);
+  const bridged = !!buttonReply && bridgeClaims(buttonReply);
   const root = ryzeEmulatorBaseUrl(gw.chatwootInstanceId);
 
   const out = await scoped(
@@ -255,6 +258,9 @@ async function handleMessage(
       const contentAttributes: Record<string, unknown> = {
         ...(inReplyTo !== null ? { in_reply_to: inReplyTo } : {}),
         ...(reaction ? { is_reaction: true } : {}),
+        ...(buttonReply
+          ? { button_reply: { id: buttonReply.id, title: buttonReply.title } }
+          : {}),
         ...(outgoing
           ? {
               external_sender_name: RYZE_DEVICE_SENDER_NAME,
@@ -268,7 +274,11 @@ async function handleMessage(
           gatewayId: gw.id,
           conversationId: conv.displayId,
           messageType: outgoing ? 1 : 0,
-          content: reaction ? reaction.emoji : text,
+          // A tap reads as the button the contact saw, not as its id.
+          content: reaction
+            ? reaction.emoji
+            : (buttonReply?.title ??
+              (buttonReply ? `[botão] ${buttonReply.id}` : text)),
           contentAttributes: contentAttributes as object,
           ...(outgoing
             ? {}
@@ -313,6 +323,7 @@ async function handleMessage(
       const body = await conversationBody(db, gw, conv);
       return {
         kind: "stored" as const,
+        conv,
         row,
         body,
         reopened: opened.reopened,
@@ -322,6 +333,16 @@ async function handleMessage(
   );
 
   if (out.kind === "duplicate") return { status: 200, outcome: "duplicate" };
+  if (bridged && buttonReply) {
+    // The tap is the decision: the bridge answers it, and no agent turn starts.
+    await forwardButtonReply(
+      gw,
+      out.conv,
+      { externalId, reply: buttonReply },
+      { base },
+    );
+    return { status: 200, outcome: "accepted" };
+  }
   const payloads: unknown[] = [];
   if (out.reopened) {
     payloads.push({ ...out.body, event: "conversation_status_changed" });

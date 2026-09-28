@@ -10,6 +10,7 @@ import {
 } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
+import { sendRyzeCard } from "@/modules/ryze/interactive";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import {
   connectRyzeGateway,
@@ -172,6 +173,50 @@ export const ryzeAdminController = new Elysia({
           ),
         }),
       ),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .post(
+    "/gateways/:id/cards",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      card: await sendRyzeCard(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        body,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Send RyzeAPI button card",
+        "Send a card with 1 to 3 reply buttons into the contact's conversation on this number. The card is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A tap on a button whose id carries RYZE_BUTTON_BRIDGE_PREFIX is posted to RYZE_BUTTON_BRIDGE_URL instead of starting an agent turn.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+      }),
+      body: t.Object({
+        to: t.String({
+          description: "Recipient phone, digits only, with country code.",
+        }),
+        text: t.String({ minLength: 1, description: "Card body." }),
+        header: t.Optional(t.String({ description: "Bold header line." })),
+        footer: t.Optional(t.String({ description: "Small footer line." })),
+        buttons: t.Array(
+          t.Object({
+            id: t.String({
+              description:
+                "Button id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+            }),
+            title: t.String({
+              description: "Button label, up to 20 characters.",
+            }),
+          }),
+          { minItems: 1, maxItems: 3 },
+        ),
+      }),
       response: errors(400, 401, 403, 404, 422),
     },
   )

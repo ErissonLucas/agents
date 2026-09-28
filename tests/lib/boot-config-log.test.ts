@@ -7,6 +7,8 @@ const MASK = "********";
 // Every string the boot log prints in clear, by path. A new string field fails the fence below until
 // it is classified: either its name matches the secret pattern, or it is added here as readable.
 const READABLE_STRING_FIELDS = [
+  "ryzeButtonBridge.url",
+  "ryzeButtonBridge.prefix",
   "packageInfo.name",
   "packageInfo.version",
   "publicUrl",
