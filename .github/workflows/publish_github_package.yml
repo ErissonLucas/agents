@@ -101,8 +101,12 @@ jobs:
     env:
       GIT_REF: ${{ github.head_ref || github.ref_name }}
     steps:
-      - name: Lowercase image name
-        run: echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
+      - name: Lowercase image name and a tag-safe ref
+        env:
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${REF_NAME//\//-}" >> "$GITHUB_ENV"
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -148,7 +152,7 @@ jobs:
           tags: |
             ${{ env.GITHUB_REPO }}:latest
             ${{ env.GITHUB_REPO }}:${{ github.sha }}
-            ${{ env.GITHUB_REPO }}:${{ github.ref_name }}
+            ${{ env.GITHUB_REPO }}:${{ env.IMAGE_TAG }}
           cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
           cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
 
@@ -169,7 +173,7 @@ jobs:
           tags: |
             ${{ env.GITHUB_REPO }}:latest
             ${{ env.GITHUB_REPO }}:${{ github.sha }}
-            ${{ env.GITHUB_REPO }}:${{ github.ref_name }}
+            ${{ env.GITHUB_REPO }}:${{ env.IMAGE_TAG }}
 
       - name: Export digest
         run: |
@@ -194,8 +198,12 @@ jobs:
     # explicitly on build so the manifest is assembled whenever the build succeeded, R2 or not.
     if: always() && needs.build.result == 'success'
     steps:
-      - name: Lowercase image name
-        run: echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
+      - name: Lowercase image name and a tag-safe ref
+        env:
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${REF_NAME//\//-}" >> "$GITHUB_ENV"
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
@@ -221,7 +229,7 @@ jobs:
           docker buildx imagetools create \
             -t ${{ env.GITHUB_REPO }}:latest \
             -t ${{ env.GITHUB_REPO }}:${{ github.sha }} \
-            -t ${{ env.GITHUB_REPO }}:${GIT_REF} \
+            -t ${{ env.GITHUB_REPO }}:${IMAGE_TAG} \
             $(printf '${{ env.GITHUB_REPO }}@sha256:%s ' *)
 
       - name: Inspect image
@@ -231,4 +239,4 @@ jobs:
           REPO="${{ env.GITHUB_REPO }}"
           docker buildx imagetools inspect ${REPO}:latest
           docker buildx imagetools inspect ${REPO}:${{ github.sha }}
-          docker buildx imagetools inspect ${REPO}:${GIT_REF}
+          docker buildx imagetools inspect ${REPO}:${IMAGE_TAG}
