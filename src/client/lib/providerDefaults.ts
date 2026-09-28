@@ -9,6 +9,7 @@ export const STT_DEFAULT_MODEL: Record<string, string> = {
   gemini: "gemini-3.5-flash",
   elevenlabs: "scribe_v2",
   openrouter: "openai/whisper-1",
+  assemblyai: "universal-3-5-pro",
 };
 
 export const VISION_DEFAULT_MODEL: Record<string, string> = {
@@ -23,6 +24,7 @@ export const TTS_DEFAULT_MODEL: Record<string, string> = {
   openai: "gpt-4o-mini-tts",
   elevenlabs: "eleven_flash_v2_5",
   openrouter: "hexgrad/kokoro-82m",
+  gemini: "gemini-2.5-flash-preview-tts",
 };
 
 // ElevenLabs has no default voice (a voice id is mandatory) → empty string here, surfaced in the UI
@@ -31,10 +33,16 @@ export const TTS_DEFAULT_MODEL: Record<string, string> = {
 // pull the synthesis registry in (see modules/tts/settings-shared.ts). The mirror test asserts the
 // two lists are EQUAL, in both directions: an entry missing here hides a provider the runtime
 // supports, and an extra one is worse, because the form reader uses this as its allowlist.
-export const TTS_PROVIDERS = ["openai", "elevenlabs", "openrouter"] as const;
+export const TTS_PROVIDERS = [
+  "openai",
+  "elevenlabs",
+  "openrouter",
+  "gemini",
+] as const;
 
 export const TTS_DEFAULT_VOICE: Record<string, string> = {
   openai: "alloy",
   elevenlabs: "",
   openrouter: "af_alloy",
+  gemini: "Kore",
 };

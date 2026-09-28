@@ -6,9 +6,10 @@ const PROVIDER_LABELS: Record<string, string> = {
   openai: "OpenAI",
   anthropic: "Anthropic",
   google: "Google (Gemini)",
-  // STT/vision use the key `gemini` (not `google`) for the same vendor; STT/TTS add `elevenlabs`.
+  // STT/vision use the key `gemini` (not `google`) for the same vendor; STT/TTS add `elevenlabs`, STT adds `assemblyai`.
   gemini: "Google (Gemini)",
   elevenlabs: "ElevenLabs",
+  assemblyai: "AssemblyAI",
   deepseek: "DeepSeek",
   openrouter: "OpenRouter",
 };

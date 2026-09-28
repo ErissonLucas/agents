@@ -51,6 +51,9 @@ Both texts are capped at 1,500 characters at the write boundary (`tts.spokenNoti
 | ------------ | -------------------- | --------------------------------- | ------------ | ------------------ |
 | `openai`     | `tts-1`              | `…/v1/audio/speech`               | `Bearer`     | voice default `alloy` |
 | `elevenlabs` | `eleven_flash_v2_5`  | `…/v1/text-to-speech/{voice_id}`  | `xi-api-key` | voice **required**  |
+| `gemini`     | `gemini-2.5-flash-preview-tts` | `…/v1beta/models/{model}:generateContent` | `x-goog-api-key` | voice default `Kore`; PCM encoded to Ogg/Opus locally |
+
+**Gemini returns raw PCM only** (s16le, mono, 24 kHz, base64 in `candidates[0].content.parts[].inlineData`), so both containers it serves are built in-process: `wav` is `pcmToWav`, and `ogg_opus`, the WhatsApp voice note, is encoded by `pcmToOggOpus` (`src/modules/tts/ogg-opus.ts`): libopus compiled to WASM (the `opusscript` package, loaded on first use) at 32 kbps in 20 ms frames, framed as Ogg by our own writer (OpusHead with pre-skip 312, OpusTags, the final page's granule trimmed to the input length). No ffmpeg and no native addon enter the image; the runtime is the interpreted `bun src/index.ts` over `node_modules`, where the `.wasm` file is read from disk like any other dependency file. A RIFF body, should a model return one, is unwrapped first, and a `rate=` in the part's `mimeType` overrides the 24 kHz default. The voices are Gemini's fixed prebuilt catalog, listed curated by `/tts/list`.
 
 `prepareSpeechText` is a no-LLM cleanup (strip markdown/links/emoji, collapse whitespace).
 

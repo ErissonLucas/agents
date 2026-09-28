@@ -1441,14 +1441,15 @@ export const agentsController = new Elysia({
     {
       detail: doc(
         "List TTS voices/models",
-        "Lists the voices or models for a text-to-speech provider. OpenAI returns a curated set; ElevenLabs is fetched live with the vault credential.",
+        "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs is fetched live with the vault credential.",
       ),
       response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
       body: t.Object({
         provider: t.String({
           minLength: 1,
-          description: "TTS provider key (openai, elevenlabs).",
+          description:
+            "TTS provider key (openai, elevenlabs, openrouter, gemini).",
         }),
         kind: t.Union([t.Literal("voices"), t.Literal("models")], {
           description: "Which list to return: the provider's voices or models.",

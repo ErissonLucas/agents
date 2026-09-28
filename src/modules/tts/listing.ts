@@ -63,6 +63,46 @@ const OPENROUTER_MODELS = [
   "canopylabs/orpheus-3b-0.1-ft",
 ];
 
+// Gemini's prebuilt voices are one fixed catalog shared by every TTS model, and Google exposes no
+// listing endpoint for them, so the set is curated. The models are the ones generateContent serves.
+const GEMINI_VOICES = [
+  "Kore",
+  "Puck",
+  "Charon",
+  "Aoede",
+  "Fenrir",
+  "Leda",
+  "Orus",
+  "Zephyr",
+  "Callirrhoe",
+  "Autonoe",
+  "Enceladus",
+  "Iapetus",
+  "Umbriel",
+  "Algieba",
+  "Despina",
+  "Erinome",
+  "Algenib",
+  "Rasalgethi",
+  "Laomedeia",
+  "Achernar",
+  "Alnilam",
+  "Schedar",
+  "Gacrux",
+  "Pulcherrima",
+  "Achird",
+  "Zubenelgenubi",
+  "Vindemiatrix",
+  "Sadachbia",
+  "Sadaltager",
+  "Sulafat",
+];
+const GEMINI_MODELS = [
+  "gemini-2.5-flash-preview-tts",
+  "gemini-2.5-pro-preview-tts",
+  "gemini-3.1-flash-tts-preview",
+];
+
 async function resolveApiKey(
   base: PrismaClient,
   ctx: TenantContext,
@@ -120,6 +160,12 @@ export async function listTtsOptions(
     return (kind === "voices" ? OPENROUTER_VOICES : OPENROUTER_MODELS).map(
       (id) => ({ id }),
     );
+  }
+
+  if (provider === "gemini") {
+    return (kind === "voices" ? GEMINI_VOICES : GEMINI_MODELS).map((id) => ({
+      id,
+    }));
   }
 
   if (provider !== "elevenlabs") return [];

@@ -19,12 +19,14 @@ const STT_PROVIDER_TYPE: Record<string, string> = {
   gemini: "gemini",
   elevenlabs: "elevenlabs",
   openrouter: "openrouter",
+  assemblyai: "assemblyai",
 };
 
 const TTS_PROVIDER_TYPE: Record<string, string> = {
   openai: "openai",
   elevenlabs: "elevenlabs",
   openrouter: "openrouter",
+  gemini: "gemini",
 };
 
 const VISION_PROVIDER_TYPE: Record<string, string> = {

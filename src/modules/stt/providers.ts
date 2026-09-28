@@ -1,8 +1,9 @@
 // Speech-to-text provider abstraction. The OpenAI `/audio/transcriptions` multipart shape is a
 // de-facto standard (Groq and most self-hosted Whisper servers implement it), so `openai` and
 // `openai-compatible` share one adapter (baseURL switch). Gemini and ElevenLabs have their own
-// shapes, so each gets a thin adapter. Adding a provider = one function + one registry entry; a
-// future generic/declarative provider can slot in behind the same interface without touching callers.
+// shapes, so each gets a thin adapter; AssemblyAI is asynchronous (upload, submit, poll). Adding a
+// provider = one function + one registry entry; a future generic/declarative provider can slot in
+// behind the same interface without touching callers.
 
 const STT_TIMEOUT_MS = 60_000;
 
@@ -27,9 +28,13 @@ export class SttError extends Error {
   constructor(
     readonly provider: string,
     readonly status: number,
+    // NOTE: a fixed slug of ours (never provider text) for failures that are not an HTTP status.
+    readonly reason: string | null = null,
   ) {
     // NOTE: never capture the response body — it carries the (PII) transcription / provider detail.
-    super(`STT ${provider} failed with ${status}`);
+    super(
+      `STT ${provider} failed with ${status}${reason ? ` (${reason})` : ""}`,
+    );
     this.name = "SttError";
   }
 }
@@ -183,6 +188,73 @@ async function openrouterTranscribe(req: SttRequest): Promise<string> {
   return (json.text ?? "").trim();
 }
 
+// AssemblyAI: upload the raw bytes, submit a transcript job for the returned URL, then poll the job
+// until it settles. Every request of the three steps shares ONE deadline, the same budget the
+// single-call adapters get, so a slow queue costs a skipped transcription and never a longer turn.
+// A job that ends in `error` is reported by our own slug: its `error` field is provider prose.
+export function makeAssemblyaiTranscribe(opts: {
+  budgetMs: number;
+  pollDelaysMs: readonly number[];
+}): (req: SttRequest) => Promise<string> {
+  return async (req) => {
+    const base = (req.baseURL ?? "https://api.assemblyai.com/v2").replace(
+      /\/+$/,
+      "",
+    );
+    const deadline = Date.now() + opts.budgetMs;
+    const remaining = () => Math.max(1, deadline - Date.now());
+    const call = async (url: string, init: RequestInit) => {
+      const res = await req.fetchImpl(url, {
+        ...init,
+        headers: { authorization: req.apiKey, ...init.headers },
+        redirect: "error",
+        signal: AbortSignal.timeout(remaining()),
+      });
+      if (!res.ok) throw new SttError("assemblyai", res.status);
+      return (await res.json()) as Record<string, unknown>;
+    };
+
+    const uploaded = await call(`${base}/upload`, {
+      method: "POST",
+      headers: { "content-type": "application/octet-stream" },
+      body: req.audio,
+    });
+    const audioUrl = uploaded.upload_url;
+    if (typeof audioUrl !== "string")
+      throw new SttError("assemblyai", 502, "no_upload_url");
+
+    const body: Record<string, unknown> = {
+      audio_url: audioUrl,
+      speech_models: [req.model],
+    };
+    // NOTE: AssemblyAI names languages by the base code ("pt"), with its own `_` regional ids.
+    if (req.language)
+      body.language_code = req.language.split("-")[0]?.toLowerCase();
+    const job = await call(`${base}/transcript`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (typeof job.id !== "string")
+      throw new SttError("assemblyai", 502, "no_transcript_id");
+
+    const pollUrl = `${base}/transcript/${encodeURIComponent(job.id)}`;
+    for (let attempt = 0; ; attempt++) {
+      const delay =
+        opts.pollDelaysMs[Math.min(attempt, opts.pollDelaysMs.length - 1)] ??
+        1_000;
+      if (Date.now() + delay >= deadline)
+        throw new SttError("assemblyai", 504, "poll_timeout");
+      await Bun.sleep(delay);
+      const state = await call(pollUrl, { method: "GET" });
+      if (state.status === "completed")
+        return (typeof state.text === "string" ? state.text : "").trim();
+      if (state.status === "error")
+        throw new SttError("assemblyai", 502, "transcript_error");
+    }
+  };
+}
+
 const PROVIDERS: Record<string, SttProvider> = {
   openai: { defaultModel: "gpt-4o-transcribe", transcribe: openaiTranscribe },
   "openai-compatible": {
@@ -196,6 +268,13 @@ const PROVIDERS: Record<string, SttProvider> = {
   openrouter: {
     defaultModel: "openai/whisper-1",
     transcribe: openrouterTranscribe,
+  },
+  assemblyai: {
+    defaultModel: "universal-3-5-pro",
+    transcribe: makeAssemblyaiTranscribe({
+      budgetMs: STT_TIMEOUT_MS,
+      pollDelaysMs: [500, 1_000, 1_500, 2_000, 3_000],
+    }),
   },
 };
 

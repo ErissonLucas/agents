@@ -13629,7 +13629,7 @@
           "Agents"
         ],
         "summary": "List TTS voices/models",
-        "description": "Lists the voices or models for a text-to-speech provider. OpenAI returns a curated set; ElevenLabs is fetched live with the vault credential.",
+        "description": "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs is fetched live with the vault credential.",
         "requestBody": {
           "required": true,
           "content": {
@@ -13643,7 +13643,7 @@
                 "properties": {
                   "provider": {
                     "minLength": 1,
-                    "description": "TTS provider key (openai, elevenlabs).",
+                    "description": "TTS provider key (openai, elevenlabs, openrouter, gemini).",
                     "type": "string"
                   },
                   "kind": {
@@ -13674,7 +13674,7 @@
                 "properties": {
                   "provider": {
                     "minLength": 1,
-                    "description": "TTS provider key (openai, elevenlabs).",
+                    "description": "TTS provider key (openai, elevenlabs, openrouter, gemini).",
                     "type": "string"
                   },
                   "kind": {
@@ -13705,7 +13705,7 @@
                 "properties": {
                   "provider": {
                     "minLength": 1,
-                    "description": "TTS provider key (openai, elevenlabs).",
+                    "description": "TTS provider key (openai, elevenlabs, openrouter, gemini).",
                     "type": "string"
                   },
                   "kind": {

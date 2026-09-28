@@ -42,6 +42,9 @@ The OpenAI `/audio/transcriptions` multipart shape is a de-facto standard, so `o
 | `openai-compatible` | (set yours)         | `{baseURL}/audio/transcriptions`           | `Bearer`         |
 | `gemini`            | `gemini-2.0-flash`  | `…/models/{model}:generateContent`         | `x-goog-api-key` |
 | `elevenlabs`        | `scribe_v1`         | `…/v1/speech-to-text`                       | `xi-api-key`     |
+| `assemblyai`        | `universal-3-5-pro` | `…/v2/upload` → `…/v2/transcript` → poll    | `authorization` (bare key) |
+
+AssemblyAI is the one asynchronous provider: the bytes are uploaded, a transcript job is submitted for the returned URL (`speech_models: [model]`, `language_code` = the base code of `language`, so `pt-BR` goes as `pt`), and the job is polled with a short backoff (0.5s, 1s, 1.5s, 2s, then every 3s) until `completed` or `error`. The three steps share one 60s deadline, the same budget a single-call provider gets; a job still queued at the deadline fails as `SttError(504, "poll_timeout")` and a job that ends in `error` as `SttError(502, "transcript_error")`, never with the provider's error text. The credential is the `assemblyai` vault kind. `universal-2` is the other model id the picker offers; both read Portuguese.
 
 ## Inbound rendering (`src/modules/chatwoot/render.ts`)
 

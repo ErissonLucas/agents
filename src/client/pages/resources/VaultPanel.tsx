@@ -46,6 +46,7 @@ type VaultEntry = NonNullable<
 // t('vault.secretType.openrouter', 'OpenRouter')
 // t('vault.secretType.openai_compatible', 'OpenAI-compatible')
 // t('vault.secretType.elevenlabs', 'ElevenLabs')
+// t('vault.secretType.assemblyai', 'AssemblyAI')
 // t('vault.secretType.asaas', 'Asaas')
 // t('vault.secretType.resend', 'Resend')
 // t('vault.secretType.google_oauth', 'Google OAuth2')

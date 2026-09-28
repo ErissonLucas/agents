@@ -30,6 +30,7 @@ const TABLE: [string, boolean, boolean][] = [
   ["openrouter", true, true],
   ["openai_compatible", true, true],
   ["elevenlabs", true, true],
+  ["assemblyai", true, true],
   ["asaas", true, true],
   ["resend", true, true],
   ["chatwoot_api_token", true, true],

@@ -133,6 +133,7 @@ const STT_PROVIDERS = [
   "gemini",
   "elevenlabs",
   "openrouter",
+  "assemblyai",
 ] as const;
 
 // Audio-reply providers (mirror src/modules/tts/providers). The three reply modes are rendered

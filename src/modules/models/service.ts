@@ -33,7 +33,7 @@ function isOpenAiChatModel(id: string): boolean {
 export type ModelCapability = "chat" | "transcription" | "vision";
 
 // Providers selectable per capability — mirrors the editor's chat/STT/vision provider lists. STT and
-// vision use `gemini` (→ Google's listing endpoint); STT also offers `elevenlabs`.
+// vision use `gemini` (→ Google's listing endpoint); STT also offers `elevenlabs` and `assemblyai`.
 const PROVIDERS_BY_CAPABILITY: Record<ModelCapability, readonly string[]> = {
   chat: MODEL_PROVIDERS,
   transcription: [
@@ -42,6 +42,7 @@ const PROVIDERS_BY_CAPABILITY: Record<ModelCapability, readonly string[]> = {
     "gemini",
     "elevenlabs",
     "openrouter",
+    "assemblyai",
   ],
   vision: ["openai", "gemini", "anthropic", "openrouter"],
 };
@@ -53,6 +54,12 @@ const ELEVENLABS_STT_MODELS: ProviderModel[] = [
   { id: "scribe_v2", label: "Scribe v2" },
   { id: "scribe_v1", label: "Scribe v1" },
   { id: "scribe_v1_experimental", label: "Scribe v1 (experimental)" },
+];
+
+// AssemblyAI has no model listing endpoint either; these are the `speech_models` ids its API takes.
+const ASSEMBLYAI_STT_MODELS: ProviderModel[] = [
+  { id: "universal-3-5-pro", label: "Universal-3.5 Pro" },
+  { id: "universal-2", label: "Universal-2" },
 ];
 
 // OpenAI lists every model on one endpoint, so filter by what the capability needs: transcription
@@ -130,6 +137,7 @@ export async function listProviderModels(
 
   // ElevenLabs has no usable list endpoint → curated set, no credential needed.
   if (provider === "elevenlabs") return ELEVENLABS_STT_MODELS;
+  if (provider === "assemblyai") return ASSEMBLYAI_STT_MODELS;
 
   if (!credentialRef) {
     throw new AppError(

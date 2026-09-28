@@ -8,8 +8,10 @@
 // silently never receives it). openai emits aac natively; elevenlabs has no aac/wav output, so its
 // Instagram replies are raw PCM wrapped in a 44-byte RIFF header locally (pcmToWav — a header write,
 // not a transcode); openrouter only emits mp3 and therefore cannot serve Instagram at all (the
-// service falls back to a text reply there).
+// service falls back to a text reply there). gemini emits only raw PCM, which is wrapped into a
+// RIFF header for "wav" and encoded to Ogg/Opus in-process for "ogg_opus" (ogg-opus.ts, WASM).
 
+import { pcmToOggOpus } from "./ogg-opus";
 import type { TtsVoiceSettings } from "./settings-shared";
 import { pcmToWav } from "./wav";
 
@@ -72,7 +74,7 @@ export class TtsError extends Error {
 // NOTE: a provider error body is not a safe thing to keep (free-text messages carry account/billing
 // detail and echoed credentials), but the machine-readable STATUS inside it is: `voice_not_found`,
 // `invalid_api_key`, `quota_exceeded` each end a debugging session in one line. Known shapes:
-// ElevenLabs `{detail: {status}}`, OpenAI/OpenRouter `{error: {code|type}}`.
+// ElevenLabs `{detail: {status}}`, OpenAI/OpenRouter `{error: {code|type}}`, Google `{error: {status}}`.
 const MAX_ERROR_BODY = 8_192;
 // NOTE: the guard that keeps prose out by construction — a code is a slug, a message has spaces and
 // punctuation. A body whose "code" field holds a sentence is dropped rather than logged.
@@ -129,6 +131,7 @@ export async function readProviderErrorCode(
       pickErrorCode(nested(detail, "status")) ??
       pickErrorCode(nested(error, "code")) ??
       pickErrorCode(nested(error, "type")) ??
+      pickErrorCode(nested(error, "status")) ??
       pickErrorCode(status) ??
       pickErrorCode(code) ??
       null
@@ -312,6 +315,93 @@ async function openrouterSynthesize(req: TtsRequest): Promise<TtsResult> {
   return { audio: await res.arrayBuffer(), ...RESULT_BY_FORMAT.mp3 };
 }
 
+// NOTE: Gemini speech: generateContent with the AUDIO response modality. The output is base64 audio in
+// one inline part, documented as raw PCM (s16le, mono, 24 kHz, rate also named in its mimeType), so
+// every container is built here: a RIFF header for "wav", an in-process Opus encode for "ogg_opus".
+// `providerFormat` names the PCM the wire carries, since the container never reaches Google.
+const GEMINI_PCM_RATE = 24_000;
+const GEMINI_FORMATS = ["ogg_opus", "wav"] as const;
+
+/** Raw PCM + its sample rate out of a Gemini inline part, unwrapping a RIFF/WAVE body if one came back. */
+export function geminiPcm(
+  bytes: Uint8Array,
+  mimeType: string | undefined,
+): { pcm: ArrayBuffer; sampleRate: number } {
+  // NOTE: a copy through the Uint8Array constructor, since Buffer#slice is a view onto a shared pool.
+  const copy = (from: number, to: number) =>
+    new Uint8Array(bytes.subarray(from, to)).buffer as ArrayBuffer;
+  const ascii = (off: number) =>
+    String.fromCharCode(...bytes.subarray(off, off + 4));
+  if (bytes.byteLength >= 44 && ascii(0) === "RIFF" && ascii(8) === "WAVE") {
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let sampleRate = GEMINI_PCM_RATE;
+    for (let off = 12; off + 8 <= bytes.byteLength; ) {
+      const size = view.getUint32(off + 4, true);
+      if (ascii(off) === "fmt ") sampleRate = view.getUint32(off + 12, true);
+      if (ascii(off) === "data")
+        return { pcm: copy(off + 8, off + 8 + size), sampleRate };
+      off += 8 + size + (size % 2);
+    }
+    throw new TtsError("gemini", 200, "no_audio");
+  }
+  const rate = /rate=(\d+)/i.exec(mimeType ?? "")?.[1];
+  return {
+    pcm: copy(0, bytes.byteLength),
+    sampleRate: rate ? Number(rate) : GEMINI_PCM_RATE,
+  };
+}
+
+async function geminiSynthesize(req: TtsRequest): Promise<TtsResult> {
+  const base = (
+    req.baseURL ?? "https://generativelanguage.googleapis.com/v1beta"
+  ).replace(/\/+$/, "");
+  const res = await req.fetchImpl(
+    `${base}/models/${encodeURIComponent(req.model)}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "x-goog-api-key": req.apiKey,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: req.text }] }],
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: { prebuiltVoiceConfig: { voiceName: req.voice } },
+          },
+        },
+      }),
+      redirect: "error",
+      signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+    },
+  );
+  if (!res.ok)
+    throw new TtsError("gemini", res.status, await readProviderErrorCode(res));
+  const json = (await res.json()) as {
+    candidates?: Array<{
+      content?: {
+        parts?: Array<{ inlineData?: { data?: string; mimeType?: string } }>;
+      };
+    }>;
+  };
+  const inline = json.candidates?.[0]?.content?.parts?.find(
+    (p) => typeof p.inlineData?.data === "string",
+  )?.inlineData;
+  if (!inline?.data) throw new TtsError("gemini", res.status, "no_audio");
+  const { pcm, sampleRate } = geminiPcm(
+    Buffer.from(inline.data, "base64"),
+    inline.mimeType,
+  );
+  if (req.format === "wav") {
+    return { audio: pcmToWav(pcm, sampleRate), ...RESULT_BY_FORMAT.wav };
+  }
+  return {
+    audio: await pcmToOggOpus(pcm, sampleRate),
+    ...RESULT_BY_FORMAT.ogg_opus,
+  };
+}
+
 const PROVIDERS: Record<string, TtsProvider> = {
   openai: {
     defaultModel: "gpt-4o-mini-tts",
@@ -341,6 +431,13 @@ const PROVIDERS: Record<string, TtsProvider> = {
     formats: ["mp3"],
     providerFormat: () => "mp3",
     synthesize: openrouterSynthesize,
+  },
+  gemini: {
+    defaultModel: "gemini-2.5-flash-preview-tts",
+    defaultVoice: "Kore",
+    formats: GEMINI_FORMATS,
+    providerFormat: () => "pcm_s16le_24000",
+    synthesize: geminiSynthesize,
   },
 };
 

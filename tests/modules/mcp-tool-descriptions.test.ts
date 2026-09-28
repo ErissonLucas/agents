@@ -299,7 +299,10 @@ const SETTINGS_DESC_CEILING = 2_000;
 // RAISED by `crossInboxCase.subjectTemplate`, the operator's email subject for a case: one string,
 // 124 characters. Trimmed first, by 97: the description names only what `{{resumo}}` is. Re-measured
 // on the tree that ships: 28,691.
-const SETTINGS_SCHEMA_CEILING = 28_706;
+//
+// RAISED by the `assemblyai` STT and `gemini` TTS providers, two enum members the registries publish:
+// 22 characters, nothing to trim. Re-measured on the tree that ships: 28,713.
+const SETTINGS_SCHEMA_CEILING = 28_728;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -751,6 +754,8 @@ describe("MCP tool descriptions", () => {
   // DESCRIPTIONS RAISED by the four RyzeAPI tools (ryze_list/connect/refresh/remove), trimmed to
   // what a caller cannot read off the schema: this tree measures 31,879, so 31,895 with the same 16.
   // Their input schemas cost 708 characters: this tree measures 64,989, so 65,005 with the same 16.
+  // SCHEMA RAISED by the `assemblyai` STT and `gemini` TTS enum members, the same 22 characters as
+  // the settings ceiling above: this tree measures 65,011, so 65,027 with the same 16.
   test("the whole tools/list payload stays under its ceiling", async () => {
     const all = await listed();
     let desc = 0;
@@ -760,7 +765,7 @@ describe("MCP tool descriptions", () => {
       schema += t.schema.length;
     }
     expect(desc).toBeLessThanOrEqual(31_895);
-    expect(schema).toBeLessThanOrEqual(65_005);
+    expect(schema).toBeLessThanOrEqual(65_027);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

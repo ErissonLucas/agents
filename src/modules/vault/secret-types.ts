@@ -158,6 +158,17 @@ export const SECRET_TYPES: SecretType[] = [
     },
   },
   {
+    id: "assemblyai",
+    injection: "header",
+    // NOTE: AssemblyAI takes the bare key in `authorization`, with no `Bearer` prefix.
+    name: "authorization",
+    service: "assemblyai",
+    test: {
+      bases: ["https://api.assemblyai.com"],
+      path: "/v2/transcript?limit=1",
+    },
+  },
+  {
     id: "asaas",
     injection: "header",
     name: "access_token",

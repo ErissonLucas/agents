@@ -3200,6 +3200,7 @@
     "secretType": {
       "anthropic": "Anthropic",
       "asaas": "Asaas",
+      "assemblyai": "AssemblyAI",
       "basic_auth": "Autenticação básica",
       "bearer_token": "Token Bearer",
       "chatwoot_api_token": "Token de API do Chatwoot",
