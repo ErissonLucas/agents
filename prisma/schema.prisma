@@ -168,6 +168,12 @@ model Tenant {
   mcpOAuthRefreshTokens         McpOAuthRefreshToken[]
   mcpOAuthPendingAuthorizations McpOAuthPendingAuthorization[]
   appointments                  Appointment[]
+  ryzeGateways                  RyzeGateway[]
+  ryzeBots                      RyzeBot[]
+  ryzeContacts                  RyzeContact[]
+  ryzeConversations             RyzeConversation[]
+  ryzeMessages                  RyzeMessage[]
+  ryzeMedia                     RyzeMedia[]
 
   @@map("tenants")
 }
@@ -312,11 +318,15 @@ model ChatwootInstance {
   // Soft-disconnect: "remove account" keeps the rows (conversations/inboxes/contacts) for history +
   // analytics but unbinds agents and makes the webhook/runtime ignore the account. Null = active.
   disconnectedAt DateTime? @map("disconnected_at")
+  // WHO answers this account's API. CHATWOOT is a real Chatwoot; RYZE is the in-process emulator in
+  // src/modules/ryze, which serves the same API over our own tables and delivers through RyzeAPI.
+  kind           ChannelKind @default(CHATWOOT)
   createdAt      DateTime  @default(now()) @map("created_at")
   updatedAt      DateTime  @updatedAt @map("updated_at")
 
   tenant              Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deployment          ChatwootDeployment        @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
+  ryzeGateway         RyzeGateway?
   inboxes             Inbox[]
   contacts            Contact[]
   conversations       Conversation[]
@@ -2470,4 +2480,172 @@ model McpOAuthClientApproval {
 
   @@unique([userId, clientId])
   @@map("mcp_oauth_client_approvals")
+}
+
+enum ChannelKind {
+  CHATWOOT
+  RYZE
+}
+
+// A WhatsApp number served through RyzeAPI instead of Chatwoot. One gateway backs exactly one
+// ChatwootInstance of kind RYZE, whose Chatwoot API is emulated in-process (src/modules/ryze), so the
+// rest of the runtime keeps talking to a ChatwootClient. The emulated ids (inbox, bot, contact,
+// conversation, message, attachment) come from `ryze_emulated_id_seq`, which starts far above any
+// real Chatwoot id so an emulated account and a real one in the same tenant never collide.
+model RyzeGateway {
+  id                    BigInt    @id @default(autoincrement())
+  tenantId              BigInt    @map("tenant_id")
+  chatwootInstanceId    BigInt    @unique @map("chatwoot_instance_id")
+  baseUrl               String    @map("base_url")
+  instanceName          String    @map("instance_name")
+  token                 String // encrypted instance token
+  webhookAuth           String    @map("webhook_auth") // encrypted value of the Authorization header Ryze sends
+  webhookRouteTokenHash String    @unique @map("webhook_route_token_hash")
+  inboxId               Int       @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("inbox_id")
+  inboxName             String    @map("inbox_name")
+  agentBotId            Int?      @map("agent_bot_id")
+  observerBotIds        Int[]     @default([]) @map("observer_bot_ids")
+  connectionState       String?   @map("connection_state")
+  numberJid             String?   @map("number_jid")
+  lastEventAt           DateTime? @map("last_event_at")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance      ChatwootInstance   @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  bots          RyzeBot[]
+  contacts      RyzeContact[]
+  conversations RyzeConversation[]
+  messages      RyzeMessage[]
+  media         RyzeMedia[]
+
+  @@index([tenantId])
+  @@map("ryze_gateways")
+}
+
+// An emulated Chatwoot Agent Bot: where the emulator delivers the bot's webhooks and the secret it
+// signs them with, exactly as Chatwoot would.
+model RyzeBot {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  gatewayId   BigInt   @map("gateway_id")
+  botId       Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("bot_id")
+  name        String
+  outgoingUrl String?  @map("outgoing_url")
+  accessToken String   @map("access_token") // encrypted
+  secret      String // encrypted
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([gatewayId])
+  @@map("ryze_bots")
+}
+
+model RyzeContact {
+  id               BigInt   @id @default(autoincrement())
+  tenantId         BigInt   @map("tenant_id")
+  gatewayId        BigInt   @map("gateway_id")
+  contactId        Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("contact_id")
+  jid              String
+  name             String?
+  phone            String?
+  email            String?
+  identifier       String?
+  customAttributes Json     @default("{}") @map("custom_attributes")
+  labels           String[] @default([])
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@unique([gatewayId, jid])
+  @@index([tenantId])
+  @@map("ryze_contacts")
+}
+
+// One conversation per WhatsApp chat, reopened (back to pending) when the contact writes after it
+// was resolved, which is how a Chatwoot API inbox with a bot behaves.
+model RyzeConversation {
+  id               BigInt   @id @default(autoincrement())
+  tenantId         BigInt   @map("tenant_id")
+  gatewayId        BigInt   @map("gateway_id")
+  displayId        Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("display_id")
+  contactInboxId   Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("contact_inbox_id")
+  contactId        Int      @map("contact_id")
+  chatJid          String   @map("chat_jid")
+  status           String   @default("pending")
+  assigneeType     String?  @map("assignee_type")
+  assigneeId       Int?     @map("assignee_id")
+  assigneeName     String?  @map("assignee_name")
+  teamId           Int?     @map("team_id")
+  labels           String[] @default([])
+  customAttributes Json     @default("{}") @map("custom_attributes")
+  lastActivityAt   DateTime @default(now()) @map("last_activity_at")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@unique([gatewayId, chatJid])
+  @@index([tenantId])
+  @@map("ryze_conversations")
+}
+
+// Chatwoot's message row, which the runtime re-reads (it never stores bodies itself). messageType is
+// Chatwoot's integer: 0 incoming, 1 outgoing, 2 activity, 3 template.
+model RyzeMessage {
+  id                BigInt   @id @default(autoincrement())
+  tenantId          BigInt   @map("tenant_id")
+  gatewayId         BigInt   @map("gateway_id")
+  conversationId    Int      @map("conversation_id")
+  messageId         Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("message_id")
+  messageType       Int      @map("message_type")
+  private           Boolean  @default(false)
+  content           String?
+  contentAttributes Json     @default("{}") @map("content_attributes")
+  senderType        String?  @map("sender_type")
+  senderId          Int?     @map("sender_id")
+  senderName        String?  @map("sender_name")
+  attachments       Json     @default("[]")
+  externalId        String?  @map("external_id")
+  status            String   @default("sent")
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@unique([gatewayId, externalId])
+  @@index([gatewayId, conversationId, messageId])
+  @@index([tenantId])
+  @@map("ryze_messages")
+}
+
+// The bytes behind an emulated attachment's data_url. Inbound media arrives base64 in the webhook;
+// when it does not, `externalMessageId` lets the emulator fetch it from RyzeAPI on first read.
+model RyzeMedia {
+  id                BigInt   @id @default(autoincrement())
+  tenantId          BigInt   @map("tenant_id")
+  gatewayId         BigInt   @map("gateway_id")
+  attachmentId      Int      @unique @default(dbgenerated("nextval('ryze_emulated_id_seq')")) @map("attachment_id")
+  messageId         Int      @map("message_id")
+  fileType          String   @map("file_type")
+  mime              String?
+  fileName          String?  @map("file_name")
+  bytes             Bytes?
+  externalMessageId String?  @map("external_message_id")
+  createdAt         DateTime @default(now()) @map("created_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@index([gatewayId, messageId])
+  @@index([tenantId])
+  @@map("ryze_media")
 }
