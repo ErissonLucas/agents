@@ -101,6 +101,8 @@ jobs:
     env:
       GIT_REF: ${{ github.head_ref || github.ref_name }}
     steps:
+      - name: Lowercase image name
+        run: echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
       - name: Checkout
         uses: actions/checkout@v7
 
@@ -192,6 +194,8 @@ jobs:
     # explicitly on build so the manifest is assembled whenever the build succeeded, R2 or not.
     if: always() && needs.build.result == 'success'
     steps:
+      - name: Lowercase image name
+        run: echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
