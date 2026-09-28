@@ -31,7 +31,7 @@ The inbox reports `provider: "ryze"`, which is in `ECHO_RESERVING_WHATSAPP_PROVI
 
 ## Outbound
 
-Public outgoing messages go out through `/api/message/text` or `/api/message/media` with `source: "fazer-ai-agents"`; typing through `/api/chat/presence`; read receipts through `/api/chat/markRead`; reactions through `/api/message/reaction`. A send RyzeAPI refuses deletes the row and answers 422 (a 4xx from Ryze) or 503, so the delivery path's read-back finds nothing and treats it as not landed. Private notes, labels, attributes, status and assignment live only in our tables and are announced to the bot like Chatwoot announces them. There are no agents or teams to assign to; a handoff opens the conversation and the person answers from the phone.
+Public outgoing messages go out through `/api/message/text` or `/api/message/media` with `source: "fazer-ai-agents"`; typing through `/api/chat/presence` (`state: "typing"`, or `"recording"` when the `toggle_typing_status` body carries `presence: "recording"`, and `"pause"` for off; `ryzePresenceOf` in the emulator); read receipts through `/api/chat/markRead`; reactions through `/api/message/reaction`. A send RyzeAPI refuses deletes the row and answers 422 (a 4xx from Ryze) or 503, so the delivery path's read-back finds nothing and treats it as not landed. Private notes, labels, attributes, status and assignment live only in our tables and are announced to the bot like Chatwoot announces them. There are no agents or teams to assign to; a handoff opens the conversation and the person answers from the phone.
 
 ## Not supported on RyzeAPI
 
@@ -43,3 +43,5 @@ Kanban, cross-inbox cases, contact merge, website-chat redirect, WhatsApp templa
 - Connect: `POST /v1/ryze/gateways` or the MCP tool `ryze_connect` (then `inbox_bind` the new inbox to an agent). Validates the token, registers our webhook on the instance (`events: message.exchange, instance.state`, `mediaBase64: true`), creates the inbox mirror.
 - List / refresh / remove: `ryze_list`, `ryze_refresh`, `ryze_remove` (and the REST routes beside them).
 - A tenant with no Chatwoot gets a placeholder deployment row (base URL `https://203.0.113.250/ryze-emulator`); disconnecting Chatwoot is refused while RyzeAPI numbers exist, because its cascade would take them.
+
+An incoming attachment's kind (`file_type`, which decides whether STT runs) comes from its MIME, read from `media.mimetype`, `mimeType` or `mime`: `audio/*`, `image/*`, `video/*`, anything else a file. `media.type` decides only when the MIME is missing or `application/octet-stream`, because the live gateway sends values outside `image | sticker | audio | ptt | video | ptv | document` (a voice note with `audio/mpeg` was stored as a file and never transcribed). `inboundMedia` in `receiver.ts`.

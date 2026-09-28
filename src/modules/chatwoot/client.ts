@@ -1086,13 +1086,20 @@ export class ChatwootClient {
   // Typing indicator for the split/humanized delivery. `toggle_typing_status` IS in the fork's
   // BOT_ACCESSIBLE_ENDPOINTS (confirmed against access_token_auth_helper.rb), so we use the bot
   // token — the indicator is then attributed to our bot, not to the admin agent. Best-effort (the
-  // caller ignores failures). typing_status: "on" | "off".
-  toggleTyping(conversationId: number, on: boolean): Promise<unknown> {
+  // caller ignores failures). typing_status: "on" | "off". Chatwoot has no recording state, so
+  // "recording" goes out as "on" plus a `presence` hint that Chatwoot ignores and the RyzeAPI
+  // emulator turns into WhatsApp's "recording audio…".
+  toggleTyping(
+    conversationId: number,
+    on: boolean | "recording",
+  ): Promise<unknown> {
     return this.request(
       this.config.botToken,
       "POST",
       `/conversations/${conversationId}/toggle_typing_status`,
-      { typing_status: on ? "on" : "off" },
+      on === "recording"
+        ? { typing_status: "on", presence: "recording" }
+        : { typing_status: on ? "on" : "off" },
     );
   }
 

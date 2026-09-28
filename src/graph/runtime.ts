@@ -74,6 +74,7 @@ import {
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import { armCompaction } from "@/modules/memory/compact";
 import { signatureFor } from "@/modules/signature/service";
+import { holdPresence, type PresenceHold } from "@/modules/split/presence";
 import { deliverReply, type ReplyDelivery } from "@/modules/split/service";
 import type { TtsCheckConfig } from "@/modules/tts/check";
 import { plannedReplyIsAudio, spokenNoticeFor } from "@/modules/tts/modality";
@@ -919,8 +920,26 @@ function channelCanReadReceipt(channelType: string | null): boolean {
   return channelType === null || channelType === "Channel::Whatsapp";
 }
 
+// The presence the turn shows the contact, started inside the body once the turn is known to be
+// live and ended here on every way out, a throw included.
 async function runTurnBody(
   params: RunTurnBodyParams,
+): Promise<RunAgentTurnOutcome> {
+  const presence: PresenceSlot = { hold: null };
+  try {
+    return await turnBody(params, presence);
+  } finally {
+    void presence.hold?.end();
+  }
+}
+
+interface PresenceSlot {
+  hold: PresenceHold | null;
+}
+
+async function turnBody(
+  params: RunTurnBodyParams,
+  presence: PresenceSlot,
 ): Promise<RunAgentTurnOutcome> {
   // The turn's wall time starts here, before the config is read (issue #855).
   const turnStartedAt = performance.now();
@@ -1118,12 +1137,17 @@ async function runTurnBody(
   //
   // Nothing is lost to (3): a job is retired because a NEWER burst took over, and that flush
   // acknowledges a superset of these ids.
-  if (
+  //
+  // The typing indicator for the think time asks the same (1), (3) and (4), on every channel, and
+  // never on a muted client: it is what the contact watches until the reply lands.
+  const liveTurn =
     params.conversationId > 0 &&
-    channelCanReadReceipt(loaded.channelType) &&
     !(await writeCalledOff()) &&
-    (await botOwnsItNow())
-  ) {
+    (await botOwnsItNow());
+  if (liveTurn && !client.muted) {
+    presence.hold = holdPresence(client, params.conversationId, "typing");
+  }
+  if (liveTurn && channelCanReadReceipt(loaded.channelType)) {
     // try/catch and NOT `.catch()`: the latter only covers a rejected promise, and the failure this
     // has to survive can happen while INVOKING — a client that predates the method (a test double,
     // an older build) throws TypeError synchronously and walks straight past a `.catch()`. Measured:
@@ -1564,6 +1588,7 @@ async function runTurnBody(
     const spoken = planAudioReply(text, loaded.ttsConfig);
     if (wantAudio) logTextInsteadOfAudio(flow, spoken);
     if (wantAudio && !spoken.textOnly) {
+      presence.hold?.set("recording");
       try {
         // Opt-in LLM speech normalization (or the injected normalizer in tests). Its callbacks are
         // built fresh rather than reusing this turn's array: same usage/trace identity, different
@@ -1603,6 +1628,7 @@ async function runTurnBody(
         if (await writeCalledOff()) return "stale";
         if (tts) {
           if (!(await claimBeforeSend())) return "superseded";
+          presence.hold?.quiet();
           const sent = await client.sendAudioMessage(
             conversationId,
             tts.audio,
@@ -1686,6 +1712,9 @@ async function runTurnBody(
     // above has failed and fallen through — the longest wait of the two.
     if (await writeCalledOff()) return "stale";
     if (!(await claimBeforeSend())) return "superseded";
+    // NOTE: from here the split delivery drives the indicator itself, balloon by balloon.
+    presence.hold?.set("typing");
+    presence.hold?.quiet();
     const balloons = await deliverReply(
       client,
       conversationId,

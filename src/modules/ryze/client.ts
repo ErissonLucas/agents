@@ -37,6 +37,8 @@ export interface RyzeClientDeps {
 
 export type RyzeMediaType = "image" | "video" | "document" | "audio";
 
+export type RyzePresence = "typing" | "recording" | "pause";
+
 export interface RyzeSentMessage {
   messageId: string | null;
   timestamp: string | null;
@@ -199,11 +201,11 @@ export class RyzeClient {
     return RyzeClient.sent(res);
   }
 
-  async setPresence(jid: string, typing: boolean): Promise<void> {
+  async setPresence(jid: string, state: RyzePresence): Promise<void> {
     await this.call("POST", this.path("/api/chat/presence"), {
       number: ryzeRecipient(jid),
-      state: typing ? "typing" : "pause",
-      ...(typing ? { duration: 20 } : {}),
+      state,
+      ...(state === "pause" ? {} : { duration: 20 }),
     });
   }
 

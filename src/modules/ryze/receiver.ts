@@ -68,29 +68,51 @@ async function resolveGateway(
   );
 }
 
-interface InboundMedia {
+export interface InboundMedia {
   fileType: string;
   mime: string | null;
   fileName: string | null;
   bytes: Uint8Array<ArrayBuffer> | null;
 }
 
-function inboundMedia(msg: Record<string, unknown>): InboundMedia | null {
+const FILE_TYPE_BY_MEDIA_TYPE: Readonly<Record<string, string>> = {
+  image: "image",
+  sticker: "image",
+  audio: "audio",
+  ptt: "audio",
+  voice: "audio",
+  video: "video",
+  ptv: "video",
+  document: "file",
+  file: "file",
+};
+
+function fileTypeOfMime(mime: string | null): string | null {
+  const m = mime?.toLowerCase() ?? "";
+  // NOTE: no MIME, or the generic octet-stream, says nothing about the kind.
+  if (m === "" || m.startsWith("application/octet-stream")) return null;
+  if (m.startsWith("audio/")) return "audio";
+  if (m.startsWith("image/")) return "image";
+  if (m.startsWith("video/")) return "video";
+  return "file";
+}
+
+// The kind a stored attachment is read as (and so whether STT runs on it). The MIME decides when it
+// names one, because the live gateway's `media.type` is not always a value of the set above; the type
+// decides when the MIME is missing or generic, with a `…Message` suffix read as the bare kind.
+export function inboundMedia(
+  msg: Record<string, unknown>,
+): InboundMedia | null {
   const media = isRecord(msg.media) ? msg.media : null;
   if (!media) return null;
-  const type = str(media.type) ?? "document";
+  const mime = str(media.mimetype) ?? str(media.mimeType) ?? str(media.mime);
+  const type = (str(media.type) ?? "").toLowerCase().replace(/message$/, "");
   const fileType =
-    type === "image" || type === "sticker"
-      ? "image"
-      : type === "audio" || type === "ptt"
-        ? "audio"
-        : type === "video" || type === "ptv"
-          ? "video"
-          : "file";
+    fileTypeOfMime(mime) ?? FILE_TYPE_BY_MEDIA_TYPE[type] ?? "file";
   const b64 = str(media.base64);
   return {
     fileType,
-    mime: str(media.mimetype),
+    mime,
     fileName: str(media.fileName),
     bytes: b64
       ? new Uint8Array(Buffer.from(b64.replace(/^data:[^,]*,/, ""), "base64"))

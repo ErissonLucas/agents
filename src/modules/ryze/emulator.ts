@@ -15,6 +15,7 @@ import {
   RyzeApiError,
   type RyzeClient,
   type RyzeMediaType,
+  type RyzePresence,
 } from "./client";
 import {
   RYZE_EMULATED_ACCOUNT_ID,
@@ -72,6 +73,13 @@ function num(v: unknown): number | null {
 
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+// A `toggle_typing_status` body as RyzeAPI's presence: the `presence: "recording"` hint the client
+// adds to an "on" is the voice-note indicator, anything else that is not "on" is a pause.
+export function ryzePresenceOf(b: Record<string, unknown>): RyzePresence {
+  if (b.typing_status !== "on") return "pause";
+  return b.presence === "recording" ? "recording" : "typing";
 }
 
 function fileTypeOf(mime: string): string {
@@ -836,7 +844,7 @@ export class RyzeEmulator {
     if (!conv) return NOT_FOUND();
     try {
       const ryze = await this.makeRyze(gw);
-      await ryze.setPresence(conv.chatJid, b.typing_status === "on");
+      await ryze.setPresence(conv.chatJid, ryzePresenceOf(b));
     } catch {
       return json(502, { error: "presence failed" });
     }

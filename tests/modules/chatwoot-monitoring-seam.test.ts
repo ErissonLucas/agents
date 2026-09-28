@@ -2425,7 +2425,8 @@ describe.skipIf(!dbUp)("a monitoring agent never answers", () => {
         },
       });
       expect(sent).toEqual(["Vou verificar seu pedido."]);
-      expect(seen.typing).toBe(1);
+      // One for the think time, one before the first balloon, none before the second.
+      expect(seen.typing).toBe(2);
       expect(seen.pauses).toBe(1);
       // Not "posted-partial": a run called off between balloons attempted nothing after the fence,
       // by decision, and the split reports that as a delivery rather than a failure (see

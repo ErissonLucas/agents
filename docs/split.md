@@ -63,7 +63,11 @@ Both delivery paths go through the same function to ask it. With splitting off t
 
 When a balloon fails, the **remainder is retried once, consolidated into a single send** (rejoined with its real separators, per the rule above). The chunk that failed joins it only on `absent`. The cancellation fence is asked again after the read-back and immediately before that write — the failed request and the read are both I/O, so the earlier answer is stale — and standing down there is **not** a failure. Per-chunk durable state was the alternative and buys nothing here — the chunks are still in memory in this very process; the only thing it would add is resuming after a process death, which is the recovery's job. If that one retry fails too, the reply stays truncated and `failed` is reported: the flow line (`stage: "split"`, `outcome: "send_failed"`) carries the cause, and the conversation carries the badge the turn writes for it.
 
-`client.toggleTyping(id, on)` = `POST …/conversations/{id}/toggle_typing_status { typing_status }` (admin token — not in the bot allowlist). The runtime threads an injectable `sleep` via `RuntimeDeps`.
+`client.toggleTyping(id, on)` = `POST …/conversations/{id}/toggle_typing_status { typing_status }` (bot token). `on` may also be `"recording"`, sent as `typing_status: "on"` plus `presence: "recording"`: Chatwoot has no recording state and ignores the extra key, the RyzeAPI emulator shows WhatsApp's "recording audio…".
+
+## Think-time presence (`src/modules/split/presence.ts`)
+
+A reactive turn shows "typing…" for the whole time the model works, not only between balloons. `runTurnBody` (`src/graph/runtime.ts`) starts a `holdPresence` at the read-receipt site, once the turn is known to be live: a real conversation (not the playground), not called off, still the bot's, and a client that is not muted. A contact the authorization gate refused, a human-owned conversation and a monitoring agent never reach it. The hold re-sends the state every `PRESENCE_REFRESH_MS` (12s; WhatsApp drops a presence after 5–10s), switches to `"recording"` right before a voice reply is normalized and synthesized, goes quiet (stops re-sending) right before the reply is sent — from there `deliverReply` drives the indicator balloon by balloon — and is ended (off) in a `finally` around the whole body, a throw included. Requests go out one at a time, in order, and every failure is swallowed. The runtime threads an injectable `sleep` via `RuntimeDeps`.
 
 ## Configuration
 
