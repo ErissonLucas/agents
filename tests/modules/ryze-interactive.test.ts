@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import config from "@/config";
 import { bridgeClaims, buttonReplyOf } from "@/modules/ryze/interactive";
 import { exchangeMessage } from "@/modules/ryze/receiver";
+import { brazilianNinthDigitVariant } from "@/modules/ryze/store";
 
 // The RyzeAPI docs describe a button tap in two shapes that disagree and a list pick in a third;
 // buttonReplyOf reads every one, keeps the id and never takes free text for an id.
@@ -165,5 +166,24 @@ describe("the live message.exchange shape", () => {
     expect((msg?.content as Record<string, unknown> | undefined)?.text).toBe(
       "oi",
     );
+  });
+});
+
+describe("brazilianNinthDigitVariant", () => {
+  test("a mobile with the 9 maps to the short form and back", () => {
+    expect(brazilianNinthDigitVariant("5581988236119@s.whatsapp.net")).toBe(
+      "558188236119@s.whatsapp.net",
+    );
+    expect(brazilianNinthDigitVariant("558188236119@s.whatsapp.net")).toBe(
+      "5581988236119@s.whatsapp.net",
+    );
+  });
+
+  test("a landline, a foreign number and a lid have no variant", () => {
+    expect(
+      brazilianNinthDigitVariant("558133001234@s.whatsapp.net"),
+    ).toBeNull();
+    expect(brazilianNinthDigitVariant("14155550100@s.whatsapp.net")).toBeNull();
+    expect(brazilianNinthDigitVariant("123456789012345@lid")).toBeNull();
   });
 });

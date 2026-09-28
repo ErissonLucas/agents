@@ -103,12 +103,39 @@ export async function listMessages(
   return page.reverse();
 }
 
+// A Brazilian mobile exists on WhatsApp with or without the ninth digit (55 81 9xxxx-xxxx vs
+// 55 81 xxxx-xxxx): an older account keeps the short form, and a send addressed to the long one reaches
+// it. The other spelling of the same number, or null when there is none.
+export function brazilianNinthDigitVariant(jid: string): string | null {
+  const [user, domain] = jid.split("@");
+  const m = /^55(\d{2})(\d{8,9})$/.exec(user ?? "");
+  if (!m || !domain) return null;
+  const [, ddd, local] = m as unknown as [string, string, string];
+  if (local.length === 9 && local.startsWith("9"))
+    return `55${ddd}${local.slice(1)}@${domain}`;
+  if (local.length === 8 && "6789".includes(local[0] ?? ""))
+    return `55${ddd}9${local}@${domain}`;
+  return null;
+}
+
 export async function upsertContact(
   db: ScopedDb,
   gateway: RyzeGateway,
   jid: string,
   name: string | null,
 ): Promise<RyzeContact> {
+  // The same person under the other spelling keeps one contact and one conversation.
+  const variant = brazilianNinthDigitVariant(jid);
+  if (variant) {
+    const known = await db.ryzeContact.findUnique({
+      where: { gatewayId_jid: { gatewayId: gateway.id, jid: variant } },
+    });
+    if (known) {
+      return name && name !== known.name
+        ? db.ryzeContact.update({ where: { id: known.id }, data: { name } })
+        : known;
+    }
+  }
   const phone = /^\d+$/.test(jid.split("@")[0] ?? "")
     ? `+${jid.split("@")[0]}`
     : null;

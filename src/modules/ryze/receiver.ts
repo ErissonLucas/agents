@@ -163,6 +163,30 @@ async function internalIdOf(
   return row?.messageId ?? null;
 }
 
+// The label of a tapped button, read off the card we sent: a live tap carries only the id.
+async function cardButtonTitle(
+  db: ScopedDb,
+  gatewayId: bigint,
+  conversationId: number,
+  buttonId: string,
+): Promise<string | null> {
+  const recent = await db.ryzeMessage.findMany({
+    where: { gatewayId, conversationId, messageType: 1 },
+    orderBy: { messageId: "desc" },
+    take: 20,
+    select: { contentAttributes: true },
+  });
+  for (const row of recent) {
+    const attrs = isRecord(row.contentAttributes) ? row.contentAttributes : {};
+    const buttons = Array.isArray(attrs.buttons) ? attrs.buttons : [];
+    for (const b of buttons) {
+      if (isRecord(b) && b.id === buttonId && typeof b.title === "string")
+        return b.title;
+    }
+  }
+  return null;
+}
+
 // An outgoing message with no source of ours is our own send only if it is one we already hold:
 // by the gateway id Ryze returned, or (the send's response still in flight) by the same text on a
 // send of ours in the last minute that has no gateway id yet.
@@ -243,6 +267,9 @@ async function handleMessage(
   const text = textOf(msg);
   const media = inboundMedia(msg);
   const reaction = reactionOf(msg);
+  // A reaction sent from this number (ours, or tapped on the paired phone) answers nothing and is not a
+  // person taking the conversation over.
+  if (outgoing && reaction) return { status: 200, outcome: "ignored" };
   const buttonReply = outgoing || reaction ? null : buttonReplyOf(msg);
   const bridged = !!buttonReply && bridgeClaims(buttonReply);
   const root = ryzeEmulatorBaseUrl(gw.chatwootInstanceId);
@@ -272,11 +299,15 @@ async function handleMessage(
         gw.id,
         reaction?.targetId ?? (reply ? str(reply.message_id) : null),
       );
+      const buttonTitle =
+        buttonReply && !buttonReply.title
+          ? await cardButtonTitle(db, gw.id, conv.displayId, buttonReply.id)
+          : (buttonReply?.title ?? null);
       const contentAttributes: Record<string, unknown> = {
         ...(inReplyTo !== null ? { in_reply_to: inReplyTo } : {}),
         ...(reaction ? { is_reaction: true } : {}),
         ...(buttonReply
-          ? { button_reply: { id: buttonReply.id, title: buttonReply.title } }
+          ? { button_reply: { id: buttonReply.id, title: buttonTitle } }
           : {}),
         ...(outgoing
           ? {
@@ -294,8 +325,10 @@ async function handleMessage(
           // A tap reads as the button the contact saw, not as its id.
           content: reaction
             ? reaction.emoji
-            : (buttonReply?.title ??
-              (buttonReply ? `[botão] ${buttonReply.id}` : text)),
+            : buttonReply
+              ? (buttonTitle ??
+                (bridged ? "[botão]" : `[botão] ${buttonReply.id}`))
+              : text,
           contentAttributes: contentAttributes as object,
           ...(outgoing
             ? {}
