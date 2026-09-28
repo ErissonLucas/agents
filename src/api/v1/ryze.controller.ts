@@ -2,7 +2,12 @@ import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import { requireDbId } from "@/lib/db-id";
-import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
+import {
+  AppError,
+  ForbiddenError,
+  TenantTargetRequiredError,
+  UnauthorizedError,
+} from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
@@ -34,15 +39,17 @@ export const ryzeWebhookController = new Elysia({
   tags: ["Channels"],
 }).post(
   "/webhook/:routeToken",
-  async ({ params, request, set }) => {
+  async ({ params, request }) => {
     const rawBody = await request.text();
     const result = await receiveRyzeWebhook({
       routeToken: params.routeToken,
       rawBody,
       authorization: request.headers.get("authorization"),
     });
-    set.status = result.status;
-    return { ack: result.status < 300, outcome: result.outcome };
+    if (result.status === 401) throw new UnauthorizedError();
+    if (result.status === 400) throw new AppError("invalid payload", 400);
+    if (result.status >= 500) throw new AppError("processing failed", 500);
+    return { ack: true, outcome: result.outcome };
   },
   {
     detail: {
