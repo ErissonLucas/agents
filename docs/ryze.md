@@ -39,6 +39,7 @@ Kanban, cross-inbox cases, contact merge, website-chat redirect, WhatsApp templa
 
 ## Operating
 
+- Console: Channels → WhatsApp via RyzeAPI → Connect number. One modal in three steps: instance name and token (the URL defaults to https://ryzeapi.cloud), pairing by QR code or by phone code (`POST /v1/ryze/gateways/:id/pair`, re-asked every 25s while the status is polled every 3s), and the agent that answers (the same inbox bind the Chatwoot inboxes use). `src/client/pages/channels/RyzeSection.tsx`.
 - Connect: `POST /v1/ryze/gateways` or the MCP tool `ryze_connect` (then `inbox_bind` the new inbox to an agent). Validates the token, registers our webhook on the instance (`events: message.exchange, instance.state`, `mediaBase64: true`), creates the inbox mirror.
 - List / refresh / remove: `ryze_list`, `ryze_refresh`, `ryze_remove` (and the REST routes beside them).
 - A tenant with no Chatwoot gets a placeholder deployment row (base URL `https://203.0.113.250/ryze-emulator`); disconnecting Chatwoot is refused while RyzeAPI numbers exist, because its cascade would take them.
