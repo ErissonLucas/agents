@@ -527,7 +527,7 @@ export function RyzeSection({
               <Input
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder={t("channels.ryze.namePlaceholder", "Amanda Sena")}
+                placeholder={t("channels.ryze.namePlaceholder", "My business")}
               />
             </FormField>
             <FormField
