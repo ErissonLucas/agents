@@ -228,6 +228,32 @@ describe("sendRyzeText — validation", () => {
     );
   });
 
+  test("link buttons take an https url and never mix with reply buttons", () => {
+    const link = {
+      url: "https://www.asaas.com/i/abc",
+      title: "Pagar mensalidade",
+    };
+    expect(() => validateCard({ ...ok, buttons: [link] })).not.toThrow();
+    expect(() =>
+      validateCard({ ...ok, buttons: [link, { id: "a", title: "Sim" }] }),
+    ).toThrow(AppError);
+    for (const url of [
+      "http://x.com/a",
+      "javascript:alert(1)",
+      "https://u:p@x.com/a",
+    ]) {
+      expect(() =>
+        validateCard({ ...ok, buttons: [{ url, title: "Abrir" }] }),
+      ).toThrow(AppError);
+    }
+    expect(() =>
+      validateCard({
+        ...ok,
+        buttons: [{ id: "a", url: "https://x.com", title: "Dois" }],
+      }),
+    ).toThrow(AppError);
+  });
+
   test("a card image must be an https URL without credentials", () => {
     const button = { id: "a", title: "Sim" };
     const card = { ...ok, buttons: [button] };

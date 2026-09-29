@@ -177,7 +177,9 @@ export interface CardInput {
   footer?: string;
   // Image shown with the card (https only), e.g. the artwork waiting for approval.
   mediaUrl?: string;
-  buttons: { id: string; title: string }[];
+  // Reply buttons (id, tap comes back) or link buttons (url, opens the page); never both in one card,
+  // because WhatsApp Web/Desktop hides reply buttons mixed with link buttons.
+  buttons: { id?: string; url?: string; title: string }[];
 }
 
 export interface TextInput {
@@ -215,8 +217,18 @@ export function validateCard(card: CardInput): void {
   validateRecipientAndText(card.to, card.text, "card");
   if (card.buttons.length < 1 || card.buttons.length > MAX_BUTTONS)
     throw new AppError("a card takes 1 to 3 buttons", 400);
+  const links = card.buttons.filter((b) => b.url !== undefined).length;
+  if (links > 0 && links !== card.buttons.length)
+    throw new AppError(
+      "a card takes reply buttons or link buttons, not both",
+      400,
+    );
   for (const b of card.buttons) {
-    if (!BUTTON_ID_RE.test(b.id) || !b.title.trim() || b.title.length > 20)
+    const target =
+      b.url !== undefined
+        ? b.id === undefined && isHttpsMediaUrl(b.url)
+        : b.id !== undefined && BUTTON_ID_RE.test(b.id);
+    if (!target || !b.title.trim() || b.title.length > 20)
       throw new AppError("invalid button", 400);
   }
   if (card.mediaUrl !== undefined && !isHttpsMediaUrl(card.mediaUrl))

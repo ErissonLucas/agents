@@ -211,10 +211,18 @@ export const ryzeAdminController = new Elysia({
         ),
         buttons: t.Array(
           t.Object({
-            id: t.String({
-              description:
-                "Button id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
-            }),
+            id: t.Optional(
+              t.String({
+                description:
+                  "Reply button: id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+              }),
+            ),
+            url: t.Optional(
+              t.String({
+                description:
+                  "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
+              }),
+            ),
             title: t.String({
               description: "Button label, up to 20 characters.",
             }),

@@ -47079,12 +47079,15 @@
                     "items": {
                       "type": "object",
                       "required": [
-                        "id",
                         "title"
                       ],
                       "properties": {
                         "id": {
-                          "description": "Button id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "description": "Reply button: id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "type": "string"
+                        },
+                        "url": {
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
                           "type": "string"
                         },
                         "title": {
@@ -47134,12 +47137,15 @@
                     "items": {
                       "type": "object",
                       "required": [
-                        "id",
                         "title"
                       ],
                       "properties": {
                         "id": {
-                          "description": "Button id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "description": "Reply button: id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "type": "string"
+                        },
+                        "url": {
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
                           "type": "string"
                         },
                         "title": {
@@ -47189,12 +47195,15 @@
                     "items": {
                       "type": "object",
                       "required": [
-                        "id",
                         "title"
                       ],
                       "properties": {
                         "id": {
-                          "description": "Button id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "description": "Reply button: id returned on tap (A-Z a-z 0-9 : _ -, up to 128).",
+                          "type": "string"
+                        },
+                        "url": {
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
                           "type": "string"
                         },
                         "title": {

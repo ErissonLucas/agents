@@ -161,8 +161,8 @@ export class RyzeClient {
     return RyzeClient.sent(res);
   }
 
-  // NOTE: reply buttons only. RyzeAPI allows up to 3, and mixing REPLY with URL/CALL/COPY makes the
-  // REPLY ones vanish on WhatsApp Web/Desktop, so this client never offers the other kinds.
+  // NOTE: reply buttons or link buttons, never mixed. RyzeAPI allows up to 3, and mixing REPLY with
+  // URL/CALL/COPY makes the REPLY ones vanish on WhatsApp Web/Desktop (validateCard refuses the mix).
   async sendButtons(
     jid: string,
     card: {
@@ -170,7 +170,7 @@ export class RyzeClient {
       header?: string;
       footer?: string;
       mediaUrl?: string;
-      buttons: { id: string; title: string }[];
+      buttons: { id?: string; url?: string; title: string }[];
     },
   ): Promise<RyzeSentMessage> {
     const res = await this.call("POST", this.path("/api/message/button"), {
@@ -179,11 +179,11 @@ export class RyzeClient {
       ...(card.header ? { headerText: card.header } : {}),
       ...(card.footer ? { footerText: card.footer } : {}),
       ...(card.mediaUrl ? { mediaUrl: card.mediaUrl, mediaType: "IMAGE" } : {}),
-      buttons: card.buttons.map((b) => ({
-        id: b.id,
-        displayText: b.title,
-        type: "REPLY",
-      })),
+      buttons: card.buttons.map((b) =>
+        b.url
+          ? { id: b.url, displayText: b.title, type: "URL" }
+          : { id: b.id, displayText: b.title, type: "REPLY" },
+      ),
       source: RYZE_SOURCE,
     });
     return RyzeClient.sent(res);
