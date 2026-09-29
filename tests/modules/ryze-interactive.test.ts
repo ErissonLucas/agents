@@ -6,8 +6,10 @@ import { RYZE_SOURCE, RyzeClient } from "@/modules/ryze/client";
 import {
   bridgeClaims,
   buttonReplyOf,
+  sendRyzeCard,
   sendRyzeText,
   validateCard,
+  validateConversationContext,
   validateText,
 } from "@/modules/ryze/interactive";
 import { exchangeMessage } from "@/modules/ryze/receiver";
@@ -304,6 +306,114 @@ describe("sendRyzeText — validation", () => {
     const ctx = { tenantId: 1n, userId: null, role: "TENANT_ADMIN" as const };
     await expect(
       sendRyzeText(ctx, 1n, { to: "123", text: "oi" }, { base }),
+    ).rejects.toBeInstanceOf(AppError);
+    expect(touched).toEqual([]);
+  });
+});
+
+describe("conversation context on a send — validation", () => {
+  test("no context, and every field within its limits, pass", () => {
+    expect(() => validateConversationContext({})).not.toThrow();
+    const bag = Object.fromEntries(
+      Array.from({ length: 50 }, (_, i) => [`k_${i}`, i]),
+    );
+    expect(() =>
+      validateConversationContext({
+        contactName: "Ana",
+        contactAttributes: bag,
+        conversationAttributes: {
+          deal_id: 42,
+          "tem-passaporte": true,
+          ["k".repeat(64)]: "x".repeat(1000),
+        },
+        labels: ["novo-lead", "acpb", "etapa_1"],
+      }),
+    ).not.toThrow();
+  });
+
+  test("more than 50 attributes, a bad key or a bad value is refused", () => {
+    const bag = Object.fromEntries(
+      Array.from({ length: 51 }, (_, i) => [`k${i}`, i]),
+    );
+    expect(() =>
+      validateConversationContext({ conversationAttributes: bag }),
+    ).toThrow(AppError);
+    for (const key of ["", "k".repeat(65), "com espaço", "a.b", "__proto__"]) {
+      expect(() =>
+        validateConversationContext({ contactAttributes: { [key]: 1 } }),
+      ).toThrow(AppError);
+    }
+    for (const value of [
+      "x".repeat(1001),
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+      null,
+      { nested: 1 },
+      ["a"],
+    ]) {
+      expect(() =>
+        validateConversationContext({
+          conversationAttributes: { k: value as unknown as string },
+        }),
+      ).toThrow(AppError);
+    }
+  });
+
+  test("more than 10 labels, or one outside the slug form, is refused", () => {
+    expect(() =>
+      validateConversationContext({
+        labels: Array.from({ length: 11 }, (_, i) => `l${i}`),
+      }),
+    ).toThrow(AppError);
+    for (const label of [
+      "",
+      "Novo-Lead",
+      "novo lead",
+      "ação",
+      "-novo",
+      "x".repeat(41),
+    ]) {
+      expect(() => validateConversationContext({ labels: [label] })).toThrow(
+        AppError,
+      );
+    }
+  });
+
+  test("a blank or too long contact name is refused", () => {
+    for (const contactName of ["", "   ", "x".repeat(256)]) {
+      expect(() => validateConversationContext({ contactName })).toThrow(
+        AppError,
+      );
+    }
+  });
+
+  test("a refused context stops the send before the database is touched", async () => {
+    const touched: string[] = [];
+    const base = new Proxy(
+      {},
+      {
+        get(_t, key) {
+          touched.push(String(key));
+          throw new Error("database touched");
+        },
+      },
+    ) as unknown as PrismaClient;
+    const ctx = { tenantId: 1n, userId: null, role: "TENANT_ADMIN" as const };
+    const ok = { to: "5581988236119", text: "Olá" };
+    await expect(
+      sendRyzeText(ctx, 1n, { ...ok, labels: ["Não Pode"] }, { base }),
+    ).rejects.toBeInstanceOf(AppError);
+    await expect(
+      sendRyzeCard(
+        ctx,
+        1n,
+        {
+          ...ok,
+          buttons: [{ id: "a", title: "Sim" }],
+          conversationAttributes: { "chave inválida": 1 },
+        },
+        { base },
+      ),
     ).rejects.toBeInstanceOf(AppError);
     expect(touched).toEqual([]);
   });
