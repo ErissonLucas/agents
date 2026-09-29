@@ -47087,7 +47087,11 @@
                           "type": "string"
                         },
                         "url": {
-                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link/copy buttons, not both.",
+                          "type": "string"
+                        },
+                        "copy": {
+                          "description": "Copy button: code copied on tap (A-Z a-z 0-9 _ -, up to 40).",
                           "type": "string"
                         },
                         "title": {
@@ -47145,7 +47149,11 @@
                           "type": "string"
                         },
                         "url": {
-                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link/copy buttons, not both.",
+                          "type": "string"
+                        },
+                        "copy": {
+                          "description": "Copy button: code copied on tap (A-Z a-z 0-9 _ -, up to 40).",
                           "type": "string"
                         },
                         "title": {
@@ -47203,7 +47211,11 @@
                           "type": "string"
                         },
                         "url": {
-                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
+                          "description": "Link button: https URL opened on tap. A card takes reply buttons or link/copy buttons, not both.",
+                          "type": "string"
+                        },
+                        "copy": {
+                          "description": "Copy button: code copied on tap (A-Z a-z 0-9 _ -, up to 40).",
                           "type": "string"
                         },
                         "title": {

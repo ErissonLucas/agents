@@ -220,7 +220,13 @@ export const ryzeAdminController = new Elysia({
             url: t.Optional(
               t.String({
                 description:
-                  "Link button: https URL opened on tap. A card takes reply buttons or link buttons, not both.",
+                  "Link button: https URL opened on tap. A card takes reply buttons or link/copy buttons, not both.",
+              }),
+            ),
+            copy: t.Optional(
+              t.String({
+                description:
+                  "Copy button: code copied on tap (A-Z a-z 0-9 _ -, up to 40).",
               }),
             ),
             title: t.String({

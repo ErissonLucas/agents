@@ -254,6 +254,23 @@ describe("sendRyzeText — validation", () => {
     ).toThrow(AppError);
   });
 
+  test("a copy button carries a short plain code and can sit with link buttons", () => {
+    const copy = { copy: "482913", title: "Copiar código" };
+    expect(() => validateCard({ ...ok, buttons: [copy] })).not.toThrow();
+    expect(() =>
+      validateCard({
+        ...ok,
+        buttons: [copy, { url: "https://x.com/a", title: "Abrir" }],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateCard({ ...ok, buttons: [copy, { id: "a", title: "Sim" }] }),
+    ).toThrow(AppError);
+    expect(() =>
+      validateCard({ ...ok, buttons: [{ copy: "com espaço", title: "x" }] }),
+    ).toThrow(AppError);
+  });
+
   test("a card image must be an https URL without credentials", () => {
     const button = { id: "a", title: "Sim" };
     const card = { ...ok, buttons: [button] };

@@ -170,7 +170,7 @@ export class RyzeClient {
       header?: string;
       footer?: string;
       mediaUrl?: string;
-      buttons: { id?: string; url?: string; title: string }[];
+      buttons: { id?: string; url?: string; copy?: string; title: string }[];
     },
   ): Promise<RyzeSentMessage> {
     const res = await this.call("POST", this.path("/api/message/button"), {
@@ -182,7 +182,9 @@ export class RyzeClient {
       buttons: card.buttons.map((b) =>
         b.url
           ? { id: b.url, displayText: b.title, type: "URL" }
-          : { id: b.id, displayText: b.title, type: "REPLY" },
+          : b.copy
+            ? { id: b.copy, displayText: b.title, type: "COPY" }
+            : { id: b.id, displayText: b.title, type: "REPLY" },
       ),
       source: RYZE_SOURCE,
     });
