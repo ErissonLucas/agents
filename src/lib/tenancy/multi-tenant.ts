@@ -63,6 +63,7 @@ const TENANT_SCOPED_MODELS = new Set<string>([
   "RyzeConversation",
   "RyzeMessage",
   "RyzeMedia",
+  "RyzeLabel",
 ]);
 
 function withTenant<T>(data: T, tenantId: bigint): T {

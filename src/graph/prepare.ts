@@ -96,6 +96,8 @@ import {
 } from "@/modules/integrations/toolpacks";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import { ryzeLabelPromptSection } from "@/modules/ryze/label-shared";
+import { ryzeLabelTurnContext } from "@/modules/ryze/labels";
 import {
   readServiceWindowConfig,
   type ServiceWindowConfig,
@@ -844,9 +846,30 @@ export async function loadAgentConfig(
       );
     }
   }
-  const promptSections = [attributeSection, appointmentSection].filter(
-    (s): s is string => s !== null,
-  );
+  let ryzeLabels: Awaited<ReturnType<typeof ryzeLabelTurnContext>> = null;
+  if (conv?.inbox?.provider === "ryze") {
+    try {
+      ryzeLabels = await ryzeLabelTurnContext(
+        db,
+        args.instanceId,
+        args.conversationId,
+      );
+    } catch (e) {
+      // NOTE: Optional context fails OPEN, like the appointment block above.
+      logger.warn(
+        "ryze label context load failed: %s",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+  const labelSection = ryzeLabels
+    ? ryzeLabelPromptSection(ryzeLabels.catalog, ryzeLabels.deviceLabels)
+    : null;
+  const promptSections = [
+    attributeSection,
+    appointmentSection,
+    labelSection,
+  ].filter((s): s is string => s !== null);
   // The same prompt with every customer-authored value taken out, for the row the Logs page shows.
   // Built here, from the same parts, so the two can never describe different turns. The alternative
   // (reconstructing it at the emit) would read a prompt that had already lost the seam between the
@@ -863,6 +886,9 @@ export async function loadAgentConfig(
   }
   if (appointmentSection) {
     auditedSections.push({ label: "agendamentos", text: appointmentSection });
+  }
+  if (labelSection) {
+    auditedSections.push({ label: "etiquetas", text: labelSection });
   }
   const limits = readLimitsConfig(effSettings);
   return {
@@ -921,7 +947,13 @@ export async function loadAgentConfig(
     chatwootContactId: conv?.contact?.chatwootContactId ?? null,
     kanbanConfig: readKanbanConfig(effSettings),
     toolGuidance: readToolGuidance(effSettings),
-    protectedLabels: readProtectedLabels(effSettings),
+    // NOTE: on a Ryze number, what the team labelled on the phone is off limits to set_labels too.
+    protectedLabels: [
+      ...new Set([
+        ...readProtectedLabels(effSettings),
+        ...(ryzeLabels?.deviceLabels ?? []),
+      ]),
+    ],
     allowedLabels: readAllowedLabels(effSettings),
     outsideAllowedLabels: readOutsideAllowedLabels(effSettings),
     toolPreconditions: readToolPreconditions(effSettings),

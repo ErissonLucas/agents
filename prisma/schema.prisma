@@ -174,6 +174,7 @@ model Tenant {
   ryzeConversations             RyzeConversation[]
   ryzeMessages                  RyzeMessage[]
   ryzeMedia                     RyzeMedia[]
+  ryzeLabels                    RyzeLabel[]
 
   @@map("tenants")
 }
@@ -2508,6 +2509,10 @@ model RyzeGateway {
   connectionState       String?   @map("connection_state")
   numberJid             String?   @map("number_jid")
   lastEventAt           DateTime? @map("last_event_at")
+  // Whether the number answers WhatsApp Business label calls: null until asked, false after a
+  // refusal (a regular WhatsApp number), re-asked once `labelsCheckedAt` is old enough.
+  labelsSupported       Boolean?  @map("labels_supported")
+  labelsCheckedAt       DateTime? @map("labels_checked_at")
   createdAt             DateTime  @default(now()) @map("created_at")
   updatedAt             DateTime  @updatedAt @map("updated_at")
 
@@ -2518,6 +2523,7 @@ model RyzeGateway {
   conversations RyzeConversation[]
   messages      RyzeMessage[]
   media         RyzeMedia[]
+  labels        RyzeLabel[]
 
   @@index([tenantId])
   @@map("ryze_gateways")
@@ -2584,6 +2590,9 @@ model RyzeConversation {
   assigneeName     String?  @map("assignee_name")
   teamId           Int?     @map("team_id")
   labels           String[] @default([])
+  // Titles the team added or removed on the phone; the model's set_labels leaves them alone. Only
+  // grows (automatic writes may still move these titles).
+  deviceLabels     String[] @default([]) @map("device_labels")
   customAttributes Json     @default("{}") @map("custom_attributes")
   lastActivityAt   DateTime @default(now()) @map("last_activity_at")
   createdAt        DateTime @default(now()) @map("created_at")
@@ -2595,6 +2604,33 @@ model RyzeConversation {
   @@unique([gatewayId, chatJid])
   @@index([tenantId])
   @@map("ryze_conversations")
+}
+
+// A WhatsApp Business label of a Ryze number. `title` is the label the model and the conversation
+// rows use; `displayName` is its name on WhatsApp (`tagId`), when it differs. Rows created on the
+// phone are imported with origin "device". A deleted label keeps its row (`deletedAt`). Titles are
+// unique per gateway among live rows (partial index in the migration).
+model RyzeLabel {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  gatewayId   BigInt    @map("gateway_id")
+  title       String
+  displayName String?   @map("display_name")
+  color       Int       @default(0)
+  description String?
+  autoRule    String?   @map("auto_rule")
+  tagId       String?   @map("tag_id")
+  origin      String
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tenant  Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gateway RyzeGateway @relation(fields: [gatewayId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([gatewayId])
+  @@map("ryze_labels")
 }
 
 // Chatwoot's message row, which the runtime re-reads (it never stores bodies itself). messageType is

@@ -13,6 +13,7 @@ import { RYZE_SOURCE } from "./client";
 import { RYZE_DEVICE_SENDER_NAME, ryzeEmulatorBaseUrl } from "./constants";
 import { emitToBots } from "./emit";
 import { bridgeClaims, buttonReplyOf, forwardButtonReply } from "./interactive";
+import { applyLabelRules, handleLabelUpdate } from "./labels";
 import { presentMessageWebhook, type StoredAttachment } from "./present";
 import {
   conversationBody,
@@ -25,7 +26,8 @@ import {
 // RyzeAPI webhook receiver. Authenticated by the route token in the path (resolves the gateway) and
 // the static Authorization value we configured on the gateway (Ryze does not sign). A customer
 // message becomes an emulated `message_created` incoming; a message typed on the paired phone becomes
-// the device-reply shape; our own sends coming back are dropped. Groups are ignored.
+// the device-reply shape; our own sends coming back are dropped. Groups are ignored. A `label.update`
+// is the team labelling on the phone (see labels.ts).
 
 export interface RyzeWebhookResult {
   status: number;
@@ -398,6 +400,7 @@ async function handleMessage(
         conv,
         row,
         body,
+        created: opened.created,
         reopened: opened.reopened,
       };
     },
@@ -423,6 +426,20 @@ async function handleMessage(
     presentMessageWebhook("message_created", out.row, out.body, gw),
   );
   emitToBots({ tenantId: gw.tenantId, gatewayId: gw.id, base }, payloads);
+  if (!outgoing) {
+    await applyLabelRules(
+      gw,
+      out.conv.id,
+      {
+        add: out.created ? ["new_conversation"] : [],
+        remove: [
+          ...(reaction ? [] : (["clear_on_reply"] as const)),
+          ...(out.reopened ? (["human_takeover"] as const) : []),
+        ],
+      },
+      { base },
+    );
+  }
   return { status: 200, outcome: "accepted" };
 }
 
@@ -457,6 +474,10 @@ export async function receiveRyzeWebhook(params: {
     }
     if (event === "message.exchange")
       return await handleMessage(gw, data, base);
+    if (event === "label.update") {
+      const outcome = await handleLabelUpdate(gw, data, { base });
+      return { status: 200, outcome };
+    }
   } catch (err) {
     logger.error(
       "ryze: webhook %s failed for gateway %s: %s",

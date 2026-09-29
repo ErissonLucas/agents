@@ -44,6 +44,13 @@ export interface RyzeSentMessage {
   timestamp: string | null;
 }
 
+export interface RyzeTag {
+  id: string;
+  name: string;
+  color: number;
+  deleted: boolean;
+}
+
 export interface RyzeConnectionState {
   state: string | null;
   numberJid: string | null;
@@ -56,6 +63,24 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function tagOf(v: unknown): RyzeTag | null {
+  if (!isRecord(v)) return null;
+  const id =
+    typeof v.id === "number"
+      ? String(v.id)
+      : typeof v.id === "string"
+        ? v.id
+        : "";
+  const name = str(v.name);
+  if (!id || !name) return null;
+  return {
+    id,
+    name,
+    color: typeof v.color === "number" ? v.color : Number(v.color) || 0,
+    deleted: v.deleted === true,
+  };
 }
 
 // The recipient as the gateway wants it: a bare number for a phone JID, the JID untouched otherwise
@@ -239,6 +264,44 @@ export class RyzeClient {
     };
   }
 
+  // WhatsApp Business labels ("tags" in RyzeAPI). A regular WhatsApp number may refuse these.
+  async listTags(): Promise<RyzeTag[]> {
+    const res = await this.call("GET", this.path("/api/chat/tag"));
+    const list = Array.isArray(res.tags) ? res.tags : [];
+    return list.map(tagOf).filter((t): t is RyzeTag => t !== null);
+  }
+
+  async createTag(name: string, color?: number): Promise<RyzeTag> {
+    const res = await this.call("POST", this.path("/api/chat/tag"), {
+      name,
+      ...(color !== undefined ? { color } : {}),
+    });
+    const tag = tagOf(res.tag);
+    if (!tag) throw new RyzeApiError(502, "POST /api/chat/tag");
+    return tag;
+  }
+
+  async deleteTag(tagId: string): Promise<void> {
+    await this.call(
+      "DELETE",
+      `${this.path("/api/chat/tag")}?tagId=${encodeURIComponent(tagId)}`,
+    );
+  }
+
+  async assignTag(number: string, tagId: string): Promise<void> {
+    await this.call("POST", this.path("/api/chat/assignTag"), {
+      number,
+      tagId,
+    });
+  }
+
+  async unassignTag(number: string, tagId: string): Promise<void> {
+    await this.call(
+      "DELETE",
+      `${this.path("/api/chat/assignTag")}?number=${encodeURIComponent(number)}&tagId=${encodeURIComponent(tagId)}`,
+    );
+  }
+
   async configureWebhook(params: {
     url: string;
     authorization: string;
@@ -249,7 +312,7 @@ export class RyzeClient {
       enabled: true,
       url: params.url,
       authorization: params.authorization,
-      events: ["message.exchange", "instance.state"],
+      events: ["message.exchange", "instance.state", "label.update"],
       mediaBase64: true,
     });
   }

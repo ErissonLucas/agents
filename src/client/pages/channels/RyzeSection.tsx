@@ -5,6 +5,7 @@ import {
   Plus,
   QrCode,
   RefreshCw,
+  Tag,
   Trash2,
 } from "lucide-react";
 import {
@@ -33,6 +34,7 @@ import {
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { RyzeLabelsModal, type RyzeLabelsTarget } from "./RyzeLabelsModal";
 
 // The RyzeAPI half of the Channels screen: WhatsApp numbers served through RyzeAPI instead of
 // Chatwoot. Connecting is one modal in three steps (credentials, pairing by QR or code, the agent that
@@ -103,6 +105,7 @@ export function RyzeSection({
 
   const modal = useModalController();
   const confirm = useModalController<ConfirmPayload>();
+  const labelsModal = useModalController<RyzeLabelsTarget>();
   const [step, setStep] = useState<Step>("form");
   const [name, setName] = useState("");
   const [baseUrl, setBaseUrl] = useState(DEFAULT_BASE_URL);
@@ -448,6 +451,19 @@ export function RyzeSection({
                   <Button
                     size="sm"
                     variant="secondary"
+                    onClick={() =>
+                      labelsModal.open({
+                        instanceId: gw.instanceId,
+                        name: gw.name,
+                      })
+                    }
+                  >
+                    <Tag className="h-4 w-4" aria-hidden="true" />
+                    {t("channels.ryze.labels.open", "WhatsApp labels")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
                     loading={busyId === gw.instanceId}
                     onClick={() => void refresh(gw)}
                     aria-label={t("channels.ryze.refresh", "Refresh status")}
@@ -692,6 +708,7 @@ export function RyzeSection({
         )}
       </Modal>
       <ConfirmDialog modal={confirm} />
+      <RyzeLabelsModal modal={labelsModal} />
     </section>
   );
 }

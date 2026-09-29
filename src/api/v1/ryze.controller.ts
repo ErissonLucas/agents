@@ -11,6 +11,12 @@ import {
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
 import { sendRyzeCard, sendRyzeText } from "@/modules/ryze/interactive";
+import {
+  createRyzeLabel,
+  deleteRyzeLabel,
+  listRyzeLabels,
+  updateRyzeLabel,
+} from "@/modules/ryze/labels";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import {
   connectRyzeGateway,
@@ -23,6 +29,14 @@ import {
 // translate('errors.ryzeConnectFailed', 'Could not reach the RyzeAPI instance: {{detail}}')
 // translate('errors.ryzeGatewayNotFound', 'RyzeAPI number not found.')
 // translate('errors.ryzeGatewaysBlockDisconnect', 'Remove the RyzeAPI numbers before disconnecting Chatwoot.')
+
+// translate('errors.ryzeLabelDescriptionTooLong', '"When to use" takes at most {{max}} characters.')
+// translate('errors.ryzeLabelColorInvalid', 'The label color must be one of the 11 WhatsApp colors (0 to 10).')
+// translate('errors.ryzeLabelRuleInvalid', 'Unknown automatic rule for the label.')
+// translate('errors.ryzeLabelNameInvalid', 'A label name takes 1 to {{max}} characters.')
+// translate('errors.ryzeLabelLimit', 'A WhatsApp Business number holds at most {{max}} labels. Delete one before creating another.')
+// translate('errors.ryzeLabelExists', 'A label with this name already exists on this number.')
+// translate('errors.ryzeLabelNotFound', 'Label not found.')
 
 // RyzeAPI as a WhatsApp channel beside Chatwoot. The webhook route is public and JWT-less: the opaque
 // route token names the gateway and the static Authorization value we configured on it authenticates
@@ -271,6 +285,174 @@ export const ryzeAdminController = new Elysia({
         }),
       }),
       response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .get(
+    "/gateways/:id/labels",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      catalog: await listRyzeLabels(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "List RyzeAPI number labels",
+        "The number's WhatsApp Business labels, after importing the ones created on the phone. `labelsSupported` is false when the number refused label calls (not WhatsApp Business): the labels then live only here.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+      }),
+      response: errors(400, 401, 403, 404),
+    },
+  )
+  .post(
+    "/gateways/:id/labels",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      label: await createRyzeLabel(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        body,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Create RyzeAPI number label",
+        "Create a label on WhatsApp (when the number is WhatsApp Business) and in the catalog. At most 20 live labels per number.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+      }),
+      body: t.Object({
+        displayName: t.String({
+          minLength: 1,
+          maxLength: 40,
+          description: "Name shown on WhatsApp.",
+        }),
+        title: t.Optional(
+          t.String({
+            maxLength: 40,
+            description:
+              "Internal title the agent uses; defaults to a slug of displayName.",
+          }),
+        ),
+        color: t.Optional(
+          t.Integer({
+            minimum: 0,
+            maximum: 10,
+            description: "WhatsApp palette index, 0 to 10.",
+          }),
+        ),
+        description: t.Optional(
+          t.Nullable(
+            t.String({
+              maxLength: 300,
+              description: "When to use it; shown to the agent.",
+            }),
+          ),
+        ),
+        autoRule: t.Optional(
+          t.Nullable(
+            t.Union(
+              [
+                t.Literal("clear_on_reply"),
+                t.Literal("human_takeover"),
+                t.Literal("new_conversation"),
+              ],
+              { description: "Automatic rule, or null for none." },
+            ),
+          ),
+        ),
+      }),
+      response: errors(400, 401, 403, 404, 409, 422),
+    },
+  )
+  .patch(
+    "/gateways/:id/labels/:labelId",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      label: await updateRyzeLabel(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        requireDbId(params.labelId),
+        body,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Update RyzeAPI number label",
+        "Change when to use a label, its automatic rule or its color. RyzeAPI cannot edit a label, so a new color shows here only, not on the phone.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+        labelId: t.String({ description: "Label id." }),
+      }),
+      body: t.Object({
+        color: t.Optional(
+          t.Integer({
+            minimum: 0,
+            maximum: 10,
+            description: "WhatsApp palette index, 0 to 10 (local only).",
+          }),
+        ),
+        description: t.Optional(
+          t.Nullable(
+            t.String({
+              maxLength: 300,
+              description: "When to use it; shown to the agent.",
+            }),
+          ),
+        ),
+        autoRule: t.Optional(
+          t.Nullable(
+            t.Union(
+              [
+                t.Literal("clear_on_reply"),
+                t.Literal("human_takeover"),
+                t.Literal("new_conversation"),
+              ],
+              { description: "Automatic rule, or null for none." },
+            ),
+          ),
+        ),
+      }),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .delete(
+    "/gateways/:id/labels/:labelId",
+    async ({ tenantContext, params }) => {
+      await deleteRyzeLabel(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        requireDbId(params.labelId),
+      );
+      return { instance: instanceIdentity, success: true };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Delete RyzeAPI number label",
+        "Delete the label on WhatsApp and in the catalog, and take it off every conversation of the number.",
+      ),
+      params: t.Object({
+        id: t.String({
+          description: "Account (Chatwoot instance) id of the number.",
+        }),
+        labelId: t.String({ description: "Label id." }),
+      }),
+      response: errors(400, 401, 403, 404),
     },
   )
   .delete(

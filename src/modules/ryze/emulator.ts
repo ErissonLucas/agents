@@ -11,7 +11,6 @@ import basePrisma from "@/api/lib/prisma";
 import type { ScopedDb } from "@/lib/tenancy";
 import { CHATWOOT_AUTH_HEADER } from "@/modules/chatwoot/constants";
 import {
-  createRyzeClient,
   RyzeApiError,
   type RyzeClient,
   type RyzeMediaType,
@@ -23,6 +22,13 @@ import {
   ryzeEmulatorBaseUrl,
 } from "./constants";
 import { emitToBots } from "./emit";
+import { ryzeClientForGateway } from "./gateway-client";
+import { ryzeLabelColorHex } from "./label-shared";
+import {
+  applyLabelRules,
+  catalogTitles,
+  syncConversationLabels,
+} from "./labels";
 import {
   presentContact,
   presentInbox,
@@ -64,6 +70,8 @@ function json(status: number, body: unknown): Response {
   });
 }
 
+const UNCATALOGUED_LABEL_COLOR = "#1f93ff";
+
 const NOT_FOUND = () => json(404, { error: "Resource could not be found" });
 
 function num(v: unknown): number | null {
@@ -96,25 +104,7 @@ function ryzeMediaTypeOf(fileType: string): RyzeMediaType {
   return "document";
 }
 
-async function defaultRyzeClient(gw: RyzeGateway): Promise<RyzeClient> {
-  return createRyzeClient({
-    baseUrl: gw.baseUrl,
-    instance: gw.instanceName,
-    token: decryptJson<string>(gw.token),
-  });
-}
-
-let ryzeClientFactory: (gw: RyzeGateway) => Promise<RyzeClient> =
-  defaultRyzeClient;
-
-// NOTE: test seam for the emulators built by `loadChatwootClient`; returns the previous factory.
-export function setRyzeClientFactory(
-  next: (gw: RyzeGateway) => Promise<RyzeClient>,
-): (gw: RyzeGateway) => Promise<RyzeClient> {
-  const prev = ryzeClientFactory;
-  ryzeClientFactory = next;
-  return prev;
-}
+export { setRyzeClientFactory } from "./gateway-client";
 
 function sendFailureStatus(err: unknown): number {
   return err instanceof RyzeApiError && err.status >= 400 && err.status < 500
@@ -133,7 +123,7 @@ export class RyzeEmulator {
     deps: RyzeEmulatorDeps = {},
   ) {
     this.base = deps.base ?? basePrisma;
-    this.makeRyze = deps.makeRyzeClient ?? ((gw) => ryzeClientFactory(gw));
+    this.makeRyze = deps.makeRyzeClient ?? ((gw) => ryzeClientForGateway(gw));
     this.root = ryzeEmulatorBaseUrl(instanceId);
   }
 
@@ -752,9 +742,13 @@ export class RyzeEmulator {
     if (!["open", "pending", "resolved", "snoozed"].includes(status)) {
       return json(422, { error: "invalid status" });
     }
+    let previous = "";
     const done = await this.mutateConversation(
       cid,
-      (c) => (c.status === status ? null : { status }),
+      (c) => {
+        previous = c.status;
+        return c.status === status ? null : { status };
+      },
       (before, after) => {
         if (before.status === after.status) return [];
         const extra =
@@ -771,6 +765,20 @@ export class RyzeEmulator {
       },
     );
     if (!done) return NOT_FOUND();
+    // NOTE: a takeover opens the conversation and a return to the agent sets it back to pending,
+    // which is when the `human_takeover` labels go on and come off.
+    if (previous !== status && (status === "open" || previous === "open")) {
+      await applyLabelRules(
+        await this.gateway(),
+        done.conv.id,
+        status === "open"
+          ? { add: ["human_takeover"] }
+          : status === "pending"
+            ? { remove: ["human_takeover"] }
+            : {},
+        { base: this.base, makeRyzeClient: this.makeRyze },
+      );
+    }
     return json(200, {
       success: true,
       conversation_id: cid,
@@ -827,12 +835,28 @@ export class RyzeEmulator {
     const labels = Array.isArray(b.labels)
       ? b.labels.filter((l): l is string => typeof l === "string")
       : [];
+    let before: string[] = [];
     const done = await this.mutateConversation(
       cid,
-      () => ({ labels }),
+      (conv) => {
+        before = conv.labels;
+        return { labels };
+      },
       () => ["conversation_updated"],
     );
-    return done ? json(200, { payload: labels }) : NOT_FOUND();
+    if (!done) return NOT_FOUND();
+    try {
+      syncConversationLabels(await this.gateway(), done.conv, before, labels, {
+        base: this.base,
+        makeRyzeClient: this.makeRyze,
+      });
+    } catch (err) {
+      logger.warn(
+        "ryze: label sync not queued: %s",
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+    return json(200, { payload: labels });
   }
 
   private async typing(
@@ -1020,9 +1044,10 @@ export class RyzeEmulator {
     return json(200, { payload: list.map(presentContact) });
   }
 
+  // The catalog's labels in their WhatsApp colors, then any other title in use.
   private async accountLabels(): Promise<Response> {
     const gw = await this.gateway();
-    const used = await this.db(async (db) => {
+    const { catalog, used } = await this.db(async (db) => {
       const convs = await db.ryzeConversation.findMany({
         where: { gatewayId: gw.id },
         select: { labels: true },
@@ -1031,11 +1056,21 @@ export class RyzeEmulator {
         where: { gatewayId: gw.id },
         select: { labels: true },
       });
-      return [...convs, ...contacts].flatMap((r) => r.labels);
+      return {
+        catalog: await catalogTitles(db, gw.id),
+        used: [...convs, ...contacts].flatMap((r) => r.labels),
+      };
     });
-    const titles = [...new Set(used)].sort();
+    const known = new Set(catalog.map((l) => l.title));
+    const others = [...new Set(used)].filter((t) => !known.has(t)).sort();
     return json(200, {
-      payload: titles.map((title) => ({ title, color: "#1f93ff" })),
+      payload: [
+        ...catalog.map((l) => ({
+          title: l.title,
+          color: ryzeLabelColorHex(l.color),
+        })),
+        ...others.map((title) => ({ title, color: UNCATALOGUED_LABEL_COLOR })),
+      ],
     });
   }
 

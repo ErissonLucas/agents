@@ -143,6 +143,18 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/ryze/gateways/:id/messages": {
     gap: "sending a plain text as the agent on a RyzeAPI number",
   },
+  "GET /v1/ryze/gateways/:id/labels": {
+    gap: "the WhatsApp Business label catalog of a RyzeAPI number",
+  },
+  "POST /v1/ryze/gateways/:id/labels": {
+    gap: "creating a WhatsApp Business label on a RyzeAPI number",
+  },
+  "PATCH /v1/ryze/gateways/:id/labels/:labelId": {
+    gap: "editing a RyzeAPI number label's description, rule or color",
+  },
+  "DELETE /v1/ryze/gateways/:id/labels/:labelId": {
+    gap: "deleting a WhatsApp Business label of a RyzeAPI number",
+  },
   "DELETE /v1/ryze/gateways/:id": { tool: "ryze_remove" },
   "GET /v1/code-tools/": { tool: "code_tool_list" },
   "GET /v1/code-tools/:id": { tool: "code_tool_get" },
