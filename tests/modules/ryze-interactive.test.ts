@@ -228,6 +228,25 @@ describe("sendRyzeText — validation", () => {
     );
   });
 
+  test("a card image must be an https URL without credentials", () => {
+    const button = { id: "a", title: "Sim" };
+    const card = { ...ok, buttons: [button] };
+    expect(() =>
+      validateCard({
+        ...card,
+        mediaUrl: "https://api.consultora.site/media/a.png",
+      }),
+    ).not.toThrow();
+    for (const mediaUrl of [
+      "http://x.com/a.png",
+      "https://u:p@x.com/a.png",
+      "nada",
+      "ftp://x.com/a",
+    ]) {
+      expect(() => validateCard({ ...card, mediaUrl })).toThrow(AppError);
+    }
+  });
+
   test("an invalid message is refused before the database is touched", async () => {
     const touched: string[] = [];
     const base = new Proxy(

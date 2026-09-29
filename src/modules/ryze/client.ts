@@ -169,6 +169,7 @@ export class RyzeClient {
       text: string;
       header?: string;
       footer?: string;
+      mediaUrl?: string;
       buttons: { id: string; title: string }[];
     },
   ): Promise<RyzeSentMessage> {
@@ -177,6 +178,7 @@ export class RyzeClient {
       contentText: card.text,
       ...(card.header ? { headerText: card.header } : {}),
       ...(card.footer ? { footerText: card.footer } : {}),
+      ...(card.mediaUrl ? { mediaUrl: card.mediaUrl, mediaType: "IMAGE" } : {}),
       buttons: card.buttons.map((b) => ({
         id: b.id,
         displayText: b.title,

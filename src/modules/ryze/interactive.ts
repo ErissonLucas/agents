@@ -175,6 +175,8 @@ export interface CardInput {
   text: string;
   header?: string;
   footer?: string;
+  // Image shown with the card (https only), e.g. the artwork waiting for approval.
+  mediaUrl?: string;
   buttons: { id: string; title: string }[];
 }
 
@@ -199,6 +201,16 @@ function validateRecipientAndText(to: string, text: string, what: string) {
     throw new AppError(`invalid ${what} text`, 400);
 }
 
+function isHttpsMediaUrl(raw: string): boolean {
+  if (raw.length > 2048) return false;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+}
+
 export function validateCard(card: CardInput): void {
   validateRecipientAndText(card.to, card.text, "card");
   if (card.buttons.length < 1 || card.buttons.length > MAX_BUTTONS)
@@ -207,6 +219,8 @@ export function validateCard(card: CardInput): void {
     if (!BUTTON_ID_RE.test(b.id) || !b.title.trim() || b.title.length > 20)
       throw new AppError("invalid button", 400);
   }
+  if (card.mediaUrl !== undefined && !isHttpsMediaUrl(card.mediaUrl))
+    throw new AppError("invalid media url", 400);
 }
 
 export function validateText(msg: TextInput): void {
@@ -277,7 +291,9 @@ export async function sendRyzeCard(
     gatewayInstanceId,
     card.to,
     content,
-    { buttons: card.buttons },
+    card.mediaUrl
+      ? { buttons: card.buttons, mediaUrl: card.mediaUrl }
+      : { buttons: card.buttons },
     (ryze, chatJid) => ryze.sendButtons(chatJid, card),
     deps,
   );

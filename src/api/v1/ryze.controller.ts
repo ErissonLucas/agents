@@ -204,6 +204,11 @@ export const ryzeAdminController = new Elysia({
         text: t.String({ minLength: 1, description: "Card body." }),
         header: t.Optional(t.String({ description: "Bold header line." })),
         footer: t.Optional(t.String({ description: "Small footer line." })),
+        mediaUrl: t.Optional(
+          t.String({
+            description: "https URL of an image shown with the card.",
+          }),
+        ),
         buttons: t.Array(
           t.Object({
             id: t.String({

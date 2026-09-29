@@ -47068,6 +47068,10 @@
                     "description": "Small footer line.",
                     "type": "string"
                   },
+                  "mediaUrl": {
+                    "description": "https URL of an image shown with the card.",
+                    "type": "string"
+                  },
                   "buttons": {
                     "minItems": 1,
                     "maxItems": 3,
@@ -47119,6 +47123,10 @@
                     "description": "Small footer line.",
                     "type": "string"
                   },
+                  "mediaUrl": {
+                    "description": "https URL of an image shown with the card.",
+                    "type": "string"
+                  },
                   "buttons": {
                     "minItems": 1,
                     "maxItems": 3,
@@ -47168,6 +47176,10 @@
                   },
                   "footer": {
                     "description": "Small footer line.",
+                    "type": "string"
+                  },
+                  "mediaUrl": {
+                    "description": "https URL of an image shown with the card.",
                     "type": "string"
                   },
                   "buttons": {
