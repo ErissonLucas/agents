@@ -770,6 +770,11 @@ async function conversationForJid(
  * WhatsApp id; `chat` is the team labelling a chat on the phone: the title moves on the conversation,
  * joins its `deviceLabels`, and is NOT synced back. Idempotent: an event that changes nothing (a
  * redelivery, or the echo of our own sync) announces nothing.
+ *
+ * A `human_takeover` label is also the handoff switch on the phone, for numbers with no Chatwoot
+ * console: put on, the conversation opens (a human has it, the agent stops — `shouldBotHandle` only
+ * answers `pending`); taken off an open conversation, it goes back to `pending` and the agent
+ * answers again. The echo of our own takeover sync changes nothing, so it cannot flip it back.
  */
 export async function handleLabelUpdate(
   gw: RyzeGateway,
@@ -807,7 +812,7 @@ export async function handleLabelUpdate(
       (db) =>
         db.ryzeLabel.findFirst({
           where: { gatewayId: gw.id, tagId, deletedAt: null },
-          select: { title: true },
+          select: { title: true, autoRule: true },
         }),
       base,
     );
@@ -818,6 +823,7 @@ export async function handleLabelUpdate(
   }
   if (!label) return "ignored";
   const title = label.title;
+  const takeover = label.autoRule === "human_takeover";
   const out = await scoped(
     gw.tenantId,
     async (db) => {
@@ -825,6 +831,15 @@ export async function handleLabelUpdate(
       if (!conv) return null;
       const has = conv.labels.includes(title);
       if (adding === has) return null;
+      const status = !takeover
+        ? null
+        : adding
+          ? conv.status === "open"
+            ? null
+            : "open"
+          : conv.status === "open"
+            ? "pending"
+            : null;
       const after = await db.ryzeConversation.update({
         where: { id: conv.id },
         data: {
@@ -834,16 +849,26 @@ export async function handleLabelUpdate(
           ...(conv.deviceLabels.includes(title)
             ? {}
             : { deviceLabels: [...conv.deviceLabels, title] }),
+          ...(status ? { status } : {}),
         },
       });
-      return conversationBody(db, gw, after);
+      return { body: await conversationBody(db, gw, after), status };
     },
     base,
   );
   if (!out) return "ignored";
-  emitToBots({ tenantId: gw.tenantId, gatewayId: gw.id, base }, [
-    { ...out, event: "conversation_updated" },
-  ]);
+  // Same events as a status toggle from the console, so the takeover bookkeeping runs as usual.
+  const events = out.status
+    ? [
+        "conversation_status_changed",
+        ...(out.status === "open" ? ["conversation_opened"] : []),
+        "conversation_updated",
+      ]
+    : ["conversation_updated"];
+  emitToBots(
+    { tenantId: gw.tenantId, gatewayId: gw.id, base },
+    events.map((event) => ({ ...out.body, event })),
+  );
   return "accepted";
 }
 

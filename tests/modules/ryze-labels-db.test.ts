@@ -459,6 +459,50 @@ describe.skipIf(!dbUp)("RyzeAPI WhatsApp labels", () => {
     expect((await conv()).labels).not.toContain("humano");
   });
 
+  test("the human_takeover label put on the phone hands the chat to a human; taken off, back to the agent", async () => {
+    const humano = ryze.tagNamed("Humano") as Tag;
+    const phone = (action: "add" | "remove") =>
+      hook("label.update", {
+        type: "chat",
+        labelId: humano.id,
+        action,
+        chatJid: `${jid}@s.whatsapp.net`,
+        labeled: action === "add",
+      });
+    expect((await conv()).status).toBe("pending");
+    expect((await phone("add")).outcome).toBe("accepted");
+    await drainEmits(gatewayId);
+    let c = await conv();
+    expect(c.status).toBe("open");
+    expect(c.labels).toContain("humano");
+    // A redelivery (or the echo of our own sync) changes nothing.
+    expect((await phone("add")).outcome).toBe("ignored");
+    expect((await conv()).status).toBe("open");
+    expect((await phone("remove")).outcome).toBe("accepted");
+    await drainEmits(gatewayId);
+    c = await conv();
+    expect(c.status).toBe("pending");
+    expect(c.labels).not.toContain("humano");
+  });
+
+  test("an ordinary label put on the phone does not touch the status", async () => {
+    const before = (await conv()).status;
+    await hook("label.update", {
+      type: "chat",
+      labelId: "100",
+      action: "remove",
+      chatJid: `${jid}@s.whatsapp.net`,
+    });
+    await hook("label.update", {
+      type: "chat",
+      labelId: "100",
+      action: "add",
+      chatJid: `${jid}@s.whatsapp.net`,
+      labeled: true,
+    });
+    expect((await conv()).status).toBe(before);
+  });
+
   test("editing keeps the title, and deleting removes it on WhatsApp and from conversations", async () => {
     const catalog = await listRyzeLabels(ctx(), instanceId, deps());
     const frio = catalog.labels.find((l) => l.title === "lead-frio");
