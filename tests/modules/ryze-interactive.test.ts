@@ -5,6 +5,7 @@ import { AppError } from "@/lib/errors";
 import { RYZE_SOURCE, RyzeClient } from "@/modules/ryze/client";
 import {
   bridgeClaims,
+  bridgeFor,
   buttonReplyOf,
   sendRyzeText,
   validateCard,
@@ -88,6 +89,29 @@ describe("bridgeClaims", () => {
         expect(bridgeClaims({ ...tap, id: "outro:a" })).toBe(false);
       },
     );
+  });
+
+  test("a second bridge takes its own prefix; the first keeps its own", () => {
+    const saved2 = { ...config.ryzeButtonBridge2 };
+    Object.assign(config.ryzeButtonBridge2, {
+      url: "https://villa.example/b",
+      secret: "s2",
+      prefix: "villa:",
+    });
+    try {
+      withBridge(
+        { url: "https://maria.example/b", secret: "s", prefix: "maria:" },
+        () => {
+          expect(bridgeFor(tap)?.url).toBe("https://maria.example/b");
+          expect(bridgeFor({ ...tap, id: "villa:ok:1" })?.url).toBe(
+            "https://villa.example/b",
+          );
+          expect(bridgeClaims({ ...tap, id: "outro:a" })).toBe(false);
+        },
+      );
+    } finally {
+      Object.assign(config.ryzeButtonBridge2, saved2);
+    }
   });
 
   test("off when any of url, secret or prefix is missing", () => {

@@ -9,6 +9,8 @@ const MASK = "********";
 const READABLE_STRING_FIELDS = [
   "ryzeButtonBridge.url",
   "ryzeButtonBridge.prefix",
+  "ryzeButtonBridge2.url",
+  "ryzeButtonBridge2.prefix",
   "packageInfo.name",
   "packageInfo.version",
   "publicUrl",

@@ -68,6 +68,9 @@ const {
   RYZE_BUTTON_BRIDGE_SECRET,
   RYZE_BUTTON_BRIDGE_PREFIX,
   RYZE_AUTOMATION_SOURCES,
+  RYZE_BUTTON_BRIDGE_2_URL,
+  RYZE_BUTTON_BRIDGE_2_SECRET,
+  RYZE_BUTTON_BRIDGE_2_PREFIX,
 } = process.env;
 
 // NOTE: Domain entries are trimmed, lowercased, and have a leading "@" stripped
@@ -654,6 +657,14 @@ const config = {
     url: (RYZE_BUTTON_BRIDGE_URL ?? "").trim(),
     secret: (RYZE_BUTTON_BRIDGE_SECRET ?? "").trim(),
     prefix: (RYZE_BUTTON_BRIDGE_PREFIX ?? "").trim(),
+  },
+  // NOTE: A second button bridge, for another system answering taps on its own prefix (e.g. a store
+  // app's "villa:" approval cards while "maria:" goes to the first). Same contract and header; a tap
+  // goes to the bridge whose prefix it starts with, the longest one if both match.
+  ryzeButtonBridge2: {
+    url: (RYZE_BUTTON_BRIDGE_2_URL ?? "").trim(),
+    secret: (RYZE_BUTTON_BRIDGE_2_SECRET ?? "").trim(),
+    prefix: (RYZE_BUTTON_BRIDGE_2_PREFIX ?? "").trim(),
   },
   // NOTE: `source` values (comma-separated) of another system that sends through the SAME RyzeAPI
   // number — e.g. a store app's order-status messages. Their outgoing echoes are kept in the

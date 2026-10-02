@@ -89,9 +89,19 @@ export function buttonReplyOf(
   };
 }
 
+// The configured bridge whose prefix this tap's id starts with (the longest when two match), or null.
+export function bridgeFor(
+  reply: ButtonReply,
+): { url: string; secret: string; prefix: string } | null {
+  const live = [config.ryzeButtonBridge, config.ryzeButtonBridge2].filter(
+    (b) => !!b.url && !!b.secret && !!b.prefix && reply.id.startsWith(b.prefix),
+  );
+  live.sort((a, b) => b.prefix.length - a.prefix.length);
+  return live[0] ?? null;
+}
+
 export function bridgeClaims(reply: ButtonReply): boolean {
-  const { url, secret, prefix } = config.ryzeButtonBridge;
-  return !!url && !!secret && !!prefix && reply.id.startsWith(prefix);
+  return bridgeFor(reply) !== null;
 }
 
 function clientFor(gw: RyzeGateway): Promise<RyzeClient> {
@@ -501,7 +511,9 @@ export async function forwardButtonReply(
   } = {},
 ): Promise<void> {
   const base = deps.base ?? basePrisma;
-  const { url, secret } = config.ryzeButtonBridge;
+  const bridge = bridgeFor(tap.reply);
+  if (!bridge) return;
+  const { url, secret } = bridge;
   let answer: BridgeAnswer;
   try {
     const res = await (deps.fetchImpl ?? fetch)(url, {
