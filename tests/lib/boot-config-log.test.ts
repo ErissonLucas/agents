@@ -11,6 +11,7 @@ const READABLE_STRING_FIELDS = [
   "ryzeButtonBridge.prefix",
   "ryzeButtonBridge2.url",
   "ryzeButtonBridge2.prefix",
+  "ryzeAutomationSources",
   "packageInfo.name",
   "packageInfo.version",
   "publicUrl",
