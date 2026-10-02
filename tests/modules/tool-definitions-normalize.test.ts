@@ -161,7 +161,8 @@ describe("compactFromJsonSchema", () => {
       },
       warnings,
     );
-    expect(out.docs).toEqual({ type: "array", itemType: "string" });
+    // A list of objects is now expressible (itemType "object"), so it maps faithfully and silently.
+    expect(out.docs).toEqual({ type: "array", itemType: "object" });
     expect(out.plain_obj).toEqual({ type: "object" });
     // NOTE: allOf is a composition keyword like anyOf/oneOf; an allOf-only field must degrade to
     // "object" with a warning, never to a silent "string".
@@ -173,7 +174,7 @@ describe("compactFromJsonSchema", () => {
     expect(allOfOut.combo).toEqual({ type: "object" });
     expect(allOfWarnings.join("\n")).toContain('"combo"');
     const joined = warnings.join("\n");
-    expect(joined).toContain('"docs"');
+    expect(joined).not.toContain('"docs"');
     expect(joined).toContain('"nested"');
     expect(joined).toContain('"either"');
     // NOTE: faithful mappings never warn: a bare {type: "object"} and an untyped array.
@@ -335,4 +336,13 @@ describe("a field named __proto__", () => {
     expect(shapes.inputSchema).toEqual(plain);
     expect(warnings).toEqual([]);
   });
+});
+
+test("a JSON Schema array of objects keeps itemType object", () => {
+  expect(
+    normalizeInputSchemaShape({
+      properties: { itens: { type: "array", items: { type: "object" } } },
+      required: ["itens"],
+    }),
+  ).toEqual({ itens: { type: "array", itemType: "object", required: true } });
 });

@@ -139,8 +139,9 @@ export function compactFromJsonSchema(
         typeof items.type === "string" && SCALAR_TYPES.has(items.type)
           ? items.type
           : null;
-      field.itemType = scalarItem ?? "string";
-      if (!scalarItem && items.type !== undefined) {
+      field.itemType =
+        items.type === "object" ? "object" : (scalarItem ?? "string");
+      if (!scalarItem && items.type !== undefined && items.type !== "object") {
         warnings?.push(
           `field "${name}": array item type "${String(items.type)}" is not expressible in the compact schema; items validate as "string"`,
         );

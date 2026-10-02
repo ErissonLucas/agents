@@ -199,6 +199,7 @@ export interface HttpToolDeps {
 // object) are body-only (array/object flatten to "a,b"/"[object Object]" outside JSON).
 type ScalarType = "string" | "integer" | "number" | "boolean";
 type FieldType = ScalarType | "enum" | "array" | "object";
+type ItemType = ScalarType | "object";
 
 const FIELD_TYPES = new Set<FieldType>([
   "string",
@@ -232,9 +233,10 @@ interface FieldSpec {
   description?: string;
   source?: "ai" | "fixed";
   value?: string;
-  // enum: the allowed string values. array: the element scalar type. Ignored for other types.
+  // enum: the allowed string values. array: the element type — a scalar, or "object" for a list of
+  // free-form JSON objects (e.g. order items). Ignored for other types.
   enumValues?: string[];
-  itemType?: ScalarType;
+  itemType?: ItemType;
 }
 
 interface ParsedField {
@@ -245,7 +247,7 @@ interface ParsedField {
   source: "ai" | "fixed";
   value: string;
   enumValues?: string[];
-  itemType?: ScalarType;
+  itemType?: ItemType;
 }
 
 // Compact tool input schema: a map of field name → {type, required?, description?, enumValues?,
@@ -268,7 +270,12 @@ function parseFields(raw: unknown): ParsedField[] {
       enumValues: Array.isArray(s.enumValues)
         ? s.enumValues.filter((v): v is string => typeof v === "string")
         : undefined,
-      itemType: s.itemType ? coerceScalarType(s.itemType) : undefined,
+      itemType:
+        s.itemType === "object"
+          ? "object"
+          : s.itemType
+            ? coerceScalarType(s.itemType)
+            : undefined,
     });
   }
   return out;
@@ -293,7 +300,12 @@ function zodFor(f: ParsedField): z.ZodTypeAny {
         ? z.enum(f.enumValues as [string, ...string[]])
         : z.string();
   } else if (f.type === "array") {
-    zt = z.array(zodForScalar(f.itemType ?? "string"));
+    // A list of objects is body-only, like an object field: each element is free-form JSON.
+    zt = z.array(
+      f.itemType === "object"
+        ? z.record(z.string(), z.unknown())
+        : zodForScalar(f.itemType ?? "string"),
+    );
   } else if (f.type === "object") {
     // Generic JSON object: validates the AI passed an object; contents are free-form.
     zt = z.record(z.string(), z.unknown());

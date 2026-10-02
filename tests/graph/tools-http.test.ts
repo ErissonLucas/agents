@@ -679,6 +679,34 @@ describe("buildHttpTool — extended AI types (enum/integer/array/object)", () =
     });
   });
 
+  test("array of objects (order items) validates and keeps its structure in the kv body", async () => {
+    const schema = parseToolInputSchema({
+      itens: { type: "array", itemType: "object", required: true },
+    });
+    expect(
+      schema.safeParse({ itens: [{ produto: "X", qtd: 2 }] }).success,
+    ).toBe(true);
+    expect(schema.safeParse({ itens: ["X"] }).success).toBe(false);
+    const captured: Captured = {};
+    const tool = buildHttpTool(
+      def({
+        method: "POST",
+        urlTemplate: `https://${PUBLIC}/v3/x`,
+        inputSchema: {
+          itens: { type: "array", itemType: "object", required: true },
+        },
+        body: { mode: "kv", rows: [{ key: "itens", value: "{{itens}}" }] },
+      }),
+      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
+    );
+    await tool.invoke({
+      itens: [{ produto: "Picanha Prime", qtd: 2, adicionais: { sache: 1 } }],
+    });
+    expect(JSON.parse(captured.init?.body as string)).toEqual({
+      itens: [{ produto: "Picanha Prime", qtd: 2, adicionais: { sache: 1 } }],
+    });
+  });
+
   test("object keeps its nested structure in the kv body", async () => {
     const captured: Captured = {};
     const tool = buildHttpTool(
