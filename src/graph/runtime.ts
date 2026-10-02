@@ -1559,7 +1559,9 @@ async function turnBody(
   // `deliverText`, which a turn reaches once: a transfer's closing line takes the place of the reply
   // (measured with a model that transfers and then answers: one text reaches the customer). The tool
   // itself writes nothing, so calling it twice is still one line.
-  const noteSentAsText = (reason: "contact_preference" | "model_choice") =>
+  const noteSentAsText = (
+    reason: "contact_preference" | "model_choice" | "buttons",
+  ) =>
     emitFlowEvent(flow, {
       stage: "tts",
       level: "info",
@@ -1581,7 +1583,14 @@ async function turnBody(
     if (plannedAudio && !asked) noteSentAsText("contact_preference");
     const chosenText = asked && replyChoice.textChosen;
     if (chosenText) noteSentAsText("model_choice");
-    const wantAudio = asked && !chosenText;
+    // send_buttons: the options ride the last text balloon, and a voice note cannot carry them, so a
+    // turn that asked for buttons is answered in text (RyzeAPI only; elsewhere the tool refuses).
+    const buttons =
+      turnState.pendingButtons?.length && client.isRyzeEmulator
+        ? turnState.pendingButtons
+        : null;
+    if (asked && !chosenText && buttons) noteSentAsText("buttons");
+    const wantAudio = asked && !chosenText && !buttons;
     // A URL or an e-mail address is never said: it follows the voice note in writing, or the whole
     // reply goes as text when nothing but its introduction would be said (issue #787), or when the
     // reply is built to be read, not heard: too long, a list, a run of prices (issue #856).
@@ -1733,6 +1742,7 @@ async function turnBody(
       // The audio branch above returned before this line: a spoken "Alex, Minha Empresa" is noise, and
       // the voice note's `transcribedText` is the words that were actually said.
       signed,
+      buttons,
     );
     logger.info(
       "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d partial=%s",
@@ -1799,7 +1809,10 @@ async function turnBody(
       // customer-facing text means the same thing wherever it is reached: a `silent` action that
       // suppressed the goodbye and then let a photo through would be the operator's policy applied
       // to one artefact and not the other.
-      if (guardrailTripped(guarded)) turnState.pendingAttachments.length = 0;
+      if (guardrailTripped(guarded)) {
+        turnState.pendingAttachments.length = 0;
+        turnState.pendingButtons = undefined;
+      }
       const screened = screenedText(guarded, line);
       if (screened === null) return;
       const delivered = await deliverText(screened, await currentVoiceReply());
@@ -2763,6 +2776,7 @@ async function turnBody(
       reply = "";
       const dropped = turnState.pendingAttachments.length;
       turnState.pendingAttachments.length = 0;
+      turnState.pendingButtons = undefined;
       logger.info(
         "turn: the handoff declared silence (conv=%s), so nothing goes to the customer (attachments dropped=%d)",
         String(conversationId),
@@ -2890,9 +2904,15 @@ async function turnBody(
     // the model wrote, attachments included. This sits ABOVE the empty-reply branch because a caption
     // is customer-facing text even when the model produced no final message of its own (skip_reply
     // with an image is a legitimate shape).
-    const modelWritten = turnState.pendingAttachments.flatMap((i) =>
-      [i.caption?.trim(), i.screenText?.trim()].filter((c): c is string => !!c),
-    );
+    const modelWritten = [
+      ...turnState.pendingAttachments.flatMap((i) =>
+        [i.caption?.trim(), i.screenText?.trim()].filter(
+          (c): c is string => !!c,
+        ),
+      ),
+      // Button titles are model-written text the customer reads, same as a caption.
+      ...(turnState.pendingButtons ?? []).map((b) => b.title),
+    ];
     const screened = [reply, ...modelWritten].filter(Boolean).join("\n");
     const outGuard = screened ? await runGuardrail("output", screened) : null;
     // Same wait, same reason: `postBlocked` answered before this model call, and the suppressed
@@ -2900,6 +2920,7 @@ async function turnBody(
     if (await writeCalledOff()) return refuse(standDown());
     if (outGuard && guardrailTripped(outGuard)) {
       turnState.pendingAttachments.length = 0;
+      turnState.pendingButtons = undefined;
       const replacement = screenedText(outGuard, screened);
       // The refused reply goes nowhere and the case goes to the team. An empty hand-over message is
       // the operator's "say nothing", so the reply is blanked and the empty branch below runs with

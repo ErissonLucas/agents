@@ -11,6 +11,7 @@ import {
   type LucideIcon,
   Mic,
   Smile,
+  SquareMousePointer,
   SquarePen,
   StickyNote,
   Tag,
@@ -32,6 +33,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   set_voice_preference: Mic,
   react_to_message: Smile,
   send_image: ImageIcon,
+  send_buttons: SquareMousePointer,
   open_case_in_inbox: FolderInput,
   skip_reply: BellOff,
   calculator: Calculator,
@@ -127,6 +129,15 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         description: t(
           "nativeTools.react_to_message.desc",
           "React to the customer's last message with an emoji (WhatsApp reaction).",
+        ),
+      };
+    case "send_buttons":
+      return {
+        icon,
+        label: t("nativeTools.send_buttons.label", "Send buttons"),
+        description: t(
+          "nativeTools.send_buttons.desc",
+          "Show up to 3 tappable buttons (quick replies or links) under the reply on WhatsApp (RyzeAPI).",
         ),
       };
     case "send_image":

@@ -23,6 +23,7 @@ import {
 } from "./constants";
 import { emitToBots } from "./emit";
 import { ryzeClientForGateway } from "./gateway-client";
+import { cardButtonsOf } from "./interactive";
 import { ryzeLabelColorHex } from "./label-shared";
 import {
   applyLabelRules,
@@ -449,7 +450,19 @@ export class RyzeEmulator {
     }
     try {
       const ryze = await this.makeRyze(gw);
-      const sent = await ryze.sendText(conv.chatJid, content as string);
+      // A reply that carries buttons (send_buttons) goes out as a WhatsApp card; checked by the
+      // same rules as an admin card, and a bag that fails them goes out as the plain text.
+      const buttons = cardButtonsOf(
+        b.content_attributes,
+        conv.chatJid,
+        content as string,
+      );
+      const sent = buttons
+        ? await ryze.sendButtons(conv.chatJid, {
+            text: content as string,
+            buttons,
+          })
+        : await ryze.sendText(conv.chatJid, content as string);
       const done = await this.landed(gw, row, sent.messageId);
       await this.echo(gw, done);
       return json(200, presentMessageRest(done));

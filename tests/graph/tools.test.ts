@@ -2885,6 +2885,12 @@ describe("the fence rule, over every native tool", () => {
       label: "",
       args: { url: "https://imgs.example/x.png" },
     },
+    // Writes nothing through the client: the buttons wait in TurnState for the reply.
+    {
+      tool: "send_buttons",
+      label: "",
+      args: { buttons: [{ title: "Quero" }] },
+    },
     {
       tool: "open_case_in_inbox",
       label: "",
@@ -2959,4 +2965,103 @@ describe("the fence rule, over every native tool", () => {
       expect(trace.filter((e) => e.includes("unknown"))).toEqual([]);
     });
   }
+});
+
+describe("send_buttons", () => {
+  const turnState = () => ({
+    resolveRequested: false,
+    pendingAttachments: [],
+    imagesInFlight: 0,
+    documentsInFlight: 0,
+    attachmentsSeq: 0,
+  });
+  function ryze(isRyze: boolean) {
+    const { client, calls } = recordingClient();
+    Object.defineProperty(client, "isRyzeEmulator", { value: isRyze });
+    return { client, calls };
+  }
+
+  test("queues the buttons for the reply's last balloon and sends nothing itself", async () => {
+    const { client, calls } = ryze(true);
+    const state = turnState() as Parameters<
+      typeof buildNativeTools
+    >[0]["turnState"] &
+      object;
+    const tool = byName(
+      buildNativeTools({ client, conversationId: 1, turnState: state }),
+      "send_buttons",
+    );
+    const out = String(
+      await tool.invoke({
+        buttons: [{ title: "Quero" }, { title: "Ver cardápio" }],
+      }),
+    );
+    expect(out).toContain("LAST message of your reply");
+    expect(state.pendingButtons).toEqual([
+      { title: "Quero", id: "btn-1" },
+      { title: "Ver cardápio", id: "btn-2" },
+    ]);
+    expect(calls).toEqual([]);
+    await tool.invoke({
+      buttons: [
+        {
+          title: "Finalizar pedido",
+          url: "https://villaengenho.com.br/sacola?s=x",
+        },
+      ],
+    });
+    expect(state.pendingButtons).toEqual([
+      {
+        title: "Finalizar pedido",
+        url: "https://villaengenho.com.br/sacola?s=x",
+      },
+    ]);
+  });
+
+  test("refuses mixed kinds, a bad link, repeated titles and a non-Ryze channel", async () => {
+    const state = turnState() as Parameters<
+      typeof buildNativeTools
+    >[0]["turnState"] &
+      object;
+    const onRyze = byName(
+      buildNativeTools({
+        client: ryze(true).client,
+        conversationId: 1,
+        turnState: state,
+      }),
+      "send_buttons",
+    );
+    expect(
+      String(
+        await onRyze.invoke({
+          buttons: [{ title: "Um" }, { title: "Dois", url: "https://a.com" }],
+        }),
+      ),
+    ).toContain("never both");
+    expect(
+      String(
+        await onRyze.invoke({
+          buttons: [{ title: "Pagar", url: "http://a.com" }],
+        }),
+      ),
+    ).toContain("https://");
+    expect(
+      String(
+        await onRyze.invoke({ buttons: [{ title: "Sim" }, { title: "sim" }] }),
+      ),
+    ).toContain("same title");
+    expect(state.pendingButtons).toBeUndefined();
+    const elsewhere = byName(
+      buildNativeTools({
+        client: ryze(false).client,
+        conversationId: 1,
+        turnState: state,
+      }),
+      "send_buttons",
+    );
+    expect(
+      String(await elsewhere.invoke({ buttons: [{ title: "Quero" }] })),
+    ).toContain("RyzeAPI");
+    expect(state.pendingButtons).toBeUndefined();
+  });
 });

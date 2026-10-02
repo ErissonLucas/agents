@@ -25,6 +25,7 @@ import {
   ChatwootCalledOffError,
   type ChatwootClient,
   type CustomAttributeDef,
+  type RyzeReplyButton,
 } from "@/modules/chatwoot/client";
 import { type KanbanContext, matchKanbanStep } from "@/modules/chatwoot/kanban";
 import { withConversationLabels } from "@/modules/chatwoot/labels";
@@ -142,6 +143,10 @@ export interface TurnState {
   // `declinedToSpeak` is: the shape is spelled out by hand at several call sites, and absent means
   // exactly what it says — nobody recorded an ack.
   spokeOutsideTheReply?: boolean;
+  // Buttons the agent asked to show this turn (send_buttons). Like the attachments, NOT sent by the
+  // tool: they ride the reply's last text balloon through the same gates (RyzeAPI only). A second
+  // call replaces the first; the output guardrail screens their titles and a trip drops them.
+  pendingButtons?: RyzeReplyButton[];
 }
 
 // Isolated from TurnState on purpose: reactive turns and proactive nudges share handoff delivery,
@@ -1985,6 +1990,79 @@ function reactToMessageTool(ctx: ToolCtx) {
   );
 }
 
+// Show up to 3 buttons under the reply (RyzeAPI WhatsApp numbers): reply buttons, whose tap comes back
+// as the button's title, or link buttons that open a page (a checkout, an order). Nothing is sent by the
+// tool: the buttons ride the last text balloon of this turn's reply (TurnState.pendingButtons), so a
+// reply discarded by a gate takes its buttons with it, and the reply goes out as text, not audio.
+function sendButtonsTool(ctx: ToolCtx) {
+  return failableTool(
+    async ({ buttons }: { buttons: { title: string; url?: string }[] }) => {
+      if (!ctx.turnState) return "Buttons are not available here.";
+      if (!ctx.client.isRyzeEmulator) {
+        return "Buttons only work on WhatsApp numbers connected through RyzeAPI. Write the options in the reply text instead.";
+      }
+      const titles = buttons.map((b) => b.title.trim());
+      if (titles.some((t) => !t || t.length > 20)) {
+        return "Each button title must have 1 to 20 characters. Shorten them and call again.";
+      }
+      if (new Set(titles.map((t) => t.toLowerCase())).size !== titles.length) {
+        return "Two buttons have the same title. Make each one different and call again.";
+      }
+      const links = buttons.filter((b) => b.url !== undefined).length;
+      if (links > 0 && links !== buttons.length) {
+        return "Use either reply buttons (no url) or link buttons (all with url), never both on one message. Call again with one kind.";
+      }
+      for (const b of buttons) {
+        if (b.url === undefined) continue;
+        let ok = false;
+        try {
+          const u = new URL(b.url);
+          ok = u.protocol === "https:" && !u.username && !u.password;
+        } catch {
+          ok = false;
+        }
+        if (!ok) {
+          return `The link of "${b.title}" must be a full https:// address. Call again with the right link.`;
+        }
+      }
+      const replaced = !!ctx.turnState.pendingButtons?.length;
+      ctx.turnState.pendingButtons = buttons.map(
+        (b, i): RyzeReplyButton =>
+          b.url !== undefined
+            ? { title: titles[i] as string, url: b.url }
+            : { title: titles[i] as string, id: `btn-${i + 1}` },
+      );
+      return `${replaced ? "Buttons replaced. " : ""}The ${buttons.length} button(s) will appear under the LAST message of your reply. Now write the reply normally, ending with the question or offer the buttons answer, and do NOT list the options again in the text. A tap comes back to you as the button's title.`;
+    },
+    {
+      name: "send_buttons",
+      description:
+        "Show 1 to 3 tappable buttons under your reply on WhatsApp. Reply buttons (no url) give the customer quick answers to your last question; the tap comes back to you as the button's title. Link buttons (every button with a https url) open a page, e.g. the checkout link. Never mix the two kinds. Titles: up to 20 characters, short and distinct. Call it BEFORE writing the reply, then write the reply text as usual (the buttons attach to its last message), without repeating the options in the text. A reply with buttons is sent as text, never as a voice note. Calling again in the same turn replaces the buttons.",
+      schema: z.object({
+        buttons: z
+          .array(
+            z.object({
+              title: z
+                .string()
+                .min(1)
+                .max(20)
+                .describe("What the button shows, up to 20 characters."),
+              url: z
+                .string()
+                .optional()
+                .describe(
+                  "Only for a link button: the full https:// address it opens.",
+                ),
+            }),
+          )
+          .min(1)
+          .max(3)
+          .describe("1 to 3 buttons, all reply buttons or all link buttons."),
+      }),
+    },
+  );
+}
+
 const SKIP_REPLY_DESCRIPTION =
   "Decide NOT to send any reply this turn, then output NO reply text (end your turn). `reason` decides what happens next: `acknowledged` when a reply would add nothing (the customer sent just 'ok', 'obrigado' or an emoji, optionally after react_to_message) and the conversation stays with you; `not_for_us` when this is not a real conversation (an automated report, a payment notice, a newsletter, an unsolicited pitch); `needs_human` when it is a real request you cannot resolve. The last two hand the conversation to the team with a private note, and so does ANY skip on a conversation nobody on our side has answered yet.";
 
@@ -2576,6 +2654,7 @@ export function buildNativeTools(
     setVoicePreferenceTool(ctx),
     reactToMessageTool(ctx),
     sendImageTool(ctx),
+    sendButtonsTool(ctx),
     ...(ctx.crossInboxCase?.config.targetInboxId != null
       ? [openCaseInInboxTool(ctx)]
       : []),

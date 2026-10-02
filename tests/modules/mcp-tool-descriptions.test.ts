@@ -302,7 +302,11 @@ const SETTINGS_DESC_CEILING = 2_000;
 //
 // RAISED by the `assemblyai` STT and `gemini` TTS providers, two enum members the registries publish:
 // 22 characters, nothing to trim. Re-measured on the tree that ships: 28,713.
-const SETTINGS_SCHEMA_CEILING = 28_728;
+//
+// RAISED by the `send_buttons` native (buttons under a RyzeAPI reply): one more name in every per-tool
+// enum the settings publish (grants, toolGuidance, toolPreconditions), 386 characters, nothing to
+// trim — the name is the whole entry. Re-measured on the tree that ships: 29,114.
+const SETTINGS_SCHEMA_CEILING = 29_129;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -765,7 +769,8 @@ describe("MCP tool descriptions", () => {
       schema += t.schema.length;
     }
     expect(desc).toBeLessThanOrEqual(31_895);
-    expect(schema).toBeLessThanOrEqual(65_027);
+    // +386 for the `send_buttons` native, the same enum growth as SETTINGS_SCHEMA_CEILING.
+    expect(schema).toBeLessThanOrEqual(65_427);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

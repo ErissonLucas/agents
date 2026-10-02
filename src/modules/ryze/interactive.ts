@@ -14,6 +14,7 @@ import {
   createRyzeClient,
   type RyzeClient,
   type RyzeSentMessage,
+  ryzeRecipient,
 } from "./client";
 import { RYZE_OPERATOR_USER } from "./constants";
 import { emitToBots } from "./emit";
@@ -243,6 +244,45 @@ export function validateCard(card: CardInput): void {
 
 export function validateText(msg: TextInput): void {
   validateRecipientAndText(msg.to, msg.text, "message");
+}
+
+// The buttons a reply sent through the emulator carries (`content_attributes.buttons`, written by
+// send_buttons), checked by the same rules as an admin card: 1 to 3, reply OR link, titles of up to 20
+// characters. Copy buttons are the operator's, not the agent's. Null when there are none or they fail
+// the rules: the reply then goes out as plain text, which beats a reply that does not go at all.
+export function cardButtonsOf(
+  bag: unknown,
+  chatJid: string,
+  text: string,
+): CardInput["buttons"] | null {
+  if (!bag || typeof bag !== "object") return null;
+  const raw = (bag as { buttons?: unknown }).buttons;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const buttons: CardInput["buttons"] = [];
+  for (const b of raw) {
+    if (!b || typeof b !== "object") return null;
+    const { id, url, title } = b as Record<string, unknown>;
+    if (typeof title !== "string") return null;
+    if (typeof id === "string" && url === undefined)
+      buttons.push({ id, title });
+    else if (typeof url === "string" && id === undefined)
+      buttons.push({ url, title });
+    else return null;
+  }
+  try {
+    validateCard({
+      to: ryzeRecipient(chatJid).replace(/\D/g, ""),
+      text,
+      buttons,
+    });
+    return buttons;
+  } catch (err) {
+    logger.warn(
+      "ryze: reply buttons refused, sending the text alone: %s",
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
 }
 
 // Stages the agent-owned row in the contact's conversation on this number (a Brazilian mobile

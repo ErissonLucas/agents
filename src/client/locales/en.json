@@ -643,6 +643,7 @@
       "note": "Writing an internal note",
       "openCase": "Opening the case in another inbox",
       "react": "Reacting to a message",
+      "buttons": "Adding buttons to the reply",
       "resolve": "Wrapping up the conversation",
       "search": "Searching the knowledge base",
       "skip": "Decided not to respond",
@@ -2379,6 +2380,10 @@
     "react_to_message": {
       "desc": "React to the customer's last message with an emoji (WhatsApp reaction).",
       "label": "React with emoji"
+    },
+    "send_buttons": {
+      "desc": "Show up to 3 tappable buttons (quick replies or links) under the reply on WhatsApp (RyzeAPI).",
+      "label": "Send buttons"
     },
     "resolve_conversation": {
       "desc": "Mark the conversation as resolved when the request is fully handled.",

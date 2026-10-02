@@ -661,6 +661,7 @@
       "note": "Escrevendo uma nota interna",
       "openCase": "Abrindo o caso em outra caixa",
       "react": "Reagindo a uma mensagem",
+      "buttons": "Colocando botões na resposta",
       "resolve": "Encerrando o atendimento",
       "search": "Consultando a base de conhecimento",
       "skip": "Decidiu não responder",
@@ -2445,6 +2446,10 @@
     "react_to_message": {
       "desc": "Reage à última mensagem do cliente com um emoji (reação do WhatsApp).",
       "label": "Reagir com emoji"
+    },
+    "send_buttons": {
+      "desc": "Mostra até 3 botões (respostas rápidas ou links) embaixo da resposta no WhatsApp (RyzeAPI).",
+      "label": "Enviar botões"
     },
     "resolve_conversation": {
       "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",

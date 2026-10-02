@@ -67,6 +67,10 @@ const BY_TOOL = new Map<string, ToolLabel>(
       key: "conversation.activity.react",
       fallback: "Reacting to a message",
     },
+    send_buttons: {
+      key: "conversation.activity.buttons",
+      fallback: "Adding buttons to the reply",
+    },
     skip_reply: {
       key: "conversation.activity.skip",
       fallback: "Decided not to respond",

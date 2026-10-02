@@ -9,6 +9,14 @@ import {
   CHATWOOT_SEND_ID_KEY,
 } from "./constants";
 
+// A button on a reply sent to a RyzeAPI number (send_buttons): a reply button (`id`, the tap comes
+// back as the button's title) or a link button (`url`). Never both kinds on one message.
+export type RyzeReplyButton = { title: string } & (
+  | { id: string }
+  | { url: string }
+);
+const RYZE_EMULATOR_URL_PREFIX = "https://203.0.113.250/ryze-emulator";
+
 // Chatwoot Application API client with the dual-identity profiles (validated against the
 // chatwoot-pro fork's BOT_ACCESSIBLE_ENDPOINTS):
 //   * bot-token  → send messages (outgoing + private note), assign (handoff), toggle status,
@@ -433,6 +441,13 @@ export class ChatwootClient {
     this.accountBase = `${root}/api/v1/accounts/${config.accountId}`;
   }
 
+  // Whether this client talks to the RyzeAPI emulator (a WhatsApp number with no Chatwoot), the only
+  // channel where a reply can carry buttons. Same root as RYZE_EMULATOR_ROOT (ryze/constants.ts),
+  // spelled here so the Chatwoot client does not import the Ryze module.
+  get isRyzeEmulator(): boolean {
+    return this.config.baseUrl.startsWith(RYZE_EMULATOR_URL_PREFIX);
+  }
+
   // WHETHER ANYTHING THIS CLIENT DOES CAN REACH THE CUSTOMER. Asked by callers that arm an effect
   // the transport cannot see — a scheduled reminder is the one that matters: it runs later, through
   // the inbox's RESPONDER and a client of its own, so a mute here does not reach it (issue #568,
@@ -512,8 +527,17 @@ export class ChatwootClient {
       // everywhere else there is nothing to reconcile, and a key written for nobody to read is the
       // hypothesis-shaped debt this repo asks callers not to leave behind.
       sendId?: string;
+      // Buttons for the RyzeAPI emulator, which sends a message carrying them as a WhatsApp card
+      // (send_buttons). Only ever set on a Ryze inbox: on a real Chatwoot the bag reaches the contact.
+      buttons?: RyzeReplyButton[];
     } = {},
   ): Promise<unknown> {
+    const bag = {
+      ...(opts.sendId === undefined
+        ? {}
+        : { [CHATWOOT_SEND_ID_KEY]: opts.sendId }),
+      ...(opts.buttons?.length ? { buttons: opts.buttons } : {}),
+    };
     return this.request(
       this.config.botToken,
       "POST",
@@ -530,9 +554,7 @@ export class ChatwootClient {
         // renders `json.content_attributes message.content_attributes` and `Message#push_event_data`
         // ships the whole attributes hash. A name for the send is ours and opaque; anything that
         // says something about the account's own state belongs on our side of the fence.
-        ...(opts.sendId === undefined
-          ? {}
-          : { content_attributes: { [CHATWOOT_SEND_ID_KEY]: opts.sendId } }),
+        ...(Object.keys(bag).length ? { content_attributes: bag } : {}),
       },
     );
   }

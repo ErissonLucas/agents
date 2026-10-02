@@ -53,8 +53,10 @@ interface RyzeCall {
   body: Record<string, unknown>;
 }
 
+// One counter for the whole suite: the emulator builds a client per send, and a counter per client
+// would hand every send the same gateway id.
+let n = 0;
 function fakeRyze(calls: RyzeCall[]): RyzeClient {
-  let n = 0;
   const fetchImpl = (async (
     input: string | URL | Request,
     init?: RequestInit,
@@ -80,7 +82,8 @@ function fakeRyze(calls: RyzeCall[]): RyzeClient {
         ],
       });
     }
-    n += 1;
+    // Only sends take an id, so the suite's first message is WAOUT1 whatever was configured before.
+    if (url.pathname.startsWith("/api/message/")) n += 1;
     return Response.json({
       success: true,
       data: { messageId: `WAOUT${n}`, timestamp: new Date().toISOString() },
@@ -385,6 +388,60 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     } finally {
       config.ryzeAutomationSources.length = 0;
     }
+  });
+
+  test("a reply carrying buttons (send_buttons) leaves as a WhatsApp card", async () => {
+    const client = await loadChatwootClient(tenantId, instanceId, {
+      base: appDb,
+      botToken,
+    });
+    expect(client.isRyzeEmulator).toBe(true);
+    await client.sendMessage(conversationId, "Bora fechar?", {
+      sendId: "s-btn",
+      buttons: [
+        { id: "btn-1", title: "Quero" },
+        { id: "btn-2", title: "Ver cardápio" },
+      ],
+    });
+    const card = calls.findLast((c) => c.path.startsWith("/api/message/"));
+    expect(card?.path.startsWith("/api/message/button")).toBe(true);
+    expect(card?.body.contentText).toBe("Bora fechar?");
+    expect(card?.body.buttons).toEqual([
+      { id: "btn-1", displayText: "Quero", type: "REPLY" },
+      { id: "btn-2", displayText: "Ver cardápio", type: "REPLY" },
+    ]);
+
+    await client.sendMessage(conversationId, "Seu link", {
+      buttons: [
+        {
+          url: "https://villaengenho.com.br/sacola?s=x",
+          title: "Finalizar pedido",
+        },
+      ],
+    });
+    const link = calls.findLast((c) => c.path.startsWith("/api/message/"));
+    expect(link?.body.buttons).toEqual([
+      {
+        id: "https://villaengenho.com.br/sacola?s=x",
+        displayText: "Finalizar pedido",
+        type: "URL",
+      },
+    ]);
+  });
+
+  test("buttons that break the card rules do not stop the reply: it leaves as plain text", async () => {
+    const client = await loadChatwootClient(tenantId, instanceId, {
+      base: appDb,
+      botToken,
+    });
+    await client.sendMessage(conversationId, "Escolhe aí", {
+      buttons: [
+        { id: "btn-1", title: "Um" },
+        { url: "https://exemplo.com", title: "Dois" },
+      ],
+    });
+    const send = calls.findLast((c) => c.path.startsWith("/api/message/"));
+    expect(send?.path.startsWith("/api/message/text")).toBe(true);
   });
 
   test("status changes are served live and announced to the bot", async () => {

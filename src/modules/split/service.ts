@@ -3,6 +3,7 @@ import {
   ChatwootApiError,
   type ChatwootClient,
   ChatwootMissingTokenError,
+  type RyzeReplyButton,
 } from "@/modules/chatwoot/client";
 import {
   chatwootMessageListLength,
@@ -254,7 +255,12 @@ export async function deliverReply(
     separator: SignatureSeparator;
     frequency: SignatureFrequency;
   } | null = null,
+  // BUTTONS FOR THE LAST BALLOON (send_buttons, RyzeAPI only): the options read right under the
+  // words that offer them, so they ride the message that closes the reply — and the one retry, which
+  // always carries the last balloon. Null on every other channel and on an audio reply.
+  buttons: RyzeReplyButton[] | null = null,
 ): Promise<ReplyDelivery> {
+  const withButtons = buttons?.length ? { buttons } : {};
   return withFlowStage(
     flow,
     "split",
@@ -274,7 +280,10 @@ export async function deliverReply(
           ? attachSignature([reply], signature.text, signature)
           : [reply];
         try {
-          await client.sendMessage(conversationId, single, { sendId });
+          await client.sendMessage(conversationId, single, {
+            sendId,
+            ...withButtons,
+          });
           return { delivered: 1, failed: false, unproven: false };
         } catch (e) {
           // ASKED HERE TOO. There is no remainder to salvage on this path, so nothing is ever
@@ -353,6 +362,7 @@ export async function deliverReply(
           try {
             const res = await client.sendMessage(conversationId, chunk, {
               sendId,
+              ...(i === chunks.length - 1 ? withButtons : {}),
             });
             noteDelivered(createdMessageId(res));
           } catch (e) {
@@ -460,6 +470,7 @@ export async function deliverReply(
                 createdMessageId(
                   await client.sendMessage(conversationId, owed, {
                     sendId: retrySendId,
+                    ...withButtons,
                   }),
                 ),
               );

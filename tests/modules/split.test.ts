@@ -193,6 +193,55 @@ describe("deliverReply", () => {
     expect(rec.typing).toEqual([true, true, false]);
   });
 
+  test("buttons (send_buttons) ride only the LAST balloon, split or not", async () => {
+    const seen: Array<{ content: string; buttons?: unknown }> = [];
+    const client = {
+      sendMessage: async (
+        _c: number,
+        content: string,
+        opts: { buttons?: unknown } = {},
+      ) => {
+        seen.push({ content, buttons: opts.buttons });
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    const buttons = [
+      { id: "btn-1", title: "Quero" },
+      { id: "btn-2", title: "Depois" },
+    ];
+    await deliverReply(
+      client,
+      1,
+      "Olha essa!\n\nBora pedir?",
+      { ...SPLIT_DEFAULTS, enabled: true },
+      noSleep,
+      undefined,
+      async () => false,
+      null,
+      null,
+      buttons,
+    );
+    expect(seen).toEqual([
+      { content: "Olha essa!", buttons: undefined },
+      { content: "Bora pedir?", buttons },
+    ]);
+    seen.length = 0;
+    await deliverReply(
+      client,
+      1,
+      "Bora pedir?",
+      { ...SPLIT_DEFAULTS, enabled: false },
+      noSleep,
+      undefined,
+      async () => false,
+      null,
+      null,
+      buttons,
+    );
+    expect(seen).toEqual([{ content: "Bora pedir?", buttons }]);
+  });
+
   // A split reply is several sends with a typing pause between them, so /reset landing after the
   // first balloon finds a run that already answered its only fence. Asked per balloon, the rest of
   // the message stays unsent — and the count reports what actually landed, not what was planned,
