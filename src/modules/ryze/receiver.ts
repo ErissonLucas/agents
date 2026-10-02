@@ -7,6 +7,7 @@ import type {
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import config from "@/config";
 import { asSuperAdminOn, type ScopedDb } from "@/lib/tenancy";
 import { hashRouteToken } from "@/modules/webhooks/inbound/route-token";
 import { RYZE_SOURCE } from "./client";
@@ -286,6 +287,12 @@ async function handleMessage(
   if (outgoing && str(msg.source) === RYZE_SOURCE) {
     return { status: 200, outcome: "ignored" };
   }
+  // Another system sending through this number (config.ryzeAutomationSources): kept in the history,
+  // but shaped like an automation rule's send, so it is not a person taking the conversation over.
+  const automationSource =
+    outgoing && config.ryzeAutomationSources.includes(str(msg.source) ?? "")
+      ? str(msg.source)
+      : null;
 
   const sender = isRecord(msg.sender) ? msg.sender : {};
   const text = textOf(msg);
@@ -333,12 +340,14 @@ async function handleMessage(
         ...(buttonReply
           ? { button_reply: { id: buttonReply.id, title: buttonTitle } }
           : {}),
-        ...(outgoing
-          ? {
-              external_sender_name: RYZE_DEVICE_SENDER_NAME,
-              external_created_at: Math.floor(Date.now() / 1000),
-            }
-          : {}),
+        ...(automationSource
+          ? { automation_source: automationSource }
+          : outgoing
+            ? {
+                external_sender_name: RYZE_DEVICE_SENDER_NAME,
+                external_created_at: Math.floor(Date.now() / 1000),
+              }
+            : {}),
       };
       const created = await db.ryzeMessage.create({
         data: {

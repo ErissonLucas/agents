@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
+import config from "@/config";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import { bindInbox } from "@/modules/chatwoot/management";
@@ -351,6 +352,39 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     const event = delivered.at(-1) as NormalizedChatwootEvent;
     expect(event.message?.messageType).toBe("outgoing");
     expect(hasDeviceAttendantShape(event)).toBe(true);
+  });
+
+  test("a send by another system on the number (automation source) is history, not a person on the phone", async () => {
+    config.ryzeAutomationSources.push("villa-app");
+    try {
+      const res = await receiveRyzeWebhook({
+        routeToken,
+        authorization: auth,
+        base: appDb,
+        rawBody: JSON.stringify({
+          event: "message.exchange",
+          data: {
+            message: {
+              id: "WAAPP1",
+              direction: "outgoing",
+              source: "villa-app",
+              chat: { jid: "5581999990000", type: "private" },
+              content: { text: "Tá na chapa! Assim que sair, te aviso aqui." },
+            },
+          },
+        }),
+      });
+      expect(res.outcome).toBe("accepted");
+      await drainEmits(gatewayId);
+      const event = delivered.at(-1) as NormalizedChatwootEvent;
+      expect(event.message?.messageType).toBe("outgoing");
+      expect(event.message?.content).toBe(
+        "Tá na chapa! Assim que sair, te aviso aqui.",
+      );
+      expect(hasDeviceAttendantShape(event)).toBe(false);
+    } finally {
+      config.ryzeAutomationSources.length = 0;
+    }
   });
 
   test("status changes are served live and announced to the bot", async () => {

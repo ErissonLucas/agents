@@ -67,6 +67,7 @@ const {
   RYZE_BUTTON_BRIDGE_URL,
   RYZE_BUTTON_BRIDGE_SECRET,
   RYZE_BUTTON_BRIDGE_PREFIX,
+  RYZE_AUTOMATION_SOURCES,
 } = process.env;
 
 // NOTE: Domain entries are trimmed, lowercased, and have a leading "@" stripped
@@ -654,6 +655,15 @@ const config = {
     secret: (RYZE_BUTTON_BRIDGE_SECRET ?? "").trim(),
     prefix: (RYZE_BUTTON_BRIDGE_PREFIX ?? "").trim(),
   },
+  // NOTE: `source` values (comma-separated) of another system that sends through the SAME RyzeAPI
+  // number — e.g. a store app's order-status messages. Their outgoing echoes are kept in the
+  // conversation as automation (like a Chatwoot automation rule's send), never as a person typing on
+  // the phone, so they do not take the conversation away from the agent. Empty = every unknown
+  // outgoing message is a person on the phone, as before.
+  ryzeAutomationSources: (RYZE_AUTOMATION_SOURCES ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   hub: {
     // NOTE: trim before stripping trailing slashes so a padded or whitespace-only value resolves to
     // "" (disabled) instead of a malformed URL.
