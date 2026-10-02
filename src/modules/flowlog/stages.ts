@@ -27,6 +27,7 @@ export const FLOW_STAGES = [
   "spend_ceiling",
   "generate", // the LLM turn (graph.invoke)
   "guardrail", // input/output moderation trip (a guardrails check fired)
+  "jev", // Jev fast decisions around a turn: the reading before the model, the rule check after it
   "tool", // a tool call the agent made during the turn (name + status + duration)
   "normalize", // the reply rewritten for speech before synthesis (its own model call)
   "tts", // audio-reply synthesis

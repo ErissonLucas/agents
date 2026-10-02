@@ -2271,6 +2271,7 @@
       "embed": "Embedding",
       "generate": "Geração",
       "guardrail": "Verificação de guardrails",
+      "jev": "Decisão do Jev",
       "handoff": "Transferência",
       "memory": "Memória",
       "normalize": "Reescrita para fala",

@@ -71,6 +71,7 @@ const {
   RYZE_BUTTON_BRIDGE_2_URL,
   RYZE_BUTTON_BRIDGE_2_SECRET,
   RYZE_BUTTON_BRIDGE_2_PREFIX,
+  TYPESAFE_API_KEY,
 } = process.env;
 
 // NOTE: Domain entries are trimmed, lowercased, and have a leading "@" stripped
@@ -661,6 +662,11 @@ const config = {
   // NOTE: A second button bridge, for another system answering taps on its own prefix (e.g. a store
   // app's "villa:" approval cards while "maria:" goes to the first). Same contract and header; a tap
   // goes to the bridge whose prefix it starts with, the longest one if both match.
+  // NOTE: Jev (TypeSafe AI) for the per-agent fast decisions (modules/jev). No key = off everywhere,
+  // whatever an agent's settings say.
+  jev: {
+    apiKey: (TYPESAFE_API_KEY ?? "").trim(),
+  },
   ryzeButtonBridge2: {
     url: (RYZE_BUTTON_BRIDGE_2_URL ?? "").trim(),
     secret: (RYZE_BUTTON_BRIDGE_2_SECRET ?? "").trim(),

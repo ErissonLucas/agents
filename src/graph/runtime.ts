@@ -72,6 +72,12 @@ import {
   GuardrailHandoffFailedError,
 } from "@/modules/guardrails/handoff";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
+import {
+  isBareAcknowledgement,
+  readCustomerMessage,
+  readingNote,
+  replyBreaksRules,
+} from "@/modules/jev/service";
 import { armCompaction } from "@/modules/memory/compact";
 import { signatureFor } from "@/modules/signature/service";
 import { holdPresence, type PresenceHold } from "@/modules/split/presence";
@@ -2401,6 +2407,50 @@ async function turnBody(
       return "blocked";
     }
 
+    // JEV (modules/jev): one fast, typed read of the customer's message before the model runs. A bare
+    // acknowledgement is answered with a reaction and no model call; anything else reaches the model
+    // with a short reading appended (asked for a person, frustration, intent). Best-effort: a reading
+    // that could not be taken leaves the turn exactly as it was.
+    let jevNote: string | null = null;
+    if (loaded.jevConfig && text.trim()) {
+      const reading = await readCustomerMessage(loaded.jevConfig, text);
+      if (reading) {
+        emitFlowEvent(flow, {
+          stage: "jev",
+          level: "info",
+          status: "ok",
+          detail: { ...reading },
+        });
+        if (isBareAcknowledgement(loaded.jevConfig, reading, text)) {
+          if (await writeCalledOff()) return standDown();
+          const blocked = await postBlocked();
+          if (blocked) return blocked;
+          if (!(await claimBeforeSend())) return "superseded";
+          try {
+            const latest =
+              await client.getLatestIncomingMessage(conversationId);
+            if (latest && !latest.isReaction) {
+              await client.addMessageReaction(
+                conversationId,
+                latest.id,
+                loaded.jevConfig.ackEmoji,
+              );
+            }
+          } catch (err) {
+            logger.warn(
+              "jev: acknowledgement reaction failed (conv=%s): %s",
+              String(conversationId),
+              err instanceof Error ? err.message : String(err),
+            );
+          }
+          // Consumed, nothing to say: the same word a suppression uses, so the watermark advances.
+          return "blocked";
+        }
+        jevNote = readingNote(loaded.jevConfig, reading);
+      }
+      if (await writeCalledOff()) return standDown();
+    }
+
     // The second ask, and it is not a repeat of the one inside the lock: that one guards the divider
     // and the claim, this one guards the INVOKE, which persists the channel. Between them sit the
     // state read, the toolset build and the prompt resolution, and on a conversation with no
@@ -2558,7 +2608,7 @@ async function turnBody(
               // finished saying it. Unknown stays unstamped rather than becoming the turn's clock.
               new HumanMessage({
                 id: inputMessageId,
-                content: text,
+                content: jevNote ? `${text}\n\n${jevNote}` : text,
                 additional_kwargs: {
                   ...conversationStamp(conversationId),
                   ...sentAtStamp(loaded.promptOpts.messageAt),
@@ -2925,6 +2975,39 @@ async function turnBody(
         [c.title, c.text, c.footer ?? "", c.buttonTitle].filter(Boolean),
       ),
     ];
+    // JEV rule check (modules/jev): a reply that breaks the operator's rules (a discount, coupon or
+    // deadline they do not grant) is held back and the case goes to the team, like an output
+    // guardrail that hands off. Best-effort: a check that could not run lets the reply through to
+    // the guardrails below, as before.
+    if (loaded.jevConfig?.outputCheck.enabled && reply) {
+      const breaks = await replyBreaksRules(
+        loaded.jevConfig,
+        [reply, ...modelWritten].filter(Boolean).join("\n"),
+      );
+      if (breaks !== null) {
+        const held = breaks >= loaded.jevConfig.outputCheck.threshold;
+        emitFlowEvent(flow, {
+          stage: "jev",
+          level: "info",
+          status: "ok",
+          detail: { outputCheck: breaks, held },
+        });
+        if (await writeCalledOff()) return refuse(standDown());
+        if (held) {
+          turnState.pendingAttachments.length = 0;
+          turnState.pendingButtons = undefined;
+          turnState.pendingCarousel = undefined;
+          const handed = await handOverForGuardrail("output");
+          if (handed !== "handed" && handed !== "failed") return refuse(handed);
+          if (handed === "failed") {
+            handoffFailed = "output";
+            return refuse("empty");
+          }
+          reply = loaded.jevConfig.outputCheck.handoffMessage;
+          replyRecovered = false;
+        }
+      }
+    }
     const screened = [reply, ...modelWritten].filter(Boolean).join("\n");
     const outGuard = screened ? await runGuardrail("output", screened) : null;
     // Same wait, same reason: `postBlocked` answered before this model call, and the suppressed

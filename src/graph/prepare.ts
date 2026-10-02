@@ -94,6 +94,7 @@ import {
   type IntegrationSelection,
   type SideEffectErrorReporter,
 } from "@/modules/integrations/toolpacks";
+import { type JevConfig, readJevConfig } from "@/modules/jev/service";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { ryzeLabelPromptSection } from "@/modules/ryze/label-shared";
@@ -297,6 +298,8 @@ export interface AgentConfig {
   contactAuthConfig: ContactAuthConfig;
   // Hosts the send_image tool may fetch an image from (operator-set; empty = the tool refuses).
   sendImageConfig: SendImageConfig;
+  // Jev fast decisions around the turn (modules/jev); null = off for this agent.
+  jevConfig: JevConfig | null;
   // Where `open_case_in_inbox` opens the case (operator-set; no inbox = the tool is not built).
   crossInboxCaseConfig: CrossInboxCaseConfig;
   // The origin contact as Chatwoot knows it; what `open_case_in_inbox` settles the identity on.
@@ -943,6 +946,7 @@ export async function loadAgentConfig(
     handoffConfig: readHandoffConfig(effSettings),
     contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
+    jevConfig: readJevConfig(effSettings),
     crossInboxCaseConfig,
     chatwootContactId: conv?.contact?.chatwootContactId ?? null,
     kanbanConfig: readKanbanConfig(effSettings),

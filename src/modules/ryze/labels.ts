@@ -769,12 +769,9 @@ async function conversationForJid(
  * A `label.update` from RyzeAPI. `edit` refreshes (or imports, or deletes) the catalog row of that
  * WhatsApp id; `chat` is the team labelling a chat on the phone: the title moves on the conversation,
  * joins its `deviceLabels`, and is NOT synced back. Idempotent: an event that changes nothing (a
- * redelivery, or the echo of our own sync) announces nothing.
- *
- * A `human_takeover` label is also the handoff switch on the phone, for numbers with no Chatwoot
- * console: put on, the conversation opens (a human has it, the agent stops — `shouldBotHandle` only
- * answers `pending`); taken off an open conversation, it goes back to `pending` and the agent
- * answers again. The echo of our own takeover sync changes nothing, so it cannot flip it back.
+ * redelivery, or the echo of our own sync) announces nothing. A `human_takeover` label is also the
+ * handoff switch on the phone: put on, the conversation opens and the agent stops; taken off an open
+ * one, it goes back to `pending` and the agent answers again.
  */
 export async function handleLabelUpdate(
   gw: RyzeGateway,

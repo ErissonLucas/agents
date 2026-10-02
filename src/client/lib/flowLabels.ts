@@ -28,6 +28,8 @@ export function flowStageLabel(stage: string, t: TFunction): string {
       return t("logs.stage.generate", "Generation");
     case "guardrail":
       return t("logs.stage.guardrail", "Guardrail check");
+    case "jev":
+      return t("logs.stage.jev", "Jev decision");
     case "tool":
       return t("logs.stage.tool", "Tool call");
     case "normalize":

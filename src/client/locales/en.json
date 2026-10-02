@@ -2207,6 +2207,7 @@
       "embed": "Embedding",
       "generate": "Generation",
       "guardrail": "Guardrail check",
+      "jev": "Jev decision",
       "handoff": "Handoff",
       "memory": "Memory",
       "normalize": "Speech rewrite",
