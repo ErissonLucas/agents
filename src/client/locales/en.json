@@ -644,6 +644,7 @@
       "openCase": "Opening the case in another inbox",
       "react": "Reacting to a message",
       "buttons": "Adding buttons to the reply",
+      "carousel": "Adding a carousel to the reply",
       "resolve": "Wrapping up the conversation",
       "search": "Searching the knowledge base",
       "skip": "Decided not to respond",
@@ -2384,6 +2385,10 @@
     "send_buttons": {
       "desc": "Show up to 3 tappable buttons (quick replies or links) under the reply on WhatsApp (RyzeAPI).",
       "label": "Send buttons"
+    },
+    "send_carousel": {
+      "desc": "Show 2 to 5 swipeable product cards (photo, name, price, button) under the reply on WhatsApp (RyzeAPI).",
+      "label": "Send carousel"
     },
     "resolve_conversation": {
       "desc": "Mark the conversation as resolved when the request is fully handled.",

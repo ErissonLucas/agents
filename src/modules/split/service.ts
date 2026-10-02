@@ -3,6 +3,7 @@ import {
   ChatwootApiError,
   type ChatwootClient,
   ChatwootMissingTokenError,
+  type RyzeCarouselCard,
   type RyzeReplyButton,
 } from "@/modules/chatwoot/client";
 import {
@@ -259,8 +260,14 @@ export async function deliverReply(
   // words that offer them, so they ride the message that closes the reply — and the one retry, which
   // always carries the last balloon. Null on every other channel and on an audio reply.
   buttons: RyzeReplyButton[] | null = null,
+  // A CAROUSEL FOR THE LAST BALLOON (send_carousel, RyzeAPI only), on the same terms as `buttons`:
+  // the closing text becomes the line above the cards.
+  carousel: RyzeCarouselCard[] | null = null,
 ): Promise<ReplyDelivery> {
-  const withButtons = buttons?.length ? { buttons } : {};
+  const withButtons = {
+    ...(buttons?.length ? { buttons } : {}),
+    ...(carousel?.length ? { carousel } : {}),
+  };
   return withFlowStage(
     flow,
     "split",

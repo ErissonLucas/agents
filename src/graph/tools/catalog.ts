@@ -15,6 +15,7 @@ export const NATIVE_TOOL_NAMES = [
   "react_to_message",
   "send_image",
   "send_buttons",
+  "send_carousel",
   "open_case_in_inbox",
   "skip_reply",
   "calculator",
@@ -75,6 +76,7 @@ export const NATIVE_TOOL_CATEGORY: Record<NativeToolName, NativeToolCategory> =
     react_to_message: "conversation",
     send_image: "conversation",
     send_buttons: "conversation",
+    send_carousel: "conversation",
     open_case_in_inbox: "conversation",
     skip_reply: "conversation",
     calculator: "utility",
@@ -101,6 +103,7 @@ export const CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES: readonly NativeToolName[] = [
   "react_to_message",
   "send_image",
   "send_buttons",
+  "send_carousel",
   // Its opening message reaches the customer in the destination inbox (issue #700).
   "open_case_in_inbox",
 ];

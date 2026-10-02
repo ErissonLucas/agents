@@ -444,6 +444,65 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     expect(send?.path.startsWith("/api/message/text")).toBe(true);
   });
 
+  test("a reply carrying a carousel (send_carousel) leaves as cards, and a tap names the card", async () => {
+    const client = await loadChatwootClient(tenantId, instanceId, {
+      base: appDb,
+      botToken,
+    });
+    const card = (n: number, title: string) => ({
+      id: `card-${n}`,
+      title,
+      text: "Picanha selada e queijo derretendo.",
+      footer: "R$ 47,99",
+      imageUrl: `https://villaengenho.com.br/menu/${n}.jpg`,
+      buttonTitle: "Quero esse",
+    });
+    await client.sendMessage(conversationId, "Olha as ofertas 🔥", {
+      carousel: [card(1, "Super Oferta"), card(2, "Trio Ternura")],
+    });
+    const sent = calls.findLast((c) => c.path.startsWith("/api/message/"));
+    expect(sent?.path.startsWith("/api/message/carousel")).toBe(true);
+    expect(sent?.body.message).toBe("Olha as ofertas 🔥");
+    expect((sent?.body.cards as unknown[])[1]).toEqual({
+      header: {
+        title: "Trio Ternura",
+        imageUrl: "https://villaengenho.com.br/menu/2.jpg",
+      },
+      body: { text: "Picanha selada e queijo derretendo." },
+      footer: "R$ 47,99",
+      buttons: [{ id: "card-2", displayText: "Quero esse", type: "REPLY" }],
+    });
+
+    const tap = await receiveRyzeWebhook({
+      routeToken,
+      authorization: auth,
+      base: appDb,
+      rawBody: JSON.stringify({
+        event: "message.exchange",
+        data: {
+          message: {
+            id: "WATAP-CARD",
+            direction: "incoming",
+            type: "template_button_reply",
+            chat: { jid: "5581999990000", type: "private" },
+            content: { text: "card-2" },
+            interactive: { selectedButtonId: "card-2", title: "Quero esse" },
+          },
+        },
+      }),
+    });
+    expect(tap.outcome).toBe("accepted");
+    await drainEmits(gatewayId);
+    const event = delivered.at(-1) as NormalizedChatwootEvent;
+    expect(event.message?.content).toBe("Quero esse — Trio Ternura");
+
+    await client.sendMessage(conversationId, "Só um", {
+      carousel: [card(1, "Super Oferta")],
+    });
+    const lone = calls.findLast((c) => c.path.startsWith("/api/message/"));
+    expect(lone?.path.startsWith("/api/message/text")).toBe(true);
+  });
+
   test("status changes are served live and announced to the bot", async () => {
     const client = await loadChatwootClient(tenantId, instanceId, {
       base: appDb,

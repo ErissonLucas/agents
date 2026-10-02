@@ -216,6 +216,36 @@ export class RyzeClient {
     return RyzeClient.sent(res);
   }
 
+  // Swipeable cards, each with a photo header, a text, an optional footer and one reply button. The
+  // tap comes back as a `template_button_reply` carrying the button id (buttonReplyOf reads it).
+  async sendCarousel(
+    jid: string,
+    carousel: {
+      message: string;
+      cards: {
+        id: string;
+        title: string;
+        text: string;
+        footer?: string;
+        imageUrl: string;
+        buttonTitle: string;
+      }[];
+    },
+  ): Promise<RyzeSentMessage> {
+    const res = await this.call("POST", this.path("/api/message/carousel"), {
+      number: ryzeRecipient(jid),
+      message: carousel.message,
+      cards: carousel.cards.map((c) => ({
+        header: { title: c.title, imageUrl: c.imageUrl },
+        body: { text: c.text },
+        ...(c.footer ? { footer: c.footer } : {}),
+        buttons: [{ id: c.id, displayText: c.buttonTitle, type: "REPLY" }],
+      })),
+      source: RYZE_SOURCE,
+    });
+    return RyzeClient.sent(res);
+  }
+
   async sendReaction(
     jid: string,
     messageId: string,

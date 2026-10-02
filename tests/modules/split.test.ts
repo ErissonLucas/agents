@@ -242,6 +242,47 @@ describe("deliverReply", () => {
     expect(seen).toEqual([{ content: "Bora pedir?", buttons }]);
   });
 
+  test("a carousel (send_carousel) rides only the LAST balloon too", async () => {
+    const seen: Array<{ content: string; carousel?: unknown }> = [];
+    const client = {
+      sendMessage: async (
+        _c: number,
+        content: string,
+        opts: { carousel?: unknown } = {},
+      ) => {
+        seen.push({ content, carousel: opts.carousel });
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    const carousel = [
+      {
+        id: "card-1",
+        title: "A",
+        text: "a",
+        imageUrl: "https://x.example/a.jpg",
+        buttonTitle: "Quero esse",
+      },
+    ];
+    await deliverReply(
+      client,
+      1,
+      "Pra 2 pessoas, olha essas:\n\nQual vai ser?",
+      { ...SPLIT_DEFAULTS, enabled: true },
+      noSleep,
+      undefined,
+      async () => false,
+      null,
+      null,
+      null,
+      carousel,
+    );
+    expect(seen).toEqual([
+      { content: "Pra 2 pessoas, olha essas:", carousel: undefined },
+      { content: "Qual vai ser?", carousel },
+    ]);
+  });
+
   // A split reply is several sends with a typing pause between them, so /reset landing after the
   // first balloon finds a run that already answered its only fence. Asked per balloon, the rest of
   // the message stays unsent — and the count reports what actually landed, not what was planned,

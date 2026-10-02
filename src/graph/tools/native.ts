@@ -25,6 +25,7 @@ import {
   ChatwootCalledOffError,
   type ChatwootClient,
   type CustomAttributeDef,
+  type RyzeCarouselCard,
   type RyzeReplyButton,
 } from "@/modules/chatwoot/client";
 import { type KanbanContext, matchKanbanStep } from "@/modules/chatwoot/kanban";
@@ -58,6 +59,7 @@ import {
   type ImageFetchFailure,
 } from "@/modules/images/fetch";
 import {
+  isAllowedImageHost,
   SEND_IMAGE_DEFAULTS,
   SEND_IMAGE_MAX_CAPTION_CHARS,
   SEND_IMAGE_MAX_PER_TURN,
@@ -147,6 +149,9 @@ export interface TurnState {
   // tool: they ride the reply's last text balloon through the same gates (RyzeAPI only). A second
   // call replaces the first; the output guardrail screens their titles and a trip drops them.
   pendingButtons?: RyzeReplyButton[];
+  // A carousel the agent asked to show this turn (send_carousel), on the same terms as the buttons:
+  // it rides the last text balloon and is screened and dropped with the reply.
+  pendingCarousel?: RyzeCarouselCard[];
 }
 
 // Isolated from TurnState on purpose: reactive turns and proactive nudges share handoff delivery,
@@ -2025,7 +2030,11 @@ function sendButtonsTool(ctx: ToolCtx) {
           return `The link of "${b.title}" must be a full https:// address. Call again with the right link.`;
         }
       }
-      const replaced = !!ctx.turnState.pendingButtons?.length;
+      const replaced = !!(
+        ctx.turnState.pendingButtons?.length ||
+        ctx.turnState.pendingCarousel?.length
+      );
+      ctx.turnState.pendingCarousel = undefined;
       ctx.turnState.pendingButtons = buttons.map(
         (b, i): RyzeReplyButton =>
           b.url !== undefined
@@ -2058,6 +2067,116 @@ function sendButtonsTool(ctx: ToolCtx) {
           .min(1)
           .max(3)
           .describe("1 to 3 buttons, all reply buttons or all link buttons."),
+      }),
+    },
+  );
+}
+
+// Show 2 to 5 swipeable cards under the reply (RyzeAPI WhatsApp numbers): each a product with its
+// photo, name, short text, price line and one reply button. Like send_buttons it sends nothing: the
+// cards ride the last text balloon of this turn's reply (TurnState.pendingCarousel), and that balloon's
+// text becomes the line above them. Photos come only from the hosts the operator allowed for
+// send_image. A tap comes back as "<button> — <card title>", so the agent knows which card it was.
+function sendCarouselTool(ctx: ToolCtx) {
+  return failableTool(
+    async ({
+      cards,
+    }: {
+      cards: {
+        title: string;
+        description: string;
+        price?: string;
+        image_url: string;
+        button_title?: string;
+      }[];
+    }) => {
+      if (!ctx.turnState) return "Carousels are not available here.";
+      if (!ctx.client.isRyzeEmulator) {
+        return "Carousels only work on WhatsApp numbers connected through RyzeAPI. Show the options with send_image and text instead.";
+      }
+      const hosts = (ctx.sendImage ?? SEND_IMAGE_DEFAULTS).allowedHosts;
+      if (hosts.length === 0) {
+        return "No image host is allowed for this agent (send_image settings), so a carousel cannot show photos. Present the options in text.";
+      }
+      const titles = cards.map((c) => c.title.trim());
+      if (new Set(titles.map((t) => t.toLowerCase())).size !== titles.length) {
+        return "Two cards have the same title. Each card must be a different option.";
+      }
+      for (const c of cards) {
+        let host = "";
+        try {
+          const u = new URL(c.image_url);
+          if (u.protocol === "https:" && !u.username && !u.password)
+            host = u.hostname;
+        } catch {
+          host = "";
+        }
+        if (!host || !isAllowedImageHost(host, hosts)) {
+          return `The photo of "${c.title}" must be a https link from an allowed host (${hosts.join(", ")}). Use the photo link the catalog gave you.`;
+        }
+      }
+      const replaced = !!(
+        ctx.turnState.pendingCarousel?.length ||
+        ctx.turnState.pendingButtons?.length
+      );
+      ctx.turnState.pendingButtons = undefined;
+      ctx.turnState.pendingCarousel = cards.map(
+        (c, i): RyzeCarouselCard => ({
+          id: `card-${i + 1}`,
+          title: titles[i] as string,
+          text: c.description.trim(),
+          ...(c.price?.trim() ? { footer: c.price.trim() } : {}),
+          imageUrl: c.image_url,
+          buttonTitle: c.button_title?.trim() || "Quero esse",
+        }),
+      );
+      return `${replaced ? "Replaced what was queued before (a reply carries one carousel OR buttons). " : ""}The carousel with ${cards.length} cards will go out as the LAST message of your reply, under its text. Now write the reply normally and keep its last paragraph short (it becomes the line above the cards, e.g. "Olha as opções de hoje 🔥"). Do NOT repeat the cards' names or prices in the text, and do not send their photos again with send_image. A tap comes back to you as "<button> — <card title>".`;
+    },
+    {
+      name: "send_carousel",
+      description:
+        "Show 2 to 5 swipeable product cards on WhatsApp, each with its photo, name, short description, price line and one button. Use ONLY when offering several options at once (e.g. the day's deals, the burgers that fit the request); for a single product use send_image. The cards attach to the last message of your reply, whose text becomes the line above them; do not repeat the cards' content in the text. Photos must be the catalog's own links. A reply with a carousel is sent as text, never as a voice note, and carries no other buttons.",
+      schema: z.object({
+        cards: z
+          .array(
+            z.object({
+              title: z
+                .string()
+                .min(1)
+                .max(60)
+                .describe(
+                  "Product name as in the catalog, up to 60 characters.",
+                ),
+              description: z
+                .string()
+                .min(1)
+                .max(300)
+                .describe(
+                  "One or two short sentences that make it appetising, up to 300 characters.",
+                ),
+              price: z
+                .string()
+                .max(60)
+                .optional()
+                .describe(
+                  'The price line, e.g. "de R$ 60,00 por R$ 47,99" or "R$ 30,00". From the catalog only.',
+                ),
+              image_url: z
+                .string()
+                .min(1)
+                .describe("The product photo link from the catalog (https)."),
+              button_title: z
+                .string()
+                .max(20)
+                .optional()
+                .describe(
+                  'The card button, up to 20 characters. Default "Quero esse".',
+                ),
+            }),
+          )
+          .min(2)
+          .max(5)
+          .describe("2 to 5 cards, one per option."),
       }),
     },
   );
@@ -2655,6 +2774,7 @@ export function buildNativeTools(
     reactToMessageTool(ctx),
     sendImageTool(ctx),
     sendButtonsTool(ctx),
+    sendCarouselTool(ctx),
     ...(ctx.crossInboxCase?.config.targetInboxId != null
       ? [openCaseInInboxTool(ctx)]
       : []),

@@ -23,7 +23,7 @@ import {
 } from "./constants";
 import { emitToBots } from "./emit";
 import { ryzeClientForGateway } from "./gateway-client";
-import { cardButtonsOf } from "./interactive";
+import { cardButtonsOf, carouselCardsOf } from "./interactive";
 import { ryzeLabelColorHex } from "./label-shared";
 import {
   applyLabelRules,
@@ -452,17 +452,23 @@ export class RyzeEmulator {
       const ryze = await this.makeRyze(gw);
       // A reply that carries buttons (send_buttons) goes out as a WhatsApp card; checked by the
       // same rules as an admin card, and a bag that fails them goes out as the plain text.
-      const buttons = cardButtonsOf(
-        b.content_attributes,
-        conv.chatJid,
-        content as string,
-      );
-      const sent = buttons
-        ? await ryze.sendButtons(conv.chatJid, {
-            text: content as string,
-            buttons,
+      // A carousel (send_carousel) goes out as swipeable cards with this text above them; it wins
+      // over buttons, which a carousel's cards already carry.
+      const carousel = carouselCardsOf(b.content_attributes, content as string);
+      const buttons = carousel
+        ? null
+        : cardButtonsOf(b.content_attributes, conv.chatJid, content as string);
+      const sent = carousel
+        ? await ryze.sendCarousel(conv.chatJid, {
+            message: content as string,
+            cards: carousel,
           })
-        : await ryze.sendText(conv.chatJid, content as string);
+        : buttons
+          ? await ryze.sendButtons(conv.chatJid, {
+              text: content as string,
+              buttons,
+            })
+          : await ryze.sendText(conv.chatJid, content as string);
       const done = await this.landed(gw, row, sent.messageId);
       await this.echo(gw, done);
       return json(200, presentMessageRest(done));

@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   Clock,
   FolderInput,
+  GalleryHorizontal,
   Image as ImageIcon,
   LayoutGrid,
   type LucideIcon,
@@ -34,6 +35,7 @@ export const NATIVE_TOOL_ICONS: Record<string, LucideIcon> = {
   react_to_message: Smile,
   send_image: ImageIcon,
   send_buttons: SquareMousePointer,
+  send_carousel: GalleryHorizontal,
   open_case_in_inbox: FolderInput,
   skip_reply: BellOff,
   calculator: Calculator,
@@ -129,6 +131,15 @@ export function nativeToolMeta(name: string, t: TFunction): NativeToolMeta {
         description: t(
           "nativeTools.react_to_message.desc",
           "React to the customer's last message with an emoji (WhatsApp reaction).",
+        ),
+      };
+    case "send_carousel":
+      return {
+        icon,
+        label: t("nativeTools.send_carousel.label", "Send carousel"),
+        description: t(
+          "nativeTools.send_carousel.desc",
+          "Show 2 to 5 swipeable product cards (photo, name, price, button) under the reply on WhatsApp (RyzeAPI).",
         ),
       };
     case "send_buttons":

@@ -1589,8 +1589,14 @@ async function turnBody(
       turnState.pendingButtons?.length && client.isRyzeEmulator
         ? turnState.pendingButtons
         : null;
-    if (asked && !chosenText && buttons) noteSentAsText("buttons");
-    const wantAudio = asked && !chosenText && !buttons;
+    // send_carousel, same terms: the cards ride the last text balloon, never a voice note.
+    const carousel =
+      turnState.pendingCarousel?.length && client.isRyzeEmulator
+        ? turnState.pendingCarousel
+        : null;
+    if (asked && !chosenText && (buttons || carousel))
+      noteSentAsText("buttons");
+    const wantAudio = asked && !chosenText && !buttons && !carousel;
     // A URL or an e-mail address is never said: it follows the voice note in writing, or the whole
     // reply goes as text when nothing but its introduction would be said (issue #787), or when the
     // reply is built to be read, not heard: too long, a list, a run of prices (issue #856).
@@ -1743,6 +1749,7 @@ async function turnBody(
       // the voice note's `transcribedText` is the words that were actually said.
       signed,
       buttons,
+      carousel,
     );
     logger.info(
       "chatwoot agent replied: conv=%s thread=%s len=%d balloons=%d partial=%s",
@@ -1812,6 +1819,7 @@ async function turnBody(
       if (guardrailTripped(guarded)) {
         turnState.pendingAttachments.length = 0;
         turnState.pendingButtons = undefined;
+        turnState.pendingCarousel = undefined;
       }
       const screened = screenedText(guarded, line);
       if (screened === null) return;
@@ -2777,6 +2785,7 @@ async function turnBody(
       const dropped = turnState.pendingAttachments.length;
       turnState.pendingAttachments.length = 0;
       turnState.pendingButtons = undefined;
+      turnState.pendingCarousel = undefined;
       logger.info(
         "turn: the handoff declared silence (conv=%s), so nothing goes to the customer (attachments dropped=%d)",
         String(conversationId),
@@ -2912,6 +2921,9 @@ async function turnBody(
       ),
       // Button titles are model-written text the customer reads, same as a caption.
       ...(turnState.pendingButtons ?? []).map((b) => b.title),
+      ...(turnState.pendingCarousel ?? []).flatMap((c) =>
+        [c.title, c.text, c.footer ?? "", c.buttonTitle].filter(Boolean),
+      ),
     ];
     const screened = [reply, ...modelWritten].filter(Boolean).join("\n");
     const outGuard = screened ? await runGuardrail("output", screened) : null;
@@ -2921,6 +2933,7 @@ async function turnBody(
     if (outGuard && guardrailTripped(outGuard)) {
       turnState.pendingAttachments.length = 0;
       turnState.pendingButtons = undefined;
+      turnState.pendingCarousel = undefined;
       const replacement = screenedText(outGuard, screened);
       // The refused reply goes nowhere and the case goes to the team. An empty hand-over message is
       // the operator's "say nothing", so the reply is blanked and the empty branch below runs with

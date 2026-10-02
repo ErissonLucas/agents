@@ -246,6 +246,97 @@ export function validateText(msg: TextInput): void {
   validateRecipientAndText(msg.to, msg.text, "message");
 }
 
+export const CAROUSEL_MIN_CARDS = 2;
+export const CAROUSEL_MAX_CARDS = 5;
+const CAROUSEL_TITLE_MAX = 60;
+const CAROUSEL_TEXT_MAX = 300;
+const CAROUSEL_FOOTER_MAX = 60;
+
+export interface CarouselCardInput {
+  id: string;
+  title: string;
+  text: string;
+  footer?: string;
+  imageUrl: string;
+  buttonTitle: string;
+}
+
+// The carousel a reply sent through the emulator carries (`content_attributes.carousel`, written by
+// send_carousel): 2 to 5 cards, each with an https photo, a title, a text, an optional footer and one
+// reply button with a distinct id. Null when there is none or it breaks a rule: the reply then goes
+// out as plain text, which beats a reply that does not go at all.
+export function carouselCardsOf(
+  bag: unknown,
+  text: string,
+): CarouselCardInput[] | null {
+  if (!bag || typeof bag !== "object") return null;
+  const raw = (bag as { carousel?: unknown }).carousel;
+  if (!Array.isArray(raw) || raw.length === 0) return null;
+  const refuse = (why: string) => {
+    logger.warn(
+      "ryze: reply carousel refused, sending the text alone: %s",
+      why,
+    );
+    return null;
+  };
+  if (!text.trim() || text.length > TEXT_MAX)
+    return refuse("invalid message text");
+  if (raw.length < CAROUSEL_MIN_CARDS || raw.length > CAROUSEL_MAX_CARDS)
+    return refuse(
+      `a carousel takes ${CAROUSEL_MIN_CARDS} to ${CAROUSEL_MAX_CARDS} cards`,
+    );
+  const cards: CarouselCardInput[] = [];
+  const ids = new Set<string>();
+  for (const c of raw) {
+    if (!c || typeof c !== "object") return refuse("invalid card");
+    const {
+      id,
+      title,
+      text: body,
+      footer,
+      imageUrl,
+      buttonTitle,
+    } = c as Record<string, unknown>;
+    if (typeof id !== "string" || !BUTTON_ID_RE.test(id) || ids.has(id))
+      return refuse("invalid card id");
+    if (
+      typeof title !== "string" ||
+      !title.trim() ||
+      title.length > CAROUSEL_TITLE_MAX
+    )
+      return refuse("invalid card title");
+    if (
+      typeof body !== "string" ||
+      !body.trim() ||
+      body.length > CAROUSEL_TEXT_MAX
+    )
+      return refuse("invalid card text");
+    if (
+      footer !== undefined &&
+      (typeof footer !== "string" || footer.length > CAROUSEL_FOOTER_MAX)
+    )
+      return refuse("invalid card footer");
+    if (typeof imageUrl !== "string" || !isHttpsMediaUrl(imageUrl))
+      return refuse("invalid card image");
+    if (
+      typeof buttonTitle !== "string" ||
+      !buttonTitle.trim() ||
+      buttonTitle.length > 20
+    )
+      return refuse("invalid card button");
+    ids.add(id);
+    cards.push({
+      id,
+      title,
+      text: body,
+      imageUrl,
+      buttonTitle,
+      ...(footer ? { footer } : {}),
+    });
+  }
+  return cards;
+}
+
 // The buttons a reply sent through the emulator carries (`content_attributes.buttons`, written by
 // send_buttons), checked by the same rules as an admin card: 1 to 3, reply OR link, titles of up to 20
 // characters. Copy buttons are the operator's, not the agent's. Null when there are none or they fail

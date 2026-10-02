@@ -15,6 +15,16 @@ export type RyzeReplyButton = { title: string } & (
   | { id: string }
   | { url: string }
 );
+// A card of a carousel sent to a RyzeAPI number (send_carousel): photo, name, short text, an optional
+// footer (the price) and one reply button whose tap comes back as `buttonTitle — title`.
+export type RyzeCarouselCard = {
+  id: string;
+  title: string;
+  text: string;
+  footer?: string;
+  imageUrl: string;
+  buttonTitle: string;
+};
 const RYZE_EMULATOR_URL_PREFIX = "https://203.0.113.250/ryze-emulator";
 
 // Chatwoot Application API client with the dual-identity profiles (validated against the
@@ -530,6 +540,9 @@ export class ChatwootClient {
       // Buttons for the RyzeAPI emulator, which sends a message carrying them as a WhatsApp card
       // (send_buttons). Only ever set on a Ryze inbox: on a real Chatwoot the bag reaches the contact.
       buttons?: RyzeReplyButton[];
+      // A carousel for the same emulator (send_carousel): the message goes out as swipeable cards,
+      // with this content as the text above them. Same Ryze-only rule as `buttons`.
+      carousel?: RyzeCarouselCard[];
     } = {},
   ): Promise<unknown> {
     const bag = {
@@ -537,6 +550,7 @@ export class ChatwootClient {
         ? {}
         : { [CHATWOOT_SEND_ID_KEY]: opts.sendId }),
       ...(opts.buttons?.length ? { buttons: opts.buttons } : {}),
+      ...(opts.carousel?.length ? { carousel: opts.carousel } : {}),
     };
     return this.request(
       this.config.botToken,

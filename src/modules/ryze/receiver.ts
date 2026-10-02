@@ -208,6 +208,18 @@ async function cardButtonTitle(
       if (isRecord(b) && b.id === buttonId && typeof b.title === "string")
         return b.title;
     }
+    // A carousel card's button reads as the button AND the card it sits on ("Quero esse — Trio
+    // Ternura"): every card shows the same button, so the title alone would not say which one.
+    const cards = Array.isArray(attrs.carousel) ? attrs.carousel : [];
+    for (const c of cards) {
+      if (
+        isRecord(c) &&
+        c.id === buttonId &&
+        typeof c.buttonTitle === "string" &&
+        typeof c.title === "string"
+      )
+        return `${c.buttonTitle} — ${c.title}`;
+    }
   }
   return null;
 }
@@ -330,10 +342,13 @@ async function handleMessage(
         gw.id,
         reaction?.targetId ?? (reply ? str(reply.message_id) : null),
       );
-      const buttonTitle =
-        buttonReply && !buttonReply.title
-          ? await cardButtonTitle(db, gw.id, conv.displayId, buttonReply.id)
-          : (buttonReply?.title ?? null);
+      // What we sent wins over what WhatsApp echoes: a carousel shows the same button on every card,
+      // so only our record says which card was tapped. Plain buttons read the same either way.
+      const buttonTitle = buttonReply
+        ? ((await cardButtonTitle(db, gw.id, conv.displayId, buttonReply.id)) ??
+          buttonReply.title ??
+          null)
+        : null;
       const contentAttributes: Record<string, unknown> = {
         ...(inReplyTo !== null ? { in_reply_to: inReplyTo } : {}),
         ...(reaction ? { is_reaction: true } : {}),

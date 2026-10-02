@@ -71,6 +71,10 @@ const BY_TOOL = new Map<string, ToolLabel>(
       key: "conversation.activity.buttons",
       fallback: "Adding buttons to the reply",
     },
+    send_carousel: {
+      key: "conversation.activity.carousel",
+      fallback: "Adding a carousel to the reply",
+    },
     skip_reply: {
       key: "conversation.activity.skip",
       fallback: "Decided not to respond",

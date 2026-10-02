@@ -662,6 +662,7 @@
       "openCase": "Abrindo o caso em outra caixa",
       "react": "Reagindo a uma mensagem",
       "buttons": "Colocando botões na resposta",
+      "carousel": "Colocando um carrossel na resposta",
       "resolve": "Encerrando o atendimento",
       "search": "Consultando a base de conhecimento",
       "skip": "Decidiu não responder",
@@ -2450,6 +2451,10 @@
     "send_buttons": {
       "desc": "Mostra até 3 botões (respostas rápidas ou links) embaixo da resposta no WhatsApp (RyzeAPI).",
       "label": "Enviar botões"
+    },
+    "send_carousel": {
+      "desc": "Mostra de 2 a 5 cards deslizáveis (foto, nome, preço e botão) embaixo da resposta no WhatsApp (RyzeAPI).",
+      "label": "Enviar carrossel"
     },
     "resolve_conversation": {
       "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",

@@ -2891,6 +2891,25 @@ describe("the fence rule, over every native tool", () => {
       label: "",
       args: { buttons: [{ title: "Quero" }] },
     },
+    // Writes nothing through the client either: the cards wait in TurnState for the reply.
+    {
+      tool: "send_carousel",
+      label: "",
+      args: {
+        cards: [
+          {
+            title: "A",
+            description: "a",
+            image_url: "https://imgs.example/a.png",
+          },
+          {
+            title: "B",
+            description: "b",
+            image_url: "https://imgs.example/b.png",
+          },
+        ],
+      },
+    },
     {
       tool: "open_case_in_inbox",
       label: "",
@@ -3063,5 +3082,83 @@ describe("send_buttons", () => {
       String(await elsewhere.invoke({ buttons: [{ title: "Quero" }] })),
     ).toContain("RyzeAPI");
     expect(state.pendingButtons).toBeUndefined();
+  });
+});
+
+describe("send_carousel", () => {
+  const state = () =>
+    ({
+      resolveRequested: false,
+      pendingAttachments: [],
+      imagesInFlight: 0,
+      documentsInFlight: 0,
+      attachmentsSeq: 0,
+    }) as Parameters<typeof buildNativeTools>[0]["turnState"] & object;
+  function ryzeClient() {
+    const { client, calls } = recordingClient();
+    Object.defineProperty(client, "isRyzeEmulator", { value: true });
+    return { client, calls };
+  }
+  const card = (title: string, host = "villaengenho.com.br") => ({
+    title,
+    description: "Picanha selada.",
+    price: "R$ 47,99",
+    image_url: `https://${host}/menu/x.jpg`,
+  });
+
+  test("queues the cards for the last balloon, replaces queued buttons and sends nothing", async () => {
+    const { client, calls } = ryzeClient();
+    const st = state();
+    st.pendingButtons = [{ id: "btn-1", title: "Quero" }];
+    const tool = byName(
+      buildNativeTools({
+        client,
+        conversationId: 1,
+        turnState: st,
+        sendImage: { allowedHosts: ["villaengenho.com.br"] },
+      }),
+      "send_carousel",
+    );
+    const out = String(
+      await tool.invoke({
+        cards: [card("Super Oferta"), card("Trio Ternura")],
+      }),
+    );
+    expect(out).toContain("LAST message of your reply");
+    expect(st.pendingButtons).toBeUndefined();
+    expect(
+      st.pendingCarousel?.map((c) => [c.id, c.title, c.footer, c.buttonTitle]),
+    ).toEqual([
+      ["card-1", "Super Oferta", "R$ 47,99", "Quero esse"],
+      ["card-2", "Trio Ternura", "R$ 47,99", "Quero esse"],
+    ]);
+    expect(calls).toEqual([]);
+  });
+
+  test("refuses a photo from a host the operator did not allow, no hosts at all, and repeated titles", async () => {
+    const st = state();
+    const tool = (allowedHosts: string[]) =>
+      byName(
+        buildNativeTools({
+          client: ryzeClient().client,
+          conversationId: 1,
+          turnState: st,
+          sendImage: { allowedHosts },
+        }),
+        "send_carousel",
+      );
+    const allowed = tool(["villaengenho.com.br"]);
+    expect(
+      String(
+        await allowed.invoke({ cards: [card("A"), card("B", "evil.example")] }),
+      ),
+    ).toContain("allowed host");
+    expect(
+      String(await allowed.invoke({ cards: [card("A"), card("a")] })),
+    ).toContain("same title");
+    expect(
+      String(await tool([]).invoke({ cards: [card("A"), card("B")] })),
+    ).toContain("No image host");
+    expect(st.pendingCarousel).toBeUndefined();
   });
 });
