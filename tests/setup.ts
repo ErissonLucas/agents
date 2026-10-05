@@ -13,7 +13,12 @@ import {
   unreachableDb,
   withDeadline,
 } from "./db-gate";
-import { checkoutRootFrom, testDbNameFor, withDbName } from "./db-name";
+import {
+  checkoutRootFrom,
+  testDbNameFor,
+  withDbName,
+  withUtcSession,
+} from "./db-name";
 
 // NOTE: happy-dom registration and the Bun-native global capture live in
 // ./dom-setup.ts, which bunfig.toml preloads BEFORE this file. The DOM must
@@ -72,7 +77,9 @@ if (testSuUrl) {
   // reads the DECLARED name, because it is a statement about what the developer pointed at.
   const dbName = testDbNameFor(declared, REPO_ROOT);
   const testDbPath = `/${dbName}`;
-  process.env.MIGRATION_DATABASE_URL = withDbName(testSuUrl, dbName);
+  process.env.MIGRATION_DATABASE_URL = withUtcSession(
+    withDbName(testSuUrl, dbName),
+  );
   // BOTH spellings, and this line is the whole reason the derivation is safe to add. Three test
   // files build their superuser client from the RAW `TEST_MIGRATION_DATABASE_URL` rather than the
   // derived `MIGRATION_DATABASE_URL`, which was equivalent while the two named the same database
@@ -84,7 +91,7 @@ if (testSuUrl) {
   if (process.env.TEST_APP_DATABASE_URL) {
     const appUrl = new URL(process.env.TEST_APP_DATABASE_URL);
     appUrl.pathname = testDbPath;
-    process.env.TEST_APP_DATABASE_URL = appUrl.toString();
+    process.env.TEST_APP_DATABASE_URL = withUtcSession(appUrl.toString());
     // NOTE: the LangGraph checkpointer is the one connection the fence above used to miss.
     // `config.langgraphDatabaseUrl` is `LANGGRAPH_DATABASE_URL || DATABASE_URL`, so the dead
     // DATABASE_URL set at the top only catches it when LANGGRAPH_DATABASE_URL is UNSET, and a dev
@@ -92,7 +99,7 @@ if (testSuUrl) {
     // pointed the checkpointer at secretaria_v4_db (1685 live checkpoint rows) while everything else
     // was on secretaria_v4_test, and the /reset test issued deleteThread against it. Forced onto the
     // test DB with the app-role creds, same derivation as the line above.
-    process.env.LANGGRAPH_DATABASE_URL = appUrl.toString();
+    process.env.LANGGRAPH_DATABASE_URL = process.env.TEST_APP_DATABASE_URL;
   }
 }
 // THE GATE. Everything above points the suite at the test database; this refuses to start when
