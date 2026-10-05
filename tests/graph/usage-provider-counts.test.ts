@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
@@ -236,7 +237,7 @@ describe("no Gemini built-in tool is enabled", () => {
   test("src/ enables none, so the total's gap is thinking alone", async () => {
     const offenders: string[] = [];
     for (const file of await tsFilesUnder(
-      new URL("../../src", import.meta.url).pathname,
+      fileURLToPath(new URL("../../src", import.meta.url)),
     )) {
       if (declaresBuiltinTool(await Bun.file(file).text())) {
         offenders.push(file.split("/src/")[1] as string);

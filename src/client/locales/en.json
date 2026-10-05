@@ -636,6 +636,8 @@
   "conversation": {
     "activity": {
       "attr": "Updating details",
+      "buttons": "Adding buttons to the reply",
+      "carousel": "Adding a carousel to the reply",
       "debounce": "Waiting for more messages",
       "debounceCountdown": "Waiting for more messages · ~{{seconds}}s",
       "delivering": "Delivering the reply",
@@ -643,8 +645,6 @@
       "note": "Writing an internal note",
       "openCase": "Opening the case in another inbox",
       "react": "Reacting to a message",
-      "buttons": "Adding buttons to the reply",
-      "carousel": "Adding a carousel to the reply",
       "resolve": "Wrapping up the conversation",
       "search": "Searching the knowledge base",
       "skip": "Decided not to respond",
@@ -2207,8 +2207,8 @@
       "embed": "Embedding",
       "generate": "Generation",
       "guardrail": "Guardrail check",
-      "jev": "Jev decision",
       "handoff": "Handoff",
+      "jev": "Jev decision",
       "memory": "Memory",
       "normalize": "Speech rewrite",
       "observe": "Observation",
@@ -2383,6 +2383,10 @@
       "desc": "React to the customer's last message with an emoji (WhatsApp reaction).",
       "label": "React with emoji"
     },
+    "resolve_conversation": {
+      "desc": "Mark the conversation as resolved when the request is fully handled.",
+      "label": "Resolve"
+    },
     "send_buttons": {
       "desc": "Show up to 3 tappable buttons (quick replies or links) under the reply on WhatsApp (RyzeAPI).",
       "label": "Send buttons"
@@ -2390,10 +2394,6 @@
     "send_carousel": {
       "desc": "Show 2 to 5 swipeable product cards (photo, name, price, button) under the reply on WhatsApp (RyzeAPI).",
       "label": "Send carousel"
-    },
-    "resolve_conversation": {
-      "desc": "Mark the conversation as resolved when the request is fully handled.",
-      "label": "Resolve"
     },
     "send_image": {
       "desc": "Deliver an image to the customer from its URL, limited to the hosts you allow.",

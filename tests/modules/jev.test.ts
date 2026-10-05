@@ -122,8 +122,9 @@ describe("the rule check after the model", () => {
     expect(await replyBreaksRules(cfg, "Te dou um cupom de 20%!", deps)).toBe(
       0.94,
     );
+    if (!calls[0]) throw new Error("Expected a Jev request");
     const q = (
-      calls[0]?.body.questions as Record<string, { instructions: string }>
+      calls[0].body.questions as Record<string, { instructions: string }>
     ).breaks;
     expect(q?.instructions).toContain("promete cupom");
   });

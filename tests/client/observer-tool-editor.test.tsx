@@ -1,6 +1,7 @@
 /// <reference lib="dom" />
 
 import { afterEach, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 
@@ -203,10 +204,12 @@ test("both places a pack's tools are decided read one predicate", async () => {
   // ...and the source of both call sites names it. Read from the file rather than deduced: this is
   // the assertion that a second, hand-rolled filter cannot pass (review round 31).
   const src = await Bun.file(
-    new URL(
-      "../../src/client/pages/agents/ToolGrantsEditor.tsx",
-      import.meta.url,
-    ).pathname,
+    fileURLToPath(
+      new URL(
+        "../../src/client/pages/agents/ToolGrantsEditor.tsx",
+        import.meta.url,
+      ),
+    ),
   ).text();
   expect(src.match(/offeredPackTools\(inst\.tools, observing\)/g)).toHaveLength(
     2,

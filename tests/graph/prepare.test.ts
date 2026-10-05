@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { MemorySaver } from "@langchain/langgraph";
 import type { ResolvedModelConfig } from "@/graph/models";
@@ -322,7 +323,7 @@ describe("prepare — a draft cannot widen what is recorded", () => {
     const files = new Bun.Glob("src/**/*.{ts,tsx}");
     const found: string[] = [];
     for await (const f of files.scan(
-      new URL("../../", import.meta.url).pathname,
+      fileURLToPath(new URL("../../", import.meta.url)),
     )) {
       if (f.endsWith("modules/flowlog/settings.ts")) continue; // the definition
       // Through the scan, so a comment naming the reader is not counted as a call to it (#424).

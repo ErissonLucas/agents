@@ -463,7 +463,8 @@ describe.skipIf(!dbUp)("RyzeAPI channel", () => {
     const sent = calls.findLast((c) => c.path.startsWith("/api/message/"));
     expect(sent?.path.startsWith("/api/message/carousel")).toBe(true);
     expect(sent?.body.message).toBe("Olha as ofertas 🔥");
-    expect((sent?.body.cards as unknown[])[1]).toEqual({
+    if (!sent) throw new Error("Expected a carousel request");
+    expect((sent.body.cards as unknown[])[1]).toEqual({
       header: {
         title: "Trio Ternura",
         imageUrl: "https://villaengenho.com.br/menu/2.jpg",

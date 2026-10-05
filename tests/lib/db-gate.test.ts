@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import {
   DB_GATE_OPT_OUT,
   missingDbConfig,
@@ -201,7 +202,7 @@ describe("the probe's deadline", () => {
   // from the outside, because a leaked timer is invisible to the process holding it (Bun's
   // `process.getActiveResourcesInfo` returns an empty list, so asserting on it proves nothing).
   test("the timer does not outlive a settled probe", async () => {
-    const module = new URL("../db-gate.ts", import.meta.url).pathname;
+    const module = fileURLToPath(new URL("../db-gate.ts", import.meta.url));
     const started = Date.now();
     const proc = Bun.spawn(
       [
@@ -225,8 +226,10 @@ describe("the probe's deadline", () => {
 // caught it, because the shape of the bug was "the preload asks a different question than the
 // guarded files do".
 describe("the gate, as a run", () => {
-  const noop = new URL("../utils/db-gate-noop.ts", import.meta.url).pathname;
-  const repoRoot = new URL("../..", import.meta.url).pathname;
+  const noop = fileURLToPath(
+    new URL("../utils/db-gate-noop.ts", import.meta.url),
+  );
+  const repoRoot = fileURLToPath(new URL("../..", import.meta.url));
 
   // Both URLs are the ones this very run is using, which the gate above already proved reachable.
   const suUrl = process.env.MIGRATION_DATABASE_URL as string;

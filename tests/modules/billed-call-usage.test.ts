@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -675,7 +676,7 @@ describe("every model invocation carries a usage sink", () => {
   test("no billed call in src/ invokes a model without one", async () => {
     const offenders: string[] = [];
     for (const file of await tsFilesUnder(
-      new URL("../../src", import.meta.url).pathname,
+      fileURLToPath(new URL("../../src", import.meta.url)),
     )) {
       const found = sinkless(await Bun.file(file).text());
       for (const f of found) {
@@ -722,7 +723,7 @@ describe("every node the ledger writes is classified for the involvement KPI", (
   test("no node reaches a row without an answer to 'did the agent run'", async () => {
     const found = new Set<string>();
     for (const file of await tsFilesUnder(
-      new URL("../../src", import.meta.url).pathname,
+      fileURLToPath(new URL("../../src", import.meta.url)),
     )) {
       for (const node of nodesWritten(await Bun.file(file).text())) {
         found.add(node);

@@ -654,6 +654,8 @@
   "conversation": {
     "activity": {
       "attr": "Atualizando dados",
+      "buttons": "Colocando botões na resposta",
+      "carousel": "Colocando um carrossel na resposta",
       "debounce": "Aguardando novas mensagens",
       "debounceCountdown": "Aguardando novas mensagens · ~{{seconds}}s",
       "delivering": "Entregando a resposta",
@@ -661,8 +663,6 @@
       "note": "Escrevendo uma nota interna",
       "openCase": "Abrindo o caso em outra caixa",
       "react": "Reagindo a uma mensagem",
-      "buttons": "Colocando botões na resposta",
-      "carousel": "Colocando um carrossel na resposta",
       "resolve": "Encerrando o atendimento",
       "search": "Consultando a base de conhecimento",
       "skip": "Decidiu não responder",
@@ -2271,8 +2271,8 @@
       "embed": "Embedding",
       "generate": "Geração",
       "guardrail": "Verificação de guardrails",
-      "jev": "Decisão do Jev",
       "handoff": "Transferência",
+      "jev": "Decisão do Jev",
       "memory": "Memória",
       "normalize": "Reescrita para fala",
       "observe": "Observação",
@@ -2449,6 +2449,10 @@
       "desc": "Reage à última mensagem do cliente com um emoji (reação do WhatsApp).",
       "label": "Reagir com emoji"
     },
+    "resolve_conversation": {
+      "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",
+      "label": "Resolver"
+    },
     "send_buttons": {
       "desc": "Mostra até 3 botões (respostas rápidas ou links) embaixo da resposta no WhatsApp (RyzeAPI).",
       "label": "Enviar botões"
@@ -2456,10 +2460,6 @@
     "send_carousel": {
       "desc": "Mostra de 2 a 5 cards deslizáveis (foto, nome, preço e botão) embaixo da resposta no WhatsApp (RyzeAPI).",
       "label": "Enviar carrossel"
-    },
-    "resolve_conversation": {
-      "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",
-      "label": "Resolver"
     },
     "send_image": {
       "desc": "Entrega uma imagem ao cliente a partir da URL dela, restrita aos hosts que você liberar.",

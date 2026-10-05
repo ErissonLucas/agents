@@ -122,3 +122,7 @@ Measured live on Coolify v4.1.2 with a throwaway service: when a compose uses `$
 
 Practical consequence: changing a default in `docker-compose.coolify.yml` is **safe** for existing installs (they stay on the old value) and only new installs get the new one. It also means a rename cannot reach an existing install at all, which is why `DOCUMENTS_STORAGE_DIR` keeps a `QUOTES_STORAGE_DIR` fallback. Not tested: an operator who destroys and recreates the service while reusing the old Postgres volume — that service is born with the new name and does not find the database.
 
+
+### Livare reconciliation: buttons/carousel namespace
+
+`20261005180000_rename_http_tools_named_after_natives` requires STOP-MIGRATE-START: stop the old process, run the migration, then start the new image. Existing HTTP and code tools named `send_buttons` or `send_carousel` move to a free per-tenant suffix; IDs and grants remain, guidance/precondition keys follow the custom tool, and audit records identify renamed tools and prompts requiring operator review. No row is deleted. Rehearse on a protected copy first; production execution requires its own approval. Rollback starts by stopping senders and retaining the database and audit evidence; do not blindly reverse names or restore an old database over new events.

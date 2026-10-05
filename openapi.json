@@ -47016,7 +47016,7 @@
           "Channels"
         ],
         "summary": "Send RyzeAPI button card",
-        "description": "Send a card with 1 to 3 reply buttons into the contact's conversation on this number. The card is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A tap on a button whose id carries RYZE_BUTTON_BRIDGE_PREFIX is posted to RYZE_BUTTON_BRIDGE_URL instead of starting an agent turn.",
+        "description": "Send a card with 1 to 3 reply buttons into the contact's conversation on this number. The card is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A tap on a button whose id carries RYZE_BUTTON_BRIDGE_PREFIX is posted to RYZE_BUTTON_BRIDGE_URL instead of starting an agent turn. Optional `contactName`, `contactAttributes`, `conversationAttributes` and `labels` are written on the contact and conversation (created if the contact never wrote) before the message is stored and sent, merged into what is there, so the agent reads them when the contact answers.",
         "parameters": [
           {
             "name": "id",
@@ -47100,6 +47100,63 @@
                         }
                       }
                     }
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -47162,6 +47219,63 @@
                         }
                       }
                     }
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -47223,6 +47337,63 @@
                           "type": "string"
                         }
                       }
+                    }
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
                     }
                   }
                 }
@@ -47371,7 +47542,7 @@
           "Channels"
         ],
         "summary": "Send RyzeAPI text",
-        "description": "Send a plain text into the contact's conversation on this number. The text is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A Brazilian mobile reuses the conversation stored with or without the ninth digit.",
+        "description": "Send a plain text into the contact's conversation on this number. The text is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A Brazilian mobile reuses the conversation stored with or without the ninth digit. Optional `contactName`, `contactAttributes`, `conversationAttributes` and `labels` are written on the contact and conversation (created if the contact never wrote) before the message is stored and sent, merged into what is there, so the agent reads them when the contact answers.",
         "parameters": [
           {
             "name": "id",
@@ -47414,6 +47585,63 @@
                     "maxLength": 4000,
                     "description": "Message text, up to 4000 characters.",
                     "type": "string"
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -47435,6 +47663,63 @@
                     "maxLength": 4000,
                     "description": "Message text, up to 4000 characters.",
                     "type": "string"
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -47456,6 +47741,63 @@
                     "maxLength": 4000,
                     "description": "Message text, up to 4000 characters.",
                     "type": "string"
+                  },
+                  "contactName": {
+                    "minLength": 1,
+                    "maxLength": 255,
+                    "description": "Contact name, set only when the contact has none yet.",
+                    "type": "string"
+                  },
+                  "contactAttributes": {
+                    "description": "Custom attributes merged into the contact's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "conversationAttributes": {
+                    "description": "Custom attributes merged into the conversation's before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.",
+                    "type": "object",
+                    "patternProperties": {
+                      "^(.*)$": {
+                        "anyOf": [
+                          {
+                            "maxLength": 1000,
+                            "type": "string"
+                          },
+                          {
+                            "type": "number"
+                          },
+                          {
+                            "type": "boolean"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "labels": {
+                    "maxItems": 10,
+                    "description": "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+                    "type": "array",
+                    "items": {
+                      "minLength": 1,
+                      "maxLength": 40,
+                      "description": "Label title (a-z 0-9 _ -, up to 40).",
+                      "type": "string"
+                    }
                   }
                 }
               }
