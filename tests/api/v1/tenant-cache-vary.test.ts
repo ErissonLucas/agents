@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 // A sweep, not an example, because the defect it guards is invisible at the line that causes it.
 //
@@ -14,7 +15,7 @@ import { join } from "node:path";
 // sweep so the next byte-serving endpoint gets it for free, rather than as a test of the one route
 // that has it today.
 
-const ROOT = new URL("../../../src/api/v1", import.meta.url).pathname;
+const ROOT = fileURLToPath(new URL("../../../src/api/v1", import.meta.url));
 
 async function sourceFiles(dir: string): Promise<string[]> {
   const out: string[] = [];

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 
 // `scripts/db-bootstrap.ts` and `scripts/db-bootstrap.sql` provision the same thing by two routes:
 // the first runs unattended on every container boot, the second is the by-hand psql equivalent for a
@@ -168,14 +169,15 @@ const INVARIANTS: Array<{
 ];
 
 const reach = await Bun.file(
-  new URL("../../src/lib/tenancy/privileged-reach.ts", import.meta.url)
-    .pathname,
+  fileURLToPath(
+    new URL("../../src/lib/tenancy/privileged-reach.ts", import.meta.url),
+  ),
 ).text();
 const ts = await Bun.file(
-  new URL("../../scripts/db-bootstrap.ts", import.meta.url).pathname,
+  fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
 ).text();
 const sql = await Bun.file(
-  new URL("../../scripts/db-bootstrap.sql", import.meta.url).pathname,
+  fileURLToPath(new URL("../../scripts/db-bootstrap.sql", import.meta.url)),
 ).text();
 
 // PL/pgSQL's `RAISE` knows only `%`. `%I` there is not an identifier placeholder: it emits the value
@@ -183,10 +185,12 @@ const sql = await Bun.file(
 // operator it was written for cannot run. It reads exactly like the `format()` spelling one line
 // away, which is why it survived a review round and appeared TWICE in one file.
 const migration = await Bun.file(
-  new URL(
-    "../../prisma/migrations/20260827000000_rls_split_tenant_and_fleet_policies/migration.sql",
-    import.meta.url,
-  ).pathname,
+  fileURLToPath(
+    new URL(
+      "../../prisma/migrations/20260827000000_rls_split_tenant_and_fleet_policies/migration.sql",
+      import.meta.url,
+    ),
+  ),
 ).text();
 const FILES = [
   ["scripts/db-bootstrap.sql", sql],

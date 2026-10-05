@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { debugModesFrom } from "@/modules/flowlog/debug-mode";
 import {
   FULL_DETAIL_ARM_HOURS,
@@ -344,7 +345,7 @@ describe("the editor says which deadline it is talking about", () => {
 // client-side one added later is not, and would be invisible to every test above.
 describe("every client-side read of the window is on the server's clock", () => {
   test("there are exactly two, and neither reads the browser's clock", async () => {
-    const dir = new URL("../../src/client/", import.meta.url).pathname;
+    const dir = fileURLToPath(new URL("../../src/client/", import.meta.url));
     const files = (
       await Array.fromAsync(
         new Bun.Glob("**/*.{ts,tsx}").scan({ cwd: dir, absolute: true }),

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
@@ -862,8 +863,9 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
   // before the statement after it, because from there on the words exist nowhere durable but the row.
   test("the fill sits in the branch that produced the transcription", async () => {
     const src = await Bun.file(
-      new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url)
-        .pathname,
+      fileURLToPath(
+        new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url),
+      ),
     ).text();
     const stash = src.indexOf("n.message.transcribedText = text;");
     expect(stash).toBeGreaterThan(-1);
@@ -893,8 +895,9 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
   // eager pass in the function, not before them.
   test("the ingestion guards read a transcription the eager pass produced", async () => {
     const src = await Bun.file(
-      new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url)
-        .pathname,
+      fileURLToPath(
+        new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url),
+      ),
     ).text();
     const receiver = src.indexOf(
       "export async function processChatwootDelivery(",

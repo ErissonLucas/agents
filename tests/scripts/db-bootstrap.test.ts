@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { Client } from "pg";
 import {
   FLEET_ROLE_EXPR,
@@ -70,7 +71,7 @@ const NOINH_DB = `fazerai_bs_noinh_db_${process.pid}`;
 const ADMIN_PW = "bs-admin-pw";
 const APP_PW = "bs-app-pw";
 const ROTATED_PW = "bs-app-pw-rotated";
-const REPO_ROOT = new URL("../../", import.meta.url).pathname;
+const REPO_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 
 function urlFor(user: string, password: string, database: string): string {
   const u = new URL(suUrl as string);
@@ -645,7 +646,7 @@ describe("planRoleProvisioning", () => {
   // sides of the version gate, in the version-appropriate spelling.
   test("the administrative grant exists on both sides of the version gate", async () => {
     const source = await Bun.file(
-      new URL("../../scripts/db-bootstrap.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
     ).text();
     // The needle is written with an escaped dollar rather than as a plain string, so the linter does
     // not read a literal `${` as a template someone forgot to interpolate.
@@ -685,7 +686,7 @@ describe("planRoleProvisioning", () => {
 
   test("16-only syntax stays behind the version gate", async () => {
     const source = await Bun.file(
-      new URL("../../scripts/db-bootstrap.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
     ).text();
     // Every gate, not "the" gate. The file had one when this was written; the count was the proxy,
     // never the rule, and a second gate arriving is not the thing to make red. What the rule says is

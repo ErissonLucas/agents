@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import config from "@/config";
 import { auditedPromptVar, buildPromptAudit } from "@/graph/prompt-audit";
@@ -638,7 +639,7 @@ describe("only an ISO instant that names its offset arms the mode", () => {
 // written list goes stale the same way a hand-written site list does: a new emitter arrived on the
 // base (`flowlog/command.ts`) and this test had nothing to say about it, while five files that were
 // there all along had never been looked at. Discovered now, from the tree.
-const FLOW_SRC = new URL("../../src/", import.meta.url).pathname;
+const FLOW_SRC = fileURLToPath(new URL("../../src/", import.meta.url));
 
 async function flowFiles(): Promise<string[]> {
   const out: string[] = [];
