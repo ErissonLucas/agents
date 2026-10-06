@@ -7,6 +7,10 @@ import { parseDbId } from "@/lib/db-id";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
+import {
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { agentStillSpeaks } from "@/modules/agents/speaks";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { episodeTestActivatedAt } from "@/modules/channel-redirect/episode";
@@ -745,6 +749,32 @@ async function runAgentNudgeBody(
   closing.flow = flow;
   closing.sentIds = recorded.sentIds;
 
+  // The reply gate as stored NOW (docs/LIVARE-F21-PORTAO-ETIQUETA.md). No I/O for an agent that
+  // loaded none, and not asked once this run handed the conversation over itself: the hand-off took
+  // the label off, and the line it promised is still this run's to deliver.
+  const replyGateHeld = async (): Promise<boolean> => {
+    if (!cfg.replyGateConfig.enabled) return false;
+    if (handoffOf && ownerChangedByTurn(handoffOf)) return false;
+    const verdict = await replyGateVerdictNow({
+      tenantId,
+      instanceId,
+      conversationId,
+      agentId: cfg.agentId,
+      base,
+      readLabels: () => client.getConversationLabels(conversationId),
+      fallback: cfg.replyGateConfig,
+    });
+    if (verdict.open) return false;
+    reportReplyGateHeld({
+      seam: "nudge",
+      reason: verdict.reason,
+      tenantId,
+      conversationId,
+      flow,
+    });
+    return true;
+  };
+
   // NOTE: Live-ownership probe (the opt-in requireLiveBotOwnership path): fetch the REAL
   // conversation from Chatwoot, reconcile the mirror with what came back (the GET is fresher than
   // any queued webhook, and fixing the stored status is what stops the sweep from re-enqueuing this
@@ -992,6 +1022,13 @@ async function runAgentNudgeBody(
     return noteOperatorEvent();
   }
 
+  // THE REPLY GATE, before any model spend like the two checks above: a conversation without the
+  // label hears nothing proactive either. An operator's event still reaches the team as a note.
+  if (await replyGateHeld()) {
+    if (operatorEvent) return noteOperatorEvent();
+    return "silent";
+  }
+
   // THE TENANT'S OWN CEILING, asked here for the reason the line above states: before any model
   // spend. A proactive nudge has nobody waiting on the other end, so there is no copy and no handoff
   // to arrange — it simply does not go out, and the caller reschedules it rather than burning the
@@ -1220,15 +1257,26 @@ async function runAgentNudgeBody(
   // different question wearing the first one's name. Each mode keeps its own semantics — the
   // live-gated path re-probes Chatwoot itself (the pre-invoke GET only covers the window BEFORE the
   // model ran), the event-nudge path reads the mirror.
+  // A CONVERSATION WITHOUT THE REPLY GATE'S LABEL IS NOT THE AGENT'S TO SPEAK IN
+  // (docs/LIVARE-F21-PORTAO-ETIQUETA.md), and the probe after the model says so the way it says a
+  // person took it over: the text becomes a note for the team and nothing reaches the customer.
   const botStillOwnsIt = async (): Promise<
     "ours" | "not-ours" | "unavailable"
   > => {
+    let owned: "ours" | "not-ours" | "unavailable";
     if (params.requireLiveBotOwnership) {
       const post = await probeLiveOwnership();
-      if (post === "unavailable") return "unavailable";
-      return post === "not-owned" ? "not-ours" : "ours";
+      owned =
+        post === "unavailable"
+          ? "unavailable"
+          : post === "not-owned"
+            ? "not-ours"
+            : "ours";
+    } else {
+      owned = (await botOwnsItNow()) ? "ours" : "not-ours";
     }
-    return (await botOwnsItNow()) ? "ours" : "not-ours";
+    if (owned === "ours" && (await replyGateHeld())) return "not-ours";
+    return owned;
   };
 
   // `canMessage` is the caller's own proof of ownership, not a shared variable: the branches below

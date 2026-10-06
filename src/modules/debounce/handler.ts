@@ -23,6 +23,10 @@ import {
 import { readTurnClaim } from "@/graph/thread-claim";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { isMonitoring } from "@/modules/agents/mode";
+import {
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { agentObservesNow, agentStillSpeaks } from "@/modules/agents/speaks";
 import { retireRedirectFollowUp } from "@/modules/channel-redirect/followup";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
@@ -1833,6 +1837,30 @@ export async function flushDebounceJob(
           const client = await ceilingClient();
           if (!(await stillOurs("message")) || !(await stillWanted("message")))
             return false;
+          // NOTE: the reply gate too (docs/LIVARE-F21-PORTAO-ETIQUETA.md): the sentence is the agent
+          // speaking, and a conversation without the label hears nothing from it.
+          const gate = await replyGateVerdictNow({
+            tenantId,
+            instanceId,
+            conversationId,
+            agentId: ctx.loaded.agentId,
+            base,
+            readLabels: () => client.getConversationLabels(conversationId),
+            fallback: ctx.loaded.replyGateConfig,
+          });
+          if (!gate.open) {
+            reportReplyGateHeld({
+              seam: "spend_ceiling",
+              reason: gate.reason,
+              tenantId,
+              conversationId,
+              conversationRowId: ctx.convDbId,
+              agentId: ctx.loaded.agentId,
+              inboxRowId: ctx.loaded.inboxDbId,
+              base,
+            });
+            return false;
+          }
           await client.sendMessage(conversationId, text);
           ceilingActed = true;
           return true;

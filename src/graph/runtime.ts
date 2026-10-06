@@ -11,6 +11,10 @@ import {
 } from "@/graph/close-intent";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import {
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { agentStillSpeaks } from "@/modules/agents/speaks";
 import {
   overlayMediaAnnotations,
@@ -1116,6 +1120,38 @@ async function turnBody(
   // first refusal, because every ask after it repeats the question; the episode is asked first, so
   // a run that lost both answers "stale".
   let silenced = false;
+  // THE REPLY GATE, asked at the same fence (docs/LIVARE-F21-PORTAO-ETIQUETA.md): a conversation that
+  // lost its label while the model ran gets nothing more from this turn. Latched like the other
+  // silences, so a reply is never cut and then resumed balloon by balloon. Not asked once this turn
+  // moved the owner itself: its own hand-off takes the label off, and the line the transfer
+  // promised is still this turn's to deliver. Skipped with no I/O for an agent that loaded no gate.
+  let gateHeld = false;
+  // Whether the model has been invoked: a turn the gate stops before that leaves the message owed.
+  let invoked = false;
+  const replyGateClosedNow = async (): Promise<boolean> => {
+    if (gateHeld) return true;
+    if (!loaded.replyGateConfig.enabled || conversationId <= 0) return false;
+    if (handoffOf && ownerChangedByTurn(handoffOf)) return false;
+    const verdict = await replyGateVerdictNow({
+      tenantId,
+      instanceId,
+      conversationId,
+      agentId: loaded.agentId,
+      base,
+      readLabels: () => client.getConversationLabels(conversationId),
+      fallback: loaded.replyGateConfig,
+    });
+    if (verdict.open) return false;
+    gateHeld = true;
+    reportReplyGateHeld({
+      seam: "turn",
+      reason: verdict.reason,
+      tenantId,
+      conversationId,
+      flow,
+    });
+    return true;
+  };
   const writeCalledOff = async (): Promise<boolean> => {
     if (
       params.stillWanted !== null &&
@@ -1127,6 +1163,7 @@ async function turnBody(
       silenced = true;
       return true;
     }
+    if (await replyGateClosedNow()) return true;
     // NOTE: a run its job's deadline ended was failed, and its retry answers the burst. Every write it
     // would still make settles the burst for that retry: a silence, a guardrail's refusal, a receipt
     // (issue #811). Answered as a withdrawal, which leaves the burst unmarked. Read after the reads
@@ -1134,8 +1171,20 @@ async function turnBody(
     // already on its way is not cut midway.
     return pastDeadline();
   };
-  const standDown = (): "stale" | "agent-unavailable" =>
-    silenced ? "agent-unavailable" : "stale";
+  // A gate that closed is a conversation that is not the agent's to answer: `taken-over` once the
+  // model ran (its message is in memory and the reply is rolled back), `taken-over-unread` before.
+  const standDown = ():
+    | "stale"
+    | "agent-unavailable"
+    | "taken-over"
+    | "taken-over-unread" =>
+    silenced
+      ? "agent-unavailable"
+      : gateHeld
+        ? invoked
+          ? "taken-over"
+          : "taken-over-unread"
+        : "stale";
 
   // WHO OWNS IT ACCORDING TO THE MIRROR, RIGHT NOW (issue #457, review round 7). The receiver's gate
   // proved bot ownership before this turn was queued, and the note is written much later — after the
@@ -1260,7 +1309,13 @@ async function turnBody(
   // output-guardrail path has returned "stale" past this same claim since the ask after that model
   // call was added.
   const postBlocked = async (): Promise<
-    "stale" | "agent-unavailable" | "superseded" | "answered-elsewhere" | null
+    | "stale"
+    | "agent-unavailable"
+    | "taken-over"
+    | "taken-over-unread"
+    | "superseded"
+    | "answered-elsewhere"
+    | null
   > => {
     if (await writeCalledOff()) return standDown();
     // A PALAVRA DO PORTÃO, repassada inteira (issue #703). Traduzir as duas recusas dele para um
@@ -2692,6 +2747,7 @@ async function turnBody(
       }
     };
     reachedModel = true;
+    invoked = true;
     const result = await withFlowStage(
       flow,
       "generate",

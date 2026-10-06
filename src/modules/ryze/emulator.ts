@@ -9,6 +9,11 @@ import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import type { ScopedDb } from "@/lib/tenancy";
+import {
+  readReplyGateConfig,
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { CHATWOOT_AUTH_HEADER } from "@/modules/chatwoot/constants";
 import {
   RyzeApiError,
@@ -27,6 +32,7 @@ import { cardButtonsOf, carouselCardsOf } from "./interactive";
 import { ryzeLabelColorHex } from "./label-shared";
 import {
   applyLabelRules,
+  applyReplyGateHandoff,
   catalogTitles,
   syncConversationLabels,
 } from "./labels";
@@ -210,6 +216,73 @@ export class RyzeEmulator {
       if (bot) return { type: "agent_bot", id: bot.botId, name: bot.name };
     }
     return { type: "user", ...RYZE_OPERATOR_USER };
+  }
+
+  // THE REPLY GATE AT THE TRANSPORT (docs/LIVARE-F21-PORTAO-ETIQUETA.md), the backstop behind the
+  // fences every speaking path asks: an agent bot's message, media or reaction on a conversation the
+  // agent may not speak in is refused before a row is written or RyzeAPI is called. A person's send
+  // is never asked, and neither is a conversation in the human queue (`open`): every bot path refuses
+  // that one on ownership already, except the line a hand-off promised, which is the agent's to say
+  // after its own transfer took the label off. An unreadable binding is not evidence of a gate.
+  private async replyGateRefusal(
+    conv: RyzeConversation,
+    sender: Sender,
+  ): Promise<Response | null> {
+    if (sender.type !== "agent_bot" || conv.status === "open") return null;
+    let bound: { agentId: bigint; settings: unknown } | null;
+    try {
+      bound = await this.db(async (db) => {
+        const bot = await db.chatwootAgentBot.findFirst({
+          where: {
+            chatwootInstanceId: this.instanceId,
+            chatwootAgentBotId: sender.id,
+          },
+          select: { agentId: true, agent: { select: { settings: true } } },
+        });
+        return bot
+          ? { agentId: bot.agentId, settings: bot.agent.settings }
+          : null;
+      });
+    } catch (err) {
+      logger.warn(
+        "ryze emulator: could not read the sending bot's reply gate (conversation %d): %s",
+        conv.displayId,
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
+    if (!bound) return null;
+    const cfg = readReplyGateConfig(bound.settings);
+    if (!cfg.enabled) return null;
+    const verdict = await replyGateVerdictNow({
+      tenantId: this.tenantId,
+      instanceId: this.instanceId,
+      conversationId: conv.displayId,
+      agentId: bound.agentId,
+      base: this.base,
+      config: cfg,
+    });
+    if (verdict.open) return null;
+    const mirrored = await this.db((db) =>
+      db.conversation.findFirst({
+        where: {
+          chatwootInstanceId: this.instanceId,
+          chatwootConversationId: conv.displayId,
+        },
+        select: { id: true, inboxId: true },
+      }),
+    ).catch(() => null);
+    reportReplyGateHeld({
+      seam: "transport",
+      reason: verdict.reason,
+      tenantId: this.tenantId,
+      conversationId: conv.displayId,
+      conversationRowId: mirrored?.id ?? null,
+      inboxRowId: mirrored?.inboxId ?? null,
+      agentId: bound.agentId,
+      base: this.base,
+    });
+    return json(422, { error: "reply_gate_closed", reason: verdict.reason });
   }
 
   private async route(
@@ -619,6 +692,10 @@ export class RyzeEmulator {
     const messageType =
       b.message_type === "incoming" ? 0 : b.message_type === "activity" ? 2 : 1;
     const goesOut = !isPrivate && messageType === 1 && !!content;
+    if (goesOut) {
+      const refused = await this.replyGateRefusal(conv, sender);
+      if (refused) return refused;
+    }
     const row = await this.insertOutgoing(gw, conv, {
       content,
       isPrivate,
@@ -682,6 +759,8 @@ export class RyzeEmulator {
     if (!(file instanceof File))
       return json(422, { error: "attachment missing" });
     const sender = await this.senderFor(gw, token);
+    const refused = await this.replyGateRefusal(conv, sender);
+    if (refused) return refused;
     const bytes = await file.arrayBuffer();
     const mime = file.type || "application/octet-stream";
     const fileType = fileTypeOf(mime);
@@ -838,6 +917,9 @@ export class RyzeEmulator {
       found.prior.contentAttributes.is_reaction === true &&
       found.prior.content === emoji;
     const toSend = priorIsSame ? "" : emoji;
+    const sender = await this.senderFor(gw, token);
+    const refused = await this.replyGateRefusal(found.conv, sender);
+    if (refused) return refused;
     try {
       const ryze = await this.makeRyze(gw);
       await ryze.sendReaction(
@@ -848,7 +930,6 @@ export class RyzeEmulator {
     } catch (err) {
       return json(sendFailureStatus(err), { error: "reaction failed" });
     }
-    const sender = await this.senderFor(gw, token);
     await this.db(async (db) => {
       if (found.prior && priorIsSame) {
         await db.ryzeMessage.delete({ where: { id: found.prior.id } });
@@ -982,6 +1063,16 @@ export class RyzeEmulator {
             : {},
         { base: this.base, makeRyzeClient: this.makeRyze },
       );
+    }
+    // NOTE: the same moment is the reply gate's hand-off: whoever moved the conversation to the human
+    // queue (the handoff tool, a person's reply, the console), its required label comes off and the
+    // hand-off one goes on (docs/LIVARE-F21-PORTAO-ETIQUETA.md). A return to the agent restores
+    // nothing: the label is granted, never assumed.
+    if (previous !== status && status === "open") {
+      await applyReplyGateHandoff(await this.gateway(), done.conv.id, {
+        base: this.base,
+        makeRyzeClient: this.makeRyze,
+      });
     }
     return json(200, {
       success: true,
