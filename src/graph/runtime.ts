@@ -77,6 +77,7 @@ import {
   readCustomerMessage,
   readingNote,
   replyBreaksRules,
+  stripForeignScripts,
 } from "@/modules/jev/service";
 import { armCompaction } from "@/modules/memory/compact";
 import { signatureFor } from "@/modules/signature/service";
@@ -2979,6 +2980,18 @@ async function turnBody(
     // deadline they do not grant) is held back and the case goes to the team, like an output
     // guardrail that hands off. Best-effort: a check that could not run lets the reply through to
     // the guardrails below, as before.
+    if (loaded.jevConfig?.latinOnly && reply) {
+      const cleaned = stripForeignScripts(reply);
+      if (cleaned !== reply) {
+        emitFlowEvent(flow, {
+          stage: "jev",
+          level: "info",
+          status: "ok",
+          detail: { strippedForeignScript: reply.length - cleaned.length },
+        });
+        reply = cleaned;
+      }
+    }
     if (loaded.jevConfig?.outputCheck.enabled && reply) {
       const breaks = await replyBreaksRules(
         loaded.jevConfig,

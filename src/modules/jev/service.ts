@@ -20,6 +20,9 @@ const STATE_MAX_CHARS = 4_000;
 
 export interface JevConfig {
   enabled: boolean;
+  // Drop characters of scripts the agent never writes in (a model that leaks a Gujarati or CJK token
+  // into a Portuguese reply): Latin, digits, punctuation and emoji stay.
+  latinOnly: boolean;
   // Above this, a message that is only an acknowledgement is answered with a reaction and no reply.
   ackThreshold: number;
   // Above this, "asked for a person" is told to the model as a must-act (transfer now).
@@ -67,6 +70,7 @@ export function readJevConfig(settings: unknown): JevConfig | null {
       : "";
   return {
     enabled: true,
+    latinOnly: j.latinOnly === true,
     ackThreshold: num(j.ackThreshold, 0.9),
     humanThreshold: num(j.humanThreshold, 0.9),
     intents: Object.keys(intents).length >= 2 ? intents : {},
@@ -265,4 +269,17 @@ export async function replyBreaksRules(
     deps,
   );
   return typeof a?.breaks?.noul === "number" ? a.breaks.noul : null;
+}
+
+// Removes letters of non-Latin scripts and tidies the spaces they leave; emoji, digits and punctuation
+// (Unicode "Common") stay. Used only when the agent opted in (latinOnly).
+export function stripForeignScripts(text: string): string {
+  const foreign =
+    /[^\p{Script=Latin}\p{Script=Common}\p{Script=Inherited}\n]+/gu;
+  if (!foreign.test(text)) return text;
+  return text
+    .replace(foreign, "")
+    .replace(/[ \t]{2,}/g, " ")
+    .replace(/[ \t]+$/gm, "")
+    .trim();
 }

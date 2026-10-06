@@ -6,6 +6,7 @@ import {
   readingNote,
   readJevConfig,
   replyBreaksRules,
+  stripForeignScripts,
 } from "@/modules/jev/service";
 
 // Jev (TypeSafe AI) against a fake API: the shapes are the ones the real one answered on 02/10/2026.
@@ -122,9 +123,10 @@ describe("the rule check after the model", () => {
     expect(await replyBreaksRules(cfg, "Te dou um cupom de 20%!", deps)).toBe(
       0.94,
     );
-    const q = (
-      calls[0]?.body.questions as Record<string, { instructions: string }>
-    ).breaks;
+    const body = calls[0]?.body as
+      | { questions: Record<string, { instructions: string }> }
+      | undefined;
+    const q = body?.questions.breaks;
     expect(q?.instructions).toContain("promete cupom");
   });
 
@@ -135,5 +137,19 @@ describe("the rule check after the model", () => {
     expect(await replyBreaksRules(off, "qualquer", deps)).toBeNull();
     expect(await replyBreaksRules(cfg, "  ", deps)).toBeNull();
     expect(calls.length).toBe(0);
+  });
+});
+
+describe("stripForeignScripts", () => {
+  test("drops a leaked Gujarati word, keeps accents, emoji and line breaks", () => {
+    expect(stripForeignScripts("Opa, Erisson! 😊 Não consigo agora. જરૂર")).toBe(
+      "Opa, Erisson! 😊 Não consigo agora.",
+    );
+    expect(stripForeignScripts("R$ 47,99 🔥\nQual vai ser?")).toBe(
+      "R$ 47,99 🔥\nQual vai ser?",
+    );
+    expect(stripForeignScripts("ação, coração — 2× fritas")).toBe(
+      "ação, coração — 2× fritas",
+    );
   });
 });
