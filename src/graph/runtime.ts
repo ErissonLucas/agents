@@ -79,9 +79,18 @@ import {
   replyBreaksRules,
 } from "@/modules/jev/service";
 import { armCompaction } from "@/modules/memory/compact";
+import {
+  gatewayForInstance,
+  scoped as ryzeScoped,
+  unsettledSinceLastAccepted,
+} from "@/modules/ryze/store";
 import { signatureFor } from "@/modules/signature/service";
 import { holdPresence, type PresenceHold } from "@/modules/split/presence";
-import { deliverReply, type ReplyDelivery } from "@/modules/split/service";
+import {
+  accountForRejectedSend,
+  deliverReply,
+  type ReplyDelivery,
+} from "@/modules/split/service";
 import type { TtsCheckConfig } from "@/modules/tts/check";
 import { plannedReplyIsAudio, spokenNoticeFor } from "@/modules/tts/modality";
 import { synthesizeReply } from "@/modules/tts/service";
@@ -342,6 +351,35 @@ export interface RuntimeDeps {
 //
 // Best-effort by contract (see recordConversationError): bookkeeping must never turn a half-answer
 // that WAS delivered into a thrown turn.
+// The note a turn carries when this RyzeAPI conversation's latest sends were never accepted by the
+// provider (F2.1-A). Null when there is nothing to say or the lookup failed.
+async function unconfirmedSendNote(
+  tenantId: bigint,
+  instanceId: bigint,
+  conversationId: number,
+  base: PrismaClient,
+): Promise<string | null> {
+  try {
+    const unsettled = await ryzeScoped(
+      tenantId,
+      async (db) => {
+        const gw = await gatewayForInstance(db, instanceId);
+        return gw ? unsettledSinceLastAccepted(db, gw.id, conversationId) : [];
+      },
+      base,
+    );
+    if (unsettled.length === 0) return null;
+    return "<envio_nao_confirmado>\nNota do sistema (não mencione ao cliente): sua(s) última(s) mensagem(ns) nesta conversa não teve(tiveram) o aceite confirmado pelo provedor do WhatsApp. Ela(s) pode(m) ou não ter chegado ao cliente. Não presuma que o cliente a(s) leu e não a(s) repita por conta própria; se o assunto depender dela(s), confirme com o cliente de forma natural.\n</envio_nao_confirmado>";
+  } catch (err) {
+    logger.warn(
+      "turn: could not read unconfirmed RyzeAPI sends (conv=%s): %s",
+      String(conversationId),
+      err instanceof Error ? err.message : String(err),
+    );
+    return null;
+  }
+}
+
 async function notePartialDelivery(params: {
   tenantId: bigint;
   instanceId: bigint;
@@ -353,6 +391,10 @@ async function notePartialDelivery(params: {
   // have them post a duplicate by hand. Default false, so every existing caller keeps saying what
   // it already said.
   unproven?: boolean;
+  // A RyzeAPI number, where the doubt has a different source (F2.1-A): the provider never confirmed
+  // it took the message, and its own record cannot say it did not. Worded for that, because "the
+  // read-back did not answer" sends the operator to look for a Chatwoot that is not there.
+  ryze?: boolean;
 }): Promise<void> {
   await recordConversationError({
     tenantId: params.tenantId,
@@ -360,7 +402,9 @@ async function notePartialDelivery(params: {
     chatwootConversationId: params.conversationId,
     error: new Error(
       params.unproven
-        ? "não foi possível confirmar a entrega: o envio foi rejeitado e o Chatwoot não respondeu à releitura, então parte da resposta pode ou não ter chegado ao cliente. Confira a conversa antes de reenviar."
+        ? params.ryze
+          ? "não foi possível confirmar o envio: o provedor do WhatsApp não confirmou o aceite e o registro do envio não prova que ele não saiu, então parte da resposta pode ou não ter chegado ao cliente. Nada foi reenviado. Confira a conversa no aparelho antes de reenviar."
+          : "não foi possível confirmar a entrega: o envio foi rejeitado e o Chatwoot não respondeu à releitura, então parte da resposta pode ou não ter chegado ao cliente. Confira a conversa antes de reenviar."
         : "a entrega ficou incompleta: parte do que o turno prometeu não chegou ao cliente, e não será reenviada",
     ),
     base: params.base,
@@ -692,6 +736,12 @@ interface AttachmentDelivery {
   // `sent: false`: the ask is one statement before the first send, and the gate is memoized, so a
   // batch that delivered anything had already won the claim.
   lostClaim: boolean;
+  // A RyzeAPI send was rejected and its own record cannot say the provider did not take it (F2.1-A,
+  // docs/LIVARE-F21-A-ENVIO-INCERTO.md). Not `sent`, because nobody knows that, and not `failed`,
+  // because `failed` with nothing sent is what throws and re-runs the turn — sending this file again
+  // when the customer may already hold it. Every caller reads it as "may have reached them": no
+  // re-run, no stand-down, no close, and the unproven badge.
+  unproven: boolean;
 }
 
 async function deliverPendingAttachments(
@@ -718,6 +768,7 @@ async function deliverPendingAttachments(
   let failed = false;
   let stopped = false;
   let lostClaim = false;
+  let unproven = false;
   for (const file of queued) {
     // A document is queued as BYTES, and bytes cannot say whether the row is still deliverable. The
     // operator can revoke between the tool issuing it and this loop running — the model still had a
@@ -800,13 +851,15 @@ async function deliverPendingAttachments(
       lostClaim = true;
       break;
     }
+    // Named before it leaves, on a RyzeAPI number only: the name is what a rejection is asked about.
+    const sendId = client.isRyzeEmulator ? crypto.randomUUID() : undefined;
     try {
       await client.sendFileAttachment(
         conversationId,
         file.bytes,
         file.fileName,
         file.mime,
-        { caption: file.caption },
+        { caption: file.caption, ...(sendId ? { sendId } : {}) },
       );
       sent = true;
       emitFlowEvent(flow, {
@@ -825,17 +878,37 @@ async function deliverPendingAttachments(
         String(conversationId),
         msg,
       );
+      // A REJECTION IS NOT AN ABSENCE on a RyzeAPI number (F2.1-A): the attempt's own record decides,
+      // and only a send the provider was never asked to make counts as failed.
+      let outcome: "sent" | "failed" | "unconfirmed" = "failed";
+      if (sendId) {
+        const verdict = await accountForRejectedSend(
+          client,
+          conversationId,
+          sendId,
+          null,
+          e,
+          flow,
+        );
+        outcome = !verdict.known
+          ? "unconfirmed"
+          : verdict.id !== null
+            ? "sent"
+            : "failed";
+      }
+      if (outcome === "sent") sent = true;
+      else if (outcome === "unconfirmed") unproven = true;
+      else failed = true;
       emitFlowEvent(flow, {
         stage: "tool",
         level: "warn",
         status: "error",
-        detail: { tool: file.tool, outcome: "failed" },
+        detail: { tool: file.tool, outcome },
         errorMessage: msg,
       });
-      failed = true;
     }
   }
-  return { sent, failed, calledOff: stopped, lostClaim };
+  return { sent, failed, calledOff: stopped, lostClaim, unproven };
 }
 
 // THE REPLY CLAIM, taken here because this is the tail every posting path shares (issue #452): the
@@ -1650,18 +1723,46 @@ async function turnBody(
         if (tts) {
           if (!(await claimBeforeSend())) return "superseded";
           presence.hold?.quiet();
-          const sent = await client.sendAudioMessage(
-            conversationId,
-            tts.audio,
-            tts.fileName,
-            tts.mime,
-            {
-              transcribedText: spoken.speech,
-              // What the channel gets as TEXT if it refuses the audio: the speech has holes where
-              // the items were, and the reply does not (issue #792).
-              ...(spoken.speech === text ? {} : { replyText: text }),
-            },
-          );
+          // A REJECTED VOICE NOTE IS NOT A REASON TO SEND THE TEXT on a RyzeAPI number (F2.1-A). The
+          // fallback below is a second message, so it may only follow a voice note the provider was
+          // never asked to send; one it may have taken leaves the turn unproven instead, and the
+          // customer does not get the same answer twice in two forms. Native Chatwoot is unchanged.
+          const audioSendId = client.isRyzeEmulator
+            ? crypto.randomUUID()
+            : undefined;
+          let sent: unknown;
+          try {
+            sent = await client.sendAudioMessage(
+              conversationId,
+              tts.audio,
+              tts.fileName,
+              tts.mime,
+              {
+                transcribedText: spoken.speech,
+                // What the channel gets as TEXT if it refuses the audio: the speech has holes where
+                // the items were, and the reply does not (issue #792).
+                ...(spoken.speech === text ? {} : { replyText: text }),
+                ...(audioSendId ? { sendId: audioSendId } : {}),
+              },
+            );
+          } catch (e) {
+            if (!audioSendId) throw e;
+            const verdict = await accountForRejectedSend(
+              client,
+              conversationId,
+              audioSendId,
+              null,
+              e,
+              flow,
+            );
+            if (!verdict.known) {
+              return { delivered: 0, failed: true, unproven: true };
+            }
+            // Never dispatched: the fallback to text below is the safe send it always was.
+            if (verdict.id === null) throw e;
+            // Accepted by the provider although the answer was lost: the voice note is out.
+            sent = { id: verdict.id };
+          }
           // AND KEEP THE WORDS WHERE OUR OWN READERS LOOK, which on upstream Chatwoot is the only
           // place they survive (issue #763). `transcribedText` above rides in
           // `attachments_metadata`, which the fork stores on the attachment and shows under the
@@ -2451,6 +2552,19 @@ async function turnBody(
       if (await writeCalledOff()) return standDown();
     }
 
+    // WHAT OUR LAST WORD ACTUALLY WAS (F2.1-A, docs/LIVARE-F21-A-ENVIO-INCERTO.md). The thread holds
+    // every reply a turn produced, delivered or not — the invoke persists it before the send — so on a
+    // RyzeAPI number whose latest sends the provider never accepted, the model would read its own
+    // unconfirmed words as said. Nothing in the history is touched: this turn's input carries a short
+    // note instead, and only while those attempts are the newest thing our side tried. Best-effort: a
+    // lookup that fails leaves the turn as it was.
+    const sendDoubtNote = client.isRyzeEmulator
+      ? await unconfirmedSendNote(tenantId, instanceId, conversationId, base)
+      : null;
+    const turnNotes = [jevNote, sendDoubtNote].filter(
+      (n): n is string => n !== null,
+    );
+
     // The second ask, and it is not a repeat of the one inside the lock: that one guards the divider
     // and the claim, this one guards the INVOKE, which persists the channel. Between them sit the
     // state read, the toolset build and the prompt resolution, and on a conversation with no
@@ -2608,7 +2722,9 @@ async function turnBody(
               // finished saying it. Unknown stays unstamped rather than becoming the turn's clock.
               new HumanMessage({
                 id: inputMessageId,
-                content: jevNote ? `${text}\n\n${jevNote}` : text,
+                content: turnNotes.length
+                  ? `${text}\n\n${turnNotes.join("\n\n")}`
+                  : text,
                 additional_kwargs: {
                   ...conversationStamp(conversationId),
                   ...sentAtStamp(loaded.promptOpts.messageAt),
@@ -3095,6 +3211,7 @@ async function turnBody(
         failed,
         calledOff: attachmentsCalledOff,
         lostClaim,
+        unproven: attachmentsUnproven,
       } = await deliverPendingAttachments(
         client,
         conversationId,
@@ -3112,7 +3229,8 @@ async function turnBody(
       // customer, and "stale" would leave the watermark where it is — handing the same burst to the
       // next flush, which would send that attachment again. What was delivered decides the word, the
       // same rule the reply below follows.
-      if (attachmentsCalledOff && !sent) return refuse(standDown());
+      if (attachmentsCalledOff && !sent && !attachmentsUnproven)
+        return refuse(standDown());
       // NOTE: The attachments WERE the turn and none of them reached the customer. That is a failed
       // turn, not a silent one: returning "empty" here would let the deferred resolve close a
       // conversation nobody answered, and the callers only record a turn error (private note,
@@ -3127,6 +3245,19 @@ async function turnBody(
       // and the deferred resolve is skipped with it, because a conversation the customer never
       // heard back on must not close.
       if (queued > 0 && !sent && !handedOff) {
+        // MAY HAVE REACHED THEM (F2.1-A): not a failure to re-run and not an empty turn to close,
+        // the same word the text path gives an unproven zero.
+        if (attachmentsUnproven) {
+          await notePartialDelivery({
+            tenantId,
+            instanceId,
+            conversationId,
+            base,
+            unproven: true,
+            ryze: client.isRyzeEmulator,
+          });
+          return "posted-partial";
+        }
         if (failed) {
           throw new Error(
             "envio de anexo: nada foi entregue e o turno não tinha resposta em texto",
@@ -3214,7 +3345,7 @@ async function turnBody(
         !unexplained &&
         mayCloseConversation({
           replyPartial: false,
-          attachmentFailed: failed,
+          attachmentFailed: failed || attachmentsUnproven,
         }) &&
         !(await writeCalledOff())
       ) {
@@ -3235,7 +3366,7 @@ async function turnBody(
       if (!sent && !handedOff) return "empty";
       const postedFiles = postedOutcomeFor({
         replyPartial: false,
-        attachmentFailed: failed,
+        attachmentFailed: failed || attachmentsUnproven,
       });
       if (postedFiles === "posted-partial") {
         await notePartialDelivery({
@@ -3243,6 +3374,8 @@ async function turnBody(
           instanceId,
           conversationId,
           base,
+          unproven: attachmentsUnproven,
+          ryze: client.isRyzeEmulator,
         });
       }
       return postedFiles;
@@ -3265,8 +3398,20 @@ async function turnBody(
     // Called off mid-batch with something already out: the text below would stand down anyway, and
     // returning "stale" from there would replay a burst whose attachment the customer has. The turn
     // reports what it delivered and stops here.
-    if (attachments.calledOff)
+    if (attachments.calledOff) {
+      if (attachments.unproven) {
+        await notePartialDelivery({
+          tenantId,
+          instanceId,
+          conversationId,
+          base,
+          unproven: true,
+          ryze: client.isRyzeEmulator,
+        });
+        return "posted-partial";
+      }
       return attachments.sent ? "posted" : refuse(standDown());
+    }
 
     const delivered = await deliverText(reply, recheck.voiceReply);
     // Another turn holds the claim on this burst. Nothing left here — the ask sits one statement
@@ -3298,7 +3443,7 @@ async function turnBody(
       // the delivery recovery, which re-runs this turn in full — every side-effecting tool included
       // — over a message that may already have been answered. The operator still hears about it
       // through the badge the branch below writes.
-      if (!attachments.sent && !delivered.unproven) {
+      if (!attachments.sent && !attachments.unproven && !delivered.unproven) {
         throw new Error(
           "envio da resposta: nenhum balão foi entregue ao cliente",
         );
@@ -3317,13 +3462,17 @@ async function turnBody(
       // flush, which would answer it again — the same duplicate the throw above was just kept from
       // arming, arriving through the other door. It is reported instead, so the burst is consumed,
       // the conversation stays open and the badge says a delivery could not be accounted for.
-      if (delivered !== "stale" && delivered.unproven) {
+      if (
+        (delivered !== "stale" && delivered.unproven) ||
+        attachments.unproven
+      ) {
         await notePartialDelivery({
           tenantId,
           instanceId,
           conversationId,
           base,
           unproven: true,
+          ryze: client.isRyzeEmulator,
         });
         return "posted-partial";
       }
@@ -3362,7 +3511,7 @@ async function turnBody(
     // failed sends are what tell the operator why the conversation stayed open.
     const posted = postedOutcomeFor({
       replyPartial: delivered.failed,
-      attachmentFailed: attachments.failed,
+      attachmentFailed: attachments.failed || attachments.unproven,
     });
     if (posted === "posted-partial") {
       await notePartialDelivery({
@@ -3372,7 +3521,8 @@ async function turnBody(
         base,
         // Some of the reply landed and one send could not be accounted for, so what is missing is
         // a doubt rather than a fact here too.
-        unproven: delivered.unproven,
+        unproven: delivered.unproven || attachments.unproven,
+        ryze: client.isRyzeEmulator,
       });
       return posted;
     }

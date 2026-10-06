@@ -17,6 +17,10 @@ import {
   withFlowStage,
 } from "@/modules/flowlog/service";
 import {
+  RYZE_STATUS_NOT_DISPATCHED,
+  type RyzeDeliveryState,
+} from "@/modules/ryze/store";
+import {
   attachSignature,
   type SignatureFrequency,
   type SignaturePosition,
@@ -570,7 +574,7 @@ const CHATWOOT_MESSAGES_PAGE = 20;
 //
 // This repo already states the rule elsewhere in this very file's history — no rows is UNKNOWN, not
 // zero — and this is the site where it was not applied.
-type LandedVerdict =
+export type LandedVerdict =
   // Chatwoot holds it. The id comes back because it is also the oldest point a later read-back on
   // this same reply needs to page to.
   | { known: true; id: number }
@@ -599,7 +603,7 @@ function isPreCreateStatus(status: number): boolean {
 // differently (issue #499). Splitting on or off, the question is the same — did those words reach
 // the customer? — and the path with no remainder to salvage used to skip it entirely, reporting
 // every rejection as unaccounted for.
-async function accountForRejectedSend(
+export async function accountForRejectedSend(
   client: ChatwootClient,
   conversationId: number,
   sendId: string,
@@ -608,6 +612,13 @@ async function accountForRejectedSend(
   flow: FlowContext | undefined,
 ): Promise<LandedVerdict> {
   reportFailedSend(flow, conversationId, err);
+  // A RyzeAPI NUMBER IS ASKED ITS OWN WAY, and nothing below applies to it (F2.1-A). The emulator
+  // keeps every attempt, so the question is answered by the attempt's own record, not by an HTTP
+  // status and not by an absence: a 422 or a 5xx from it, a timeout, a page without the message —
+  // none of them is proof the provider did not take it.
+  if (client.isRyzeEmulator) {
+    return ryzeSendVerdict(client, conversationId, sendId);
+  }
   // A REJECTION THAT COULD NOT HAVE CREATED A MESSAGE IS A PROVEN ABSENCE, not an ambiguous one.
   // Ambiguity has one source: the request may have been served before the response was lost. Two
   // families cannot have been.
@@ -620,6 +631,58 @@ async function accountForRejectedSend(
   if (err instanceof ChatwootApiError && isPreCreateStatus(err.status))
     return { known: true, id: null };
   return findLandedMessage(client, conversationId, sendId, after);
+}
+
+// The three answers, for a RyzeAPI send (F2.1-A, docs/LIVARE-F21-A-ENVIO-INCERTO.md):
+//   accepted      exactly one row, `sent` and marked accepted: the provider took it (its acceptance,
+//                 not the phone's delivery). Not resent.
+//   never sent    exactly one row marked `not_dispatched`, no provider id: the provider was never
+//                 called, the ONLY proof a resend may stand on.
+//   unknown       anything else — sending, uncertain, no row, several rows, states that disagree, a
+//                 failed lookup. Not resent, and reported as unproven.
+const RYZE_ACCEPTED: ReadonlySet<string> = new Set<RyzeDeliveryState>([
+  "provider_accepted",
+  "provider_accepted_unrecorded",
+]);
+
+async function ryzeSendVerdict(
+  client: ChatwootClient,
+  conversationId: number,
+  sendId: string,
+): Promise<LandedVerdict> {
+  try {
+    const records = await client.getRyzeSendState(
+      conversationId,
+      sendId,
+      READBACK_BUDGET_MS,
+    );
+    if (records.length !== 1) return { known: false };
+    const [only] = records as [(typeof records)[number]];
+    if (
+      only.state !== null &&
+      RYZE_ACCEPTED.has(only.state) &&
+      only.status === "sent" &&
+      Number.isSafeInteger(only.id)
+    ) {
+      noteLandedMessage(client, only.id);
+      return { known: true, id: only.id };
+    }
+    if (
+      only.state === "not_dispatched" &&
+      only.status === RYZE_STATUS_NOT_DISPATCHED &&
+      only.sourceId === null
+    ) {
+      return { known: true, id: null };
+    }
+    return { known: false };
+  } catch (e) {
+    logger.warn(
+      "split: could not ask the RyzeAPI emulator about a rejected send (conv=%s): %s",
+      String(conversationId),
+      e instanceof Error ? e.message : String(e),
+    );
+    return { known: false };
+  }
 }
 
 async function findLandedMessage(
