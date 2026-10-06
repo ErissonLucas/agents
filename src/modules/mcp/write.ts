@@ -38,6 +38,7 @@ import {
   assertSettingsDebugWindow,
   assertSettingsModelFallback,
   assertSettingsProtectedLabels,
+  assertSettingsReplyGate,
   assertSettingsRetiredLabelKeys,
   assertSettingsTextSizes,
   assertSettingsToolPreconditions,
@@ -716,6 +717,8 @@ export async function agentSettingsSet(
       (current.settings ?? {}) as Record<string, unknown>,
       patch,
     );
+    // NOTE: the merged bag, not the patch: a patch that only flips `enabled` keeps the stored label.
+    assertSettingsReplyGate(nextBag, current.settings);
     // NOTE: PROJECTED, like the read — the same question asked in a third place. A client is expected to
     // reuse the preview's `after` (that is what a dry run is for), so a diff carrying the fields the
     // write refuses hands back a document that the apply rejects. Fixing `agent_settings_get` alone

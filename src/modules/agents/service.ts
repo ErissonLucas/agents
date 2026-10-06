@@ -26,6 +26,7 @@ import {
 } from "@/modules/agents/audit-projection";
 import { readBehaviorSettings } from "@/modules/agents/behavior-settings";
 import { collectCredentialRefWrites } from "@/modules/agents/credential-paths";
+import { readReplyGateConfig } from "@/modules/agents/reply-gate";
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { collectOversizedTextChanges } from "@/modules/agents/text-caps";
 import {
@@ -656,6 +657,57 @@ function labelListOverflows(
   if (kept.size <= max) return false;
   const before = rawLabelList(stored, key);
   return !(before !== null && JSON.stringify(before) === JSON.stringify(next));
+}
+
+// THE REPLY GATE IS REFUSED WHEN IT COULD NEVER OPEN (docs/LIVARE-F21-PORTAO-ETIQUETA.md). On with no
+// label to require, the runtime holds every reply for good, and the same title as the requirement
+// and the hand-off mark would close the gate the moment it opened. Both are saved without complaint
+// by the readers, so they are refused here, and only when the write changes the block.
+export class ReplyGateNeedsLabelError extends AppError {
+  constructor() {
+    super(
+      "The reply gate is on but names no required label, so the agent would never answer. Name the label or turn the gate off.",
+      400,
+      "errors.replyGateNeedsLabel",
+      undefined,
+      "replyGate.requiredLabel",
+    );
+  }
+}
+
+export class ReplyGateSameLabelsError extends AppError {
+  constructor() {
+    super(
+      "The hand-off label must differ from the required label.",
+      400,
+      "errors.replyGateSameLabels",
+      undefined,
+      "replyGate.handoffLabel",
+    );
+  }
+}
+
+function rawReplyGate(settings: unknown): unknown {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings))
+    return undefined;
+  return (settings as Record<string, unknown>).replyGate;
+}
+
+export function assertSettingsReplyGate(
+  settings: unknown,
+  stored: unknown,
+): void {
+  const raw = rawReplyGate(settings);
+  if (raw === undefined) return;
+  if (JSON.stringify(raw) === JSON.stringify(rawReplyGate(stored))) return;
+  const cfg = readReplyGateConfig(settings);
+  if (!cfg.enabled) return;
+  if (!cfg.requiredLabel) throw new ReplyGateNeedsLabelError();
+  if (
+    cfg.handoffLabel &&
+    cfg.handoffLabel.toLowerCase() === cfg.requiredLabel.toLowerCase()
+  )
+    throw new ReplyGateSameLabelsError();
 }
 
 export function assertSettingsProtectedLabels(
@@ -1776,6 +1828,7 @@ export async function updateAgent(
     stripRetiredNoteFlagInPlace(rest.settings);
     stripDerivedFullDetailInPlace(rest.settings);
     assertSettingsProtectedLabels(rest.settings, before?.settings);
+    assertSettingsReplyGate(rest.settings, before?.settings);
     // LAST of the settings rules, after both strips: the dedicated rules above answer their fields
     // with their own sentences, and a retired or derived key is gone before the schema is asked.
     assertSettingsClosedValues(rest.settings, before?.settings);
@@ -2003,6 +2056,7 @@ export function assertAgentCreatable(input: AgentCreate): {
   stripRetiredNoteFlagInPlace(input.settings);
   stripDerivedFullDetailInPlace(input.settings);
   assertSettingsProtectedLabels(input.settings, undefined);
+  assertSettingsReplyGate(input.settings, undefined);
   assertSettingsClosedValues(input.settings, undefined);
   const data = parseInput(agentCreateSchema, input);
   validateModelConfigForWrite(data.modelConfig);

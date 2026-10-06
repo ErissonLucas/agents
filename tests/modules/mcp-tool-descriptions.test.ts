@@ -308,7 +308,10 @@ const SETTINGS_DESC_CEILING = 2_000;
 // trim — the name is the whole entry. Re-measured on the tree that ships: 29,114.
 // RAISED again by the `send_carousel` native, the same per-tool enum growth as `send_buttons`: 388
 // characters, nothing to trim. Re-measured on the tree that ships: 29,517.
-const SETTINGS_SCHEMA_CEILING = 29_532;
+// RAISED by the `replyGate` block (docs/LIVARE-F21-PORTAO-ETIQUETA.md): a new block of four fields,
+// 476 characters after trimming its three descriptions to the defaults they state. Re-measured on the
+// tree that ships: 30,008.
+const SETTINGS_SCHEMA_CEILING = 30_010;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -773,7 +776,8 @@ describe("MCP tool descriptions", () => {
     expect(desc).toBeLessThanOrEqual(31_895);
     // +386 for the `send_buttons` native, the same enum growth as SETTINGS_SCHEMA_CEILING.
     // +388 for `send_carousel`, the same enum growth as SETTINGS_SCHEMA_CEILING.
-    expect(schema).toBeLessThanOrEqual(65_830);
+    // +488 for the `replyGate` block, the same growth as SETTINGS_SCHEMA_CEILING.
+    expect(schema).toBeLessThanOrEqual(66_320);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

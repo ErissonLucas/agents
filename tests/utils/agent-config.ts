@@ -1,4 +1,5 @@
 import type { AgentConfig } from "@/graph/prepare";
+import { REPLY_GATE_DEFAULTS } from "@/modules/agents/reply-gate";
 import { CONTACT_AUTH_DEFAULTS } from "@/modules/contact-auth/settings";
 import { CROSS_INBOX_CASE_DEFAULTS } from "@/modules/cross-inbox-case/settings";
 import { GUARDRAILS_DEFAULTS } from "@/modules/guardrails/settings";
@@ -90,6 +91,7 @@ export function makeConfig(
     serviceWindowConfig: SERVICE_WINDOW_DEFAULTS,
     contactAuthConfig: CONTACT_AUTH_DEFAULTS,
     handoffConfig: HANDOFF_DEFAULTS,
+    replyGateConfig: REPLY_GATE_DEFAULTS,
     sendImageConfig: SEND_IMAGE_DEFAULTS,
     jevConfig: null,
     crossInboxCaseConfig: { ...CROSS_INBOX_CASE_DEFAULTS },

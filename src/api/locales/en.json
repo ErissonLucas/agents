@@ -192,6 +192,8 @@
     "providerModelsFailed": "{{provider}} refused the list request (status {{status}}).",
     "rateLimitExceeded": "Rate limit exceeded. Please try again later.",
     "reengageNoAgent": "No agent is bound to the inbox of this conversation.",
+    "replyGateNeedsLabel": "The reply gate is on but names no required label, so the agent would never answer. Name the label or turn the gate off.",
+    "replyGateSameLabels": "The hand-off label must differ from the required label.",
     "retiredLabelSetting": "`settings.{{key}}` was retired: say which labels exist and which exclude each other in the `set_labels` usage guidance.",
     "returnAgentNoBot": "The responder of this inbox has no bot on this Chatwoot; reconnect the instance.",
     "returnAgentNotAttached": "The responder of this inbox is not attached in Chatwoot; reconnect the inbox.",
