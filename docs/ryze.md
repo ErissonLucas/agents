@@ -65,6 +65,14 @@ A number's labels are a catalog of its own, `ryze_labels` (`src/modules/ryze/lab
 - The prompt of a Ryze conversation carries a block listing the labels that have a "when to use", the one-stage-at-a-time rule for descriptions starting with `Etapa:`, and the phone-edited titles.
 - A lid or group chat has no phone number to tag, so its labels stay local. A number connected before `label.update` was subscribed does not receive phone edits until its RyzeAPI webhook also lists that event (our route token is stored only as a hash, so the URL has to come from RyzeAPI's own webhook config).
 
+### The reply gate
+
+An agent with `settings.replyGate` on speaks only in a conversation carrying its required label, which here must be
+in the number's live catalog and synced to WhatsApp (a `tagId`); anything else holds the reply. A move to `open`
+(any hand-off) takes the required label off and puts the hand-off label on when the catalog has it, through the
+ordinary label sync. The emulator also refuses an agent bot's send on a gated conversation (422
+`reply_gate_closed`) as a backstop. Off by default. See [`LIVARE-F21-PORTAO-ETIQUETA.md`](LIVARE-F21-PORTAO-ETIQUETA.md).
+
 ## Not supported on RyzeAPI
 
 Kanban, cross-inbox cases, contact merge, website-chat redirect, WhatsApp templates (RyzeAPI is not the official API, so there is no 24h window and follow-ups go out as plain text). Routes for these answer 404 from the emulator.
