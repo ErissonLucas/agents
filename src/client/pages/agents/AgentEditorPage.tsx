@@ -111,6 +111,7 @@ import {
   type MemoryState,
   MONITORING_SECTIONS,
   type ModelFallbackState,
+  type ReplyGateState,
   type TakeoverState,
 } from "./BehaviorTab";
 import {
@@ -400,6 +401,21 @@ function readModelState(a: Agent) {
   };
 }
 
+// The reply gate block as the form holds it (docs/LIVARE-F21-PORTAO-ETIQUETA.md). Only an explicit
+// `true` turns it on, and a missing `removeOnHandoff` reads as on, as the runtime reads both.
+function readReplyGateState(raw: unknown): ReplyGateState {
+  const b = (raw && typeof raw === "object" ? raw : {}) as Record<
+    string,
+    unknown
+  >;
+  return {
+    enabled: b.enabled === true,
+    requiredLabel: typeof b.requiredLabel === "string" ? b.requiredLabel : "",
+    handoffLabel: typeof b.handoffLabel === "string" ? b.handoffLabel : "",
+    removeOnHandoff: b.removeOnHandoff !== false,
+  };
+}
+
 function readBehaviorState(a: Agent) {
   const s = (a.settings ?? {}) as Record<string, unknown>;
   const d = (s.debounce ?? {}) as Record<string, unknown>;
@@ -545,6 +561,8 @@ function readBehaviorState(a: Agent) {
       onHumanReply:
         ((s.takeover ?? {}) as Record<string, unknown>).onHumanReply !== false,
     },
+    // NOTE: OFF unless the stored bag turns it on, mirroring readReplyGateConfig.
+    replyGate: readReplyGateState(s.replyGate),
     // NOTE: through the SAME reader the runtime uses, not a hand-rolled check: a bag that came from
     // REST or an import can carry the string "true", which the runtime honors — reading it stricter
     // here would show the switch off while values were being logged, and would then persist that lie
@@ -919,6 +937,9 @@ function AgentEditor() {
   const [takeover, setTakeover] = useState<TakeoverState>({
     onHumanReply: true,
   });
+  const [replyGate, setReplyGate] = useState<ReplyGateState>(() =>
+    readReplyGateState(undefined),
+  );
   // NOTE: Hosts the send_image tool may fetch from. Mirrors agent.settings.sendImage
   // (modules/images/settings), edited as one host per line on the tool's card (issue #880).
   const [sendImage, setSendImage] = useState<SendImageState>({
@@ -1496,6 +1517,7 @@ function AgentEditor() {
     setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setTakeover(b.takeover);
+    setReplyGate(b.replyGate);
     setAttributeContext(b.attributeContext);
     setChannelRedirect(readChannelRedirectState(a));
     setGuardrails(readGuardrailsFormState(a.settings));
@@ -1537,6 +1559,7 @@ function AgentEditor() {
     setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setTakeover(b.takeover);
+    setReplyGate(b.replyGate);
     setAttributeContext(b.attributeContext);
   }, []);
 
@@ -1844,6 +1867,12 @@ function AgentEditor() {
         task: attributeContext.task,
       },
       takeover: { onHumanReply: takeover.onHumanReply },
+      replyGate: {
+        enabled: replyGate.enabled,
+        requiredLabel: replyGate.requiredLabel.trim() || null,
+        handoffLabel: replyGate.handoffLabel.trim() || null,
+        removeOnHandoff: replyGate.removeOnHandoff,
+      },
     };
   }
 
@@ -1879,6 +1908,7 @@ function AgentEditor() {
       limits,
       attributeContext,
       takeover,
+      replyGate,
       observability,
       memory,
       modelFallback,
@@ -2880,6 +2910,7 @@ function AgentEditor() {
     setObservation(b.observation);
     setModelFallback(b.modelFallback);
     setTakeover(b.takeover);
+    setReplyGate(b.replyGate);
     setAttributeContext(b.attributeContext);
   };
   const revertChannelRedirect = () => {
@@ -4051,6 +4082,8 @@ function AgentEditor() {
                 setObservability={setObservability}
                 takeover={takeover}
                 setTakeover={setTakeover}
+                replyGate={replyGate}
+                setReplyGate={setReplyGate}
                 attributeContext={attributeContext}
                 setAttributeContext={setAttributeContext}
                 onScheduleSaved={onScheduleSaved}

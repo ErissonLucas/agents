@@ -1,5 +1,6 @@
 import { readModelFallbackConfig } from "@/graph/fallback-settings";
 import { readLimitsConfig } from "@/modules/agents/limits";
+import { readReplyGateConfig } from "@/modules/agents/reply-gate";
 import {
   readAllowedLabels,
   readOutsideAllowedLabels,
@@ -68,6 +69,8 @@ export interface BehaviorSettings {
   // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
   // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
   takeover: ReturnType<typeof readTakeoverConfig>;
+  // NOTE: Off by default: an agent whose bag has no block speaks as it always did.
+  replyGate: ReturnType<typeof readReplyGateConfig>;
   sendImage: ReturnType<typeof readSendImageConfig>;
   crossInboxCase: ReturnType<typeof readCrossInboxCaseConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
@@ -115,6 +118,7 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "followUp",
   "handoff",
   "takeover",
+  "replyGate",
   "sendImage",
   "crossInboxCase",
   "limits",
@@ -157,6 +161,7 @@ export function readBehaviorSettings(
     followUp: readFollowUpConfig(settings),
     handoff: readHandoffConfig(settings),
     takeover: readTakeoverConfig(settings),
+    replyGate: readReplyGateConfig(settings),
     sendImage: readSendImageConfig(settings),
     crossInboxCase: readCrossInboxCaseConfig(settings),
     limits: readLimitsConfig(settings),
@@ -194,6 +199,7 @@ export interface BehaviorSettingsPatch {
   followUp?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
   takeover?: Record<string, unknown>;
+  replyGate?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
   crossInboxCase?: Record<string, unknown>;
   limits?: Record<string, unknown>;

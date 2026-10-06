@@ -28,6 +28,12 @@ import {
   type TenantContext,
 } from "@/lib/tenancy";
 import { ingestsContinuously, isMonitoring } from "@/modules/agents/mode";
+import {
+  grantReplyGateLabel,
+  readReplyGateConfig,
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { agentObservesNow, agentStillSpeaks } from "@/modules/agents/speaks";
 import { shouldRunReset } from "@/modules/agents/test-mode";
 import { cancelThreadAppointments } from "@/modules/appointments/reminders";
@@ -2887,6 +2893,32 @@ async function maybeConsumeCommandOrGate(params: {
         );
         return false;
       }
+      // AND THE REPLY GATE (docs/LIVARE-F21-PORTAO-ETIQUETA.md), the same question every speaking
+      // seam asks at its send. Closed, the text falls to whatever the caller does with "not sent":
+      // a command's acknowledgement becomes a private note.
+      if (ctx.agentId !== null) {
+        const verdict = await replyGateVerdictNow({
+          tenantId,
+          instanceId,
+          conversationId,
+          agentId: ctx.agentId,
+          base,
+          readLabels: () => client.getConversationLabels(conversationId),
+        });
+        if (!verdict.open) {
+          reportReplyGateHeld({
+            seam: "notice",
+            reason: verdict.reason,
+            tenantId,
+            conversationId,
+            conversationRowId: ctx.conv.id,
+            agentId: ctx.agentId,
+            inboxRowId: ctx.conv.inboxId,
+            base,
+          });
+          return false;
+        }
+      }
       await client.sendMessage(conversationId, text, { sendId });
       return true;
     } catch (err) {
@@ -3077,6 +3109,28 @@ async function maybeConsumeCommandOrGate(params: {
     //
     // Diagnosed here, ACTED ON in /reset: silently pulling a conversation away from an agent who
     // legitimately took it is a bigger surprise than a clear message.
+    // With the reply gate on, activating the test is handing the conversation to the agent, so its
+    // label goes on (docs/LIVARE-F21-PORTAO-ETIQUETA.md). Best-effort: a label that does not land
+    // leaves the gate closed, and the acknowledgement then arrives as a private note.
+    const testeGate = readReplyGateConfig(ctx.agentSettings);
+    if (testeGate.enabled) {
+      try {
+        await grantReplyGateLabel({
+          client: await personaClient(),
+          tenantId,
+          instanceId,
+          conversationId,
+          cfg: testeGate,
+          base,
+        });
+      } catch (err) {
+        logger.warn(
+          "chatwoot: /teste could not put the reply gate label on (conv=%s): %s",
+          String(conversationId),
+          errMsg(err),
+        );
+      }
+    }
     const testeBlocker = await answerBlocker();
     await postAcknowledgement(
       testeBlocker === "none"
@@ -3702,6 +3756,25 @@ async function maybeConsumeCommandOrGate(params: {
             );
         }),
       );
+      // THE REPLY GATE'S LABEL GOES BACK ON (docs/LIVARE-F21-PORTAO-ETIQUETA.md): the clear above
+      // took it off with everything else, and a reset hands the conversation back to the agent, which
+      // with the gate on cannot answer without it. After the clear, in its own pass through the queue.
+      const replyGate = readReplyGateConfig(ctx.agentSettings);
+      if (replyGate.enabled) {
+        await step("grant the reply gate label", "etiquetas", async () => {
+          if (
+            (await grantReplyGateLabel({
+              client,
+              tenantId,
+              instanceId,
+              conversationId,
+              cfg: replyGate,
+              base,
+            })) === "failed"
+          )
+            throw new Error("the reply gate label could not be put back");
+        });
+      }
       await step("clear custom attributes", "atributos", () =>
         client.clearConversationCustomAttributes(conversationId),
       );
@@ -4013,6 +4086,40 @@ async function maybeConsumeCommandOrGate(params: {
       String(conversationId),
     );
     return true;
+  }
+
+  // ── Reply gate (docs/LIVARE-F21-PORTAO-ETIQUETA.md): with the agent's `replyGate` on, a
+  //    conversation without the required label gets nothing from the agent, and the delivery is
+  //    consumed HERE, which is what hands the message to continuous ingestion below: the mirror and
+  //    the memory keep up, only the speech is held. After the test-mode gate and the two commands
+  //    (they decide whether there is a turn at all), before every other gate that can speak. ──
+  if (ctx.agentId !== null) {
+    const gateCfg = readReplyGateConfig(ctx.agentSettings);
+    if (gateCfg.enabled) {
+      const verdict = await replyGateVerdictNow({
+        tenantId,
+        instanceId,
+        conversationId,
+        agentId: ctx.agentId,
+        base,
+        config: gateCfg,
+        readLabels: async () =>
+          (await personaClient()).getConversationLabels(conversationId),
+      });
+      if (!verdict.open) {
+        reportReplyGateHeld({
+          seam: "receiver",
+          reason: verdict.reason,
+          tenantId,
+          conversationId,
+          conversationRowId: ctx.conv.id,
+          agentId: ctx.agentId,
+          inboxRowId: ctx.conv.inboxId,
+          base,
+        });
+        return true;
+      }
+    }
   }
 
   // ── WhatsApp→chat redirect gate: on the designated entry inbox this agent NEVER runs the AI — it

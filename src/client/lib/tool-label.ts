@@ -37,6 +37,8 @@ export interface TurnFacts {
 // t('conversation.activity.skipAfterDelivery', 'Nothing further to add')
 // t('conversation.activity.search', 'Searching the knowledge base')
 // t('conversation.activity.suggest', 'Preparing a knowledge suggestion')
+// t('conversation.activity.buttons', 'Adding buttons to the reply')
+// t('conversation.activity.carousel', 'Adding a carousel to the reply')
 // A Map and not an object literal, because the key comes from the OPERATOR: a custom HTTP tool or
 // an MCP server may be named `constructor` or `toString`, and an object literal answers those with
 // the inherited member, which is truthy. The label would come out as `t(undefined, undefined)` — an

@@ -34,6 +34,25 @@ The inbox reports `provider: "ryze"`, which is in `ECHO_RESERVING_WHATSAPP_PROVI
 
 Public outgoing messages go out through `/api/message/text` or `/api/message/media` with `source: "fazer-ai-agents"`; typing through `/api/chat/presence` (`state: "typing"`, or `"recording"` when the `toggle_typing_status` body carries `presence: "recording"`, and `"pause"` for off; `ryzePresenceOf` in the emulator); read receipts through `/api/chat/markRead`; reactions through `/api/message/reaction`. A send RyzeAPI refuses deletes the row and answers 422 (a 4xx from Ryze) or 503, so the delivery path's read-back finds nothing and treats it as not landed. Private notes, attributes, status and assignment live only in our tables and are announced to the bot like Chatwoot announces them; conversation labels also go to WhatsApp (below). There are no agents or teams to assign to; a handoff opens the conversation and the person answers from the phone.
 
+### Sending as the agent over REST
+
+`POST /v1/ryze/gateways/:id/messages` (`to`, `text`) and `POST /v1/ryze/gateways/:id/cards` (`to`, `text`, `header?`, `footer?`, `mediaUrl?`, `buttons[]`) let the operator's backend send into a contact's conversation as the agent (`src/modules/ryze/interactive.ts`). The row is stored as the agent's own message, so the model reads it and no human takeover is inferred. The contact and conversation are created when the contact never wrote, and a Brazilian mobile reuses the one stored with or without the ninth digit.
+
+Both take four optional fields that open a conversation with context the agent reads when the contact answers:
+
+| Field | Written as |
+|---|---|
+| `contactName` | the contact's name, only when it has none (the contact's own WhatsApp name replaces it when they write) |
+| `contactAttributes` | merged into the contact's `custom_attributes` |
+| `conversationAttributes` | merged into the conversation's `custom_attributes` |
+| `labels` | added to the conversation's labels; none is ever removed |
+
+- They go through the emulator's own routes (`PUT /contacts/:id`, `POST /conversations/:id/custom_attributes`, `POST /conversations/:id/labels`), after the contact and conversation are committed and before the message row is staged. Those routes replace what they are given, so each gets the stored bag or set with the new keys merged in, as `ChatwootClient` does. The conversation writes announce `conversation_updated` to the bots, and labels follow the WhatsApp Business sync below (persisted first, synced in the gateway's queue, never failing the write).
+- Limits: at most 50 attributes per bag, keys `A-Z a-z 0-9 _ -` up to 64, values a string up to 1000 characters, a number or a boolean; at most 10 labels, each in the slug form catalog titles use (`a-z 0-9 _ -`, up to 40). A refused field answers 400 (422 when the body schema refuses it) before anything is written or sent.
+- A context write that fails answers 500 and sends nothing; what was already written stays. A send that fails after the context was written leaves the context in place (only the message row is removed).
+- The agent sees these values through the attribute context (`docs/chatwoot.md`, "Attribute context"): every payload of the conversation carries both bags, but only the keys selected in the agent's "Data in context" reach the prompt.
+- A body without these fields (or with them empty) behaves exactly as before: one transaction stages the contact, conversation and message.
+
 ## WhatsApp Business labels
 
 A number's labels are a catalog of its own, `ryze_labels` (`src/modules/ryze/labels.ts`, pure half in `label-shared.ts`): `title` is what the conversation rows and the model use, `displayName` the name on WhatsApp (`tagId`), `description` the "when to use" the prompt shows, `autoRule` an optional automatic rule. WhatsApp Business allows 20 labels per number, and the 21st is refused. Console: Channels → a Ryze number → WhatsApp labels; REST `GET/POST /v1/ryze/gateways/:id/labels`, `PATCH/DELETE /v1/ryze/gateways/:id/labels/:labelId`.
@@ -45,6 +64,14 @@ A number's labels are a catalog of its own, `ryze_labels` (`src/modules/ryze/lab
 - Rules: `clear_on_reply` comes off when the contact writes; `human_takeover` goes on when the conversation is opened (takeover, handoff) and off when it is set back to pending or reopened by the contact; `new_conversation` goes on the first conversation of a chat.
 - The prompt of a Ryze conversation carries a block listing the labels that have a "when to use", the one-stage-at-a-time rule for descriptions starting with `Etapa:`, and the phone-edited titles.
 - A lid or group chat has no phone number to tag, so its labels stay local. A number connected before `label.update` was subscribed does not receive phone edits until its RyzeAPI webhook also lists that event (our route token is stored only as a hash, so the URL has to come from RyzeAPI's own webhook config).
+
+### The reply gate
+
+An agent with `settings.replyGate` on speaks only in a conversation carrying its required label, which here must be
+in the number's live catalog and synced to WhatsApp (a `tagId`); anything else holds the reply. A move to `open`
+(any hand-off) takes the required label off and puts the hand-off label on when the catalog has it, through the
+ordinary label sync. The emulator also refuses an agent bot's send on a gated conversation (422
+`reply_gate_closed`) as a backstop. Off by default. See [`LIVARE-F21-PORTAO-ETIQUETA.md`](LIVARE-F21-PORTAO-ETIQUETA.md).
 
 ## Not supported on RyzeAPI
 

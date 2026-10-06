@@ -155,6 +155,13 @@ export function behaviorTabProps(
     setObservability: noop,
     takeover: { onHumanReply: true },
     setTakeover: () => {},
+    replyGate: {
+      enabled: false,
+      requiredLabel: "",
+      handoffLabel: "",
+      removeOnHandoff: true,
+    },
+    setReplyGate: () => {},
     attributeContext: { conversation: [], contact: [], task: [] },
     setAttributeContext: noop,
     serviceWindow: {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 
 // The whole reason src/api/lib/schema-refusal.ts exists is what the app answered under
 // NODE_ENV=production, and that is the one environment this suite cannot enter: tests/setup.ts pins
@@ -14,7 +15,7 @@ import { describe, expect, test } from "bun:test";
 // behind `isProduction` — a future Elysia gating `valueError` the same way would drop `field` from
 // every refusal in production while every other test in this directory stayed green.
 const SECRET = "sk-live-PRODUCTION-PROBE-9f3a";
-const REPO_ROOT = new URL("../../../", import.meta.url).pathname;
+const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 
 const PROGRAM = `
 import { t, ValidationError } from "elysia";

@@ -16,6 +16,7 @@ import {
   Scissors,
   ScrollText,
   ShieldCheck,
+  Tag,
   Trash2,
   UserRoundCheck,
   Volume2,
@@ -352,6 +353,15 @@ export interface TakeoverState {
   onHumanReply: boolean;
 }
 
+// NOTE: Mirrors agent.settings.replyGate / readReplyGateConfig (docs/LIVARE-F21-PORTAO-ETIQUETA.md).
+// Off by default; the labels are kept as typed, and blank means none.
+export interface ReplyGateState {
+  enabled: boolean;
+  requiredLabel: string;
+  handoffLabel: string;
+  removeOnHandoff: boolean;
+}
+
 // NOTE: Which Chatwoot custom attributes the agent sees the CURRENT VALUES of (one key list per
 // scope). Mirrors agent.settings.attributeContext / readAttributeContextConfig.
 interface AttributeContextState {
@@ -460,6 +470,8 @@ interface BehaviorTabProps {
   setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
   takeover: TakeoverState;
   setTakeover: React.Dispatch<React.SetStateAction<TakeoverState>>;
+  replyGate: ReplyGateState;
+  setReplyGate: React.Dispatch<React.SetStateAction<ReplyGateState>>;
   attributeContext: AttributeContextState;
   setAttributeContext: React.Dispatch<
     React.SetStateAction<AttributeContextState>
@@ -1202,6 +1214,8 @@ export function BehaviorTab({
   setLimits,
   takeover,
   setTakeover,
+  replyGate,
+  setReplyGate,
   attributeContext,
   setAttributeContext,
   serviceWindow,
@@ -1593,6 +1607,11 @@ export function BehaviorTab({
       id: "takeover",
       icon: UserRoundCheck,
       label: t("editor.takeover", "When a person answers"),
+    },
+    {
+      id: "replyGate",
+      icon: Tag,
+      label: t("editor.replyGate", "Answer only with a label"),
     },
     {
       id: "limits",
@@ -3485,6 +3504,78 @@ export function BehaviorTab({
                 "Stop answering when a person replies to the customer",
               )}
             />
+          </Section>
+
+          <Section
+            id="replyGate"
+            hidden={watcher}
+            icon={Tag}
+            title={t("editor.replyGate", "Answer only with a label")}
+            help={t(
+              "editor.replyGateHelp",
+              "The agent answers only conversations that carry the required label, and stays quiet whenever it is not sure: a label that is missing, unknown on the WhatsApp number or not synced there yet.\n\nIt keeps reading every message, so it knows the conversation when the label comes back. When the conversation goes to a person, the required label comes off and the hand-off label goes on.\n\nOn a RyzeAPI number the hand-off label must already exist in the number's label list. In test mode, /teste and /reset put the required label back.",
+            )}
+          >
+            <SwitchField
+              checked={replyGate.enabled}
+              onCheckedChange={(v) =>
+                setReplyGate({ ...replyGate, enabled: v })
+              }
+              label={t(
+                "editor.replyGateEnabled",
+                "Answer only conversations with the required label",
+              )}
+            />
+            {replyGate.enabled && (
+              <div className="grid gap-4 sm:grid-cols-2">
+                <FormField
+                  label={t("editor.replyGateRequiredLabel", "Required label")}
+                  description={t(
+                    "editor.replyGateRequiredLabelHint",
+                    "Without it on the conversation, the agent does not answer.",
+                  )}
+                >
+                  <Input
+                    value={replyGate.requiredLabel}
+                    onChange={(e) =>
+                      setReplyGate({
+                        ...replyGate,
+                        requiredLabel: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.replyGateHandoffLabel", "Hand-off label")}
+                  description={t(
+                    "editor.replyGateHandoffLabelHint",
+                    "Put on when the conversation goes to a person. Optional.",
+                  )}
+                >
+                  <Input
+                    value={replyGate.handoffLabel}
+                    onChange={(e) =>
+                      setReplyGate({
+                        ...replyGate,
+                        handoffLabel: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+              </div>
+            )}
+            {replyGate.enabled && (
+              <SwitchField
+                checked={replyGate.removeOnHandoff}
+                onCheckedChange={(v) =>
+                  setReplyGate({ ...replyGate, removeOnHandoff: v })
+                }
+                label={t(
+                  "editor.replyGateRemoveOnHandoff",
+                  "Take the required label off at the hand-off",
+                )}
+              />
+            )}
           </Section>
 
           <Section

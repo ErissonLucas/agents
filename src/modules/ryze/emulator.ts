@@ -9,6 +9,11 @@ import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import type { ScopedDb } from "@/lib/tenancy";
+import {
+  readReplyGateConfig,
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { CHATWOOT_AUTH_HEADER } from "@/modules/chatwoot/constants";
 import {
   RyzeApiError,
@@ -27,6 +32,7 @@ import { cardButtonsOf, carouselCardsOf } from "./interactive";
 import { ryzeLabelColorHex } from "./label-shared";
 import {
   applyLabelRules,
+  applyReplyGateHandoff,
   catalogTitles,
   syncConversationLabels,
 } from "./labels";
@@ -44,7 +50,13 @@ import {
   conversationByDisplayId,
   gatewayForInstance,
   listMessages,
+  RYZE_DELIVERY_KEY,
+  RYZE_STATUS_NOT_DISPATCHED,
+  RYZE_STATUS_SENDING,
+  RYZE_STATUS_UNCERTAIN,
+  type RyzeDeliveryState,
   scoped,
+  sendRecords,
   touchConversation,
 } from "./store";
 
@@ -78,6 +90,18 @@ const NOT_FOUND = () => json(404, { error: "Resource could not be found" });
 function num(v: unknown): number | null {
   const n = typeof v === "string" ? Number(v) : v;
   return typeof n === "number" && Number.isInteger(n) ? n : null;
+}
+
+// The delivery state is the emulator's to write (F2.1-A). One arriving in a caller's content_attributes
+// is dropped, so no client can mark its own send as accepted, or as never dispatched, which is what a
+// resend is allowed on.
+function withDeliveryState(
+  attrs: Record<string, unknown>,
+  state: RyzeDeliveryState | null,
+): Record<string, unknown> {
+  const rest = { ...attrs };
+  delete rest[RYZE_DELIVERY_KEY];
+  return state ? { ...rest, [RYZE_DELIVERY_KEY]: state } : rest;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -194,6 +218,73 @@ export class RyzeEmulator {
     return { type: "user", ...RYZE_OPERATOR_USER };
   }
 
+  // THE REPLY GATE AT THE TRANSPORT (docs/LIVARE-F21-PORTAO-ETIQUETA.md), the backstop behind the
+  // fences every speaking path asks: an agent bot's message, media or reaction on a conversation the
+  // agent may not speak in is refused before a row is written or RyzeAPI is called. A person's send
+  // is never asked, and neither is a conversation in the human queue (`open`): every bot path refuses
+  // that one on ownership already, except the line a hand-off promised, which is the agent's to say
+  // after its own transfer took the label off. An unreadable binding is not evidence of a gate.
+  private async replyGateRefusal(
+    conv: RyzeConversation,
+    sender: Sender,
+  ): Promise<Response | null> {
+    if (sender.type !== "agent_bot" || conv.status === "open") return null;
+    let bound: { agentId: bigint; settings: unknown } | null;
+    try {
+      bound = await this.db(async (db) => {
+        const bot = await db.chatwootAgentBot.findFirst({
+          where: {
+            chatwootInstanceId: this.instanceId,
+            chatwootAgentBotId: sender.id,
+          },
+          select: { agentId: true, agent: { select: { settings: true } } },
+        });
+        return bot
+          ? { agentId: bot.agentId, settings: bot.agent.settings }
+          : null;
+      });
+    } catch (err) {
+      logger.warn(
+        "ryze emulator: could not read the sending bot's reply gate (conversation %d): %s",
+        conv.displayId,
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
+    if (!bound) return null;
+    const cfg = readReplyGateConfig(bound.settings);
+    if (!cfg.enabled) return null;
+    const verdict = await replyGateVerdictNow({
+      tenantId: this.tenantId,
+      instanceId: this.instanceId,
+      conversationId: conv.displayId,
+      agentId: bound.agentId,
+      base: this.base,
+      config: cfg,
+    });
+    if (verdict.open) return null;
+    const mirrored = await this.db((db) =>
+      db.conversation.findFirst({
+        where: {
+          chatwootInstanceId: this.instanceId,
+          chatwootConversationId: conv.displayId,
+        },
+        select: { id: true, inboxId: true },
+      }),
+    ).catch(() => null);
+    reportReplyGateHeld({
+      seam: "transport",
+      reason: verdict.reason,
+      tenantId: this.tenantId,
+      conversationId: conv.displayId,
+      conversationRowId: mirrored?.id ?? null,
+      inboxRowId: mirrored?.inboxId ?? null,
+      agentId: bound.agentId,
+      base: this.base,
+    });
+    return json(422, { error: "reply_gate_closed", reason: verdict.reason });
+  }
+
   private async route(
     method: string,
     url: URL,
@@ -239,7 +330,11 @@ export class RyzeEmulator {
     m = /^\/conversations\/(\d+)\/messages$/.exec(path);
     if (m) {
       const cid = Number(m[1]);
-      if (method === "GET") return this.getMessages(cid, q);
+      if (method === "GET") {
+        return q.has("send_id")
+          ? this.sendState(cid, q.get("send_id") ?? "", token)
+          : this.getMessages(cid, q);
+      }
       if (method === "POST") {
         return body instanceof FormData
           ? this.postMultipart(cid, body, token)
@@ -360,6 +455,40 @@ export class RyzeEmulator {
     return json(200, { meta: {}, payload: rows.map(presentMessageRest) });
   }
 
+  // WHAT BECAME OF ONE SEND, by the name it left with (F2.1-A). The history above hides attempts the
+  // provider never accepted, so this is the one way to them, and it answers only the party that can
+  // have sent: a bot of THIS gateway, by its own token. The admin token this client carries is a
+  // constant (../chatwoot/instance.ts) and proves nothing, so it gets the same 401 as no token.
+  // Scoped to the tenant (the transaction), the gateway and the conversation in the path. Every row
+  // carrying the name comes back, never a chosen one: deciding what several rows mean is the
+  // caller's, and its answer to more than one is "unknown".
+  private async sendState(
+    cid: number,
+    sendId: string,
+    token: string | null,
+  ): Promise<Response> {
+    const gw = await this.gateway();
+    const sender = await this.senderFor(gw, token);
+    if (sender.type !== "agent_bot")
+      return json(401, { error: "unauthorized" });
+    if (!sendId) return json(422, { error: "send_id missing" });
+    const records = await this.db(async (db) => {
+      const conv = await conversationByDisplayId(db, gw.id, cid);
+      if (!conv) return null;
+      return sendRecords(db, gw.id, cid, sendId);
+    });
+    if (!records) return NOT_FOUND();
+    return json(200, {
+      send_id: sendId,
+      records: records.map((r) => ({
+        id: r.messageId,
+        status: r.status,
+        state: typeof r.state === "string" ? r.state : null,
+        source_id: r.externalId,
+      })),
+    });
+  }
+
   private async insertOutgoing(
     gw: RyzeGateway,
     conv: RyzeConversation,
@@ -382,7 +511,10 @@ export class RyzeEmulator {
           messageType: p.messageType,
           private: p.isPrivate,
           content: p.content,
-          contentAttributes: p.contentAttributes as object,
+          contentAttributes: withDeliveryState(
+            p.contentAttributes,
+            p.status === RYZE_STATUS_SENDING ? "sending" : null,
+          ) as object,
           attachments: p.attachments as unknown as object,
           senderType: p.sender.type,
           senderId: p.sender.id,
@@ -393,29 +525,156 @@ export class RyzeEmulator {
     );
   }
 
-  private async landed(
+  // THE PROVIDER TOOK IT, and nothing local may turn that back into doubt (F2.1-A). A `messageId` from
+  // RyzeAPI is its acceptance — not delivery to the phone, not a read — and it is a fact whatever our
+  // own bookkeeping does next. So the write that records it is retried once, then reduced to the row
+  // alone (`provider_accepted_unrecorded`: the conversation's activity mark was not moved), and if even
+  // that fails the caller is still answered with the acceptance: a resend over an accepted message is
+  // the duplicate this exists to prevent. The row then stays hidden and unsettled, which a read-back
+  // reports as unknown, never as absent.
+  private async accept(
     gw: RyzeGateway,
     msg: RyzeMessage,
     externalId: string | null,
   ): Promise<RyzeMessage> {
-    return this.db(async (db) => {
-      const updated = await db.ryzeMessage.update({
-        where: { id: msg.id },
-        data: { externalId, status: "sent" },
-      });
-      const conv = await conversationByDisplayId(db, gw.id, msg.conversationId);
-      if (conv) await touchConversation(db, conv);
-      return updated;
-    });
+    const attrs = (state: RyzeDeliveryState) =>
+      withDeliveryState(
+        isRecord(msg.contentAttributes) ? msg.contentAttributes : {},
+        state,
+      ) as object;
+    let lastErr: unknown = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.db(async (db) => {
+          const updated = await db.ryzeMessage.update({
+            where: { id: msg.id },
+            data: {
+              externalId,
+              status: "sent",
+              contentAttributes: attrs("provider_accepted"),
+            },
+          });
+          const conv = await conversationByDisplayId(
+            db,
+            gw.id,
+            msg.conversationId,
+          );
+          if (conv) await touchConversation(db, conv);
+          return updated;
+        });
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    logger.error(
+      "ryze emulator: provider accepted message %d (conversation %d) but recording it failed: %s",
+      msg.messageId,
+      msg.conversationId,
+      lastErr instanceof Error ? lastErr.message : String(lastErr),
+    );
+    try {
+      return await this.db((db) =>
+        db.ryzeMessage.update({
+          where: { id: msg.id },
+          data: {
+            externalId,
+            status: "sent",
+            contentAttributes: attrs("provider_accepted_unrecorded"),
+          },
+        }),
+      );
+    } catch (err) {
+      logger.error(
+        "ryze emulator: provider accepted message %d but even the bare record failed; it stays unsettled: %s",
+        msg.messageId,
+        err instanceof Error ? err.message : String(err),
+      );
+      return {
+        ...msg,
+        externalId,
+        status: "sent",
+        contentAttributes: attrs("provider_accepted_unrecorded"),
+      } as RyzeMessage;
+    }
   }
 
+  // An attempt that did not end in the provider's acceptance, KEPT (F2.1-A). `not_dispatched` is the
+  // proof a resend needs: the provider was never called. `uncertain` is everything after the call
+  // began — a timeout, a dropped connection, any status, `success:false` — because none of them
+  // proves the provider did not take it. Best-effort: a row this cannot mark stays `sending`, which
+  // reads as unknown too.
+  private async settleUnaccepted(
+    msg: RyzeMessage,
+    state: "not_dispatched" | "uncertain",
+  ): Promise<void> {
+    try {
+      await this.db((db) =>
+        db.ryzeMessage.update({
+          where: { id: msg.id },
+          data: {
+            status:
+              state === "not_dispatched"
+                ? RYZE_STATUS_NOT_DISPATCHED
+                : RYZE_STATUS_UNCERTAIN,
+            contentAttributes: withDeliveryState(
+              isRecord(msg.contentAttributes) ? msg.contentAttributes : {},
+              state,
+            ) as object,
+          },
+        }),
+      );
+    } catch (err) {
+      logger.error(
+        "ryze emulator: could not mark message %d as %s; it stays unsettled: %s",
+        msg.messageId,
+        state,
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+
+  // The answer to a send that did not end in acceptance. Neither status decides anything on its
+  // own: the caller asks `sendState` for the row, and only a row marked `not_dispatched` allows a
+  // resend.
+  private unaccepted(
+    cid: number,
+    state: "not_dispatched" | "uncertain",
+    err: unknown,
+  ): Response {
+    logger.warn(
+      "ryze emulator: send %s on conversation %d: %s",
+      state === "not_dispatched" ? "never dispatched" : "unconfirmed",
+      cid,
+      err instanceof Error ? err.message : String(err),
+    );
+    return state === "not_dispatched"
+      ? json(422, { error: "not_dispatched" })
+      : json(502, { error: "delivery_uncertain" });
+  }
+
+  // The bots' copy of a send the provider accepted. Best-effort, and on its own: failing here says
+  // nothing about the send, which stays accepted.
   private async echo(gw: RyzeGateway, msg: RyzeMessage): Promise<void> {
-    const body = await this.db(async (db) => {
-      const conv = await conversationByDisplayId(db, gw.id, msg.conversationId);
-      return conv ? conversationBody(db, gw, conv) : null;
-    });
-    if (body) {
-      this.emit(gw, [presentMessageWebhook("message_created", msg, body, gw)]);
+    try {
+      const body = await this.db(async (db) => {
+        const conv = await conversationByDisplayId(
+          db,
+          gw.id,
+          msg.conversationId,
+        );
+        return conv ? conversationBody(db, gw, conv) : null;
+      });
+      if (body) {
+        this.emit(gw, [
+          presentMessageWebhook("message_created", msg, body, gw),
+        ]);
+      }
+    } catch (err) {
+      logger.warn(
+        "ryze emulator: echo of message %d failed: %s",
+        msg.messageId,
+        err instanceof Error ? err.message : String(err),
+      );
     }
   }
 
@@ -433,6 +692,10 @@ export class RyzeEmulator {
     const messageType =
       b.message_type === "incoming" ? 0 : b.message_type === "activity" ? 2 : 1;
     const goesOut = !isPrivate && messageType === 1 && !!content;
+    if (goesOut) {
+      const refused = await this.replyGateRefusal(conv, sender);
+      if (refused) return refused;
+    }
     const row = await this.insertOutgoing(gw, conv, {
       content,
       isPrivate,
@@ -442,12 +705,16 @@ export class RyzeEmulator {
         : {},
       attachments: [],
       sender,
-      status: goesOut ? "sending" : "sent",
+      status: goesOut ? RYZE_STATUS_SENDING : "sent",
     });
     if (!goesOut) {
       await this.echo(gw, row);
       return json(200, presentMessageRest(row));
     }
+    // Set the instant before the provider is called: everything that fails before it is a send that
+    // provably never left; everything after it may have.
+    let dispatched = false;
+    let sent: { messageId: string | null };
     try {
       const ryze = await this.makeRyze(gw);
       // A reply that carries buttons (send_buttons) goes out as a WhatsApp card; checked by the
@@ -458,7 +725,8 @@ export class RyzeEmulator {
       const buttons = carousel
         ? null
         : cardButtonsOf(b.content_attributes, conv.chatJid, content as string);
-      const sent = carousel
+      dispatched = true;
+      sent = carousel
         ? await ryze.sendCarousel(conv.chatJid, {
             message: content as string,
             cards: carousel,
@@ -469,18 +737,14 @@ export class RyzeEmulator {
               buttons,
             })
           : await ryze.sendText(conv.chatJid, content as string);
-      const done = await this.landed(gw, row, sent.messageId);
-      await this.echo(gw, done);
-      return json(200, presentMessageRest(done));
     } catch (err) {
-      await this.db((db) => db.ryzeMessage.delete({ where: { id: row.id } }));
-      logger.warn(
-        "ryze emulator: send failed on conversation %d: %s",
-        cid,
-        err instanceof Error ? err.message : String(err),
-      );
-      return json(sendFailureStatus(err), { error: "send failed" });
+      const state = dispatched ? "uncertain" : "not_dispatched";
+      await this.settleUnaccepted(row, state);
+      return this.unaccepted(cid, state, err);
     }
+    const done = await this.accept(gw, row, sent.messageId);
+    await this.echo(gw, done);
+    return json(200, presentMessageRest(done));
   }
 
   private async postMultipart(
@@ -495,6 +759,8 @@ export class RyzeEmulator {
     if (!(file instanceof File))
       return json(422, { error: "attachment missing" });
     const sender = await this.senderFor(gw, token);
+    const refused = await this.replyGateRefusal(conv, sender);
+    if (refused) return refused;
     const bytes = await file.arrayBuffer();
     const mime = file.type || "application/octet-stream";
     const fileType = fileTypeOf(mime);
@@ -552,7 +818,7 @@ export class RyzeEmulator {
       contentAttributes,
       attachments: [attachment],
       sender,
-      status: "sending",
+      status: RYZE_STATUS_SENDING,
     });
     await this.db((db) =>
       db.ryzeMedia.update({
@@ -560,9 +826,12 @@ export class RyzeEmulator {
         data: { messageId: row.messageId },
       }),
     );
+    let dispatched = false;
+    let sent: { messageId: string | null };
     try {
       const ryze = await this.makeRyze(gw);
-      const sent = await ryze.sendMedia(conv.chatJid, {
+      dispatched = true;
+      sent = await ryze.sendMedia(conv.chatJid, {
         type: ryzeMediaTypeOf(fileType),
         bytes,
         mime,
@@ -570,21 +839,16 @@ export class RyzeEmulator {
         caption: typeof caption === "string" ? caption : undefined,
         isVoice: recorded,
       });
-      const done = await this.landed(gw, row, sent.messageId);
-      await this.echo(gw, done);
-      return json(200, presentMessageRest(done));
     } catch (err) {
-      await this.db(async (db) => {
-        await db.ryzeMessage.delete({ where: { id: row.id } });
-        await db.ryzeMedia.delete({ where: { id: mediaRow.id } });
-      });
-      logger.warn(
-        "ryze emulator: media send failed on conversation %d: %s",
-        cid,
-        err instanceof Error ? err.message : String(err),
-      );
-      return json(sendFailureStatus(err), { error: "send failed" });
+      // The message row and its media are KEPT either way (F2.1-A): the bytes are part of the
+      // evidence of what was attempted.
+      const state = dispatched ? "uncertain" : "not_dispatched";
+      await this.settleUnaccepted(row, state);
+      return this.unaccepted(cid, state, err);
     }
+    const done = await this.accept(gw, row, sent.messageId);
+    await this.echo(gw, done);
+    return json(200, presentMessageRest(done));
   }
 
   private async patchAttachment(
@@ -653,6 +917,9 @@ export class RyzeEmulator {
       found.prior.contentAttributes.is_reaction === true &&
       found.prior.content === emoji;
     const toSend = priorIsSame ? "" : emoji;
+    const sender = await this.senderFor(gw, token);
+    const refused = await this.replyGateRefusal(found.conv, sender);
+    if (refused) return refused;
     try {
       const ryze = await this.makeRyze(gw);
       await ryze.sendReaction(
@@ -663,7 +930,6 @@ export class RyzeEmulator {
     } catch (err) {
       return json(sendFailureStatus(err), { error: "reaction failed" });
     }
-    const sender = await this.senderFor(gw, token);
     await this.db(async (db) => {
       if (found.prior && priorIsSame) {
         await db.ryzeMessage.delete({ where: { id: found.prior.id } });
@@ -797,6 +1063,16 @@ export class RyzeEmulator {
             : {},
         { base: this.base, makeRyzeClient: this.makeRyze },
       );
+    }
+    // NOTE: the same moment is the reply gate's hand-off: whoever moved the conversation to the human
+    // queue (the handoff tool, a person's reply, the console), its required label comes off and the
+    // hand-off one goes on (docs/LIVARE-F21-PORTAO-ETIQUETA.md). A return to the agent restores
+    // nothing: the label is granted, never assumed.
+    if (previous !== status && status === "open") {
+      await applyReplyGateHandoff(await this.gateway(), done.conv.id, {
+        base: this.base,
+        makeRyzeClient: this.makeRyze,
+      });
     }
     return json(200, {
       success: true,

@@ -1,5 +1,6 @@
 import type {
   PrismaClient,
+  RyzeContact,
   RyzeConversation,
   RyzeGateway,
   RyzeMessage,
@@ -16,8 +17,14 @@ import {
   type RyzeSentMessage,
   ryzeRecipient,
 } from "./client";
-import { RYZE_OPERATOR_USER } from "./constants";
+import {
+  RYZE_EMULATED_ACCOUNT_ID,
+  RYZE_OPERATOR_USER,
+  ryzeEmulatorBaseUrl,
+} from "./constants";
 import { emitToBots } from "./emit";
+import { RyzeEmulator } from "./emulator";
+import { labelSlug, sameLabelTitle } from "./label-shared";
 import { presentMessageWebhook } from "./present";
 import {
   conversationBody,
@@ -183,7 +190,25 @@ async function landAndEcho(
   return done;
 }
 
-export interface CardInput {
+// What a send can write on the conversation before the message goes: the contact's name (only when
+// it has none), custom attributes of the contact and of the conversation (merged into what is
+// there), and labels added to the conversation (never removed). Every field is optional.
+export interface ConversationContextInput {
+  contactName?: string;
+  contactAttributes?: Record<string, AttributeValue>;
+  conversationAttributes?: Record<string, AttributeValue>;
+  labels?: string[];
+}
+
+export type AttributeValue = string | number | boolean;
+
+export const CONTEXT_ATTRIBUTES_MAX = 50;
+export const CONTEXT_ATTRIBUTE_VALUE_MAX = 1_000;
+export const CONTEXT_LABELS_MAX = 10;
+export const CONTEXT_CONTACT_NAME_MAX = 255;
+const ATTRIBUTE_KEY_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+export interface CardInput extends ConversationContextInput {
   to: string;
   text: string;
   header?: string;
@@ -195,7 +220,7 @@ export interface CardInput {
   buttons: { id?: string; url?: string; copy?: string; title: string }[];
 }
 
-export interface TextInput {
+export interface TextInput extends ConversationContextInput {
   to: string;
   text: string;
 }
@@ -386,6 +411,133 @@ export function cardButtonsOf(
   }
 }
 
+function validateAttributes(
+  bag: Record<string, AttributeValue> | undefined,
+  what: string,
+): void {
+  if (bag === undefined) return;
+  if (typeof bag !== "object" || bag === null || Array.isArray(bag))
+    throw new AppError(`invalid ${what} attributes`, 400);
+  const entries = Object.entries(bag);
+  if (entries.length > CONTEXT_ATTRIBUTES_MAX)
+    throw new AppError(
+      `${what} attributes take at most ${CONTEXT_ATTRIBUTES_MAX} keys`,
+      400,
+    );
+  for (const [key, value] of entries) {
+    if (!ATTRIBUTE_KEY_RE.test(key) || key === "__proto__")
+      throw new AppError(`invalid ${what} attribute key`, 400);
+    const ok =
+      typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value)) ||
+      (typeof value === "string" &&
+        value.length <= CONTEXT_ATTRIBUTE_VALUE_MAX);
+    if (!ok) throw new AppError(`invalid ${what} attribute value`, 400);
+  }
+}
+
+// A label is added under the title the rest of the channel uses: the slug form (a-z 0-9 _ -, up
+// to 40), which is what a catalog row's title and a WhatsApp tag sync are keyed on.
+export function validateConversationContext(
+  input: ConversationContextInput,
+): void {
+  if (input.contactName !== undefined) {
+    const name = input.contactName.trim();
+    if (!name || input.contactName.length > CONTEXT_CONTACT_NAME_MAX)
+      throw new AppError("invalid contact name", 400);
+  }
+  validateAttributes(input.contactAttributes, "contact");
+  validateAttributes(input.conversationAttributes, "conversation");
+  if (input.labels !== undefined) {
+    if (
+      !Array.isArray(input.labels) ||
+      input.labels.length > CONTEXT_LABELS_MAX
+    )
+      throw new AppError(
+        `labels take at most ${CONTEXT_LABELS_MAX} titles`,
+        400,
+      );
+    for (const l of input.labels) {
+      if (typeof l !== "string" || l.length === 0 || labelSlug(l) !== l)
+        throw new AppError("invalid label", 400);
+    }
+  }
+}
+
+function hasContext(input: ConversationContextInput): boolean {
+  return (
+    input.contactName !== undefined ||
+    (input.contactAttributes !== undefined &&
+      Object.keys(input.contactAttributes).length > 0) ||
+    (input.conversationAttributes !== undefined &&
+      Object.keys(input.conversationAttributes).length > 0) ||
+    (input.labels !== undefined && input.labels.length > 0)
+  );
+}
+
+function bagOf(v: unknown): Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v)
+    ? (v as Record<string, unknown>)
+    : {};
+}
+
+// Writes the context through the emulated Chatwoot, the same routes the runtime calls: PUT contact,
+// POST conversation custom_attributes, POST conversation labels. Those replace what they are given,
+// so each is sent the stored bag or set with the new keys merged in, like `ChatwootClient` does.
+// The label route persists first and queues the WhatsApp sync, which never fails the write.
+async function applyConversationContext(
+  gw: RyzeGateway,
+  contact: RyzeContact,
+  conv: RyzeConversation,
+  input: ConversationContextInput,
+  deps: SendDeps,
+): Promise<void> {
+  const emulator = new RyzeEmulator(gw.tenantId, gw.chatwootInstanceId, {
+    base: deps.base,
+    makeRyzeClient: deps.makeClient,
+  });
+  const root = `${ryzeEmulatorBaseUrl(gw.chatwootInstanceId)}/api/v1/accounts/${RYZE_EMULATED_ACCOUNT_ID}`;
+  const call = async (method: string, path: string, body: unknown) => {
+    const res = await emulator.fetch(`${root}${path}`, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok)
+      throw new AppError(
+        `conversation context not applied (${method} ${path}: ${res.status})`,
+        500,
+      );
+  };
+
+  const setName = input.contactName !== undefined && !contact.name;
+  const contactAttrs = input.contactAttributes ?? {};
+  if (setName || Object.keys(contactAttrs).length > 0) {
+    await call("PUT", `/contacts/${contact.contactId}`, {
+      ...(setName ? { name: input.contactName?.trim() } : {}),
+      custom_attributes: {
+        ...bagOf(contact.customAttributes),
+        ...contactAttrs,
+      },
+    });
+  }
+  const convAttrs = input.conversationAttributes ?? {};
+  if (Object.keys(convAttrs).length > 0) {
+    await call("POST", `/conversations/${conv.displayId}/custom_attributes`, {
+      custom_attributes: { ...bagOf(conv.customAttributes), ...convAttrs },
+    });
+  }
+  const added = (input.labels ?? []).filter(
+    (l, i, all) =>
+      all.indexOf(l) === i && !conv.labels.some((c) => sameLabelTitle(c, l)),
+  );
+  if (added.length > 0) {
+    await call("POST", `/conversations/${conv.displayId}/labels`, {
+      labels: [...conv.labels, ...added],
+    });
+  }
+}
+
 // Stages the agent-owned row in the contact's conversation on this number (a Brazilian mobile
 // reuses the contact stored with or without the ninth digit), sends it, then lands and echoes it.
 // A send that fails removes the staged row, so the history never shows a message that did not go.
@@ -396,11 +548,13 @@ async function sendAsAgent(
   content: string,
   contentAttributes: Record<string, unknown>,
   send: (ryze: RyzeClient, chatJid: string) => Promise<RyzeSentMessage>,
+  context: ConversationContextInput,
   deps: SendDeps,
 ): Promise<SentMessage> {
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
   const tenantId = ctx.tenantId;
   const base = deps.base ?? basePrisma;
+  const withContext = hasContext(context);
   const staged = await scoped(
     tenantId,
     async (db) => {
@@ -410,20 +564,41 @@ async function sendAsAgent(
       if (!gw) throw new NotFoundError("errors.ryzeGatewayNotFound");
       const contact = await upsertContact(db, gw, `${to}@s.whatsapp.net`, null);
       const { conv } = await openConversation(db, gw, contact);
-      const row = await storeOutgoing(db, gw, conv, content, contentAttributes);
-      return { gw, conv, row };
+      const row = withContext
+        ? null
+        : await storeOutgoing(db, gw, conv, content, contentAttributes);
+      return { gw, contact, conv, row };
     },
     base,
   );
+  // NOTE: with context, the contact and conversation are committed first so the emulator's own
+  // transactions see them, and the message row is staged only once the context is written.
+  let row = staged.row;
+  if (!row) {
+    await applyConversationContext(
+      staged.gw,
+      staged.contact,
+      staged.conv,
+      context,
+      { ...deps, base },
+    );
+    row = await scoped(
+      tenantId,
+      (db) =>
+        storeOutgoing(db, staged.gw, staged.conv, content, contentAttributes),
+      base,
+    );
+  }
+  const stagedRow = row;
   try {
     const ryze = await (deps.makeClient ?? clientFor)(staged.gw);
     const sent = await send(ryze, staged.conv.chatJid);
-    await landAndEcho(staged.gw, staged.row, sent.messageId, base);
+    await landAndEcho(staged.gw, stagedRow, sent.messageId, base);
     return { messageId: sent.messageId, conversationId: staged.conv.displayId };
   } catch (err) {
     await scoped(
       tenantId,
-      (db) => db.ryzeMessage.delete({ where: { id: staged.row.id } }),
+      (db) => db.ryzeMessage.delete({ where: { id: stagedRow.id } }),
       base,
     );
     throw err;
@@ -438,6 +613,7 @@ export async function sendRyzeCard(
   deps: SendDeps = {},
 ): Promise<SentMessage> {
   validateCard(card);
+  validateConversationContext(card);
   const content = [
     card.header ? `*${card.header}*` : null,
     card.text,
@@ -454,6 +630,7 @@ export async function sendRyzeCard(
       ? { buttons: card.buttons, mediaUrl: card.mediaUrl }
       : { buttons: card.buttons },
     (ryze, chatJid) => ryze.sendButtons(chatJid, card),
+    card,
     deps,
   );
 }
@@ -466,6 +643,7 @@ export async function sendRyzeText(
   deps: SendDeps = {},
 ): Promise<SentMessage> {
   validateText(msg);
+  validateConversationContext(msg);
   return sendAsAgent(
     ctx,
     gatewayInstanceId,
@@ -473,6 +651,7 @@ export async function sendRyzeText(
     msg.text,
     {},
     (ryze, chatJid) => ryze.sendText(chatJid, msg.text),
+    msg,
     deps,
   );
 }

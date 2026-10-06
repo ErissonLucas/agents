@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { Client } from "pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -75,7 +76,7 @@ describe("every refusal this guard makes is fatal at boot", () => {
 
   test("and src/index.ts catches the base, not one of them by name", async () => {
     const source = await Bun.file(
-      new URL("../../src/index.ts", import.meta.url).pathname,
+      fileURLToPath(new URL("../../src/index.ts", import.meta.url)),
     ).text();
     const code = source
       .split("\n")

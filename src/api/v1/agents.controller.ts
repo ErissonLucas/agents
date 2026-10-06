@@ -85,6 +85,8 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.retiredLabelSetting', '`settings.{{key}}` was retired: say which labels exist and which exclude each other in the `set_labels` usage guidance.')
 // translate('errors.tooManyProtectedLabels', '`Labels off limits` takes at most {{max}} labels.')
 // translate('errors.tooManyAllowedLabels', '`Labels it may add` takes at most {{max}} labels.')
+// translate('errors.replyGateNeedsLabel', 'The reply gate is on but names no required label, so the agent would never answer. Name the label or turn the gate off.')
+// translate('errors.replyGateSameLabels', 'The hand-off label must differ from the required label.')
 // translate('errors.halfConfiguredFallback', 'The fallback provider is only half configured: {{missing}} is missing.')
 // translate('errors.sttCredentialMissing', 'The transcription credential was not found.')
 // translate('errors.sttFailed', 'Transcription failed: {{detail}}')

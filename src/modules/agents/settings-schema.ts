@@ -377,6 +377,29 @@ const takeover = z.looseObject({
     ),
 });
 
+// The Livare reply gate (docs/LIVARE-F21-PORTAO-ETIQUETA.md). Its own block, because it is not
+// config of any tool: it decides whether the agent speaks at all.
+const replyGate = z.looseObject({
+  enabled: z
+    .boolean()
+    .optional()
+    .describe(
+      "speak only where requiredLabel is on; closed on doubt; default false",
+    ),
+  requiredLabel: z.string().nullable().optional(),
+  handoffLabel: z
+    .string()
+    .nullable()
+    .optional()
+    .describe(
+      "put on at a hand-off; on RyzeAPI only if the number's catalog has it",
+    ),
+  removeOnHandoff: z
+    .boolean()
+    .optional()
+    .describe("hand-off removes requiredLabel; default true"),
+});
+
 const limits = z.looseObject({
   maxToolCalls: z
     .number()
@@ -947,6 +970,7 @@ export const BEHAVIOR_PATCH_SHAPE = {
   followUp: followUp.optional(),
   handoff: handoff.optional(),
   takeover: takeover.optional(),
+  replyGate: replyGate.optional(),
   limits: limits.optional(),
   availability: availability.optional(),
   contactAuth: contactAuth.optional(),

@@ -50,3 +50,30 @@ export function describeClosedGate(observed: {
     status: observed.status ?? "unknown",
   };
 }
+
+// THE REPLY GATE HOLDING A REPLY (Livare F2.1, docs/LIVARE-F21-PORTAO-ETIQUETA.md): the conversation
+// does not carry the label the agent needs to speak, so whatever the agent was about to say stays
+// with us. Not a takeover and not a lost owner: the conversation can still be the bot's. `seam` says
+// which speaking path was stopped and `reason` why; neither carries anything anybody wrote.
+export type ReplyGateSeam =
+  | "receiver"
+  | "turn"
+  | "nudge"
+  | "notice"
+  | "spend_ceiling"
+  | "media_fallback"
+  | "redirect_followup"
+  | "transport";
+
+export type ReplyGateHeldDetail = {
+  outcome: "reply_gate_closed";
+  reason: string;
+  seam: ReplyGateSeam;
+};
+
+export function describeReplyGateHeld(
+  reason: string,
+  seam: ReplyGateSeam,
+): ReplyGateHeldDetail {
+  return { outcome: "reply_gate_closed", reason, seam };
+}

@@ -1,6 +1,7 @@
 /// <reference lib="dom" />
 
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { cleanup, render } from "@testing-library/react";
 
 // A layout rule that only exists at paint time. happy-dom computes no layout, so what is checked is
@@ -13,10 +14,12 @@ import { cleanup, render } from "@testing-library/react";
 // that tall. The fix is a DEFINITE height, and this is the check that it does not quietly go back to
 // a ceiling the next time someone tunes the number.
 
-const MODAL = new URL(
-  "../../src/client/pages/resources/documents/DocumentTemplateModal.tsx",
-  import.meta.url,
-).pathname;
+const MODAL = fileURLToPath(
+  new URL(
+    "../../src/client/pages/resources/documents/DocumentTemplateModal.tsx",
+    import.meta.url,
+  ),
+);
 async function classNamesOfPreview(): Promise<string> {
   const src = await Bun.file(MODAL).text();
   const match = src.match(/<DocumentPreview[\s\S]*?className="([^"]*)"/);

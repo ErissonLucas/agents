@@ -43,6 +43,44 @@ import {
 // the call. The management routes connect, list, refresh and remove numbers; binding a number to an
 // agent goes through the Chatwoot inbox routes, since the number is an emulated Chatwoot inbox.
 
+const attributeBag = (what: string) =>
+  t.Optional(
+    t.Record(
+      t.String(),
+      t.Union([t.String({ maxLength: 1000 }), t.Number(), t.Boolean()]),
+      {
+        description: `Custom attributes merged into the ${what}'s before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.`,
+      },
+    ),
+  );
+
+// Optional context a send writes on the conversation first, so the agent reads it on the reply.
+const conversationContextFields = {
+  contactName: t.Optional(
+    t.String({
+      minLength: 1,
+      maxLength: 255,
+      description: "Contact name, set only when the contact has none yet.",
+    }),
+  ),
+  contactAttributes: attributeBag("contact"),
+  conversationAttributes: attributeBag("conversation"),
+  labels: t.Optional(
+    t.Array(
+      t.String({
+        minLength: 1,
+        maxLength: 40,
+        description: "Label title (a-z 0-9 _ -, up to 40).",
+      }),
+      {
+        maxItems: 10,
+        description:
+          "Labels ADDED to the conversation (never removed), synced to WhatsApp Business like any label write. At most 10.",
+      },
+    ),
+  ),
+};
+
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
   if (ctx.tenantId === null) throw new TenantTargetRequiredError();
@@ -204,7 +242,7 @@ export const ryzeAdminController = new Elysia({
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Send RyzeAPI button card",
-        "Send a card with 1 to 3 reply buttons into the contact's conversation on this number. The card is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A tap on a button whose id carries RYZE_BUTTON_BRIDGE_PREFIX is posted to RYZE_BUTTON_BRIDGE_URL instead of starting an agent turn.",
+        "Send a card with 1 to 3 reply buttons into the contact's conversation on this number. The card is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A tap on a button whose id carries RYZE_BUTTON_BRIDGE_PREFIX is posted to RYZE_BUTTON_BRIDGE_URL instead of starting an agent turn. Optional `contactName`, `contactAttributes`, `conversationAttributes` and `labels` are written on the contact and conversation (created if the contact never wrote) before the message is stored and sent, merged into what is there, so the agent reads them when the contact answers.",
       ),
       params: t.Object({
         id: t.String({
@@ -249,6 +287,7 @@ export const ryzeAdminController = new Elysia({
           }),
           { minItems: 1, maxItems: 3 },
         ),
+        ...conversationContextFields,
       }),
       response: errors(400, 401, 403, 404, 422),
     },
@@ -267,7 +306,7 @@ export const ryzeAdminController = new Elysia({
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Send RyzeAPI text",
-        "Send a plain text into the contact's conversation on this number. The text is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A Brazilian mobile reuses the conversation stored with or without the ninth digit.",
+        "Send a plain text into the contact's conversation on this number. The text is stored as the agent's own message, so it is part of the history the model reads and is never taken for a person typing on the phone. A Brazilian mobile reuses the conversation stored with or without the ninth digit. Optional `contactName`, `contactAttributes`, `conversationAttributes` and `labels` are written on the contact and conversation (created if the contact never wrote) before the message is stored and sent, merged into what is there, so the agent reads them when the contact answers.",
       ),
       params: t.Object({
         id: t.String({
@@ -283,6 +322,7 @@ export const ryzeAdminController = new Elysia({
           maxLength: 4000,
           description: "Message text, up to 4000 characters.",
         }),
+        ...conversationContextFields,
       }),
       response: errors(400, 401, 403, 404, 422),
     },

@@ -10,6 +10,11 @@ import {
 import type { RuntimeDeps } from "@/graph/runtime";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { isMonitoring } from "@/modules/agents/mode";
+import {
+  readReplyGateConfig,
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { loadAgentBot, loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
@@ -465,6 +470,29 @@ export async function sendWhatsAppFollowUp(
   // this line. Nothing has left yet, which makes this the last free place to stop.
   const verdict = p.fence ? await p.fence() : "go";
   if (verdict !== "go") return verdict;
+  // THE REPLY GATE (docs/LIVARE-F21-PORTAO-ETIQUETA.md), on the conversation the link goes to: a
+  // WhatsApp conversation without the label hears nothing from the agent, fixed text included.
+  const replyGate = await replyGateVerdictNow({
+    tenantId: p.tenantId,
+    instanceId: p.instanceId,
+    conversationId: sibling.chatwootConversationId,
+    agentId: p.agentId,
+    base: p.base,
+    config: readReplyGateConfig(p.settings),
+    readLabels: () =>
+      client.getConversationLabels(sibling.chatwootConversationId),
+  });
+  if (!replyGate.open) {
+    reportReplyGateHeld({
+      seam: "redirect_followup",
+      reason: replyGate.reason,
+      tenantId: p.tenantId,
+      conversationId: sibling.chatwootConversationId,
+      agentId: p.agentId,
+      base: p.base,
+    });
+    return "stood-down";
+  }
   const sw = readServiceWindowConfig(p.settings);
   const mode = proactiveSendMode(sw, sibling.lastInboundAt, p.now, {
     channelType: sibling.channelType,

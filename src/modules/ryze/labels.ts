@@ -9,6 +9,11 @@ import basePrisma from "@/api/lib/prisma";
 import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
 import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  readReplyGateConfig,
+  replyGateLabelsAfterHandoff,
+} from "@/modules/agents/reply-gate";
+import { withConversationLabels } from "@/modules/chatwoot/labels";
 import { RyzeApiError, type RyzeClient, type RyzeTag } from "./client";
 import { emitToBots } from "./emit";
 import { ryzeClientForGateway } from "./gateway-client";
@@ -735,6 +740,113 @@ export async function applyLabelRules(
   } catch (err) {
     logger.warn(
       "ryze: automatic labels not applied (gateway %s): %s",
+      String(gw.id),
+      describe(err),
+    );
+    return null;
+  }
+}
+
+/**
+ * The reply gate's half of a hand-off on a Ryze number (docs/LIVARE-F21-PORTAO-ETIQUETA.md): when a
+ * conversation goes to the human queue and the inbox's agent has `replyGate` on, its required label
+ * comes off (unless `removeOnHandoff` is false) and its hand-off label goes on, when the number's
+ * catalog has it — a hand-off never spends a catalog slot. Inside the conversation's label queue, so
+ * it cannot interleave with a `set_labels` read-modify-write. Announced and synced to WhatsApp like any
+ * label change. Idempotent; best-effort: logs and returns null on failure, and null when nothing moved.
+ */
+export async function applyReplyGateHandoff(
+  gw: RyzeGateway,
+  conversationId: bigint,
+  deps: RyzeLabelDeps = {},
+): Promise<RyzeConversation | null> {
+  const base = deps.base ?? basePrisma;
+  try {
+    const cfg = await scoped(
+      gw.tenantId,
+      async (db) => {
+        const inbox = await db.inbox.findFirst({
+          where: {
+            chatwootInstanceId: gw.chatwootInstanceId,
+            chatwootInboxId: gw.inboxId,
+          },
+          select: { agentId: true },
+        });
+        if (!inbox?.agentId) return null;
+        const agent = await db.agent.findUnique({
+          where: { id: inbox.agentId },
+          select: { settings: true },
+        });
+        return readReplyGateConfig(agent?.settings);
+      },
+      base,
+    );
+    if (!cfg?.enabled) return null;
+    const conv = await scoped(
+      gw.tenantId,
+      (db) =>
+        db.ryzeConversation.findUnique({
+          where: { id: conversationId },
+          select: { displayId: true },
+        }),
+      base,
+    );
+    if (!conv) return null;
+    const out = await withConversationLabels(gw.tenantId, conv.displayId, () =>
+      scoped(
+        gw.tenantId,
+        async (db) => {
+          const row = await db.ryzeConversation.findUnique({
+            where: { id: conversationId },
+          });
+          if (!row) return null;
+          const catalog = await liveRows(db, gw.id);
+          const handoff = cfg.handoffLabel;
+          const unknownHandoff =
+            handoff !== null &&
+            !catalog.some((r) => sameLabelTitle(r.title, handoff));
+          const next = replyGateLabelsAfterHandoff(cfg, row.labels, (t) =>
+            catalog.some((r) => sameLabelTitle(r.title, t)),
+          );
+          const delta = labelDelta(row.labels, next);
+          if (delta.added.length === 0 && delta.removed.length === 0)
+            return { unknownHandoff, change: null };
+          const after = await db.ryzeConversation.update({
+            where: { id: row.id },
+            data: { labels: next },
+          });
+          const body = await conversationBody(db, gw, after);
+          return {
+            unknownHandoff,
+            change: { before: row.labels, after, body },
+          };
+        },
+        base,
+      ),
+    );
+    if (out?.unknownHandoff) {
+      logger.warn(
+        "ryze: the hand-off label %s is not in the catalog of %s, so it was not put on",
+        cfg.handoffLabel,
+        gw.instanceName,
+      );
+    }
+    const change = out?.change;
+    if (!change) return null;
+    emitToBots({ tenantId: gw.tenantId, gatewayId: gw.id, base }, [
+      { ...change.body, event: "conversation_updated" },
+    ]);
+    syncConversationLabels(
+      gw,
+      change.after,
+      change.before,
+      change.after.labels,
+      deps,
+    );
+    return change.after;
+  } catch (err) {
+    logger.warn(
+      "ryze: reply gate labels not swapped at the hand-off (gateway %s): %s",
       String(gw.id),
       describe(err),
     );

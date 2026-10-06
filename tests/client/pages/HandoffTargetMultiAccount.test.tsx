@@ -242,6 +242,13 @@ function renderContactAuth(
       sendImage: { allowedHosts: "" },
       takeover: { onHumanReply: true },
       setTakeover: noop,
+      replyGate: {
+        enabled: false,
+        requiredLabel: "",
+        handoffLabel: "",
+        removeOnHandoff: true,
+      },
+      setReplyGate: noop,
       setSendImage: noop,
       attributeContext: { conversation: [], contact: [], task: [] },
       setAttributeContext: noop,

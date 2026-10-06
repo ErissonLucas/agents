@@ -10,6 +10,10 @@ import {
   type ScopedDb,
   type TenantContext,
 } from "@/lib/tenancy";
+import {
+  replyGateVerdictNow,
+  reportReplyGateHeld,
+} from "@/modules/agents/reply-gate";
 import { isTestSilenced } from "@/modules/agents/test-mode";
 import { episodeTestActivatedAt } from "@/modules/channel-redirect/episode";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
@@ -471,6 +475,30 @@ export async function mediaFallbackHandler(
   // that differs is a binding nobody here has read, so nothing goes out under the old persona.
   if (live.inboxId !== null && live.inboxId !== gate.chatwootInboxId)
     return stop("the conversation moved to another inbox");
+  // THE REPLY GATE (docs/LIVARE-F21-PORTAO-ETIQUETA.md): the text is the agent speaking, so a
+  // conversation that lost its label while the job waited gets nothing.
+  const replyGate = await replyGateVerdictNow({
+    tenantId: job.tenantId,
+    instanceId,
+    conversationId,
+    agentId: cfg.agentId,
+    base,
+    readLabels: () => client.getConversationLabels(conversationId),
+    fallback: cfg.replyGateConfig,
+  });
+  if (!replyGate.open) {
+    reportReplyGateHeld({
+      seam: "media_fallback",
+      reason: replyGate.reason,
+      tenantId: job.tenantId,
+      conversationId,
+      conversationRowId: cfg.conversationDbId,
+      agentId: cfg.agentId,
+      inboxRowId: cfg.inboxDbId,
+      base,
+    });
+    return stop("the reply gate is closed");
+  }
 
   // SIGNED, as the text path signs a reply: the audio is exempt from the signature, its text
   // replacement is not (docs/signature.md).

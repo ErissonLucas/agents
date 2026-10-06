@@ -1,3 +1,5 @@
+import { fileURLToPath } from "node:url";
+
 // The field names declared on the `FollowUpStep` interface, read off the source the runtime
 // consumes rather than copied into a list.
 //
@@ -13,7 +15,9 @@
 // because a parse that finds nothing hands back a list every assertion passes over.
 
 const SRC = await Bun.file(
-  new URL("../../src/modules/followups/settings.ts", import.meta.url).pathname,
+  fileURLToPath(
+    new URL("../../src/modules/followups/settings.ts", import.meta.url),
+  ),
 ).text();
 
 export function followUpStepFields(): string[] {

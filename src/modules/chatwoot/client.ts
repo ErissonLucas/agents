@@ -594,7 +594,11 @@ export class ChatwootClient {
     audio: ArrayBuffer,
     fileName: string,
     mime: string,
-    opts: { transcribedText?: string; replyText?: string } = {},
+    opts: {
+      transcribedText?: string;
+      replyText?: string;
+      sendId?: string;
+    } = {},
   ): Promise<unknown> {
     this.assertToken(this.config.botToken, "POST audio message");
     const form = new FormData();
@@ -618,10 +622,17 @@ export class ChatwootClient {
     // The whole reply, only when the speech is not it (issue #792): the text that replaces a refused
     // voice note reads it from here. A JSON string, which is how the builder takes the bag on a
     // multipart create.
-    if (opts.replyText) {
+    // THE SEND'S NAME rides in the same bag (F2.1-A), so a rejected voice note can be asked about by
+    // identity, as the text sends are. Only a caller that will ask passes one.
+    if (opts.replyText || opts.sendId) {
       form.append(
         "content_attributes",
-        JSON.stringify({ [CHATWOOT_REPLY_TEXT_KEY]: opts.replyText }),
+        JSON.stringify({
+          ...(opts.replyText
+            ? { [CHATWOOT_REPLY_TEXT_KEY]: opts.replyText }
+            : {}),
+          ...(opts.sendId ? { [CHATWOOT_SEND_ID_KEY]: opts.sendId } : {}),
+        }),
       );
     }
     const res = await this.fetchImpl(
@@ -654,7 +665,7 @@ export class ChatwootClient {
     bytes: ArrayBuffer,
     fileName: string,
     mime: string,
-    opts: { caption?: string } = {},
+    opts: { caption?: string; sendId?: string } = {},
   ): Promise<unknown> {
     this.assertToken(this.config.botToken, "POST file attachment");
     const form = new FormData();
@@ -663,6 +674,12 @@ export class ChatwootClient {
     form.append("attachments[]", new File([bytes], fileName, { type: mime }));
     form.append("message_type", "outgoing");
     if (opts.caption) form.append("content", opts.caption);
+    if (opts.sendId) {
+      form.append(
+        "content_attributes",
+        JSON.stringify({ [CHATWOOT_SEND_ID_KEY]: opts.sendId }),
+      );
+    }
     const res = await this.fetchImpl(
       `${this.accountBase}/conversations/${conversationId}/messages`,
       {
@@ -1200,6 +1217,48 @@ export class ChatwootClient {
       undefined,
       timeoutMs,
     );
+  }
+
+  // WHAT BECAME OF ONE SEND, asked of the RyzeAPI emulator by the name the send left with (F2.1-A).
+  // Every row carrying that name in this conversation comes back with its state; what they mean is
+  // decided by the caller (../split/service.ts). Asked with the BOT token, the only one the emulator
+  // answers: the admin token this client holds for a RYZE account is a constant. Not a Chatwoot
+  // route — on any other client this refuses rather than ask a real Chatwoot something it does not
+  // know.
+  async getRyzeSendState(
+    conversationId: number,
+    sendId: string,
+    timeoutMs: number = INTERACTIVE_TIMEOUT_MS,
+  ): Promise<
+    Array<{
+      id: number;
+      status: string;
+      state: string | null;
+      sourceId: string | null;
+    }>
+  > {
+    if (!this.isRyzeEmulator) {
+      throw new Error("getRyzeSendState: not a RyzeAPI emulator client");
+    }
+    const res = (await this.request(
+      this.config.botToken,
+      "GET",
+      `/conversations/${conversationId}/messages?send_id=${encodeURIComponent(sendId)}`,
+      undefined,
+      timeoutMs,
+    )) as { records?: unknown } | null;
+    if (!res || !Array.isArray(res.records)) {
+      throw new Error("getRyzeSendState: unreadable answer");
+    }
+    return res.records.map((r) => {
+      const o = (r ?? {}) as Record<string, unknown>;
+      return {
+        id: typeof o.id === "number" ? o.id : Number.NaN,
+        status: typeof o.status === "string" ? o.status : "",
+        state: typeof o.state === "string" ? o.state : null,
+        sourceId: typeof o.source_id === "string" ? o.source_id : null,
+      };
+    });
   }
 
   // Writes a metadata blob onto a message attachment (fork route, confirmed against

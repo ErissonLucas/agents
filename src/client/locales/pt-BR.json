@@ -654,6 +654,8 @@
   "conversation": {
     "activity": {
       "attr": "Atualizando dados",
+      "buttons": "Colocando botões na resposta",
+      "carousel": "Colocando um carrossel na resposta",
       "debounce": "Aguardando novas mensagens",
       "debounceCountdown": "Aguardando novas mensagens · ~{{seconds}}s",
       "delivering": "Entregando a resposta",
@@ -661,8 +663,6 @@
       "note": "Escrevendo uma nota interna",
       "openCase": "Abrindo o caso em outra caixa",
       "react": "Reagindo a uma mensagem",
-      "buttons": "Colocando botões na resposta",
-      "carousel": "Colocando um carrossel na resposta",
       "resolve": "Encerrando o atendimento",
       "search": "Consultando a base de conhecimento",
       "skip": "Decidiu não responder",
@@ -1612,6 +1612,14 @@
     "reasoningEffortHint": "Quanto o modelo pensa antes de responder. Só em modelos de raciocínio (série o, gpt-5, gpt-6); mais esforço significa resposta mais lenta e mais cara.",
     "refusalNoControl": "Este valor não tem campo no console, então só dá para alterá-lo pela API.",
     "reload": "Recarregar",
+    "replyGate": "Responder só com etiqueta",
+    "replyGateEnabled": "Responder só conversas com a etiqueta exigida",
+    "replyGateHandoffLabel": "Etiqueta de transferência",
+    "replyGateHandoffLabelHint": "Colocada quando a conversa vai para uma pessoa. Opcional.",
+    "replyGateHelp": "O agente só responde conversas que têm a etiqueta exigida e fica em silêncio sempre que não tiver certeza: etiqueta ausente, desconhecida no número de WhatsApp ou ainda não sincronizada lá.\n\nEle continua lendo todas as mensagens, então conhece a conversa quando a etiqueta volta. Quando a conversa vai para uma pessoa, a etiqueta exigida sai e a de transferência entra.\n\nNum número RyzeAPI a etiqueta de transferência já tem que existir na lista de etiquetas do número. No modo teste, /teste e /reset recolocam a etiqueta exigida.",
+    "replyGateRemoveOnHandoff": "Tirar a etiqueta exigida na transferência",
+    "replyGateRequiredLabel": "Etiqueta exigida",
+    "replyGateRequiredLabelHint": "Sem ela na conversa, o agente não responde.",
     "roundingDate": "data",
     "roundingExact": "exata · muda a cada minuto",
     "roundingNote": "Valores arredondados ficam estáveis por {{minutes}} min, o que melhora o cache do prompt.",
@@ -2271,8 +2279,8 @@
       "embed": "Embedding",
       "generate": "Geração",
       "guardrail": "Verificação de guardrails",
-      "jev": "Decisão do Jev",
       "handoff": "Transferência",
+      "jev": "Decisão do Jev",
       "memory": "Memória",
       "normalize": "Reescrita para fala",
       "observe": "Observação",
@@ -2449,6 +2457,10 @@
       "desc": "Reage à última mensagem do cliente com um emoji (reação do WhatsApp).",
       "label": "Reagir com emoji"
     },
+    "resolve_conversation": {
+      "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",
+      "label": "Resolver"
+    },
     "send_buttons": {
       "desc": "Mostra até 3 botões (respostas rápidas ou links) embaixo da resposta no WhatsApp (RyzeAPI).",
       "label": "Enviar botões"
@@ -2456,10 +2468,6 @@
     "send_carousel": {
       "desc": "Mostra de 2 a 5 cards deslizáveis (foto, nome, preço e botão) embaixo da resposta no WhatsApp (RyzeAPI).",
       "label": "Enviar carrossel"
-    },
-    "resolve_conversation": {
-      "desc": "Marca a conversa como resolvida quando o pedido foi totalmente atendido.",
-      "label": "Resolver"
     },
     "send_image": {
       "desc": "Entrega uma imagem ao cliente a partir da URL dela, restrita aos hosts que você liberar.",

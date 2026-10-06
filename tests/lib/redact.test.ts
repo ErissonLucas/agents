@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 import { redactSecretsDeep, sanitizeErrorMessage } from "@/lib/redact";
 import { unstorableProblem } from "@/lib/text";
 
@@ -214,7 +215,7 @@ describe("the scrub reads past the cut", () => {
 // written the same way would leak the same credential, and no type would say so.
 describe("no surface composes the order by hand", () => {
   test("nothing pairs the scrub with a cut it did not do first", async () => {
-    const dir = new URL("../../src/", import.meta.url).pathname;
+    const dir = fileURLToPath(new URL("../../src/", import.meta.url));
     const offenders: string[] = [];
     for await (const rel of new Bun.Glob("**/*.{ts,tsx}").scan({ cwd: dir })) {
       const text = await Bun.file(`${dir}${rel}`).text();

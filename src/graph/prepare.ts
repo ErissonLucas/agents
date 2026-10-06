@@ -20,6 +20,11 @@ import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { isMonitoring } from "@/modules/agents/mode";
 import {
+  type ReplyGateConfig,
+  readReplyGateConfig,
+  replyGateControlLabels,
+} from "@/modules/agents/reply-gate";
+import {
   readAllowedLabels,
   readOutsideAllowedLabels,
   readProtectedLabels,
@@ -292,6 +297,9 @@ export interface AgentConfig {
   // WhatsApp 24h service-window gate for proactive sends + the contact name for template params.
   serviceWindowConfig: ServiceWindowConfig;
   handoffConfig: HandoffConfig;
+  // The reply gate (docs/LIVARE-F21-PORTAO-ETIQUETA.md), as loaded: the send fences re-read the
+  // stored one and fall back to this only when that read fails.
+  replyGateConfig: ReplyGateConfig;
   // Contact authorization gate (docs/contact-auth.md). Enforced by the webhook gate, the debounce
   // flush, the proactive nudge and the manual re-engage, NOT here; carried on the config so they
   // need no second settings read.
@@ -944,6 +952,7 @@ export async function loadAgentConfig(
     signatureConfig: readSignatureConfig(effSettings),
     serviceWindowConfig: readServiceWindowConfig(effSettings),
     handoffConfig: readHandoffConfig(effSettings),
+    replyGateConfig: readReplyGateConfig(effSettings),
     contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
     jevConfig: readJevConfig(effSettings),
@@ -956,6 +965,8 @@ export async function loadAgentConfig(
       ...new Set([
         ...readProtectedLabels(effSettings),
         ...(ryzeLabels?.deviceLabels ?? []),
+        // NOTE: the reply gate's own labels: a model that moved them would open or close its gate.
+        ...replyGateControlLabels(readReplyGateConfig(effSettings)),
       ]),
     ],
     allowedLabels: readAllowedLabels(effSettings),

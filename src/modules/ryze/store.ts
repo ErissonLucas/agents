@@ -16,6 +16,107 @@ import { presentConversation } from "./present";
 export const PAGE_SIZE = 20;
 export const AFTER_PAGE_SIZE = 100;
 
+// WHAT BECAME OF A SEND THE EMULATOR MADE (F2.1-A, docs/LIVARE-F21-A-ENVIO-INCERTO.md). The row is
+// written before the provider is called and never deleted: deleting a failed one is what let a
+// read-back prove a false absence (a timeout after the provider took it) and resend it.
+//
+// Unsettled states live in `status` under names no other writer uses, so the history filter runs on a
+// non-null column and leaves every other row as it was; settled rows keep `sent`. RYZE_DELIVERY_KEY
+// names the same state, and "accepted": a RyzeAPI `messageId` proves the provider took the message,
+// not that the phone got it.
+export const RYZE_DELIVERY_KEY = "fazer_ai_ryze_delivery";
+export type RyzeDeliveryState =
+  | "sending"
+  | "not_dispatched"
+  | "uncertain"
+  | "provider_accepted"
+  | "provider_accepted_unrecorded";
+export const RYZE_STATUS_SENDING = "fazer_ai_sending";
+export const RYZE_STATUS_NOT_DISPATCHED = "fazer_ai_not_dispatched";
+export const RYZE_STATUS_UNCERTAIN = "fazer_ai_uncertain";
+export const RYZE_UNSETTLED_STATUSES = [
+  RYZE_STATUS_SENDING,
+  RYZE_STATUS_NOT_DISPATCHED,
+  RYZE_STATUS_UNCERTAIN,
+];
+// The send's own name, written by `ChatwootClient` (CHATWOOT_SEND_ID_KEY, ../chatwoot/constants.ts).
+const SEND_ID_KEY = "fazer_ai_send_id";
+
+// An attempt is not a message the customer has: hidden from every history read, so no reader takes
+// it for a reply that was delivered, a person's reply or a conversation boundary. The rows stay; the
+// lookup by send id below is the one way to them.
+const settledOnly = { status: { notIn: RYZE_UNSETTLED_STATUSES } };
+
+export interface RyzeSendRecord {
+  messageId: number;
+  status: string;
+  state: unknown;
+  externalId: string | null;
+}
+
+// The rows of ONE conversation that carry this send id, whatever their state. Bounded at three: two
+// already make the answer "unknown", and the caller must never pick one of several.
+export async function sendRecords(
+  db: ScopedDb,
+  gatewayId: bigint,
+  conversationId: number,
+  sendId: string,
+): Promise<RyzeSendRecord[]> {
+  const rows = await db.ryzeMessage.findMany({
+    where: {
+      gatewayId,
+      conversationId,
+      messageType: 1,
+      contentAttributes: { path: [SEND_ID_KEY], equals: sendId },
+    },
+    orderBy: { messageId: "asc" },
+    take: 3,
+    select: {
+      messageId: true,
+      status: true,
+      contentAttributes: true,
+      externalId: true,
+    },
+  });
+  return rows.map((r) => ({
+    messageId: r.messageId,
+    status: r.status,
+    state:
+      r.contentAttributes &&
+      typeof r.contentAttributes === "object" &&
+      !Array.isArray(r.contentAttributes)
+        ? (r.contentAttributes as Record<string, unknown>)[RYZE_DELIVERY_KEY]
+        : undefined,
+    externalId: r.externalId,
+  }));
+}
+
+// The outgoing attempts of this conversation that the provider never accepted, newer than the last
+// one it did. Empty once a later send is accepted: the doubt is about the conversation's latest word
+// from our side, not about every failure it ever had.
+export async function unsettledSinceLastAccepted(
+  db: ScopedDb,
+  gatewayId: bigint,
+  conversationId: number,
+): Promise<Array<{ messageId: number; status: string; createdAt: Date }>> {
+  const accepted = await db.ryzeMessage.findFirst({
+    where: { gatewayId, conversationId, messageType: 1, status: "sent" },
+    orderBy: { messageId: "desc" },
+    select: { messageId: true },
+  });
+  return db.ryzeMessage.findMany({
+    where: {
+      gatewayId,
+      conversationId,
+      messageType: 1,
+      status: { in: RYZE_UNSETTLED_STATUSES },
+      ...(accepted ? { messageId: { gt: accepted.messageId } } : {}),
+    },
+    orderBy: { messageId: "asc" },
+    select: { messageId: true, status: true, createdAt: true },
+  });
+}
+
 export function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
@@ -61,7 +162,12 @@ export async function latestMessageId(
   conversationId: number,
 ): Promise<number | null> {
   const m = await db.ryzeMessage.findFirst({
-    where: { gatewayId, conversationId, messageType: { not: 2 } },
+    where: {
+      gatewayId,
+      conversationId,
+      messageType: { not: 2 },
+      ...settledOnly,
+    },
     orderBy: { messageId: "desc" },
     select: { messageId: true },
   });
@@ -86,7 +192,12 @@ export async function listMessages(
 ): Promise<RyzeMessage[]> {
   if (q.after !== undefined) {
     return db.ryzeMessage.findMany({
-      where: { gatewayId, conversationId, messageId: { gt: q.after } },
+      where: {
+        gatewayId,
+        conversationId,
+        messageId: { gt: q.after },
+        ...settledOnly,
+      },
       orderBy: { messageId: "asc" },
       take: AFTER_PAGE_SIZE,
     });
@@ -95,6 +206,7 @@ export async function listMessages(
     where: {
       gatewayId,
       conversationId,
+      ...settledOnly,
       ...(q.before !== undefined ? { messageId: { lt: q.before } } : {}),
     },
     orderBy: { messageId: "desc" },

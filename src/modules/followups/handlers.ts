@@ -27,6 +27,11 @@ import {
   ourSideHasSpoken,
 } from "@/modules/followups/eligibility";
 import {
+  gatewayForInstance,
+  scoped as ryzeScoped,
+  unsettledSinceLastAccepted,
+} from "@/modules/ryze/store";
+import {
   type ClaimedJob,
   enqueueJob,
   enqueueJobUnlessClaimed,
@@ -849,6 +854,30 @@ export async function followUpHandler(
       runAt: new Date(Date.now() + IN_FLIGHT_BACKOFF_MS),
       payload: { ...job.payload, deferredUnder: BACKOFF_DEFERRAL },
     };
+  }
+
+  // NOT ON A WORD THE PROVIDER NEVER TOOK (F2.1-A, docs/LIVARE-F21-A-ENVIO-INCERTO.md). On RyzeAPI,
+  // `ourSideHasSpoken` reads the reply CLAIM, written before the send, so the ladder is live for a reply
+  // the provider may never have accepted. Asked before `runAgentNudge`, so no nudge, label or resolve
+  // is built on it; ended WITH A STAMP, like the schedule that never opens above, because a bare
+  // `done` leaves the episode selectable every minute. The customer's next message opens a new episode
+  // as always, and a later accepted reply empties this list. A native Chatwoot instance has no gateway.
+  const unconfirmed = await ryzeScoped(
+    tenantId,
+    async (db) => {
+      const gw = await gatewayForInstance(db, instanceId);
+      return gw ? unsettledSinceLastAccepted(db, gw.id, conversationId) : [];
+    },
+    base,
+  );
+  if (unconfirmed.length > 0) {
+    logger.warn(
+      "followUpHandler: our latest send was not accepted by the provider — ending the follow-up episode at step %d without a nudge (thread=%s)",
+      stepIndex,
+      threadId,
+    );
+    await stampUnlessRetired();
+    return { outcome: "done" };
   }
 
   const idleMin = lastEventAt

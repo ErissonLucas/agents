@@ -98,6 +98,19 @@ export function testDbNameFor(base: string, checkoutRoot: string): string {
 
 // Swaps the database out of a connection URL and leaves everything else — host, port, role,
 // password, query parameters — exactly as the `.env` wrote it.
+// The suite asserts calendar boundaries (`2026-01-06T00:00:00.000Z`) that Postgres computes in the
+// SESSION time zone, and CI's Postgres runs in UTC. A local server in another zone (measured:
+// America/Recife, -03) moved 24 tests and 8 between-test errors by exactly three hours. Pinning the
+// session here, on the test URLs only, makes the local run answer like CI without touching the
+// server, the database or any role (no ALTER ... SET). An explicit TimeZone in `options` wins.
+export function withUtcSession(url: string): string {
+  const parsed = new URL(url);
+  const options = parsed.searchParams.get("options") ?? "";
+  if (/(^|\s)-c\s*TimeZone=/i.test(options)) return url;
+  parsed.searchParams.set("options", `${options} -c TimeZone=UTC`.trim());
+  return parsed.toString();
+}
+
 export function withDbName(url: string, name: string): string {
   const parsed = new URL(url);
   parsed.pathname = `/${name}`;
