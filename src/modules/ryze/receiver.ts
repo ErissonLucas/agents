@@ -11,7 +11,11 @@ import config from "@/config";
 import { asSuperAdminOn, type ScopedDb } from "@/lib/tenancy";
 import { hashRouteToken } from "@/modules/webhooks/inbound/route-token";
 import { RYZE_SOURCE } from "./client";
-import { RYZE_DEVICE_SENDER_NAME, ryzeEmulatorBaseUrl } from "./constants";
+import {
+  RYZE_CONNECTED_STATE,
+  RYZE_DEVICE_SENDER_NAME,
+  ryzeEmulatorBaseUrl,
+} from "./constants";
 import { emitToBots } from "./emit";
 import { bridgeClaims, buttonReplyOf, forwardButtonReply } from "./interactive";
 import { applyLabelRules, handleLabelUpdate } from "./labels";
@@ -263,6 +267,12 @@ async function handleInstanceState(
 ): Promise<void> {
   const state = str(data.state);
   if (!state) return;
+  const jid = str(data.jid);
+  // Set when a number pairs (none before, or another one takes the instance). A gateway that already
+  // had its number before the column existed keeps null, and with it the old new_conversation rule.
+  const firstConnect =
+    state === RYZE_CONNECTED_STATE &&
+    ((!!jid && jid !== gw.numberJid) || (!gw.connectedAt && !gw.numberJid));
   await scoped(
     gw.tenantId,
     (db) =>
@@ -270,7 +280,8 @@ async function handleInstanceState(
         where: { id: gw.id },
         data: {
           connectionState: state,
-          ...(str(data.jid) ? { numberJid: str(data.jid) } : {}),
+          ...(jid ? { numberJid: jid } : {}),
+          ...(firstConnect ? { connectedAt: new Date() } : {}),
           lastEventAt: new Date(),
         },
       }),
@@ -316,6 +327,14 @@ async function handleMessage(
   const buttonReply = outgoing || reaction ? null : buttonReplyOf(msg);
   const bridged = !!buttonReply && bridgeClaims(buttonReply);
   const root = ryzeEmulatorBaseUrl(gw.chatwootInstanceId);
+  const sentAt = str(msg.timestamp)
+    ? new Date(str(msg.timestamp) as string)
+    : new Date();
+  // History older than the connection: the chat existed before the number came to us.
+  const beforeConnection =
+    !!gw.connectedAt &&
+    !Number.isNaN(sentAt.getTime()) &&
+    sentAt < gw.connectedAt;
 
   const out = await scoped(
     gw.tenantId,
@@ -386,9 +405,7 @@ async function handleMessage(
                 senderName: contact.name,
               }),
           externalId,
-          createdAt: str(msg.timestamp)
-            ? new Date(str(msg.timestamp) as string)
-            : new Date(),
+          createdAt: sentAt,
         },
       });
       let row: RyzeMessage = created;
@@ -455,7 +472,7 @@ async function handleMessage(
       gw,
       out.conv.id,
       {
-        add: out.created ? ["new_conversation"] : [],
+        add: out.created && !beforeConnection ? ["new_conversation"] : [],
         remove: [
           ...(reaction ? [] : (["clear_on_reply"] as const)),
           ...(out.reopened ? (["human_takeover"] as const) : []),

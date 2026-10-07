@@ -25,3 +25,6 @@ export const RYZE_DEVICE_SENDER_NAME = "WhatsApp";
 export const RYZE_OPERATOR_USER = { id: 1, name: "fazer.ai" } as const;
 
 export const RYZE_WEBHOOK_MOUNT = "/api/v1/ryze/webhook";
+
+// What RyzeAPI reports (instance.state, /api/instance/list) for a number that is up.
+export const RYZE_CONNECTED_STATE = "connected";

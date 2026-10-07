@@ -551,4 +551,52 @@ describe.skipIf(!dbUp)("RyzeAPI WhatsApp labels", () => {
     expect(ryze.calls.length).toBe(before);
     expect((await gateway()).labelsSupported).toBe(false);
   });
+  test("a chat older than the connection does not get new_conversation", async () => {
+    const gw = await gateway();
+    expect(gw.connectedAt).not.toBeNull();
+    const connectedAt = gw.connectedAt as Date;
+    const antiga = "5581977771111";
+    const nova = "5581977772222";
+    async function from(chatJid: string, id: string, timestamp?: string) {
+      await hook("message.exchange", {
+        message: {
+          id,
+          direction: "incoming",
+          chat: { jid: chatJid, name: "Paciente", type: "private" },
+          sender: { jid: chatJid, name: "Paciente" },
+          content: { text: "oi" },
+          ...(timestamp ? { timestamp } : {}),
+        },
+      });
+      await drainLabelSyncs(gatewayId);
+      return runScopedOn(appDb, ctx(), async (db) => {
+        const contact = await db.ryzeContact.findUniqueOrThrow({
+          where: {
+            gatewayId_jid: { gatewayId, jid: `${chatJid}@s.whatsapp.net` },
+          },
+        });
+        return db.ryzeConversation.findFirstOrThrow({
+          where: { gatewayId, contactId: contact.contactId },
+        });
+      });
+    }
+    // History RyzeAPI delivers from before the connection opens the chat without the label...
+    const before = new Date(connectedAt.getTime() - 86_400_000).toISOString();
+    expect((await from(antiga, "OLD1", before)).labels).not.toContain("novo");
+    // ...and the same chat writing after the connection is not new either.
+    expect((await from(antiga, "OLD2")).labels).not.toContain("novo");
+    // A chat seen for the first time after the connection still gets it.
+    expect((await from(nova, "NEW1")).labels).toContain("novo");
+  });
+
+  test("the connection date stays put on reconnect and moves only for another number", async () => {
+    const first = (await gateway()).connectedAt as Date;
+    await hook("instance.state", { state: "disconnected" });
+    await hook("instance.state", { state: "connected", jid: "5581900000000" });
+    expect((await gateway()).connectedAt).toEqual(first);
+    await hook("instance.state", { state: "connected", jid: "5581911112222" });
+    const moved = (await gateway()).connectedAt as Date;
+    expect(moved.getTime()).toBeGreaterThan(first.getTime());
+    await hook("instance.state", { state: "connected", jid: "5581900000000" });
+  });
 });

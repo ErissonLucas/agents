@@ -17,7 +17,11 @@ import {
   type RyzeClient,
   type RyzeClientConfig,
 } from "./client";
-import { RYZE_EMULATOR_ROOT, RYZE_WEBHOOK_MOUNT } from "./constants";
+import {
+  RYZE_CONNECTED_STATE,
+  RYZE_EMULATOR_ROOT,
+  RYZE_WEBHOOK_MOUNT,
+} from "./constants";
 
 // The operator-facing half of the RyzeAPI channel: connecting a number creates an account of kind
 // RYZE (under the tenant's deployment, or a placeholder one when the tenant has no Chatwoot), the
@@ -133,6 +137,9 @@ export async function connectRyzeGateway(
         inboxName: input.name,
         connectionState: state.state,
         numberJid: state.numberJid,
+        ...(state.state === RYZE_CONNECTED_STATE
+          ? { connectedAt: new Date() }
+          : {}),
       },
     });
     return { instance, gateway };

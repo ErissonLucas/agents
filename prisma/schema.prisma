@@ -2509,6 +2509,9 @@ model RyzeGateway {
   connectionState       String?   @map("connection_state")
   numberJid             String?   @map("number_jid")
   lastEventAt           DateTime? @map("last_event_at")
+  // First seen connected (null for gateways connected before the column): `new_conversation` skips a chat
+  // whose first message is older than this.
+  connectedAt           DateTime? @map("connected_at")
   // Whether the number answers WhatsApp Business label calls: null until asked, false after a
   // refusal (a regular WhatsApp number), re-asked once `labelsCheckedAt` is old enough.
   labelsSupported       Boolean?  @map("labels_supported")
