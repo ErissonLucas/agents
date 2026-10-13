@@ -160,6 +160,11 @@ export interface BuildAgentGraphParams {
   retrySilence?: () => boolean;
   // Fired once when that retry ran, with what the second answer did, for the turn's trail.
   onSilenceRetry?: (info: SilenceRetryInfo) => void;
+  // A FINAL ANSWER THE CALLER REFUSES, asked once more (Jev outputCheck.onBreak "retry"). Asked of a
+  // final answer with text; a note back means "held": the answer is neither sent nor persisted, and
+  // the model is asked again in the same round with the note as a late system instruction. Once per
+  // invocation, so the tool budget, the deadlines and the permit stay the turn's. Absent means never.
+  checkReply?: (text: string, toolsCalled: string[]) => Promise<string | null>;
 }
 
 // What the retry of an unexplained silence got back (issue #885): text for the customer, the
@@ -630,6 +635,7 @@ export function buildAgentGraph({
   signal: jobSignal,
   retrySilence,
   onSilenceRetry,
+  checkReply,
 }: BuildAgentGraphParams) {
   const hasTools = !!tools && tools.length > 0;
   const llm = hasTools ? (model.bindTools?.(tools) ?? model) : model;
@@ -683,6 +689,8 @@ export function buildAgentGraph({
   // ONCE PER TURN, the same closure argument: the silence retry (issue #885) runs at most once in
   // this invocation, however many rounds follow it.
   let silenceRetried = false;
+  // The held reply's retry, once per invocation for the same reason.
+  let replyRetried = false;
   const reportToolLimit = (info: {
     maxToolCalls: number;
     toolCalls: number;
@@ -1005,6 +1013,28 @@ export function buildAgentGraph({
       response = await ask(retried);
       onSilenceRetry?.({ outcome: silenceRetryOutcome(response) });
     }
+    // THE HELD REPLY, ASKED ONCE MORE (see `checkReply`). Only a final answer with text in a turn
+    // that is not silent; it travels where the silence retry's instruction does, and the held answer
+    // is not sent back, so the model reads the rule and a summary instead of its own words.
+    const heldNote =
+      checkReply &&
+      !replyRetried &&
+      !noReplyChannel &&
+      !silentTurn &&
+      ((response as AIMessage).tool_calls?.length ?? 0) === 0 &&
+      contentToText(response.content).trim()
+        ? await checkReply(
+            contentToText(response.content).trim(),
+            toolsCalledThisTurn(history),
+          )
+        : null;
+    if (heldNote && !jobSignal?.aborted) {
+      replyRetried = true;
+      const retried = lateSystemAccepted
+        ? [...messages, new SystemMessage(heldNote)]
+        : [new SystemMessage(`${prompt}\n\n${heldNote}`), ...shown, ...wrapUp];
+      response = await ask(retried);
+    }
     return { messages: [...narration, silenced(response)] };
   };
 
@@ -1119,6 +1149,19 @@ export function buildAgentGraph({
   }
 
   return builder.compile(checkpointer ? { checkpointer } : {});
+}
+
+// The tools the model asked for since the customer's last message, in order, each name once: what a
+// rule check needs to tell "registered" said after the call from the same word said instead of it.
+export function toolsCalledThisTurn(messages: BaseMessage[]): string[] {
+  const names: string[] = [];
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.getType() === "human") break;
+    if (m.getType() !== "ai") continue;
+    for (const c of (m as AIMessage).tool_calls ?? []) names.unshift(c.name);
+  }
+  return [...new Set(names)];
 }
 
 // Extracts the assistant's reply text from the final state, normalizing the content (which may

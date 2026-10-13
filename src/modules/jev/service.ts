@@ -1,15 +1,16 @@
 import logger from "@/api/lib/logger";
 import config from "@/config";
 import { clipText } from "@/lib/text";
+import type { ChatwootMessageRow } from "@/modules/chatwoot/messages";
 
 // Jev (TypeSafe AI's System One model): fast, typed decisions with calibrated confidence, no text. It
-// reads the customer's message BEFORE the agent's model runs and the agent's reply BEFORE it is sent,
-// so the cheap yes/no questions stop costing a whole LLM turn:
-//   - a bare "ok"/"valeu"/sticker gets a reaction and no reply (no model call at all);
+// reads the customer's message BEFORE the model runs and the agent's reply BEFORE it is sent:
+//   - a bare "ok"/"valeu"/sticker gets a reaction and no model call, unless our last message asked;
 //   - asking for a person, frustration and intent reach the model as a short reading it acts on;
-//   - a reply that promises what the operator's rules forbid is held back and the case goes to the team.
-// Best-effort by construction: no key, a timeout, an HTTP error or an answer it cannot read all return
-// null and the turn runs exactly as it would without Jev.
+//   - a reply breaking the operator's rules is held: the team takes the case, or (onBreak "retry")
+//     the model gets one more go and a second break sends a fixed line.
+// Best-effort: no key, a timeout, an HTTP error or an unreadable answer return null and the turn
+// runs exactly as it would without Jev.
 
 export const JEV_URL = "https://api.typesafe.ai/v1/systemone";
 export const JEV_MODEL = "jev-latest";
@@ -25,7 +26,8 @@ export interface JevConfig {
   latinOnly: boolean;
   // Above this, a message that is only an acknowledgement is answered with a reaction and no reply.
   ackThreshold: number;
-  // Above this, "asked for a person" is told to the model as a must-act (transfer now).
+  // Above this, "asked for a person" is told to the model as a must-act (transfer now). Any value
+  // above 1 turns the note off (the reading is a probability), for an agent with nobody to hand to.
   humanThreshold: number;
   // The intents the reading names, `name: description` (the agent's own vocabulary). Empty = no intent.
   intents: Record<string, string>;
@@ -39,11 +41,21 @@ export interface JevConfig {
     threshold: number;
     // What the customer reads when a reply is held back and the case goes to the team.
     handoffMessage: string;
+    // What a held reply does: "handoff" (the team takes the case) or "retry" (the model is asked once
+    // more in the same turn, told why; a second break sends `retryFallback`, and nobody is called).
+    onBreak: "handoff" | "retry";
+    retryFallback: string;
   };
 }
 
 const num = (v: unknown, d: number) =>
   typeof v === "number" && v > 0 && v <= 1 ? v : d;
+// The same, plus "off": a threshold above 1 is one a probability never reaches.
+const numOrOff = (v: unknown, d: number) =>
+  typeof v === "number" && Number.isFinite(v) && v > 1 ? v : num(v, d);
+
+export const JEV_RETRY_FALLBACK =
+  "Não consegui concluir isso agora. Pode me mandar de novo o que precisa registrar?";
 
 export function readJevConfig(settings: unknown): JevConfig | null {
   const raw =
@@ -72,7 +84,7 @@ export function readJevConfig(settings: unknown): JevConfig | null {
     enabled: true,
     latinOnly: j.latinOnly === true,
     ackThreshold: num(j.ackThreshold, 0.9),
-    humanThreshold: num(j.humanThreshold, 0.9),
+    humanThreshold: numOrOff(j.humanThreshold, 0.9),
     intents: Object.keys(intents).length >= 2 ? intents : {},
     ackEmoji:
       typeof j.ackEmoji === "string" && j.ackEmoji.trim()
@@ -86,6 +98,11 @@ export function readJevConfig(settings: unknown): JevConfig | null {
         typeof oc.handoffMessage === "string" && oc.handoffMessage.trim()
           ? clipText(oc.handoffMessage.trim(), 500)
           : "Deixa eu confirmar isso com a equipe e já te respondo aqui 🙏",
+      onBreak: oc.onBreak === "retry" ? "retry" : "handoff",
+      retryFallback:
+        typeof oc.retryFallback === "string" && oc.retryFallback.trim()
+          ? clipText(oc.retryFallback.trim(), 500)
+          : JEV_RETRY_FALLBACK,
     },
   };
 }
@@ -164,18 +181,46 @@ const FRUSTRATION_LEVELS = [
   "Bravo: reclama forte, xinga ou ameaça",
 ];
 
+// THE LAST THING OUR SIDE SAID in the conversation, off a fetched page: the newest public outgoing
+// message (or template) with text. A "Sim" or a "250" only reads as an acknowledgement when nobody
+// asked anything, so the ack shortcut needs it. Null when there is none.
+export function lastAgentMessage(
+  rows: readonly ChatwootMessageRow[],
+): string | null {
+  let best: ChatwootMessageRow | null = null;
+  for (const m of rows) {
+    if (m.messageType !== "outgoing" && m.messageType !== "template") continue;
+    if (m.private || m.isReaction || !m.content.trim()) continue;
+    if (!best || m.id > best.id) best = m;
+  }
+  return best ? best.content.trim() : null;
+}
+
+// Whether that message asked the customer something. Deterministic on purpose: a question mark
+// anywhere in it, because an agent that asks ends its sentence with one, and a split reply can put
+// the question before a closing line.
+export function agentAsked(lastAgent: string | null | undefined): boolean {
+  return !!lastAgent && /[?¿]/.test(lastAgent);
+}
+
+// The previous message is context for the reading, cut short: the question is about the reply.
+const LAST_AGENT_MAX_CHARS = 600;
+
 // One call, every question at once (Jev answers them in parallel; output tokens are free).
 export async function readCustomerMessage(
   cfg: JevConfig,
   text: string,
   deps: JevDeps = {},
+  context: { lastAgentMessage?: string | null } = {},
 ): Promise<JevReading | null> {
   if (!text.trim()) return null;
+  const lastAgent = context.lastAgentMessage?.trim() || null;
   const questions: Record<string, Question> = {
     ack: {
       type: "noul",
-      instructions:
-        "A mensagem do cliente é só um agradecimento, confirmação ou despedida ('ok', 'valeu', 'obrigado', 'beleza', emoji ou figurinha), sem nenhum pedido, pergunta ou informação nova.",
+      instructions: lastAgent
+        ? "A mensagem do cliente é só um agradecimento, confirmação ou despedida ('ok', 'valeu', 'obrigado', 'beleza', emoji ou figurinha), sem nenhum pedido, pergunta ou informação nova. Se a última mensagem do atendente fez uma pergunta ou pediu uma informação ou decisão, a resposta do cliente a ela NÃO é só confirmação ('sim', um número, um mês, uma forma de pagamento são respostas)."
+        : "A mensagem do cliente é só um agradecimento, confirmação ou despedida ('ok', 'valeu', 'obrigado', 'beleza', emoji ou figurinha), sem nenhum pedido, pergunta ou informação nova.",
     },
     human: {
       type: "noul",
@@ -195,7 +240,10 @@ export async function readCustomerMessage(
       criteria: cfg.intents,
     };
   }
-  const a = await ask(`Mensagem do cliente:\n${text}`, questions, deps);
+  const state = lastAgent
+    ? `Última mensagem do atendente:\n${clipText(lastAgent, LAST_AGENT_MAX_CHARS)}\n\nMensagem do cliente:\n${text}`
+    : `Mensagem do cliente:\n${text}`;
+  const a = await ask(state, questions, deps);
   if (!a) return null;
   const p = (x: Answer | undefined) =>
     typeof x?.noul === "number" ? x.noul : 0;
@@ -211,12 +259,15 @@ export async function readCustomerMessage(
 }
 
 // Whether the turn may end with a reaction and no model call: an acknowledgement, short, and nothing in
-// it that asks for anything (the human question below the threshold).
+// it that asks for anything (the human question below the threshold). Never right after our side
+// asked something: "Sim", "250" or "Pix" there is the answer the conversation is waiting on.
 export function isBareAcknowledgement(
   cfg: JevConfig,
   r: JevReading,
   text: string,
+  lastAgent?: string | null,
 ): boolean {
+  if (agentAsked(lastAgent)) return false;
   return r.ack >= cfg.ackThreshold && r.human < 0.5 && text.trim().length <= 60;
 }
 
@@ -252,14 +303,20 @@ export function readingNote(cfg: JevConfig, r: JevReading): string | null {
 }
 
 // The probability that the reply breaks the operator's rules, or null when the check did not run.
+// `toolsCalled` (the retry mode passes it) lets a rule about promising without acting be judged:
+// the state then says which tools the agent called this turn, or that it called none.
 export async function replyBreaksRules(
   cfg: JevConfig,
   reply: string,
   deps: JevDeps = {},
+  context: { toolsCalled?: readonly string[] } = {},
 ): Promise<number | null> {
   if (!cfg.outputCheck.enabled || !reply.trim()) return null;
+  const tools = context.toolsCalled
+    ? `Ferramentas que o atendente chamou neste turno: ${context.toolsCalled.length ? context.toolsCalled.join(", ") : "nenhuma"}.\n\n`
+    : "";
   const a = await ask(
-    `Resposta que o atendente virtual vai enviar ao cliente:\n${reply}`,
+    `${tools}Resposta que o atendente virtual vai enviar ao cliente:\n${reply}`,
     {
       breaks: {
         type: "noul",
@@ -269,6 +326,15 @@ export async function replyBreaksRules(
     deps,
   );
   return typeof a?.breaks?.noul === "number" ? a.breaks.noul : null;
+}
+
+// The opening of the note a held reply's retry carries, exported so a test can find it.
+export const JEV_RETRY_MARK = "[Sistema] Sua resposta anterior foi barrada";
+
+// What the model is told when its reply was held and it gets one more go (outputCheck.onBreak
+// "retry"): which rule, what it wrote (cut short), and the two ways out.
+export function retryNote(cfg: JevConfig, held: string): string {
+  return `${JEV_RETRY_MARK} e NÃO foi enviada, porque quebra esta regra: ${cfg.outputCheck.instructions}\nO que você tinha escrito (resumo): "${clipText(held.trim(), 300)}"\nCorrija agora, numa resposta só: se faltou fazer algo (registrar, consultar, salvar), chame a ferramenta em vez de prometer ou dizer que fez; se não dá para fazer, diga com clareza o que NÃO foi feito. Não repita a resposta barrada.`;
 }
 
 // Removes letters of non-Latin scripts and tidies the spaces they leave; emoji, digits and punctuation

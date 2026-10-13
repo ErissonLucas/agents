@@ -77,10 +77,14 @@ import {
 } from "@/modules/guardrails/handoff";
 import type { ImageFetchDeps } from "@/modules/images/fetch";
 import {
+  agentAsked,
   isBareAcknowledgement,
+  type JevDeps,
+  lastAgentMessage,
   readCustomerMessage,
   readingNote,
   replyBreaksRules,
+  retryNote,
   stripForeignScripts,
 } from "@/modules/jev/service";
 import { armCompaction } from "@/modules/memory/compact";
@@ -116,6 +120,7 @@ import {
   recursionLimitFor,
   replyWrittenThisTurn,
   type SilenceRetryOutcome,
+  toolsCalledThisTurn,
 } from "./graph";
 import { owesHandbackNote } from "./handback";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
@@ -306,6 +311,8 @@ export interface RuntimeDeps {
   visionFetch?: typeof fetch;
   // Injectable fetch for the STT provider (tests); real fetch in production.
   sttFetch?: typeof fetch;
+  // Injectable fetch and key for Jev (tests); the real API and config.jev.apiKey in production.
+  jev?: JevDeps;
   // Injectable download + SSRF assertion for send_image (tests); the real ones in production.
   imageDeps?: ImageFetchDeps;
   // Injectable for tests: where a document tool writes and reads its rendered PDF.
@@ -1446,8 +1453,76 @@ async function turnBody(
   // still fires when the second answer said nothing too.
   let silenceRetried = false;
   let silenceRetryOutcome: SilenceRetryOutcome | null = null;
+  // Everything the MODEL wrote for the customer besides the reply (captions, document fields, button
+  // and card text): the screenings read it with the reply. A function, because the held reply's
+  // retry asks it mid-invoke and the delivery asks it again at the end.
+  const modelWrittenNow = (): string[] => [
+    ...turnState.pendingAttachments.flatMap((i) =>
+      [i.caption?.trim(), i.screenText?.trim()].filter((c): c is string => !!c),
+    ),
+    // Button titles are model-written text the customer reads, same as a caption.
+    ...(turnState.pendingButtons ?? []).map((b) => b.title),
+    ...(turnState.pendingCarousel ?? []).flatMap((c) =>
+      [c.title, c.text, c.footer ?? "", c.buttonTitle].filter(Boolean),
+    ),
+  ];
+  // JEV's rule check, one call per distinct text: the held reply's retry checks the draft inside the
+  // invoke, and the delivery would otherwise ask again about the same words.
+  // In "retry" mode the check also learns which tools ran this turn (see `replyBreaksRules`); the
+  // "handoff" mode asks exactly what it asked before.
+  const jevVerdicts = new Map<string, number | null>();
+  const jevBreaks = async (
+    screened: string,
+    toolsCalled: string[],
+  ): Promise<number | null> => {
+    const cfg = loaded.jevConfig;
+    if (!cfg) return null;
+    const retryMode = cfg.outputCheck.onBreak === "retry";
+    const key = `${screened}\u0000${retryMode ? toolsCalled.join(",") : ""}`;
+    if (jevVerdicts.has(key)) return jevVerdicts.get(key) ?? null;
+    const v = await replyBreaksRules(
+      cfg,
+      screened,
+      params.deps?.jev,
+      retryMode ? { toolsCalled } : {},
+    );
+    jevVerdicts.set(key, v);
+    return v;
+  };
+  let jevRetried = false;
+  // outputCheck.onBreak "retry": a draft that breaks the rules is held inside the invoke and the
+  // model is asked once more with the rule. Not after a transfer (a person has the case) and not once
+  // the run was called off; the delivery below checks whatever the turn ends on.
+  const jevCheckReply =
+    loaded.jevConfig?.outputCheck.enabled &&
+    loaded.jevConfig.outputCheck.onBreak === "retry"
+      ? async (
+          draft: string,
+          toolsCalled: string[],
+        ): Promise<string | null> => {
+          const cfg = loaded.jevConfig;
+          if (!cfg || jevRetried || handoffState.completed) return null;
+          const text = cfg.latinOnly ? stripForeignScripts(draft) : draft;
+          const breaks = await jevBreaks(
+            [text, ...modelWrittenNow()].filter(Boolean).join("\n"),
+            toolsCalled,
+          );
+          if (breaks === null || breaks < cfg.outputCheck.threshold)
+            return null;
+          if (await writeCalledOff()) return null;
+          jevRetried = true;
+          emitFlowEvent(flow, {
+            stage: "jev",
+            level: "info",
+            status: "ok",
+            detail: { outputCheck: breaks, held: true, retried: true },
+          });
+          return retryNote(cfg, text);
+        }
+      : undefined;
   // Build model + graph + cost/trace callbacks.
   const graph = await buildModelAndGraph(loaded, tools, {
+    checkReply: jevCheckReply,
     // THE RETRY OF AN UNEXPLAINED SILENCE (issue #885), asked by the graph at the moment it would
     // run. Not a silence, and so never retried: a turn whose transfer completed (a person owns the
     // conversation) or that already put something in front of the customer. The same two facts
@@ -2570,15 +2645,35 @@ async function turnBody(
     // that could not be taken leaves the turn exactly as it was.
     let jevNote: string | null = null;
     if (loaded.jevConfig && text.trim()) {
-      const reading = await readCustomerMessage(loaded.jevConfig, text);
+      // What our side said last, from Chatwoot's page (what was delivered, split balloons and
+      // templates included): a "Sim" to a question is an answer, not a thank-you. A read that fails
+      // leaves the reading as it was before this existed.
+      let lastAgent: string | null = null;
+      try {
+        lastAgent = lastAgentMessage(
+          parseChatwootMessages(await client.getMessages(conversationId)),
+        );
+      } catch (err) {
+        logger.warn(
+          "jev: last agent message unreadable (conv=%s): %s",
+          String(conversationId),
+          err instanceof Error ? err.message : String(err),
+        );
+      }
+      const reading = await readCustomerMessage(
+        loaded.jevConfig,
+        text,
+        params.deps?.jev,
+        { lastAgentMessage: lastAgent },
+      );
       if (reading) {
         emitFlowEvent(flow, {
           stage: "jev",
           level: "info",
           status: "ok",
-          detail: { ...reading },
+          detail: { ...reading, agentAsked: agentAsked(lastAgent) },
         });
-        if (isBareAcknowledgement(loaded.jevConfig, reading, text)) {
+        if (isBareAcknowledgement(loaded.jevConfig, reading, text, lastAgent)) {
           if (await writeCalledOff()) return standDown();
           const blocked = await postBlocked();
           if (blocked) return blocked;
@@ -3136,22 +3231,12 @@ async function turnBody(
     // the model wrote, attachments included. This sits ABOVE the empty-reply branch because a caption
     // is customer-facing text even when the model produced no final message of its own (skip_reply
     // with an image is a legitimate shape).
-    const modelWritten = [
-      ...turnState.pendingAttachments.flatMap((i) =>
-        [i.caption?.trim(), i.screenText?.trim()].filter(
-          (c): c is string => !!c,
-        ),
-      ),
-      // Button titles are model-written text the customer reads, same as a caption.
-      ...(turnState.pendingButtons ?? []).map((b) => b.title),
-      ...(turnState.pendingCarousel ?? []).flatMap((c) =>
-        [c.title, c.text, c.footer ?? "", c.buttonTitle].filter(Boolean),
-      ),
-    ];
+    const modelWritten = modelWrittenNow();
     // JEV rule check (modules/jev): a reply that breaks the operator's rules (a discount, coupon or
-    // deadline they do not grant) is held back and the case goes to the team, like an output
-    // guardrail that hands off. Best-effort: a check that could not run lets the reply through to
-    // the guardrails below, as before.
+    // deadline they do not grant) is held back. "handoff": the case goes to the team, like an output
+    // guardrail that hands off. "retry": the model already had its one more go inside the invoke, so
+    // a reply still breaking them becomes `retryFallback`, with no transfer. Best-effort: a check
+    // that could not run lets the reply through to the guardrails below, as before.
     if (loaded.jevConfig?.latinOnly && reply) {
       const cleaned = stripForeignScripts(reply);
       if (cleaned !== reply) {
@@ -3165,9 +3250,10 @@ async function turnBody(
       }
     }
     if (loaded.jevConfig?.outputCheck.enabled && reply) {
-      const breaks = await replyBreaksRules(
-        loaded.jevConfig,
+      const retryMode = loaded.jevConfig.outputCheck.onBreak === "retry";
+      const breaks = await jevBreaks(
         [reply, ...modelWritten].filter(Boolean).join("\n"),
+        toolsCalledThisTurn(result.messages as BaseMessage[]),
       );
       if (breaks !== null) {
         const held = breaks >= loaded.jevConfig.outputCheck.threshold;
@@ -3175,10 +3261,23 @@ async function turnBody(
           stage: "jev",
           level: "info",
           status: "ok",
-          detail: { outputCheck: breaks, held },
+          detail: {
+            outputCheck: breaks,
+            held,
+            ...(retryMode ? { retried: jevRetried } : {}),
+          },
         });
         if (await writeCalledOff()) return refuse(standDown());
-        if (held) {
+        if (held && retryMode) {
+          turnState.pendingAttachments.length = 0;
+          turnState.pendingButtons = undefined;
+          turnState.pendingCarousel = undefined;
+          // The held words come out of the thread (the deferred rollback the silence token uses),
+          // so the next turn does not read as said what the customer never received.
+          silenceProduced = result.messages as BaseMessage[];
+          reply = loaded.jevConfig.outputCheck.retryFallback;
+          replyRecovered = false;
+        } else if (held) {
           turnState.pendingAttachments.length = 0;
           turnState.pendingButtons = undefined;
           turnState.pendingCarousel = undefined;

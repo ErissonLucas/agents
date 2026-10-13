@@ -2041,6 +2041,8 @@ export interface GraphBuildDeps {
   // the turn already delivered.
   retrySilence?: () => boolean;
   onSilenceRetry?: (info: SilenceRetryInfo) => void;
+  // The held reply's retry (Jev outputCheck.onBreak "retry"). See BuildAgentGraphParams.checkReply.
+  checkReply?: (text: string, toolsCalled: string[]) => Promise<string | null>;
 }
 
 // The second provider, built or deliberately absent. Every way this returns undefined is a way an
@@ -2185,6 +2187,7 @@ export async function buildModelAndGraph(
     stillWanted: deps.stillWanted,
     retrySilence: deps.retrySilence,
     onSilenceRetry: deps.onSilenceRetry,
+    checkReply: deps.checkReply,
     primaryDeadlineMs: fallback
       ? PRIMARY_TIMEOUT_MS
       : config.agent.modelCallTimeoutMs,
