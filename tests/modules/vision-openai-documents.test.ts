@@ -3,12 +3,14 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { PDF_SEM_TEXTO } from "@/modules/vision/pdf-text";
 import {
   extractInboundFile,
   resolveVisionConfig,
 } from "@/modules/vision/service";
 import type { VisionConfig } from "@/modules/vision/settings";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { tinyPdf } from "../utils/tiny-pdf";
 
 // Issue #324: choosing `openai` as the vision provider used to skip every PDF before any call was
 // made, so the agent saw the "couldn't extract" marker and the content of the attachment was lost
@@ -102,11 +104,15 @@ function openaiFetch() {
   return { impl, parts };
 }
 
-function stubClient(meta: Array<Record<string, unknown>>, contentType: string) {
+function stubClient(
+  meta: Array<Record<string, unknown>>,
+  contentType: string,
+  bytes: ArrayBuffer = new ArrayBuffer(16),
+) {
   return async () =>
     ({
       downloadAttachment: async () => ({
-        bytes: new ArrayBuffer(16),
+        bytes,
         contentType,
       }),
       updateAttachmentMeta: async (
@@ -247,7 +253,7 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
   // agent switched from `openai-compatible` to `openai` still posts to the operator's own server —
   // which need not implement the `file` part, and answers 200 with a plausible extraction of
   // nothing if it ignores what it does not know.
-  test("openai pointed at another endpoint skips the PDF instead of guessing", async () => {
+  test("openai pointed at another endpoint skips the PDF instead of guessing (pdfText off)", async () => {
     const { impl, parts } = openaiFetch();
     const meta: Array<Record<string, unknown>> = [];
     const out = await extractInboundFile({
@@ -257,7 +263,11 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
       messageId: 53,
       attachmentId: 8,
       dataUrl: "https://chat.example.com/orcamento.pdf",
-      cfg: { ...(await cfg()), baseURL: "https://llm.internal.example/v1" },
+      cfg: {
+        ...(await cfg()),
+        baseURL: "https://llm.internal.example/v1",
+        pdfText: false,
+      },
       base: appDb,
       deps: {
         makeClient: stubClient(meta, "application/pdf"),
@@ -297,7 +307,7 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
   // The registry still governs, and it is the only thing that does: openrouter reaches the same
   // adapter, so if the skip were dropped in favour of "the part exists now", a router pointed at a
   // model that ignores the part would answer with a plausible extraction of nothing.
-  test("openrouter still skips a PDF without calling the provider", async () => {
+  test("openrouter still skips a PDF without calling the provider (pdfText off)", async () => {
     const { impl, parts } = openaiFetch();
     const meta: Array<Record<string, unknown>> = [];
     const out = await extractInboundFile({
@@ -307,7 +317,7 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
       messageId: 52,
       attachmentId: 7,
       dataUrl: "https://chat.example.com/orcamento.pdf",
-      cfg: await cfg("openrouter"),
+      cfg: { ...(await cfg("openrouter")), pdfText: false },
       base: appDb,
       deps: {
         makeClient: stubClient(meta, "application/pdf"),
@@ -315,6 +325,54 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
         sleep: async () => {},
       },
     });
+    expect(out).toBeNull();
+    expect(parts).toEqual([]);
+    expect(meta).toEqual([]);
+  });
+  // `vision.pdfText` (default on): the PDF the endpoint cannot take is read from its text layer,
+  // with no provider call, and lands where a provider's extraction would.
+  async function localRead(bytes: ArrayBuffer, id: number) {
+    const { impl, parts } = openaiFetch();
+    const meta: Array<Record<string, unknown>> = [];
+    const out = await extractInboundFile({
+      tenantId,
+      instanceId,
+      conversationId: 810 + id,
+      messageId: 60 + id,
+      attachmentId: 20 + id,
+      dataUrl: `https://chat.example.com/nf-${id}.pdf`,
+      cfg: await cfg("openrouter"),
+      base: appDb,
+      deps: {
+        makeClient: stubClient(meta, "application/pdf", bytes),
+        fetchImpl: impl,
+        sleep: async () => {},
+      },
+    });
+    return { out, parts, meta };
+  }
+
+  test("pdfText: a PDF the endpoint cannot take is read from its text layer", async () => {
+    const { out, parts, meta } = await localRead(
+      tinyPdf(["NF-e 4521 Batom Matte Mary Kay 2 un R$ 119,80"]),
+      1,
+    );
+    expect(out).toEqual({
+      kind: "document",
+      text: "NF-e 4521 Batom Matte Mary Kay 2 un R$ 119,80",
+    });
+    expect(parts).toEqual([]);
+    expect(meta).toEqual([{ extracted_text: out?.text }]);
+  });
+
+  test("pdfText: a scan with no text layer tells the model to ask for photos", async () => {
+    const { out, parts } = await localRead(tinyPdf([null]), 2);
+    expect(out).toEqual({ kind: "document", text: PDF_SEM_TEXTO });
+    expect(parts).toEqual([]);
+  });
+
+  test("pdfText: a file that does not parse is left unread, and nothing throws", async () => {
+    const { out, parts, meta } = await localRead(new ArrayBuffer(16), 3);
     expect(out).toBeNull();
     expect(parts).toEqual([]);
     expect(meta).toEqual([]);

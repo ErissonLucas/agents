@@ -19,6 +19,9 @@ export interface VisionConfig {
   credentialRef: string | null; // `vault:<id>` ref of the entry holding the API key
   baseURL: string | null; // for self-hosted / compatible endpoints
   extractionPrompt: string; // instruction sent to the vision model
+  // A PDF the endpoint cannot take is read from its text layer instead (./pdf-text). On by default:
+  // that file used to go unread, and reading it costs no provider call. Absent = on.
+  pdfText?: boolean;
 }
 
 export const VISION_DEFAULTS: VisionConfig = {
@@ -29,6 +32,7 @@ export const VISION_DEFAULTS: VisionConfig = {
   credentialRef: null,
   baseURL: null,
   extractionPrompt: DEFAULT_EXTRACTION_PROMPT,
+  pdfText: true,
 };
 
 function str(v: unknown): string | null {
@@ -57,5 +61,6 @@ export function readVisionConfig(settings: unknown): VisionConfig {
     extractionPrompt: prompt
       ? clipText(prompt, EXTRACTION_PROMPT_MAX)
       : DEFAULT_EXTRACTION_PROMPT,
+    pdfText: bag.pdfText !== false,
   };
 }

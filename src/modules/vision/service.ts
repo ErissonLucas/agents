@@ -27,6 +27,7 @@ import { MediaSourceMismatchError, runMediaConverter } from "./convert";
 import { isDecorativeImage } from "./decorative";
 import { visionAcceptsDocuments } from "./document-support";
 import { normalizeMediaType, planImageConversion } from "./media-conversion";
+import { pdfTextForModel, readPdfText } from "./pdf-text";
 import {
   getVisionProvider,
   type VisionKind,
@@ -474,8 +475,13 @@ async function extractInboundOnce(
   if (
     kind === "document" &&
     !visionAcceptsDocuments(cfg.provider, entry.baseUrl ?? cfg.baseURL)
-  )
-    return skip("document_not_supported");
+  ) {
+    if (cfg.pdfText === false) return skip("document_not_supported");
+    // Read locally, so no spend ceiling: nothing is billed.
+    const local = await pdfTextFor(bytes, params.flow, cfg.provider);
+    if (local === null) return null;
+    return keepExtraction(params, client, "document", local);
+  }
 
   // THE SPEND CEILING, asked here and not by the caller. Vision runs on the incoming attachment
   // BEFORE the webhook's gates decide anything, so the turn ceiling upstream has not run yet and
@@ -602,7 +608,70 @@ async function extractInboundOnce(
     });
   }
   if (!text) return null;
+  return keepExtraction(params, client, kind, text);
+}
 
+// The text layer of a PDF the provider cannot take (./pdf-text), already worded for the model. Null
+// when the read failed or timed out: the attachment then counts as unread, as before this existed.
+async function pdfTextFor(
+  bytes: ArrayBuffer,
+  flow: FlowContext | undefined,
+  provider: string,
+): Promise<string | null> {
+  const startedAt = performance.now();
+  try {
+    const r = await readPdfText(bytes);
+    if (flow && r.text)
+      emitFlowEvent(flow, {
+        stage: "vision",
+        level: "info",
+        status: "ok",
+        provider,
+        durationMs: Math.round(performance.now() - startedAt),
+        detail: {
+          step: "pdf_text",
+          pages: r.pages,
+          pagesRead: r.pagesRead,
+          chars: r.text.length,
+          clipped: r.clipped,
+        },
+      });
+    // A scan: read, but nothing in it, which the operator sees as the reason the model asked again.
+    else if (flow)
+      emitFlowEvent(flow, {
+        stage: "vision",
+        level: "warn",
+        status: "skipped",
+        provider,
+        detail: { reason: "pdf_no_text" },
+      });
+    return pdfTextForModel(r);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    logger.warn("vision: PDF text extraction failed: %s", why);
+    if (flow)
+      emitFlowEvent(flow, {
+        stage: "vision",
+        level: "warn",
+        status: "error",
+        provider,
+        durationMs: Math.round(performance.now() - startedAt),
+        detail: { step: "pdf_text" },
+        errorMessage: why,
+      });
+    return null;
+  }
+}
+
+// What every successful read ends with, provider or local: the annotation store, then the
+// write-back onto the attachment.
+async function keepExtraction(
+  params: ExtractInboundParams,
+  client: ChatwootClient,
+  kind: VisionKind,
+  text: string,
+): Promise<ExtractResult> {
+  const { cfg } = params;
   // NOTE: Stash BEFORE the write-back — same contract as the STT pass: on upstream Chatwoot (no
   // fork meta route) the in-process overlay is the only reader of this extraction (issue #49).
   if (params.stashAnnotation !== false)
@@ -728,12 +797,19 @@ export async function extractPlaygroundFile(
   // the credential resolution moves up with it: an unreadable credential is a configuration error
   // like the `!cfg.enabled` one already above the ceiling, not something the budget decided.
   const kind = visionKindForMime(params.mimeType);
+  if (!kind) return { kind: "unsupported", text: "" };
   if (
-    !kind ||
-    (kind === "document" &&
-      !visionAcceptsDocuments(cfg.provider, entry.baseUrl ?? cfg.baseURL))
+    kind === "document" &&
+    !visionAcceptsDocuments(cfg.provider, entry.baseUrl ?? cfg.baseURL)
   ) {
-    return { kind: "unsupported", text: "" };
+    // The same local read the inbound path falls back to, so the operator tests what ships.
+    const local =
+      cfg.pdfText === false
+        ? null
+        : await pdfTextFor(params.file, params.flow, cfg.provider);
+    return local === null
+      ? { kind: "unsupported", text: "" }
+      : { kind: "document", text: local };
   }
 
   // Same placement as the inbound path and the same rule: a file this provider cannot read stops the

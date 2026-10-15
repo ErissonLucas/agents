@@ -378,7 +378,8 @@ const ERROR_COLUMN_LINES: Record<string, [number, ErrorSite | string]> = {
   "src/modules/stt/service.ts": [2, "flow-event"],
   // The audio check's "unavailable" line (issue #779): a closed `audio check unavailable (<code>)`.
   "src/modules/tts/service.ts": [1, "flow-event"],
-  "src/modules/vision/service.ts": [2, "flow-event"],
+  // Up from 2: the failed local read of a PDF's text layer (`pdf_text`), a parser's message.
+  "src/modules/vision/service.ts": [3, "flow-event"],
   // Was 4 until issue #325 collapsed the two DEAD writes into `finalizeDead`; the line that went
   // is the duplicate, not a guard.
   // Three reads of `lastError`, and none of them a write: the DTO field, the projection that feeds

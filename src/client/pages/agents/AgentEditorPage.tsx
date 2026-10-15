@@ -1825,6 +1825,11 @@ function AgentEditor() {
       },
       followUp: followUpToStored(followUp),
       vision: {
+        // The stored block first, so a key this form has no control for (`pdfText`, set in the
+        // settings JSON) survives a Behavior save instead of being reset to its default.
+        ...(settings.vision && typeof settings.vision === "object"
+          ? (settings.vision as Record<string, unknown>)
+          : {}),
         enabled: vision.enabled,
         provider: vision.provider,
         model: vision.model.trim(),

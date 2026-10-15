@@ -311,7 +311,10 @@ const SETTINGS_DESC_CEILING = 2_000;
 // RAISED by the `replyGate` block (docs/LIVARE-F21-PORTAO-ETIQUETA.md): a new block of four fields,
 // 476 characters after trimming its three descriptions to the defaults they state. Re-measured on the
 // tree that ships: 30,008.
-const SETTINGS_SCHEMA_CEILING = 30_010;
+// RAISED by `vision.pdfText` (a PDF the endpoint cannot take is read from its text layer): one
+// boolean the reader already produces, which `mcp-settings-schema` requires declared. 79 characters
+// after trimming its description to the default it states. Re-measured on the tree that ships: 30,089.
+const SETTINGS_SCHEMA_CEILING = 30_089;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -777,7 +780,8 @@ describe("MCP tool descriptions", () => {
     // +386 for the `send_buttons` native, the same enum growth as SETTINGS_SCHEMA_CEILING.
     // +388 for `send_carousel`, the same enum growth as SETTINGS_SCHEMA_CEILING.
     // +488 for the `replyGate` block, the same growth as SETTINGS_SCHEMA_CEILING.
-    expect(schema).toBeLessThanOrEqual(66_320);
+    // +79 for `vision.pdfText`, the same growth as SETTINGS_SCHEMA_CEILING.
+    expect(schema).toBeLessThanOrEqual(66_399);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

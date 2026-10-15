@@ -257,6 +257,10 @@ const vision = z.looseObject({
     .nullable()
     .optional()
     .describe("what the vision model is asked to extract"),
+  pdfText: z
+    .boolean()
+    .optional()
+    .describe("PDF text read locally; default true"),
 });
 
 const split = z.looseObject({
