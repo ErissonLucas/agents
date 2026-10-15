@@ -363,6 +363,9 @@ export interface ToolCtx {
   // Per-agent toggle (default ON when undefined): when false, a handoff posts NO summary note even
   // if the model supplies a reason — the operator opted out of leaving internal summaries.
   transferWithSummary?: boolean;
+  // `settings.skipReply.handoff` (../skip-handover). Absent ⇒ true. False: a skip never opens the
+  // conversation, and `needs_human` is refused so the model answers instead.
+  skipReplyHandoff?: boolean;
   // Per-agent handoff targeting (route | pinned | agent_choice). Absent ⇒ route (current behavior).
   handoff?: HandoffConfig;
   // For agent_choice: the live agents/teams (resolved at turn prep), surfaced in the tool description
@@ -2185,6 +2188,16 @@ function sendCarouselTool(ctx: ToolCtx) {
 const SKIP_REPLY_DESCRIPTION =
   "Decide NOT to send any reply this turn, then output NO reply text (end your turn). `reason` decides what happens next: `acknowledged` when a reply would add nothing (the customer sent just 'ok', 'obrigado' or an emoji, optionally after react_to_message) and the conversation stays with you; `not_for_us` when this is not a real conversation (an automated report, a payment notice, a newsletter, an unsolicited pitch); `needs_human` when it is a real request you cannot resolve. The last two hand the conversation to the team with a private note, and so does ANY skip on a conversation nobody on our side has answered yet.";
 
+// With `skipReply.handoff` off there is nobody to hand to, so the description promises nothing and
+// steers a real request the model cannot resolve into an answer instead of a silence.
+const SKIP_REPLY_DESCRIPTION_NO_TEAM =
+  "Decide NOT to send any reply this turn, then output NO reply text (end your turn). Use `acknowledged` when a reply would add nothing (just 'ok', 'obrigado' or an emoji, optionally after react_to_message), or `not_for_us` when this is not a real conversation (an automated report, a newsletter, a pitch). Nobody else reads this conversation, so a real request you cannot resolve is NOT a reason to skip: answer it, saying briefly what you cannot do.";
+
+// What `needs_human` returns when nobody is behind the agent. No mark, so the turn is not a silence:
+// the model reads this and writes the reply, instead of the person getting nothing back.
+export const SKIP_REPLY_NO_TEAM_RESULT =
+  "Not skipped: nobody else reads this conversation, so a silence would leave the person with no answer. Reply now, in one or two short sentences, saying plainly what you cannot do here and, if there is one, what they can do instead.";
+
 // Deliberately produce NO reply this turn. The agent calls this, then ends without any customer-facing
 // text, so the runtime posts nothing (it already skips an empty reply). The call is recorded in the
 // conversation timeline (via the tool flow log) as a "decided not to respond" marker, and its REASON
@@ -2195,12 +2208,18 @@ function skipReplyTool(ctx: ToolCtx) {
   // to put a person on the conversation is named instead, the contract `handoff_to_human` already
   // gives the same turn.
   const speaks = !ctx.client?.muted;
+  const noTeam = ctx.skipReplyHandoff === false;
   return tool(
     async (
-      { reason, detail }: { reason: SkipReplyReason; detail?: string },
+      { reason: asked, detail }: { reason: SkipReplyReason; detail?: string },
       config: ToolRunnableConfig,
     ) => {
-      const note = detail?.trim() ? `${reason}: ${detail.trim()}` : reason;
+      if (noTeam && speaks && asked === "needs_human")
+        return SKIP_REPLY_NO_TEAM_RESULT;
+      // NOTE: recorded as `acknowledged` when nobody is behind the agent, because the reason is
+      // what later turns read as "a person took this" (../handback.ts) and nobody did.
+      const reason: SkipReplyReason = noTeam ? "acknowledged" : asked;
+      const note = detail?.trim() ? `${asked}: ${detail.trim()}` : asked;
       // The ack is what the MODEL reads — LangGraph calls it again after a tool result, and this
       // sentence is the instruction that makes the turn end quiet.
       const ack = `${SKIP_REPLY_ACK} (${note}). Produce no message now.`;
@@ -2231,7 +2250,9 @@ function skipReplyTool(ctx: ToolCtx) {
     {
       name: "skip_reply",
       description: speaks
-        ? SKIP_REPLY_DESCRIPTION
+        ? noTeam
+          ? SKIP_REPLY_DESCRIPTION_NO_TEAM
+          : SKIP_REPLY_DESCRIPTION
         : "Record that this turn adds nothing, then output NO text (end your turn). This turn does not answer the customer, and `reason` is only recorded: nothing is handed over by it. To put a person on the conversation, call handoff_to_human.",
 
       schema: z.object({

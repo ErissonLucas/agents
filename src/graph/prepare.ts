@@ -157,6 +157,7 @@ import {
   type PromptRenderOpts,
 } from "./prompt";
 import { type AuditedSection, buildPromptAudit } from "./prompt-audit";
+import { readSkipReplyConfig, type SkipReplyConfig } from "./skip-handover";
 import { DEFAULT_TIMEZONE, zonedWallClockToInstant } from "./time";
 import {
   buildHttpTools,
@@ -308,6 +309,8 @@ export interface AgentConfig {
   sendImageConfig: SendImageConfig;
   // Jev fast decisions around the turn (modules/jev); null = off for this agent.
   jevConfig: JevConfig | null;
+  // Whether a silence may open the conversation for the team (./skip-handover). Absent = yes.
+  skipReplyConfig?: SkipReplyConfig;
   // Where `open_case_in_inbox` opens the case (operator-set; no inbox = the tool is not built).
   crossInboxCaseConfig: CrossInboxCaseConfig;
   // The origin contact as Chatwoot knows it; what `open_case_in_inbox` settles the identity on.
@@ -956,6 +959,7 @@ export async function loadAgentConfig(
     contactAuthConfig: readContactAuthConfig(effSettings),
     sendImageConfig: readSendImageConfig(effSettings),
     jevConfig: readJevConfig(effSettings),
+    skipReplyConfig: readSkipReplyConfig(effSettings),
     crossInboxCaseConfig,
     chatwootContactId: conv?.contact?.chatwootContactId ?? null,
     kanbanConfig: readKanbanConfig(effSettings),
@@ -1155,6 +1159,7 @@ export interface ToolBuildDeps {
       };
       handoffState?: { customerMessage: string | null; completed: boolean };
       transferWithSummary?: boolean;
+      skipReplyHandoff?: boolean;
       handoff?: HandoffConfig;
       handoffTargets?: HandoffTargets;
       tenantId?: bigint;
@@ -1535,6 +1540,7 @@ export async function buildToolset(
       turnState: ctx.turnState,
       handoffState: ctx.handoffState,
       transferWithSummary: cfg.transferWithSummary,
+      skipReplyHandoff: cfg.skipReplyConfig?.handoff !== false,
       handoff: effectiveHandoff,
       handoffTargets,
       tenantId: ctx.tenantId,

@@ -220,7 +220,8 @@ const FLOWLOG_READERS: Record<string, number> = {
   // takeover refused, a guardrail replaced, and an ordinary delivered turn, each scoped by thread.
   "tests/graph/runtime.test.ts": 34,
   "tests/graph/side-effect-flowlog.test.ts": 1,
-  "tests/graph/skip-handover.test.ts": 1,
+  // Up from 1: the `skip_handover_off` line of an agent with `skipReply.handoff: false`.
+  "tests/graph/skip-handover.test.ts": 2,
   // #726: the helper that runs one tool call end to end, plus the case that asks WHEN the turn's
   // delivery is read — that one drives the callback by hand, so it cannot go through the helper.
   "tests/graph/skip-reply-turn-delivered.test.ts": 2,

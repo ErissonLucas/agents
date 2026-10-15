@@ -99,6 +99,7 @@ import {
 } from "./silence";
 import {
   applySkipHandover,
+  noteSkipHandoverOff,
   resolvedThisTurn,
   skipHandoverKind,
 } from "./skip-handover";
@@ -2576,7 +2577,9 @@ async function runAgentNudgeBody(
       !resolvedThisTurn(result.messages as BaseMessage[])
         ? chosenSilence(result.messages as BaseMessage[])
         : null;
-    const handover = chosen ? skipHandoverKind(chosen, true) : null;
+    const kind = chosen ? skipHandoverKind(chosen, true) : null;
+    const handover = cfg.skipReplyConfig?.handoff === false ? null : kind;
+    if (kind && !handover) noteSkipHandoverOff(flow, kind);
     if (handover && (await stillWanted())) {
       await applySkipHandover({
         client,

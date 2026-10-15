@@ -52,7 +52,37 @@ export function resolvedThisTurn(
   return false;
 }
 
+// `settings.skipReply.handoff` (docs/graph.md, "skip_reply without a team"). ON by default: the
+// hand-over above is the behaviour every agent had. OFF is for an agent nobody on a team stands
+// behind (an assistant whose only user is the business owner): no silence opens the conversation,
+// and `needs_human` is refused at the tool so the model answers saying what it cannot do.
+export interface SkipReplyConfig {
+  handoff: boolean;
+}
+
+export function readSkipReplyConfig(settings: unknown): SkipReplyConfig {
+  const s =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).skipReply
+      : undefined;
+  const bag = s && typeof s === "object" ? (s as Record<string, unknown>) : {};
+  return { handoff: bag.handoff !== false };
+}
+
 export type SkipHandoverKind = "not_for_us" | "needs_human" | "unanswered";
+
+// The line a hand-over the agent's settings turned off leaves instead, so the Logs page still says
+// why a silence stayed with the bot.
+export function noteSkipHandoverOff(
+  flow: FlowContext,
+  kind: SkipHandoverKind,
+): void {
+  emitFlowEvent(flow, {
+    stage: "handoff",
+    status: "skipped",
+    detail: { outcome: "skip_handover_off", reason: kind },
+  });
+}
 
 export function skipHandoverKind(
   chosen: { reason: SkipReplyReason } | null,

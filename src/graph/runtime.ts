@@ -150,7 +150,11 @@ import {
   customerFacingReply,
   silenceWasChosen,
 } from "./silence";
-import { applySkipHandover, skipHandoverKind } from "./skip-handover";
+import {
+  applySkipHandover,
+  noteSkipHandoverOff,
+  skipHandoverKind,
+} from "./skip-handover";
 import { AgentStatusReporter } from "./status";
 import {
   clearTurnOwning,
@@ -3364,6 +3368,10 @@ async function turnBody(
           row.spoken || turnState.spokeOutsideTheReply === true,
         );
         if (!kind) return;
+        if (loaded.skipReplyConfig?.handoff === false) {
+          noteSkipHandoverOff(flow, kind);
+          return;
+        }
         await applySkipHandover({
           client,
           conversationId,

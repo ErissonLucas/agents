@@ -17,13 +17,17 @@ import {
 } from "@/graph/silence";
 import {
   applySkipHandover,
+  readSkipReplyConfig,
   resolvedThisTurn,
   SKIP_NOTE_DETAIL_MAX,
   skipHandoverKind,
   skipHandoverNote,
 } from "@/graph/skip-handover";
 import { RESOLVE_DONE } from "@/graph/tools/catalog";
-import { buildNativeTools } from "@/graph/tools/native";
+import {
+  buildNativeTools,
+  SKIP_REPLY_NO_TEAM_RESULT,
+} from "@/graph/tools/native";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import { seedChatwootInstance } from "../utils/chatwoot";
@@ -218,6 +222,55 @@ describe("the reason on skip_reply", () => {
   });
 });
 
+describe("skipReply.handoff off: an agent with no team behind it", () => {
+  test("the setting defaults on, and only an explicit false turns it off", () => {
+    expect(readSkipReplyConfig(undefined)).toEqual({ handoff: true });
+    expect(readSkipReplyConfig({ skipReply: "x" })).toEqual({ handoff: true });
+    expect(readSkipReplyConfig({ skipReply: { handoff: 0 } })).toEqual({
+      handoff: true,
+    });
+    expect(readSkipReplyConfig({ skipReply: { handoff: false } })).toEqual({
+      handoff: false,
+    });
+  });
+
+  const offTool = () =>
+    buildNativeTools(
+      { client: {} as never, conversationId: 1, skipReplyHandoff: false },
+      [SKIP_REPLY_TOOL],
+    )[0];
+  const call = (args: Record<string, unknown>) =>
+    offTool()?.invoke({
+      type: "tool_call",
+      id: "c1",
+      name: SKIP_REPLY_TOOL,
+      args,
+    } as never);
+
+  test("needs_human is refused with no mark, so the model answers instead", async () => {
+    const out = await call({ reason: "needs_human", detail: "PDF" });
+    const content =
+      out instanceof ToolMessage ? out.content : (out as unknown as string);
+    expect(content).toBe(SKIP_REPLY_NO_TEAM_RESULT);
+    if (out instanceof ToolMessage)
+      expect(out.additional_kwargs[SKIP_REPLY_MARK]).toBeUndefined();
+  });
+
+  test("not_for_us still goes quiet, recorded as a silence nobody took over", async () => {
+    const out = (await call({ reason: "not_for_us" })) as ToolMessage;
+    expect(out.additional_kwargs[SKIP_REPLY_MARK]).toBe(true);
+    expect(out.additional_kwargs[SKIP_REPLY_REASON_KEY]).toBe("acknowledged");
+    expect(String(out.content)).toContain("not_for_us");
+    expect(owesHandbackNote([new HumanMessage("oi"), out])).toBe(false);
+  });
+
+  test("the description promises no team", () => {
+    const d = offTool()?.description ?? "";
+    expect(d).not.toContain("hand the conversation to the team");
+    expect(d).toContain("NOT a reason to skip");
+  });
+});
+
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -243,6 +296,7 @@ const suDb = su as PrismaClient;
 
 let tenantId = 0n;
 let instanceId = 0n;
+let agentId = 0n;
 
 // Calls `skip_reply` with the given arguments, then ends with no text. `thenResolve` adds the
 // operator's `resolve_conversation` to the same batch.
@@ -298,6 +352,34 @@ class SkipTwiceModel {
             ],
           });
         return new AIMessage("");
+      },
+    };
+  }
+}
+
+// needs_human first; on the round after the tool's answer, the reply the owner should get.
+const CANT_DO = "Não consigo registrar isso por aqui.";
+class SkipThenAnswerModel {
+  async invoke(): Promise<AIMessage> {
+    return new AIMessage(CANT_DO);
+  }
+  bindTools(_tools: unknown) {
+    let n = 0;
+    return {
+      async invoke(): Promise<AIMessage> {
+        n++;
+        if (n === 1)
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "skip_reply",
+                args: { reason: "needs_human" },
+                id: "call_skip",
+              },
+            ],
+          });
+        return new AIMessage(CANT_DO);
       },
     };
   }
@@ -466,6 +548,7 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
         name: "Atendente",
       },
     });
+    agentId = agent.id;
     await suDb.inbox.create({
       data: {
         tenantId,
@@ -817,5 +900,59 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
       },
     });
     expect(calls).toEqual([]);
+  });
+  test("skipReply.handoff off: no silence opens the conversation, and needs_human becomes a reply", async () => {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentId },
+      select: { settings: true },
+    });
+    const on = before.settings as Record<string, unknown>;
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { settings: { ...on, skipReply: { handoff: false } } },
+    });
+    try {
+      // The floor (nobody ever answered) and a not_for_us both stay with the bot.
+      await seed(65_930, false);
+      await seed(65_931, true);
+      const floor = await turn(
+        65_930,
+        new SkipModel({ reason: "acknowledged" }),
+      );
+      const notOurs = await turn(
+        65_931,
+        new SkipModel({ reason: "not_for_us" }),
+      );
+      expect(floor.calls).toEqual([]);
+      expect(notOurs.calls).toEqual([]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 65_930 },
+        select: { id: true },
+      });
+      const lines = await flowLogRows(suDb, {
+        where: { conversationId: conv.id, stage: "handoff" },
+      });
+      expect(lines.map((l) => l.detail)).toEqual([
+        { outcome: "skip_handover_off", reason: "unanswered" },
+      ]);
+
+      // needs_human: the tool refuses, and the model's next round is the answer the owner gets.
+      await seed(65_932, true);
+      const answered = await turn(
+        65_932,
+        new SkipThenAnswerModel(),
+        undefined,
+        [],
+        2,
+      );
+      expect(answered.outcome).toBe("posted");
+      expect(answered.calls.map(([op]) => op)).toEqual(["sendMessage"]);
+      expect(answered.calls[0]?.[2]).toBe(CANT_DO);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: on as never },
+      });
+    }
   });
 });
