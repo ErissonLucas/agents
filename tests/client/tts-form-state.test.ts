@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   type AgentModelSource,
+  fishVoiceCheck,
   readTtsFormState,
   type TtsFormState,
   ttsNormalizerBaseUrlInvalid,
@@ -9,6 +10,7 @@ import {
   ttsNormalizerOverridePicked,
   ttsNormalizerPickerSource,
   ttsNormalizerProviderChanged,
+  ttsProviderChanged,
   ttsSettingsFrom,
 } from "@/client/pages/agents/ttsFormState";
 import { readTtsConfig } from "@/modules/tts/settings";
@@ -638,5 +640,66 @@ describe("the rewrite's endpoint has to be usable before saving", () => {
         null,
       ),
     ).toBe(false);
+  });
+});
+
+// Measured in the editor: switching Gemini to Fish kept voice "Kore" and the gemini model on screen,
+// and the save would have sent them to Fish. A provider change drops what was picked for the old one.
+describe("switching the synthesis provider", () => {
+  const gemini = readTtsFormState({
+    mode: "mirror",
+    provider: "gemini",
+    voice: "Kore",
+    model: "gemini-2.5-flash-preview-tts",
+    credentialRef: "vault:7",
+    speed: 1.2,
+  });
+
+  test("every pair clears the voice, model, key, base URL and delivery knobs", () => {
+    const fish = ttsProviderChanged(gemini, "fish");
+    expect(fish.provider).toBe("fish");
+    expect([fish.voice, fish.model, fish.credentialRef, fish.speed]).toEqual([
+      "",
+      "",
+      "",
+      "",
+    ]);
+    const eleven = ttsProviderChanged(readTtsFormState(SAVED), "openai");
+    expect(eleven.voice).toBe("");
+    expect(eleven.model).toBe("");
+    expect(eleven.baseURL).toBe("");
+    expect(eleven.stability).toBe("");
+    expect(eleven.speakerBoost).toBeNull();
+    expect(eleven.latency).toBe("");
+    // What is not the provider's stays: the mode and the rewrite override.
+    expect(eleven.mode).toBe("preference");
+    expect(eleven.normalizeModel).toBe("llama-3.1-8b");
+  });
+
+  test("picking the same provider again changes nothing", () => {
+    expect(ttsProviderChanged(gemini, "gemini")).toBe(gemini);
+  });
+
+  test("what the cleared form saves is the new provider's defaults", () => {
+    const saved = ttsSettingsFrom(ttsProviderChanged(gemini, "fish"));
+    expect(saved.provider).toBe("fish");
+    expect(saved.voice).toBe("");
+    expect(saved.model).toBe("");
+  });
+});
+
+describe("the Fish voice notice", () => {
+  const id = "802e3bc2b27e49c2995d23ef70e6ac89";
+  test("a found id shows its title; an unknown one says not found", () => {
+    expect(fishVoiceCheck(id, [{ id, label: "Narrador" }])).toEqual({
+      state: "found",
+      label: "Narrador",
+    });
+    expect(fishVoiceCheck(id, [])).toEqual({ state: "notFound" });
+  });
+  test("a non-id is flagged, and nothing is said before Fish answers", () => {
+    expect(fishVoiceCheck("Kore", null)).toEqual({ state: "notAnId" });
+    expect(fishVoiceCheck(id, null)).toEqual({ state: "none" });
+    expect(fishVoiceCheck("", [])).toEqual({ state: "none" });
   });
 });

@@ -5,6 +5,16 @@ import { assertSafeOutboundUrl as defaultAssertSafeOutboundUrl } from "@/lib/ssr
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { readProviderJson } from "@/modules/models/provider-listing";
 import { tryResolveApiKeyEntry } from "@/modules/vault/service";
+import {
+  FISH_MODELS,
+  GEMINI_MODELS,
+  GEMINI_VOICES,
+  looksLikeFishVoiceId,
+  OPENAI_MODELS,
+  OPENAI_VOICES,
+  OPENROUTER_MODELS,
+  OPENROUTER_VOICES,
+} from "./catalog";
 import { TTS_PROVIDER_NAMES } from "./providers";
 
 // Lists the voices / models the editor's TTS combobox offers (item 10). OpenAI has no list endpoint
@@ -19,93 +29,8 @@ export interface TtsListItem {
 
 export type TtsListKind = "voices" | "models";
 
-const OPENAI_VOICES = [
-  "alloy",
-  "ash",
-  "ballad",
-  "coral",
-  "echo",
-  "fable",
-  "nova",
-  "onyx",
-  "sage",
-  "shimmer",
-  "verse",
-];
-const OPENAI_MODELS = ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
+// The curated lists live in ./catalog: the save boundary judges a voice or model against them too.
 
-// OpenRouter's audio API (launched 2026-05-01) DOES expose a live catalog (GET
-// /models?output_modalities=speech, each entry carrying a `supported_voices` array), but voices are
-// scoped per model and this function isn't passed the currently-selected model — wiring true live
-// listing needs that extra parameter. Until then: curated, verified live against the real catalog
-// (no openai/* entries exist here, unlike chat/vision/transcription) AND against a real
-// /audio/speech call (confirms the model/voice/response_format combination actually works — see
-// providers.ts on why kokoro, not the also-real gemini TTS, is the default). Voices are the default
-// model's `supported_voices`; picking a different model needs different voices (combobox "use
-// custom" covers it).
-const OPENROUTER_VOICES = [
-  "af_alloy",
-  "af_bella",
-  "af_heart",
-  "af_nova",
-  "am_adam",
-  "am_michael",
-  "bf_emma",
-  "bm_george",
-];
-const OPENROUTER_MODELS = [
-  "hexgrad/kokoro-82m",
-  "google/gemini-3.1-flash-tts-preview",
-  "microsoft/mai-voice-2",
-  "x-ai/grok-voice-tts-1.0",
-  "mistralai/voxtral-mini-tts-2603",
-  "sesame/csm-1b",
-  "canopylabs/orpheus-3b-0.1-ft",
-];
-
-// Gemini's prebuilt voices are one fixed catalog shared by every TTS model, and Google exposes no
-// listing endpoint for them, so the set is curated. The models are the ones generateContent serves.
-const GEMINI_VOICES = [
-  "Kore",
-  "Puck",
-  "Charon",
-  "Aoede",
-  "Fenrir",
-  "Leda",
-  "Orus",
-  "Zephyr",
-  "Callirrhoe",
-  "Autonoe",
-  "Enceladus",
-  "Iapetus",
-  "Umbriel",
-  "Algieba",
-  "Despina",
-  "Erinome",
-  "Algenib",
-  "Rasalgethi",
-  "Laomedeia",
-  "Achernar",
-  "Alnilam",
-  "Schedar",
-  "Gacrux",
-  "Pulcherrima",
-  "Achird",
-  "Zubenelgenubi",
-  "Vindemiatrix",
-  "Sadachbia",
-  "Sadaltager",
-  "Sulafat",
-];
-const GEMINI_MODELS = [
-  "gemini-2.5-flash-preview-tts",
-  "gemini-2.5-pro-preview-tts",
-  "gemini-3.1-flash-tts-preview",
-];
-
-// Fish Audio's TTS models go in the `model` header; `s1` is retired at the end of 2026, so it is not
-// offered. Its voices are listed live: the account's own, then the most used public Portuguese ones.
-const FISH_MODELS = ["s2.1-pro", "s2-pro", "s2.1-pro-free", "drama-3"];
 const FISH_PAGE_SIZE = 50;
 
 async function resolveApiKey(
@@ -135,13 +60,16 @@ export async function listTtsOptions(
     kind: TtsListKind;
     credentialRef?: string;
     baseURL?: string;
+    // Fish voices only: a name to search for, or a voice id to look up. Ignored elsewhere, where the
+    // whole list is local and the combobox filters it.
+    search?: string;
   },
   base: PrismaClient = basePrisma,
   fetchFn: typeof fetch = fetch,
   assertSafe: typeof defaultAssertSafeOutboundUrl = defaultAssertSafeOutboundUrl,
   resolveKey: KeyResolver = resolveApiKey,
 ): Promise<TtsListItem[]> {
-  const { provider, kind, credentialRef, baseURL } = input;
+  const { provider, kind, credentialRef, baseURL, search } = input;
 
   if (!TTS_PROVIDER_NAMES.includes(provider)) {
     throw new AppError(
@@ -202,7 +130,7 @@ export async function listTtsOptions(
   }
 
   if (provider === "fish") {
-    return listFishVoices(apiKey, baseURL, fetchFn, assertSafe);
+    return listFishVoices(apiKey, baseURL, search, fetchFn, assertSafe);
   }
 
   const root = (baseURL ?? "https://api.elevenlabs.io/v1").replace(/\/+$/, "");
@@ -284,27 +212,52 @@ export async function listTtsOptions(
   }
 }
 
-// One page of GET /model: `self=true` is the account's own voices, the other query the public
-// catalog in Portuguese by popularity. Fish's API root has no /v1 (the TTS route does), so a custom
-// baseURL is read as the TTS one and its trailing /v1 dropped.
+// One page of GET /model. Fish's API root has no /v1 (the TTS route does), so a custom baseURL is
+// read as the TTS one and its trailing /v1 dropped. A voice still training, or a non-TTS model
+// (`svc`), is not one the agent can speak with, so it is not offered.
+function fishVoiceOf(raw: unknown): TtsListItem | null {
+  const v = (raw ?? {}) as {
+    _id?: unknown;
+    title?: unknown;
+    type?: unknown;
+    state?: unknown;
+  };
+  if (v.type === "svc" || (v.state && v.state !== "trained")) return null;
+  if (typeof v._id !== "string" || v._id.length === 0) return null;
+  return {
+    id: v._id,
+    label: typeof v.title === "string" ? v.title : undefined,
+  };
+}
+
+async function fishGet(
+  url: URL,
+  apiKey: string,
+  fetchFn: typeof fetch,
+): Promise<Response> {
+  return fetchFn(url.toString(), {
+    headers: { authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+  });
+}
+
+function fishRefused(status: number): AppError {
+  return new AppError(
+    `Fish Audio voices endpoint returned ${status}`,
+    502,
+    "errors.providerModelsFailed",
+    { provider: "fish", status },
+  );
+}
+
 async function fishVoicePage(
   url: URL,
   apiKey: string,
   fetchFn: typeof fetch,
 ): Promise<TtsListItem[]> {
-  const res = await fetchFn(url.toString(), {
-    headers: { authorization: `Bearer ${apiKey}` },
-    redirect: "error",
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!res.ok) {
-    throw new AppError(
-      `Fish Audio voices endpoint returned ${res.status}`,
-      502,
-      "errors.providerModelsFailed",
-      { provider: "fish", status: res.status },
-    );
-  }
+  const res = await fishGet(url, apiKey, fetchFn);
+  if (!res.ok) throw fishRefused(res.status);
   const items = ((await readProviderJson(res, "fish")) as { items?: unknown })
     .items;
   if (!Array.isArray(items)) {
@@ -315,38 +268,65 @@ async function fishVoicePage(
       { provider: "fish" },
     );
   }
-  return items
-    .map(
-      (v) =>
-        v as {
-          _id?: unknown;
-          title?: unknown;
-          type?: unknown;
-          state?: unknown;
-        },
-    )
-    .filter((v) => v && v.type !== "svc" && (!v.state || v.state === "trained"))
-    .map((v) => ({
-      id: typeof v._id === "string" ? v._id : "",
-      label: typeof v.title === "string" ? v.title : undefined,
-    }))
-    .filter((v) => v.id.length > 0);
+  return items.map(fishVoiceOf).filter((v): v is TtsListItem => v !== null);
 }
 
+// GET /model/{id}: the one voice, or none when Fish does not know the id (404, or 400/422 for an id
+// it cannot parse). An empty list is the answer the editor turns into "voice not found".
+async function fishVoiceById(
+  root: string,
+  id: string,
+  apiKey: string,
+  fetchFn: typeof fetch,
+  assertSafe: typeof defaultAssertSafeOutboundUrl,
+): Promise<TtsListItem[]> {
+  const url = await assertSafe(`${root}/model/${id}`, { allowHttp: true });
+  const res = await fishGet(url, apiKey, fetchFn);
+  if (res.status === 404 || res.status === 400 || res.status === 422) {
+    return [];
+  }
+  if (!res.ok) throw fishRefused(res.status);
+  const voice = fishVoiceOf(await readProviderJson(res, "fish"));
+  return voice ? [voice] : [];
+}
+
+// Without a search: the account's voices, then the most used public Portuguese ones. With a name:
+// the account's matches, then public ones in Portuguese, then public ones in any language, so a
+// Portuguese voice comes first but a search for an English one still finds it. With a voice id:
+// that one voice, looked up directly.
 async function listFishVoices(
   apiKey: string,
   baseURL: string | undefined,
+  search: string | undefined,
   fetchFn: typeof fetch,
   assertSafe: typeof defaultAssertSafeOutboundUrl,
 ): Promise<TtsListItem[]> {
   const root = (baseURL ?? "https://api.fish.audio")
     .replace(/\/+$/, "")
     .replace(/\/v1$/, "");
-  const query = [
-    `self=true&page_size=${FISH_PAGE_SIZE}&sort_by=created_at`,
-    `language=pt&page_size=${FISH_PAGE_SIZE}&sort_by=task_count`,
-  ];
+  const term = search?.trim() ?? "";
+  const page = `page_size=${FISH_PAGE_SIZE}`;
+  const title = `title=${encodeURIComponent(term)}`;
+  const query = term
+    ? [
+        `self=true&${title}&${page}&sort_by=created_at`,
+        `${title}&language=pt&${page}&sort_by=task_count`,
+        `${title}&${page}&sort_by=task_count`,
+      ]
+    : [
+        `self=true&${page}&sort_by=created_at`,
+        `language=pt&${page}&sort_by=task_count`,
+      ];
   try {
+    if (looksLikeFishVoiceId(term)) {
+      return await fishVoiceById(
+        root,
+        term.toLowerCase(),
+        apiKey,
+        fetchFn,
+        assertSafe,
+      );
+    }
     const out: TtsListItem[] = [];
     const seen = new Set<string>();
     for (const q of query) {

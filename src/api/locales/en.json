@@ -256,6 +256,8 @@
     "toolNameTaken": "That tool name is already in use.",
     "tooManyAllowedLabels": "`Labels it may add` takes at most {{max}} labels.",
     "tooManyProtectedLabels": "`Labels off limits` takes at most {{max}} labels.",
+    "ttsChoiceMismatch": "`tts.{{field}}` \"{{got}}\" belongs to another provider and {{provider}} cannot use it. Pick one of this provider's, or leave it blank for its default.",
+    "ttsFishVoiceInvalid": "`tts.voice` must be a Fish Audio voice id (32 hex characters, as fish.audio shows it), not \"{{got}}\". Pick the voice in the list or paste its id.",
     "unauthorized": "Unauthorized",
     "unknownDeliveryStatus": "Unknown delivery status: {{status}}",
     "unknownFlowStage": "Unknown flow stage: {{stage}}",

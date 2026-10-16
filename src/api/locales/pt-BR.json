@@ -256,6 +256,8 @@
     "toolNameTaken": "Este nome de ferramenta já está em uso.",
     "tooManyAllowedLabels": "`Etiquetas que pode acrescentar` aceita no máximo {{max}} etiquetas.",
     "tooManyProtectedLabels": "`Etiquetas fora do alcance` aceita no máximo {{max}} etiquetas.",
+    "ttsChoiceMismatch": "`tts.{{field}}` \"{{got}}\" é de outro provedor e o {{provider}} não consegue usá-lo. Escolha um valor deste provedor, ou deixe em branco para o padrão dele.",
+    "ttsFishVoiceInvalid": "`tts.voice` tem que ser o id de uma voz do Fish Audio (32 caracteres hexadecimais, como o fish.audio mostra), não \"{{got}}\". Escolha a voz na lista ou cole o id dela.",
     "unauthorized": "Não autorizado",
     "unknownDeliveryStatus": "Status de entrega desconhecido: {{status}}",
     "unknownFlowStage": "Etapa de fluxo desconhecida: {{stage}}",

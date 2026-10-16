@@ -322,6 +322,99 @@ describe("Fish Audio voice listing", () => {
     ).rejects.toThrow("A credential is required");
   });
 
+  test("a search goes to Fish as `title`: the account's, then public Portuguese, then any language", async () => {
+    const { calls, fetchImpl } = listingFetch([
+      {
+        items: [{ _id: "mine1", title: "Ana", type: "tts", state: "trained" }],
+      },
+      {
+        items: [{ _id: "pt1", title: "Ana BR", type: "tts", state: "trained" }],
+      },
+      {
+        items: [
+          { _id: "pt1", title: "Ana BR", type: "tts", state: "trained" },
+          { _id: "en1", title: "Anna", type: "tts", state: "trained" },
+        ],
+      },
+    ]);
+    const items = await listTtsOptions(
+      ctx,
+      {
+        provider: "fish",
+        kind: "voices",
+        credentialRef: "vault:1",
+        search: " Ana Clara ",
+      },
+      noDb,
+      fetchImpl,
+      passthroughSafe,
+      resolvesKey,
+    );
+    expect(items.map((i) => i.id)).toEqual(["mine1", "pt1", "en1"]);
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://api.fish.audio/model?self=true&title=Ana%20Clara&page_size=50&sort_by=created_at",
+      "https://api.fish.audio/model?title=Ana%20Clara&language=pt&page_size=50&sort_by=task_count",
+      "https://api.fish.audio/model?title=Ana%20Clara&page_size=50&sort_by=task_count",
+    ]);
+  });
+
+  test("a voice id is looked up with GET /model/{id} and answers its title", async () => {
+    const id = "802e3bc2b27e49c2995d23ef70e6ac89";
+    const { calls, fetchImpl } = listingFetch([
+      { _id: id, title: "Narrador Energético", type: "tts", state: "trained" },
+    ]);
+    const items = await listTtsOptions(
+      ctx,
+      {
+        provider: "fish",
+        kind: "voices",
+        credentialRef: "vault:1",
+        search: id.toUpperCase(),
+      },
+      noDb,
+      fetchImpl,
+      passthroughSafe,
+      resolvesKey,
+    );
+    expect(items).toEqual([{ id, label: "Narrador Energético" }]);
+    expect(calls.map((c) => c.url)).toEqual([
+      `https://api.fish.audio/model/${id}`,
+    ]);
+  });
+
+  test("an id Fish does not know answers no items, not an error", async () => {
+    const fetchImpl = (async () =>
+      new Response('{"detail":"Not Found"}', {
+        status: 404,
+      })) as unknown as typeof fetch;
+    const items = await listTtsOptions(
+      ctx,
+      {
+        provider: "fish",
+        kind: "voices",
+        credentialRef: "vault:1",
+        search: "00000000000000000000000000000000",
+      },
+      noDb,
+      fetchImpl,
+      passthroughSafe,
+      resolvesKey,
+    );
+    expect(items).toEqual([]);
+  });
+
+  test("a search is ignored where the list is local", async () => {
+    const items = await listTtsOptions(
+      ctx,
+      { provider: "gemini", kind: "voices", search: "zzz" },
+      noDb,
+      listingFetch([]).fetchImpl,
+      passthroughSafe,
+      resolvesKey,
+    );
+    expect(items[0]?.id).toBe("Kore");
+  });
+
   test("a 401 from the listing is a provider failure carrying the status", async () => {
     const fetchImpl = (async () =>
       new Response("{}", { status: 401 })) as unknown as typeof fetch;

@@ -1,5 +1,6 @@
 import { TTS_PROVIDERS } from "@/client/lib/providerDefaults";
 import type { ModelOverride } from "@/graph/model-override";
+import { looksLikeFishVoiceId } from "@/modules/tts/catalog";
 import type {
   NormalizeModelResolution,
   NormalizeOverrides,
@@ -187,6 +188,55 @@ export function ttsSettingsFrom(tts: TtsFormState): Record<string, unknown> {
     spokenNoticeText: tts.spokenNoticeText.trim() || null,
     textChoice: tts.textChoice,
     textChoiceNote: tts.textChoiceNote.trim() || null,
+  };
+}
+
+// What the editor says under a Fish voice: nothing when it is blank or the lookup has not answered
+// (or could not be made), "notAnId" for a value that is no reference_id at all (a Gemini voice left
+// from before), "notFound" when Fish answered the id with nothing, else the voice's title to show.
+export type FishVoiceCheck =
+  | { state: "none" }
+  | { state: "notAnId" }
+  | { state: "notFound" }
+  | { state: "found"; label: string };
+
+export function fishVoiceCheck(
+  voice: string,
+  lookup: { id: string; label?: string }[] | null,
+): FishVoiceCheck {
+  const v = voice.trim();
+  if (!v) return { state: "none" };
+  if (!looksLikeFishVoiceId(v)) return { state: "notAnId" };
+  if (lookup === null) return { state: "none" };
+  const hit = lookup.find((i) => i.id === v.toLowerCase());
+  return hit
+    ? { state: "found", label: hit.label ?? hit.id }
+    : { state: "notFound" };
+}
+
+// Switching the SYNTHESIS provider invalidates what was picked for the old one: a Gemini voice
+// ("Kore") is not a Fish reference_id, a gemini-* model is refused by every other vendor, the key is
+// the old vendor's, a base URL points at its proxy, and the delivery knobs have per-vendor ranges
+// (ElevenLabs' stability/style, Fish's latency, three different speed bands). All go back to blank,
+// which every provider reads as its own default. Picking the same provider again changes nothing.
+export function ttsProviderChanged(
+  tts: TtsFormState,
+  provider: string,
+): TtsFormState {
+  if (provider === tts.provider) return tts;
+  return {
+    ...tts,
+    provider,
+    voice: "",
+    model: "",
+    credentialRef: "",
+    baseURL: "",
+    stability: "",
+    similarityBoost: "",
+    style: "",
+    speed: "",
+    speakerBoost: null,
+    latency: "",
   };
 }
 

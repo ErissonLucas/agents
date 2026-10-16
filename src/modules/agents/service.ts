@@ -19,6 +19,7 @@ import {
 } from "@/lib/errors";
 import { parseInput } from "@/lib/parse-input";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { clipText } from "@/lib/text";
 import {
   agentUpdateAudit,
   auditSafe,
@@ -59,6 +60,8 @@ import {
 } from "@/modules/integrations/toolpacks";
 import { isOneOf, SIGNATURE_CHOICES } from "@/modules/signature/domains";
 import { lockToolNames } from "@/modules/tool-definitions/namespace";
+import { ttsChoiceIssue } from "@/modules/tts/catalog";
+import { readTtsConfig } from "@/modules/tts/settings";
 import { requireVaultRefFor } from "@/modules/vault/service";
 import {
   AGENT_MODES,
@@ -421,6 +424,36 @@ export class DebugWindowTooLongError extends AppError {
       "errors.debugWindowTooLong",
       { hours },
       "observability.fullDetailUntil",
+    );
+  }
+}
+
+// A voice or model the TTS provider cannot take: a Fish voice that is not a reference_id, or a
+// value that is certainly another provider's (Gemini's "Kore" with Fish, a gemini-* model with
+// OpenAI). Refused because the agent would otherwise fail on its first audio reply, after the save
+// said it was fine. Issue: switching provider in the editor used to keep the old provider's values.
+export class TtsChoiceMismatchError extends AppError {
+  constructor(field: "voice" | "model", value: string, provider: string) {
+    const got = clipText(value, 80);
+    super(
+      `tts.${field} "${got}" belongs to another provider, not ${provider}`,
+      400,
+      "errors.ttsChoiceMismatch",
+      { field, got, provider },
+      `tts.${field}`,
+    );
+  }
+}
+
+export class TtsFishVoiceInvalidError extends AppError {
+  constructor(value: string) {
+    const got = clipText(value, 80);
+    super(
+      `tts.voice must be a Fish Audio voice id (32 hex characters), got "${got}"`,
+      400,
+      "errors.ttsFishVoiceInvalid",
+      { got },
+      "tts.voice",
     );
   }
 }
@@ -1549,6 +1582,30 @@ export function assertSettingsSignature(
   }
 }
 
+// Scoped like the rest of the family: only when this write changes the provider, voice, model or
+// base URL. A row stored before this rule (or by a path that skipped it) re-sent untouched saves.
+export function assertSettingsTtsChoice(
+  settings: unknown,
+  stored: unknown,
+): void {
+  if (!plainObject(plainObject(settings)?.tts)) return;
+  const next = readTtsConfig(settings);
+  const prev = readTtsConfig(stored);
+  if (
+    next.provider === prev.provider &&
+    next.voice === prev.voice &&
+    next.model === prev.model &&
+    next.baseURL === prev.baseURL
+  ) {
+    return;
+  }
+  const issue = ttsChoiceIssue(next);
+  if (!issue) return;
+  if (next.provider === "fish" && issue.field === "voice")
+    throw new TtsFishVoiceInvalidError(issue.value);
+  throw new TtsChoiceMismatchError(issue.field, issue.value, next.provider);
+}
+
 function rawSignatureField(settings: unknown, field: string): unknown {
   if (!settings || typeof settings !== "object") return undefined;
   const sg = (settings as Record<string, unknown>).signature;
@@ -1822,6 +1879,7 @@ export async function updateAgent(
     assertSettingsDebugWindow(rest.settings, before?.settings);
     assertSettingsModelFallback(rest.settings, before?.settings, "replace");
     assertSettingsSignature(rest.settings, before?.settings);
+    assertSettingsTtsChoice(rest.settings, before?.settings);
     assertSettingsToolPreconditions(rest.settings, before?.settings);
     assertSettingsContactAuthRule(rest.settings, before?.settings);
     assertSettingsRetiredLabelKeys(rest.settings);
@@ -2050,6 +2108,7 @@ export function assertAgentCreatable(input: AgentCreate): {
   assertSettingsDebugWindow(input.settings, undefined);
   assertSettingsModelFallback(input.settings, undefined, "replace");
   assertSettingsSignature(input.settings, undefined);
+  assertSettingsTtsChoice(input.settings, undefined);
   assertSettingsToolPreconditions(input.settings, undefined);
   assertSettingsContactAuthRule(input.settings, undefined);
   assertSettingsRetiredLabelKeys(input.settings);

@@ -1217,7 +1217,9 @@ function AgentEditor() {
       vision.extractionPrompt.trim() !== DEFAULT_EXTRACTION_PROMPT
         ? vision.extractionPrompt.trim()
         : null,
-    // As `ttsSettingsFrom` stores them: trimmed, null when empty.
+    // As `ttsSettingsFrom` stores them: voice and model trimmed, the texts also null when empty.
+    "tts.voice": tts.voice.trim(),
+    "tts.model": tts.model.trim(),
     "tts.spokenNoticeText": tts.spokenNoticeText.trim() || null,
     "tts.textChoiceNote": tts.textChoiceNote.trim() || null,
     "guardrails.customPolicy": guardrails.customPolicy,
@@ -4101,6 +4103,14 @@ function AgentEditor() {
                   ttsCredential: refusal.at(
                     "settings.tts.credentialRef",
                     currentRef.current["settings.tts.credentialRef"],
+                  ),
+                  ttsVoice: refusal.at(
+                    "tts.voice",
+                    currentRef.current["tts.voice"],
+                  ),
+                  ttsModel: refusal.at(
+                    "tts.model",
+                    currentRef.current["tts.model"],
                   ),
                   ttsNormalizeCredential: refusal.at(
                     "settings.tts.normalizeCredentialRef",

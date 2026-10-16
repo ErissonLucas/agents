@@ -36,8 +36,15 @@ type CommonProps = {
   searchPlaceholder?: string;
   disabled?: boolean;
   needsCredential?: boolean;
+  // Optional SERVER-side search, for a catalog too big to load whole (Fish Audio's public voices).
+  // Called with the typed text after a pause; its results are listed before the local matches while
+  // the text is non-empty. `searchEmptyText` replaces "No options" when the search found nothing.
+  searchLoader?: (query: string) => Promise<ComboItem[]>;
+  searchEmptyText?: (query: string) => string;
   "aria-label"?: string;
 };
+
+const SEARCH_DEBOUNCE_MS = 300;
 
 type SingleProps = CommonProps & {
   multiple?: false;
@@ -78,6 +85,8 @@ export function ComboBox(props: ComboBoxProps) {
     searchPlaceholder,
     disabled,
     needsCredential,
+    searchLoader,
+    searchEmptyText,
     "aria-label": ariaLabel,
   } = props;
   const multiple = props.multiple === true;
@@ -89,6 +98,35 @@ export function ComboBox(props: ComboBoxProps) {
   // The loaderKey we've already loaded (or are loading), so doLoad is idempotent without depending on
   // the loadState closure (which would be stale when called right after a reset).
   const loadedKey = useRef<string | undefined>(undefined);
+  const [remote, setRemote] = useState<
+    LoadState & { query?: string; items?: ComboItem[] }
+  >({ status: "idle" });
+
+  // The server search: debounced, and an answer to a query the operator has already typed past is
+  // dropped (the cleanup flag), so a slow reply never overwrites a newer one.
+  useEffect(() => {
+    const query = search.trim();
+    if (!searchLoader || !query || needsCredential) {
+      setRemote({ status: "idle" });
+      return;
+    }
+    let stale = false;
+    setRemote({ status: "loading", query });
+    const timer = setTimeout(() => {
+      searchLoader(query).then(
+        (items) => {
+          if (!stale) setRemote({ status: "ok", query, items });
+        },
+        () => {
+          if (!stale) setRemote({ status: "error", query });
+        },
+      );
+    }, SEARCH_DEBOUNCE_MS);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [search, searchLoader, needsCredential]);
 
   async function doLoad() {
     if (!loader || inFlight.current) return;
@@ -127,13 +165,21 @@ export function ComboBox(props: ComboBoxProps) {
   }
 
   const q = search.trim().toLowerCase();
-  const filtered = q
+  const localMatches = q
     ? merged.filter(
         (m) =>
           m.id.toLowerCase().includes(q) ||
           (m.label ?? "").toLowerCase().includes(q),
       )
     : merged;
+  const remoteItems =
+    remote.status === "ok" && remote.query === search.trim()
+      ? (remote.items ?? [])
+      : [];
+  const filtered: ComboItem[] = [...remoteItems];
+  for (const it of localMatches) {
+    if (!remoteItems.some((r) => r.id === it.id)) filtered.push(it);
+  }
   const searchTrimmed = search.trim();
   const showCustom =
     allowCustom &&
@@ -162,7 +208,9 @@ export function ComboBox(props: ComboBoxProps) {
   }
 
   function itemOf(id: string): ComboItem | undefined {
-    return merged.find((m) => m.id === id);
+    return (
+      merged.find((m) => m.id === id) ?? remoteItems.find((m) => m.id === id)
+    );
   }
 
   const single = !multiple ? (props as SingleProps) : null;
@@ -304,7 +352,8 @@ export function ComboBox(props: ComboBoxProps) {
                 </DropdownMenuPrimitive.Item>
               )}
 
-              {loadState.status === "loading" && (
+              {(loadState.status === "loading" ||
+                remote.status === "loading") && (
                 <div className="flex items-center gap-2 px-2 py-1.5 text-sm text-text-muted">
                   <Loader2
                     aria-hidden="true"
@@ -314,7 +363,7 @@ export function ComboBox(props: ComboBoxProps) {
                 </div>
               )}
 
-              {loadState.status === "error" && (
+              {(loadState.status === "error" || remote.status === "error") && (
                 <div className="px-2 py-1.5 text-error text-sm">
                   {t("common.comboBoxLoadError", "Could not load the list.")}
                 </div>
@@ -332,9 +381,13 @@ export function ComboBox(props: ComboBoxProps) {
               {filtered.length === 0 &&
                 !showCustom &&
                 loadState.status !== "loading" &&
-                loadState.status !== "error" && (
+                loadState.status !== "error" &&
+                remote.status !== "loading" &&
+                remote.status !== "error" && (
                   <div className="px-2 py-1.5 text-sm text-text-muted">
-                    {t("common.comboBoxEmpty", "No options")}
+                    {remote.status === "ok" && searchEmptyText
+                      ? searchEmptyText(searchTrimmed)
+                      : t("common.comboBoxEmpty", "No options")}
                   </div>
                 )}
 

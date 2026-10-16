@@ -75,6 +75,9 @@ export interface ToolPreconditionRow {
 export interface BehaviorRefusals {
   sttCredential: string | null;
   ttsCredential: string | null;
+  // A voice or model the provider cannot take (a Fish voice that is not an id, Gemini's model).
+  ttsVoice: string | null;
+  ttsModel: string | null;
   ttsNormalizeCredential: string | null;
   visionCredential: string | null;
   visionExtractionPrompt: string | null;

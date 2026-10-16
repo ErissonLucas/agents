@@ -269,7 +269,10 @@ describe("editorRefusalFields", () => {
     const cases: Array<[Partial<EditorControlsShown>, string[]]> = [
       [{ awayEnabled: false }, ["availability.awayMessage"]],
       [{ sttEnabled: false }, ["settings.stt.credentialRef"]],
-      [{ ttsOn: false }, ["settings.tts.credentialRef"]],
+      [
+        { ttsOn: false },
+        ["settings.tts.credentialRef", "tts.voice", "tts.model"],
+      ],
       [{ ttsNormalize: false }, ["settings.tts.normalizeCredentialRef"]],
       [
         { contactAuthEnabled: false },

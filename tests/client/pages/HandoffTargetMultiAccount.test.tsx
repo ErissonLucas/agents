@@ -120,6 +120,8 @@ function renderContactAuth(
       refusals: {
         sttCredential: null,
         ttsCredential: null,
+        ttsVoice: null,
+        ttsModel: null,
         ttsNormalizeCredential: null,
         visionCredential: null,
         visionExtractionPrompt: null,

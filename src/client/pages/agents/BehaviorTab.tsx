@@ -85,6 +85,7 @@ import {
   type ObservabilityConfig,
 } from "@/modules/flowlog/settings";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
+import { looksLikeFishVoiceId } from "@/modules/tts/catalog";
 import {
   SPOKEN_NOTICE_DEFAULT,
   TTS_CHECK_MODES,
@@ -117,6 +118,7 @@ import { Section, SectionNav } from "./SectionNav";
 import { signatureOnToggle } from "./signatureFormState";
 import { TabActionBar } from "./TabActionBar";
 import {
+  fishVoiceCheck,
   type TtsFormState,
   ttsNormalizerBaseUrlInvalid,
   ttsNormalizerBaseUrlUnsupported,
@@ -124,6 +126,7 @@ import {
   ttsNormalizerOverridePicked,
   ttsNormalizerPickerSource,
   ttsNormalizerProviderChanged,
+  ttsProviderChanged,
 } from "./ttsFormState";
 import type { BehaviorRefusals, Hours } from "./types";
 
@@ -616,7 +619,9 @@ function ServiceWindowTemplateField({
 // TTS voice/model picker backed by the live listing endpoint (item 10): OpenAI returns a curated set,
 // ElevenLabs is fetched with the vault credential so the operator picks a real per-account voice by
 // name. Eager-loads (when it won't error for lack of a credential) so the trigger shows the human
-// label; typing a custom value still works (parity with the old free input).
+// label; typing a custom value still works (parity with the old free input). Fish voices are the
+// exception: searched on the server (by name, or a pasted id looked up), never typed in raw, and a
+// saved id is looked up so the trigger shows its title, or says Fish does not know it.
 function TtsOptionPicker({
   kind,
   provider,
@@ -637,37 +642,118 @@ function TtsOptionPicker({
   ariaLabel: string;
 }) {
   const { t } = useTranslation();
+  const fishVoices = provider === "fish" && kind === "voices";
   const loaderKey = `${kind}||${provider}||${credentialRef ?? ""}||${baseURL ?? ""}`;
-  const loader = useCallback(async (): Promise<ComboItem[]> => {
-    const { data, error } = await api.api.v1.agents.tts.list.post({
-      provider,
-      kind,
-      credentialRef,
-      baseURL,
-    });
-    if (error || !data) throw new Error("tts list failed");
-    return data.items.map((i) => ({
-      id: i.id,
-      label: i.label ?? undefined,
-      hint: i.label && i.label !== i.id ? i.id : undefined,
-    }));
-  }, [provider, kind, credentialRef, baseURL]);
+  // Every voice a list or a search returned, so picking one needs no second lookup for its title.
+  const known = useRef(new Map<string, ComboItem>());
+  const fetchItems = useCallback(
+    async (search?: string): Promise<ComboItem[]> => {
+      const { data, error } = await api.api.v1.agents.tts.list.post({
+        provider,
+        kind,
+        credentialRef,
+        baseURL,
+        ...(search ? { search } : {}),
+      });
+      if (error || !data) throw new Error("tts list failed");
+      const items = data.items.map((i) => ({
+        id: i.id,
+        label: i.label ?? undefined,
+        hint: i.label && i.label !== i.id ? i.id : undefined,
+      }));
+      for (const i of items) known.current.set(i.id, i);
+      return items;
+    },
+    [provider, kind, credentialRef, baseURL],
+  );
+  const loader = useCallback(() => fetchItems(), [fetchItems]);
+  const searchLoader = useCallback(
+    (q: string) =>
+      fetchItems(looksLikeFishVoiceId(q) ? q.trim().toLowerCase() : q),
+    [fetchItems],
+  );
+  // The saved Fish id, looked up: null until Fish answers (or when it could not be asked).
+  const [lookup, setLookup] = useState<ComboItem[] | null>(null);
+  useEffect(() => {
+    setLookup(null);
+    const id = value.trim().toLowerCase();
+    if (!fishVoices || !credentialRef || !looksLikeFishVoiceId(id)) return;
+    const hit = known.current.get(id);
+    if (hit) {
+      setLookup([hit]);
+      return;
+    }
+    let stale = false;
+    fetchItems(id).then(
+      (items) => {
+        if (!stale) setLookup(items);
+      },
+      () => {
+        // NOTE: unreachable or refused: say nothing rather than "not found"
+      },
+    );
+    return () => {
+      stale = true;
+    };
+  }, [fishVoices, credentialRef, value, fetchItems]);
+  const check = fishVoices ? fishVoiceCheck(value, lookup) : null;
   return (
-    <ComboBox
-      value={value}
-      onChange={onChange}
-      loader={loader}
-      loaderKey={loaderKey}
-      eager
-      needsCredential={
-        (provider === "elevenlabs" ||
-          (provider === "fish" && kind === "voices")) &&
-        !credentialRef
-      }
-      placeholder={placeholder}
-      searchPlaceholder={t("common.search", "Search")}
-      aria-label={ariaLabel}
-    />
+    <div className="flex flex-col gap-1">
+      <ComboBox
+        value={value}
+        onChange={onChange}
+        loader={loader}
+        loaderKey={loaderKey}
+        eager
+        items={
+          check?.state === "found"
+            ? [{ id: value.trim(), label: check.label, hint: value.trim() }]
+            : undefined
+        }
+        allowCustom={!fishVoices}
+        searchLoader={fishVoices ? searchLoader : undefined}
+        searchEmptyText={
+          fishVoices
+            ? (q) =>
+                looksLikeFishVoiceId(q)
+                  ? t(
+                      "editor.ttsFishVoiceNotFound",
+                      "Voice not found on Fish Audio.",
+                    )
+                  : t(
+                      "editor.ttsFishVoiceNoMatch",
+                      "No Fish Audio voice with that name. Paste its id to look it up.",
+                    )
+            : undefined
+        }
+        needsCredential={
+          (provider === "elevenlabs" || fishVoices) && !credentialRef
+        }
+        placeholder={placeholder}
+        searchPlaceholder={
+          fishVoices
+            ? t("editor.ttsFishVoiceSearch", "Search by name or paste the id")
+            : t("common.search", "Search")
+        }
+        aria-label={ariaLabel}
+      />
+      {check?.state === "notFound" && (
+        <span className="text-error text-xs" role="alert">
+          {t(
+            "editor.ttsFishVoiceNotFoundSaved",
+            "Voice not found on Fish Audio: this id would fail on the first audio reply. Pick another voice.",
+          )}
+        </span>
+      )}
+      {check?.state === "notAnId" && (
+        <span className="text-error text-xs" role="alert">
+          {t(
+            "editor.ttsFishVoiceNotAnId",
+            "This is not a Fish Audio voice id. Pick a voice in the list or paste its id.",
+          )}
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -2145,7 +2231,7 @@ export function BehaviorTab({
                     <Select
                       value={tts.provider}
                       onChange={(e) =>
-                        setTts({ ...tts, provider: e.target.value })
+                        setTts(ttsProviderChanged(tts, e.target.value))
                       }
                     >
                       {TTS_PROVIDERS.map((p) => (
@@ -2187,6 +2273,7 @@ export function BehaviorTab({
                 <div className="grid gap-4 sm:grid-cols-2">
                   <FormField
                     label={t("editor.ttsVoice", "Voice")}
+                    error={refusals.ttsVoice}
                     // A ComboBox-based picker, not one focusable control: `group` per the
                     // repo rule, so the label names the group instead of dangling.
                     group
@@ -2194,7 +2281,7 @@ export function BehaviorTab({
                       tts.provider === "fish"
                         ? t(
                             "editor.ttsFishVoiceHint",
-                            "Pick one of your voices or a public Portuguese one, or paste the voice id (reference_id) from fish.audio.",
+                            "Search by name (your voices first, then public ones in Portuguese, then in any language), or paste the voice id (reference_id) from fish.audio.",
                           )
                         : t(
                             "editor.ttsVoiceHint",
@@ -2217,6 +2304,7 @@ export function BehaviorTab({
                   </FormField>
                   <FormField
                     label={t("editor.ttsModel", "Model")}
+                    error={refusals.ttsModel}
                     // A ComboBox-based picker, not one focusable control: `group` per the
                     // repo rule, so the label names the group instead of dangling.
                     group

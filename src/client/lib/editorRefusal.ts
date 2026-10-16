@@ -94,7 +94,7 @@ const TEXT_TARGETS: ReadonlyArray<{ match: RegExp } & EditorTarget> = [
   { match: /^guardrails\.output\./, tab: "guardrails", sectionId: "gr-output" },
   { match: /^vision\.extractionPrompt$/, tab: "behavior", sectionId: "vision" },
   {
-    match: /^tts\.(spokenNoticeText|textChoiceNote)$/,
+    match: /^tts\.(spokenNoticeText|textChoiceNote|voice|model)$/,
     tab: "behavior",
     sectionId: "tts",
   },
@@ -259,6 +259,8 @@ const OWNED_FIELDS: readonly OwnedField[] = [
     tab: "behavior",
     needs: "visionEnabled",
   },
+  { field: "tts.voice", tab: "behavior", needs: "ttsOn" },
+  { field: "tts.model", tab: "behavior", needs: "ttsOn" },
   {
     field: "tts.spokenNoticeText",
     tab: "behavior",

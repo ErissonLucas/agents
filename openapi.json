@@ -13629,7 +13629,7 @@
           "Agents"
         ],
         "summary": "List TTS voices/models",
-        "description": "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs and Fish Audio voices are fetched live with the vault credential.",
+        "description": "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs and Fish Audio voices are fetched live with the vault credential, and Fish Audio voices can be searched by name or looked up by id.",
         "requestBody": {
           "required": true,
           "content": {
@@ -13659,6 +13659,11 @@
                   },
                   "baseURL": {
                     "description": "Optional override base URL.",
+                    "type": "string"
+                  },
+                  "search": {
+                    "maxLength": 200,
+                    "description": "Fish Audio voices only: a name to search for (sent as Fish's `title`), or a 32-hex voice id to look up. An id Fish does not know returns no items.",
                     "type": "string"
                   }
                 }
@@ -13691,6 +13696,11 @@
                   "baseURL": {
                     "description": "Optional override base URL.",
                     "type": "string"
+                  },
+                  "search": {
+                    "maxLength": 200,
+                    "description": "Fish Audio voices only: a name to search for (sent as Fish's `title`), or a 32-hex voice id to look up. An id Fish does not know returns no items.",
+                    "type": "string"
                   }
                 }
               }
@@ -13721,6 +13731,11 @@
                   },
                   "baseURL": {
                     "description": "Optional override base URL.",
+                    "type": "string"
+                  },
+                  "search": {
+                    "maxLength": 200,
+                    "description": "Fish Audio voices only: a name to search for (sent as Fish's `title`), or a 32-hex voice id to look up. An id Fish does not know returns no items.",
                     "type": "string"
                   }
                 }

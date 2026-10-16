@@ -78,6 +78,8 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.invalidSignatureSwitch', '`signature.enabled` must be true or false, not {{got}}. Send the whole signature block to change it.')
 // translate('errors.settingsBlocksDropped', 'This `settings` would delete what this agent has configured under {{blocks}}, because it replaces the whole object. Add what is missing, or pass `settingsMode: "replace"` to say it is complete.')
 // translate('errors.invalidSignatureChoice', '`signature.{{field}}` must be one of {{allowed}}, not {{got}}. Send the whole signature block to change it.')
+// translate('errors.ttsFishVoiceInvalid', '`tts.voice` must be a Fish Audio voice id (32 hex characters, as fish.audio shows it), not "{{got}}". Pick the voice in the list or paste its id.')
+// translate('errors.ttsChoiceMismatch', '`tts.{{field}}` "{{got}}" belongs to another provider and {{provider}} cannot use it. Pick one of this provider\'s, or leave it blank for its default.')
 // translate('errors.invalidSettingsValue', '`{{field}}` expects {{expected}}, not {{got}}. The agent would ignore that value and use its default, so it is not stored.')
 // translate('errors.debugWindowTooLong', 'The log debug mode can be armed for at most {{hours}}h at a time.')
 // translate('errors.invalidToolPrecondition', '`{{tool}}` has an invalid precondition: it must name an attribute scope and key.')
@@ -1429,6 +1431,7 @@ export const agentsController = new Elysia({
         kind: "voices" | "models";
         credentialRef?: string;
         baseURL?: string;
+        search?: string;
       };
       return {
         instance: instanceIdentity,
@@ -1437,13 +1440,14 @@ export const agentsController = new Elysia({
           kind: b.kind,
           credentialRef: b.credentialRef,
           baseURL: b.baseURL,
+          search: b.search,
         }),
       };
     },
     {
       detail: doc(
         "List TTS voices/models",
-        "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs and Fish Audio voices are fetched live with the vault credential.",
+        "Lists the voices or models for a text-to-speech provider. OpenAI, OpenRouter and Gemini return a curated set; ElevenLabs and Fish Audio voices are fetched live with the vault credential, and Fish Audio voices can be searched by name or looked up by id.",
       ),
       response: errors(400, 401, 403, 404, 422),
       requireRole: "TENANT_ADMIN",
@@ -1464,6 +1468,13 @@ export const agentsController = new Elysia({
         ),
         baseURL: t.Optional(
           t.String({ description: "Optional override base URL." }),
+        ),
+        search: t.Optional(
+          t.String({
+            maxLength: 200,
+            description:
+              "Fish Audio voices only: a name to search for (sent as Fish's `title`), or a 32-hex voice id to look up. An id Fish does not know returns no items.",
+          }),
         ),
       }),
     },
