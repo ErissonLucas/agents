@@ -10,6 +10,7 @@ export const STT_DEFAULT_MODEL: Record<string, string> = {
   elevenlabs: "scribe_v2",
   openrouter: "openai/whisper-1",
   assemblyai: "universal-3-5-pro",
+  fish: "transcribe-1-pro",
 };
 
 export const VISION_DEFAULT_MODEL: Record<string, string> = {
@@ -25,6 +26,7 @@ export const TTS_DEFAULT_MODEL: Record<string, string> = {
   elevenlabs: "eleven_flash_v2_5",
   openrouter: "hexgrad/kokoro-82m",
   gemini: "gemini-2.5-flash-preview-tts",
+  fish: "s2.1-pro",
 };
 
 // ElevenLabs has no default voice (a voice id is mandatory) → empty string here, surfaced in the UI
@@ -38,6 +40,7 @@ export const TTS_PROVIDERS = [
   "elevenlabs",
   "openrouter",
   "gemini",
+  "fish",
 ] as const;
 
 export const TTS_DEFAULT_VOICE: Record<string, string> = {
@@ -45,4 +48,5 @@ export const TTS_DEFAULT_VOICE: Record<string, string> = {
   elevenlabs: "",
   openrouter: "af_alloy",
   gemini: "Kore",
+  fish: "",
 };

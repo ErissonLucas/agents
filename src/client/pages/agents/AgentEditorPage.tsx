@@ -2835,12 +2835,13 @@ function AgentEditor() {
   // the operator still tests before saving by flipping the toggle on (no separate "ignore" path). The
   // other hard requirement is the credential — the provider always defaults to a valid one. The audio
   // REPLY is a manual playground toggle (forceAudio), so it only needs TTS configured (a voice too for
-  // providers that require one, like ElevenLabs; mirrors modules/tts), not tts.enabled.
+  // providers that require one, like ElevenLabs and Fish; mirrors modules/tts), not tts.enabled.
   const playgroundCapabilities = {
     audioInput: stt.enabled && !!stt.credentialRef,
     audioReply:
       !!tts.credentialRef &&
-      (tts.provider !== "elevenlabs" || !!tts.voice.trim()),
+      ((tts.provider !== "elevenlabs" && tts.provider !== "fish") ||
+        !!tts.voice.trim()),
     fileInput: vision.enabled && !!vision.credentialRef,
     // Same two hard requirements the runtime has (modules/guardrails/gate): the feature switched on
     // and its OWN credential resolved. A direction being off is not checked here — that is a per-

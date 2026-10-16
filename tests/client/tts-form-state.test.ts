@@ -37,6 +37,7 @@ const SAVED = {
   style: 0.2,
   speed: 1.5,
   speakerBoost: false,
+  latency: "balanced",
   checkMode: "enforce",
   textInstead: true,
   textOverChars: 600,

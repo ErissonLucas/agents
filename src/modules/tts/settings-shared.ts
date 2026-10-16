@@ -17,8 +17,8 @@ export const TTS_MODES: TtsMode[] = ["never", "mirror", "preference"];
 // Delivery knobs for the synthesis itself: HOW the words are spoken, as opposed to WHICH words the
 // model picked. Every field is nullable and null means "omit it and let the provider decide" — an
 // install that never touches this keeps sending the exact same request body it sent before.
-// Currently consumed only by ElevenLabs (`voice_settings`); OpenAI's /audio/speech has no equivalent
-// bag, so the provider mapper simply ignores what it cannot express.
+// Consumed by ElevenLabs (`voice_settings`) and Fish Audio (`prosody.speed`, `latency`); OpenAI's
+// /audio/speech has no equivalent bag, so each provider mapper ignores what it cannot express.
 // NOTE: these live FLAT on TtsConfig, not in a nested object, because mergeBehaviorSettings merges a
 // block shallowly — a nested bag would make a patch of one knob null out the others, breaking the
 // partial-patch contract the REST/MCP transports promise. Grouping happens at the provider boundary
@@ -36,7 +36,12 @@ export interface TtsVoiceSettings {
   // Speaking rate, 1.0 being natural speed.
   speed?: number | null;
   speakerBoost?: boolean | null;
+  // Fish Audio's latency/quality trade-off ("normal" is its best quality and its default).
+  latency?: TtsLatency | null;
 }
+
+export const TTS_LATENCIES = ["normal", "balanced", "low"] as const;
+export type TtsLatency = (typeof TTS_LATENCIES)[number];
 
 export const VOICE_SETTINGS_DEFAULTS: TtsVoiceSettings = {
   stability: null,
@@ -44,6 +49,7 @@ export const VOICE_SETTINGS_DEFAULTS: TtsVoiceSettings = {
   style: null,
   speed: null,
   speakerBoost: null,
+  latency: null,
 };
 
 // What an audio check can do with a synthesized reply (issues #779, #802): nothing, record the
@@ -239,5 +245,8 @@ export function readVoiceSettings(bag: unknown): TtsVoiceSettings {
     style: clamped(b.style, VOICE_SETTING_RANGES.style),
     speed: clamped(b.speed, VOICE_SETTING_RANGES.speed),
     speakerBoost: typeof b.speakerBoost === "boolean" ? b.speakerBoost : null,
+    latency: TTS_LATENCIES.includes(b.latency as TtsLatency)
+      ? (b.latency as TtsLatency)
+      : null,
   };
 }

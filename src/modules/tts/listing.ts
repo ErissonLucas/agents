@@ -9,8 +9,8 @@ import { TTS_PROVIDER_NAMES } from "./providers";
 
 // Lists the voices / models the editor's TTS combobox offers (item 10). OpenAI has no list endpoint
 // for its named voices/speech models, so we serve a curated set (the combobox's "use custom" covers
-// anything newer). ElevenLabs voices are per-account, so we fetch them live with the tenant's vault
-// key — the operator picks from their real voices instead of guessing a voice_id.
+// anything newer). ElevenLabs and Fish Audio voices are per-account, so we fetch them live with the
+// tenant's vault key — the operator picks from their real voices instead of guessing a voice_id.
 
 export interface TtsListItem {
   id: string;
@@ -103,6 +103,11 @@ const GEMINI_MODELS = [
   "gemini-3.1-flash-tts-preview",
 ];
 
+// Fish Audio's TTS models go in the `model` header; `s1` is retired at the end of 2026, so it is not
+// offered. Its voices are listed live: the account's own, then the most used public Portuguese ones.
+const FISH_MODELS = ["s2.1-pro", "s2-pro", "s2.1-pro-free", "drama-3"];
+const FISH_PAGE_SIZE = 50;
+
 async function resolveApiKey(
   base: PrismaClient,
   ctx: TenantContext,
@@ -168,7 +173,11 @@ export async function listTtsOptions(
     }));
   }
 
-  if (provider !== "elevenlabs") return [];
+  if (provider === "fish" && kind === "models") {
+    return FISH_MODELS.map((id) => ({ id }));
+  }
+
+  if (provider !== "elevenlabs" && provider !== "fish") return [];
 
   if (!credentialRef) {
     throw new AppError(
@@ -190,6 +199,10 @@ export async function listTtsOptions(
       400,
       "errors.credentialNotUsable",
     );
+  }
+
+  if (provider === "fish") {
+    return listFishVoices(apiKey, baseURL, fetchFn, assertSafe);
   }
 
   const root = (baseURL ?? "https://api.elevenlabs.io/v1").replace(/\/+$/, "");
@@ -267,6 +280,92 @@ export async function listTtsOptions(
       502,
       "errors.providerListUnreachable",
       { provider },
+    );
+  }
+}
+
+// One page of GET /model: `self=true` is the account's own voices, the other query the public
+// catalog in Portuguese by popularity. Fish's API root has no /v1 (the TTS route does), so a custom
+// baseURL is read as the TTS one and its trailing /v1 dropped.
+async function fishVoicePage(
+  url: URL,
+  apiKey: string,
+  fetchFn: typeof fetch,
+): Promise<TtsListItem[]> {
+  const res = await fetchFn(url.toString(), {
+    headers: { authorization: `Bearer ${apiKey}` },
+    redirect: "error",
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) {
+    throw new AppError(
+      `Fish Audio voices endpoint returned ${res.status}`,
+      502,
+      "errors.providerModelsFailed",
+      { provider: "fish", status: res.status },
+    );
+  }
+  const items = ((await readProviderJson(res, "fish")) as { items?: unknown })
+    .items;
+  if (!Array.isArray(items)) {
+    throw new AppError(
+      "unexpected Fish Audio voices response",
+      502,
+      "errors.providerListUnexpectedResponse",
+      { provider: "fish" },
+    );
+  }
+  return items
+    .map(
+      (v) =>
+        v as {
+          _id?: unknown;
+          title?: unknown;
+          type?: unknown;
+          state?: unknown;
+        },
+    )
+    .filter((v) => v && v.type !== "svc" && (!v.state || v.state === "trained"))
+    .map((v) => ({
+      id: typeof v._id === "string" ? v._id : "",
+      label: typeof v.title === "string" ? v.title : undefined,
+    }))
+    .filter((v) => v.id.length > 0);
+}
+
+async function listFishVoices(
+  apiKey: string,
+  baseURL: string | undefined,
+  fetchFn: typeof fetch,
+  assertSafe: typeof defaultAssertSafeOutboundUrl,
+): Promise<TtsListItem[]> {
+  const root = (baseURL ?? "https://api.fish.audio")
+    .replace(/\/+$/, "")
+    .replace(/\/v1$/, "");
+  const query = [
+    `self=true&page_size=${FISH_PAGE_SIZE}&sort_by=created_at`,
+    `language=pt&page_size=${FISH_PAGE_SIZE}&sort_by=task_count`,
+  ];
+  try {
+    const out: TtsListItem[] = [];
+    const seen = new Set<string>();
+    for (const q of query) {
+      const url = await assertSafe(`${root}/model?${q}`, { allowHttp: true });
+      for (const v of await fishVoicePage(url, apiKey, fetchFn)) {
+        if (seen.has(v.id)) continue;
+        seen.add(v.id);
+        out.push(v);
+      }
+    }
+    return out;
+  } catch (e) {
+    if (e instanceof AppError) throw e;
+    // NOTE: the provider, not the error text, goes to the caller, as on the ElevenLabs path above.
+    throw new AppError(
+      `failed to list Fish Audio voices: ${e instanceof Error ? e.message : String(e)}`,
+      502,
+      "errors.providerListUnreachable",
+      { provider: "fish" },
     );
   }
 }

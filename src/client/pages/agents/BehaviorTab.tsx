@@ -135,6 +135,7 @@ const STT_PROVIDERS = [
   "elevenlabs",
   "openrouter",
   "assemblyai",
+  "fish",
 ] as const;
 
 // Audio-reply providers (mirror src/modules/tts/providers). The three reply modes are rendered
@@ -658,7 +659,11 @@ function TtsOptionPicker({
       loader={loader}
       loaderKey={loaderKey}
       eager
-      needsCredential={provider === "elevenlabs" && !credentialRef}
+      needsCredential={
+        (provider === "elevenlabs" ||
+          (provider === "fish" && kind === "voices")) &&
+        !credentialRef
+      }
       placeholder={placeholder}
       searchPlaceholder={t("common.search", "Search")}
       aria-label={ariaLabel}
@@ -2185,10 +2190,17 @@ export function BehaviorTab({
                     // A ComboBox-based picker, not one focusable control: `group` per the
                     // repo rule, so the label names the group instead of dangling.
                     group
-                    description={t(
-                      "editor.ttsVoiceHint",
-                      "Voice id/name (required for ElevenLabs).",
-                    )}
+                    description={
+                      tts.provider === "fish"
+                        ? t(
+                            "editor.ttsFishVoiceHint",
+                            "Pick one of your voices or a public Portuguese one, or paste the voice id (reference_id) from fish.audio.",
+                          )
+                        : t(
+                            "editor.ttsVoiceHint",
+                            "Voice id/name (required for ElevenLabs and Fish Audio).",
+                          )
+                    }
                   >
                     <TtsOptionPicker
                       kind="voices"
@@ -2514,6 +2526,78 @@ export function BehaviorTab({
                           </option>
                           <option value="false">
                             {t("common.disabled", "Disabled")}
+                          </option>
+                        </Select>
+                      </FormField>
+                    </div>
+                  </div>
+                )}
+                {tts.provider === "fish" && (
+                  <div className="flex flex-col gap-3">
+                    <div>
+                      <p className="font-medium text-sm">
+                        {t("editor.ttsDelivery", "Voice delivery")}
+                      </p>
+                      <p className="text-text-muted text-xs">
+                        {t(
+                          "editor.ttsFishDeliveryHint",
+                          "Leave a field blank to use Fish Audio's default: natural speed and its best quality.",
+                        )}
+                      </p>
+                    </div>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <FormField
+                        label={t("editor.ttsSpeed", "Speed")}
+                        description={t(
+                          "editor.ttsFishSpeedHint",
+                          "Speaking rate, 1 being natural speed (0.5-2).",
+                        )}
+                      >
+                        <Input
+                          type="number"
+                          min={0.5}
+                          max={2}
+                          step={0.05}
+                          value={tts.speed}
+                          onChange={(e) =>
+                            setTts({ ...tts, speed: e.target.value })
+                          }
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsLatency", "Latency")}
+                        description={t(
+                          "editor.ttsLatencyHint",
+                          "Normal sounds best; balanced and low answer faster.",
+                        )}
+                      >
+                        <Select
+                          value={tts.latency}
+                          onChange={(e) =>
+                            setTts({
+                              ...tts,
+                              latency: e.target
+                                .value as TtsFormState["latency"],
+                            })
+                          }
+                        >
+                          <option value="">
+                            {t("editor.ttsVoiceDefault", "Voice default")}
+                          </option>
+                          <option value="normal">
+                            {t(
+                              "editor.ttsLatencyNormal",
+                              "Normal (best quality)",
+                            )}
+                          </option>
+                          <option value="balanced">
+                            {t(
+                              "editor.ttsLatencyBalanced",
+                              "Balanced (faster)",
+                            )}
+                          </option>
+                          <option value="low">
+                            {t("editor.ttsLatencyLow", "Low (fastest)")}
                           </option>
                         </Select>
                       </FormField>

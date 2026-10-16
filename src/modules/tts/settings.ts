@@ -23,7 +23,7 @@ export { TTS_DEFAULTS, type TtsConfig } from "./settings-shared";
 //   * "mirror"     → reply in audio whenever the customer sent audio;
 //   * "preference" → follow the per-contact preference (Contact.voiceReply), falling back to mirror
 //                    while it is unknown.
-// Provider is selectable (ElevenLabs / OpenAI, extensible) and the API key is a vault entry
+// Provider is selectable (ElevenLabs / OpenAI / Gemini / Fish Audio, extensible) and the API key is a vault entry
 // referenced by a stable `vault:<id>` ref (renaming the secret never breaks the agent).
 
 function str(v: unknown): string | null {
@@ -84,6 +84,7 @@ export function voiceSettingsOf(cfg: TtsConfig): TtsVoiceSettings | null {
     style: cfg.style ?? null,
     speed: cfg.speed ?? null,
     speakerBoost: cfg.speakerBoost ?? null,
+    latency: cfg.latency ?? null,
   };
   return Object.values(v).some((x) => x !== null) ? v : null;
 }

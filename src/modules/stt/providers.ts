@@ -1,9 +1,9 @@
 // Speech-to-text provider abstraction. The OpenAI `/audio/transcriptions` multipart shape is a
 // de-facto standard (Groq and most self-hosted Whisper servers implement it), so `openai` and
 // `openai-compatible` share one adapter (baseURL switch). Gemini and ElevenLabs have their own
-// shapes, so each gets a thin adapter; AssemblyAI is asynchronous (upload, submit, poll). Adding a
-// provider = one function + one registry entry; a future generic/declarative provider can slot in
-// behind the same interface without touching callers.
+// shapes, so each gets a thin adapter (Fish Audio too); AssemblyAI is asynchronous (upload, submit,
+// poll). Adding a provider = one function + one registry entry; a future generic/declarative
+// provider can slot in behind the same interface without touching callers.
 
 const STT_TIMEOUT_MS = 60_000;
 
@@ -255,6 +255,63 @@ export function makeAssemblyaiTranscribe(opts: {
   };
 }
 
+// Fish Audio: POST /v1/asr, Bearer key, the model in a `model` HEADER, multipart `audio`. It takes an
+// ISO 639-1 base code ("pt-BR" can be refused with a 400). The text may carry speaker turns
+// (`<|speaker:0|>`) and audio events (`[laughter]`), stripped so the agent reads only the words.
+// A 429/5xx is retried once inside the same 60s budget; 401/402 fail with our own slug.
+const FISH_ERROR_REASON: Record<number, string> = {
+  401: "invalid_api_key",
+  402: "insufficient_credit",
+  429: "rate_limited",
+  503: "overloaded",
+};
+
+export function cleanFishTranscript(text: string): string {
+  return text
+    .replace(/<\|[^|<>]{0,40}\|>/g, " ")
+    .replace(/\[[a-z][a-z _-]{0,30}\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function makeFishTranscribe(opts: {
+  budgetMs: number;
+  retryDelayMs: number;
+}): (req: SttRequest) => Promise<string> {
+  return async (req) => {
+    const base = (req.baseURL ?? "https://api.fish.audio/v1").replace(
+      /\/+$/,
+      "",
+    );
+    const deadline = Date.now() + opts.budgetMs;
+    const post = () => {
+      const form = new FormData();
+      form.append("audio", audioBlob(req), fileNameFor(req.mimeType));
+      const language = req.language.split("-")[0]?.toLowerCase();
+      if (language) form.append("language", language);
+      form.append("ignore_timestamps", "true");
+      return req.fetchImpl(`${base}/asr`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${req.apiKey}`, model: req.model },
+        body: form,
+        redirect: "error",
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      });
+    };
+    let res = await post();
+    const retryable = res.status === 429 || res.status >= 500;
+    if (retryable && Date.now() + opts.retryDelayMs < deadline) {
+      await res.body?.cancel();
+      await Bun.sleep(opts.retryDelayMs);
+      res = await post();
+    }
+    if (!res.ok)
+      throw new SttError("fish", res.status, FISH_ERROR_REASON[res.status]);
+    const json = (await res.json()) as { text?: unknown };
+    return cleanFishTranscript(typeof json.text === "string" ? json.text : "");
+  };
+}
+
 const PROVIDERS: Record<string, SttProvider> = {
   openai: { defaultModel: "gpt-4o-transcribe", transcribe: openaiTranscribe },
   "openai-compatible": {
@@ -274,6 +331,13 @@ const PROVIDERS: Record<string, SttProvider> = {
     transcribe: makeAssemblyaiTranscribe({
       budgetMs: STT_TIMEOUT_MS,
       pollDelaysMs: [500, 1_000, 1_500, 2_000, 3_000],
+    }),
+  },
+  fish: {
+    defaultModel: "transcribe-1-pro",
+    transcribe: makeFishTranscribe({
+      budgetMs: STT_TIMEOUT_MS,
+      retryDelayMs: 1_000,
     }),
   },
 };

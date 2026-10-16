@@ -9,7 +9,8 @@
 // Instagram replies are raw PCM wrapped in a 44-byte RIFF header locally (pcmToWav — a header write,
 // not a transcode); openrouter only emits mp3 and therefore cannot serve Instagram at all (the
 // service falls back to a text reply there). gemini emits only raw PCM, which is wrapped into a
-// RIFF header for "wav" and encoded to Ogg/Opus in-process for "ogg_opus" (ogg-opus.ts, WASM).
+// RIFF header for "wav" and encoded to Ogg/Opus in-process for "ogg_opus" (ogg-opus.ts, WASM). fish
+// is asked for that same PCM and takes the same path.
 
 import { pcmToOggOpus } from "./ogg-opus";
 import type { TtsVoiceSettings } from "./settings-shared";
@@ -326,6 +327,7 @@ const GEMINI_FORMATS = ["ogg_opus", "wav"] as const;
 export function geminiPcm(
   bytes: Uint8Array,
   mimeType: string | undefined,
+  provider = "gemini",
 ): { pcm: ArrayBuffer; sampleRate: number } {
   // NOTE: a copy through the Uint8Array constructor, since Buffer#slice is a view onto a shared pool.
   const copy = (from: number, to: number) =>
@@ -342,7 +344,7 @@ export function geminiPcm(
         return { pcm: copy(off + 8, off + 8 + size), sampleRate };
       off += 8 + size + (size % 2);
     }
-    throw new TtsError("gemini", 200, "no_audio");
+    throw new TtsError(provider, 200, "no_audio");
   }
   const rate = /rate=(\d+)/i.exec(mimeType ?? "")?.[1];
   return {
@@ -402,6 +404,105 @@ async function geminiSynthesize(req: TtsRequest): Promise<TtsResult> {
   };
 }
 
+// NOTE: Fish Audio: POST /v1/tts, Bearer key, the model in a `model` HEADER and the voice as
+// `reference_id`. Its `opus` output names no container in the docs, so the voice note is built the
+// way Gemini's is: 16-bit mono PCM at 24 kHz, encoded to Ogg/Opus here (and wrapped for "wav").
+// A 429/5xx is retried once inside the same 60s budget; the status maps to our own slug, never to
+// the provider's message (402 = the account ran out of credit, 401 = the key is wrong).
+const FISH_PCM_RATE = 24_000;
+const FISH_SPEED: readonly [number, number] = [0.5, 2];
+const FISH_ERROR_CODE: Record<number, string> = {
+  401: "invalid_api_key",
+  402: "insufficient_credit",
+  429: "rate_limited",
+  503: "overloaded",
+};
+
+/** Fish Audio's wire `format` for one of our containers. */
+function fishFormat(format: TtsOutputFormat): string {
+  return format === "mp3" ? "mp3" : "pcm";
+}
+
+/** Our slug for a failed Fish response: the status first, the body's slug-shaped field after. */
+export async function fishErrorCode(res: Response): Promise<string | null> {
+  return FISH_ERROR_CODE[res.status] ?? (await readProviderErrorCode(res));
+}
+
+export function isRetryableStatus(status: number): boolean {
+  return status === 429 || status >= 500;
+}
+
+function fishBody(req: TtsRequest): Record<string, unknown> {
+  const v = req.voiceSettings;
+  const body: Record<string, unknown> = {
+    text: req.text,
+    reference_id: req.voice,
+    format: fishFormat(req.format),
+  };
+  if (body.format === "pcm") body.sample_rate = FISH_PCM_RATE;
+  else body.mp3_bitrate = 128;
+  if (v?.latency) body.latency = v.latency;
+  if (typeof v?.speed === "number") {
+    const [min, max] = FISH_SPEED;
+    body.prosody = { speed: Math.min(max, Math.max(min, v.speed)) };
+  }
+  return body;
+}
+
+export function makeFishSynthesize(opts: {
+  budgetMs: number;
+  retryDelayMs: number;
+}): (req: TtsRequest) => Promise<TtsResult> {
+  return async (req) => {
+    const base = (req.baseURL ?? "https://api.fish.audio/v1").replace(
+      /\/+$/,
+      "",
+    );
+    const deadline = Date.now() + opts.budgetMs;
+    const payload = JSON.stringify(fishBody(req));
+    const post = () =>
+      req.fetchImpl(`${base}/tts`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${req.apiKey}`,
+          "content-type": "application/json",
+          model: req.model,
+        },
+        body: payload,
+        redirect: "error",
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
+      });
+    let res = await post();
+    if (
+      isRetryableStatus(res.status) &&
+      Date.now() + opts.retryDelayMs < deadline
+    ) {
+      await res.body?.cancel();
+      await Bun.sleep(opts.retryDelayMs);
+      res = await post();
+    }
+    if (!res.ok)
+      throw new TtsError("fish", res.status, await fishErrorCode(res));
+    const raw = new Uint8Array(await res.arrayBuffer());
+    if (raw.byteLength === 0) throw new TtsError("fish", 502, "no_audio");
+    if (req.format === "mp3")
+      return { audio: raw.buffer, ...RESULT_BY_FORMAT.mp3 };
+    // NOTE: a RIFF body, should one come back, is unwrapped and its own sample rate honoured.
+    const { pcm, sampleRate } = geminiPcm(
+      raw,
+      `audio/pcm;rate=${FISH_PCM_RATE}`,
+      "fish",
+    );
+    if (req.format === "wav") {
+      return { audio: pcmToWav(pcm, sampleRate), ...RESULT_BY_FORMAT.wav };
+    }
+    return {
+      audio: await pcmToOggOpus(pcm, sampleRate),
+      ...RESULT_BY_FORMAT.ogg_opus,
+    };
+  };
+}
+
 const PROVIDERS: Record<string, TtsProvider> = {
   openai: {
     defaultModel: "gpt-4o-mini-tts",
@@ -438,6 +539,20 @@ const PROVIDERS: Record<string, TtsProvider> = {
     formats: GEMINI_FORMATS,
     providerFormat: () => "pcm_s16le_24000",
     synthesize: geminiSynthesize,
+  },
+  fish: {
+    defaultModel: "s2.1-pro",
+    // NOTE: no default: without a `reference_id` Fish picks a voice per request, so an agent would
+    // speak with a different voice on every reply.
+    defaultVoice: "",
+    requiresVoice: true,
+    formats: ["ogg_opus", "wav", "mp3"],
+    providerFormat: (format) =>
+      fishFormat(format) === "pcm" ? "pcm_s16le_24000" : "mp3",
+    synthesize: makeFishSynthesize({
+      budgetMs: TTS_TIMEOUT_MS,
+      retryDelayMs: 1_000,
+    }),
   },
 };
 

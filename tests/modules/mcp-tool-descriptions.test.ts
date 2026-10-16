@@ -314,7 +314,10 @@ const SETTINGS_DESC_CEILING = 2_000;
 // RAISED by `vision.pdfText` (a PDF the endpoint cannot take is read from its text layer): one
 // boolean the reader already produces, which `mcp-settings-schema` requires declared. 79 characters
 // after trimming its description to the default it states. Re-measured on the tree that ships: 30,089.
-const SETTINGS_SCHEMA_CEILING = 30_089;
+// RAISED by the `fish` STT and TTS providers: two enum members the registries publish, plus
+// `tts.latency`, the Fish knob the reader produces (an enum of three, no description). 105
+// characters, nothing to trim. Re-measured on the tree that ships: 30,194.
+const SETTINGS_SCHEMA_CEILING = 30_194;
 
 describe("MCP tool descriptions", () => {
   test("agent_settings_set stays under its ceiling", async () => {
@@ -781,7 +784,8 @@ describe("MCP tool descriptions", () => {
     // +388 for `send_carousel`, the same enum growth as SETTINGS_SCHEMA_CEILING.
     // +488 for the `replyGate` block, the same growth as SETTINGS_SCHEMA_CEILING.
     // +79 for `vision.pdfText`, the same growth as SETTINGS_SCHEMA_CEILING.
-    expect(schema).toBeLessThanOrEqual(66_399);
+    // +105 for the `fish` providers and `tts.latency`, the same growth as SETTINGS_SCHEMA_CEILING.
+    expect(schema).toBeLessThanOrEqual(66_504);
   });
 
   // Why the document write tools declare `blocks`/`fields` as loose arrays and put the vocabulary in

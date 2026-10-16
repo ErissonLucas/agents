@@ -133,6 +133,7 @@ const CLIENT_IDENTICAL_BY_DESIGN: readonly string[] = [
   "vault.secretType.assemblyai",
   "vault.secretType.deepseek",
   "vault.secretType.elevenlabs",
+  "vault.secretType.fish",
   "vault.secretType.gemini",
   "vault.secretType.google_oauth",
   "vault.secretType.langfuse",
@@ -1108,8 +1109,8 @@ describe("both languages answer, and answer differently", () => {
       // 103 -> 105: the RESEND integration ships two proper-noun keys
       // (`integrations.catalog.RESEND.label`, `vault.secretType.resend`) — the brand is not
       // translated in any language, same standing as the Asaas and Google entries above.
-      // 105 -> 106: `vault.secretType.assemblyai`, the AssemblyAI credential kind, a brand name.
-      hasProOnlyKeys ? 106 : 104,
+      // 105 -> 107: `vault.secretType.assemblyai` and `.fish`, credential kinds named by brand.
+      hasProOnlyKeys ? 107 : 105,
     );
     // NOT per edition any more, and that is the point: the list is empty in every tree, so the two
     // editions can no longer differ on it. The one entry that used to make them differ was waived

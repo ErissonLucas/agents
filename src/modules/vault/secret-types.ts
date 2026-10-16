@@ -169,6 +169,16 @@ export const SECRET_TYPES: SecretType[] = [
     },
   },
   {
+    id: "fish",
+    injection: "bearer",
+    service: "fish",
+    // NOTE: the account's own voices, one per page: any valid key can read it, and a wrong one 401s.
+    test: {
+      bases: ["https://api.fish.audio"],
+      path: "/model?self=true&page_size=1",
+    },
+  },
+  {
     id: "asaas",
     injection: "header",
     name: "access_token",

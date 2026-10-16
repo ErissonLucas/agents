@@ -14,6 +14,7 @@ import {
   TTS_DEFAULTS,
   TTS_MODES,
   type TtsCheckMode,
+  type TtsLatency,
   type TtsMode,
 } from "@/modules/tts/settings-shared";
 import {
@@ -55,6 +56,8 @@ export interface TtsFormState {
   style: string;
   speed: string;
   speakerBoost: boolean | null;
+  // Fish Audio's latency mode; "" = the provider's default, stored as null.
+  latency: TtsLatency | "";
   // The audio check for this agent (issue #802). "" = the instance's default, which is stored as
   // null so saving the tab never pins the agent to whatever the instance says today.
   checkMode: TtsCheckMode | "";
@@ -123,6 +126,7 @@ export function readTtsFormState(block: unknown): TtsFormState {
     style: num(voice.style),
     speed: num(voice.speed),
     speakerBoost: voice.speakerBoost ?? null,
+    latency: voice.latency ?? "",
     checkMode: TTS_CHECK_MODES.includes(str(tt.checkMode) as TtsCheckMode)
       ? (str(tt.checkMode) as TtsCheckMode)
       : "",
@@ -164,6 +168,7 @@ export function ttsSettingsFrom(tts: TtsFormState): Record<string, unknown> {
     style: clampVoiceSetting("style", numOrNull(tts.style)),
     speed: clampVoiceSetting("speed", numOrNull(tts.speed)),
     speakerBoost: tts.speakerBoost,
+    latency: tts.latency || null,
     checkMode: tts.checkMode || null,
     textInstead: tts.textInstead,
     textOverChars: clampSpeakableLimit(

@@ -20,6 +20,7 @@ const STT_PROVIDER_TYPE: Record<string, string> = {
   elevenlabs: "elevenlabs",
   openrouter: "openrouter",
   assemblyai: "assemblyai",
+  fish: "fish",
 };
 
 const TTS_PROVIDER_TYPE: Record<string, string> = {
@@ -27,6 +28,7 @@ const TTS_PROVIDER_TYPE: Record<string, string> = {
   elevenlabs: "elevenlabs",
   openrouter: "openrouter",
   gemini: "gemini",
+  fish: "fish",
 };
 
 const VISION_PROVIDER_TYPE: Record<string, string> = {

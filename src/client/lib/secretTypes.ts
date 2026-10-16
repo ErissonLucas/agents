@@ -18,6 +18,7 @@ export const SECRET_TYPE_IDS = [
   "openai_compatible",
   "elevenlabs",
   "assemblyai",
+  "fish",
   "asaas",
   "resend",
   "chatwoot_api_token",
@@ -71,6 +72,7 @@ export const SECRET_TYPE_META: Record<SecretTypeId, SecretTypeMeta> = {
   },
   elevenlabs: { service: "elevenlabs", testable: true },
   assemblyai: { service: "assemblyai", testable: true },
+  fish: { service: "fish", testable: true },
   asaas: { service: "asaas", testable: true },
   resend: { service: "resend", testable: true },
   chatwoot_api_token: {
