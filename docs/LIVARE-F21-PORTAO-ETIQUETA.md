@@ -120,6 +120,9 @@ Sem texto do cliente nem do agente.
 
 - Ligar o portão no meio de um turno só vale a partir do turno seguinte (o turno só relê quem carregou o portão).
 - Uma etiqueta tirada no celular só vale depois que o evento `label.update` chega (ver `handleLabelUpdate`).
+- Etiqueta posta por fora do fazer.ai (celular ou `POST /api/chat/assignTag` da RyzeAPI) vale para o portão: chega pelo
+  mesmo `label.update`, cujo formato real traz `chat: { jid, labeled }` (ver `docs/ryze.md`). O portão lê a etiqueta do
+  banco, não consulta a RyzeAPI na hora; um evento perdido deixa a conversa fechada (o lado seguro) até o próximo.
 - Um `set_labels` concorrente à transferência no mesmo turno é serializado pela fila; a etiqueta exigida e a de
   transferência são protegidas, então o modelo não as move.
 - Testes: `tests/modules/reply-gate.test.ts` (puros) e `tests/modules/ryze-reply-gate.test.ts` (ponta a ponta no
