@@ -383,6 +383,33 @@ describe.skipIf(!dbUp)("RyzeAPI WhatsApp labels", () => {
     expect(dup.outcome).toBe("ignored");
   });
 
+  test("the live event shape, with the chat as an object, moves the label too", async () => {
+    const off = await hook("label.update", {
+      type: "chat",
+      labelId: "100",
+      timestamp: "2026-11-13T11:51:30.835-03:00",
+      action: "remove",
+      label: null,
+      chat: { jid: `${jid}@s.whatsapp.net`, labeled: false },
+      messageId: null,
+    });
+    expect(off.outcome).toBe("accepted");
+    expect((await conv()).labels).not.toContain("cliente-vip");
+    const on = await hook("label.update", {
+      type: "chat",
+      labelId: "100",
+      timestamp: "2026-11-13T11:51:37.447-03:00",
+      action: "add",
+      label: null,
+      chat: { jid: `${jid}@s.whatsapp.net`, labeled: true },
+      messageId: null,
+    });
+    expect(on.outcome).toBe("accepted");
+    const c = await conv();
+    expect(c.labels).toContain("cliente-vip");
+    expect(c.deviceLabels).toEqual(["cliente-vip"]);
+  });
+
   test("the turn context lists the described catalog and the phone-edited titles", async () => {
     const turn = await runScopedOn(appDb, ctx(), (db) =>
       ryzeLabelTurnContext(db, instanceId, conversationId),

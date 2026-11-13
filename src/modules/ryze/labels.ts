@@ -854,6 +854,14 @@ export async function applyReplyGateHandoff(
   }
 }
 
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+function strOf(v: unknown): string | null {
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
 function tagIdOf(v: unknown): string | null {
   if (typeof v === "number" && Number.isFinite(v)) return String(v);
   return typeof v === "string" && v.length > 0 ? v : null;
@@ -910,11 +918,22 @@ export async function handleLabelUpdate(
     return "accepted";
   }
   if (type !== "chat") return "ignored";
-  const chatJid = typeof data.chatJid === "string" ? data.chatJid : "";
-  if (!chatJid || chatJid.endsWith("@g.us")) return "ignored";
+  // The live event carries the chat as an object, `chat: { jid, labeled }`; the documented one has
+  // `chatJid` and `labeled` on `data`. Both are read.
+  const chat = isRecord(data.chat) ? data.chat : {};
+  const chatJid =
+    strOf(data.chatJid) ?? strOf(chat.jid) ?? strOf(chat.lid) ?? "";
+  if (!chatJid || chatJid.endsWith("@g.us")) {
+    logger.warn(
+      "ryze: label.update for %s names no chat we can use (label %s)",
+      gw.instanceName,
+      tagId,
+    );
+    return "ignored";
+  }
+  const labeled = data.labeled ?? chat.labeled;
   const adding =
-    data.action === "add" ||
-    (data.action !== "remove" && data.labeled === true);
+    data.action === "add" || (data.action !== "remove" && labeled === true);
   const findTitle = () =>
     scoped(
       gw.tenantId,
@@ -930,14 +949,28 @@ export async function handleLabelUpdate(
     await syncCatalogFromWhatsApp(gw, deps);
     label = await findTitle();
   }
-  if (!label) return "ignored";
+  if (!label) {
+    logger.warn(
+      "ryze: label.update for %s names label %s, which is not in the catalog",
+      gw.instanceName,
+      tagId,
+    );
+    return "ignored";
+  }
   const title = label.title;
   const takeover = label.autoRule === "human_takeover";
   const out = await scoped(
     gw.tenantId,
     async (db) => {
       const conv = await conversationForJid(db, gw.id, chatJid);
-      if (!conv) return null;
+      if (!conv) {
+        logger.warn(
+          "ryze: label.update for %s names a chat with no conversation here (label %s)",
+          gw.instanceName,
+          tagId,
+        );
+        return null;
+      }
       const has = conv.labels.includes(title);
       if (adding === has) return null;
       const status = !takeover
