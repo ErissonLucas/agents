@@ -4,6 +4,7 @@ import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
+import config from "@/config";
 import {
   mayCloseConversation,
   postedOutcomeFor,
@@ -144,6 +145,7 @@ import {
 } from "./prepare";
 import { undoRefusedTurn } from "./refused-turn";
 import { burstReopenedResolved } from "./reopened-by-burst";
+import { checkReplyLoop, recordReply } from "./reply-loop";
 import { stillInSameEpisode } from "./reset-episode";
 import {
   chosenSilence,
@@ -3235,6 +3237,27 @@ async function turnBody(
     // the model wrote, attachments included. This sits ABOVE the empty-reply branch because a caption
     // is customer-facing text even when the model produced no final message of its own (skip_reply
     // with an image is a legitimate shape).
+    // NOTE: reply-loop guard (./reply-loop.ts): a conversation answered too often lately is a bot
+    // answering ours. Holding the reply is what stops the other side; the trip is a warn, so it alerts.
+    if (reply || turnState.pendingAttachments.length > 0) {
+      const loop = checkReplyLoop(graphThreadId);
+      if (loop.held) {
+        if (loop.tripped)
+          emitFlowEvent(flow, {
+            stage: "guardrail",
+            level: "warn",
+            status: "ok",
+            detail: {
+              replyLoop: loop.replies,
+              heldMs: config.agent.replyLoopPauseMs,
+            },
+          });
+        turnState.pendingAttachments.length = 0;
+        turnState.pendingButtons = undefined;
+        turnState.pendingCarousel = undefined;
+        return refuse("blocked");
+      }
+    }
     const modelWritten = modelWrittenNow();
     // JEV rule check (modules/jev): a reply that breaks the operator's rules (a discount, coupon or
     // deadline they do not grant) is held back. "handoff": the case goes to the team, like an output
@@ -3805,6 +3828,7 @@ async function turnBody(
     // messages it created, so the conversation screen can hang what the turn spent on the turn's own
     // last bubble. The answer above rides on it only when the silence tool asked.
     const sentMessageIds = recorded.sentIds();
+    if (sentMessageIds.length > 0) recordReply(graphThreadId);
     if (reachedModel || sentMessageIds.length > 0)
       emitFlowEvent(flow, {
         stage: "generate",

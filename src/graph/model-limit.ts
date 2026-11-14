@@ -7,6 +7,12 @@ import {
   isEmptyCompletionFault,
 } from "./empty-completion";
 import { isFallbackWorthy } from "./model-fallback";
+import {
+  isProviderNotice,
+  isProviderNoticeFault,
+  PROVIDER_NOTICE_MESSAGE,
+  ProviderNoticeFault,
+} from "./provider-notice";
 
 // Policy point for every agent model call: the LLM round-trip in the LangGraph agent node
 // (graph.ts), the guardrail classifier and the opt-in TTS-normalize call. It caps how many calls are
@@ -44,6 +50,7 @@ function describeProviderFault(err: unknown): unknown {
     // mutation showed it killed nothing — the retry's log is what covers this path.
     return new Error(EMPTY_COMPLETION_MESSAGE, { cause: err });
   }
+  if (isProviderNoticeFault(err)) return new Error(PROVIDER_NOTICE_MESSAGE);
   return asProviderFailure(err);
 }
 
@@ -177,7 +184,18 @@ export async function runModelCall<T>(
     labels: ModelLabels | undefined,
     ms: number,
   ): Promise<T> => {
-    const run = () => callWithDeadline(ms, call);
+    // NOTE: a provider notice is thrown, not retried: the same model answers it again.
+    const run = async () => {
+      const out = await callWithDeadline(ms, call);
+      if (isProviderNotice(out)) {
+        logger.warn(
+          { model: labels?.model, provider: labels?.provider },
+          "model call returned a provider service notice instead of a completion",
+        );
+        throw new ProviderNoticeFault();
+      }
+      return out;
+    };
     try {
       return await run();
     } catch (err) {

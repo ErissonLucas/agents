@@ -57,6 +57,9 @@ const {
   AGENT_MODEL_CONCURRENCY,
   AGENT_MODEL_CALL_TIMEOUT_MS,
   AGENT_CAPACITY_WAIT_ALERT_MS,
+  AGENT_REPLY_LOOP_MAX,
+  AGENT_REPLY_LOOP_WINDOW_MS,
+  AGENT_REPLY_LOOP_PAUSE_MS,
   AGENT_PROMPT_MAX_CHARS,
   HTTP_TOOL_TIMEOUT_MS,
   DB_POOL_MAX,
@@ -412,6 +415,30 @@ const config = {
       "AGENT_CAPACITY_WAIT_ALERT_MS",
       30_000,
       "It is how long a reply may wait for a debounce slot or a model permit before a capacity warning is logged.",
+      MAX_DURATION_MS,
+    ),
+    // NOTE: Reply-loop guard (src/graph/reply-loop.ts): more than `replyLoopMax` replies to one
+    // conversation inside `replyLoopWindowMs` reads as two bots answering each other, so replies there
+    // are held for `replyLoopPauseMs` and the operator is warned.
+    replyLoopMax: parseIntSetting(
+      AGENT_REPLY_LOOP_MAX,
+      "AGENT_REPLY_LOOP_MAX",
+      15,
+      "It is how many replies one conversation may receive inside the loop window before replies there are held.",
+      100_000,
+    ),
+    replyLoopWindowMs: parseIntSetting(
+      AGENT_REPLY_LOOP_WINDOW_MS,
+      "AGENT_REPLY_LOOP_WINDOW_MS",
+      600_000,
+      "It is the window the reply-loop guard counts replies in.",
+      MAX_DURATION_MS,
+    ),
+    replyLoopPauseMs: parseIntSetting(
+      AGENT_REPLY_LOOP_PAUSE_MS,
+      "AGENT_REPLY_LOOP_PAUSE_MS",
+      1_800_000,
+      "It is how long replies to a conversation stay held after the reply-loop guard trips.",
       MAX_DURATION_MS,
     ),
     // NOTE: Hard cap (characters) on an agent's system prompt, enforced at the service layer for

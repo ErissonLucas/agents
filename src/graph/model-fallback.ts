@@ -4,6 +4,7 @@ import {
   statusOf,
 } from "@/lib/provider-failure";
 import { isEmptyCompletionFault } from "./empty-completion";
+import { isProviderNoticeFault } from "./provider-notice";
 
 // WHEN A FAILED TURN IS WORTH ASKING A DIFFERENT PROVIDER, AND HOW LONG THE FIRST ONE MAY HOLD IT.
 //
@@ -45,6 +46,8 @@ export function isFallbackWorthy(err: unknown): boolean {
   // (measured 1 in 184 on one install, issue #63). Once that has failed too, another provider is
   // what is left.
   if (isEmptyCompletionFault(err)) return true;
+  // NOTE: a 200 that is the provider's notice (deprecated client, retired model) is its fault too.
+  if (isProviderNoticeFault(err)) return true;
   // "Was this a timeout?" has an owner, and this is not the place to write a second opinion: both
   // vendor SDKs raise a CLASS and leave `name` at "Error", which is what `provider-failure` learned
   // by measurement.
