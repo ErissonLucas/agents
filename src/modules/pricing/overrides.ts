@@ -1,17 +1,11 @@
 import { z } from "zod";
+import { phrase } from "@/lib/errors";
 
-// A TENANT'S OWN PRICES for model calls (issue #865), read from `tenant.settings.priceOverrides`.
-//
-// The price table (./model-prices.json) is public list prices, and a tenant does not always pay
-// list: a negotiated discount, a model served through Azure or Bedrock, a regional uplift, or its own
-// `openai-compatible` server, which the table can never price. An override names a provider and a
-// model and the four rates the table would have given, and it is consulted FIRST when a ledger row is
-// priced (./price.ts). It is also the correction that does not wait for a release when a list price
-// changes under a table already deployed.
-//
-// Stored as a list, not a map keyed by model, because the key is a PAIR (provider and model) and a
-// JSON object key would have to encode it. The list is short and read on every priced call, through
-// the cache below.
+// A tenant's own prices for model calls, read from `tenant.settings.priceOverrides`. The price table
+// holds public list prices, and a tenant may pay otherwise (a discount, Azure or Bedrock, its own
+// `openai-compatible` server the table can never price). An override is consulted FIRST when a ledger
+// row is priced (./price.ts). Stored as a list, not a map, because the key is a (provider, model)
+// PAIR a JSON object key would have to encode; it is short and read through the cache below.
 
 export const PRICE_OVERRIDE_PROVIDERS = [
   "openai",
@@ -20,6 +14,8 @@ export const PRICE_OVERRIDE_PROVIDERS = [
   "deepseek",
   "openrouter",
   "openai-compatible",
+  // Jev, the decisions engine's classification API (docs/decisions.md); its rate is pinned in price.ts.
+  "typesafe",
 ] as const;
 
 export const PRICE_OVERRIDES_MAX = 100;
@@ -55,6 +51,12 @@ export const priceOverridesSchema = z
           code: "custom",
           path: [i, "model"],
           message: "a model name is required for this provider",
+          params: {
+            phrase: phrase(
+              "errors.priceOverrideModelRequired",
+              "model: a model name is required for this provider",
+            ),
+          },
         });
       const key = overrideKey(o.provider, o.model);
       if (seen.has(key))
@@ -62,6 +64,12 @@ export const priceOverridesSchema = z
           code: "custom",
           path: [i, "model"],
           message: "duplicate provider and model",
+          params: {
+            phrase: phrase(
+              "errors.priceOverrideDuplicate",
+              "model: duplicate provider and model",
+            ),
+          },
         });
       seen.add(key);
     });

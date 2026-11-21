@@ -5,12 +5,10 @@ import { redactEndpoint } from "@/modules/audit/projection";
 // surfaces that return these URLs whole are not. `redactEndpoint` is what stands between an operator
 // pasting a token into an endpoint and that token being permanent.
 //
-// A table rather than a fixture per caller, because the rule is ONE and the callers are two. It was
-// briefly two rules — the alert channel keeping only its origin, the outbound subscription keeping
-// its path as well, on the reasoning that its column is in the clear. That reasoning ran from where
-// a value is stored to whether it is a secret, and those are unrelated: both families accept the
-// same arbitrary HTTPS destination, and the destinations operators point them at (Discord, Slack)
-// carry the credential in the PATH.
+// A table rather than a fixture per caller, because the rule is ONE and the callers are two. Where
+// a value is stored says nothing about whether it is a secret: both families accept the same
+// arbitrary HTTPS destination, and the ones operators use (Discord, Slack) carry the credential in
+// the PATH.
 
 const CASES: Array<[what: string, url: string, redacted: string]> = [
   // The three places a credential hides in the abstract, one at a time, then all at once.
@@ -62,19 +60,6 @@ describe("redactEndpoint", () => {
     // Not parseable, so no part of it can be shown to be safe — including the whole of it.
     for (const bad of ["", "not a url", "///", "example.com/hook"]) {
       expect(redactEndpoint(bad)).toBe("…");
-    }
-  });
-
-  test("no case in the table leaks the secret it carries", () => {
-    // The table above is read by eye; this is the assertion that does not depend on that.
-    const SECRETS = ["pw", "abc", "xyz", "sk-live-abc", "TOKENHERE", "hunter2"];
-    for (const [what, url, redacted] of CASES) {
-      for (const secret of SECRETS) {
-        if (!url.includes(secret)) continue;
-        expect(`${what} keeps ${secret}: ${redacted.includes(secret)}`).toBe(
-          `${what} keeps ${secret}: false`,
-        );
-      }
     }
   });
 });

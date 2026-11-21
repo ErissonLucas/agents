@@ -3,11 +3,12 @@
 import { PrismaPg } from "@prisma/adapter-pg";
 import { emailEquals } from "@/lib/email-match";
 import { roleAtLeast } from "@/lib/roles";
+import { withSessionOptions } from "@/lib/session-zone";
 import { PrismaClient, type UserRole } from "../generated/prisma/client";
 
 export interface ExistingUserUpdatePlan {
   // Present only when a promotion is actually needed (the role the person holds where it counts is
-  // below target). Role and tenant travel TOGETHER because they are one fact (issue #756):
+  // below target). Role and tenant travel TOGETHER because they are one fact:
   // SUPER_ADMIN is the person, with no tenant, and any other role is a membership in `tenantId`.
   promotion?: { role: UserRole; tenantId: bigint | null };
   passwordHash?: string;
@@ -16,9 +17,8 @@ export interface ExistingUserUpdatePlan {
 
 // Pure decision logic for updating an EXISTING user (no DB/hashing I/O), so the "never
 // silently demote, never split role from tenant" rule is unit-testable. Setting a password
-// must NOT force a role change: a SUPER_ADMIN given a password used to get unconditionally
-// reset to the computed TENANT_ADMIN role. Promotion only happens when the user's current role
-// ranks below the target. `currentRole` is SUPER_ADMIN for a fleet administrator, the role held in
+// must NOT force a role change (a SUPER_ADMIN given a password would drop to TENANT_ADMIN):
+// promotion only happens when the user's current role ranks below the target. `currentRole` is SUPER_ADMIN for a fleet administrator, the role held in
 // the target tenant otherwise, and null when the person does not belong to it yet.
 export function planExistingUserUpdate(params: {
   email: string;
@@ -61,7 +61,7 @@ async function main() {
     process.exit(1);
   }
 
-  // NOTE: admin CLI connects via the migration/superuser URL so it can read the tenants
+  // Admin CLI connects via the migration/superuser URL so it can read the tenants
   // table and write users without RLS friction (it writes outside the /setup advisory lock).
   // Run via Bun, which expands ${POSTGRES_PORT} in .env at load time.
   const databaseUrl =
@@ -73,11 +73,11 @@ async function main() {
     process.exit(1);
   }
   const prisma = new PrismaClient({
-    adapter: new PrismaPg({ connectionString: databaseUrl }),
+    adapter: new PrismaPg(withSessionOptions(databaseUrl)),
   });
 
   try {
-    // NOTE: TENANT_ADMIN of the first tenant when one exists; SUPER_ADMIN (no membership)
+    // TENANT_ADMIN of the first tenant when one exists; SUPER_ADMIN (no membership)
     // otherwise, so this can also bootstrap a fleet admin before /setup has run.
     const tenant = await prisma.tenant.findFirst({
       orderBy: { id: "asc" },

@@ -1,17 +1,24 @@
 import { readModelFallbackConfig } from "@/graph/fallback-settings";
+import { readChoiceCheckConfig } from "@/graph/tools/choice-check-settings";
 import { readLimitsConfig } from "@/modules/agents/limits";
+import { GROUNDING_RANGES } from "@/modules/agents/number-ranges";
 import { readReplyGateConfig } from "@/modules/agents/reply-gate";
+import { readResolveConversationConfig } from "@/modules/agents/resolve-labels";
 import {
   readAllowedLabels,
+  readLabelRemoval,
   readOutsideAllowedLabels,
   readProtectedLabels,
   readToolGuidance,
+  readWritableAttributes,
 } from "@/modules/agents/tool-guidance";
-import { readToolPreconditions } from "@/modules/agents/tool-preconditions";
+import { readToolPreconditionsForDisplay } from "@/modules/agents/tool-preconditions";
 import { readAvailabilityConfig } from "@/modules/availability/away";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
 import { readAttributeContextConfig } from "@/modules/chatwoot/attributes";
+import { readContactFieldsConfig } from "@/modules/chatwoot/contact-fields";
 import { readContactAuthConfig } from "@/modules/contact-auth/settings";
+import { readConversationNotesConfig } from "@/modules/conversation-notes/settings";
 import { readCrossInboxCaseConfig } from "@/modules/cross-inbox-case/settings";
 import { readDebounceConfig } from "@/modules/debounce/settings";
 import {
@@ -19,6 +26,7 @@ import {
   storableObservability,
 } from "@/modules/flowlog/settings";
 import { readFollowUpConfig } from "@/modules/followups/settings";
+import { readSnoozedFollowUpConfig } from "@/modules/followups/snoozed-settings";
 import { readGuardrailsConfig } from "@/modules/guardrails/settings";
 import {
   readHandoffConfig,
@@ -28,12 +36,15 @@ import { readSendImageConfig } from "@/modules/images/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { readMonitoringConfig } from "@/modules/observe/settings";
+import { readOtherInboxesConfig } from "@/modules/other-inboxes/settings";
+import { readKnowledgeConfig } from "@/modules/rag/review-settings";
 import { readServiceWindowConfig } from "@/modules/service-window/service";
 import { readSignatureConfig } from "@/modules/signature/service";
 import { readSplitConfig } from "@/modules/split/service";
 import { readSttConfig } from "@/modules/stt/settings";
 import { readTtsConfig } from "@/modules/tts/settings";
 import { readVisionConfig } from "@/modules/vision/settings";
+import { readCallsConfig } from "@/modules/voice-call/settings";
 
 // Normalized read of the per-agent BEHAVIOR config that lives in the free-form `agent.settings` bag
 // (debounce / stt / tts / split / serviceWindow + grounding + followUp). The same typed readers the
@@ -51,7 +62,9 @@ function readGrounding(settings: unknown): { maxDistance: number | null } {
   const v = (g as Record<string, unknown>).maxDistance;
   return {
     maxDistance:
-      typeof v === "number" && Number.isFinite(v) && v > 0 ? v : null,
+      typeof v === "number" && Number.isFinite(v) && v > 0
+        ? Math.min(v, GROUNDING_RANGES.maxDistance.max)
+        : null,
   };
 }
 
@@ -59,20 +72,29 @@ export interface BehaviorSettings {
   debounce: ReturnType<typeof readDebounceConfig>;
   stt: ReturnType<typeof readSttConfig>;
   tts: ReturnType<typeof readTtsConfig>;
+  // WhatsApp calls the agent answers and places (modules/voice-call/settings).
+  calls: ReturnType<typeof readCallsConfig>;
   vision: ReturnType<typeof readVisionConfig>;
   split: ReturnType<typeof readSplitConfig>;
   signature: ReturnType<typeof readSignatureConfig>;
   serviceWindow: ReturnType<typeof readServiceWindowConfig>;
   grounding: { maxDistance: number | null };
   followUp: ReturnType<typeof readFollowUpConfig>;
+  // NOTE: The ladder for a snoozed conversation a PERSON owns; `followUp` is the bot's.
+  snoozedFollowUp: ReturnType<typeof readSnoozedFollowUpConfig>;
   handoff: ReturnType<typeof readHandoffConfig>;
   // NOTE: The second block whose default is ON (see modules/handoff/settings for why), and it is kept
   // apart from `handoff` above because the Tools tab REPLACES that one wholesale.
   takeover: ReturnType<typeof readTakeoverConfig>;
   // NOTE: Off by default: an agent whose bag has no block speaks as it always did.
   replyGate: ReturnType<typeof readReplyGateConfig>;
+  conversationNotes: ReturnType<typeof readConversationNotesConfig>;
   sendImage: ReturnType<typeof readSendImageConfig>;
+  // NOTE: The labels resolve_conversation writes itself, before the close.
+  resolveConversation: ReturnType<typeof readResolveConversationConfig>;
   crossInboxCase: ReturnType<typeof readCrossInboxCaseConfig>;
+  // NOTE: The contact's conversations in other inboxes the operator picked, read into the prompt.
+  otherInboxes: ReturnType<typeof readOtherInboxesConfig>;
   limits: ReturnType<typeof readLimitsConfig>;
   availability: ReturnType<typeof readAvailabilityConfig>;
   contactAuth: ReturnType<typeof readContactAuthConfig>;
@@ -80,27 +102,31 @@ export interface BehaviorSettings {
   guardrails: ReturnType<typeof readGuardrailsConfig>;
   // NOTE: Which Chatwoot custom attributes (per scope) are injected into the system prompt.
   attributeContext: ReturnType<typeof readAttributeContextConfig>;
+  // NOTE: Which standard contact fields go into the prompt, and which update_contact may change.
+  contactFields: ReturnType<typeof readContactFieldsConfig>;
   observability: ReturnType<typeof readObservabilityConfig>;
   // NOTE: The one block in this bag whose default is ON (see modules/memory/settings), so a bag with
   // no `memory` key projects `enabled: true` rather than the usual "absent means off".
   memory: ReturnType<typeof readMemoryConfig>;
+  // NOTE: All four fields null is the agent's own model, as for the summariser.
+  knowledge: ReturnType<typeof readKnowledgeConfig>;
   // NOTE: All four fields null is the ordinary state and means NO fallback, not "the agent's own
   // model" the way the two sibling overrides read it (see graph/fallback-settings).
   modelFallback: ReturnType<typeof readModelFallbackConfig>;
-  // NOTE: The five below joined this surface with issue #402, and they are the reason the guard over it
-  // changed shape. Each was already written by the console and by REST; none was reachable over MCP,
-  // because the check that should have noticed compared against the list right below rather than
-  // against what the readers produce. `guardrails` is the one that was left out on purpose, and the
-  // reason was never written anywhere — which is why "decided" and "forgotten" had become the same
-  // thing from outside.
   kanban: ReturnType<typeof readKanbanConfig>;
   toolGuidance: ReturnType<typeof readToolGuidance>;
   setLabels: {
     protected: ReturnType<typeof readProtectedLabels>;
     allowed: ReturnType<typeof readAllowedLabels>;
     outsideAllowed: ReturnType<typeof readOutsideAllowedLabels>;
+    removal: ReturnType<typeof readLabelRemoval>;
   };
-  toolPreconditions: ReturnType<typeof readToolPreconditions>;
+  setCustomAttribute: {
+    allowed: ReturnType<typeof readWritableAttributes>;
+  };
+  toolPreconditions: ReturnType<typeof readToolPreconditionsForDisplay>;
+  // NOTE: All four fields null is the agent's own model, as for the reviewer.
+  choiceCheck: ReturnType<typeof readChoiceCheckConfig>;
   monitoring: ReturnType<typeof readMonitoringConfig>;
 }
 
@@ -110,41 +136,46 @@ export const BEHAVIOR_SETTINGS_KEYS = [
   "debounce",
   "stt",
   "tts",
+  "calls",
   "vision",
   "split",
   "signature",
   "serviceWindow",
   "grounding",
   "followUp",
+  "snoozedFollowUp",
   "handoff",
   "takeover",
   "replyGate",
+  "conversationNotes",
   "sendImage",
+  "resolveConversation",
   "crossInboxCase",
+  "otherInboxes",
   "limits",
   "availability",
   "contactAuth",
   "channelRedirect",
   "guardrails",
   "attributeContext",
+  "contactFields",
   "observability",
   "memory",
+  "knowledge",
   "modelFallback",
   "kanban",
   "toolGuidance",
   "setLabels",
+  "setCustomAttribute",
   "toolPreconditions",
+  "choiceCheck",
   "monitoring",
 ] as const;
 export type BehaviorSettingsKey = (typeof BEHAVIOR_SETTINGS_KEYS)[number];
 
 // Normalize the whole behavior block from a raw settings bag (defaults + clamps applied).
-// `now` is threaded rather than left to each reader's own default for the reason
-// `readObservabilityConfig` states at its own signature: a caller that already holds an instant has
-// to use the SAME one for every read of it. Two calls of this function on one stored bag are not
-// otherwise guaranteed to agree — measured, 80ms apart across a `fullDetailUntil` expiry they differ
-// in two fields, because that reader nulls the deadline once the window closes as well as flipping
-// the derived flag.
+// `now` is threaded so every read uses the SAME instant: across a `fullDetailUntil` expiry, two reads
+// of one bag would otherwise differ.
 export function readBehaviorSettings(
   settings: unknown,
   now: Date = new Date(),
@@ -153,25 +184,32 @@ export function readBehaviorSettings(
     debounce: readDebounceConfig(settings),
     stt: readSttConfig(settings),
     tts: readTtsConfig(settings),
+    calls: readCallsConfig(settings),
     vision: readVisionConfig(settings),
     split: readSplitConfig(settings),
     signature: readSignatureConfig(settings),
     serviceWindow: readServiceWindowConfig(settings),
     grounding: readGrounding(settings),
     followUp: readFollowUpConfig(settings),
+    snoozedFollowUp: readSnoozedFollowUpConfig(settings),
     handoff: readHandoffConfig(settings),
     takeover: readTakeoverConfig(settings),
     replyGate: readReplyGateConfig(settings),
+    conversationNotes: readConversationNotesConfig(settings),
     sendImage: readSendImageConfig(settings),
+    resolveConversation: readResolveConversationConfig(settings),
     crossInboxCase: readCrossInboxCaseConfig(settings),
+    otherInboxes: readOtherInboxesConfig(settings),
     limits: readLimitsConfig(settings),
     availability: readAvailabilityConfig(settings),
     contactAuth: readContactAuthConfig(settings),
     channelRedirect: readChannelRedirectConfig(settings),
     guardrails: readGuardrailsConfig(settings),
     attributeContext: readAttributeContextConfig(settings),
+    contactFields: readContactFieldsConfig(settings),
     observability: readObservabilityConfig(settings, now),
     memory: readMemoryConfig(settings),
+    knowledge: readKnowledgeConfig(settings),
     modelFallback: readModelFallbackConfig(settings),
     kanban: readKanbanConfig(settings),
     toolGuidance: readToolGuidance(settings),
@@ -179,8 +217,11 @@ export function readBehaviorSettings(
       protected: readProtectedLabels(settings),
       allowed: readAllowedLabels(settings),
       outsideAllowed: readOutsideAllowedLabels(settings),
+      removal: readLabelRemoval(settings),
     },
-    toolPreconditions: readToolPreconditions(settings),
+    setCustomAttribute: { allowed: readWritableAttributes(settings) },
+    toolPreconditions: readToolPreconditionsForDisplay(settings),
+    choiceCheck: readChoiceCheckConfig(settings),
     monitoring: readMonitoringConfig(settings),
   };
 }
@@ -191,30 +232,39 @@ export interface BehaviorSettingsPatch {
   debounce?: Record<string, unknown>;
   stt?: Record<string, unknown>;
   tts?: Record<string, unknown>;
+  calls?: Record<string, unknown>;
   vision?: Record<string, unknown>;
   split?: Record<string, unknown>;
   signature?: Record<string, unknown>;
   serviceWindow?: Record<string, unknown>;
   grounding?: Record<string, unknown>;
   followUp?: Record<string, unknown>;
+  snoozedFollowUp?: Record<string, unknown>;
   handoff?: Record<string, unknown>;
   takeover?: Record<string, unknown>;
   replyGate?: Record<string, unknown>;
+  conversationNotes?: Record<string, unknown>;
   sendImage?: Record<string, unknown>;
+  resolveConversation?: Record<string, unknown>;
   crossInboxCase?: Record<string, unknown>;
+  otherInboxes?: Record<string, unknown>;
   limits?: Record<string, unknown>;
   availability?: Record<string, unknown>;
   contactAuth?: Record<string, unknown>;
   channelRedirect?: Record<string, unknown>;
   guardrails?: Record<string, unknown>;
   attributeContext?: Record<string, unknown>;
+  contactFields?: Record<string, unknown>;
   observability?: Record<string, unknown>;
   memory?: Record<string, unknown>;
+  knowledge?: Record<string, unknown>;
   modelFallback?: Record<string, unknown>;
   kanban?: Record<string, unknown>;
   toolGuidance?: Record<string, unknown>;
   setLabels?: Record<string, unknown>;
+  setCustomAttribute?: Record<string, unknown>;
   toolPreconditions?: Record<string, unknown>;
+  choiceCheck?: Record<string, unknown>;
   monitoring?: Record<string, unknown>;
 }
 
@@ -222,35 +272,9 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-// Merge a patch into a stored block key by key, at ANY depth (issue #184). Two objects merge;
-// anything else replaces.
-//
-// The depth is the whole point. One shallow spread kept the "untouched keys preserved" promise at
-// the top level of a block and broke it one step in, and the break was silent rather than loud:
-// each block is re-read through its typed reader afterwards, so a sub-object the patch replaced
-// came back FILLED WITH DEFAULTS instead of absent. Turning off a guardrail direction returned a
-// complete, plausible direction with the operator's refusal text swapped for the product's and
-// `action: "silent"` — send nothing — swapped for `template` — send this.
-//
-// An ARRAY replaces, deliberately: a list patch means the new list. Merging element by element
-// would make a shorter `followUp.steps` or a smaller attribute scope impossible to express, which
-// is the opposite of what sending one means.
-// How deep the merge will follow a patch before it stops descending and simply replaces. Both halves
-// of that are load-bearing.
-//
-// It is BOUNDED because the settings bag is caller-supplied on both sides — the stored value and the
-// patch — and `agentUpdateSchema.settings` accepts arbitrary nested `unknown`. Recursing once per
-// level turns "store a deep object, then patch it" into `RangeError: Maximum call stack size
-// exceeded` (measured against this tree: 5_000 levels merge fine, 20_000 throw), and since the throw
-// escapes the write, the agent's settings would stay unwritable until the row was repaired by hand.
-//
-// The number comes from the shape the readers actually produce, not from the stack: the deepest is
-// `guardrails.input.checks.toxicity`, at 4. Eight is double that and four orders of magnitude short
-// of where the stack gives out. `mergeMaxDepthCoversReaders` in the tests ties the two together, so
-// a block that grows deeper than this fails there rather than silently losing values past the cap.
-//
-// Past the cap it REPLACES, which is what the merge did at every level before it learned to descend.
-// Nothing that used to work changes shape; only the runaway stops.
+// How deep the merge descends before it replaces. Bounded because both sides are caller-supplied and
+// unbounded recursion would overflow the stack and leave the settings unwritable. Double the deepest
+// path the readers produce (4); `mergeMaxDepthCoversReaders` in the tests keeps it above that.
 const MERGE_MAX_DEPTH = 8;
 
 // Fields inside a block that the merge replaces whole instead of descending into.
@@ -258,7 +282,10 @@ const ATOMIC_FIELDS: Record<string, readonly string[]> = {
   contactAuth: ["rule"],
 };
 
-function mergeBlock(
+// Merge a patch into a stored block key by key, at any depth: a sub-object replaced by a shallow
+// spread would be re-read FILLED WITH DEFAULTS. Two objects merge; anything else, arrays included
+// (a list patch means the new list), replaces.
+export function mergeBlock(
   before: Record<string, unknown>,
   patch: Record<string, unknown>,
   depth = 1,
@@ -290,29 +317,9 @@ export function behaviorSettingsMaxDepth(): number {
 
 export const MERGE_MAX_DEPTH_FOR_TESTS = MERGE_MAX_DEPTH;
 
-// Merge a behavior patch into the existing raw settings bag, then RE-READ each touched block through
-// its typed reader so the persisted value is always normalized + clamped (never the raw patch).
-// Untouched keys in the bag (and untouched blocks) are preserved verbatim — the REST/UI merge
-// contract. Returns the new settings bag to persist.
-// THE BLOCKS WHOSE READER IS A FILTER, NOT A DEFAULTER — and the distinction is the whole reason
-// they are handled apart (PR #404, round 1).
-//
-// Every other block reads into DEFAULTS: an unrecognized value becomes the default, so re-reading a
-// bag and storing what came out loses nothing, because there was nothing the reader could not
-// represent. These two DROP what they do not recognize — a key outside the native catalog, a
-// condition of a kind added later, an entry an agent import copied in verbatim. Run them through the
-// same normalized write-back and "normalize" means DELETE.
-//
-// Three ways that was measured to bite, all silent, all on a guard the operator believed was there:
-// an invalid entry in the patch erased the VALID one it replaced; an update to `debounce` deleted a
-// precondition it never mentioned; and there was no way to remove one at all, since an empty object
-// deep-merged into the old value and changed nothing.
-//
-// So: merged BY KEY with whole-value replacement, `null` to remove, keys the patch does not mention
-// left byte-identical — and never written back through the reader. The write boundary is what
-// refuses a bad entry (assertSettingsToolPreconditions, run on the PATCH before this merge, like its
-// three siblings in modules/mcp/write.ts), which is also why dropping one here would be the wrong
-// place to enforce anything.
+// The blocks whose reader FILTERS rather than defaults: it drops what it does not recognize, so a
+// normalized write-back would delete entries. Merged by key with whole-value replacement, `null` to
+// remove, never written back through the reader; the write boundary refuses bad entries instead.
 const TOOL_KEYED_BLOCKS: ReadonlySet<string> = new Set([
   "toolGuidance",
   "toolPreconditions",
@@ -322,12 +329,8 @@ function mergeToolKeyedBlock(
   before: Record<string, unknown>,
   patch: Record<string, unknown>,
 ): Record<string, unknown> {
-  // NOTE: An ARRAY prior is no map at all, and enumerating it is worse than ignoring it: `Object.entries`
-  // on an array yields its INDICES, so a stored array became keys "0" and "1" and the apply then
-  // refused with `settings.toolPreconditions.0 is not a valid precondition` — a field name the
-  // operator never wrote, and no way for this surface to write over the bad block at all. An array
-  // was never valid configuration here (the reader ignores it whole), so there is nothing to
-  // preserve and the patch repairs the block.
+  // An ARRAY prior is not a map (the reader ignores it whole), and enumerating it would yield
+  // index keys; dropping it lets the patch repair the block.
   const prior = Array.isArray(before) ? {} : before;
   // NULL-PROTOTYPE, for the reason the runtime map is: a tool name is operator text, and `__proto__`
   // assigned onto an ordinary object mutates the prototype instead of storing an entry.
@@ -342,18 +345,19 @@ function mergeToolKeyedBlock(
   return out;
 }
 
+// Merge a behavior patch into the raw settings bag, then RE-READ each block through its typed reader
+// so what is persisted is normalized and clamped. Untouched keys and blocks are preserved verbatim.
 export function mergeBehaviorSettings(
   current: Record<string, unknown>,
   patch: BehaviorSettingsPatch,
 ): Record<string, unknown> {
-  // Start from a shallow copy of the existing bag (preserves unknown/non-behavior keys).
   const next: Record<string, unknown> = { ...current };
 
   for (const key of BEHAVIOR_SETTINGS_KEYS) {
     const sub = patch[key];
     if (sub === undefined) continue;
     if (sub === null || typeof sub !== "object" || Array.isArray(sub)) {
-      // A non-object block is ignored (the readers would coerce it to defaults anyway); skipping
+      // NOTE: A non-object block is ignored (the readers would coerce it to defaults anyway); skipping
       // here keeps the existing block intact rather than silently wiping it.
       continue;
     }
@@ -364,10 +368,8 @@ export function mergeBehaviorSettings(
     next[key] = TOOL_KEYED_BLOCKS.has(key)
       ? mergeToolKeyedBlock(before, sub)
       : mergeBlock(before, sub);
-    // A value that is ONE decision is replaced, never merged into (issue #646 review). The contact
-    // gate's rule is tagged by `kind`: merged, a new key kept the old rule's `equals`, and a list
-    // switched to an attribute kept its phones beside it, so the rule a caller wrote was not the rule
-    // stored.
+    // A value that is ONE decision (the contact gate's `kind`-tagged rule) is replaced, never
+    // merged into, or the stored rule would keep fields of the old one.
     const atomic = ATOMIC_FIELDS[key];
     if (atomic) {
       for (const field of atomic) {
@@ -380,17 +382,10 @@ export function mergeBehaviorSettings(
     }
   }
 
-  // Re-read through the typed readers to clamp/validate, then write the normalized blocks back.
-  //
-  // FROM THE KEY LIST, not eighteen assignments beside it. This was a line per block, and the guard
-  // over it (tests/modules/behavior-settings.test.ts) exists because `modelFallback` went in without
-  // one — the fourth block in a single change to reach one registration point and not the next. It
-  // happened again here: #402 added four blocks to the list above and the write-back kept the shape
-  // it had, so `kanban` and `appointmentReminders` merged and were never stored normalized. The
-  // guard caught it, which is the argument for deriving rather than for a more careful reviewer.
-  //
-  // The two exceptions are handled after the loop, and each is a real difference rather than an
-  // omission: see their own comments below.
+  // Write the normalized blocks back, derived from the key list so a new block cannot miss it, and
+  // only the blocks the patch named: one it did not name stays exactly as stored, absent included,
+  // since written through its reader it would carry today's defaults and stop following them.
+  // The exceptions are handled after the loop.
   const normalized = readBehaviorSettings(next) as unknown as Record<
     string,
     unknown
@@ -400,15 +395,19 @@ export function mergeBehaviorSettings(
     "grounding",
     ...TOOL_KEYED_BLOCKS,
   ]);
+  const named = (key: string) =>
+    (patch as Record<string, unknown>)[key] !== undefined;
   for (const key of BEHAVIOR_SETTINGS_KEYS) {
-    if (WRITTEN_BACK_SEPARATELY.has(key)) continue;
+    if (WRITTEN_BACK_SEPARATELY.has(key) || !named(key)) continue;
     next[key] = normalized[key];
   }
   // Through the storable projection, not the read shape: `observability.fullDetail` is DERIVED, and
   // this line is what would persist it.
-  next.observability = storableObservability(
-    normalized.observability as ReturnType<typeof readObservabilityConfig>,
-  );
+  if (named("observability")) {
+    next.observability = storableObservability(
+      normalized.observability as ReturnType<typeof readObservabilityConfig>,
+    );
+  }
   // grounding: only persist when a valid distance is set; otherwise leave whatever was there
   // (a null maxDistance means "no grounding filter" — represent it explicitly when the patch
   // touched grounding so the operator can clear it).

@@ -7,8 +7,8 @@ import {
   setActiveTenantId,
 } from "@/client/lib/activeTenant";
 
-// Issue #756: with a person able to belong to several tenants, choosing one in one tab must not move
-// the others. The selection lives in the TAB (sessionStorage); the last choice is only the starting
+// With a person able to belong to several tenants, choosing one in one tab must not move the
+// others. The selection lives in the TAB (sessionStorage); the last choice is only the starting
 // point of a new tab (localStorage), and a tab keeps what it started with.
 
 const KEY = "@app:active-tenant";
@@ -36,12 +36,6 @@ describe("the selected tenant is the tab's", () => {
     expect(getActiveTenantId()).toBe("3");
   });
 
-  test("the tab's own choice wins over the shared default", () => {
-    sessionStorage.setItem(KEY, "4");
-    localStorage.setItem(KEY, "5");
-    expect(getActiveTenantId()).toBe("4");
-  });
-
   test("a refused selection is dropped from the tab and from the default", () => {
     setActiveTenantId("8");
     expect(dropRejectedSelection("8")).toBe(true);
@@ -50,9 +44,9 @@ describe("the selected tenant is the tab's", () => {
     expect(getActiveTenantId()).toBeNull();
   });
 
-  // Review round 1: a member's first tab runs under the default membership with nothing stored, and
-  // until it holds that id it would inherit whatever another tab chooses next. The session pins it to
-  // the tab, and only to the tab: it is not a choice, so it is not the next tab's default.
+  // NOTE: a member's first tab runs under the default membership with nothing stored, and until it
+  // holds that id it would inherit whatever another tab chooses next. The session pins it to the
+  // tab, and only to the tab: it is not a choice, so it is not the next tab's default.
   test("the tenant the session resolved is pinned to the tab, and to the tab only", () => {
     pinTabTenantId("6");
     expect(sessionStorage.getItem(KEY)).toBe("6");
@@ -84,5 +78,93 @@ describe("the selected tenant is the tab's", () => {
     setActiveTenantId("5");
     adoptSessionTenant({ role: "SUPER_ADMIN", tenantId: null }, "2");
     expect(getActiveTenantId()).toBe("5");
+  });
+});
+
+// Every API call reads the selection for its X-Tenant-Id header, so a browser that blocks site data
+// (touching either store throws) must read as "nothing selected", not fail every request. A store
+// that exists but refuses a write still fails loudly, and so does an explicit choice: a selection
+// that silently is not kept would leave this tab on the shared default another tab moves, or reload
+// a tenant switch forever.
+describe("storage the browser refuses", () => {
+  beforeEach(() => {
+    sessionStorage.clear();
+    localStorage.clear();
+  });
+
+  const blocked = () => {
+    throw new DOMException("blocked", "SecurityError");
+  };
+
+  function withStores(
+    session: PropertyDescriptor,
+    local: PropertyDescriptor,
+    run: () => void,
+  ) {
+    const s = Object.getOwnPropertyDescriptor(globalThis, "sessionStorage");
+    const l = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    Object.defineProperty(globalThis, "sessionStorage", {
+      configurable: true,
+      ...session,
+    });
+    Object.defineProperty(globalThis, "localStorage", {
+      configurable: true,
+      ...local,
+    });
+    try {
+      run();
+    } finally {
+      if (s) Object.defineProperty(globalThis, "sessionStorage", s);
+      if (l) Object.defineProperty(globalThis, "localStorage", l);
+    }
+  }
+
+  test("site data blocked: nothing is selected, the session's pins are skipped, a choice throws", () => {
+    withStores({ get: blocked }, { get: blocked }, () => {
+      expect(getActiveTenantId()).toBeNull();
+      expect(() => pinTabTenantId("7")).not.toThrow();
+      expect(() =>
+        adoptSessionTenant({ role: "SUPER_ADMIN", tenantId: null }, "7"),
+      ).not.toThrow();
+      expect(() =>
+        adoptSessionTenant({ role: "TENANT_ADMIN", tenantId: "7" }, null),
+      ).not.toThrow();
+      expect(getActiveTenantId()).toBeNull();
+      expect(() => setActiveTenantId("7")).toThrow();
+    });
+  });
+
+  test("a store whose reads throw reads as nothing selected; its writes still throw", () => {
+    const refusing = {
+      getItem: blocked,
+      setItem: blocked,
+      removeItem: blocked,
+    } as unknown as Storage;
+    withStores({ value: refusing }, { value: refusing }, () => {
+      expect(getActiveTenantId()).toBeNull();
+      expect(() => pinTabTenantId("7")).toThrow();
+      expect(() => setActiveTenantId("7")).toThrow();
+    });
+  });
+
+  test("a blocked tab store with a shared default reads the default and pins nothing", () => {
+    localStorage.setItem(KEY, "3");
+    const l = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    withStores({ get: blocked }, l ?? {}, () => {
+      expect(getActiveTenantId()).toBe("3");
+    });
+  });
+
+  test("a tab store that refuses the pin fails loudly instead of following the shared default", () => {
+    const tabRefusingWrites = {
+      getItem: () => null,
+      setItem: blocked,
+      removeItem: blocked,
+    } as unknown as Storage;
+    localStorage.setItem(KEY, "3");
+    const l = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+    withStores({ value: tabRefusingWrites }, l ?? {}, () => {
+      expect(() => getActiveTenantId()).toThrow();
+    });
   });
 });

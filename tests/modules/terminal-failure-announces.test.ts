@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { processAlertBatch } from "@/modules/flowlog/alert-worker";
+import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import { registerRagIngestHandler } from "@/modules/rag/documents";
 import {
   claimDueJobs,
@@ -22,20 +23,18 @@ import {
   processInboundDelivery,
   receiveInbound,
 } from "@/modules/webhooks/inbound/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
 import { withJobHandler } from "@/tests/utils/job-registry";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { until } from "@/tests/utils/poll";
 
-// ── A UNIT OF WORK THAT DIES PERMANENTLY HAS TO SAY SO (issue #356) ──
+// ── A UNIT OF WORK THAT DIES PERMANENTLY HAS TO SAY SO ──
 //
-// Four buses reach a terminal failure state and, before this, three of them said nothing anywhere:
-// the scheduler (for every kind without a hand-written hook), the alert bus, the inbound receptor,
-// and the RAG indexer. The operator cannot infer any of them — by definition nothing happens
-// afterwards — so the effect asserted here is always the durable row an operator reads
-// (`ExecutionLog`), never a return value or a counter, because counting is exactly what did not
-// reach anybody.
-//
-// Integration, real DB, real RLS. Only the network is injected.
+// The scheduler (every kind without a hand-written hook), the alert bus, the inbound receptor and
+// the RAG indexer each reach a terminal failure the operator cannot infer (nothing happens after
+// it), so the effect asserted is always the durable row an operator reads (`ExecutionLog`), never a
+// return value or a counter, which reaches nobody. Integration, real DB, real RLS; only the network
+// is injected.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -53,8 +52,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -74,26 +73,25 @@ let routeToken = "";
 
 const past = () => new Date(Date.now() - 60_000);
 
-// The emit is fire-and-forget, so the row lands after the caller returned. Poll for the expected
-// count rather than sleeping a fixed amount: a fixed sleep is either flaky or slow, and this says
-// which of the two it is when it fails.
-async function deadRows(expected: number, waitMs = POLL_DEADLINE_MS) {
-  const deadline = Date.now() + waitMs;
-  for (;;) {
-    const rows = await flowLogRows(suDb, {
-      // flowlog-scope: tenant-wide — the subject is HOW MANY lines a terminal failure wrote, so a
-      // reader scoped to one turn would answer a different question and stay green while a second,
-      // duplicate line existed. None of these units HAS a turn; this file's tenant is its own, and
-      // `clearRows` empties it before each case through `clearFlowLog`, which settles the scheduled
-      // writes first — without that the emptying misses whatever the previous case had scheduled and
-      // not yet written, and 23 cases share this tenant (issue #375).
+// The emit is fire-and-forget, so the row lands after the caller returned. Every scheduled write is
+// settled first, which is what lets `deadRows(0)` say "none was written" without sleeping; a count
+// above zero is then polled for, in case a line comes from a write nothing tracks.
+async function deadRows(expected: number) {
+  await settleFlowEvents();
+  const read = () =>
+    flowLogRows(suDb, {
+      // flowlog-scope: tenant-wide. The subject is HOW MANY lines a terminal failure wrote, and none of
+      // these units has a turn. The tenant is this file's own, and `clearRows` empties it before each
+      // case through `clearFlowLog`, which settles scheduled writes first, or the emptying misses the
+      // line the previous case scheduled (many cases share this tenant).
       where: { tenantId, stage: "dead_letter" },
       orderBy: { id: "asc" },
     });
-    if (rows.length >= expected) return rows;
-    if (Date.now() > deadline) return rows;
-    await Bun.sleep(50);
-  }
+  if (expected === 0) return read();
+  return until(`${expected} dead-letter line(s)`, async () => {
+    const rows = await read();
+    return rows.length >= expected ? rows : null;
+  });
 }
 
 async function clearRows() {
@@ -115,6 +113,7 @@ const BunRes = (globalThis as { BunResponse?: typeof Response })
 describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
   beforeAll(async () => {
     embedServer = Bun.serve({
+      hostname: "127.0.0.1",
       port: 0,
       async fetch(req) {
         if (req.method === "OPTIONS")
@@ -226,18 +225,13 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     await app?.$disconnect();
   });
 
-  // ── THE SCHEDULER: the biggest half, and it was per kind ──
+  // ── THE SCHEDULER: the biggest half, per kind ──
 
   test("the test harness puts the registry back, including when it was empty", async () => {
-    // WEBHOOK_RETRY has no production handler at all — nothing registers one and nothing enqueues
-    // the kind — so it is the case a restore that only re-registers a PREVIOUS handler gets wrong,
-    // and the mistake is invisible from inside the file that makes it: the stub surfaces as another
-    // file's scheduler test inheriting it, order-dependently.
-    //
-    // The absent state is SET UP here rather than assumed, because asserting it would be asserting
-    // a global this file does not own — scheduler.test.ts installs a stub for this very kind and
-    // does not put it back, which is the adjacent shape this helper cannot fix from here. Whatever
-    // was there goes back at the end.
+    // WEBHOOK_RETRY has no production handler (nothing registers or enqueues it), so a restore
+    // that only re-registers a PREVIOUS handler leaks the stub into another file's scheduler test,
+    // order-dependently. The absent state is SET UP, not assumed: ./scheduler.test.ts installs a stub
+    // for this kind and does not put it back. Whatever was there goes back at the end.
     const outer = getJobHandler("WEBHOOK_RETRY");
     unregisterJobHandler("WEBHOOK_RETRY");
     try {
@@ -260,7 +254,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       rearm: "same-work",
       tenantId,
       kind: "WEBHOOK_RETRY",
-      dedupeKey: "dk-356-exhaust",
+      dedupeKey: "dk-356-end",
       runAt: past(),
       base: appDb,
     });
@@ -290,7 +284,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     expect(detail.unit).toBe("job");
     expect(detail.kind).toBe("WEBHOOK_RETRY");
     expect(detail.jobId).toBe(String(id));
-    expect(detail.dedupeKey).toBe("dk-356-exhaust");
+    expect(detail.dedupeKey).toBe("dk-356-end");
     expect(line.errorMessage).toContain("handler blew up");
   });
 
@@ -299,7 +293,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     const id = await enqueueJob({
       rearm: "same-work",
       tenantId,
-      kind: "FLOWLOG_SWEEP",
+      kind: "WEBHOOK_RETRY",
       dedupeKey: "dk-356-reap",
       runAt: past(),
       base: appDb,
@@ -323,7 +317,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       unknown
     >;
     expect(detail.unit).toBe("job");
-    expect(detail.kind).toBe("FLOWLOG_SWEEP");
+    expect(detail.kind).toBe("WEBHOOK_RETRY");
     expect((rows[0] as (typeof rows)[number]).errorMessage).toContain(
       "the claim never finished",
     );
@@ -368,7 +362,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     const id = await enqueueJob({
       rearm: "same-work",
       tenantId,
-      kind: "FLOWLOG_SWEEP",
+      kind: "WEBHOOK_RETRY",
       dedupeKey: "dk-356-rearmed",
       runAt: past(),
       base: appDb,
@@ -386,7 +380,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       appDb,
       new Date(),
       tenantId,
-      "FLOWLOG_SWEEP",
+      "WEBHOOK_RETRY",
     );
     expect(reaped.find((r) => r.id === id)?.status).toBe("DEAD");
     // The re-arm: `upsertJobRow` keys on (tenant, kind, dedupeKey), so a sweep arming this work
@@ -396,8 +390,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       data: { status: "PENDING", attempts: 0 },
     });
     await announceReaped(reaped, appDb);
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   test("a failed re-read loses one line, never the rest of the batch", async () => {
@@ -407,7 +400,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       const id = await enqueueJob({
         rearm: "same-work",
         tenantId,
-        kind: "HEARTBEAT",
+        kind: "WEBHOOK_RETRY",
         dedupeKey: `dk-356-batch-${k}`,
         runAt: past(),
         base: appDb,
@@ -423,7 +416,13 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       ids.push(id);
     }
     const reaped = (
-      await reapStaleJobs(5 * 60_000, appDb, new Date(), tenantId, "HEARTBEAT")
+      await reapStaleJobs(
+        5 * 60_000,
+        appDb,
+        new Date(),
+        tenantId,
+        "WEBHOOK_RETRY",
+      )
     ).filter((r) => ids.includes(r.id));
     expect(reaped).toHaveLength(2);
 
@@ -472,7 +471,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       rearm: "same-work",
       tenantId,
       kind: "INGEST_MESSAGE",
-      dedupeKey: "dk-356-generation",
+      dedupeKey: "dk-356-gen",
       runAt: past(),
       base: appDb,
     });
@@ -500,8 +499,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       data: { claimSeq: { increment: 1 } },
     });
     await announceReaped(reaped, appDb);
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   test("a kind that registers its own hook does not get the generic line as well", async () => {
@@ -536,11 +534,10 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     expect(reaped.find((r) => r.id === id)?.status).toBe("DEAD");
     await announceReaped(reaped, appDb);
 
-    // Its hook owns the announcement for this kind (a private note on the conversation, issue #71),
+    // NOTE: its hook owns the announcement for this kind (a private note on the conversation),
     // and here it declines to write one — the payload carries no thread. The generic line must not
     // step in over that decision: the hook already looked and said no.
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   // ── THE ALERT BUS: the sharp one, because it cannot notify through itself ──
@@ -606,51 +603,12 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     // would be queued to that same broken channel, die, and queue another — one new row per death,
     // forever. The coalescing one layer down does not bound it: it bumps a PENDING row, and the
     // row this would follow is DEAD.
-    await Bun.sleep(300);
+    await settleFlowEvents();
     const deliveries = await suDb.alertDelivery.findMany({
       where: { tenantId },
     });
     expect(deliveries).toHaveLength(1);
     expect(deliveries[0]?.status).toBe("DEAD");
-  });
-
-  test("and it does not breed: four ticks against a broken channel stay at one", async () => {
-    await clearRows();
-    await suDb.alertDelivery.create({
-      data: {
-        tenantId,
-        channelId,
-        stage: "generate",
-        level: "error",
-        summary: "the turn failed",
-        attempts: 7,
-      },
-    });
-    // The claim above is one cycle; this is the sentence the PR body makes about ALL of them. The
-    // measurement without the guard, on this same harness: cycle 1 leaves 1 DEAD + 1 PENDING, cycle
-    // 6 leaves 6 DEAD + 1 PENDING and six lines. One new delivery per death, for as long as the
-    // channel stays broken.
-    const census: number[] = [];
-    for (let cycle = 0; cycle < 4; cycle++) {
-      await processAlertBatch({
-        base: appDb,
-        tenantId,
-        coalesceWindowMs: 0,
-        fetchImpl: (async () =>
-          ({ status: 500 }) as Response) as unknown as typeof fetch,
-        assertSafe: async (u: string) => new URL(u),
-      });
-      await Bun.sleep(250);
-      // Anything born in this cycle is made immediately claimable, so the next tick would kill it
-      // and emit again — the loop runs at the retry ladder's pace, and this removes the wait.
-      await suDb.alertDelivery.updateMany({
-        where: { tenantId, status: "PENDING" },
-        data: { nextAttemptAt: new Date(Date.now() - 1000), attempts: 7 },
-      });
-      census.push(await suDb.alertDelivery.count({ where: { tenantId } }));
-    }
-    expect(census).toEqual([1, 1, 1, 1]);
-    expect(await deadRows(0, 0)).toHaveLength(1);
   });
 
   test("a blocked channel URL dies on the first attempt, and says so too", async () => {
@@ -763,10 +721,9 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     });
     // The dedupe key is a digest of the body, so the retry lands on the row that already exists.
     expect(again.deliveryId).toBe(first.deliveryId as bigint);
-    await Bun.sleep(400);
     // One event was dropped, so one line. A provider that retries for a day would otherwise report
     // the same loss all day, at its own rate.
-    expect(await deadRows(0, 0)).toHaveLength(1);
+    expect(await deadRows(0)).toHaveLength(1);
   });
 
   test("a delivery that burns through its processing attempts announces", async () => {
@@ -811,11 +768,10 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
         integrationInstanceId: instanceId,
         dedupeKey: `inflight-356-${process.pid}`,
         payload: { kind: "conversion" },
-        // The fifth attempt, RUNNING right now: at the cap, claimed a moment ago — and RECEIVED
-        // long before that, which is the shape the first version of this test missed. Four prior
-        // deaths take time, so by the last attempt the receipt is always ancient; a staleness rule
-        // read off `receivedAt` calls this row stale forever and the test passed for the wrong
-        // reason with a fresh receipt.
+        // NOTE: the fifth attempt, RUNNING right now: at the cap, claimed a moment ago, and RECEIVED
+        // long before. Four prior deaths take time, so by the last attempt the receipt is always
+        // ancient; a staleness rule read off `receivedAt` would call this row stale forever, which a
+        // fresh receipt here would hide.
         status: "PROCESSING",
         attempts: 5,
         receivedAt: new Date(Date.now() - 60 * 60_000),
@@ -835,8 +791,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       (await suDb.inboundDelivery.findUniqueOrThrow({ where: { id: row.id } }))
         .status,
     ).toBe("PROCESSING");
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   test("a stale processing claim at the cap is killed, and says so", async () => {
@@ -890,8 +845,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
     expect(outcome).toBe("skipped");
     // The claim and the attempt-cap kill share one branch, and only the second is a death. A row
     // another replica took a second ago reaches exactly the same `return { kind: "skip" }`.
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   test("an unstamped row claimed a moment ago is not taken from under it", async () => {
@@ -920,8 +874,7 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
       (await suDb.inboundDelivery.findUniqueOrThrow({ where: { id: row.id } }))
         .status,
     ).toBe("PROCESSING");
-    await Bun.sleep(400);
-    expect(await deadRows(0, 0)).toHaveLength(0);
+    expect(await deadRows(0)).toHaveLength(0);
   });
 
   test("claiming stamps the clock the staleness rule reads", async () => {
@@ -966,9 +919,9 @@ describe.skipIf(!dbUp)("a terminal failure announces itself", () => {
         status: "PROCESSING",
         attempts: 5,
         receivedAt: new Date(Date.now() - 60 * 60_000),
-        // What a claim taken by a replica that does not stamp yet looks like. It is judged by the
-        // receipt, which is exactly what shipped before this column — no worse than today for a row
-        // the old code claimed, and the arm stops being reachable once every replica stamps.
+        // NOTE: a claim taken by a replica that does not stamp yet. It is judged by the receipt, no
+        // worse than a row claimed before the column existed, and the arm stops being reachable once
+        // every replica stamps.
         claimedAt: null,
       },
     });

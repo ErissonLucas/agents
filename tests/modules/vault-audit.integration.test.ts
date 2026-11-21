@@ -15,6 +15,7 @@ import {
   updateVaultEntry,
   vaultReferences,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { syntheticAction } from "../utils/audit-action";
 
 // Integration test for the Phase 2 primitives (vault round-trip, audit row, entity lock)
@@ -39,8 +40,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -373,11 +374,39 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
     expect(other.tenantSettings).toEqual([]);
   });
 
+  test("vaultReferences: a credential an occurrence monitor's steps use is referenced", async () => {
+    const ctx = { tenantId, userId: null, role: "TENANT_ADMIN" as const };
+    const { id } = await createVaultEntry(
+      ctx,
+      { name: "refs-occurrences", value: "sk_y" },
+      undefined,
+      undefined,
+      appDb,
+    );
+    const step = {
+      provider: "openai",
+      model: null,
+      credentialRef: formatVaultRef(id),
+      baseURL: null,
+    };
+    // Any of the account's monitors: the second one here, the first naming another key.
+    await su?.occurrenceMonitor.createMany({
+      data: [
+        { tenantId, name: "Ocorrências", config: { model: null } },
+        { tenantId, name: "Produtor", position: 1, config: { model: step } },
+      ],
+    });
+    expect((await vaultReferences(ctx, id, appDb)).tenantSettings).toEqual([
+      "occurrences",
+    ]);
+    await su?.occurrenceMonitor.deleteMany({ where: { tenantId } });
+    expect((await vaultReferences(ctx, id, appDb)).tenantSettings).toEqual([]);
+  });
+
   test("audit: records a row scoped to the tenant", async () => {
-    // A synthetic action, because this asserts RLS scoping and nothing about the vocabulary. It used
-    // to borrow `tenant.update`, which is Full-only: once `AuditEntry.action` became `AuditAction`,
-    // this file stopped compiling in the Free tree while the master tree stayed green -- caught by
-    // `bun run build:free`, which is the only check that reads the derived tree.
+    // A synthetic action, because this asserts RLS scoping and nothing about the vocabulary. A
+    // real one like `tenant.update` is Full-only, so the Free tree would not compile while the master
+    // tree stays green; only `bun run build:free` reads the derived tree.
     const ACTION = syntheticAction("vault_audit.scoped");
     await scoped((db) =>
       recordAudit(db, tenantId, {
@@ -394,8 +423,12 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
   });
 
   test("withEntityLock runs the body inside the scoped tx", async () => {
-    const { result, lockedId } = await scoped((db) =>
+    const { result, lockedId, held } = await scoped((db) =>
       withEntityLock(db, `tenant:${tenantId}:demo`, async () => {
+        // The transaction-scoped advisory lock this body runs under, seen from its own connection.
+        const [locks] = await db.$queryRaw<{ n: number }[]>`
+          SELECT count(*)::int AS n FROM pg_locks
+          WHERE locktype = 'advisory' AND pid = pg_backend_pid() AND granted`;
         // Use db directly (already inside the scoped tx) to avoid a nested transaction.
         const created = await db.vaultEntry.create({
           data: {
@@ -406,10 +439,11 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
           },
           select: { id: true },
         });
-        return { result: "done", lockedId: created.id };
+        return { result: "done", lockedId: created.id, held: locks?.n };
       }),
     );
     expect(result).toBe("done");
+    expect(held).toBe(1);
     const v = await scoped((db) =>
       resolveVaultSecret<{ v: number }>(db, `vault:${lockedId}`),
     );
@@ -670,8 +704,6 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       undefined,
       appDb,
     );
-    expect(cwId).toBeDefined();
-
     const { id: ocId } = await createVaultEntry(
       ctx,
       {
@@ -684,8 +716,6 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       undefined,
       appDb,
     );
-    expect(ocId).toBeDefined();
-
     const { id: lfId } = await createVaultEntry(
       ctx,
       {
@@ -698,7 +728,28 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       undefined,
       appDb,
     );
-    expect(lfId).toBeDefined();
+    const stored = await su?.vaultEntry.findMany({
+      where: { id: { in: [cwId, ocId, lfId] } },
+      select: { name: true, kind: true, baseUrl: true },
+      orderBy: { id: "asc" },
+    });
+    expect(stored).toEqual([
+      {
+        name: "cw-with-base",
+        kind: "chatwoot_api_token",
+        baseUrl: "https://chat.example.com",
+      },
+      {
+        name: "oc-with-base",
+        kind: "openai_compatible",
+        baseUrl: "https://api.example.com/v1",
+      },
+      {
+        name: "lf-with-base",
+        kind: "langfuse",
+        baseUrl: "https://us.cloud.langfuse.com",
+      },
+    ]);
   });
 
   test("vault: requiresBaseUrl kinds reject update that clears baseUrl", async () => {
@@ -749,6 +800,11 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       appDb,
     );
     expect(sameId).toBe(id);
+    const row = await su?.vaultEntry.findUnique({
+      where: { id },
+      select: { baseUrl: true },
+    });
+    expect(row?.baseUrl).toBe("https://api2.example.com/v1");
   });
 
   test("vault: non-requiresBaseUrl kinds continue accepting missing/empty baseUrl", async () => {
@@ -761,7 +817,6 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       undefined,
       appDb,
     );
-    expect(id1).toBeDefined();
 
     const { id: id2 } = await createVaultEntry(
       ctx,
@@ -770,9 +825,17 @@ describe.skipIf(!dbUp)("phase-2 primitives", () => {
       undefined,
       appDb,
     );
-    expect(id2).toBeDefined();
 
     const sameId = await updateVaultEntry(ctx, id1, { baseUrl: null }, appDb);
     expect(sameId).toBe(id1);
+    const stored = await su?.vaultEntry.findMany({
+      where: { id: { in: [id1, id2] } },
+      select: { name: true, kind: true, baseUrl: true },
+      orderBy: { id: "asc" },
+    });
+    expect(stored).toEqual([
+      { name: "bearer-no-base", kind: "bearer_token", baseUrl: null },
+      { name: "openai-no-base", kind: "openai", baseUrl: null },
+    ]);
   });
 });

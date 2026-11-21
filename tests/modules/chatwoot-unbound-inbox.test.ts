@@ -4,20 +4,16 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
 
 // AN INBOX NOBODY BOUND, AND THE MESSAGES IT SWALLOWS.
 //
-// The mirror creates an `Inbox` row for any inbox that sends us traffic, deliberately — mirroring has
-// to work before an operator binds anything. So the row for a channel just connected in Chatwoot
-// exists, has no agent, consumes every delivery and answers nothing. The conversation shows the
-// customer waiting, and until issue #318 the console showed nothing at all: the only trace was one
-// process log line on the server, which is not what an operator reads.
-//
-// The effect asserted here is the row in `execution_logs`, because that is what the Logs page reads —
-// the same choice issue #271 made for the ownership gate.
+// The mirror creates an `Inbox` row for any inbox that sends traffic, deliberately: mirroring has to
+// work before an operator binds anything. That row has no agent, consumes every delivery and answers
+// nothing, so the console must say so. The effect asserted is the row in `execution_logs`, because
+// that is what the Logs page reads (as for the ownership gate).
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -35,8 +31,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -188,24 +184,19 @@ describe.skipIf(!dbUp)("an unbound inbox says so", () => {
     });
   }
 
-  // Scoped to the conversation asked for, by its INTERNAL id, and polled: the emit is
-  // fire-and-forget, so an unscoped read answers with a neighbour's row and an unpolled one races
-  // the write it is asserting.
-  async function routeRows(convId: number, waitMs = POLL_DEADLINE_MS) {
+  // Scoped to the conversation asked for, by its INTERNAL id, and read settled: the emit is
+  // fire-and-forget, so an unscoped read answers with a neighbour's row, and a raw read races the
+  // write it is asserting. The settle answers both "it was written" and "nothing was written".
+  async function routeRows(convId: number) {
     const conv = await suDb.conversation.findFirst({
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
     if (!conv) return [];
-    const deadline = Date.now() + waitMs;
-    for (;;) {
-      const rows = await flowLogRows(suDb, {
-        where: { tenantId, stage: "route", conversationId: conv.id },
-        orderBy: { id: "asc" },
-      });
-      if (rows.length > 0 || Date.now() > deadline) return rows;
-      await new Promise((r) => setTimeout(r, 50));
-    }
+    return flowLogRows(suDb, {
+      where: { tenantId, stage: "route", conversationId: conv.id },
+      orderBy: { id: "asc" },
+    });
   }
 
   test("a message on an inbox nobody bound writes the line, naming the inbox", async () => {
@@ -234,21 +225,19 @@ describe.skipIf(!dbUp)("an unbound inbox says so", () => {
   // write-back coming back around.
   test("an event that is not a new incoming message writes no line", async () => {
     await deliver(8102, UNBOUND_INBOX, { event: "message_updated" });
-    expect(await routeRows(8102, 300)).toEqual([]);
+    expect(await routeRows(8102)).toEqual([]);
   });
 
   // The control that proves the line is about the binding and not about the traffic.
   test("the same message on a bound inbox writes no line", async () => {
     await deliver(8103, BOUND_INBOX);
-    expect(await routeRows(8103, 300)).toEqual([]);
+    expect(await routeRows(8103)).toEqual([]);
     expect(agentDbId).toBeGreaterThan(0n);
   });
 
-  // The state this line must NOT claim, found by review. `runAgentTurn` answers `no-agent` for a
-  // disabled agent too — `loadAgentConfig` returns null on the `enabled` flag, one step past the
-  // binding — so keying on the outcome alone tells an operator who switched their agent off, at
-  // `warn` and through their alert channel, that the inbox has no agent. It has one; they turned it
-  // off, which is a deliberate state and the same exclusion the ownership gate's line makes.
+  // NOTE: `runAgentTurn` answers `no-agent` for a disabled agent too (`loadAgentConfig` returns null on
+  // the `enabled` flag), so keying on the outcome alone would warn an operator who switched their agent
+  // off that the inbox has no agent. The ownership gate's line makes the same exclusion.
   test("a bound agent that is switched off writes no line", async () => {
     await suDb.agent.update({
       where: { id: agentDbId },
@@ -256,7 +245,7 @@ describe.skipIf(!dbUp)("an unbound inbox says so", () => {
     });
     try {
       await deliver(8104, BOUND_INBOX);
-      expect(await routeRows(8104, 300)).toEqual([]);
+      expect(await routeRows(8104)).toEqual([]);
     } finally {
       await suDb.agent.update({
         where: { id: agentDbId },

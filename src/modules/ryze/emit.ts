@@ -106,7 +106,7 @@ export const defaultBotDeliverer: BotDeliverer = async (d) => {
 
 let deliverer: BotDeliverer = defaultBotDeliverer;
 
-// NOTE: test seam; returns the previous deliverer so a test can restore it.
+// Test seam; returns the previous deliverer so a test can restore it.
 export function setBotDeliverer(next: BotDeliverer): BotDeliverer {
   const prev = deliverer;
   deliverer = next;

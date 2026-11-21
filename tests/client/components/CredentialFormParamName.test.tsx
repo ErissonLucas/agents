@@ -8,6 +8,7 @@ import {
   expect,
   test,
 } from "bun:test";
+import { TooltipProvider } from "@radix-ui/react-tooltip";
 import {
   cleanup,
   fireEvent,
@@ -19,13 +20,11 @@ import {
 import { CredentialForm } from "@/client/components/CredentialForm";
 import { ToastProvider } from "@/client/components/Toast";
 
-// The write refuses a param name on a kind that declares none (issue #488), and the argument for
-// that refusal being safe is that the CONSOLE can never send one: the input is drawn only under
-// `needsParamName`, and every payload gates on the same flag. That is a claim about REACHABILITY,
-// and reachability is measured, not read — so this drives the one path where the two can disagree.
-// A param name typed while the type was `header` survives in form state after the operator switches
-// the type to `generic`, and if the payload carried it, the save would come back 400 naming a field
-// the form no longer renders: a refusal with no door.
+// The write refuses a param name on a kind that declares none, which is safe only because the
+// CONSOLE never sends one: the input is drawn only under `needsParamName`, and every payload gates
+// on the same flag. This drives the one path where the two can disagree: a param name typed under
+// `header` survives in form state after a switch to `generic`, and sending it would come back 400
+// naming a field the form no longer renders.
 
 describe("CredentialForm never sends a param name a kind cannot use", () => {
   const realFetch = globalThis.fetch;
@@ -64,7 +63,7 @@ describe("CredentialForm never sends a param name a kind cannot use", () => {
   const posts = () =>
     calls.filter((c) => c.method === "POST" && !c.url.includes("/vault/test"));
 
-  // NOTE: the value input carries no placeholder on create (only on update, where blank keeps the
+  // The value input carries no placeholder on create (only on update, where blank keeps the
   // stored secret), so it is addressed by its type.
   const secretInput = (): HTMLElement => {
     const el = document.querySelector('input[type="password"]');
@@ -72,7 +71,7 @@ describe("CredentialForm never sends a param name a kind cannot use", () => {
     return el as HTMLElement;
   };
 
-  // NOTE: Radix opens on pointerdown with a real pointerType, not on click, and the FormField label
+  // Radix opens on pointerdown with a real pointerType, not on click, and the FormField label
   // carries the same accessible name as the trigger — so this asks for the BUTTON, and then reads
   // the option INSIDE the menu (an open menu takes the rest of the form out of the a11y tree).
   const pickType = async (label: string) => {
@@ -84,7 +83,7 @@ describe("CredentialForm never sends a param name a kind cannot use", () => {
       expect(screen.queryAllByRole("menu", { hidden: true }).length).toBe(1),
     );
     const menu = screen.getByRole("menu", { hidden: true });
-    // NOTE: by ROLE, not by text: the type list renders the label more than once (the row and its
+    // By ROLE, not by text: the type list renders the label more than once (the row and its
     // hint), and a bare text query is ambiguous.
     const item = within(menu)
       .getAllByRole("menuitem", { hidden: true })
@@ -108,15 +107,14 @@ describe("CredentialForm never sends a param name a kind cannot use", () => {
       </ToastProvider>,
     );
 
-    // NOTE: the input exists only because the type is `header` — that is the premise being tested.
+    // The input exists only because the type is `header` — that is the premise being tested.
     const paramInput = screen.getByPlaceholderText("X-API-Key");
     fireEvent.change(paramInput, { target: { value: "Authorization" } });
 
     await pickType("Generic");
     // NOTE: by LABEL, not by placeholder: the placeholder is derived from the kind ("X-API-Key" for
     // header, "api_key" otherwise), so a form that kept drawing the field for `generic` would still
-    // satisfy a query for the header one. Measured — that mutation survived until this line asked
-    // by the name the field actually carries.
+    // satisfy a query for the header one.
     expect(screen.queryByText("Parameter name")).toBeNull();
 
     fireEvent.change(screen.getByPlaceholderText("my-api-key"), {
@@ -158,4 +156,28 @@ describe("CredentialForm never sends a param name a kind cannot use", () => {
     await waitFor(() => expect(posts().length).toBe(1));
     expect(posts()[0]?.body.paramName).toBe("Authorization");
   });
+
+  // Both forms the value takes: the single value box and the masked field of a multi-field type.
+  for (const kind of ["header", "google_oauth"]) {
+    test(`a ${kind} secret is masked but is not a password field for password managers`, () => {
+      render(
+        <TooltipProvider>
+          <ToastProvider>
+            <CredentialForm
+              mode="create"
+              initialKind={kind}
+              onSaved={() => {}}
+              onCancel={() => {}}
+            />
+          </ToastProvider>
+        </TooltipProvider>,
+      );
+      const el = secretInput();
+      expect(el.getAttribute("autocomplete")).toBe("off");
+      expect(el.getAttribute("data-1p-ignore")).toBe("");
+      expect(el.getAttribute("data-lpignore")).toBe("true");
+      expect(el.getAttribute("data-bwignore")).toBe("");
+      expect(el.getAttribute("data-form-type")).toBe("other");
+    });
+  }
 });

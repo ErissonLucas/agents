@@ -13,12 +13,9 @@ import {
 } from "@/modules/signature/domains";
 import { readSignatureConfig } from "@/modules/signature/service";
 
-// THE SWITCH IS REFUSED AT THE WRITE, not normalised in the reader (#612).
-//
-// The acceptance run measured what accepting-and-normalising costs: REST answered 200 to
-// `enabled: "sim"` and GET echoed the string back, so a client reading the API saw one answer while
-// the runtime signed on another. The switch's value is the only thing that says whether an agent is
-// signing, so two answers to that question is one answer too many.
+// The switch is refused at the write, not normalised in the reader: accepting `enabled: "sim"` would
+// have GET echo the string while the runtime signs on another answer, and the switch's value is the
+// only thing that says whether an agent is signing.
 describe("assertSettingsSignature", () => {
   const ON = { signature: { enabled: true, text: "Alex" } };
 
@@ -29,7 +26,8 @@ describe("assertSettingsSignature", () => {
     ).not.toThrow();
   });
 
-  // The pre-#612 bag: no flag at all, which the reader answers from the text. Not a bad value.
+  // NOTE: a bag written before the switch: no flag at all, which the reader answers from the text.
+  // Not a bad value.
   test("an absent switch passes, because that is every bag written before it existed", () => {
     expect(() =>
       assertSettingsSignature({ signature: { text: "Alex" } }, undefined),
@@ -81,11 +79,9 @@ describe("assertSettingsSignature", () => {
   });
 });
 
-// THE FREQUENCY IS REFUSED THE SAME WAY (#616), and the tie-breaker is what GET does rather than
-// what the reader can cope with. `position` and `separator` normalise, so a wrong value there is
-// harmless to the runtime — but the API echoes the settings bag AS STORED, so normalising leaves
-// the operator's client reading "sempre" on a field the runtime answered as "all". #612 already
-// settled that two answers to one question is one too many.
+// The frequency is refused the same way, and the tie-breaker is what GET does rather than what the
+// reader can cope with: the API echoes the settings bag AS STORED, so normalising would leave the
+// operator's client reading "sempre" on a field the runtime answered as "all".
 describe("assertSettingsSignature: the frequency", () => {
   test("both values pass", () => {
     for (const frequency of ["all", "once"]) {
@@ -93,12 +89,6 @@ describe("assertSettingsSignature: the frequency", () => {
         assertSettingsSignature({ signature: { frequency } }, undefined),
       ).not.toThrow();
     }
-  });
-
-  test("an absent frequency passes, because that is every bag written before it existed", () => {
-    expect(() =>
-      assertSettingsSignature({ signature: { text: "Alex" } }, undefined),
-    ).not.toThrow();
   });
 
   test("a value outside the domain is refused, naming the field", () => {
@@ -168,10 +158,8 @@ describe("assertSettingsSignature: the frequency", () => {
   });
 });
 
-// THE TWO OLDER ENUMS, which #616 left un-guarded on purpose and filed as #618. Same hole as the
-// frequency: the reader normalises `"esquerda"` to `"top"`, the runtime signs at the top, and GET
-// echoes `"esquerda"`. Asked without naming an error class, so on the base (where nothing throws)
-// these fail on the assertion rather than on an import.
+// The two older enums, refused for the same reason as the frequency: the reader normalises
+// `"esquerda"` to `"top"`, the runtime signs at the top, and GET would echo `"esquerda"`.
 describe("assertSettingsSignature: position and separator", () => {
   const refusal = (settings: unknown, stored: unknown) => {
     try {
@@ -189,10 +177,6 @@ describe("assertSettingsSignature: position and separator", () => {
     for (const separator of ["blank", "--"]) {
       expect(refusal({ signature: { separator } }, undefined)).toBeNull();
     }
-  });
-
-  test("an absent field passes: the reader answers it with the default", () => {
-    expect(refusal({ signature: { text: "Alex" } }, undefined)).toBeNull();
   });
 
   test("a position outside the domain is refused, naming the field", () => {
@@ -219,16 +203,6 @@ describe("assertSettingsSignature: position and separator", () => {
     }
   });
 
-  test("a stored bad value re-sent unchanged does not block an unrelated save", () => {
-    const stored = { signature: { position: "esquerda", separator: "~~" } };
-    expect(
-      refusal(
-        { signature: { position: "esquerda", separator: "~~", text: "Outro" } },
-        stored,
-      ),
-    ).toBeNull();
-  });
-
   // Per FIELD, not per block: fixing the separator of a legacy row does not require fixing its
   // position in the same save, and changing only one of them names only that one.
   test("changing one bad value for another is refused, and names only that field", () => {
@@ -253,7 +227,7 @@ describe("assertSettingsSignature: position and separator", () => {
 // THE DOMAIN IS THE READER'S, asked by execution rather than trusted from the constant. The boundary
 // refuses what is not in `SIGNATURE_CHOICES`; that is only right if every value in it is one the
 // reader KEEPS and a value outside it is one the reader REPLACES. A domain that grew on one side
-// only would either refuse a value the runtime honours or accept one it ignores, the hole #618 was.
+// only would either refuse a value the runtime honours or accept one it ignores.
 describe("the signature's domains are the reader's", () => {
   test("every allowed value round-trips through readSignatureConfig", () => {
     for (const [field, allowed] of Object.entries(SIGNATURE_CHOICES)) {

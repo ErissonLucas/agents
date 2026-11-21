@@ -4,17 +4,45 @@ import {
   beforeAll,
   describe,
   expect,
+  spyOn,
   test,
 } from "bun:test";
+import {
+  BaseChatModel,
+  type BindToolsInput,
+} from "@langchain/core/language_models/chat_models";
+import { AIMessage } from "@langchain/core/messages";
+import type { ChatResult } from "@langchain/core/outputs";
 import { PrismaPg } from "@prisma/adapter-pg";
-import { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import {
+  CONNECT_TIMEOUT_MESSAGE,
+  DatabaseConnectTimeout,
+} from "@/api/lib/pool-options";
+import { chatwootThreadId, contactInboxThreadId } from "@/graph/checkpointer";
+import {
+  clearTurnInFlight,
+  isTurnInFlight,
+  markTurnInFlight,
+} from "@/graph/inflight";
+import * as prepare from "@/graph/prepare";
+import * as humanTakeover from "@/modules/chatwoot/human-takeover";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
-import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import {
+  announceUnanswered,
+  deliveryRecoveryDedupeKey,
+  RECOVERY_GAVE_UP,
+} from "@/modules/chatwoot/recover-delivery";
+import {
+  processChatwootDelivery,
+  recordAndProcessChatwootDelivery,
+} from "@/modules/chatwoot/webhook";
 import {
   announceFailedTurn,
   claimFailureNotice,
   isTurnLost,
+  noteText,
   readDirectFence,
   type TurnFailure,
 } from "@/modules/conversations/failure-note";
@@ -22,7 +50,9 @@ import {
   announceDeadDebounceFlush,
   registerDebounceHandler,
 } from "@/modules/debounce/handler";
+import * as debounceService from "@/modules/debounce/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
+import * as schedulerService from "@/modules/scheduler/service";
 import {
   getDeadLetterHandler,
   getJobHandler,
@@ -31,17 +61,18 @@ import {
   runClaimed,
   runSchedulerTick,
 } from "@/modules/scheduler/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { clearFlowLog, flowLogRows } from "../utils/flowlog";
+import { FailingModel } from "../utils/scripted-models";
 
-// Issue #71. A turn that dies leaves the customer with no reply and the operator with nothing to see
-// inside Chatwoot. The note that says so is easy; knowing the turn is DEFINITIVELY lost is not, and
-// getting it wrong is worse than saying nothing — the note tells an operator to take over, and taking
-// over closes the gate the pending retry depends on.
-//
-// These cover the five windows the design named: the announcement hangs off the dead-letter CAS (not
-// the attempt count, and not the handler's catch), a job re-armed mid-run is not dead, the direct
-// path fences on a newer message, an unreadable fence stays silent, and the coalescing claim is the
-// write itself so two concurrent failures cannot both announce.
+// A turn that dies leaves the customer with no reply and the operator with nothing to see inside
+// Chatwoot. Knowing the turn is DEFINITIVELY lost is the hard part, and getting it wrong is worse than
+// silence: the note tells an operator to take over, which closes the gate the pending retry needs.
+// Five windows: the announcement hangs off the dead-letter CAS (not the attempt count, not the
+// handler's catch), a job re-armed mid-run is not dead, the direct path fences on a newer message, an
+// unreadable fence stays silent, and the coalescing claim is the write itself so two concurrent
+// failures cannot both announce.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -59,8 +90,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -77,9 +108,9 @@ let instanceId = 0n;
 let agentId = 0n;
 let nextConv = 900;
 
-// The double AUTHENTICATES like Chatwoot: the note is posted with the bot token, and the whole point
-// of window 1 is that a client built without one gets a 401 that a best-effort catch swallows. A stub
-// that accepts any token is what let that ship in the first place.
+// The double AUTHENTICATES like Chatwoot: the note is posted with the bot token, and a client built
+// without one gets a 401 that a best-effort catch swallows. A stub that accepts any token cannot see
+// that.
 interface Posted {
   conversationId: number;
   content: string;
@@ -87,8 +118,24 @@ interface Posted {
   token: string;
 }
 let posted: Posted[] = [];
+// Every write in the order Chatwoot received it, so a test can read the hand-over's ORDER (status,
+// target, note) and not only that each call happened.
+interface Write {
+  conversationId: number;
+  kind: "toggle" | "assign" | "note";
+  body: Record<string, unknown>;
+}
+let writes: Write[] = [];
+// What Chatwoot itself says about a conversation, where a test needs it to differ from the mirror.
+// A conversation absent here answers 404, which the hand-over reads as "unreadable".
+const liveConversations = new Map<number, Record<string, unknown>>();
 let inbound: Array<{ id: number; message_type: number; content: string }> = [];
 let messagesFail = false;
+// Runs when the toggle arrives, before Chatwoot answers it: what the mirror and the registry say AT
+// the toggle is what the hand-over's ordering is about. `toggleConflict` answers it with the 409 a
+// conversation that moved on gets.
+let onToggle: ((conversationId: number) => Promise<void>) | null = null;
+let toggleConflict = false;
 let realFetch: typeof globalThis.fetch;
 
 function installChatwootDouble(): void {
@@ -113,8 +160,29 @@ function installChatwootDouble(): void {
       if (messagesFail) return json({ error: "boom" }, 500);
       return json({ payload: inbound });
     }
+    const one = url.match(/\/conversations\/(\d+)$/);
+    if (one && (init?.method ?? "GET") === "GET") {
+      const live = liveConversations.get(Number(one[1]));
+      if (!live) return json({ error: "not found" }, 404);
+      return json({ id: Number(one[1]), ...live });
+    }
+    const toggle = url.match(/\/conversations\/(\d+)\/toggle_status$/);
+    if (toggle && init?.method === "POST") {
+      const body = JSON.parse(String(init.body ?? "{}"));
+      writes.push({ conversationId: Number(toggle[1]), kind: "toggle", body });
+      await onToggle?.(Number(toggle[1]));
+      if (toggleConflict) return json({ error: "status changed" }, 409);
+      return json({ payload: { success: true, current_status: body.status } });
+    }
+    const assign = url.match(/\/conversations\/(\d+)\/assignments$/);
+    if (assign && init?.method === "POST") {
+      const body = JSON.parse(String(init.body ?? "{}"));
+      writes.push({ conversationId: Number(assign[1]), kind: "assign", body });
+      return json({});
+    }
     if (messages && init?.method === "POST") {
       const body = JSON.parse(String(init.body ?? "{}"));
+      writes.push({ conversationId: Number(messages[1]), kind: "note", body });
       posted.push({
         conversationId: Number(messages[1]),
         content: String(body.content ?? ""),
@@ -127,7 +195,9 @@ function installChatwootDouble(): void {
   }) as typeof globalThis.fetch;
 }
 
-async function seedConversation(over: { failureNoticeSentAt?: Date } = {}) {
+async function seedConversation(
+  over: { failureNoticeSentAt?: Date; status?: string } = {},
+) {
   const chatwootConversationId = nextConv++;
   await suDb.conversation.create({
     data: {
@@ -135,7 +205,7 @@ async function seedConversation(over: { failureNoticeSentAt?: Date } = {}) {
       chatwootInstanceId: instanceId,
       chatwootConversationId,
       inboxId: inboxDbId,
-      status: "pending",
+      status: over.status ?? "pending",
       threadId: `${tenantId}:${instanceId}:${chatwootConversationId}`,
       ...(over.failureNoticeSentAt
         ? { failureNoticeSentAt: over.failureNoticeSentAt }
@@ -230,7 +300,7 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
       adminToken: encryptJson("ADMIN"),
     });
     instanceId = inst.id;
-    // NOTE: A REAL vault entry, so the turn gets as far as the model call: the double answers that
+    // A REAL vault entry, so the turn gets as far as the model call: the double answers that
     // call 401 (it authenticates like Chatwoot and knows no OpenAI route), and THAT is the death
     // this suite is about. A dangling ref would not die, it would be the orderly "no-agent" silence.
     const llmKey = await suDb.vaultEntry.create({
@@ -278,15 +348,23 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
 
   afterEach(() => {
     posted = [];
+    writes = [];
+    liveConversations.clear();
     inbound = [];
     messagesFail = false;
+    onToggle = null;
+    toggleConflict = false;
   });
 
   afterAll(async () => {
     globalThis.fetch = realFetch;
     if (!dbUp) return;
     for (const table of [
+      "agent_threads",
+      "agent_tool_selections",
       "scheduler_jobs",
+      "execution_logs",
+      "chatwoot_webhook_deliveries",
       "conversations",
       "vault_entries",
       "inboxes",
@@ -388,7 +466,724 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
     });
     expect(outcome).toBe("not-lost");
     expect(posted).toHaveLength(0);
+    // A turn still coming is not handed over either: opening the conversation is what would stop it.
+    expect(writes).toHaveLength(0);
     expect(await noticeAt(conv)).toBeNull();
+  });
+
+  // ── The hand-over ────────────────────────────────────────────────────────────────────────────
+  // A note alone, on a conversation still `pending` with the bot, is in nobody's queue: the customer
+  // waits until they write again.
+
+  async function withHandoff<T>(
+    handoff: { mode: string; targetTeamId?: number } | null,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const settings = {
+      debounce: { enabled: false },
+      split: { enabled: false },
+      ...(handoff ? { handoff } : {}),
+    };
+    await suDb.agent.update({ where: { id: agentId }, data: { settings } });
+    try {
+      return await run();
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: { debounce: { enabled: false }, split: { enabled: false } },
+        },
+      });
+    }
+  }
+
+  test("a lost turn opens the conversation, assigns the pinned team, and only then posts the note", async () => {
+    const conv = await seedConversation();
+    const outcome = await withHandoff(
+      { mode: "pinned", targetTeamId: 77 },
+      () =>
+        announceFailedTurn({
+          tenantId,
+          instanceId,
+          chatwootConversationId: conv,
+          assess: async () => ({ path: "job", deadLettered: true }),
+          error: new Error("model provider returned 503"),
+          base: appDb,
+        }),
+    );
+    expect(outcome).toBe("posted");
+    const mine = writes.filter((w) => w.conversationId === conv);
+    expect(mine.map((w) => w.kind)).toEqual(["toggle", "assign", "note"]);
+    // Conditional on the status the bot holds, so a person who took it meanwhile is not overridden.
+    expect(mine[0]?.body).toEqual({
+      status: "open",
+      expected_status: "pending",
+    });
+    expect(mine[1]?.body).toEqual({ team_id: 77 });
+    expect(posted[0]?.content).toContain(
+      "Ela foi aberta para a equipe assumir.",
+    );
+    // The mirror moved with the toggle: no reader waits on Chatwoot's webhook to see it is no
+    // longer the bot's.
+    const mirror = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { status: true },
+    });
+    expect(mirror.status).toBe("open");
+  });
+
+  test("the mirror says open before the toggle, while the reservation still holds the thread", async () => {
+    const conv = await seedConversation();
+    let atToggle = null as { status: string; reserved: boolean } | null;
+    onToggle = async (id) => {
+      const row = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: id },
+        select: { status: true },
+      });
+      atToggle = {
+        status: row.status,
+        reserved: isTurnInFlight(chatwootThreadId(tenantId, instanceId, id)),
+      };
+    };
+    await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => ({ path: "job", deadLettered: true }),
+      error: new Error("boom"),
+      base: appDb,
+    });
+    // A re-engage asks the mirror and the registry; between them one of the two must say no at
+    // every instant up to the moment the conversation is no longer the bot's.
+    expect(atToggle).toEqual({ status: "open", reserved: true });
+    expect(isTurnInFlight(chatwootThreadId(tenantId, instanceId, conv))).toBe(
+      false,
+    );
+  });
+
+  test("a person who takes the conversation after the toggle keeps it over the pinned target", async () => {
+    const conv = await seedConversation();
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    onToggle = async (id) => {
+      liveConversations.set(id, {
+        status: "open",
+        meta: { assignee_type: "User", assignee: { id: 41 } },
+        updated_at: 1_900_000_300,
+      });
+    };
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a conversation handed back after the toggle is not routed to the pinned target", async () => {
+    const conv = await seedConversation();
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    onToggle = async (id) => {
+      liveConversations.set(id, {
+        status: "pending",
+        meta: {},
+        updated_at: 1_900_000_400,
+      });
+    };
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a decision that moves the mirror between the fence and the claim closes the fence", async () => {
+    const conv = await seedConversation();
+    let asks = 0;
+    const outcome = await withHandoff(
+      { mode: "pinned", targetTeamId: 77 },
+      () =>
+        announceFailedTurn({
+          tenantId,
+          instanceId,
+          chatwootConversationId: conv,
+          assess: async () => {
+            // The last ask runs after the ownership read: an operator's hand-back lands there,
+            // leaving the row pending and the bot's, with a newer version.
+            if (asks++ === 1) {
+              await suDb.conversation.updateMany({
+                where: { tenantId, chatwootConversationId: conv },
+                data: { chatwootStatusAt: 1_900_000_000 },
+              });
+            }
+            return { path: "job", deadLettered: true };
+          },
+          error: new Error("boom"),
+          base: appDb,
+        }),
+    );
+    expect(outcome).toBe("posted");
+    // No toggle and no pinned assignment over the newer decision; the note still asks for someone.
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+    expect(posted[0]?.content).toContain("Alguém da equipe precisa assumir.");
+    const mirror = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { status: true },
+    });
+    expect(mirror.status).toBe("pending");
+  });
+
+  test("a customer message mirrored after the last ask keeps the conversation with the agent", async () => {
+    const conv = await seedConversation();
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { lastInboundMessageId: 5_000 },
+    });
+    let asks = 0;
+    const outcome = await withHandoff(
+      { mode: "pinned", targetTeamId: 77 },
+      () =>
+        announceFailedTurn({
+          tenantId,
+          instanceId,
+          chatwootConversationId: conv,
+          assess: async () => {
+            // Answered "lost" for the message it was asked about; the newer one is mirrored after,
+            // and its direct turn does not wait on the hand-over's reservation.
+            if (asks++ === 1) {
+              await suDb.conversation.updateMany({
+                where: { tenantId, chatwootConversationId: conv },
+                data: { lastInboundMessageId: 5_001 },
+              });
+            }
+            return { path: "job", deadLettered: true };
+          },
+          error: new Error("boom"),
+          base: appDb,
+        }),
+    );
+    expect(outcome).toBe("posted");
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+    const mirror = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { status: true },
+    });
+    expect(mirror.status).toBe("pending");
+  });
+
+  test("an unmirrored conversation mirrored with a newer message during the last ask stays with the agent", async () => {
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    let asks = 0;
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      routeAgentBotId: 9,
+      aboutMessageId: 6_000,
+      assess: async () => {
+        // The webhook of the customer's next message mirrors the conversation while the last ask
+        // is out: that message has its own turn coming.
+        if (asks++ === 1) {
+          await suDb.conversation.create({
+            data: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              chatwootConversationId: conv,
+              inboxId: inboxDbId,
+              status: "pending",
+              threadId: `${tenantId}:${instanceId}:${conv}`,
+              lastInboundMessageId: 6_001,
+            },
+          });
+        }
+        return { path: "job", deadLettered: true };
+      },
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("posted");
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("an unmirrored conversation mirrored during the last ask with no newer message is still handed over", async () => {
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    let asks = 0;
+    await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      routeAgentBotId: 9,
+      aboutMessageId: 6_100,
+      assess: async () => {
+        // The stranded message's own conversation_created mirrors it: nothing newer, so the claim
+        // over the new row is what lets the hand-over through.
+        if (asks++ === 1) {
+          await suDb.conversation.create({
+            data: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              chatwootConversationId: conv,
+              inboxId: inboxDbId,
+              status: "pending",
+              threadId: `${tenantId}:${instanceId}:${conv}`,
+              lastInboundMessageId: 6_100,
+            },
+          });
+        }
+        return { path: "job", deadLettered: true };
+      },
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("an opened hand-over stamps its claim from Chatwoot's versioned read", async () => {
+    const conv = await seedConversation();
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    onToggle = async (id) => {
+      liveConversations.set(id, {
+        status: "open",
+        meta: {},
+        updated_at: 1_900_000_100,
+      });
+    };
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => ({ path: "job", deadLettered: true }),
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("posted");
+    // Stamped, a hand-back newer than the toggle is ordered against the claim instead of refused
+    // by it for the claim's whole window.
+    const mirror = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { status: true, statusClaimStampedAt: true },
+    });
+    expect(mirror.status).toBe("open");
+    expect(mirror.statusClaimStampedAt).not.toBeNull();
+  });
+
+  test("Chatwoot refusing the toggle after the claim puts the mirror on Chatwoot's state", async () => {
+    const conv = await seedConversation();
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    toggleConflict = true;
+    onToggle = async (id) => {
+      liveConversations.set(id, {
+        status: "resolved",
+        meta: {},
+        updated_at: 1_900_000_200,
+      });
+    };
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    const mirror = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { status: true },
+    });
+    expect(mirror.status).toBe("resolved");
+  });
+
+  test("a newer message that lands before the hand-over cancels it, note included", async () => {
+    const conv = await seedConversation();
+    // Clear on the first ask, superseded by the time of the last fence.
+    let asks = 0;
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () =>
+        asks++ === 0
+          ? { path: "direct", fence: "clear" }
+          : { path: "direct", fence: "superseded" },
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+    expect(await noticeAt(conv)).toBeNull();
+  });
+
+  test("with no pinned target the conversation is still opened, for Chatwoot's own routing", async () => {
+    const conv = await seedConversation();
+    await withHandoff(null, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a conversation that is no longer the bot's is not reopened, and the note asks for someone", async () => {
+    const conv = await seedConversation({ status: "open" });
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => ({ path: "job", deadLettered: true }),
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("posted");
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+    expect(posted[0]?.content).toContain("Alguém da equipe precisa assumir.");
+  });
+
+  test("the turn's loss is re-asked after the ownership reads, right before the toggle", async () => {
+    const conv = await seedConversation();
+    // Superseded only once Chatwoot has been read: a message that lands during the ownership reads.
+    let liveRead = false;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (String(input).endsWith(`/conversations/${conv}`)) liveRead = true;
+      return realFetch(input, init);
+    }) as typeof globalThis.fetch;
+    let outcome: string;
+    try {
+      outcome = await announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () =>
+          liveRead
+            ? { path: "direct", fence: "superseded" }
+            : { path: "direct", fence: "clear" },
+        error: new Error("boom"),
+        base: appDb,
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a last ask that cannot be read announces nothing, rather than trusting the first", async () => {
+    const conv = await seedConversation();
+    let asks = 0;
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => {
+        if (asks++ === 0) return { path: "job", deadLettered: true };
+        throw new Error("the scheduler row could not be read");
+      },
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("failed");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+    expect(await noticeAt(conv)).toBeNull();
+  });
+
+  test("a turn already running on the conversation is not cancelled by the hand-over", async () => {
+    const conv = await seedConversation();
+    // A contact inbox, so the graph thread's key differs from the conversation's: the re-engage
+    // marks the conversation's.
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { contactInboxId: 76_000 + conv },
+    });
+    // An operator's re-engage: no new customer message, so neither ask of the fence sees it.
+    const key = `${tenantId}:${instanceId}:${conv}`;
+    markTurnInFlight(key);
+    let outcome: string;
+    try {
+      outcome = await announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      });
+    } finally {
+      clearTurnInFlight(key);
+    }
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+    expect(await noticeAt(conv)).toBeNull();
+  });
+
+  test("a turn that starts during the last ask is seen before the toggle", async () => {
+    const conv = await seedConversation();
+    const key = `${tenantId}:${instanceId}:${conv}`;
+    let asks = 0;
+    let outcome: string;
+    try {
+      outcome = await announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => {
+          // The operator re-engages while the last ask is reading Chatwoot.
+          if (asks++ === 1) markTurnInFlight(key);
+          return { path: "job", deadLettered: true };
+        },
+        error: new Error("boom"),
+        base: appDb,
+      });
+    } finally {
+      clearTurnInFlight(key);
+    }
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("the toggle runs under a reservation on both keys, released after it", async () => {
+    const conv = await seedConversation();
+    const contactInboxId = 75_000 + conv;
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { contactInboxId },
+    });
+    const conversationKey = `${tenantId}:${instanceId}:${conv}`;
+    const graphKey = contactInboxThreadId(tenantId, instanceId, contactInboxId);
+    const atToggle: boolean[] = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (String(input).endsWith(`/conversations/${conv}/toggle_status`)) {
+        // What a re-engage starting now would ask before it runs.
+        atToggle.push(
+          isTurnInFlight(conversationKey),
+          isTurnInFlight(graphKey),
+        );
+      }
+      return realFetch(input, init);
+    }) as typeof globalThis.fetch;
+    try {
+      await announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(atToggle).toEqual([true, true]);
+    expect(isTurnInFlight(conversationKey)).toBe(false);
+    expect(isTurnInFlight(graphKey)).toBe(false);
+  });
+
+  test("a turn another replica holds on the conversation's graph thread is not cancelled either", async () => {
+    const conv = await seedConversation();
+    const contactInboxId = 77_000 + conv;
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { contactInboxId },
+    });
+    // The claim's own row: the in-process Map cannot see a turn running on another replica.
+    await suDb.agentThread.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        contactInboxId,
+        threadId: contactInboxThreadId(tenantId, instanceId, contactInboxId),
+        turnHolders: 1,
+        turnHeldUntil: new Date(Date.now() + 60_000),
+      },
+    });
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => ({ path: "job", deadLettered: true }),
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a turn another replica starts while the last ask is out is not cancelled", async () => {
+    const conv = await seedConversation();
+    const contactInboxId = 78_000 + conv;
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { contactInboxId },
+    });
+    let asks = 0;
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => {
+        // A follow-up or re-engage on another replica: no new message, only its durable claim.
+        if (asks++ === 1) {
+          await suDb.agentThread.create({
+            data: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+              threadId: contactInboxThreadId(
+                tenantId,
+                instanceId,
+                contactInboxId,
+              ),
+              turnHolders: 1,
+              turnHeldUntil: new Date(Date.now() + 60_000),
+            },
+          });
+        }
+        return { path: "job", deadLettered: true };
+      },
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("not-lost");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("an ownership fence that cannot be read announces nothing", async () => {
+    const conv = await seedConversation();
+    const read = spyOn(
+      humanTakeover,
+      "conversationOwnershipNow",
+    ).mockRejectedValueOnce(new Error("the mirror could not be read"));
+    let outcome: string;
+    try {
+      outcome = await announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      });
+    } finally {
+      read.mockRestore();
+    }
+    expect(outcome).toBe("failed");
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+    expect(await noticeAt(conv)).toBeNull();
+  });
+
+  test("a person the mirror shows on the conversation keeps it, with Chatwoot unreadable", async () => {
+    const conv = await seedConversation();
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { assigneeType: "User", assigneeId: 41 },
+    });
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("a person who claimed the conversation in Chatwoot keeps it, even with the mirror behind", async () => {
+    const conv = await seedConversation();
+    // The mirror still says pending and unassigned; Chatwoot already has an attendant on it.
+    liveConversations.set(conv, {
+      status: "pending",
+      meta: { assignee_type: "User", assignee: { id: 41 } },
+    });
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceFailedTurn({
+        tenantId,
+        instanceId,
+        chatwootConversationId: conv,
+        assess: async () => ({ path: "job", deadLettered: true }),
+        error: new Error("boom"),
+        base: appDb,
+      }),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("the note's window coalesces the note, never the hand-over", async () => {
+    const conv = await seedConversation({
+      failureNoticeSentAt: new Date(Date.now() - 60_000),
+    });
+    const outcome = await announceFailedTurn({
+      tenantId,
+      instanceId,
+      chatwootConversationId: conv,
+      assess: async () => ({ path: "job", deadLettered: true }),
+      error: new Error("boom"),
+      base: appDb,
+    });
+    expect(outcome).toBe("coalesced");
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle"]);
+  });
+
+  test("the note is markdown, with the reason in a code span that a backtick cannot break", () => {
+    const text = noteText("Transaction `API` error:\n  pool", true);
+    expect(text.split("\n\n")).toEqual([
+      "**⚠️ O agente não conseguiu responder esta conversa.**",
+      "Ela foi aberta para a equipe assumir.",
+      "**Motivo:** `Transaction 'API' error: pool`",
+    ]);
   });
 
   // ── The direct path's fence ──────────────────────────────────────────────────────────────────
@@ -551,6 +1346,69 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
     expect(after.status).toBe("PENDING");
   });
 
+  // The runs' own `generate` lines are `info` (a run with another behind it had not lost the customer
+  // yet), so the death writes the one line that alerts: on `generate`, at `error`, linked to the
+  // conversation, saying how many runs failed. A row re-armed by a new message is a turn that is
+  // coming, and gets no line.
+  for (const status of ["DEAD", "PENDING"] as const) {
+    test(`a ${status} row ${status === "DEAD" ? "writes" : "does not write"} the unanswered line`, async () => {
+      const conv = await seedConversation();
+      const threadId = `${tenantId}:${instanceId}:${conv}`;
+      const row = await suDb.schedulerJob.create({
+        data: {
+          tenantId,
+          kind: KIND,
+          dedupeKey: `failnote-unanswered-${status}-${process.pid}`,
+          payload: { threadId },
+          runAt: new Date(),
+          status,
+          attempts: 5,
+          claimSeq: 0,
+        },
+        select: { id: true },
+      });
+      await announceDeadDebounceFlush(
+        {
+          id: row.id,
+          tenantId,
+          kind: KIND,
+          payload: { threadId },
+          attempts: 4,
+          claimSeq: 0,
+        },
+        "upstream 503",
+        appDb,
+      );
+      const lines = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: { tenantId, threadId, stage: "generate" },
+        select: {
+          level: true,
+          status: true,
+          detail: true,
+          errorMessage: true,
+          conversationId: true,
+        },
+      });
+      if (status === "PENDING") {
+        expect(lines).toEqual([]);
+        return;
+      }
+      const mirror = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: conv },
+        select: { id: true },
+      });
+      expect(lines).toHaveLength(1);
+      expect(lines[0]?.level).toBe("error");
+      expect(lines[0]?.status).toBe("error");
+      expect(lines[0]?.conversationId).toBe(mirror.id);
+      expect(lines[0]?.detail).toEqual({ outcome: "unanswered", runs: 5 });
+      expect(lines[0]?.errorMessage).toContain("unanswered");
+      expect(lines[0]?.errorMessage).not.toContain("503");
+      await clearFlowLog(suDb, { tenantId, threadId });
+    });
+  }
+
   test("a DEAD row re-armed before the note is posted is a live turn again", async () => {
     const conv = await seedConversation();
     const row = await suDb.schedulerJob.create({
@@ -584,6 +1442,75 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
     expect(await noticeAt(conv)).toBeNull();
   });
 
+  test("a dead burst whose conversation already mirrored a newer message hands nothing over", async () => {
+    const conv = await seedConversation();
+    // The newer delivery is mirrored and still on its way to re-arming this row: no turn claim yet.
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { lastInboundMessageId: 6_001 },
+    });
+    const payload = {
+      threadId: `${tenantId}:${instanceId}:${conv}`,
+      lastMessageId: 6_000,
+    };
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: KIND,
+        dedupeKey: `failnote-dead-superseded-${process.pid}`,
+        payload,
+        runAt: new Date(),
+        status: "DEAD",
+        attempts: 5,
+        claimSeq: 0,
+      },
+      select: { id: true },
+    });
+    await withHandoff({ mode: "pinned", targetTeamId: 77 }, () =>
+      announceDeadDebounceFlush(
+        { id: row.id, tenantId, kind: KIND, payload, attempts: 4, claimSeq: 0 },
+        "model provider returned 503",
+        appDb,
+      ),
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("a dead burst whose own message is the newest mirrored one is handed over", async () => {
+    const conv = await seedConversation();
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { lastInboundMessageId: 6_100 },
+    });
+    const payload = {
+      threadId: `${tenantId}:${instanceId}:${conv}`,
+      lastMessageId: 6_100,
+    };
+    const row = await suDb.schedulerJob.create({
+      data: {
+        tenantId,
+        kind: KIND,
+        dedupeKey: `failnote-dead-own-${process.pid}`,
+        payload,
+        runAt: new Date(),
+        status: "DEAD",
+        attempts: 5,
+        claimSeq: 0,
+      },
+      select: { id: true },
+    });
+    await announceDeadDebounceFlush(
+      { id: row.id, tenantId, kind: KIND, payload, attempts: 4, claimSeq: 0 },
+      "model provider returned 503",
+      appDb,
+    );
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
   test("a job the reaper kills is announced too", async () => {
     const conv = await seedConversation();
     const row = await suDb.schedulerJob.create({
@@ -602,12 +1529,10 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
       select: { id: true },
     });
     registerDebounceHandler();
-    // `tenantId` IS THE FENCE, not decoration: the tick is cross-tenant by design (one leader in
-    // production), so without it this drain claims and executes rows belonging to whatever else is
-    // using this database. Under `bun test --parallel` that is another worker's file, and the row it
-    // steals is gone before that file ever looks: measured, this call took the WEBHOOK_RETRY that
-    // tests/modules/debounce.test.ts had just enqueued for its own tenant, and the failure surfaced
-    // there, in a file that had done nothing wrong. See the note on TickOptions.tenantId.
+    // NOTE: `tenantId` IS THE FENCE, not decoration: the tick is cross-tenant by design (one leader in
+    // production), so without it this drain claims rows of whatever else uses this database, under
+    // `bun test --parallel` another worker's file (a WEBHOOK_RETRY tests/modules/debounce.test.ts
+    // enqueued), and the failure surfaces there. See the note on TickOptions.tenantId.
     await runSchedulerTick(appDb, {
       staleMs: 5 * 60_000,
       batchSize: 20,
@@ -621,11 +1546,6 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
     const note = posted.find((p) => p.conversationId === conv);
     expect(note).toBeDefined();
     expect(note?.token).toBe(BOT_TOKEN);
-  });
-
-  test("the debounce flush registers its dead-letter hook", () => {
-    registerDebounceHandler();
-    expect(getDeadLetterHandler("DEBOUNCE")).toBe(announceDeadDebounceFlush);
   });
 
   // The direct webhook path, end to end: a delivery arrives, the turn dies inside the runtime, and the
@@ -749,5 +1669,984 @@ describe.skipIf(!dbUp)("failed-turn note", () => {
     expect(posted[0]?.conversationId).toBe(conv);
     expect(posted[0]?.token).toBe(BOT_TOKEN);
     expect(await noticeAt(conv)).not.toBeNull();
+  });
+
+  // ── A pool that never served the turn ────────────────────────────────────────────────────────
+  // The one database error that ran nothing, so the same work a little later succeeds. Settled like
+  // any failure it would be a note on a conversation still with the bot, and the row PROCESSED, the
+  // state nothing revisits.
+
+  function neverStarted(): Error {
+    return Object.assign(
+      new Error(
+        "Transaction API error: Unable to start a transaction in the given time.",
+      ),
+      { code: "P2028" },
+    );
+  }
+
+  // Asks for one tool, then fails the way it is told: the shape of a turn whose pool gave out after a
+  // tool already ran.
+  class ToolThenFailModel extends BaseChatModel {
+    calls = 0;
+    constructor(
+      private readonly toolName: string,
+      private readonly error: unknown,
+    ) {
+      super({});
+    }
+    _llmType() {
+      return "fake-tool-then-fail";
+    }
+    override bindTools(_tools: BindToolsInput[]) {
+      return this;
+    }
+    async _generate(): Promise<ChatResult> {
+      this.calls += 1;
+      if (this.calls > 1) throw this.error;
+      const message = new AIMessage({
+        content: "",
+        tool_calls: [{ name: this.toolName, args: {}, id: "call-1" }],
+      });
+      return { generations: [{ text: "", message }] };
+    }
+  }
+
+  function incoming(conv: number, messageId: number) {
+    const n = normalizeChatwootEvent({
+      event: "message_created",
+      id: messageId,
+      content: "oi, preciso de ajuda",
+      message_type: "incoming",
+      private: false,
+      conversation: {
+        id: conv,
+        inbox_id: INBOX_ID,
+        status: "pending",
+        contact_inbox: { id: 88_000 + conv },
+        meta: {
+          assignee_type: null,
+          assignee: null,
+          sender: { id: 700, name: "Cliente", phone_number: "+5511999990000" },
+        },
+        channel: "Channel::WebWidget",
+        last_activity_at: Math.floor(Date.now() / 1000),
+      },
+    });
+    if (!n) throw new Error("unreachable");
+    inbound = [
+      { id: messageId, message_type: 0, content: "oi, preciso de ajuda" },
+    ];
+    return n;
+  }
+
+  // A connection that never opened ran nothing either: `pg`'s own error as the checkpointer meets it,
+  // and the same failure wrapped by Prisma on the main pool, which keeps its text and code.
+  test.each<[string, () => unknown]>([
+    ["no free connection", neverStarted],
+    [
+      "a connect past its bound",
+      () => new DatabaseConnectTimeout(new Error("timeout expired")),
+    ],
+    [
+      "a connect past its bound, through Prisma",
+      () =>
+        new Prisma.PrismaClientKnownRequestError(
+          `Invalid \`prisma.$queryRaw()\` invocation:\n\n${CONNECT_TIMEOUT_MESSAGE}`,
+          { code: "ETIMEDOUT", clientVersion: "test" },
+        ),
+    ],
+  ])(
+    "a live turn the pool never served goes to recovery now: DEAD, recovery armed, nothing posted (%s)",
+    async (_, failure) => {
+      const conv = await seedConversation();
+      const deliveryId = `failnote-pool-${process.pid}-${conv}`;
+      const model = new FailingModel(new Error("the model was reached"));
+      // The agent's load is where a saturated pool refuses a turn before anything can act.
+      const load = spyOn(prepare, "loadAgentConfig").mockImplementationOnce(
+        async () => {
+          throw failure();
+        },
+      );
+      let out: string;
+      try {
+        out = await recordAndProcessChatwootDelivery({
+          tenantId,
+          instanceId,
+          deliveryId,
+          agentBotId: 9,
+          normalized: incoming(conv, 5_000 + conv),
+          base: appDb,
+          deps: { makeModel: () => model, sleep: async () => {} },
+        });
+      } finally {
+        load.mockRestore();
+      }
+      expect(out).toBe("processed");
+      expect(model.calls).toBe(0);
+      const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+        where: { tenantId, deliveryId },
+        select: { id: true, status: true },
+      });
+      expect(row.status).toBe("DEAD");
+      const recovery = await suDb.schedulerJob.findMany({
+        where: {
+          tenantId,
+          kind: "DELIVERY_RECOVERY",
+          dedupeKey: deliveryRecoveryDedupeKey(row.id),
+        },
+      });
+      expect(recovery).toHaveLength(1);
+      // Said like the sweep says it, at `info` because a recovery is coming.
+      const convRow = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: conv },
+        select: { id: true },
+      });
+      const line = (
+        await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
+          where: { tenantId, conversationId: convRow.id, stage: "delivery" },
+        })
+      ).find(
+        (r) =>
+          (r.detail as { outcome?: string } | null)?.outcome === "stranded",
+      );
+      expect(line?.level).toBe("info");
+      // The recovery is going to answer: a note or a hand-over now would close the gate it needs.
+      expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+      expect(await noticeAt(conv)).toBeNull();
+    },
+  );
+
+  test("inside a recovery's own pass, a turn the pool never served announces nothing either", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-pool-replay-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 5_500 + conv,
+      },
+      select: { id: true },
+    });
+    let threw = false;
+    await processChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryRowId: row.id,
+      agentBotId: 9,
+      normalized: incoming(conv, 5_500 + conv),
+      claimFrom: "DEAD",
+      onDirectTurn: (r) => {
+        if (r.kind === "error") threw = true;
+      },
+      base: appDb,
+      deps: {
+        makeModel: () => new FailingModel(neverStarted()),
+        sleep: async () => {},
+      },
+    });
+    // The recovery reads the throw and puts the row back for its next attempt; a note or a
+    // hand-over here would close the gate that attempt needs.
+    expect(threw).toBe(true);
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("DEAD and its recovery commit together: an arm that fails leaves the row where the sweep finds it", async () => {
+    const conv = await seedConversation();
+    const deliveryId = `failnote-pool-arm-${process.pid}-${conv}`;
+    const load = spyOn(prepare, "loadAgentConfig").mockImplementationOnce(
+      async () => {
+        throw neverStarted();
+      },
+    );
+    const arm = spyOn(schedulerService, "upsertJobRow").mockRejectedValueOnce(
+      new Error("the job row could not be written"),
+    );
+    try {
+      await recordAndProcessChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryId,
+        agentBotId: 9,
+        normalized: incoming(conv, 5_100 + conv),
+        base: appDb,
+        deps: {
+          makeModel: () => new FailingModel(new Error("unreached")),
+          sleep: async () => {},
+        },
+      });
+    } finally {
+      load.mockRestore();
+      arm.mockRestore();
+    }
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { tenantId, deliveryId },
+      select: { id: true, status: true },
+    });
+    expect(row.status).toBe("PROCESSING");
+    expect(
+      await suDb.schedulerJob.count({
+        where: { tenantId, dedupeKey: deliveryRecoveryDedupeKey(row.id) },
+      }),
+    ).toBe(0);
+  });
+
+  test("a pool refusal after a tool started is not replayed: the tool may already have acted", async () => {
+    const conv = await seedConversation();
+    const deliveryId = `failnote-pool-late-${process.pid}-${conv}`;
+    const sel = await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId,
+        source: "NATIVE",
+        enabledTools: ["get_current_time"],
+        knowledgeBaseIds: [],
+      },
+      select: { id: true },
+    });
+    try {
+      await recordAndProcessChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryId,
+        agentBotId: 9,
+        normalized: incoming(conv, 5_200 + conv),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new ToolThenFailModel("get_current_time", neverStarted()),
+          sleep: async () => {},
+        },
+      });
+    } finally {
+      await suDb.agentToolSelection.delete({ where: { id: sel.id } });
+    }
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { tenantId, deliveryId },
+      select: { id: true, status: true },
+    });
+    expect(row.status).toBe("PROCESSED");
+    expect(
+      await suDb.schedulerJob.count({
+        where: { tenantId, dedupeKey: deliveryRecoveryDedupeKey(row.id) },
+      }),
+    ).toBe(0);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a pool refusal after the model but before any tool still goes to recovery", async () => {
+    const conv = await seedConversation();
+    const deliveryId = `failnote-pool-model-${process.pid}-${conv}`;
+    const model = new FailingModel(neverStarted());
+    await recordAndProcessChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryId,
+      agentBotId: 9,
+      normalized: incoming(conv, 5_300 + conv),
+      base: appDb,
+      deps: { makeModel: () => model, sleep: async () => {} },
+    });
+    expect(model.calls).toBeGreaterThan(0);
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { tenantId, deliveryId },
+      select: { id: true, status: true },
+    });
+    expect(row.status).toBe("DEAD");
+    expect(
+      await suDb.schedulerJob.count({
+        where: { tenantId, dedupeKey: deliveryRecoveryDedupeKey(row.id) },
+      }),
+    ).toBe(1);
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a live turn that failed for any other reason is handed over and its row closes", async () => {
+    const conv = await seedConversation();
+    const deliveryId = `failnote-other-${process.pid}-${conv}`;
+    await recordAndProcessChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryId,
+      agentBotId: 9,
+      normalized: incoming(conv, 6_000 + conv),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FailingModel(new Error("model provider returned 400")),
+        sleep: async () => {},
+      },
+    });
+    const row = await suDb.chatwootWebhookDelivery.findFirstOrThrow({
+      where: { tenantId, deliveryId },
+      select: { status: true },
+    });
+    expect(row.status).toBe("PROCESSED");
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a live turn whose conversation already mirrored a newer message hands nothing over", async () => {
+    const conv = await seedConversation();
+    const deliveryId = `failnote-other-newer-${process.pid}-${conv}`;
+    // The next message's delivery was mirrored first (deliveries are not ordered), and its own turn is
+    // coming; this delivery's older id does not move the mark back.
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { lastInboundMessageId: 6_501 + conv },
+    });
+    await recordAndProcessChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryId,
+      agentBotId: 9,
+      normalized: incoming(conv, 6_500 + conv),
+      base: appDb,
+      deps: {
+        makeModel: () =>
+          new FailingModel(new Error("model provider returned 400")),
+        sleep: async () => {},
+      },
+    });
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("a debounce arm the pool refused once is armed on the next try, and no direct turn runs", async () => {
+    const conv = await seedConversation();
+    const real = debounceService.armDebounce;
+    let arms = 0;
+    const spy = spyOn(debounceService, "armDebounce").mockImplementation(
+      async (p) => {
+        arms++;
+        if (arms === 1) throw neverStarted();
+        return real(p);
+      },
+    );
+    const model = new FailingModel(new Error("the direct turn ran"));
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          debounce: { enabled: true, windowSeconds: 30 },
+          split: { enabled: false },
+        },
+      },
+    });
+    try {
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: (
+          await suDb.chatwootWebhookDelivery.create({
+            data: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              deliveryId: `failnote-arm-${process.pid}-${conv}`,
+              event: "message_created",
+              status: "PENDING",
+            },
+            select: { id: true },
+          })
+        ).id,
+        agentBotId: 9,
+        normalized: incoming(conv, 7_000 + conv),
+        base: appDb,
+        deps: { makeModel: () => model, sleep: async () => {} },
+      });
+    } finally {
+      spy.mockRestore();
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: { debounce: { enabled: false }, split: { enabled: false } },
+        },
+      });
+    }
+    expect(arms).toBe(2);
+    expect(model.calls).toBe(0);
+    expect(
+      await suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "DEBOUNCE",
+          dedupeKey: debounceService.debounceDedupeKey(
+            `${tenantId}:${instanceId}:${conv}`,
+          ),
+        },
+      }),
+    ).toBe(1);
+  });
+
+  test("a recovery that gives up on an unanswered message hands the conversation over", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    expect(posted.find((p) => p.conversationId === conv)?.content).toContain(
+      RECOVERY_GAVE_UP,
+    );
+    // Once, like its line: a second announcer finds the row decided and hands nothing over again.
+    writes = [];
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  // A first message that stranded before it was mirrored: no conversation row. The persona comes from
+  // the bot the delivery arrived on, and the ownership from Chatwoot, which is all there is.
+  test("a recovery that gives up on a conversation the mirror never learned still hands it over", async () => {
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    const note = posted.find((p) => p.conversationId === conv);
+    expect(note?.token).toBe(BOT_TOKEN);
+    expect(note?.content).toContain(RECOVERY_GAVE_UP);
+  });
+
+  test("an unmirrored conversation Chatwoot cannot answer for is not opened", async () => {
+    // No row and no live read: nothing says the bot holds it, so nothing is toggled or posted.
+    const conv = nextConv++;
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-unread-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toEqual([]);
+  });
+
+  test("an unmirrored conversation whose live read names no holder is not opened", async () => {
+    // `pending` with no `meta`: nobody is named, which is not the same as nobody holding it.
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending" });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-nometa-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toEqual([]);
+  });
+
+  test("a mirror row a webhook creates during the hand-over takes the note's window", async () => {
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    onToggle = async (id) => {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: id,
+          inboxId: inboxDbId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:${id}`,
+        },
+      });
+      liveConversations.set(id, {
+        status: "open",
+        meta: {},
+        updated_at: 1_900_000_500,
+      });
+    };
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-appears-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    // Stamped, so a failure right after a hand-back is coalesced like any mirrored conversation's.
+    expect(await noticeAt(conv)).not.toBeNull();
+    // And it says what Chatwoot does: open, not the bot's `pending` the webhook wrote.
+    expect(
+      (
+        await suDb.conversation.findFirstOrThrow({
+          where: { tenantId, chatwootConversationId: conv },
+          select: { status: true },
+        })
+      ).status,
+    ).toBe("open");
+  });
+
+  test("a mirror row that lands between the note's claim and its count is claimed, not coalesced", async () => {
+    // The claim is an UPDATE that matches nothing on an unmirrored conversation; a statement trigger
+    // fires anyway, which is the one moment between that claim and the count that reads the table.
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const fn = `failnote_lands_${process.pid}_${conv}`;
+    await suDb.$executeRawUnsafe(`
+      CREATE FUNCTION ${fn}() RETURNS trigger AS $$
+      BEGIN
+        INSERT INTO conversations (tenant_id, chatwoot_instance_id, chatwoot_conversation_id, inbox_id, status, thread_id, updated_at)
+        SELECT ${tenantId}, ${instanceId}, ${conv}, ${inboxDbId}, 'open', '${tenantId}:${instanceId}:${conv}', now()
+        WHERE NOT EXISTS (SELECT 1 FROM conversations WHERE tenant_id = ${tenantId} AND chatwoot_conversation_id = ${conv});
+        RETURN NULL;
+      END $$ LANGUAGE plpgsql`);
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-lands-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    // Armed on the toggle, so only the note's claim (the next UPDATE of the table) can fire it.
+    onToggle = async () => {
+      await suDb.$executeRawUnsafe(
+        `CREATE TRIGGER ${fn} AFTER UPDATE ON conversations FOR EACH STATEMENT EXECUTE FUNCTION ${fn}()`,
+      );
+    };
+    try {
+      await announceUnanswered(tenantId, row.id, appDb);
+    } finally {
+      await suDb.$executeRawUnsafe(
+        `DROP TRIGGER IF EXISTS ${fn} ON conversations`,
+      );
+      await suDb.$executeRawUnsafe(`DROP FUNCTION IF EXISTS ${fn}()`);
+    }
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    expect(await noticeAt(conv)).not.toBeNull();
+  });
+
+  test("an unmirrored delivery whose route names no role is not handed over as that route", async () => {
+    // A route with no stated role may be an observer's, which is not who answers the customer.
+    const conv = nextConv++;
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-norole-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toEqual([]);
+  });
+
+  test("an unmirrored conversation a person holds in Chatwoot is not opened", async () => {
+    const conv = nextConv++;
+    liveConversations.set(conv, {
+      status: "open",
+      meta: { assignee_type: "User", assignee: { id: 41 } },
+    });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unmirrored-held-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toEqual([]);
+  });
+
+  test("a mirror row that names no inbox takes the persona of the delivery's route", async () => {
+    const conv = nextConv++;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conv,
+        inboxId: null,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${conv}`,
+      },
+    });
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-noinbox-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+    expect(posted.find((p) => p.conversationId === conv)?.token).toBe(
+      BOT_TOKEN,
+    );
+  });
+
+  test("a conversation on an inbox an operator unbound is not handed over as the delivery's route", async () => {
+    const unbound = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: INBOX_ID + 1,
+        name: "Desvinculada",
+      },
+      select: { id: true },
+    });
+    const conv = nextConv++;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: conv,
+        inboxId: unbound.id,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${conv}`,
+      },
+    });
+    liveConversations.set(conv, { status: "pending", meta: {} });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-unbound-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+        routeAgentBotId: 9,
+        routeObserved: false,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toEqual([]);
+  });
+
+  // The customer's message reopened a resolved conversation in Chatwoot and the mirror never heard:
+  // the hand-over reconciles before it reads the ownership, instead of refusing a stale `resolved`.
+  test("a recovery that gives up hands over a conversation the mirror still calls resolved", async () => {
+    const conv = await seedConversation({ status: "resolved" });
+    liveConversations.set(conv, {
+      status: "pending",
+      meta: {},
+      last_activity_at: Math.floor(Date.now() / 1000),
+    });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-stale-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_000 + conv,
+      },
+      select: { id: true },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["toggle", "note"]);
+  });
+
+  test("a given-up row whose conversation mirrored a newer message hands nothing over", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-mirrored-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_800 + conv,
+      },
+      select: { id: true },
+    });
+    // Chatwoot's page still ends at the row's message; the mirror already holds the next one,
+    // whose delivery is on its way.
+    incoming(conv, 8_800 + conv);
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { lastInboundMessageId: 8_801 + conv },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes.filter((w) => w.conversationId === conv).map((w) => w.kind),
+    ).toEqual(["note"]);
+  });
+
+  test("a given-up row hands over BEFORE its line decides the row", async () => {
+    const conv = await seedConversation();
+    const convRow = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: conv },
+      select: { id: true },
+    });
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-order-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_700 + conv,
+      },
+      select: { id: true },
+    });
+    incoming(conv, 8_700 + conv);
+    // The line is what makes the row decided, so a crash between the two must find no line yet:
+    // the next announcer then hands over again instead of leaving the conversation with the bot.
+    let linesAtToggle = -1;
+    onToggle = async () => {
+      linesAtToggle = (
+        await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
+          where: { tenantId, conversationId: convRow.id, stage: "delivery" },
+        })
+      ).filter(
+        (r) =>
+          (r.detail as { outcome?: string } | null)?.outcome === "unanswered",
+      ).length;
+    };
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(linesAtToggle).toBe(0);
+    expect(
+      (
+        await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
+          where: { tenantId, conversationId: convRow.id, stage: "delivery" },
+        })
+      ).filter(
+        (r) =>
+          (r.detail as { outcome?: string } | null)?.outcome === "unanswered",
+      ),
+    ).toHaveLength(1);
+  });
+
+  test("a given-up row that is not the conversation's newest message hands nothing over", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-older-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_200 + conv,
+      },
+      select: { id: true },
+    });
+    // A newer customer message: its own delivery, live or in recovery, owns the conversation now.
+    inbound = [
+      { id: 8_200 + conv, message_type: 0, content: "oi" },
+      { id: 8_201 + conv, message_type: 0, content: "alguém?" },
+    ];
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a recovery's own pass that fails for any reason announces nothing: its next attempt needs the conversation", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-replay-other-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 5_800 + conv,
+      },
+      select: { id: true },
+    });
+    await processChatwootDelivery({
+      tenantId,
+      instanceId,
+      deliveryRowId: row.id,
+      agentBotId: 9,
+      normalized: incoming(conv, 5_800 + conv),
+      claimFrom: "DEAD",
+      base: appDb,
+      deps: {
+        makeModel: () => new FailingModel(new Error("provider returned 503")),
+        sleep: async () => {},
+      },
+    });
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a given-up row a turn answered meanwhile hands nothing over", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-retired-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_700 + conv,
+      },
+      select: { id: true },
+    });
+    // A live turn answers the same message while the announcer reads Chatwoot, and retires the row.
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (String(input).endsWith(`/conversations/${conv}/messages`)) {
+        await suDb.chatwootWebhookDelivery.update({
+          where: { id: row.id },
+          data: { status: "PROCESSED" },
+        });
+      }
+      return realFetch(input, init);
+    }) as typeof globalThis.fetch;
+    try {
+      await announceUnanswered(tenantId, row.id, appDb);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(writes.filter((w) => w.conversationId === conv)).toHaveLength(0);
+  });
+
+  test("a given-up row announced again after a hand-back does not hand the conversation over twice", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-again-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_600 + conv,
+      },
+      select: { id: true },
+    });
+    incoming(conv, 8_600 + conv);
+    await announceUnanswered(tenantId, row.id, appDb);
+    // An operator returns it to the agent; the same give-up announced again owes nothing new.
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: conv },
+      data: { status: "pending", statusClaimUntil: null },
+    });
+    await announceUnanswered(tenantId, row.id, appDb);
+    expect(
+      writes
+        .filter((w) => w.conversationId === conv && w.kind === "toggle")
+        .map((w) => w.kind),
+    ).toEqual(["toggle"]);
+  });
+
+  test("two announcers racing on one given-up row hand the conversation over once", async () => {
+    const conv = await seedConversation();
+    const row = await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `failnote-gaveup-race-${process.pid}-${conv}`,
+        event: "message_created",
+        status: "DEAD",
+        conversationId: conv,
+        inboundMessageId: 8_500 + conv,
+      },
+      select: { id: true },
+    });
+    incoming(conv, 8_500 + conv);
+    await Promise.all([
+      announceUnanswered(tenantId, row.id, appDb),
+      announceUnanswered(tenantId, row.id, appDb),
+    ]);
+    expect(
+      writes
+        .filter((w) => w.conversationId === conv && w.kind === "toggle")
+        .map((w) => w.kind),
+    ).toEqual(["toggle"]);
   });
 });

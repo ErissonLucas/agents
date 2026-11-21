@@ -10,7 +10,6 @@ import type { ClaimedJob } from "@/modules/scheduler/service";
 // one level down.
 
 const base = {} as PrismaClient;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // The reaped rows below carry `id: 0n`, a number no sequence hands out. Nothing here reaches a
 // database, so any id would run; the point is that a fixture copied out of this file into one
@@ -61,17 +60,20 @@ describe("runCompactionTick", () => {
         return [job(1)];
       },
       run: async () => {},
-      reap: async () => [
-        {
-          id: 0n,
-          tenantId: 1n,
-          kind: "MEMORY_COMPACT" as const,
-          payload: {},
-          attempts: 1,
-          claimSeq: 1,
-          status: "PENDING" as const,
-        },
-      ],
+      reap: async (_stale, _base, _now, _tenant, kind) =>
+        kind === "MEMORY_COMPACT"
+          ? [
+              {
+                id: 0n,
+                tenantId: 1n,
+                kind: "MEMORY_COMPACT" as const,
+                payload: {},
+                attempts: 1,
+                claimSeq: 1,
+                status: "PENDING" as const,
+              },
+            ]
+          : [],
     });
     expect(claimed).toBe(false);
     expect(out).toEqual({ claimed: 0, reaped: 1 });
@@ -82,7 +84,7 @@ describe("runCompactionTick", () => {
     const timeline: string[] = [];
     const run = async (j: ClaimedJob) => {
       timeline.push(`start:${j.id}`);
-      await sleep(20);
+      await Bun.sleep(20);
       timeline.push(`end:${j.id}`);
     };
 
@@ -132,7 +134,7 @@ describe("runCompactionTick", () => {
   // The two worker flags are independent, so with the scheduler off nothing else re-pends a row left
   // CLAIMED by a process that died mid-summary — and this tick only claims PENDING ones. That
   // attendance would wait on a future boundary that, for a resolved conversation, may never come.
-  test("reaps its own stale claims, and only its own kind", async () => {
+  test("reaps the stale claims of every kind in its lane, and no other kind", async () => {
     const seen: (string | undefined)[] = [];
     const out = await runCompactionTick(
       base,
@@ -146,7 +148,7 @@ describe("runCompactionTick", () => {
             {
               id: 0n,
               tenantId: 1n,
-              kind: "MEMORY_COMPACT",
+              kind: kind ?? "MEMORY_COMPACT",
               payload: {},
               attempts: 1,
               claimSeq: 1,
@@ -157,8 +159,8 @@ describe("runCompactionTick", () => {
       },
       60_000,
     );
-    expect(seen).toEqual(["MEMORY_COMPACT"]);
-    expect(out.reaped).toBe(1);
+    expect(seen.sort()).toEqual(["MEMORY_COMPACT", "OTHER_INBOX_SUMMARY"]);
+    expect(out.reaped).toBe(2);
   });
 
   // `enqueueJob` re-arms by upserting the SAME physical row back to PENDING, status included, so a
@@ -196,7 +198,7 @@ describe("runCompactionTick", () => {
       run,
       reap: async () => [],
     });
-    await sleep(5);
+    await Bun.sleep(5);
     const second = await runCompactionTick(base, 20, {
       claim,
       run,

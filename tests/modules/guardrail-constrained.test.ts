@@ -2,18 +2,16 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { ChatAnthropic } from "@langchain/anthropic";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatOpenAI } from "@langchain/openai";
+import { verdictAskMode } from "@/graph/model-config";
 import { analyzeGuardrail } from "@/modules/guardrails/analyze";
 
-// The constrained verdict, against the adapters themselves (issue #131).
+// The constrained verdict, against the adapters themselves. These build the vendor adapters directly
+// and point them at a local server instead of asserting on a fake model: the subject is what an
+// ADAPTER puts on the wire and does with the answer, exactly the parts a hand-written double would
+// invent (whether the schema travels as json_schema, what a deviation parses to).
 //
-// These build the vendor adapters directly and point them at a local server, instead of asserting
-// on a fake model. The whole change is about what an ADAPTER puts on the wire and what it does with
-// the answer, and those are exactly the parts a hand-written double gets to invent: every earlier
-// belief about this feature that turned out to be false ("the schema travels as json_schema",
-// "a deviation comes back as a null parse") was a belief about the adapter, not about our code.
-//
-// The server here is not a generic double either. It answers in each vendor's own response shape,
-// so the adapter parses it the way it parses the real one.
+// The server answers in each vendor's own response shape, so the adapter parses it the way it parses
+// the real one.
 
 const BASE = {
   direction: "input" as const,
@@ -38,7 +36,7 @@ const VIOLATION = {
 
 // ── an OpenAI-shaped endpoint ───────────────────────────────────────────────
 
-// NOTE: two things the suite's happy-dom environment does to a local server. Its `fetch` enforces
+// Two things the suite's happy-dom environment does to a local server. Its `fetch` enforces
 // the same-origin policy, so every call below is preflighted and needs the CORS headers; and its
 // `Response` is not the one Bun's socket layer recognises, so a server answering with it fails the
 // connection outright (see tests/dom-setup.ts, which captures the native constructors for exactly
@@ -64,6 +62,7 @@ let refuseConstrained = false;
 let refuseWith = 400;
 
 const openaiServer = Bun.serve({
+  hostname: "127.0.0.1",
   port: 0,
   async fetch(req) {
     const pre = preflight(req);
@@ -111,19 +110,38 @@ const openaiModel = new ChatOpenAI({
   model: "gpt-5.4-nano",
   apiKey: "sk-test",
   maxRetries: 0,
-  configuration: { baseURL: `http://localhost:${openaiServer.port}/v1` },
+  configuration: { baseURL: `http://127.0.0.1:${openaiServer.port}/v1` },
 });
 
 // ── an Anthropic endpoint ───────────────────────────────────────────────────
 
 let anthropicContent: unknown[] = [];
+let anthropicWires: Wire[] = [];
+// What claude-sonnet-5-5, claude-opus-5-5 and claude-fable-5-1 answer to a forced tool call, verbatim.
+let refuseForcedTool = false;
 
 const anthropicServer = Bun.serve({
+  hostname: "127.0.0.1",
   port: 0,
   async fetch(req) {
     const pre = preflight(req);
     if (pre) return pre;
-    await req.json();
+    const wire = (await req.json()) as Wire;
+    anthropicWires.push(wire);
+    const choice = (wire.tool_choice as { type?: string } | undefined)?.type;
+    if (refuseForcedTool && (choice === "tool" || choice === "any")) {
+      return BunResponse.json(
+        {
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message:
+              'tool_choice: type "tool" and "any" are not supported for this model.',
+          },
+        },
+        { status: 400, headers: CORS },
+      );
+    }
     return BunResponse.json(
       {
         id: "msg_1",
@@ -144,7 +162,7 @@ const anthropicModel = new ChatAnthropic({
   model: "claude-haiku-4-5",
   apiKey: "sk-ant-test",
   maxRetries: 0,
-  anthropicApiUrl: `http://localhost:${anthropicServer.port}`,
+  anthropicApiUrl: `http://127.0.0.1:${anthropicServer.port}`,
 });
 
 afterAll(() => {
@@ -190,10 +208,10 @@ describe("the verdict is asked for as a schema, not as prose", () => {
     expect(v.error).toBeUndefined();
   });
 
-  // The decoder is a property of the endpoint, and this repository reaches endpoints that only
-  // claim to be the one they imitate. Measured on a local one: an answer that is valid json but not
-  // a verdict comes back through `parsed` UNVALIDATED, so trusting it would publish "not violated"
-  // for a screen that produced no verdict at all.
+  // NOTE: The decoder is a property of the endpoint, and this repository reaches endpoints that only claim to
+  // be the one they imitate. On such an endpoint an answer that is valid json but not a verdict comes
+  // back through `parsed` UNVALIDATED, so trusting it would publish "not violated" for a screen that
+  // produced no verdict at all.
   test("json that is not a verdict does not become a clean verdict", async () => {
     openaiBody = JSON.stringify({ violado: true, categorias: ["toxicity"] });
     const v = await analyzeGuardrail(openaiModel, BASE, "json-schema");
@@ -201,9 +219,9 @@ describe("the verdict is asked for as a schema, not as prose", () => {
     expect(v.error).toBe("no usable verdict in response");
   });
 
-  // The provider list is about the ENDPOINT; the model field next to it is free text, and a model
-  // that takes ordinary chat and refuses this request would otherwise turn a working screen into a
-  // silent one. A refusal is answered by making the call the way it was made before this existed.
+  // NOTE: The provider list is about the ENDPOINT; the model field next to it is free text, and a model that
+  // takes ordinary chat and refuses this request would otherwise turn a working screen into a silent
+  // one. A refusal is answered by making the call in prose, without the constraint.
   test("a refused request is retried the way it used to be made", async () => {
     refuseConstrained = true;
     const v = await analyzeGuardrail(openaiModel, BASE, "json-schema");
@@ -236,61 +254,82 @@ describe("the verdict is asked for as a schema, not as prose", () => {
   });
 });
 
-describe("an adapter that answers around the schema", () => {
+describe("an Anthropic endpoint", () => {
   beforeEach(() => {
     anthropicContent = [];
+    anthropicWires = [];
+    refuseForcedTool = false;
   });
 
-  test("a forced tool call is read as the verdict", async () => {
-    anthropicContent = [
-      {
-        type: "tool_use",
-        id: "t1",
-        name: "guardrail_verdict",
-        input: VIOLATION,
-      },
-    ];
-    const v = await analyzeGuardrail(anthropicModel, BASE, "json-schema");
+  // A model that refuses the forced tool call costs a 400 and a prose retry on every screen, and its
+  // verdict is read out of text. Asked through the native output format it answers the first call.
+  test("a model that refuses forced tool calls is screened in one constrained call", async () => {
+    refuseForcedTool = true;
+    anthropicContent = [{ type: "text", text: JSON.stringify(VIOLATION) }];
+    const v = await analyzeGuardrail(
+      anthropicModel,
+      BASE,
+      verdictAskMode("anthropic"),
+    );
+    expect(anthropicWires).toHaveLength(1);
+    const [wire] = anthropicWires;
+    expect(wire?.tool_choice).toBeUndefined();
+    expect(
+      (wire?.output_config as { format?: { type?: string } } | undefined)
+        ?.format?.type,
+    ).toBe("json_schema");
     expect(v.violated).toBe(true);
     expect(v.categories).toEqual(["toxicity"]);
     expect(v.error).toBeUndefined();
   });
+});
 
-  // Defence in depth, and it is reachable: measured on this adapter, a reply that answers in TEXT
-  // instead of calling the forced tool arrives with no parsed answer and the text intact. Reading
-  // it is what the prose path has always done, so the screen survives a model that ignored the
-  // tool, instead of being reported as one that never ran.
+describe("an adapter that answers around the schema", () => {
+  beforeEach(() => {
+    anthropicContent = [];
+    anthropicWires = [];
+    refuseForcedTool = false;
+  });
+
+  // NOTE: Defence in depth: a reply whose text the adapter cannot parse as the schema (a verdict wrapped
+  // in prose, an answer cut short) arrives with no parsed answer and the text intact. Reading it is what
+  // the prose path does, so the screen survives instead of being reported as one that never ran.
   test("a text answer is still read, rather than reported as unscreened", async () => {
     anthropicContent = [
       { type: "text", text: `Analisei: ${JSON.stringify(VIOLATION)}` },
     ];
-    const v = await analyzeGuardrail(anthropicModel, BASE, "json-schema");
+    const v = await analyzeGuardrail(
+      anthropicModel,
+      BASE,
+      verdictAskMode("anthropic"),
+    );
     expect(v.violated).toBe(true);
     expect(v.error).toBeUndefined();
   });
 
   test("a text answer carrying no verdict is not clean either", async () => {
     anthropicContent = [{ type: "text", text: "não consegui analisar" }];
-    const v = await analyzeGuardrail(anthropicModel, BASE, "json-schema");
+    const v = await analyzeGuardrail(
+      anthropicModel,
+      BASE,
+      verdictAskMode("anthropic"),
+    );
     expect(v.violated).toBe(false);
     expect(v.error).toBe("no usable verdict in response");
   });
 });
 
-// Gemini is asked in its own dialect, and this is where that is pinned. The adapter forwards the
-// schema unconverted, so what we hand it is what Gemini validates: measured live on
-// gemini-3.5-flash and -flash-lite, the json-schema dialect comes back 400 ("Proto field is not
-// repeating, cannot start list") and every screen then costs two calls, while this one answers in
-// one.
-//
-// The reverse is why the two dialects are not interchangeable, also measured live: asked with
-// `nullable: true`, OpenAI ignores the keyword, `suggestedReply` becomes a required string, and the
-// model is pushed into inventing one (8 runs on gpt-5.4-nano: `""` seven times, `"/"` once) — on
-// the direction whose entire rule is that it must never compose a reply.
+// Gemini is asked in its own dialect, pinned here. The adapter forwards the schema unconverted, so
+// what we hand it is what Gemini validates: the json-schema dialect comes back 400 ("Proto field is
+// not repeating, cannot start list") on gemini-3.5-flash and -flash-lite, and every screen would
+// cost two calls. Not interchangeable the other way either: asked with `nullable: true`, OpenAI
+// ignores the keyword, `suggestedReply` becomes a required string, and the model invents one (`""`
+// or `"/"`) on the direction whose rule is that it must never compose a reply.
 describe("the schema dialect Gemini speaks", () => {
   test("nullability reaches the wire as a flag, not as a type union", async () => {
     let wire = "";
     const server = Bun.serve({
+      hostname: "127.0.0.1",
       port: 0,
       async fetch(req) {
         const pre = preflight(req);
@@ -320,7 +359,7 @@ describe("the schema dialect Gemini speaks", () => {
     const gemini = new ChatGoogleGenerativeAI({
       model: "gemini-3.5-flash",
       apiKey: "x",
-      baseUrl: `http://localhost:${server.port}`,
+      baseUrl: `http://127.0.0.1:${server.port}`,
     });
     try {
       await analyzeGuardrail(gemini, BASE, "openapi");

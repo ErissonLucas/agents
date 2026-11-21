@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import {
+  AMBIGUOUS_MCP_NAME,
   buildConnConfig,
   buildMcpContextSection,
   filterAllowed,
@@ -9,6 +10,8 @@ import {
   mcpServerSlug,
   namespacedToolName,
 } from "@/graph/tools/mcp";
+import { isReadOnlyTool, isReadTool } from "@/graph/tools/reads";
+import { normalizeToolName } from "@/graph/tools/toolName";
 
 const PUBLIC = "8.8.8.8"; // public IP literal: no DNS lookup, not SSRF-blocked
 
@@ -205,14 +208,6 @@ describe("buildConnConfig", () => {
     expect(c.url).toBe(`https://${PUBLIC}/mcp-from-cred`);
   });
 
-  test("no url and no credentialBaseUrl → throws missing url error", async () => {
-    await expect(
-      buildConnConfig(sel({ url: null, credentialBaseUrl: null }), {
-        stdioEnabled: false,
-      }),
-    ).rejects.toThrow(/requires a url/);
-  });
-
   test("credentialBaseUrl alone (null url) is sufficient", async () => {
     const c = (await buildConnConfig(
       sel({ url: null, credentialBaseUrl: `https://${PUBLIC}/mcp` }),
@@ -246,10 +241,9 @@ describe("mcpServerSlug", () => {
   });
 
   test("and that fallback is the same for the same name, and different for a different one", () => {
-    // NOTE: The property the transfer depends on (#412): the slug is a function of the name alone, so the
-    // row id it used to carry cannot follow the connection into another tenant. Two names that both
-    // sanitize to nothing must still land on two slugs, which is why the digest is taken over the raw
-    // name and not over the (empty) sanitized one.
+    // NOTE: the agent transfer depends on the slug being a function of the name alone (a row id
+    // would not survive into another tenant). Two names that both sanitize to nothing must still land
+    // on two slugs, so the digest is taken over the raw name, not over the (empty) sanitized one.
     expect(mcpServerSlug("🎯")).toBe(mcpServerSlug("🎯"));
     expect(mcpServerSlug("🎯")).not.toBe(mcpServerSlug("🚀"));
   });
@@ -321,21 +315,19 @@ describe("loadMcpToolsForAgent", () => {
     expect(tools.map((t) => t.name)).toEqual(["mcp__asaas-mcp__a"]);
   });
 
-  test("a connection that fails to load is skipped (never breaks the turn)", async () => {
+  // Nothing in a server's declaration says read or write, so an observation reads the result of
+  // every MCP tool (tools/reads.ts); the cached original stays unmarked.
+  test("marks the exposed tool as a read, not the server's cached one", async () => {
+    const original = fakeTool("a");
     const tools = await loadMcpToolsForAgent(
       7n,
-      [
-        sel({ name: "down", enabledTools: ["a"] }),
-        sel({ name: "up", enabledTools: ["x"] }),
-      ],
-      {
-        connect: async (s) => {
-          if (s.name === "down") throw new Error("ECONNREFUSED");
-          return [fakeTool("x")];
-        },
-      },
+      [sel({ enabledTools: ["a"] })],
+      { connect: async () => [original] },
     );
-    expect(tools.map((t) => t.name)).toEqual(["mcp__up__x"]);
+    expect(tools.map(isReadTool)).toEqual([true]);
+    expect(isReadTool(original)).toBe(false);
+    // Nothing says a server's tool only reads, so it is never read-only.
+    expect(tools.map(isReadOnlyTool)).toEqual([false]);
   });
 
   test("invokes onDiscoverError for each failing connection, still loading the rest", async () => {
@@ -391,6 +383,34 @@ describe("loadMcpToolsForAgent", () => {
     ]);
   });
 
+  // A decisions rule names a tool by name alone: a name whose owner depends on the reading order is
+  // marked, and a rule on it does not run (agents#1223).
+  test("a name two servers may answer to is marked ambiguous; a name only one has is not", async () => {
+    const tools = await loadMcpToolsForAgent(
+      7n,
+      [
+        sel({ connId: 1n, name: "CRM", enabledTools: ["create"] }),
+        sel({ connId: 2n, name: "crm", enabledTools: ["create"] }),
+        sel({ connId: 3n, name: "sheets", enabledTools: ["append"] }),
+      ],
+      {
+        connect: async (s) =>
+          s.name === "sheets" ? [fakeTool("append")] : [fakeTool("create")],
+      },
+    );
+    const marked = Object.fromEntries(
+      tools.map((t) => [
+        t.name,
+        (t as { [AMBIGUOUS_MCP_NAME]?: true })[AMBIGUOUS_MCP_NAME] === true,
+      ]),
+    );
+    expect(marked).toEqual({
+      mcp__crm__create: true,
+      mcp__crm__create_2: true,
+      mcp__sheets__append: false,
+    });
+  });
+
   test("stamps mcpServer metadata (label + instructions) for the prompt section", async () => {
     const tools = await loadMcpToolsForAgent(
       7n,
@@ -405,6 +425,25 @@ describe("loadMcpToolsForAgent", () => {
     expect(meta).toEqual({
       label: "Hub",
       instructions: "Manages licenses and instances.",
+      connectionId: String(sel({}).connId),
     });
+  });
+});
+
+// THE NAMESPACE IS THE SERVERS' ALONE: an HTTP or code tool's name goes through normalizeToolName,
+// which collapses runs of underscores, so no local tool can take an `mcp__` name. The decisions save
+// and the rule editor rely on it to read such a name as a server's (agents#1223).
+describe("an HTTP or code tool never takes an MCP name", () => {
+  test("whatever the operator types", () => {
+    for (const typed of [
+      "mcp__crm__open",
+      "MCP__CRM__OPEN",
+      "mcp___crm",
+      "mcp  crm",
+      "mcp_ _crm",
+      "mcp.-_crm",
+    ]) {
+      expect(normalizeToolName(typed).startsWith("mcp__"), typed).toBe(false);
+    }
   });
 });

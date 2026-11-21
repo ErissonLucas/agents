@@ -7,7 +7,12 @@ import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
-import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
+import {
+  asSuperAdminOn,
+  runScopedOn,
+  type ScopedDb,
+  type TenantContext,
+} from "@/lib/tenancy";
 import { unstorableProblem } from "@/lib/text";
 import {
   markUndisclosed,
@@ -21,20 +26,26 @@ import {
   generateRouteToken,
   hashRouteToken,
 } from "@/modules/webhooks/inbound/route-token";
+import {
+  isSignatureConfigProblem,
+  parseSignatureConfig,
+  signatureCoversBody,
+  signatureCoversId,
+} from "@/modules/webhooks/inbound/signed-message";
 import { ensureInboundSweep } from "@/modules/webhooks/inbound/sweep";
+import { calendarConfigRangeProblem } from "./calendar-config-ranges";
 import { CATALOG, getCatalogEntry } from "./catalog";
+import { isFetchBackProblem, parseFetchBackConfig } from "./fetch-back";
+import { fetchBackToolProblem } from "./fetch-back-run";
+import { SPREADSHEET_ID_PATTERN } from "./toolpacks/google-sheets";
 import type { CatalogEntry } from "./types";
 
 // Integration instances: the per-tenant activation of a catalog entry. Creation mints the opaque
-// inbound route token; resolution maps an incoming token to the owning tenant + instance via a
-// constant-time hash lookup (cross-tenant, so asSuperAdmin).
-//
-// NOTE: The token is persisted TWICE — `routeTokenHash` (SHA-256) is what the hot inbound path
-// probes, and `routeToken` is an encryptJson() copy that exists purely so the operator can re-read
-// the webhook URL in the editor. It is an ADDRESS, not the authenticator (inbound calls are
-// authenticated by inboundAuthStrategy + the vault secret), and it is returned only by the
-// single-instance read, never by the list. Rows created before that column exists decrypt to null,
-// and the editor offers rotateIntegrationRouteToken instead.
+// inbound route token; resolution maps an incoming token to its tenant + instance by a
+// constant-time hash lookup (cross-tenant, so asSuperAdmin). The token is stored TWICE:
+// `routeTokenHash` is what the inbound path probes, and `routeToken` is an encryptJson() copy so
+// the editor can re-show the URL (single-instance read only; older rows decrypt to null and the
+// editor offers a rotation). It is an ADDRESS, not the authenticator.
 
 export interface ResolvedInboundRoute {
   id: bigint;
@@ -69,25 +80,13 @@ export async function resolveInboundRouteByToken(
   return { ...row, config: (row.config ?? {}) as Record<string, unknown> };
 }
 
-// `config` is a free-form bag on both writers (`z.record(z.string(), z.unknown())`, no allowlist),
-// and two of its keys are read back as HEADER NAMES by the inbound gate. `request.headers.get`
-// throws on a name outside RFC 7230's token, so before issue #362 a trailing space typed into that
-// JSON answered every delivery 500 — where every other refusal is a uniform 401, making the status
-// itself the oracle that uniformity exists to deny, and making the provider retry a request that
-// can never succeed.
-//
-// This REFUSES rather than trimming, the same call issue #340 made for vault values: the operator
-// typing a header name into raw JSON gets no feedback either way, and a refusal that names the key
-// is the only feedback there is. Trimming would also only cover the padded spelling — `x tok` has
-// to be refused regardless — so normalising would buy a second code path and still refuse.
-//
-// Only a STRING is judged. A key holding a number or null is already ignored by
-// `resolveInboundAuthConfig`'s `override`, which falls back to the catalog's name and then ours;
-// that is documented behaviour, and rows already carry it. Refusing it here would turn an existing
-// instance's next unrelated save into a 400.
-//
-// The read refuses too, and neither makes the other redundant: this one cannot reach a row already
-// written, and that one cannot tell the operator anything.
+// `config` is a free-form bag on both writers, and two of its keys are read back as HEADER NAMES by
+// the inbound gate, where `request.headers.get` throws on a name outside RFC 7230's token (a 500
+// where every other refusal is a uniform 401). This REFUSES rather than trims, so the operator gets
+// a refusal naming the key. Only a STRING is judged: a number or null is already ignored by
+// `resolveInboundAuthConfig`'s `override`, and refusing it would break an existing row's next save.
+// The read refuses too; this one cannot reach rows already written, and that one cannot tell the
+// operator.
 const HEADER_NAME_KEYS = ["authHeader", "signatureHeader"] as const;
 
 export function assertUsableHeaderNames(config: Record<string, unknown>): void {
@@ -95,8 +94,8 @@ export function assertUsableHeaderNames(config: Record<string, unknown>): void {
     const value = config[key];
     if (typeof value !== "string") continue;
     if (isUsableHeaderName(value)) continue;
-    // The sentence names the key because `AppError.field` does not survive every caller: the MCP
-    // writer sends `e.message` alone (issue #340 measured the same loss on the vault path).
+    // NOTE: The sentence names the key because `AppError.field` does not survive every caller: the
+    // MCP writer sends `e.message` alone.
     throw new AppError(
       `config.${key} is not a usable header name`,
       400,
@@ -107,10 +106,102 @@ export function assertUsableHeaderNames(config: Record<string, unknown>): void {
   }
 }
 
-// The operator's guidance for a GENERIC instance's events (issue #818): trusted text that reaches
-// the model outside the data fence, on every event this instance delivers. Bounded because it rides
-// every one of those turns, and refused rather than repaired, like the header names above: the
-// operator typed it and a refusal that names the key is the only feedback there is.
+function fetchBackRefusal(field: string, problem: string): AppError {
+  const path = field ? `config.fetchBack.${field}` : "config.fetchBack";
+  return new AppError(
+    `${path} ${problem}`,
+    400,
+    "errors.integrationFetchBackUnusable",
+    { field: path, problem },
+    path,
+  );
+}
+
+// A GENERIC instance's consult-back, as far as the body can tell: the shape, and that the id it
+// looks up is one the instance's authentication vouches for (an HMAC message that does not sign
+// where the id comes from would let a captured signature look up any id).
+export function assertFetchBackConfig(
+  catalogType: string,
+  config: Record<string, unknown>,
+  strategy: InboundAuthStrategy | undefined,
+): void {
+  const parsed = parseFetchBackConfig(config.fetchBack);
+  if (parsed === undefined) return;
+  if (catalogType !== "GENERIC") {
+    throw fetchBackRefusal("", "is only for the generic webhook");
+  }
+  if (isFetchBackProblem(parsed)) {
+    throw fetchBackRefusal(parsed.field, parsed.problem);
+  }
+  const { source, name } = parsed.idFrom;
+  if (
+    strategy === "HMAC_SHA256" &&
+    !(source === "body"
+      ? signatureCoversBody(config.signature)
+      : signatureCoversId(config.signature, source, name))
+  ) {
+    throw fetchBackRefusal(
+      "idFrom",
+      `reads ${source}.${name}, which the signed message does not cover`,
+    );
+  }
+}
+
+// The tool half, which needs the tenant's rows: it exists here, is enabled, takes the id in a field
+// the model would fill, and renders nothing that only a conversation has.
+export async function assertFetchBackTool(
+  db: ScopedDb,
+  config: Record<string, unknown>,
+): Promise<void> {
+  const parsed = parseFetchBackConfig(config.fetchBack);
+  if (parsed === undefined || isFetchBackProblem(parsed)) return;
+  const tool = await db.toolDefinition.findUnique({
+    where: { id: parsed.toolId },
+    select: {
+      enabled: true,
+      urlTemplate: true,
+      headers: true,
+      query: true,
+      body: true,
+      inputSchema: true,
+    },
+  });
+  const problem = fetchBackToolProblem(tool, parsed.idArg);
+  if (problem) throw fetchBackRefusal("toolId", problem);
+}
+
+// What an HMAC instance signs when it is not the body. Refused whole, naming the field, by the same
+// parser the gate reads it with, so a stored config the gate would fail closed on cannot be written.
+// A toolpack's provider signs the way its catalog entry knows; the signed message is the generic
+// webhook's, where the operator describes a gateway the catalog does not.
+export function assertSignatureConfig(
+  catalogType: string,
+  config: Record<string, unknown>,
+): void {
+  const parsed = parseSignatureConfig(config.signature);
+  if (parsed === undefined) return;
+  const problem =
+    catalogType !== "GENERIC"
+      ? { field: "", problem: "is only for the generic webhook" }
+      : isSignatureConfigProblem(parsed)
+        ? parsed
+        : null;
+  if (!problem) return;
+  const field = problem.field
+    ? `config.signature.${problem.field}`
+    : "config.signature";
+  throw new AppError(
+    `${field} ${problem.problem}`,
+    400,
+    "errors.integrationSignatureUnusable",
+    { field, problem: problem.problem },
+    field,
+  );
+}
+
+// The operator's guidance for a GENERIC instance's events: trusted text that reaches the model
+// outside the data fence, on every event this instance delivers. Bounded because it rides every one
+// of those turns, and refused rather than repaired, like the header names above.
 export const GENERIC_INSTRUCTIONS_MAX_CHARS = 2000;
 
 export function assertCatalogConfig(
@@ -138,8 +229,77 @@ export function assertCatalogConfig(
   );
 }
 
-// An inbound route that makes the agent message a customer cannot be left open (GENERIC, #818).
-// Checked on create AND update, since a later PATCH to NONE opens the same door.
+// A config number outside its range is refused with 422 naming it, instead of stored as typed and run
+// as the reader's clamp.
+function assertConfigRanges(
+  catalogType: string,
+  config: Record<string, unknown>,
+  stored?: Record<string, unknown>,
+): void {
+  if (catalogType !== "GOOGLE_CALENDAR") return;
+  const problem = calendarConfigRangeProblem(config, stored);
+  if (!problem) return;
+  const { path, range, got } = problem;
+  throw new AppError(
+    `${path} must be ${range.int ? "a whole number " : ""}between ${range.min} and ${range.max}, got ${JSON.stringify(got)}`,
+    422,
+    "errors.integrationConfigOutOfRange",
+    { field: path, min: range.min, max: range.max },
+    path,
+  );
+}
+
+// The Sheets pack reads the spreadsheet and tab from the config, so a value it could never use is
+// refused at the write instead of stored and failing on every call. An instance without both has
+// nothing to work on, so a missing one is refused too.
+function assertSheetsConfig(
+  catalogType: string,
+  config: Record<string, unknown>,
+): void {
+  if (catalogType !== "GOOGLE_SHEETS") return;
+  const missing = (field: string, why: string) =>
+    new AppError(
+      `${field} ${why}`,
+      422,
+      "errors.integrationSheetsConfigMissing",
+      { field },
+      field,
+    );
+  const invalid = (field: string, why: string) =>
+    new AppError(
+      `${field} ${why}`,
+      422,
+      "errors.integrationSheetsConfigInvalid",
+      { field },
+      field,
+    );
+  const blank = (v: unknown) =>
+    v === undefined || v === null || (typeof v === "string" && !v.trim());
+  const id = config.spreadsheetId;
+  const sheetId = config.sheetId;
+  if (blank(id))
+    throw missing(
+      "config.spreadsheetId",
+      "is required: choose the spreadsheet",
+    );
+  if (!(typeof id === "string" && SPREADSHEET_ID_PATTERN.test(id.trim())))
+    throw invalid(
+      "config.spreadsheetId",
+      "must be the spreadsheet id (the part of its URL between /d/ and /edit), not the URL",
+    );
+  if (blank(sheetId))
+    throw missing("config.sheetId", "is required: choose the tab");
+  if (
+    !(typeof sheetId === "number" && Number.isInteger(sheetId) && sheetId >= 0)
+  )
+    throw invalid(
+      "config.sheetId",
+      "must be the tab's numeric id (the gid in its URL), not its name",
+    );
+}
+
+// An inbound route that makes the agent message a customer cannot be left open (GENERIC). Checked
+// on create AND update, since a later PATCH to NONE opens the same door.
 function assertInboundAuthAllowed(
   entry: CatalogEntry | undefined,
   strategy: InboundAuthStrategy | undefined,
@@ -164,39 +324,51 @@ export function assertIntegrationWritable(
     config?: Record<string, unknown>;
     inboundAuthStrategy?: InboundAuthStrategy;
   },
+  // The row's config on update, so a number stored before the range check existed is not refused
+  // when the same value is sent back.
+  storedConfig?: Record<string, unknown>,
+  // The row's strategy on update, which the consult-back is checked against when the patch keeps it.
+  storedStrategy?: InboundAuthStrategy,
 ): void {
   if (params.config) {
     assertUsableHeaderNames(params.config);
+    assertSignatureConfig(catalogType, params.config);
     assertCatalogConfig(catalogType, params.config);
+    assertConfigRanges(catalogType, params.config, storedConfig);
+    assertSheetsConfig(catalogType, params.config);
   }
-  assertInboundAuthAllowed(
-    getCatalogEntry(catalogType),
-    params.inboundAuthStrategy,
-  );
+  const entry = getCatalogEntry(catalogType);
+  assertInboundAuthAllowed(entry, params.inboundAuthStrategy);
+  if (params.config || params.inboundAuthStrategy) {
+    assertFetchBackConfig(
+      catalogType,
+      params.config ?? storedConfig ?? {},
+      params.inboundAuthStrategy ??
+        storedStrategy ??
+        (entry?.requiresInboundAuth ? entry.defaultInboundAuth : "NONE"),
+    );
+  }
 }
 
-// What the audit row carries.
-//
-// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
-// else is listed in `UNDISCLOSED` below and compared without being carried.
-//
-// `config` is where that matters most here, and it contributes NEITHER its values nor its key
-// names. It is a free-form bag on both writers (`z.record(z.string(), z.unknown())`, no allowlist),
-// so nothing about it was vouched for by a schema: the values are whatever an operator typed, two
-// of its keys are read back as HTTP header names, and #394 already settled that an unknown,
-// caller-controlled key can itself be secret material (`docs/mcp.md`). Listing the keys would also
-// have missed the ordinary edit — a value changed under an existing key moves no key at all.
-//
-// `routeToken` and `routeTokenHash` are in NEITHER half, deliberately. The token IS the credential
-// the inbound route authenticates by, and the hash is its verifier; the change that matters to them
-// has an action of its own (`integration.rotate_token`), so nothing is lost by leaving both out and
-// a great deal would be lost by folding them in.
-//
-// The RAW `credentialRef` is compared as well as projected, and that is not belt-and-braces: two
-// different opaque values both project as `{ref: null, opaque: true}`, so swapping one for the
-// other would move nothing. `requireVaultRef` has refused that spelling on the way in since #126,
-// which makes it a legacy row rather than a reachable write — but the fence answers for columns and
-// not for what today's writer happens to allow, and listing it costs one line.
+// A create also stores what it was not sent: no config is stored as `{}`, which a Sheets instance
+// cannot work with either. An update without a config keeps the stored one, so it stays on
+// assertIntegrationWritable alone.
+export function assertIntegrationCreatable(
+  catalogType: string,
+  params: {
+    config?: Record<string, unknown>;
+    inboundAuthStrategy?: InboundAuthStrategy;
+  },
+): void {
+  assertIntegrationWritable(catalogType, params);
+  if (!params.config) assertSheetsConfig(catalogType, {});
+}
+
+// What the audit row carries: identity, policy and shape are PROJECTED, the rest is in
+// `UNDISCLOSED` and compared without being carried. `routeToken` and `routeTokenHash` are in
+// neither: the token is the inbound credential, and its change has its own action
+// (`integration.rotate_token`). The RAW `credentialRef` is compared as well as projected, because
+// two different opaque legacy values both project as `{ref: null, opaque: true}`.
 // `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
 function auditProjection(r: {
   catalogType: string;
@@ -222,10 +394,9 @@ function auditProjection(r: {
 }
 
 // The columns the projection above may not publish, compared and never carried
-// (`@/modules/audit/projection`). `config` is the reason this family needs the rule at all: it is
-// `z.record(z.string(), z.unknown())` on both writers, so neither its values NOR ITS KEY NAMES are
-// anything the schema vouched for, and #394 already settled that an unknown, caller-controlled key
-// can itself be secret material — which is why the row no longer lists them.
+// (`@/modules/audit/projection`). `config` is `z.record(z.string(), z.unknown())` on both writers,
+// so neither its values nor its key names were vouched for by a schema, and a caller-controlled key
+// can itself be secret material.
 const UNDISCLOSED = ["config", "credentialRef", "inboundSecretRef"] as const;
 
 export interface CreateIntegrationParams {
@@ -250,7 +421,7 @@ export async function createIntegrationInstance(
   if (!entry) {
     throw new AppError(`unknown catalogType: ${params.catalogType}`, 400);
   }
-  assertIntegrationWritable(entry.catalogType, params);
+  assertIntegrationCreatable(entry.catalogType, params);
   // Only inbound-capable catalog entries mint a route token; the rest get no inbound surface.
   const minted = entry.supportsInbound ? generateRouteToken() : null;
   const tenantId = ctx.tenantId as bigint;
@@ -262,6 +433,7 @@ export async function createIntegrationInstance(
       minted && params.inboundSecretRef
         ? await requireVaultRef(db, params.inboundSecretRef, "inboundSecretRef")
         : null;
+    await assertFetchBackTool(db, params.config ?? {});
     const row = await db.integrationInstance.create({
       data: {
         tenantId,
@@ -287,8 +459,8 @@ export async function createIntegrationInstance(
     });
     return row;
   });
-  // The first inbound instance is the moment a tenant can start stranding deliveries, and the boot
-  // arm only reaches tenants that had one then (issue #817). After the commit, and best-effort: the
+  // NOTE: The first inbound instance is the moment a tenant can start stranding deliveries, and the
+  // boot arm only reaches tenants that had one then. After the commit, and best-effort: the
   // instance exists either way, and the next boot arms the sweep if this did not.
   if (minted) {
     await ensureInboundSweep(tenantId, base).catch((err) =>
@@ -339,7 +511,7 @@ const INSTANCE_SELECT = {
   updatedAt: true,
 } as const;
 
-// NOTE: Why the three states are distinct. A blob that fails to decrypt does NOT throw here —
+// Why the three states are distinct. A blob that fails to decrypt does NOT throw here —
 // nothing downstream makes a security decision on this value (it is an address for the operator to
 // copy), and throwing would 500 the edit modal of every integration on the instance. But it must
 // not collapse into `absent` either: that would tell the operator "this predates the feature" when
@@ -380,9 +552,9 @@ function toInstanceDto(r: {
     name: r.name,
     enabled: r.enabled,
     config: (r.config ?? {}) as Record<string, unknown>,
-    // Both refs only where they NAME an entry — see the note on `readableVaultRef`. This module
-    // predates `requireVaultRef` by two months (#126, dc6c467a), so either column can hold a value
-    // no resolver ever matched, and this DTO is what `integration_list` returns over `mcp:read`.
+    // NOTE: Both refs only where they NAME an entry (see `readableVaultRef`): older rows of either
+    // column can hold a value no resolver ever matched, and this DTO is what `integration_list`
+    // returns over `mcp:read`.
     credentialRef: readableVaultRef(r.credentialRef),
     inboundAuthStrategy: r.inboundAuthStrategy,
     inboundSecretRef: readableVaultRef(r.inboundSecretRef),
@@ -408,7 +580,7 @@ export async function listIntegrationInstances(
   return rows.map(toInstanceDto);
 }
 
-// NOTE: The only read that returns the decrypted routeToken — this is what backs the webhook URL
+// The only read that returns the decrypted routeToken — this is what backs the webhook URL
 // field in the editor. Keep it out of the list (see IntegrationInstanceDto.routeToken).
 export async function getIntegrationInstance(
   ctx: TenantContext,
@@ -461,7 +633,13 @@ export async function updateIntegrationInstance(
         "errors.integrationInstanceNotFound",
       );
     }
-    assertIntegrationWritable(current.catalogType, params);
+    assertIntegrationWritable(
+      current.catalogType,
+      params,
+      (current.config ?? {}) as Record<string, unknown>,
+      current.inboundAuthStrategy,
+    );
+    if (params.config) await assertFetchBackTool(db, params.config);
     const credentialRef = params.credentialRef
       ? await requireVaultRef(db, params.credentialRef, "credentialRef")
       : null;
@@ -502,7 +680,7 @@ export async function updateIntegrationInstance(
   });
 }
 
-// NOTE: Mints a NEW inbound route token, invalidating the old URL the instant it commits. Two
+// Mints a NEW inbound route token, invalidating the old URL the instant it commits. Two
 // reasons it exists: an instance created before `routeToken` was stored has no readable URL (only
 // the hash survives), and a leaked URL needs a way out. The caller must warn the operator that the
 // provider's dashboard has to be updated — nothing else can reach the old address afterwards.
@@ -544,14 +722,10 @@ export async function rotateIntegrationRouteToken(
         routeToken: encryptJson(minted.token),
       },
     });
-    // A name this issue invents (#399): rotating has no MCP twin, so there was no action to move
-    // down. It is recorded rather than left out because the old URL stops answering the instant
-    // this commits — the provider keeps posting to an address nothing serves, and until now
-    // nothing said who did that or when.
-    //
-    // NEITHER token is in the projection, old or new. The row is readable by every tenant admin
-    // and outlives the instance, and the token IS the credential: the inbound route authenticates
-    // by nothing else. What identifies the rotation is the target.
+    // NOTE: Recorded because the old URL stops answering the instant this commits, and the provider
+    // keeps posting to an address nothing serves. NEITHER token is in the projection: the row is
+    // readable by every tenant admin and outlives the instance, and the token IS the inbound
+    // credential.
     await auditMutation(db, ctx, {
       action: "integration.rotate_token",
       target: `integration:${id}`,

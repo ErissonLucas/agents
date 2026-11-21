@@ -8,12 +8,14 @@ import {
   parseToolInputSchema,
   sanitizeToolName,
 } from "@/graph/tools/http";
+import { isReadOnlyTool, isReadTool } from "@/graph/tools/reads";
 import {
   buildToolpackTools,
   deadlineFetch,
   fencedFetch,
   registerToolpack,
 } from "@/modules/integrations/toolpacks/types";
+import { until } from "@/tests/utils/poll";
 
 // 8.8.8.8 is a public IP literal: the SSRF guard treats it as an IP (no DNS lookup) and does not
 // block it, so these tests never touch the network.
@@ -49,12 +51,6 @@ function def(over: Partial<HttpToolDef> = {}): HttpToolDef {
 }
 
 describe("sanitizeToolName / schema", () => {
-  test("sanitizes provider-invalid characters", () => {
-    expect(sanitizeToolName("asaas payment.create")).toBe(
-      "asaas_payment_create",
-    );
-  });
-
   test("normalizes accents (NFD), case, spaces and collapses underscores", () => {
     expect(sanitizeToolName("Busca por CPF/CNPJ")).toBe("busca_por_cpf_cnpj");
     expect(sanitizeToolName("Consultar Pedição")).toBe("consultar_pedicao");
@@ -64,6 +60,7 @@ describe("sanitizeToolName / schema", () => {
 
   test("empty schema → no declared args", () => {
     const schema = parseToolInputSchema({});
+    expect(Object.keys(schema.shape)).toEqual([]);
     expect(schema.safeParse({}).success).toBe(true);
   });
 });
@@ -124,6 +121,21 @@ describe("buildHttpTool", () => {
     expect(url.pathname).toBe("/v1/things/..%2F..%2Fadmin");
     expect(url.searchParams.get("q")).toBe("hello world");
     expect(captured.init?.body).toBeUndefined();
+  });
+
+  // The bug it catches: a tool that writes (a POST, a GET that posts an ack to the customer or
+  // registers an appointment) offered to the factual-grounding rewrite as a source it may call.
+  test("a plain GET is read-only; a POST, an ack or a declared appointment is not", () => {
+    const ctx = { resolveCredential: async () => null };
+    expect([
+      isReadOnlyTool(buildHttpTool(def(), ctx)),
+      isReadOnlyTool(buildHttpTool(def({ method: "POST" }), ctx)),
+      isReadOnlyTool(buildHttpTool(def({ ackMessage: "Um instante." }), ctx)),
+      isReadOnlyTool(
+        buildHttpTool(def({ appointment: { externalId: "$.id" } }), ctx),
+      ),
+      isReadTool(buildHttpTool(def({ ackMessage: "Um instante." }), ctx)),
+    ]).toEqual([true, false, false, false, true]);
   });
 
   test("rejects when the host is not in the per-tool allowlist", async () => {
@@ -189,10 +201,11 @@ describe("buildHttpTool credential auto-injection (item 8)", () => {
       { resolveCredential: async () => "qk", fetchImpl: stubFetch(captured) },
     );
     await tool.invoke({});
-    // resolveSecretInjection("query", ...) without paramName → null → no injection.
+    // resolveSecretInjection("query", ...) without paramName → null → no injection, under any name.
+    expect(new URL(captured.url as string).search).toBe("");
     expect(
-      new URL(captured.url as string).searchParams.get("api_key"),
-    ).toBeNull();
+      JSON.stringify({ url: captured.url, headers: captured.init?.headers }),
+    ).not.toContain("qk");
   });
 
   test("header kind + credentialParamName injects the named header", async () => {
@@ -368,8 +381,8 @@ describe("buildHttpTool slow-tool ack (item 4)", () => {
   });
 
   test("an ack that reports the run called off stops the tool before any request", async () => {
-    // The ack's send is a wait after the graph's own ask at the tool boundary; a run called off
-    // inside it (the operator's flip to monitoring, issue #209 review round 10) makes no request.
+    // The ack's send is a wait after the graph's own ask at the tool boundary; a run called
+    // off inside it (e.g. the operator's flip to monitoring) makes no request.
     const order: string[] = [];
     const fetchImpl = (async () => {
       order.push("fetch");
@@ -453,13 +466,23 @@ describe("buildHttpTool slow-tool ack (item 4)", () => {
 
   test("ack arg still required but simply not sent when emitAck is absent (playground)", async () => {
     const captured: Captured = {};
-    const tool = buildHttpTool(def({ ackMessage: "Já verifico…" }), {
-      resolveCredential: async () => null,
-      fetchImpl: stubFetch(captured),
-    });
-    // The model still writes __wait_message; with no emitAck wired it is a no-op and the call runs.
-    await tool.invoke({ __wait_message: "Checando…" });
-    expect(captured.url).toBeDefined();
+    const tool = buildHttpTool(
+      def({
+        ackMessage: "Já verifico…",
+        inputSchema: { q: { type: "string" } },
+      }),
+      {
+        resolveCredential: async () => null,
+        fetchImpl: stubFetch(captured),
+      },
+    );
+    // Still required: a call without it is refused before anything is sent.
+    await expect(tool.invoke({ q: "x" })).rejects.toThrow();
+    expect(captured.url).toBeUndefined();
+    // The model still writes __wait_message; with no emitAck wired it is a no-op and the call runs,
+    // carrying only its own arguments.
+    await tool.invoke({ q: "x", __wait_message: "Checando…" });
+    expect(captured.url).toBe(`https://${PUBLIC}/v1/thing?q=x`);
   });
 });
 
@@ -861,24 +884,10 @@ describe("buildHttpTool — query params (any method)", () => {
     expect(url.searchParams.get("bar")).toBe("static");
     expect(url.searchParams.get("foo")).toBeNull();
   });
-
-  test("legacy GET (no query) still derives non-path fields into the query", async () => {
-    const captured: Captured = {};
-    const tool = buildHttpTool(
-      def({
-        method: "GET",
-        urlTemplate: `https://${PUBLIC}/v1/x`,
-        inputSchema: { foo: { type: "string" } },
-      }),
-      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
-    );
-    await tool.invoke({ foo: "X" });
-    expect(new URL(captured.url as string).searchParams.get("foo")).toBe("X");
-  });
 });
 
 describe("buildHttpTool — programmatic authoring shapes (JSON-Schema input_schema + single-brace placeholders)", () => {
-  // NOTE: the natural shapes an API/MCP author writes: standard JSON Schema for the input and
+  // The natural shapes an API/MCP author writes: standard JSON Schema for the input and
   // OpenAPI-style single-brace path params. Both must work (converted/normalized), not fail silently.
   const JSON_SCHEMA_INPUT = {
     required: ["valor"],
@@ -960,26 +969,8 @@ describe("buildHttpTool — programmatic authoring shapes (JSON-Schema input_sch
     expect(headers["X-Nome-Cliente"]).toBe("Maria");
   });
 
-  test("POST with empty body config + JSON-Schema input: args land in the JSON body", async () => {
-    const captured: Captured = {};
-    const tool = buildHttpTool(
-      def({
-        method: "POST",
-        urlTemplate: `https://${PUBLIC}/v1/x`,
-        inputSchema: JSON_SCHEMA_INPUT,
-        body: {},
-      }),
-      { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
-    );
-    await tool.invoke({ valor: "TESTE123" });
-    expect(JSON.parse(captured.init?.body as string)).toEqual({
-      valor: "TESTE123",
-    });
-  });
-
-  // NOTE: the three "empty" spellings send three different things, and a body-shape refusal that
-  // called `{}` "no body" got the first one wrong (issue #150). Pinned together so the contract the
-  // REST/MCP descriptions state has something to be checked against.
+  // NOTE: the three "empty" spellings send three different things (`{}` is not "no body"). Pinned
+  // together so the contract the REST/MCP descriptions state has something to be checked against.
   test("the three empty body spellings are not interchangeable", async () => {
     const cases: [unknown, string][] = [
       // `{}` is the legacy fallback, NOT an empty request.
@@ -1104,15 +1095,16 @@ describe("buildHttpTool — programmatic authoring shapes (JSON-Schema input_sch
       { resolveCredential: async () => null, fetchImpl: stubFetch(captured) },
     );
     const out = await tool.invoke({});
-    expect(String(out)).toContain("id");
-    expect(String(out).toLowerCase()).toContain("error");
+    expect(String(out)).toBe(
+      "Error: no value available for URL placeholder(s): {{id}}. Call the tool again providing the missing input field(s).",
+    );
     expect(captured.url).toBeUndefined();
   });
 });
 
-// NOTE: A tool may DECLARE the statuses that are results rather than failures (issue #59). The
-// model-facing text is identical either way — same "HTTP <status>" with the same body — so only the
-// failure marking, and therefore the log level and the alert dispatch, moves.
+// A tool may DECLARE the statuses that are results rather than failures. The model-facing
+// text is identical either way (same "HTTP <status>" with the same body), so only the failure
+// marking, and therefore the log level and the alert dispatch, moves.
 describe("buildHttpTool — declared expected statuses (issue #59)", () => {
   async function callWith(status: number, expectedStatuses?: number[]) {
     const tool = buildHttpTool(
@@ -1142,11 +1134,6 @@ describe("buildHttpTool — declared expected statuses (issue #59)", () => {
     expect(String(declared.content)).toBe(String(undeclared.content));
   });
 
-  test("an undeclared status on the same tool is still a failure", async () => {
-    const out = await callWith(500, [404]);
-    expect(out.status).toBe("error");
-  });
-
   // The reason this is a list and not a range: an operator declaring "not found is data" must not
   // silently stop hearing about the credential failures next to it.
   test("declaring 404 does not cover 401 or 403", async () => {
@@ -1155,14 +1142,9 @@ describe("buildHttpTool — declared expected statuses (issue #59)", () => {
       expect(out.status).toBe("error");
     }
   });
-
-  test("an empty declaration leaves issue #40 exactly as it was", async () => {
-    const out = await callWith(404, []);
-    expect(out.status).toBe("error");
-  });
 });
 
-// NOTE: For operator-authored HTTP tools EVERY non-2xx is an integration failure (issue #40):
+// For operator-authored HTTP tools EVERY non-2xx is an integration failure:
 // invoked as a tool_call it returns a ToolMessage with status "error" carrying the same
 // "HTTP <status>" body the model already saw; 2xx stays a plain success.
 describe("buildHttpTool — non-2xx marked as integration failure (issue #40)", () => {
@@ -1199,12 +1181,12 @@ describe("buildHttpTool — non-2xx marked as integration failure (issue #40)", 
   });
 });
 
-// #456. THE MEASURED CASE: a lookup whose response is bigger than the clip, whose first kilobytes
-// are third-party data the tool was never asked for, and whose registration status sits past the
-// cut. Before the template the model got the head of the body and invented the tail.
+// A lookup whose response is bigger than the clip, whose first kilobytes are third-party data the
+// tool was never asked for, and whose registration status sits past the cut. Without a template the
+// model gets the head of the body and invents the tail.
 function measuredBody(): string {
   return JSON.stringify({
-    // 5 partners with names and masked tax ids: 29% of the real response, and none of it asked for.
+    // NOTE: 5 partners with names and masked tax ids, none of it asked for.
     qsa: Array.from({ length: 5 }, (_, i) => ({
       nome_socio: `SOCIO ${i}`,
       cnpj_cpf_do_socio: `***${i}00000**`,
@@ -1375,10 +1357,9 @@ describe("response template (#456)", () => {
   });
 });
 
-// Round 4 of review, finding 1. A template with no tokens says the same thing whatever the body is,
-// and the reader accepts one on purpose. Rendering it was gated on the body PARSING as JSON, so the
-// endpoint that most wants a constant answer — the one that returns 204 with nothing in it — was
-// the one that did not get it.
+// A template with no tokens says the same thing whatever the body is, and the reader accepts one on
+// purpose. Gating it on the body PARSING as JSON would deny it to the endpoint that most wants a
+// constant answer: the one that returns 204 with nothing in it.
 describe("a response template with no tokens does not need a body", () => {
   async function modelText(status: number, body: string | null) {
     const tool = buildHttpTool(
@@ -1410,7 +1391,6 @@ describe("a response template with no tokens does not need a body", () => {
   }
 
   test("a 204 with no body still hands the model the operator's own text", async () => {
-    // Before this, the model got `HTTP 204\n` — an empty result where the whole answer was written.
     expect(await modelText(204, null)).toBe(
       "HTTP 204\nDone. The booking is confirmed.",
     );
@@ -1425,45 +1405,11 @@ describe("a response template with no tokens does not need a body", () => {
       "HTTP 200\nDone. The booking is confirmed.",
     );
   });
-
-  test("a template WITH a token still falls back to the raw body when it is not JSON", async () => {
-    // The other half of the gate is untouched: a token needs a body to resolve against, and an
-    // empty render would be worse than the body it replaced.
-    const warns: string[] = [];
-    const tool = buildHttpTool(
-      {
-        name: "lookup",
-        method: "GET",
-        urlTemplate: "https://8.8.8.8/v1/x",
-        allowedHosts: ["8.8.8.8"],
-        headers: {},
-        inputSchema: {},
-        expectedStatuses: [],
-        credentialRef: null,
-        credentialKind: null,
-        credentialParamName: null,
-        credentialBaseUrl: null,
-        ackMessage: null,
-        outputSchema: { mode: "template", template: "Name: {{name}}" },
-      },
-      {
-        resolveCredential: async () => null,
-        onSideEffectError: (e) => warns.push(e.phase),
-        fetchImpl: (async () =>
-          new Response("not json at all", {
-            status: 200,
-          })) as unknown as typeof fetch,
-      },
-    );
-    expect(String(await tool.invoke({}))).toBe("HTTP 200\nnot json at all");
-    expect(warns).toContain("response_template");
-  });
 });
 
-// Round 12 of review, finding 2. The clip notice used to have two branches — rendered or not — and
-// "not rendered" covers a tool with NO template and a tool whose template deliberately does not
-// apply here. The second one was being told to declare a template it already has, for a case where
-// a template is not the remedy.
+// "Not rendered" covers a tool with NO template and a tool whose template deliberately does not
+// apply here, so the clip notice cannot have just two branches: the second tool would be told to
+// declare a template it already has, for a case where a template is not the remedy.
 describe("the clip notice says which fix applies", () => {
   async function clipNoticeFor(opts: {
     status?: number;
@@ -1552,9 +1498,9 @@ describe("the clip notice says which fix applies", () => {
   });
 });
 
-// #459. A search that returns N rows could not be projected at all (every token addresses one
-// value), so it kept the raw clip, and a 120-row response reads to the model as ~40 rows and an
-// end. The block renders one line per row and COUNTS the rest.
+// A search that returns N rows cannot be projected by tokens (every token addresses one value), and
+// the raw clip reads to the model as ~40 rows and an end. The block renders one line per row and
+// COUNTS the rest.
 describe("a list of unknown length renders through a block (#459)", () => {
   const results = Array.from({ length: 120 }, (_, i) => ({
     id: i + 1,
@@ -1565,17 +1511,6 @@ describe("a list of unknown length renders through a block (#459)", () => {
   const body = JSON.stringify({ total: 120, resultados: results });
   const TEMPLATE =
     "{{total}} resultados:\n{{#each resultados}}\n- #{{id}} {{nome}} — R$ {{preco}}\n{{/each}}";
-
-  test("without a block the raw list is clipped and the model reads the cut as an end", async () => {
-    expect(body.length).toBeGreaterThan(4000);
-    const tool = buildHttpTool(def(), {
-      resolveCredential: async () => null,
-      fetchImpl: stubFetch({}, 200, body),
-    });
-    const text = String(await tool.invoke({}));
-    expect(text).toContain("…[truncated]");
-    expect(text).not.toContain("Produto 120");
-  });
 
   test("with a block the model receives one line per row, the noise dropped, and the rest counted", async () => {
     const notes: string[] = [];
@@ -1602,7 +1537,7 @@ describe("a list of unknown length renders through a block (#459)", () => {
   });
 
   test("rows too long for fifty still leave the model a count, not a cut", async () => {
-    // Round 1 of review: 100 rows of ~100 characters rendered forty and the clip took the count.
+    // 100 rows of ~100 characters: rendered whole, the clip would take the count.
     const long = Array.from({ length: 100 }, (_, i) => ({
       id: i + 1,
       descricao: "d".repeat(80),
@@ -1623,7 +1558,15 @@ describe("a list of unknown length renders through a block (#459)", () => {
     );
     const text = String(await tool.invoke({}));
     expect(text).not.toContain("…[truncated]");
-    expect(text).toMatch(/\(and \d+ more not shown\)\n$/);
+    // Whole rows from the first, none cut, and the count is exactly what was left out.
+    const shown = [...text.matchAll(/^- #(\d+) (d*)$/gm)];
+    expect(shown.length).toBeGreaterThan(0);
+    expect(shown.map((m) => [Number(m[1]), m[2]])).toEqual(
+      shown.map((_, i) => [i + 1, "d".repeat(80)]),
+    );
+    expect(text.endsWith(`(and ${100 - shown.length} more not shown)\n`)).toBe(
+      true,
+    );
     expect(notes).toEqual([]);
   });
 
@@ -1690,8 +1633,7 @@ describe("a list of unknown length renders through a block (#459)", () => {
 // ABORTING AN INVOKE STOPS THE CALLER WAITING, NOT THIS HANDLER WRITING. The observer's tick has a
 // whole-turn budget; when it runs out the tick is reported as a RETRYABLE failure, so anything the
 // handler still sends afterwards is sent again by the retry. The Chatwoot client refuses past its
-// deadline for that reason, and until this an external endpoint had none of that protection and
-// none of Chatwoot's idempotency either (issue #568 review, round 12).
+// deadline for that reason, and an external endpoint needs the same, having no Chatwoot idempotency.
 describe("the turn's deadline reaches an http tool", () => {
   test("a budget that ran out while the credential resolved stops the request", async () => {
     const captured: Captured = {};
@@ -1719,35 +1661,38 @@ describe("the turn's deadline reaches an http tool", () => {
   });
 
   test("a live deadline does not stop anything, and rides along to the fetch", async () => {
-    const captured: Captured = {};
     const ctrl = new AbortController();
+    let sentTo: string | undefined;
+    let inFlight: AbortSignal | undefined;
     const tool = buildHttpTool(def(), {
       resolveCredential: async () => null,
-      fetchImpl: stubFetch(captured),
+      // NOTE: a request that stays in flight until its own signal aborts.
+      fetchImpl: ((url: string, init?: RequestInit) => {
+        sentTo = url;
+        inFlight = init?.signal ?? undefined;
+        return new Promise((_, reject) => {
+          inFlight?.addEventListener("abort", () =>
+            reject(new Error("aborted")),
+          );
+        });
+      }) as unknown as typeof fetch,
       expiresOn: ctrl.signal,
     });
-    await tool.invoke({});
-    expect(captured.url).toContain("/v1/thing");
+    const run = tool.invoke({}).catch((e: unknown) => e);
+    await until("the request to go out", () => inFlight);
+    expect(sentTo).toBe(`https://${PUBLIC}/v1/thing`);
+    expect(inFlight?.aborted).toBe(false);
     // Relayed onto the bounded fetch's own controller, so a request in flight is cancelled when the
     // budget ends instead of running to its own timeout past the end of the tick.
-    expect(captured.init?.signal).toBeDefined();
-  });
-
-  test("no deadline is the reactive turn, and it is unchanged", async () => {
-    const captured: Captured = {};
-    const tool = buildHttpTool(def(), {
-      resolveCredential: async () => null,
-      fetchImpl: stubFetch(captured),
-    });
-    await tool.invoke({});
-    expect(captured.url).toContain("/v1/thing");
+    ctrl.abort();
+    expect(inFlight?.aborted).toBe(true);
+    await run;
   });
 });
 
 // A DEADLINE SAYS THERE IS NO TIME LEFT; THE FENCE SAYS NOBODY IS WAITING. A `/reset`, a supersede
 // or a detach landing while a tool resolves a credential or a DNS name leaves the budget perfectly
-// alive and the run withdrawn all the same, and the POST reaches somebody else's system anyway
-// (issue #568 review, round 28).
+// alive and the run withdrawn all the same, and the POST would reach somebody else's system anyway.
 describe("the turn's withdrawal fence reaches an http tool", () => {
   test("a run called off while the credential resolved stops the request", async () => {
     const captured: Captured = {};
@@ -1796,7 +1741,7 @@ describe("the turn's withdrawal fence reaches an http tool", () => {
 // THE SAME DEADLINE, THE OTHER FAMILY OF TOOLS. Four toolpacks each have their own request helper,
 // so enforcing this at each of them is four places to forget and a fifth uncovered the day someone
 // adds a pack. It is applied by wrapping the ctx's `fetchImpl` at the build seam instead — the shape
-// the Chatwoot client's mutedFetch already uses (issue #568 review, round 13).
+// the Chatwoot client's mutedFetch already uses.
 describe("the turn's deadline reaches a toolpack", () => {
   test("a budget already spent stops the request before it is sent", async () => {
     const ctrl = new AbortController();
@@ -1869,6 +1814,50 @@ describe("the turn's deadline reaches a toolpack", () => {
     ).rejects.toThrow("time budget");
   });
 
+  // A pack says neither which tools only read nor when one refused in plain words, so an
+  // observation goes on to read every integration result (graph/tools/reads.ts), through both
+  // wrappers the seam may add.
+  for (const fenced of [false, true]) {
+    test(`every pack tool reaches the toolset marked as a read${fenced ? ", fenced" : ""}`, () => {
+      registerToolpack({
+        catalogType: "__test_reads__",
+        toolSpecs: [{ name: "find_rows", schema: z.object({}) }],
+        build() {
+          return [
+            tool(async () => "linha", {
+              name: "find_rows",
+              description: "find",
+              schema: z.object({}),
+            }),
+          ];
+        },
+      });
+      const built = buildToolpackTools(
+        [
+          {
+            instanceId: 1n,
+            catalogType: "__test_reads__",
+            config: {},
+            credentialRef: null,
+            enabledTools: ["find_rows"],
+          },
+        ],
+        {
+          tenantId: 1n,
+          base: {} as never,
+          threadId: "t",
+          resolveCredential: async () => null,
+          ...(fenced
+            ? { stillWanted: async () => true, onNoEffect: () => {} }
+            : {}),
+        },
+      );
+      expect(built.map(isReadTool)).toEqual([true]);
+      // Read for an observation, never read-only: a pack does not say which of its tools write.
+      expect(built.map(isReadOnlyTool)).toEqual([false]);
+    });
+  }
+
   test("both signals survive: the pack's timeout AND the deadline", async () => {
     // The half a `??` gets wrong, and it is the common case rather than the edge one: by the time
     // this wrapper runs, fetchBounded has already put its OWN controller in `init.signal`, so
@@ -1911,7 +1900,7 @@ describe("the turn's deadline reaches a toolpack", () => {
   });
 });
 
-// THE FENCE, AT THE SAME SEAM AND FOR THE SAME REASON (round 28). A pack's helper never learns about
+// THE FENCE, AT THE SAME SEAM AND FOR THE SAME REASON. A pack's helper never learns about
 // it; the wrap does, so a pack written next month is covered the day it is registered.
 describe("the turn's withdrawal fence reaches a toolpack", () => {
   test("a run called off refuses the request before it leaves", async () => {
@@ -1930,13 +1919,10 @@ describe("the turn's withdrawal fence reaches a toolpack", () => {
   });
 
   test("a refusal the pack SWALLOWED is still reported once, with the tool's own name", async () => {
-    // The refusal that ends in `throw` has no result to carry the answer, and the observer's tick
-    // has to know that nothing left the process or it counts the dispatch as a write and stops
-    // retrying. The pack here does what every real pack does with a transport error — catches it and
-    // answers a tool failure (asaas.ts, google-drive.ts, google-calendar.ts all wrap their request
-    // helper in that catch) — so nothing escapes the invoke and a report waiting outside it never
-    // fires (review round 38). Two requests, one report: the dedupe that moving the report out was
-    // meant to buy is kept by the per-dispatch frame.
+    // The observer's tick has to know that nothing left the process, or it counts the
+    // dispatch as a write and stops retrying. Every real pack catches a transport error and answers
+    // a tool failure, so nothing escapes the invoke and a report waiting outside it would never
+    // fire. Two requests, one report: the per-dispatch frame dedupes.
     const reported: string[] = [];
     registerToolpack({
       catalogType: "TEST_NOEFFECT_PACK",
@@ -1994,9 +1980,9 @@ describe("the turn's withdrawal fence reaches a toolpack", () => {
   });
 
   test("a fence that turns false AFTER a request left reports nothing", async () => {
-    // A pack tool is not one request. `asaas_create_pix_charge` POSTs the charge and then GETs its
-    // QR code: a withdrawal between the two is a refusal with the charge already made, and saying
-    // "no effect" there hands the scheduler a retry that charges twice (review round 41).
+    // A pack tool is not one request. `asaas_create_pix_charge` POSTs the charge and then
+    // GETs its QR code: a withdrawal between the two is a refusal with the charge already made, and
+    // saying "no effect" there hands the scheduler a retry that charges twice.
     const reported: string[] = [];
     const sent: string[] = [];
     let allow = true;

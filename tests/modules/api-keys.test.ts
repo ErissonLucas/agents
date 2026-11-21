@@ -21,6 +21,7 @@ import {
   verifyApiKey,
 } from "@/modules/api-keys/verify";
 import { mcpPrincipalFromApiKey } from "@/modules/mcp/oauth/tokens";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 describe("api key token generation", () => {
   test("generateApiKey is prefixed and its hash round-trips", () => {
@@ -68,8 +69,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -179,9 +180,8 @@ describe.skipIf(!dbUp)("api key service + verify (RLS)", () => {
     expect(principal?.tenantId).toBe(tenantA);
     expect(principal?.role).toBe("TENANT_ADMIN");
     expect(principal?.userId).toBe(USER_A);
-    // Written with no `stepUpAt`, the way every row that predates the password rule is: the
-    // principal says so, and the step-up asks that key the creator's password as it always did
-    // (review round 3 on #308).
+    // NOTE: written with no `stepUpAt`, like every row that predates the password rule: the
+    // principal says so, and the step-up asks that key for the creator's password.
     expect(principal?.stepUpAt).toBeNull();
   });
 
@@ -240,13 +240,11 @@ describe.skipIf(!dbUp)("api key service + verify (RLS)", () => {
   });
 });
 
-// ── fleet-scoped keys (issue #308) ──
+// ── fleet-scoped keys ──
 //
-// Every key used to be born TENANT_ADMIN and pinned to one tenant, so a fleet operation (create a
-// tenant, read the whole roster) could only be driven by a SUPER_ADMIN browser session: automation
-// logged in, kept cookies, and re-typed a person's password for step-up. A fleet key is the same
-// row with the shape `users` already gives a SUPER_ADMIN — no home tenant, SUPER_ADMIN authority —
-// and the CHECK constraint below is what keeps the two halves of that shape from drifting apart.
+// A fleet key drives fleet operations (create a tenant, read the whole roster) without a SUPER_ADMIN
+// browser session. It is the same row with the shape `users` gives a SUPER_ADMIN (no home tenant,
+// SUPER_ADMIN authority), and the CHECK constraint below keeps the two halves of that shape together.
 const FLEET_USER = 4343n;
 const fleetCtx = (): TenantContext => ({
   tenantId: null,

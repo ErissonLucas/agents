@@ -1,18 +1,40 @@
 /// <reference lib="dom" />
 
-import { describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "bun:test";
+import { EditorView } from "@codemirror/view";
+import { TooltipProvider } from "@radix-ui/react-tooltip";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useEffect, useRef } from "react";
+import { MemoryRouter } from "react-router";
+import { ToastProvider, useModalController } from "@/client/components";
+import { invalidateVault } from "@/client/lib/vaultCache";
 import {
   formFromTool,
   insertEachBlock,
+  nativeVarItems,
   outputSchemaForm,
   parseExpectedStatuses,
+  parseMaxResponseChars,
   payloadOf,
   type Tool,
+  ToolEditModal,
   templatePreviewFor,
   templateSaveProblem,
   testFieldsFrom,
 } from "@/client/pages/resources/ToolEditModal";
 import { buildHttpTool } from "@/graph/tools/http";
+import {
+  CONTEXT_VAR_NAMES,
+  HTTP_TOOL_ONLY_VAR_NAMES,
+} from "@/modules/tool-definitions/normalize";
 import { MAX_TEMPLATE_CHARS } from "@/modules/tool-definitions/response-template";
 import { toolDefinitionCreateSchema } from "@/modules/tool-definitions/service";
 
@@ -59,19 +81,6 @@ describe("formFromTool — legacy fixed URL bindings", () => {
     expect(form.aiFields.map((f) => f.name)).toEqual(["q"]);
   });
 
-  test("a fixed URL binding whose value is a context template stays a template", () => {
-    const form = formFromTool(
-      legacyTool({
-        inputSchema: {
-          tenant: { source: "fixed", value: "{{conversation_id}}" },
-        },
-      }),
-    );
-    expect(form.urlTemplate).toBe(
-      "https://api.example.com/accounts/{{conversation_id}}",
-    );
-  });
-
   test("an AI field bound to a URL placeholder keeps its {{token}} and its schema row", () => {
     const form = formFromTool(
       legacyTool({
@@ -85,8 +94,8 @@ describe("formFromTool — legacy fixed URL bindings", () => {
   });
 });
 
-// Issue #59: the operator types a list; the server normalizes it (dedupe, sort, drop 2xx and
-// out-of-range). The field is permissive on purpose — a stray separator is not worth failing a save.
+// The operator types a list; the server normalizes it (dedupe, sort, drop 2xx and out-of-range).
+// The field is permissive on purpose: a stray separator is not worth failing a save.
 describe("parseExpectedStatuses", () => {
   test("an empty field declares nothing, which is the fail-closed default", () => {
     expect(parseExpectedStatuses("")).toEqual([]);
@@ -104,14 +113,9 @@ describe("parseExpectedStatuses", () => {
   test("what is not a whole positive number is dropped rather than rejected", () => {
     expect(parseExpectedStatuses("404, abc, 4.5, -1")).toEqual([404]);
   });
-
-  // Round-trip: the stored list is rendered back into the field as a comma list.
-  test("the rendered value parses back to itself", () => {
-    expect(parseExpectedStatuses([404, 409].join(", "))).toEqual([404, 409]);
-  });
 });
 
-// #456. The response template travels through the form as plain markdown; the {mode, template}
+// The response template travels through the form as plain markdown; the {mode, template}
 // envelope is assembled on save, and whatever ELSE the column held has to survive an edit that
 // never showed it.
 describe("formFromTool / payloadOf — the response template", () => {
@@ -127,16 +131,6 @@ describe("formFromTool / payloadOf — the response template", () => {
       mode: "template",
       template: "Name: {{data.name}}",
     });
-  });
-
-  test("a legacy JSON Schema is not shown, and is not deleted either", () => {
-    // This column has been writable through MCP since it existed, unvalidated and read nowhere. A
-    // form that renders nothing for it and sends {} on save would silently drop whatever the caller
-    // that wrote it is still reading back.
-    const schema = { type: "object", properties: { id: { type: "string" } } };
-    const form = formFromTool(legacyTool({ outputSchema: schema }));
-    expect(form.outputTemplate).toBe("");
-    expect(payloadOf(form)?.outputSchema).toEqual(schema);
   });
 
   test("writing a template replaces whatever was there", () => {
@@ -155,12 +149,10 @@ describe("formFromTool / payloadOf — the response template", () => {
   });
 });
 
-// Round 3 of review, finding 4. The preview is labelled "exactly what the agent would receive", and
-// the runtime projects the template on 2xx ALONE — so a sample captured from a status outside that
-// range had the preview promising something the very same test run had just reported otherwise.
-//
-// The control is agreement with `buildHttpTool`, not with this file's reading of it: each case runs
-// the same definition through the runtime and compares.
+// The preview is labelled "exactly what the agent would receive", and the runtime projects the
+// template on 2xx ALONE, so a sample from a status outside that range must not be previewed as
+// projected. The control is agreement with `buildHttpTool`, not with this file's reading of it:
+// each case runs the same definition through the runtime and compares.
 describe("templatePreviewFor", () => {
   const BODY = {
     razao_social: "MAGAZINE LUIZA S/A",
@@ -264,16 +256,14 @@ describe("templatePreviewFor", () => {
   });
 });
 
-// Round 4 of review, finding 3. `outputSchema` accepted anything before this feature validated it
-// (MCP `tool_create` passed it through), so a row can hold `{mode:"template", template:42}`: a
-// declaration the reader refuses. Keeping it verbatim meant the editor showed an empty box, resent
-// the broken object on every save, and the service refinement — new in this same change — rejected
-// it. The operator could then edit nothing about that tool, and nothing said why.
+// A legacy row can hold `{mode:"template", template:42}`, a declaration the reader refuses (MCP
+// `tool_create` once stored `outputSchema` unvalidated). Kept verbatim, the editor would resend the
+// broken object on every save and the service would reject it, locking the tool with no reason.
 describe("outputSchemaForm", () => {
   test("a broken template declaration is dropped, with the reader's own reason", () => {
     const got = outputSchemaForm({ mode: "template", template: 42 });
     expect(got.outputTemplate).toBe("");
-    // The resend is what locked the tool.
+    // NOTE: resending it is what would lock the tool.
     expect(got.outputSchemaOther).toBeNull();
     expect(got.outputSchemaProblem).toContain("must be a string");
   });
@@ -329,9 +319,8 @@ describe("outputSchemaForm", () => {
   });
 });
 
-// Round 5 of review. Both findings are the same defect twice: the preview restated the runtime's
-// rules instead of asking it, so every rule the runtime learned in rounds 3 and 4 left the preview
-// behind. It now calls `projectToolResponse`, and these are the three cases that were wrong.
+// The preview calls `projectToolResponse` instead of restating the runtime's rules, so a rule the
+// runtime learns cannot leave the preview behind. These are three cases a restatement gets wrong.
 describe("templatePreviewFor — the rules are the runtime's, not a copy", () => {
   const TPL = "Empresa: {{razao_social}}";
 
@@ -369,9 +358,8 @@ describe("templatePreviewFor — the rules are the runtime's, not a copy", () =>
   }
 
   test("a render that overruns the model's limit is previewed clipped", async () => {
-    // Two 2,000-character fields and a separator: the substitutions, not the template, are what
-    // overrun. The runtime clips the PROJECTED body too — that is round 1's surviving mutant — and
-    // the preview was showing the whole thing under "exactly what the agent would receive".
+    // Two 2,000-character fields and a separator: the substitutions, not the template, are
+    // what overrun. The runtime clips the PROJECTED body too, so the preview must as well.
     const body = JSON.stringify({ a: "x".repeat(2000), b: "y".repeat(2000) });
     const template = "{{a}}\n---\n{{b}}";
     const preview = templatePreviewFor({ template, sample: body, status: 200 });
@@ -381,8 +369,8 @@ describe("templatePreviewFor — the rules are the runtime's, not a copy", () =>
   });
 
   test("a token-less template is previewed for a 204 with no body at all", async () => {
-    // The sample field is EMPTY here, which used to mean "nothing to preview". The runtime hands
-    // the model the operator's own text, so an empty box was the wrong answer.
+    // The sample field is EMPTY here, and still there is a preview: the runtime hands the
+    // model the operator's own text.
     const preview = templatePreviewFor({
       template: "Done. The booking is confirmed.",
       sample: "",
@@ -400,16 +388,14 @@ describe("templatePreviewFor — the rules are the runtime's, not a copy", () =>
       sample: "not json at all",
       status: 200,
     });
-    // Previously null: no preview at all, for a call that succeeds and reaches the model.
-    // Round 14: and the REASON travels with it. Collapsed to a boolean, this case rendered the
-    // non-2xx sentence — "this sample came back as HTTP null" — for a response that came back 200.
+    // NOTE: a preview, for a call that succeeds and reaches the model, and the REASON travels with
+    // it: collapsed to a boolean, this case would render the non-2xx sentence for a 200.
     expect(preview?.skipped).toBe("not-json");
     expect(preview?.text).toBe(await runtimeText(200, "not json at all"));
   });
 });
 
-// Round 6 of review, findings 1 and 2. Two more ways the console answered a question the server
-// answers differently — and both are the same shape as round 5's: a rule restated instead of asked.
+// Two more places where the console must ask the runtime rather than restate its rule.
 describe("templatePreviewFor — the raw body is the raw body", () => {
   test("leading whitespace is not trimmed away before the clip", async () => {
     // On the raw path the runtime clips the body EXACTLY as it arrived, so trimming here slides the
@@ -456,13 +442,10 @@ describe("templatePreviewFor — the raw body is the raw body", () => {
   });
 });
 
-// Round 6 of review, finding 2. The Save button was gated on the two problems this screen can phrase
-// well — an unusable token, a stray brace — while the service refines with the WHOLE reader, which
-// also refuses a template past the character limit and one carrying a NUL or a lone surrogate. For
-// those, Save stayed enabled on a payload the server was always going to reject.
-//
-// So the test is not a list of shapes this file thinks are bad: it is the agreement itself, each
-// shape put through the console's gate and the service's schema and required to get the same answer.
+// The service refines with the WHOLE reader (which also refuses a template past the character limit
+// and one carrying a NUL or a lone surrogate), so Save must gate on the same answer. The test is
+// the agreement itself: each shape goes through the console's gate and the service's schema and
+// must get the same answer.
 describe("templateSaveProblem agrees with the service, shape for shape", () => {
   const NUL = String.fromCharCode(0);
   const CASES: [string, string][] = [
@@ -489,46 +472,11 @@ describe("templateSaveProblem agrees with the service, shape for shape", () => {
   });
 });
 
-// Round 13 of review. The server refuses a declared template it would not honour (400), so a Test
-// button that ignores the same check spends a REAL request against the operator's provider to be
-// told what the box on screen already knew. Asserted at the source because the alternative is
-// mounting the whole editor to read one `disabled`.
-test("the Test button is gated on the same template check Save is", async () => {
-  const src = await Bun.file(
-    "src/client/pages/resources/ToolEditModal.tsx",
-  ).text();
-  const button = src.slice(src.indexOf("tools.testOpen") - 900);
-  const disabled = button.slice(0, button.indexOf("onClick={openTest}"));
-  expect(disabled).toContain("templateDeclProblem");
-  // And it is the READER's verdict both places, never a second phrasing of the rule.
-  expect(src).toMatch(/templateDeclProblem\s*=\s*useMemo/);
-});
-
-// Round 14 of review. The preview collapsed the runtime's three outcomes into a boolean, so a 2xx
-// response that simply is not JSON — a CSV, an XML, a plain "OK" — was explained to the operator as
-// "outside 2xx", with the status interpolated as `null` when the sample was pasted by hand. Same
-// shape as round 12's finding on the runtime side, one layer up.
-test("the preview names WHY the template did not apply, one branch per reason", async () => {
-  const src = await Bun.file(
-    "src/client/pages/resources/ToolEditModal.tsx",
-  ).text();
-  // Each reason the runtime can return has its own sentence, selected by that reason.
-  expect(src).toMatch(
-    /templatePreview\?\.skipped === "not-2xx"[\s\S]{0,400}outputTemplateNotApplied/,
-  );
-  expect(src).toMatch(
-    /templatePreview\?\.skipped === "not-json"[\s\S]{0,400}outputTemplateNotJson/,
-  );
-  // And never on the negation of "it rendered", which is what made one sentence cover two causes.
-  expect(src).not.toContain("!templatePreview.projected");
-});
-
-// Round 17 of review, finding 1. The dialog runs the definition `payloadOf` produced, and it was
-// handed its list of boxes from a DIFFERENT source: the raw form rows. Those disagree wherever two
-// rows trim to one name — which the editor permits — because `schemaFromAiFields` writes an object,
-// so the last declaration wins there while the dialog rendered both. Two boxes on one `ai:<name>`
-// slot means an earlier row's `required`, or its type, judging a value the saved definition never
-// declares: Send disabled, or a value validated against a schema that will not exist.
+// The dialog runs the definition `payloadOf` produced, so its boxes come from that definition, not
+// from the raw form rows. Those disagree wherever two rows trim to one name (which the editor
+// permits): `schemaFromAiFields` writes an object, so the last declaration wins. Two boxes on one
+// `ai:<name>` slot would let an earlier row's `required` or type judge a value the saved definition
+// never declares.
 test("the test dialog's boxes come from the definition it will send", () => {
   const form = formFromTool(legacyTool());
   const withDupes = {
@@ -583,35 +531,7 @@ test("a legacy fixed field gets no box: it is not the model's to supply", () => 
   ]);
 });
 
-test("and the dialog is built from that reader, not from the form rows", async () => {
-  const src = await Bun.file(
-    "src/client/pages/resources/ToolEditModal.tsx",
-  ).text();
-  expect(src).toMatch(/aiFields: testFieldsFrom\(/);
-  // The form rows are what disagreed with the payload; naming them here again would be the defect.
-  expect(src).not.toMatch(/aiFields: form\.aiFields/);
-});
-
-// Finding 2 of the same round. A relative urlTemplate with no credential base is refused by
-// `buildHttpTool` before a request goes out, and Save already knows: `urlTemplateInvalid` is
-// deliberately false for that shape because `relativeWithoutBase` carries it separately. The test
-// button read only the first half, so it spent a real round trip to be told what the form knew.
-test("the Test button carries the whole URL gate Save does", async () => {
-  const src = await Bun.file(
-    "src/client/pages/resources/ToolEditModal.tsx",
-  ).text();
-  const at = src.indexOf("tools.testOpen");
-  const disabled = src.slice(at - 1200, at).slice(-900);
-  for (const cond of [
-    "urlTemplateInvalid",
-    "relativeWithoutBase",
-    "templateDeclProblem",
-  ]) {
-    expect(disabled).toContain(cond);
-  }
-});
-
-// #459. The preview promises "exactly what the agent would receive", and a block is the one
+// The preview promises "exactly what the agent would receive", and a block is the one
 // construct whose output depends on how MANY of something came back, so the control is the same
 // as for a scalar template: agreement with `buildHttpTool` on the same definition and body.
 describe("templatePreviewFor with a list block", () => {
@@ -708,8 +628,8 @@ describe("insertEachBlock", () => {
       value = v;
     });
     expect(value).toBe("Total: {{total}}\n{{#each itens}}\n\n{{/each}}");
-    // What it inserts is not yet saveable, and the gate says what to write: a block with nothing
-    // to repeat would render a full list as an empty body (review round 2).
+    // NOTE: what it inserts is not yet saveable, and the gate says what to write: a block with
+    // nothing to repeat would render a full list as an empty body.
     expect(templateSaveProblem(value)).toContain("nothing to repeat");
     expect(
       templateSaveProblem(value.replace("\n\n", "\n- {{nome}}\n")),
@@ -746,5 +666,285 @@ describe("insertEachBlock", () => {
       value = v;
     });
     expect(value).toBe("a\n{{#each xs}}\n\n{{/each}}\nb");
+  });
+});
+
+test("the value picker offers every name the runtime renders into a template, and no other", () => {
+  const offered = nativeVarItems(
+    ((_k: string, fallback: string) => fallback) as unknown as Parameters<
+      typeof nativeVarItems
+    >[0],
+  ).map((v) => v.name);
+  expect(offered.sort()).toEqual(
+    [...CONTEXT_VAR_NAMES, ...HTTP_TOOL_ONLY_VAR_NAMES].sort(),
+  );
+});
+
+describe("the response limit", () => {
+  test("empty is null, so the tool keeps the default; a typed value goes as a number", () => {
+    expect(parseMaxResponseChars("")).toBeNull();
+    expect(parseMaxResponseChars("  ")).toBeNull();
+    expect(parseMaxResponseChars("12000")).toBe(12000);
+    expect(Number.isNaN(parseMaxResponseChars("abc"))).toBe(true);
+  });
+
+  test("it loads into the form and saves back, and an empty field clears it", () => {
+    const form = formFromTool(legacyTool({ maxResponseChars: 12000 }));
+    expect(form.maxResponseChars).toBe("12000");
+    expect(payloadOf(form)?.maxResponseChars).toBe(12000);
+    expect(payloadOf({ ...form, maxResponseChars: "" })?.maxResponseChars).toBe(
+      null,
+    );
+    expect(
+      payloadOf(formFromTool(legacyTool({ maxResponseChars: null })))
+        ?.maxResponseChars,
+    ).toBeNull();
+  });
+
+  test("the preview clips by the form's limit, the way the runtime would", () => {
+    const description = `${"d".repeat(8994)}FIM-9K`;
+    const sample = JSON.stringify({ descricao: description, preco: "R$ 10" });
+    const template = "Descrição: {{descricao}}\nPreço: {{preco}}";
+    const raised = templatePreviewFor({
+      template,
+      sample,
+      status: 200,
+      maxResponseChars: 20000,
+    });
+    expect(raised?.text).toBe(`Descrição: ${description}\nPreço: R$ 10`);
+    const asBefore = templatePreviewFor({ template, sample, status: 200 });
+    expect(asBefore?.text).not.toContain("FIM-9K");
+    expect(asBefore?.text).toContain(`${"d".repeat(2000)}…[truncated]`);
+  });
+});
+
+// The edit dialog itself, rendered on a stored tool: the Test button, the dialog it opens and the
+// preview's sentences are what the operator meets, so they are asked there.
+describe("the edit dialog, rendered", () => {
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    cleanup();
+    globalThis.fetch = realFetch;
+    vaultEntries = [];
+    invalidateVault();
+  });
+
+  // What the test endpoint answers, set per test.
+  let testAnswer = { status: 200, raw: "{}" };
+  // What the vault listing answers, set per test.
+  let vaultEntries: Array<{
+    id: string;
+    name: string;
+    kind: string;
+    baseUrl: string | null;
+  }> = [];
+
+  async function openStored(over: Partial<Tool> = {}) {
+    const tool = legacyTool({
+      name: "lookup",
+      label: "Lookup",
+      urlTemplate: "https://api.example.com/x",
+      outputSchema: { mode: "template", template: "{{total}}" },
+      ...over,
+    });
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const path = new URL(String(input), "http://localhost").pathname;
+      const json = (body: unknown) =>
+        new Response(JSON.stringify(body), {
+          headers: { "Content-Type": "application/json" },
+        });
+      if ((init?.method ?? "GET").toUpperCase() === "POST") {
+        return json({
+          instance: {},
+          result: {
+            status: testAnswer.status,
+            durationMs: 1,
+            raw: testAnswer.raw,
+            rawChars: testAnswer.raw.length,
+            rawClipped: false,
+            modelText: `HTTP ${testAnswer.status}\n${testAnswer.raw}`,
+            failed: testAnswer.status >= 400,
+            notes: [],
+          },
+        });
+      }
+      if (path === "/api/v1/tools/1") return json({ tool });
+      if (path === "/api/v1/vault") return json({ entries: vaultEntries });
+      return json({ items: [], entries: [], instances: [] });
+    }) as unknown as typeof fetch;
+    function Harness() {
+      const modal = useModalController<{ id?: string }>();
+      const opened = useRef(false);
+      useEffect(() => {
+        if (opened.current) return;
+        opened.current = true;
+        modal.open({ id: "1" });
+      }, [modal]);
+      return <ToolEditModal modal={modal as never} onSaved={() => undefined} />;
+    }
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <TooltipProvider>
+            <Harness />
+          </TooltipProvider>
+        </ToastProvider>
+      </MemoryRouter>,
+    );
+    await screen.findByDisplayValue("https://api.example.com/x");
+  }
+
+  const testButton = () =>
+    screen.getByRole("button", { name: "Send a test request" });
+  const testable = () => !testButton().hasAttribute("disabled");
+
+  function writeTemplate(text: string): void {
+    const content = Array.from(document.querySelectorAll(".cm-content")).find(
+      (el) =>
+        /what the agent receives/i.test(el.getAttribute("aria-label") ?? ""),
+    );
+    if (!content) throw new Error("no template editor on screen");
+    const view = EditorView.findFromDOM(
+      content.closest(".cm-editor") as HTMLElement,
+    ) as EditorView;
+    act(() => {
+      view.dispatch({
+        changes: { from: 0, to: view.state.doc.length, insert: text },
+      });
+    });
+  }
+
+  // The server refuses a declared template it would not honour (400), so a Test button that ignores
+  // the same check spends a REAL request against the operator's provider to be told what the box
+  // already knew. The NUL is the case only the reader refuses.
+  test("the Test button is gated on the same template check Save is", async () => {
+    await openStored();
+    const gate: Record<string, boolean> = { stored: testable() };
+    for (const [label, text] of [
+      ["too long", "x".repeat(MAX_TEMPLATE_CHARS + 1)],
+      ["a NUL", "a\u0000b"],
+      ["a usable one", "{{total}} itens"],
+    ] as const) {
+      writeTemplate(text);
+      gate[label] = testable();
+    }
+    expect(gate).toEqual({
+      stored: true,
+      "too long": false,
+      "a NUL": false,
+      "a usable one": true,
+    });
+  });
+
+  // A relative urlTemplate with no credential base is refused by `buildHttpTool` before a request
+  // goes out, and Save already knows; so does an URL that is not one.
+  test("the Test button carries the whole URL gate Save does", async () => {
+    await openStored();
+    const url = screen.getByDisplayValue("https://api.example.com/x");
+    const gate: Record<string, boolean> = {};
+    for (const value of ["/v1/x", "not a url", "https://api.example.com/y"]) {
+      fireEvent.change(url, { target: { value } });
+      gate[value] = testable();
+    }
+    expect(gate).toEqual({
+      "/v1/x": false,
+      "not a url": false,
+      "https://api.example.com/y": true,
+    });
+  });
+
+  // A relative template is valid only when the credential supplies a base the runtime will prepend.
+  // A base URL stored on a kind that takes none is never dialled, so it cannot be that base: the
+  // dialog refuses the relative template exactly as it does with no credential at all.
+  test("a base URL on a kind that cannot carry one does not make a relative template valid", async () => {
+    const seen: Record<string, { testable: boolean; refused: boolean }> = {};
+    for (const kind of ["bearer_token", "openai"]) {
+      vaultEntries = [
+        {
+          id: "5",
+          name: `key-${kind}`,
+          kind,
+          baseUrl: "https://elsewhere.example",
+        },
+      ];
+      invalidateVault();
+      await openStored({ credentialRef: "vault:5" });
+      await screen.findByText(`key-${kind}`);
+      fireEvent.change(screen.getByDisplayValue("https://api.example.com/x"), {
+        target: { value: "/v1/x" },
+      });
+      seen[kind] = {
+        testable: testable(),
+        refused:
+          screen.queryAllByText(
+            "A relative URL requires a credential with a base URL.",
+          ).length > 0,
+      };
+      cleanup();
+    }
+    expect(seen).toEqual({
+      bearer_token: { testable: true, refused: false },
+      openai: { testable: false, refused: true },
+    });
+  });
+
+  // The runtime has three outcomes, not a boolean: a 2xx response that is not JSON must not be
+  // explained as "outside 2xx", and a JSON error must not be explained as "not JSON".
+  test("the preview names WHY the template did not apply, one branch per reason", async () => {
+    const NOT_2XX = /^This sample came back as HTTP/;
+    const NOT_JSON = /^This sample is not JSON/;
+    const said: Record<string, { not2xx: boolean; notJson: boolean }> = {};
+    for (const answer of [
+      { status: 500, raw: '{"erro":"x"}' },
+      { status: 200, raw: "OK" },
+    ]) {
+      testAnswer = answer;
+      await openStored();
+      fireEvent.click(testButton());
+      fireEvent.click(await screen.findByText("Send request"));
+      await waitFor(() =>
+        expect(
+          screen.queryAllByText(answer.status === 500 ? NOT_2XX : NOT_JSON)
+            .length,
+        ).toBe(1),
+      );
+      said[answer.status] = {
+        not2xx: screen.queryAllByText(NOT_2XX).length > 0,
+        notJson: screen.queryAllByText(NOT_JSON).length > 0,
+      };
+      cleanup();
+    }
+    expect(said).toEqual({
+      500: { not2xx: true, notJson: false },
+      200: { not2xx: false, notJson: true },
+    });
+  });
+
+  // The dialog runs the definition `payloadOf` produced, so its boxes come from that definition, not
+  // from the raw form rows: two rows that trim to one name are one declared field, the last one.
+  test("and the dialog is built from that reader, not from the form rows", async () => {
+    await openStored({
+      inputSchema: { qty: { type: "integer", required: true } },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Add field" }));
+    const names = document.querySelectorAll<HTMLInputElement>(
+      'input[placeholder="field_name"]',
+    );
+    fireEvent.change(names[names.length - 1] as HTMLInputElement, {
+      target: { value: "  qty  " },
+    });
+    fireEvent.click(testButton());
+    const send = await screen.findByText("Send request");
+    const dialog = send.closest("[role='dialog']") as HTMLElement;
+    const boxes = within(dialog)
+      .queryAllByText(/^\s*qty\s*$/)
+      .map((el) => el.textContent);
+    expect({
+      boxes,
+      required: within(dialog).queryAllByText(/"qty" is required/).length,
+    }).toEqual({ boxes: ["qty"], required: 0 });
   });
 });

@@ -1,18 +1,12 @@
 #!/usr/bin/env bun
-// What a refresh of the price table changed, as the Markdown body of the pull request the weekly
-// price refresh opens (issue #869). Also useful by hand after running
-// scripts/refresh-model-prices.ts, against the table as it was before:
+// What a refresh of the price table changed, as the Markdown body of the scheduled refresh's pull
+// request; by hand, run it against the table as it was before a refresh:
 //
 //   git show HEAD:src/modules/pricing/model-prices.json > old.json
-//   bun scripts/diff-model-prices.ts old.json src/modules/pricing/model-prices.json
-//   bun scripts/diff-model-prices.ts --changed old.json src/modules/pricing/model-prices.json
+//   bun scripts/diff-model-prices.ts [--changed] old.json src/modules/pricing/model-prices.json
 //
-// The second form prints `true` or `false` and nothing else: whether any model's rates moved. A
-// refresh always rewrites the source commit and the date it was read, because LiteLLM's file changes
-// most days for providers this table does not keep; that alone is not a change worth a review.
-//
-// The provider defaults come first, because they are what an operator who never picked a model is
-// billed at, and they are the rows tests/modules/pricing.test.ts holds to the vendors' own pages.
+// `--changed` prints only whether any rates moved (every refresh rewrites source commit and date).
+// Provider defaults come first: they bill an operator who never picked a model.
 
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import { tableKeys } from "@/modules/pricing/price";
@@ -27,6 +21,7 @@ type Entry = Rates & { tiers?: (Rates & { above: number })[] };
 
 export interface PriceTable {
   source: string;
+  openrouter?: { source: string; hash: string };
   readAt: string;
   models: Record<string, Entry>;
 }
@@ -101,6 +96,10 @@ const ROW_HEADER = [
 const shortSource = (source: string): string =>
   /\/blob\/([0-9a-f]{12})/.exec(source)?.[1] ?? source;
 
+// The reads a table was built from, as `PRICE_TABLE_VERSION` spells them.
+const tableLabel = (t: PriceTable): string =>
+  `litellm@${shortSource(t.source)}${t.openrouter ? `+openrouter@${t.openrouter.hash}` : ""}`;
+
 export function diffModelPrices(
   oldTable: PriceTable,
   newTable: PriceTable,
@@ -123,12 +122,12 @@ export function diffModelPrices(
   if (added.length === 0 && removed.length === 0 && changed.length === 0) {
     return {
       changed: false,
-      markdown: `No model's price changed between litellm@${shortSource(oldTable.source)} and litellm@${shortSource(newTable.source)}.\n`,
+      markdown: `No model's price changed between ${tableLabel(oldTable)} and ${tableLabel(newTable)}.\n`,
     };
   }
 
   const lines: string[] = [
-    `The price table was read again from LiteLLM: litellm@${shortSource(oldTable.source)} (${oldTable.readAt}) to litellm@${shortSource(newTable.source)} (${newTable.readAt}). Rates are USD per million tokens.`,
+    `The price table was read again, OpenRouter's rows from OpenRouter's models API and the rest from LiteLLM: ${tableLabel(oldTable)} (${oldTable.readAt}) to ${tableLabel(newTable)} (${newTable.readAt}). Rates are USD per million tokens.`,
     "",
     `${changed.length} changed, ${added.length} added, ${removed.length} removed.`,
   ];

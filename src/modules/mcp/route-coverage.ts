@@ -1,27 +1,17 @@
-// WHICH REST ROUTE HAS A TWIN IN THE MCP, AND WHY THE REST DO NOT (issue #708).
-//
-// `PATCH /v1/knowledge/documents/:id` existed for months with no MCP tool, and nothing said so: a
-// session that only saw the MCP concluded that editing a document meant deleting and recreating it,
-// which loses the id and takes the document out of search while it re-embeds. The gap was not the
-// difference between the two surfaces, which is expected; it was that the difference was invisible.
-//
-// So every route under `src/api/v1/*.controller.ts` is named here with one of three answers, and
-// `tests/modules/mcp-route-coverage.test.ts` fails when a route is added without one, when an entry
-// names a route that no longer exists, or when a `tool` names nothing the server registers:
-//
-//   - `tool`: the MCP tool that does the same job. Not always one-to-one (`metrics_get` answers two
-//     routes), and the test checks that the tool exists, not that it is equivalent.
-//   - `none`: the route has no business in the MCP, and the reason says why. Shared reasons are the
-//     constants below, so a new route reuses one or writes its own.
-//   - `gap`: it SHOULD have a tool and does not yet. Written down so the next person who needs it
-//     finds the gap here instead of in a production session, and so CI charges only the delta.
-//
+// Which REST route has a twin in the MCP, and why the rest do not. Every route under
+// `src/api/v1/*.controller.ts` is named here, and `tests/modules/mcp-route-coverage.test.ts` fails
+// on a route without an entry, an entry naming no route, or a `tool` the server does not register:
+//   - `tool`: the MCP tool that does the same job (not always one-to-one; only existence checked).
+//   - `none`: the route has no business in the MCP; shared reasons are the constants below.
+//   - `gap`: it SHOULD have a tool and does not yet, written down so CI charges only the delta.
 // Keys are `METHOD /prefix/path` exactly as the controller spells them, prefix included.
 
 type Coverage = { tool: string } | { none: string } | { gap: string };
 
 const BINARY =
   "a binary body (file upload, PDF, image, audio); the MCP transport carries JSON";
+const CHATWOOT_LINK =
+  "the landing of a link a person follows from Chatwoot's contact panel, answered in console ids for a page to navigate";
 const CONV_AGENTS =
   "options for the console's agent filter to non-admin users; agent_list has them";
 const EMBEDDING_BLOCK =
@@ -44,6 +34,8 @@ const PICKER = "options for a console picker, read live to fill a form field";
 const PLAYGROUND =
   "playground session plumbing for the console chat; agent_playground is the MCP turn";
 const TRANSPORT = "the MCP transport itself";
+const CALL_AUDIO =
+  "a call's audio over a WebSocket, in real time; the MCP transport carries JSON turns";
 
 export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "GET /v1/agents/": { tool: "agent_list" },
@@ -52,6 +44,13 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
     gap: "guardrails health of one agent",
   },
   "GET /v1/agents/:id/config-health": { tool: "agent_config_health" },
+  "GET /v1/agents/:id/call-floor": { tool: "agent_call_floor" },
+  "GET /v1/agents/:id/full-detail-usage": {
+    gap: "what one agent's kept full turn detail is using; the setting itself is on agent_settings_get",
+  },
+  "POST /v1/agents/:id/call-floor": {
+    none: "measures the console editor's unsaved tool set; an MCP client has no draft, it saves the grants and reads agent_call_floor",
+  },
   "GET /v1/agents/:id/inboxes/out-of-office": {
     gap: "Chatwoot out-of-office replies on the agent's inboxes",
   },
@@ -63,6 +62,12 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/agents/import": { tool: "agent_import" },
   "GET /v1/agents/:id/tool-selections": { tool: "agent_tools_get" },
   "POST /v1/agents/:id/playground": { tool: "agent_playground" },
+  "POST /v1/agents/:id/playground/call": { none: CALL_AUDIO },
+  "POST /v1/agents/:id/calls/check": {
+    gap: "whether a voice agent's calls are set up on ElevenLabs, and why not",
+  },
+  "WS /v1/voice/stream/:routeToken": { none: CALL_AUDIO },
+  "WS /v1/voice/playground/:ticket": { none: CALL_AUDIO },
   "GET /v1/agents/:id/playground/tools": { none: PLAYGROUND },
   "POST /v1/agents/:id/playground/followup": { none: PLAYGROUND },
   "POST /v1/agents/:id/playground/audio/transcribe": { none: BINARY },
@@ -101,7 +106,7 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "DELETE /v1/business-hours/:id": { tool: "business_hours_delete" },
   "GET /v1/chatwoot/deployment": { tool: "instance_list" },
   "POST /v1/chatwoot/deployment": { tool: "deployment_connect" },
-  "PATCH /v1/chatwoot/deployment": { tool: "deployment_rotate_token" },
+  "PATCH /v1/chatwoot/deployment": { tool: "deployment_update" },
   "DELETE /v1/chatwoot/deployment": { none: FLEET },
   "GET /v1/chatwoot/deployment/accounts": { tool: "deployment_list_accounts" },
   "PUT /v1/chatwoot/deployment/accounts": { tool: "deployment_set_accounts" },
@@ -123,6 +128,7 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "GET /v1/chatwoot/labels/:agentId": { none: PICKER },
   "GET /v1/chatwoot/custom-attributes/:agentId": { none: PICKER },
   "PATCH /v1/chatwoot/inboxes/:id": { tool: "inbox_bind" },
+  "PUT /v1/chatwoot/inboxes/:id/voice-agent": { tool: "inbox_bind_voice" },
   "POST /v1/chatwoot/inboxes/:id/observers": { tool: "inbox_observe" },
   "DELETE /v1/chatwoot/inboxes/:id/observers/:agentId": {
     tool: "inbox_unobserve",
@@ -170,11 +176,35 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/document-templates/": { tool: "document_template_create" },
   "POST /v1/document-templates/preview": { none: BINARY },
   "GET /v1/document-templates/:id": { tool: "document_template_get" },
+  "GET /v1/document-templates/:id/next-number": {
+    gap: "where a template's numbering would continue under another prefix",
+  },
   "GET /v1/document-templates/:id/references": {
     gap: "which agents use this document template",
   },
   "PATCH /v1/document-templates/:id": { tool: "document_template_update" },
   "DELETE /v1/document-templates/:id": { tool: "document_template_delete" },
+  "GET /v1/document-approvals/": { gap: "list document approval requests" },
+  "GET /v1/document-approvals/:id": { gap: "read a document approval request" },
+  "GET /v1/document-approvals/pending": {
+    gap: "list the document approvals waiting on the team",
+  },
+  "GET /v1/document-approvals/decided": {
+    gap: "list the document approvals already decided",
+  },
+  "GET /v1/document-approvals/:id/preview": { none: BINARY },
+  "POST /v1/document-approvals/:id/approve": {
+    gap: "approve a document approval request",
+  },
+  "POST /v1/document-approvals/:id/reject": {
+    gap: "reject a document approval request",
+  },
+  "GET /v1/document-approvals/:id/context": {
+    gap: "read a document approval request's customer and messages",
+  },
+  "POST /v1/document-approvals/:id/request-again": {
+    gap: "request an expired document approval again",
+  },
   "GET /v1/documents/": { tool: "issued_document_list" },
   "POST /v1/documents/": { gap: "issue a document outside a conversation" },
   "POST /v1/documents/:id/revoke": { gap: "revoke an issued document" },
@@ -188,6 +218,8 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "GET /v1/integrations/catalog": { tool: "integration_catalog" },
   "GET /v1/integrations/google/calendars": { none: PICKER },
   "GET /v1/integrations/google/drive-folders": { none: PICKER },
+  "GET /v1/integrations/google/spreadsheets": { none: PICKER },
+  "GET /v1/integrations/google/spreadsheet-tabs": { none: PICKER },
   "GET /v1/integrations/instances": { tool: "integration_list" },
   "GET /v1/integrations/instances/:id": {
     gap: "one integration instance by id",
@@ -195,6 +227,9 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/integrations/instances": { tool: "integration_create" },
   "PATCH /v1/integrations/instances/:id": { tool: "integration_update" },
   "POST /v1/integrations/instances/:id/route-token": { none: SECRET },
+  "POST /v1/integrations/instances/:id/test-reception": {
+    gap: "test an inbound notification against a saved integration, stage by stage",
+  },
   "DELETE /v1/integrations/instances/:id": { tool: "integration_delete" },
   "POST /v1/integrations/inbound/:routeToken": { none: INBOUND },
   "GET /v1/knowledge/bases": { tool: "knowledge_list" },
@@ -228,6 +263,8 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "PATCH /v1/knowledge/approvals/:id": { tool: "knowledge_edit" },
   "POST /v1/knowledge/approvals/:id/approve": { tool: "knowledge_approve" },
   "POST /v1/knowledge/approvals/:id/reject": { tool: "knowledge_reject" },
+  "GET /v1/knowledge/approvals/discarded": { tool: "knowledge_approvals_list" },
+  "POST /v1/knowledge/approvals/:id/requeue": { tool: "knowledge_requeue" },
   "GET /v1/logs/": { tool: "logs_query" },
   "GET /v1/logs/export": { tool: "logs_export" },
   "GET /v1/mcp/admin/connection": { none: MCP_ACCESS },
@@ -274,10 +311,45 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "GET /v1/tenant-settings/spend-ceiling/usage": { gap: "spend-ceiling usage" },
   "PUT /v1/tenant-settings/spend-ceiling": { gap: "set the spend ceiling" },
   "PUT /v1/tenant-settings/price-overrides": { tool: "tenant_settings_update" },
+  "GET /v1/tenant-settings/proactive-breaker": {
+    tool: "proactive_breaker_get",
+  },
+  "PUT /v1/tenant-settings/proactive-breaker": {
+    tool: "proactive_breaker_set",
+  },
+  "POST /v1/tenant-settings/proactive-breaker/resume": {
+    tool: "proactive_breaker_resume",
+  },
+  "GET /v1/occurrences/config": { tool: "occurrences_get" },
+  "PUT /v1/occurrences/config": { tool: "occurrences_set" },
+  "GET /v1/occurrences/runs": { tool: "occurrence_runs_list" },
+  "GET /v1/occurrences/cost": { tool: "occurrence_runs_list" },
+  "GET /v1/occurrences/themes": { tool: "occurrence_themes_list" },
+  "GET /v1/occurrences/themes/:id": { tool: "occurrence_themes_list" },
+  "GET /v1/occurrences/monitors": { tool: "occurrence_monitors_list" },
+  "POST /v1/occurrences/monitors": { tool: "occurrence_monitor_create" },
+  "GET /v1/occurrences/monitors/:id": { tool: "occurrences_get" },
+  "PATCH /v1/occurrences/monitors/:id": { tool: "occurrence_monitor_update" },
+  "DELETE /v1/occurrences/monitors/:id": { tool: "occurrence_monitor_delete" },
+  "POST /v1/occurrences/monitors/:id/duplicate": {
+    tool: "occurrence_monitor_create",
+  },
+  "GET /v1/occurrences/monitors/:id/config": { tool: "occurrences_get" },
+  "PUT /v1/occurrences/monitors/:id/config": { tool: "occurrences_set" },
+  "GET /v1/occurrences/monitors/:id/runs": { tool: "occurrence_runs_list" },
+  "GET /v1/occurrences/monitors/:id/cost": { tool: "occurrence_runs_list" },
+  "GET /v1/occurrences/monitors/:id/themes": { tool: "occurrence_themes_list" },
+  "GET /v1/occurrences/monitors/:id/flag-episodes": {
+    tool: "occurrence_flag_episodes_list",
+  },
+  "GET /v1/occurrences/monitors/:id/themes/:themeId": {
+    tool: "occurrence_themes_list",
+  },
   "POST /v1/tenant-settings/langfuse/test": {
     gap: "probe the Langfuse credential",
   },
   "PUT /v1/tenant-settings/company": { gap: "set the company profile" },
+  "PUT /v1/tenant-settings/approval-link": { tool: "tenant_settings_update" },
   "POST /v1/tenant-settings/company/logo": { none: BINARY },
   "DELETE /v1/tenant-settings/company/logo": { none: BINARY },
   "GET /v1/tenant-settings/company/logo": { none: BINARY },
@@ -289,6 +361,29 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "PATCH /v1/tools/:id": { tool: "tool_update" },
   "DELETE /v1/tools/:id": { tool: "tool_delete" },
   "GET /v1/meta": { none: META },
+  "GET /v1/instance-health/": { tool: "instance_health_get" },
+  "GET /v1/instance-health/channels": { tool: "instance_alert_channel_list" },
+  "GET /v1/instance-health/database": { tool: "instance_database_get" },
+  // Without the url and secret, filled in the console from the answer's fillAt link.
+  "POST /v1/instance-health/channels": {
+    tool: "instance_alert_channel_create",
+  },
+  "PATCH /v1/instance-health/channels/:id": {
+    tool: "instance_alert_channel_update",
+  },
+  "DELETE /v1/instance-health/channels/:id": {
+    tool: "instance_alert_channel_delete",
+  },
+  "POST /v1/instance-health/channels/:id/test": {
+    tool: "instance_alert_channel_test",
+  },
+  "GET /v1/instance-health/thresholds": { tool: "instance_health_get" },
+  "PUT /v1/instance-health/thresholds/:signal": {
+    tool: "instance_threshold_set",
+  },
+  "DELETE /v1/instance-health/thresholds/:signal": {
+    tool: "instance_threshold_set",
+  },
   "GET /v1/tenants": { tool: "tenant_list" },
   "GET /v1/tenants/:id": { tool: "tenant_get" },
   "PATCH /v1/tenants/:id": { tool: "tenant_update" },
@@ -296,17 +391,36 @@ export const ROUTE_COVERAGE: Record<string, Coverage> = {
   "POST /v1/tenants": { tool: "tenant_create" },
   "GET /v1/conversations": { tool: "list_conversations" },
   "GET /v1/conversations/agents": { none: CONV_AGENTS },
+  "GET /v1/conversations/chatwoot-link": { none: CHATWOOT_LINK },
   "GET /v1/conversations/:id": { tool: "conversation_get" },
   "GET /v1/conversations/:id/messages": { tool: "conversation_messages" },
+  "GET /v1/conversations/:id/tool-results/:lineId": {
+    gap: "one tool call's kept whole result, for the conversation page's toggle; conversation_get says whether it is kept and its length",
+  },
   "GET /v1/conversations/:id/media": { none: BINARY },
   "POST /v1/conversations/:id/handoff": { tool: "conversation_handoff" },
   "POST /v1/conversations/:id/return": { tool: "conversation_return" },
   "POST /v1/conversations/:id/reengage": { tool: "conversation_reengage" },
+  "POST /v1/conversations/:id/decisions-test": {
+    tool: "conversation_decisions_test",
+  },
   "POST /v1/conversations/:id/status": { tool: "conversation_status" },
   "GET /v1/metrics": { tool: "metrics_get" },
   "GET /v1/metrics/kpis": { tool: "metrics_get" },
   "GET /v1/metrics/timeseries": { tool: "metrics_timeseries" },
   "GET /v1/metrics/costs": { gap: "LLM cost breakdown" },
+  "GET /v1/metrics/outcomes": { gap: "the funnel as a daily trend" },
+  "GET /v1/metrics/breakdown": {
+    gap: "usage by agent, inbox, model or call type",
+  },
+  "GET /v1/metrics/handoffs": { gap: "handoff causes over time" },
+  "GET /v1/metrics/labels": { gap: "outcome by conversation label" },
+  "GET /v1/metrics/health": { gap: "model latency and logged problems" },
+  "GET /v1/metrics/follow-ups": { gap: "follow-up activity" },
+  "GET /v1/metrics/knowledge": { gap: "knowledge suggestion activity" },
+  "GET /v1/metrics/filter-options": {
+    gap: "the dashboard filter's agent and inbox options",
+  },
   "GET /v1/vault/": { tool: "vault_list" },
   "POST /v1/vault/": { tool: "credential_create" },
   "PUT /v1/vault/:id": { none: SECRET },

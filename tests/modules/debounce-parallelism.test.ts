@@ -10,13 +10,14 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import { runDebounceTick } from "@/modules/debounce/worker";
 import type { ClaimedJob } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { burnSchedulerJobId } from "../utils/scheduler";
 
 // End-to-end parallelism harness (no Chatwoot, no LLM): drives N real turns through the actual tick
-// (runDebounceTick → flushDebounceJob → graph → runModelCall) with a stub Chatwoot client and a fake
-// model that SLEEPS (simulating LLM latency) and records how many calls are in flight at once. Proves
-// the fix empirically: turns overlap in time (not serial) and the model semaphore caps them.
+// (runDebounceTick → flushDebounceJob → graph → runModelCall) with a stub Chatwoot client and a
+// fake model that SLEEPS (simulating LLM latency) and records how many calls are in flight at once.
+// Proves turns overlap in time (not serial) and the model semaphore caps them.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -34,8 +35,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -50,40 +51,27 @@ let inboxDbId = 0n;
 
 const REPLY = "Claro, posso ajudar!";
 const CHATWOOT_INBOX_ID = 7;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function threadOf(convId: number) {
   return `${tenantId}:${instanceId}:${convId}`;
 }
 
-// NOTE: turns reach the model at their own pace, because each one does real DB work first. Measured
-// on this suite: 20 turns spread their arrivals over 91-147ms while the fake latency was 100ms, so
-// the first turn regularly released its permit before the last one arrived and the observed peak
-// landed at 15-19 instead of 20. The test failed ~13% of local runs, isolated, with nothing wrong in
-// the code under test.
-//
-// The gate turns that race into a rendezvous: every call parks until `quorum` are in flight at once,
-// so the peak becomes a property of the SEMAPHORE rather than of how loaded the machine is. What it
-// deliberately does not do is weaken the assertion — a semaphore that admits more than the cap still
-// pushes the peak above it, and one that admits fewer never reaches quorum, waits out the grace
-// window and fails on the same `toBe(cap)`. Both directions are covered by mutation.
-//
-// The grace window is ONE shared clock started by the first arrival, not a per-call timeout: a
-// broken semaphore that serializes the calls then costs the test one window in total instead of one
-// per call, which keeps a real failure fast and readable instead of a test-timeout.
+// Turns reach the model at their own pace, since each does real DB work first, so the first can
+// release its permit before the last arrives and the peak lands under the cap on a correct
+// semaphore. The gate makes it a rendezvous: every call parks until `quorum` are in flight, so the
+// peak is a property of the SEMAPHORE, not of machine load. It does not weaken the assertion:
+// over-admission still pushes the peak above the cap, and under-admission never reaches quorum and
+// fails the same `toBe(cap)`. The grace window is ONE shared clock from the first arrival, not a
+// per-call timeout, so a serializing semaphore costs one window in total and fails fast instead of
+// on the test timeout.
 const QUORUM_GRACE_MS = 1_000;
 
-// NOTE: reaching quorum only settles the LOWER half of `toBe(cap)`. Releasing there would let the
-// parked calls drain within `delayMs` while an over-admitted call was still doing its own DB work,
-// and the peak would read exactly `cap` on a semaphore that admits more than one. So quorum does not
-// release: everyone stays parked through this window, where an extra arrival still counts. Sized
-// from the measured tail (the 5 surplus turns arrive within ~25ms of the 20th) at 3x the fake
-// latency, so it is not a stopwatch on the same scale as the thing it observes.
-//
-// It is a window, not a proof: no finite wait can rule out an admission that comes later still. The
-// deterministic upper bound lives in tests/lib/semaphore.test.ts and tests/graph/model-limit.test.ts,
-// where every caller acquires synchronously in one tick and no timing is involved. What this buys is
-// that the INTEGRATION path can see over-admission at all, which it could not before.
+// Reaching quorum only settles the LOWER half of `toBe(cap)`: releasing there would let the parked
+// calls drain within `delayMs` while an over-admitted call is still doing its DB work, and the peak
+// would read exactly `cap` on a semaphore that admits more. So everyone stays parked through this
+// window, where an extra arrival still counts. At 3x the fake latency it is not a stopwatch on the
+// scale of what it observes. It is a window, not a proof: the deterministic upper bound is in
+// tests/lib/semaphore.test.ts and tests/graph/model-limit.test.ts.
 const OVERFLOW_PROBE_MS = 300;
 
 function quorumGate(quorum: number, meter: { active: number }) {
@@ -98,12 +86,12 @@ function quorumGate(quorum: number, meter: { active: number }) {
       quorumMet = true;
       reached();
     }
-    grace ??= sleep(QUORUM_GRACE_MS);
+    grace ??= Bun.sleep(QUORUM_GRACE_MS);
     await Promise.race([atQuorum, grace]);
     // Skipped when the gate opened on the grace clock instead: a semaphore that admits FEWER than
     // the cap never reaches quorum, and charging it the probe per serialized call would end the
     // test on the clock rather than on the assertion that names the defect.
-    if (quorumMet) await sleep(OVERFLOW_PROBE_MS);
+    if (quorumMet) await Bun.sleep(OVERFLOW_PROBE_MS);
   };
 }
 
@@ -124,7 +112,7 @@ function sleepyModel(
       meter.max = Math.max(meter.max, meter.active);
       try {
         await gate();
-        await sleep(delayMs);
+        await Bun.sleep(delayMs);
         return new AIMessage(REPLY);
       } finally {
         meter.active -= 1;
@@ -134,7 +122,7 @@ function sleepyModel(
   return model as unknown as BaseChatModel;
 }
 
-// One new incoming message per conversation; sendMessage records the post. Shared across turns —
+// One new incoming message per conversation; sendMessage records the post. Shared across turns:
 // getMessages keys off conversationId, so each turn sees its own message.
 function parallelStub(sent: Array<[number, string]>) {
   const client = {
@@ -304,12 +292,9 @@ describe.skipIf(!dbUp)("debounce parallelism", () => {
     // semaphore holds the line at config.agent.modelConcurrency. Deterministic thanks to the
     // rendezvous above, which is why this is `toBe` and not a range.
     expect(meter.max).toBe(cap);
-    // NOTE: the wall-clock anti-serial guard that used to sit here is gone. It bounded `elapsed`
-    // below M*delayMs, but the rendezvous adds fixed harness time (grace clock, probe window) that
-    // has nothing to do with the code under test, so the bound had drifted into measuring this
-    // file's own overhead: 1428ms observed against a 2500ms threshold. It also bought nothing.
-    // Serializing the worker's own `Promise.allSettled` over the jobs is caught above with a peak of
-    // 1, before the timing assertion is ever reached. `elapsed` stays in the log, where a human
-    // reading a failure wants it, and asserts nothing.
+    // NOTE: no wall-clock bound on `elapsed`: the rendezvous adds fixed harness time (grace clock,
+    // probe window), so such a bound measures this file's overhead, and a serialized worker is
+    // already caught above by a peak of 1. `elapsed` stays in the log for a human reading a
+    // failure.
   });
 });

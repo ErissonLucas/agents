@@ -12,6 +12,7 @@ export const NATIVE_TOOL_NAMES = [
   "kanban_move_card",
   "update_kanban_task",
   "set_voice_preference",
+  "update_contact",
   "react_to_message",
   "send_image",
   "send_buttons",
@@ -23,20 +24,12 @@ export const NATIVE_TOOL_NAMES = [
 ] as const;
 export type NativeToolName = (typeof NATIVE_TOOL_NAMES)[number];
 
-// NATIVES THAT WERE RENAMED, old name → new one. A migration repairs the rows that exist when it
-// runs; nothing repairs a BUNDLE, which is a file that can be exported today and imported in a year.
-// Read as an unknown native, the old name is dropped with a warning and the capability is simply
-// gone from the restored agent — the failure a backup exists to prevent (issue #568, review r5).
-//
-// A rename is not a removal, which is why this map exists and `run_code` is not in it: that name
-// stopped meaning anything (issue #363), so dropping it is the honest answer, while `assign_label`
-// still names a tool that is right there under another name.
-//
-// It is the IMPORT boundary that consults this, not the runtime: settings written through the API
-// are refused under the old name, and the catalog stays the one answer to "is this a native today".
+// Natives that were renamed, old name to new one. A migration repairs existing rows, but nothing
+// repairs a bundle exported earlier: read as an unknown native, the old name would be dropped and the
+// capability lost from the restored agent. A removed name (`run_code`) is not listed, since dropping
+// it is correct. Only the IMPORT boundary consults this; the API refuses the old name.
 export const RENAMED_NATIVE_TOOLS: Readonly<Record<string, NativeToolName>> =
   Object.freeze({
-    // issue #568: the tool stopped adding one label and started writing the whole set.
     assign_label: "set_labels",
   });
 
@@ -47,13 +40,11 @@ export function currentNativeToolName(name: string): string {
     : name;
 }
 
-// A name in the list above is RESERVED: the assembly drops any other tool that claims it, granted or
-// not (unique-names.ts, #457); the HTTP tool writers refuse it (tool-definitions/service.ts, which
-// REST, the console and MCP all reach); an import renames a bundled tool that carries it. None of
-// those reaches a row a tenant wrote BEFORE the name was native, which would sit in the console and
-// never reach the model — so a name added here ships with a migration named
-// `*_rename_http_tools_named_after_natives` that moves such rows to the first free `<name>_N`, the
-// way the import does. tests/prisma/native-tool-names-renamed-by-migration.test.ts asks for it.
+// A name in the list above is RESERVED: the assembly drops any other tool that claims it
+// (unique-names.ts), the HTTP tool writers refuse it, and an import renames a bundled tool that
+// carries it. None of those reaches a row written BEFORE the name was native, so a name added here
+// ships with a `*_rename_http_tools_named_after_natives` migration moving such rows to the first free
+// `<name>_N` (enforced by tests/prisma/native-tool-names-renamed-by-migration.test.ts).
 export function isNativeToolName(name: string): name is NativeToolName {
   return (NATIVE_TOOL_NAMES as readonly string[]).includes(name);
 }
@@ -73,6 +64,7 @@ export const NATIVE_TOOL_CATEGORY: Record<NativeToolName, NativeToolCategory> =
     kanban_move_card: "conversation",
     update_kanban_task: "conversation",
     set_voice_preference: "conversation",
+    update_contact: "conversation",
     react_to_message: "conversation",
     send_image: "conversation",
     send_buttons: "conversation",
@@ -82,6 +74,17 @@ export const NATIVE_TOOL_CATEGORY: Record<NativeToolName, NativeToolCategory> =
     calculator: "utility",
     get_current_time: "utility",
   };
+
+// Natives granted by their own configuration rather than by the allowlist: update_contact exists
+// when the agent marks a contact field writable (agent.settings.contactFields). A grant toggle for
+// it would be a control that changes nothing, so the grant catalog leaves it out.
+export const CONFIG_GRANTED_NATIVE_TOOL_NAMES: readonly NativeToolName[] = [
+  "update_contact",
+];
+
+export const GRANTABLE_NATIVE_TOOL_NAMES = NATIVE_TOOL_NAMES.filter(
+  (n) => !CONFIG_GRANTED_NATIVE_TOOL_NAMES.includes(n),
+);
 
 export const UTILITY_NATIVE_TOOL_NAMES = NATIVE_TOOL_NAMES.filter(
   (n) => NATIVE_TOOL_CATEGORY[n] === "utility",
@@ -93,22 +96,7 @@ export const CONVERSATION_NATIVE_TOOL_NAMES = NATIVE_TOOL_NAMES.filter(
   (n) => NATIVE_TOOL_CATEGORY[n] === "conversation",
 );
 
-// NATIVE TOOLS WHOSE WHOLE POINT IS TO PUT SOMETHING IN FRONT OF THE CUSTOMER. A muted turn — the
-// observer's (issue #568) — is not offered one: the reaction lands on the customer's phone and the
-// image is delivered by gates an observation does not have, so each would cost a model round and
-// answer with a failure an operator reads as a broken integration. Listed HERE, in the catalog, so
-// the runtime that strips them (buildNativeTools) and the editor that must not offer them read one
-// list instead of two that can drift (review round 30).
-export const CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES: readonly NativeToolName[] = [
-  "react_to_message",
-  "send_image",
-  "send_buttons",
-  "send_carousel",
-  // Its opening message reaches the customer in the destination inbox (issue #700).
-  "open_case_in_inbox",
-];
-
-// The tool that opens the customer's case in another inbox (issue #700).
+// The tool that opens the customer's case in another inbox.
 export const OPEN_CASE_TOOL_NAME = "open_case_in_inbox";
 // The sentence that tool's result carries when it handed the conversation to people instead (its
 // failure fallback, or the output check's policy), read by the hand-back rule (graph/handback.ts)
@@ -116,28 +104,25 @@ export const OPEN_CASE_TOOL_NAME = "open_case_in_inbox";
 export const OPEN_CASE_HANDED_MARK =
   "This conversation was handed to the human team";
 
+// Built by configuration rather than granted (`tts.textChoice`), so not in the native catalog; named
+// here, in a module with no imports, so the console can ask about it without loading the tool.
+export const REPLY_AS_TEXT_TOOL = "reply_as_text";
+
 export const RAG_TOOL_NAMES = ["search_knowledge", "suggest_kb_entry"] as const;
 export type RagToolName = (typeof RAG_TOOL_NAMES)[number];
 
-// WHAT A SUCCESSFUL `handoff_to_human` LEAVES IN THE THREAD, named here because two places compare
-// against it and a second spelling is how a comparison goes quietly false (issue #457).
-//
-// The tool's model-facing return is the only trace in the channel that separates a transfer that
-// HAPPENED from one that did not: the AI message carrying the call is checkpointed before the tool
-// runs, so it is written just as much when `toggleStatus` throws and when an operator's precondition
-// refuses the call — and both of those leave the conversation bot-owned, with nothing to announce
-// the end of. The hand-back decision (../handback.ts) matches this prefix on the TOOL RESULT.
 // The immediate close's own result, shared so a reader asking "did this turn close the
-// conversation" matches the same literal the tool writes (issue #659, review round 3).
+// conversation" matches the same literal the tool writes.
 export const RESOLVE_DONE = "Conversation resolved.";
 
+// What a successful `handoff_to_human` leaves in the thread, named once because two places compare
+// against it. The AI message carrying the call is checkpointed before the tool runs, so only this
+// TOOL RESULT separates a transfer that happened from one that threw or was refused by a
+// precondition. The hand-back decision (../handback.ts) matches this prefix.
 export const HANDOFF_DONE_PREFIX = "Handed off to a human";
 
-// The tool that produces it, named here for the same reason. A result is only that tool's result if
-// the tool node says so, and the NAME is the identity for a native: `handoff_to_human` is not
-// renameable and not namespaced, and the assembly RESERVES every native name — including the ones
-// this agent's allowlist left unbuilt (../tools/unique-names.ts), which is the half ordering alone
-// could not defend. See ../../modules/agents/tool-preconditions.ts, which restricts preconditions to
-// this same set on exactly that argument. Without the name, any enabled external tool that happened
-// to return text opening with the prefix above would announce a hand-back that never happened.
+// The tool that produces it. A result is only that tool's result if the tool node says so, and the
+// NAME is a native's identity: not renameable, not namespaced, and reserved by the assembly even when
+// unbuilt (../tools/unique-names.ts). Without the name, any external tool returning text that opens
+// with the prefix above would announce a hand-back that never happened.
 export const HANDOFF_TOOL_NAME = "handoff_to_human";

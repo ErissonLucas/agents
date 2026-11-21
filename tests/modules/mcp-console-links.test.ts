@@ -8,16 +8,20 @@ import {
   vaultFillUrl,
 } from "@/modules/mcp/console-links";
 
-// Every console link an MCP answer hands back has to satisfy two things at once, and each of them
-// was broken on a different link (issue #151): it must name the TENANT it belongs to, because the
-// console resolves the tenant from localStorage and never from the URL, and it must name a route
-// that EXISTS, because `path="*"` redirects anything else to the dashboard with no explanation.
+// Every console link an MCP answer hands back has to satisfy two things at once: it must name the
+// TENANT it belongs to, because the console resolves the tenant from localStorage and never from the
+// URL, and it must name a route that EXISTS, because `path="*"` redirects anything else to the
+// dashboard with no explanation.
 
 const BASE = config.publicUrl.replace(/\/+$/, "");
 
 // The routes as the router spells them (`src/client/App.tsx`), written out here rather than imported
 // so that a rename has to be made in two places on purpose instead of agreeing with itself.
-const ROUTER_PATHS: string[] = ["/resources/vault", "/resources/integrations"];
+const ROUTER_PATHS: string[] = [
+  "/resources/vault",
+  "/resources/integrations",
+  "/admin/instance-health",
+];
 
 describe("console links", () => {
   test("every named destination is a route the console actually has", () => {
@@ -53,9 +57,8 @@ describe("console links", () => {
     );
   });
 
-  // These two used to point at `/vault` and `/integrations`, which are not routes: the vault panel
-  // is `/resources/vault` and integrations is `/resources/integrations`, so both dropped the
-  // operator on the dashboard.
+  // NOTE: `/vault` and `/integrations` are not routes: the vault panel is `/resources/vault` and integrations
+  // is `/resources/integrations`, and a link to either short form drops the operator on the dashboard.
   test("the create and configure links land on the panel, not on the catch-all", () => {
     expect(vaultCreateUrl(7n)).toBe(`${BASE}/resources/vault?switchTenant=7`);
     expect(integrationsUrl(7n)).toBe(

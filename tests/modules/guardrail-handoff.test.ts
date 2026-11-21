@@ -7,6 +7,7 @@ import {
   guardrailTripped,
   handedOffNote,
   REFUSED_REPLY_NOTE_MAX,
+  screenedByOperator,
   screenedText,
 } from "@/modules/guardrails/gate";
 import { applyGuardrailHandoff } from "@/modules/guardrails/handoff";
@@ -17,7 +18,7 @@ import {
   pinnedHandoffTarget,
 } from "@/modules/handoff/settings";
 
-// Issue #704: the guardrail's `handoff` action. The unit half: how it is configured, what the gate
+// The guardrail's `handoff` action. The unit half: how it is configured, what the gate
 // hands the caller, what the operator note says, and the transfer itself. The runtime and follow-up
 // halves are in tests/graph/runtime.test.ts and tests/graph/nudge.test.ts.
 
@@ -85,15 +86,33 @@ describe("what the gate hands the caller", () => {
   });
 
   test("a long refused reply is bounded in the note", () => {
-    const note = handedOffNote("HEAD", {
-      direction: "output",
-      outcome: "handed-off",
-      refused: "x".repeat(REFUSED_REPLY_NOTE_MAX * 2),
-    });
-    expect(note.length).toBeLessThan(REFUSED_REPLY_NOTE_MAX + 200);
+    const quoted = (refused: string) =>
+      handedOffNote("HEAD", {
+        direction: "output",
+        outcome: "handed-off",
+        refused,
+      }).split("(não enviada ao cliente):\n")[1];
+    // At the cap the reply is quoted whole; one past it, the tail is what goes.
+    const atCap = `${"x".repeat(REFUSED_REPLY_NOTE_MAX - 1)}Z`;
+    expect(quoted(atCap)).toBe(atCap);
+    expect(quoted(`${atCap}!`)).toBe(atCap);
+    expect(quoted("x".repeat(REFUSED_REPLY_NOTE_MAX * 2))).toBe(
+      "x".repeat(REFUSED_REPLY_NOTE_MAX),
+    );
   });
 
-  test("the note sink posts a hand-over", async () => {
+  test("screenedByOperator: the template and the hand-over message are the operator's, a generated reply is not", () => {
+    expect(screenedByOperator({ kind: "replaced", reply: "T" })).toBe(true);
+    expect(
+      screenedByOperator({ kind: "replaced", reply: "G", generated: true }),
+    ).toBe(false);
+    expect(screenedByOperator({ kind: "handed-off", reply: "H" })).toBe(true);
+    expect(screenedByOperator({ kind: "clean" })).toBe(false);
+  });
+
+  // The note quotes the refused reply and the judge's rationale, both model text, and
+  // Chatwoot renders a note as Liquid; quoted as they were, a refused `{{contact.email}}` would fill in.
+  test("the note quotes the model's text literally", async () => {
     const notes: string[] = [];
     const sink = chatwootNoteSink(
       {
@@ -108,10 +127,12 @@ describe("what the gate hands the caller", () => {
       direction: "output",
       outcome: "handed-off",
       action: "handoff",
-      refused: "RECUSADA",
+      rationale: "citou {{foo}}",
+      refused: "Seu cadastro: {{contact.email}}",
     });
-    expect(notes).toHaveLength(1);
-    expect(notes[0]).toContain("RECUSADA");
+    expect(notes[0]).toContain("citou {{ '{{' }}foo}}");
+    expect(notes[0]).toContain("Seu cadastro: {{ '{{' }}contact.email}}");
+    expect(notes[0]).not.toContain("{{contact.email}}");
   });
 });
 

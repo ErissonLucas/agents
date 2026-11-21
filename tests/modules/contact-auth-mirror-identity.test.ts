@@ -3,18 +3,17 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { mirrorChatwootEvent } from "@/modules/chatwoot/mirror";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // The mirrored contact is what the authorization gate sends to the operator's endpoint, so these
 // are not prompt-quality questions: getting them wrong asks about the wrong person.
 //
-//   - a Chatwoot contact id is unique inside ONE account, so two accounts under one tenant used to
-//     collapse contact 42 into a single row and the last write left one person's name over
-//     another's phone;
-//   - a CLEARED identifier used to be indistinguishable from an absent one, so an unlinked contact
-//     went on being checked under the customer id it no longer has;
-//   - and the write was unconditional, so a delivery arriving late could restore what a newer one
-//     had already cleared.
+//   - a Chatwoot contact id is unique inside ONE account, so contact 42 in two accounts under one
+//     tenant is two rows, never one person's name over another's phone;
+//   - a CLEARED identifier is distinct from an absent one, so an unlinked contact stops being
+//     checked under the customer id it no longer has;
+//   - the write is conditional, so a late delivery cannot restore what a newer one cleared.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -27,8 +26,8 @@ if (appUrl && suUrl) {
     });
     await su.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -165,9 +164,8 @@ describe.if(dbUp)("the identity the gate is given", () => {
     });
   });
 
-  // The gate reads phone and e-mail as identity too, so they follow the same rule the identifier
-  // does: this was fixed for the identifier alone first, and a removed phone went on being the
-  // identity the endpoint was asked about.
+  // The gate reads phone and e-mail as identity too, so they follow the identifier's rule: a
+  // removed phone must stop being the identity the endpoint is asked about.
   test("a removed phone is removed, and an absent one is kept", async () => {
     await mirror(instB, {
       conversationId: 8002,
@@ -218,9 +216,9 @@ describe.if(dbUp)("the identity the gate is given", () => {
     expect((await contactOf(instB)).attributes).toEqual({});
   });
 
-  // The tie is decided per FIELD. A row-wide flag let an older snapshot carrying an unrelated
-  // `email: null` rewrite everything it carried at an equal timestamp, restoring a phone a newer one
-  // had just cleared.
+  // The tie is decided per FIELD. A row-wide flag would let an older snapshot carrying an unrelated
+  // `email: null` rewrite everything it carried at an equal timestamp, restoring a phone a newer
+  // one had just cleared.
   test("inside the same second, a clear elsewhere does not restore a cleared field", async () => {
     await mirror(instB, {
       conversationId: 8002,

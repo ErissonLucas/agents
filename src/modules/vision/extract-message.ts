@@ -1,20 +1,11 @@
-// A vision de UMA MENSAGEM: todos os anexos visuais dela, com o orçamento, a rotulagem e o
-// agregado que o modelo vai ler.
-//
-// Isto era o miolo de `runEagerMedia` (../chatwoot/webhook.ts) e saiu de lá quando um SEGUNDO
-// chamador apareceu (issue #757): o turno do re-engage, que relê uma thread cujos anexos nunca
-// passaram pelo caminho de chegada e por isso não têm meta nenhuma. Cada regra aqui foi paga por
-// uma rodada de review da #691/#692, e duas cópias delas divergiriam na primeira correção:
-//
-//   - o ORÇAMENTO é de chamadas ao provedor, não de quanto da mensagem se lê: anexo que já carrega
-//     a extração é reaproveitado sem custo e NÃO conta contra o teto. Cortar antes dessa distinção
-//     jogava fora resultado em mãos e ainda o contava como não lido;
-//   - o que sobra do teto, e o que falhou, são NOMEADOS ao modelo por uma contagem: um modelo a
-//     quem não se diz nada responde como se a mensagem tivesse menos arquivos;
-//   - a rotulagem por nome de arquivo só aparece quando há mais de um, para o caso comum continuar
-//     byte a byte o que era;
-//   - o stash é UM agregado por mensagem, depois do laço: a loja é chaveada por mensagem e mescla
-//     campo a campo, então N extrações em paralelo stashando cada uma deixariam só a última.
+// A vision de UMA MENSAGEM: todos os anexos visuais dela, com o orçamento, a rotulagem e o agregado
+// que o modelo vai ler. Serve à chegada (`runEagerMedia`, ../chatwoot/webhook.ts) e ao turno do
+// re-engage, cujos anexos nunca passaram pela chegada e não têm meta.
+//   - o ORÇAMENTO é de chamadas ao provedor: anexo que já carrega a extração é reaproveitado e NÃO
+//     conta contra o teto;
+//   - o que sobra do teto, e o que falhou, são NOMEADOS ao modelo por uma contagem: sem ela o
+//     modelo responde como se a mensagem tivesse menos arquivos;
+//   - o stash é UM agregado por mensagem, depois do laço (ver a nota lá).
 
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
@@ -23,32 +14,34 @@ import {
   onChatwootHost,
   oneByBlob,
   servedBy,
+  throughBase,
 } from "@/modules/chatwoot/email-body-images";
-import { chatwootBaseUrl } from "@/modules/chatwoot/instance";
+import { chatwootAddresses } from "@/modules/chatwoot/instance";
 import type { FlowContext } from "@/modules/flowlog/service";
 import {
   BODY_IMAGE_IGNORED,
   classifyBodyImage,
   type ExtractInboundParams,
   extractBodyImage,
-  extractInboundFile,
+  readInboundFile,
+  rememberedFileRead,
 } from "./service";
 import type { VisionConfig } from "./settings";
+import { isUnread, type UnreadFile } from "./unread";
 
-// Quantos anexos de uma mensagem podem custar uma EXTRAÇÃO NOVA. A média medida numa caixa de
-// produção é 1,98 por conversa, então isto cobre o tráfego real com folga; a cauda é o cliente que
-// anexa um álbum inteiro (70 na mesma medição), e ali o teto é justamente o ponto. O que sobra é
-// reportado ao modelo, não descartado em silêncio.
+// Quantos anexos de uma mensagem podem custar uma EXTRAÇÃO NOVA. Cobre o caso comum com folga; o
+// teto existe para o cliente que anexa um álbum inteiro. O que sobra é reportado ao modelo, não
+// descartado em silêncio.
 export const VISION_MAX_ATTACHMENTS = 8;
 
-// Quantas imagens do corpo de um e-mail podem ser BAIXADAS por mensagem, lidas ou só classificadas
-// (#864). Um corpo normal traz uma (3.181 de 3.801 mensagens medidas); três tetos cobrem as fotos e
-// os ornamentos que dividem o corpo com elas, e param o corpo forjado com milhares de URLs de blob.
+// Quantas imagens do corpo de um e-mail podem ser BAIXADAS por mensagem, lidas ou só classificadas.
+// Três tetos cobrem as fotos e os ornamentos que dividem o corpo com elas, e param o corpo forjado
+// com milhares de URLs de blob.
 export const BODY_IMAGE_MAX_DOWNLOADS = 3 * VISION_MAX_ATTACHMENTS;
 
 // Um anexo visual (imagem ou documento) com o que já se sabe dele.
 export interface VisualAttachment {
-  // Null for an image Chatwoot's mailbox kept inside the email body (#864): no attachment row.
+  // Null for an image Chatwoot's mailbox kept inside the email body: no attachment row.
   id: number | null;
   dataUrl: string;
   name: string | null;
@@ -62,29 +55,28 @@ export interface MessageVisuals {
   extractedText: string | null;
   // Anexos que esta passagem não abriu: os que passaram do teto mais os que falharam.
   attachmentsUnread: number;
-  // Esta passagem percorreu as imagens do corpo do e-mail (#864), mesmo que fossem todas ornamento.
+  // Os não lidos que esta passagem tentou abrir, cada um com o nome e o motivo. Os que passaram do
+  // teto não estão aqui: nunca foram tentados, e ficam só na contagem.
+  unreadFiles: UnreadFile[];
+  // Esta passagem percorreu as imagens do corpo do e-mail, mesmo que fossem todas ornamento.
   bodyRead: boolean;
 }
 
-// SE SOBROU ALGUMA COISA PARA ABRIR nesta mensagem. Uma pergunta só, e exportada, porque quem
-// decide CHAMAR a extração (o turno, ../debounce/handler.ts) e quem decide o que fazer com cada
-// anexo DENTRO dela são dois lugares, e os dois precisam da mesma resposta. Enquanto eram dois
-// predicados escritos separados, cada um segurava o erro do outro: mutar qualquer um deles não
-// mudava nada observável, porque o outro já tinha filtrado o caso — duas cercas para a mesma regra,
-// e nenhuma bateria de mutação consegue distingui-las.
+// SE SOBROU ALGUMA COISA PARA ABRIR nesta mensagem. Exportada porque quem decide CHAMAR a extração
+// (o turno, ../debounce/handler.ts) e quem decide cada anexo DENTRO dela precisam da mesma resposta:
+// dois predicados separados escondem a mutação um do outro.
 export function hasUnextractedVisual(visuals: VisualAttachment[]): boolean {
   return visuals.some((v) => !v.imageDescription && !v.extractedText);
 }
 
-// O rótulo que separa dois arquivos. Anexo único mantém o texto puro, byte a byte, para o caso
-// comum ler exatamente como lia antes desta mudança.
+// O rótulo que separa dois arquivos. Anexo único mantém o texto puro, sem rótulo.
 function rotulado(nome: string | null, texto: string, total: number): string {
   if (total <= 1) return texto;
   return `[${nome ?? "anexo"}] ${texto}`;
 }
 
 // Imagem do corpo que não é deste Chatwoot sai ANTES do teto: senão ela ocuparia vaga, ou entraria na
-// contagem de não lidos quando os anexos já esgotaram o teto (#864). Sem conseguir ler o endereço
+// contagem de não lidos quando os anexos já esgotaram o teto. Sem conseguir ler o endereço
 // da instância, nenhuma imagem do corpo é lida: ler uma remota é pior do que não ler uma do cliente.
 async function doProprioChatwoot(
   corpo: VisualAttachment[],
@@ -92,13 +84,20 @@ async function doProprioChatwoot(
 ): Promise<VisualAttachment[]> {
   if (corpo.length === 0) return corpo;
   try {
-    const baseUrl = await chatwootBaseUrl(
+    const { baseUrl, publicUrl } = await chatwootAddresses(
       params.tenantId,
       params.instanceId,
       params.base,
     );
     const doHost = corpo
-      .map((v) => ({ ...v, dataUrl: onChatwootHost(v.dataUrl, baseUrl) }))
+      .map((v) => ({
+        ...v,
+        dataUrl: throughBase(
+          onChatwootHost(v.dataUrl, baseUrl),
+          baseUrl,
+          publicUrl,
+        ),
+      }))
       .filter((v) => servedBy(v.dataUrl, baseUrl));
     const um = new Set(oneByBlob(doHost.map((v) => v.dataUrl)));
     return doHost.filter((v) => um.delete(v.dataUrl));
@@ -125,13 +124,16 @@ export async function extractMessageVisuals(params: {
   convLabel?: string;
   // Asked before each later batch of email body images: false stops the reading there.
   stillAllowed?: () => Promise<boolean>;
+  // The caller's deadline: past it, no later batch and no further provider attempt starts.
+  signal?: AbortSignal;
+  usageNode?: ExtractInboundParams["usageNode"];
 }): Promise<MessageVisuals | null> {
   const { visuals: todos, tenantId, instanceId, messageId } = params;
   if (todos.length === 0) return null;
 
-  // Anexos reais primeiro, com o teto como sempre. As imagens do corpo do e-mail (#864) vêm depois,
-  // em lotes do que sobrou do teto: só se sabe que uma é ornamento depois de baixá-la, e ornamento
-  // não gasta vaga, então cada lote devolve as vagas dos que foram ignorados ao lote seguinte.
+  // Anexos reais primeiro, com o teto. As imagens do corpo do e-mail vêm depois, em lotes do
+  // que sobrou do teto: só se sabe que uma é ornamento depois de baixá-la, e ornamento não gasta
+  // vaga, então cada lote devolve as vagas dos que foram ignorados ao lote seguinte.
   const anexos = todos.filter((v) => v.id !== null);
   const corpo = await doProprioChatwoot(
     todos.filter((v) => v.id === null),
@@ -158,16 +160,17 @@ export async function extractMessageVisuals(params: {
       deps: params.deps,
       // O agregado é stashado uma vez depois do laço; ver a nota lá embaixo.
       stashAnnotation: false,
+      signal: params.signal,
+      usageNode: params.usageNode,
     };
     return visual.id === null
       ? extractBodyImage(comum)
-      : extractInboundFile({ ...comum, attachmentId: visual.id });
+      : readInboundFile({ ...comum, attachmentId: visual.id });
   };
 
   const ler = (visual: VisualAttachment) =>
-    // Já extraído numa passagem anterior (a recuperação de entrega repassa por aqui): reusa.
-    // Mais barato, e é o que mantém o agregado COMPLETO — uma repassagem parcial publicava um
-    // agregado mais pobre do que a metadata que ela depois sobrescrevia.
+    // NOTE: Já extraído numa passagem anterior (a recuperação de entrega repassa por aqui): reusa.
+    // Reusar mantém o agregado COMPLETO, em vez de um mais pobre que a meta que ele sobrescreve.
     !hasUnextractedVisual([visual])
       ? Promise.resolve({
           nome: visual.name,
@@ -181,13 +184,22 @@ export async function extractMessageVisuals(params: {
       : extrair(visual)
           // Um arquivo ilegível não pode custar os outros: a extração é best-effort por anexo.
           .catch((err) => {
+            // A read that answered before this wait was cut (during the write-back) is kept.
+            const kept = rememberedFileRead({
+              tenantId,
+              instanceId,
+              messageId,
+              attachmentId: visual.id,
+              dataUrl: visual.dataUrl,
+            });
+            if (kept) return kept;
             logger.warn(
               "vision failed for attachment %s (conv=%s): %s",
               visual.id,
               params.convLabel ?? String(params.conversationId),
               err instanceof Error ? err.message : String(err),
             );
-            return null;
+            return { unread: "failed" } as const;
           })
           .then((r) => ({ nome: visual.name, r }));
 
@@ -212,7 +224,10 @@ export async function extractMessageVisuals(params: {
   vagas = primeiroLote.filter((e) => e.r === BODY_IMAGE_IGNORED).length;
   let parou = false;
   while (corpo.length > 0 && vagas > 0 && orcamento > 0) {
-    if (params.stillAllowed && !(await params.stillAllowed())) {
+    if (
+      params.signal?.aborted ||
+      (params.stillAllowed && !(await params.stillAllowed()))
+    ) {
       parou = true;
       break;
     }
@@ -225,6 +240,7 @@ export async function extractMessageVisuals(params: {
   // assinatura depois de oito fotos não é arquivo a pedir de novo.
   // Em lotes do tamanho do teto, porque cada download fica inteiro em memória.
   while (!parou && corpo.length > 0 && orcamento > 0) {
+    if (params.signal?.aborted) break;
     const alemDoTeto = await Promise.all(
       tirar(VISION_MAX_ATTACHMENTS).map((visual) =>
         classifyBodyImage({
@@ -238,6 +254,7 @@ export async function extractMessageVisuals(params: {
           flow: params.flow,
           deps: params.deps,
           stashAnnotation: false,
+          signal: params.signal,
         }).catch(() => null),
       ),
     );
@@ -247,17 +264,17 @@ export async function extractMessageVisuals(params: {
 
   const imagens: string[] = [];
   const documentos: string[] = [];
-  let falharam = 0;
-  // Ornamento do corpo do e-mail, ou imagem que não é deste Chatwoot: não foi enviada pelo cliente,
-  // então não é lida, não rotula as outras e não entra na contagem de não lidos (#864).
+  const unreadFiles: UnreadFile[] = [];
+  // Ornamento do corpo do e-mail, ou imagem que não é deste Chatwoot: não foi enviada pelo
+  // cliente, então não é lida, não rotula as outras e não entra na contagem de não lidos.
   const doCliente = extraidos.flatMap(({ nome, r }) =>
     r === BODY_IMAGE_IGNORED ? [] : [{ nome, r }],
   );
   for (const { nome, r } of doCliente) {
     // Arquivo que não deu para ler NÃO é arquivo que não foi enviado. Contado junto com os que
     // passaram do teto porque o movimento do modelo é o mesmo: nomear o que falta e pedir de novo.
-    if (!r) {
-      falharam++;
+    if (isUnread(r)) {
+      unreadFiles.push({ name: nome, cause: r.unread });
       continue;
     }
     (r.kind === "image" ? imagens : documentos).push(
@@ -265,25 +282,32 @@ export async function extractMessageVisuals(params: {
     );
   }
 
-  const naoLidos = sobraram + falharam;
+  const naoLidos = sobraram + unreadFiles.length;
   const descricao = imagens.length > 0 ? imagens.join("\n\n") : null;
   const documento = documentos.length > 0 ? documentos.join("\n\n") : null;
 
-  // UM agregado por mensagem, depois do laço. Cada `extractInboundFile` stasharia o seu sob a MESMA
-  // chave de mensagem e a loja mescla campo a campo, então N extrações em paralelo deixariam só a
-  // que terminou por último — e no Chatwoot upstream, onde a rota de write-back da meta não existe,
-  // essa loja é o ÚNICO leitor do flush do debounce.
+  // UM agregado por mensagem, depois do laço. Cada `extractInboundFile` stasharia o seu sob a
+  // MESMA chave de mensagem e a loja mescla campo a campo, então N extrações em paralelo deixariam
+  // só a que terminou por último; e no Chatwoot upstream, onde a rota de write-back da meta não
+  // existe, essa loja é o ÚNICO leitor do flush do debounce.
   const leuCorpo = todos.some((v) => v.id === null);
-  if (descricao || documento || naoLidos > 0 || leuCorpo)
+  // Uma mensagem que o prazo do chamador cortou sem ler nada não é stashada: a contagem de não
+  // lidos é a marca de TENTADA, e a nova tentativa do job tem que lê-la. Lida em parte, ela é
+  // stashada como sempre, com o aviso dos arquivos que faltaram.
+  const cortadaSemLeitura = params.signal?.aborted && !descricao && !documento;
+  if (
+    !cortadaSemLeitura &&
+    (descricao || documento || naoLidos > 0 || leuCorpo)
+  )
     stashMediaAnnotation(
       { tenantId, instanceId, messageId },
       {
         ...(descricao ? { imageDescription: descricao } : {}),
         ...(documento ? { extractedText: documento } : {}),
-        // SEMPRE, inclusive zero. A loja mescla campo a campo, então omitir na passagem que
-        // finalmente leu tudo deixava de pé a contagem positiva anterior, e o flush renderizava
-        // "N arquivos não lidos" ao lado da extração completa.
+        // NOTE: SEMPRE, inclusive zero. A loja mescla campo a campo: omitir o campo na passagem que
+        // leu tudo deixaria de pé a contagem positiva anterior ao lado da extração completa.
         attachmentsUnread: naoLidos,
+        unreadFiles,
         ...(leuCorpo ? { bodyRead: true } : {}),
       },
     );
@@ -292,6 +316,7 @@ export async function extractMessageVisuals(params: {
     imageDescription: descricao,
     extractedText: documento,
     attachmentsUnread: naoLidos,
+    unreadFiles,
     bodyRead: leuCorpo,
   };
 }

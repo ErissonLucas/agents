@@ -1,7 +1,21 @@
 /// <reference lib="dom" />
 
-import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  test,
+} from "bun:test";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  within,
+} from "@testing-library/react";
+import { useState } from "react";
 import { GuardrailsTab } from "@/client/pages/agents/GuardrailsTab";
 import type { GuardrailsRefusals } from "@/client/pages/agents/types";
 import {
@@ -13,20 +27,25 @@ import {
   GUARDRAILS_DEFAULTS,
   type GuardrailAction,
   type GuardrailsConfig,
+  MAX_SOURCE_TOOLS,
 } from "@/modules/guardrails/settings";
 
 // The template message is what the customer reads, and the `generated` action falls back to it
 // whenever no replacement gets written: when the model returns none, and always when the relevance
-// check is the one that tripped, since a reply that did not answer has nothing to rewrite. The
-// field used to be hidden outside the `template` action, so an operator on `generated` could not
-// see or edit the message their customers actually receive.
+// check is the one that tripped, since a reply that did not answer has nothing to rewrite. So the
+// field is shown on `generated` too, where it is the message the customer receives.
 //
-// NOTE: every assertion reduces to a boolean or a string BEFORE expect. A failing expectation that
-// holds a DOM node serializes a cyclic happy-dom tree and stalls the runner.
-function renderWith(action: GuardrailAction): void {
+// Every assertion reduces to a boolean or a string BEFORE expect: a failing expectation that holds
+// a DOM node serializes a cyclic happy-dom tree and stalls the runner.
+function renderWith(
+  action: GuardrailAction,
+  setGuardrails: (next: unknown) => void = () => {},
+  over: Partial<GuardrailsConfig> = {},
+): GuardrailsConfig {
   const config: GuardrailsConfig = {
     ...structuredClone(GUARDRAILS_DEFAULTS),
     enabled: true,
+    ...over,
   };
   // Both directions, because the tab renders a block for each and the count below cannot tell them
   // apart: with only one switched, the other's template field would answer for it.
@@ -34,8 +53,9 @@ function renderWith(action: GuardrailAction): void {
   config.output = { ...config.output, enabled: true, action };
   render(
     <GuardrailsTab
+      agentId=""
       guardrails={config}
-      setGuardrails={() => {}}
+      setGuardrails={setGuardrails as never}
       refusals={NO_REFUSALS}
       dirty={false}
       saving={false}
@@ -43,6 +63,7 @@ function renderWith(action: GuardrailAction): void {
       onDiscard={() => {}}
     />,
   );
+  return config;
 }
 
 const templateFields = () =>
@@ -52,13 +73,24 @@ const templateFields = () =>
 // Nothing refused: every test here is about the form, not about a refusal landing on it.
 const NO_REFUSALS: GuardrailsRefusals = {
   credential: null,
+  decisionsCredential: null,
   customPolicy: null,
   inputTemplateMessage: null,
   outputTemplateMessage: null,
   outputGenerationPrompt: null,
   inputHandoffMessage: null,
   outputHandoffMessage: null,
+  externalUrl: null,
+  externalSecret: null,
+  groundingCredential: null,
 };
+
+// A field of the factual-grounding section, by its label. A picker answers to its group label and its
+// own aria-label, so the first match is the control itself or its group.
+const groundingField = (label: string): HTMLElement =>
+  within(
+    document.getElementById("gr-grounding") as HTMLElement,
+  ).getAllByLabelText(label)[0] as HTMLElement;
 
 describe("GuardrailsTab template message", () => {
   // The tab mounts a CredentialPicker, which loads over the network. Stubbing `globalThis.fetch`
@@ -76,14 +108,25 @@ describe("GuardrailsTab template message", () => {
   });
 
   test("is editable on the template action", () => {
-    renderWith("template");
-    expect(templateFields() > 0).toBe(true);
-  });
-
-  // The one this round is about: on `generated` it is the fallback the customer receives.
-  test("stays editable on the generated action, where it is the fallback", () => {
-    renderWith("generated");
-    expect(templateFields() > 0).toBe(true);
+    let next: GuardrailsConfig | undefined;
+    const config = renderWith("template", (update) => {
+      next = (update as (s: GuardrailsConfig) => GuardrailsConfig)(config);
+    });
+    const fields = screen.queryAllByLabelText(
+      /^Template message/,
+    ) as HTMLTextAreaElement[];
+    expect(fields.map((f) => f.disabled)).toEqual([false, false]);
+    // Each box writes its own direction, input first.
+    const written = (["input", "output"] as const).map((dir, i) => {
+      fireEvent.change(fields[i] as HTMLTextAreaElement, {
+        target: { value: `nova ${dir}` },
+      });
+      return [next?.input.templateMessage, next?.output.templateMessage];
+    });
+    expect(written).toEqual([
+      ["nova input", config.output.templateMessage],
+      [config.input.templateMessage, "nova output"],
+    ]);
   });
 
   test("is gone on silent, which sends nothing at all", () => {
@@ -91,8 +134,8 @@ describe("GuardrailsTab template message", () => {
     expect(templateFields()).toBe(0);
   });
 
-  // Issue #704: a hand-over says a person will continue, which is not what a refusal says, so it
-  // has its own box and the template's is gone. Capped like every customer-facing line here.
+  // NOTE: a hand-over says a person will continue, which is not what a refusal says, so it has its
+  // own box and the template's is gone. Capped like every customer-facing line here.
   test("is replaced by the hand-over line on handoff", () => {
     renderWith("handoff");
     expect(templateFields()).toBe(0);
@@ -104,9 +147,19 @@ describe("GuardrailsTab template message", () => {
     expect(handoff.every((v) => v === String(TEMPLATE_MESSAGE_MAX))).toBe(true);
   });
 
-  // The custom policy is clamped at CUSTOM_POLICY_MAX on read, and until now the field said nothing:
-  // an operator pasting a longer policy saw it saved, saw it back on reload, and never learned that
-  // the analysis prompt only carried the first part of it.
+  // The bug it catches: under hold the hand-over line is what a failed check sends, and with any
+  // other violation action the operator could neither read nor change it.
+  test("is shown beside the template under hold, since a check that cannot run sends it", () => {
+    renderWith("template", () => {}, { onFailure: "hold" });
+    const handoff = [
+      ...screen.queryAllByLabelText(/^Message to the customer/),
+      ...screen.queryAllByLabelText(/^Mensagem ao cliente/),
+    ].length;
+    expect([templateFields(), handoff]).toEqual([2, 2]);
+  });
+
+  // NOTE: the custom policy is clamped at CUSTOM_POLICY_MAX on read, so the field declares the cap
+  // or an operator pasting a longer policy never learns the analysis carries only the first part.
   // Substring match: FormField puts the description inside the same <label>, so the accessible name
   // is "Custom policy Extra rules appended to every analysis." rather than the label alone.
   test("every clamped field on this tab declares its cap", () => {
@@ -138,9 +191,9 @@ describe("GuardrailsTab template message", () => {
   // otherwise picking "generated" there looks like a feature that silently does nothing. The
   // template field is the place, because the template is what that direction actually sends.
   //
-  // It lives behind that field's `?` rather than under it (issue #411), which is not a detail of
-  // presentation here: this field renders a server refusal in the same slot a description would
-  // occupy, so an inline explanation would be erased by the very refusal it explains.
+  // NOTE: it lives behind that field's `?` rather than under it: this field renders a server
+  // refusal in the slot a description would occupy, so an inline explanation would be erased by the
+  // very refusal it explains.
   test("the input direction says the template is always what gets sent", () => {
     renderWith("generated");
     expect(
@@ -163,16 +216,15 @@ describe("GuardrailsTab template message", () => {
 
 // THE MARK ACTUALLY REACHING THE BOX.
 //
-// Everything else about #349 is provable without a DOM — where a path is edited, which channel the
-// placement chooses — and none of it proves the last step: that the answer handed to a tab is
-// rendered beside the control it is about. This tab is the one that can be mounted (the editor pulls
-// auth, theme, toast and a live catalog), and its five fields are one of each shape the editor draws:
-// a credential picker, a per-direction textarea, and a policy textarea.
+// Where a refusal's path is edited and which channel the placement chooses are provable without a
+// DOM; the last step is not: that the answer handed to a tab is rendered beside the control it is
+// about. This tab is the one that can be mounted (the editor pulls auth, theme, toast and a live
+// catalog), and its five fields are one of each shape the editor draws: a credential picker, a
+// per-direction textarea, and a policy textarea.
 describe("a refusal handed to the guardrails tab lands at its input", () => {
-  // The other describe in this file scopes its own cleanup, so this block needs one too: without it
-  // the last render of the loop below survives into the next test, and the control that asserts
-  // "none of it is on screen" reads the leftover instead. Measured -- it passes alone and fails in a
-  // full run, which is the signature of state carried between tests rather than of a real defect.
+  // NOTE: the other describe in this file scopes its own cleanup, so this block needs one too:
+  // without it the last render of the loop below survives into the next test, and the control that
+  // asserts "none of it is on screen" reads the leftover (green alone, red in a full run).
   afterEach(() => cleanup());
 
   function renderRefused(refusals: GuardrailsRefusals): void {
@@ -184,6 +236,7 @@ describe("a refusal handed to the guardrails tab lands at its input", () => {
     config.output = { ...config.output, enabled: true, action: "generated" };
     render(
       <GuardrailsTab
+        agentId=""
         guardrails={config}
         setGuardrails={() => {}}
         refusals={refusals}
@@ -211,16 +264,619 @@ describe("a refusal handed to the guardrails tab lands at its input", () => {
   });
 
   test("with nothing refused the tab says none of it", () => {
-    // The control for the count above: a rendering that always showed the string would pass every
-    // line of it.
+    // NOTE: no field marks itself refused, whatever sentence a refusal would carry.
     renderRefused(NO_REFUSALS);
-    expect(screen.queryAllByText(/^refused: /).length).toBe(0);
+    expect(document.querySelectorAll('[aria-invalid="true"]').length).toBe(0);
+    cleanup();
+    renderRefused({ ...NO_REFUSALS, customPolicy: "x" });
+    expect(document.querySelectorAll('[aria-invalid="true"]').length).toBe(1);
+  });
+});
+
+// With a classification API judging, each check's threshold sits beside the check's own switch, in
+// the direction the check is on, not in a list in the model card that the operator had to match by
+// name. The value is one per check (stored once, used by both directions), so a check on in both
+// directions draws two fields that must always show the same thing, keystroke by keystroke.
+describe("GuardrailsTab thresholds beside their checks", () => {
+  // Swapped in beforeAll and put back in afterAll, with the fetch captured when this block starts:
+  // captured at collection time, it would be the stub the describe above installs at ITS collection,
+  // and restoring that would leave a fake fetch in place for every file after this one in the worker.
+  let previousFetch: typeof globalThis.fetch;
+  beforeAll(() => {
+    previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ entries: [] }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof globalThis.fetch;
+  });
+  afterEach(() => cleanup());
+  afterAll(() => {
+    globalThis.fetch = previousFetch;
   });
 
-  test("the two directions do not answer for each other", () => {
-    // One `renderDirection` draws both blocks, so a mark passed for the input template would sit on
-    // the output one too if the field were wired to a single prop.
-    renderRefused({ ...NO_REFUSALS, inputTemplateMessage: "only the input" });
-    expect(screen.queryAllByText("only the input").length).toBe(1);
+  let saved: GuardrailsConfig | null = null;
+  function Stateful({ initial }: { initial: GuardrailsConfig }) {
+    const [g, setG] = useState(initial);
+    saved = g;
+    return (
+      <GuardrailsTab
+        agentId=""
+        guardrails={g}
+        setGuardrails={setG as never}
+        refusals={NO_REFUSALS}
+        dirty={false}
+        saving={false}
+        onSave={() => {}}
+        onDiscard={() => {}}
+      />
+    );
+  }
+  function mount(edit: (c: GuardrailsConfig) => void = () => {}) {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+      classifier: "decisions",
+    };
+    c.input = { ...c.input, enabled: true, action: "template" };
+    c.output = { ...c.output, enabled: true, action: "template" };
+    c.input.checks = { ...c.input.checks, toxicity: true, unsafeContent: true };
+    c.output.checks = {
+      toxicity: true,
+      unsafeContent: false,
+      competitorMentions: false,
+      promptAdherence: true,
+      answerRelevance: false,
+    };
+    edit(c);
+    render(<Stateful initial={c} />);
+  }
+  const fields = (key: string) =>
+    Array.from(
+      document.querySelectorAll<HTMLInputElement>(
+        `[data-testid="gr-threshold-${key}"]`,
+      ),
+    );
+  const inSection = (id: string, key: string) =>
+    document
+      .getElementById(id)
+      ?.querySelectorAll(`[data-testid="gr-threshold-${key}"]`).length ?? 0;
+
+  test("each enabled check has its threshold in its own direction, and the model card has none", () => {
+    mount();
+    expect([
+      inSection("gr-input", "toxicity"),
+      inSection("gr-output", "toxicity"),
+      inSection("gr-input", "unsafeContent"),
+      inSection("gr-output", "unsafeContent"),
+      inSection("gr-output", "promptAdherence"),
+      inSection("gr-input", "promptAdherence"),
+      fields("competitorMentions").length,
+      document
+        .getElementById("gr-model")
+        ?.querySelectorAll('[data-testid^="gr-threshold-"]').length ?? -1,
+    ]).toEqual([1, 1, 1, 0, 1, 0, 0, 0]);
+  });
+
+  // The bug it catches: the setting reachable by REST and MCP only, or a choice that never reaches state.
+  test("the failure choice starts on pass and stores hold", () => {
+    mount();
+    const select = document.querySelector<HTMLSelectElement>(
+      '[data-testid="gr-on-failure"]',
+    );
+    const before = select?.value ?? null;
+    fireEvent.change(select as HTMLSelectElement, {
+      target: { value: "hold" },
+    });
+    const after = document.querySelector<HTMLSelectElement>(
+      '[data-testid="gr-on-failure"]',
+    )?.value;
+    expect([before, after]).toEqual(["pass", "hold"]);
+  });
+
+  // The bug it catches: an external check configurable only through REST and MCP.
+  test("the external check section stores the URL and the tool-values switch", () => {
+    mount();
+    const url = document.querySelector<HTMLInputElement>(
+      '[data-testid="gr-external-url"]',
+    );
+    fireEvent.change(url as HTMLInputElement, {
+      target: { value: " https://check.example.com/hook " },
+    });
+    const toolValues = [
+      ...screen.queryAllByRole("switch", { name: /Send tool values/ }),
+      ...screen.queryAllByRole("switch", {
+        name: /Enviar valores das ferramentas/,
+      }),
+    ][0];
+    fireEvent.click(toolValues as HTMLElement);
+    expect(saved?.external).toEqual({
+      url: "https://check.example.com/hook",
+      credentialRef: null,
+      sendToolValues: false,
+    });
+  });
+
+  // The bug it catches: the action and template the external check's block uses, hidden while the
+  // built-in output screening is off and so impossible to set.
+  test("with only the external check on, the output action and its messages stay editable", () => {
+    mount((c) => {
+      c.input = { ...c.input, enabled: false };
+      c.output = { ...c.output, enabled: false };
+      c.external = {
+        url: "https://check.example.com/hook",
+        credentialRef: null,
+        sendToolValues: true,
+      };
+    });
+    expect(templateFields()).toBe(1);
+  });
+
+  test("editing one direction's field shows the same text in the other, and stores one value", () => {
+    mount();
+    const [a, b] = fields("toxicity");
+    fireEvent.change(a as HTMLInputElement, { target: { value: "0.65" } });
+    expect([a?.value, b?.value]).toEqual(["0.65", "0.65"]);
+    fireEvent.change(b as HTMLInputElement, { target: { value: "0.3" } });
+    expect([a?.value, b?.value]).toEqual(["0.3", "0.3"]);
+    expect(saved?.decisions.thresholds.toxicity).toBe(0.3);
+  });
+
+  test("an out-of-range value is shown clamped in both fields, as it is stored", () => {
+    mount();
+    const [a, b] = fields("toxicity");
+    fireEvent.change(a as HTMLInputElement, { target: { value: "1.5" } });
+    expect([a?.value, b?.value, saved?.decisions.thresholds.toxicity]).toEqual([
+      "1",
+      "1",
+      1,
+    ]);
+    fireEvent.change(a as HTMLInputElement, { target: { value: "-0.2" } });
+    expect([a?.value, b?.value, saved?.decisions.thresholds.toxicity]).toEqual([
+      "0",
+      "0",
+      0,
+    ]);
+  });
+
+  test("a value still being typed is kept as typed in both fields, and leaving draws the stored one", () => {
+    mount((c) => {
+      c.decisions.thresholds = { ...c.decisions.thresholds, toxicity: 0.8 };
+    });
+    const [a, b] = fields("toxicity");
+    fireEvent.change(a as HTMLInputElement, { target: { value: "" } });
+    const cleared = [a?.value, b?.value, saved?.decisions.thresholds.toxicity];
+    fireEvent.blur(a as HTMLInputElement);
+    expect([cleared, [a?.value, b?.value]]).toEqual([
+      ["", "", 0.8],
+      ["0.8", "0.8"],
+    ]);
+  });
+
+  test("a check switched off in one direction keeps its field, and its value, in the other", () => {
+    mount((c) => {
+      c.decisions.thresholds = { ...c.decisions.thresholds, toxicity: 0.65 };
+      c.input.checks = { ...c.input.checks, toxicity: false };
+    });
+    expect([
+      inSection("gr-input", "toxicity"),
+      inSection("gr-output", "toxicity"),
+      fields("toxicity")[0]?.value,
+    ]).toEqual([0, 1, "0.65"]);
+  });
+
+  test("with a language model judging there is no threshold anywhere", () => {
+    mount((c) => {
+      c.classifier = "chat";
+    });
+    expect(
+      document.querySelectorAll('[data-testid^="gr-threshold-"]').length,
+    ).toBe(0);
+  });
+});
+
+// The conversation-context field keeps what was typed out of range on screen, and the form keeps its
+// last valid number. A discard from the editor's own bar resets the form without passing through the
+// tab, and the field must show the form again, not the text typed before it.
+describe("GuardrailsTab conversation context", () => {
+  let previousFetch: typeof globalThis.fetch;
+  beforeAll(() => {
+    previousFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ entries: [] }), {
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof globalThis.fetch;
+  });
+  afterEach(() => cleanup());
+  afterAll(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  let saved: GuardrailsConfig | null = null;
+  function Stateful({ initial }: { initial: GuardrailsConfig }) {
+    const [g, setG] = useState(initial);
+    saved = g;
+    return (
+      <>
+        <button type="button" onClick={() => setG(structuredClone(initial))}>
+          reset-from-outside
+        </button>
+        <GuardrailsTab
+          agentId=""
+          guardrails={g}
+          setGuardrails={setG as never}
+          refusals={NO_REFUSALS}
+          dirty={false}
+          saving={false}
+          onSave={() => {}}
+          onDiscard={() => {}}
+        />
+      </>
+    );
+  }
+  function mount() {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.input = { ...c.input, enabled: true, contextMessages: 4 };
+    render(<Stateful initial={c} />);
+  }
+  const field = () =>
+    document.querySelector<HTMLInputElement>(
+      '[data-testid="gr-context-messages"]',
+    );
+
+  test("a number in range goes to the form; one out of range stays on screen only", () => {
+    mount();
+    fireEvent.change(field() as HTMLInputElement, { target: { value: "6" } });
+    const valid = [field()?.value, saved?.input.contextMessages];
+    fireEvent.change(field() as HTMLInputElement, { target: { value: "25" } });
+    expect([valid, [field()?.value, saved?.input.contextMessages]]).toEqual([
+      ["6", 6],
+      ["25", 6],
+    ]);
+  });
+
+  test("a reset that does not pass through the tab shows the form's value again", () => {
+    mount();
+    fireEvent.change(field() as HTMLInputElement, { target: { value: "25" } });
+    fireEvent.click(screen.getByText("reset-from-outside"));
+    expect([field()?.value, saved?.input.contextMessages]).toEqual(["4", 4]);
+  });
+});
+
+// The factual-grounding section: the agent's own tools are offered as sources, the four actions are
+// the ones offered, and what is picked is what the form will save.
+describe("GuardrailsTab factual grounding", () => {
+  let previousFetch: typeof globalThis.fetch;
+  beforeAll(() => {
+    previousFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL) =>
+      new Response(
+        JSON.stringify(
+          String(input).includes("/playground/tools")
+            ? {
+                tools: [
+                  {
+                    name: "set_labels",
+                    description: "",
+                    category: "native",
+                    simulated: true,
+                  },
+                  {
+                    name: "catalogo_ficticio",
+                    description: "",
+                    category: "code",
+                    simulated: false,
+                  },
+                ],
+              }
+            : { entries: [] },
+        ),
+        { headers: { "content-type": "application/json" } },
+      )) as unknown as typeof globalThis.fetch;
+  });
+  afterEach(() => cleanup());
+  afterAll(() => {
+    globalThis.fetch = previousFetch;
+  });
+
+  let saved: GuardrailsConfig | null = null;
+  function Stateful({
+    initial,
+    maxToolCalls,
+  }: {
+    initial: GuardrailsConfig;
+    maxToolCalls?: number;
+  }) {
+    const [g, setG] = useState(initial);
+    saved = g;
+    return (
+      <GuardrailsTab
+        agentId="7"
+        guardrails={g}
+        setGuardrails={setG as never}
+        refusals={NO_REFUSALS}
+        dirty={false}
+        saving={false}
+        onSave={() => {}}
+        onDiscard={() => {}}
+        maxToolCalls={maxToolCalls}
+      />
+    );
+  }
+
+  test("the agent's tools are offered as sources, and a pick reaches the form", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = { ...c.factualGrounding, enabled: true };
+    render(<Stateful initial={c} />);
+    const toolSwitch = await screen.findByRole("switch", {
+      name: "catalogo_ficticio",
+    });
+    fireEvent.click(toolSwitch);
+    const action = document.querySelector<HTMLSelectElement>(
+      '[data-testid="gr-grounding-action"]',
+    );
+    const offered = [...(action?.options ?? [])].map((o) => o.value);
+    fireEvent.change(action as HTMLSelectElement, {
+      target: { value: "revise" },
+    });
+    expect([
+      offered,
+      saved?.factualGrounding.sourceTools,
+      saved?.factualGrounding.action,
+    ]).toEqual([
+      ["observe", "revise", "template", "handoff"],
+      ["catalogo_ficticio"],
+      "revise",
+    ]);
+    expect(screen.queryByRole("switch", { name: "set_labels" }) === null).toBe(
+      true,
+    );
+  });
+
+  test("at the limit of source tools a new one cannot be switched on, and one can still be taken out", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    const full = Array.from({ length: MAX_SOURCE_TOOLS }, (_, i) => `t${i}`);
+    c.factualGrounding = {
+      ...c.factualGrounding,
+      enabled: true,
+      sourceTools: full,
+    };
+    render(<Stateful initial={c} />);
+    const extra = await screen.findByRole("switch", {
+      name: "catalogo_ficticio",
+    });
+    fireEvent.click(extra);
+    expect(saved?.factualGrounding.sourceTools).toEqual(full);
+    fireEvent.click(screen.getByRole("switch", { name: "t0" }));
+    expect(saved?.factualGrounding.sourceTools).toEqual(full.slice(1));
+  });
+
+  // The bug it catches: an endpoint set over REST for one provider kept after a switch, so the new
+  // vendor's key and the review's contents go to the old server.
+  test("switching the reviewer's provider drops the endpoint and the key of the old one", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = {
+      ...c.factualGrounding,
+      enabled: true,
+      provider: "openai-compatible",
+      model: "revisor",
+      credentialRef: "vault:3",
+      baseURL: "http://antigo.local/v1",
+    };
+    render(<Stateful initial={c} />);
+    fireEvent.change(groundingField("Provider"), {
+      target: { value: "openrouter" },
+    });
+    expect([
+      saved?.factualGrounding.provider,
+      saved?.factualGrounding.baseURL,
+      saved?.factualGrounding.credentialRef,
+    ]).toEqual(["openrouter", null, null]);
+  });
+
+  // The bug it catches: a keyless compatible reviewer the console cannot finish configuring, since
+  // nothing there sets its endpoint.
+  test("a compatible reviewer takes its endpoint in the section", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = { ...c.factualGrounding, enabled: true };
+    render(<Stateful initial={c} />);
+    fireEvent.change(groundingField("Provider"), {
+      target: { value: "openai-compatible" },
+    });
+    fireEvent.change(groundingField("Base URL"), {
+      target: { value: "http://revisor.local/v1" },
+    });
+    expect([
+      saved?.factualGrounding.provider,
+      saved?.factualGrounding.baseURL,
+    ]).toEqual(["openai-compatible", "http://revisor.local/v1"]);
+  });
+
+  // The bug it catches: the reviewer's key and model hidden until a provider is picked, unlike every
+  // other own-model section, which draws them inheriting from the model above.
+  test("with nothing set the reviewer's fields are all drawn, inheriting the guardrails model", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = { ...c.factualGrounding, enabled: true };
+    render(<Stateful initial={c} />);
+    const provider = groundingField("Provider") as HTMLSelectElement;
+    expect([
+      provider.value,
+      provider.options[0]?.textContent,
+      !!groundingField("API key"),
+      !!groundingField("Model"),
+    ]).toEqual(["", "Same as the guardrails", true, true]);
+  });
+
+  // The bug it catches: a reviewer endpoint that is not a URL saved as typed, where every other
+  // own-model section holds Save until it is fixed.
+  test("a reviewer endpoint that is not a URL holds Save", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = {
+      ...c.factualGrounding,
+      enabled: true,
+      provider: "openai-compatible",
+    };
+    function Dirty() {
+      const [g, setG] = useState(c);
+      return (
+        <GuardrailsTab
+          agentId="7"
+          guardrails={g}
+          setGuardrails={setG as never}
+          refusals={NO_REFUSALS}
+          dirty
+          saving={false}
+          onSave={() => {}}
+          onDiscard={() => {}}
+        />
+      );
+    }
+    render(<Dirty />);
+    const save = screen.getByRole("button", { name: "Save" });
+    fireEvent.change(groundingField("Base URL"), {
+      target: { value: "http://revisor.local/v1" },
+    });
+    const okHeld = (save as HTMLButtonElement).disabled;
+    fireEvent.change(groundingField("Base URL"), {
+      target: { value: "not a url" },
+    });
+    expect([okHeld, (save as HTMLButtonElement).disabled]).toEqual([
+      false,
+      true,
+    ]);
+  });
+
+  // The bug it catches: a model picked while the provider still inherits is saved without one, and
+  // then follows whatever provider the guardrails switch to later.
+  test("picking the reviewer's model while it inherits pins the guardrails provider", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+      provider: "anthropic",
+    };
+    c.factualGrounding = { ...c.factualGrounding, enabled: true };
+    render(<Stateful initial={c} />);
+    // The model field is a menu: open it, type a name, take the "Use" row.
+    const trigger = within(
+      document.getElementById("gr-grounding") as HTMLElement,
+    ).getByRole("button", { name: /Model/ });
+    fireEvent.keyDown(trigger, { key: "Enter" });
+    fireEvent.change(await screen.findByLabelText("Search models…"), {
+      target: { value: "claude-modelo-x" },
+    });
+    fireEvent.click(await screen.findByText('Use "claude-modelo-x"'));
+    expect([
+      saved?.factualGrounding.provider,
+      saved?.factualGrounding.model,
+    ]).toEqual(["anthropic", "claude-modelo-x"]);
+  });
+
+  test("template shows the Output template beside the action, and editing it edits that one", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.output = { ...c.output, enabled: false };
+    c.factualGrounding = {
+      ...c.factualGrounding,
+      enabled: true,
+      action: "template",
+    };
+    render(<Stateful initial={c} />);
+    const box = document.querySelector<HTMLTextAreaElement>(
+      '[data-testid="gr-grounding-message"]',
+    );
+    fireEvent.change(box as HTMLTextAreaElement, {
+      target: { value: "Não tenho essa informação." },
+    });
+    expect(saved?.output.templateMessage).toBe("Não tenho essa informação.");
+  });
+
+  // The bug it catches: the rewrite's switch and cap drawn for an action that never rewrites, or a
+  // cap above the agent's turn limit reaching the form and the save (the limit, not a fixed 5, is the
+  // ceiling: 8 is accepted under a limit of 8).
+  test("revise shows the rewrite's switch and cap; the cap stops at the agent's turn limit", async () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = {
+      ...c.factualGrounding,
+      enabled: true,
+      action: "template",
+    };
+    render(<Stateful initial={c} maxToolCalls={8} />);
+    const toolsSwitch = () =>
+      screen.queryByRole("switch", {
+        name: /Deixar a reescrita consultar|Let the rewrite consult/,
+      });
+    const cap = () =>
+      document.querySelector<HTMLInputElement>(
+        '[data-testid="gr-grounding-revise-calls"]',
+      );
+    expect([toolsSwitch() === null, cap() === null]).toEqual([true, true]);
+    fireEvent.change(
+      document.querySelector<HTMLSelectElement>(
+        '[data-testid="gr-grounding-action"]',
+      ) as HTMLSelectElement,
+      { target: { value: "revise" } },
+    );
+    expect(toolsSwitch()?.getAttribute("aria-checked")).toBe("true");
+    fireEvent.change(cap() as HTMLInputElement, { target: { value: "8" } });
+    fireEvent.change(cap() as HTMLInputElement, { target: { value: "9" } });
+    expect(saved?.factualGrounding.reviseMaxToolCalls).toBe(8);
+    expect(screen.getByText(/De 1 a 8,|From 1 to 8,/)).toBeTruthy();
+    fireEvent.click(toolsSwitch() as HTMLElement);
+    expect([saved?.factualGrounding.reviseWithTools, cap() === null]).toEqual([
+      false,
+      true,
+    ]);
+  });
+
+  test("the reviewer's window takes up to 40 messages, past the input check's 20", () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    c.factualGrounding = { ...c.factualGrounding, enabled: true };
+    render(<Stateful initial={c} />);
+    const field = document.querySelector<HTMLInputElement>(
+      '[data-testid="gr-grounding-context"]',
+    ) as HTMLInputElement;
+    expect([field.value, field.max]).toEqual(["24", "40"]);
+    fireEvent.change(field, { target: { value: "40" } });
+    fireEvent.change(field, { target: { value: "41" } });
+    expect(saved?.factualGrounding.contextMessages).toBe(40);
+  });
+
+  test("off, the section shows only its switch", () => {
+    const c: GuardrailsConfig = {
+      ...structuredClone(GUARDRAILS_DEFAULTS),
+      enabled: true,
+    };
+    render(<Stateful initial={c} />);
+    expect(
+      document.querySelector('[data-testid="gr-grounding-action"]') === null,
+    ).toBe(true);
   });
 });

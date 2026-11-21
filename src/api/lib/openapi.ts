@@ -1,14 +1,11 @@
 import { type DocumentDecoration, type TSchema, t } from "elysia";
 
-// Shared OpenAPI documentation helpers (DEV-only docs at /api/docs). They keep per-route annotations
-// DRY and consistent across controllers: a standard error-response schema, an `errors(...)` builder
-// for the `response` status map, and a `doc(...)` builder for `detail` (summary + description).
+// Shared OpenAPI documentation helpers (DEV-only docs at /api/docs): a standard error-response
+// schema, an `errors(...)` builder for the `response` status map, and a `doc(...)` builder for `detail`.
 //
-// SAFETY: declaring only ERROR statuses in `response` does NOT validate the 2xx success path (Elysia
-// validates per declared status; an undeclared 200 passes through and is inferred for the spec). The
-// app's error handler returns a raw `Response.json({ error })` (see src/app.ts onError), which Elysia
-// does not run through response validation either — so these annotations are documentation-only and
-// carry no runtime-validation risk.
+// SAFETY: declaring only ERROR statuses in `response` does NOT validate the 2xx path (Elysia validates
+// per declared status), and onError's raw `Response.json({ error })` (src/app.ts) skips response
+// validation too, so these annotations are documentation-only and carry no runtime-validation risk.
 
 // The canonical error body every endpoint returns on failure: `{ error: "<message>" }`, plus the
 // name of the value the refusal is about when it is about one (see src/api/lib/refusal.ts).
@@ -50,12 +47,12 @@ const STATUS_DESCRIPTION: Record<number, string> = {
   // only the limiter would be false about every route that lists this status.
   429: "Too many requests — rate limited, or a spend ceiling has been reached.",
   // Declared only where the body says more than the bare 500 every route can answer: the playground's
-  // turn entry points, whose failure names the turn it ended (issue #841).
+  // turn entry points, whose failure names the turn it ended.
   500: "Internal error — the request failed on the server.",
   502: "Bad gateway — an upstream dependency failed.",
 };
 
-// NOTE: The per-status error body shared by `errors(...)` and `errorResponse(...)`, so the two
+// The per-status error body shared by `errors(...)` and `errorResponse(...)`, so the two
 // builders can never drift apart in the published spec.
 function errorSchema(status: number): typeof ErrorResponse {
   return t.Object(
@@ -100,7 +97,7 @@ export function doc(
   return description ? { summary, description } : { summary };
 }
 
-// NOTE: Doc-only `detail.responses` entries for routes that declare no `response` schema
+// Doc-only `detail.responses` entries for routes that declare no `response` schema
 // (single-status routes: always-200 acks, the HTML OAuth popups, the /v1/mcp 405 stubs). OpenAPI
 // requires at least one response per operation, so without these the published spec fails
 // validation. Living under `detail` keeps them pure documentation — declaring a `response` schema
@@ -122,7 +119,7 @@ export function jsonResponse(
   };
 }
 
-// NOTE: The OAuth popup callbacks: every status carries HTML (the page postMessages the result to
+// The OAuth popup callbacks: every status carries HTML (the page postMessages the result to
 // its opener and self-closes), so the standard JSON error map does not apply.
 export function htmlResponse(description: string): ResponseDoc {
   return {
@@ -131,7 +128,7 @@ export function htmlResponse(description: string): ResponseDoc {
   };
 }
 
-// NOTE: Doc-only twin of one `errors(...)` entry, for routes that must document BOTH a success and
+// Doc-only twin of one `errors(...)` entry, for routes that must document BOTH a success and
 // error statuses inside `detail.responses` (the openapi plugin replaces `responses` wholesale when
 // a `response` schema is present, so mixing `response: errors(...)` with a `detail` 200 drops the
 // 200). Reuses `errorSchema` so the published spec stays byte-uniform with `errors(...)`.

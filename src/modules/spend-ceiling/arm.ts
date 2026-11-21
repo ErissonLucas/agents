@@ -5,18 +5,11 @@ import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { cancelPendingJob, enqueueJob } from "@/modules/scheduler/service";
 import { readSpendCeilingConfig } from "./settings";
 
-// WHO KEEPS THE POLL ALIVE (issue #426). The month's cost is read from Langfuse by one
-// `SPEND_CEILING_POLL` scheduler job per tenant, self-re-arming like the heartbeat, and this is the
-// side that arms it: on every save of the ceiling block, and once at boot for every tenant whose
-// ceiling is on, so a row lost to a reset is not a ceiling that quietly stops refreshing.
-//
-// Armed only while the ceiling is ON, because a poll is one Langfuse query per tenant per period
-// preceded by a vault decryption, and a tenant that bounds nothing has no figure to keep fresh.
-// A tenant with the ceiling on and no Langfuse IS armed: its poll writes the reason on the row,
-// which is what the console shows, and the day Langfuse is configured the loop is already there.
-//
-// Kept apart from ./poll.ts so the settings service can import it without pulling the Langfuse
-// side (and its own settings reader) into a cycle.
+// Arms the per-tenant `SPEND_CEILING_POLL` job while the ceiling is ON, or one of the tenant's
+// embedding apps has a ceiling of its own: on every save of the
+// ceiling, and at boot, so a lost row does not leave a figure that stops refreshing. With the ceiling
+// off nothing is enforced and the console sums the ledger itself, so there is nothing to poll. Kept
+// apart from ./poll.ts so the settings service does not pull the poll in.
 
 export const SPEND_POLL_DEDUPE_KEY = "spend-ceiling";
 
@@ -24,7 +17,21 @@ function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-async function ceilingEnabled(
+// Whether one of the tenant's embedding apps has a ceiling of its own, which the poll feeds too.
+export async function hasAppCeiling(
+  tenantId: bigint,
+  base: PrismaClient,
+): Promise<boolean> {
+  const app = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.clientApp.findFirst({
+      where: { monthlyCeilingCents: { not: null } },
+      select: { id: true },
+    }),
+  );
+  return app !== null;
+}
+
+export async function wantsSpendPoll(
   tenantId: bigint,
   base: PrismaClient,
 ): Promise<boolean> {
@@ -34,7 +41,10 @@ async function ceilingEnabled(
       select: { settings: true },
     }),
   );
-  return readSpendCeilingConfig(row?.settings ?? {}).enabled;
+  return (
+    readSpendCeilingConfig(row?.settings ?? {}).enabled ||
+    (await hasAppCeiling(tenantId, base))
+  );
 }
 
 // Idempotent: `enqueueJob` upserts on (tenant, kind, dedupeKey), so the second save keeps exactly
@@ -64,7 +74,7 @@ export async function syncTenantSpendPoll(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   try {
-    if (await ceilingEnabled(tenantId, base)) {
+    if (await wantsSpendPoll(tenantId, base)) {
       await armSpendPoll(tenantId, base);
     } else {
       await cancelPendingJob(
@@ -82,17 +92,17 @@ export async function syncTenantSpendPoll(
   }
 }
 
-// Boot: every tenant whose ceiling is on. Per-tenant failures are logged and skipped, so one bad
-// row cannot leave the rest of the fleet unarmed.
+// Boot: every tenant that wants the poll. Per-tenant failures are logged and skipped, so one bad row
+// cannot leave the rest of the fleet unarmed.
 export async function ensureAllSpendPolls(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   const tenants = await asSuperAdminOn(base, (db) =>
-    db.tenant.findMany({ select: { id: true, settings: true } }),
+    db.tenant.findMany({ select: { id: true } }),
   );
   for (const t of tenants) {
-    if (!readSpendCeilingConfig(t.settings).enabled) continue;
     try {
+      if (!(await wantsSpendPoll(t.id, base))) continue;
       await armSpendPoll(t.id, base);
     } catch (err) {
       logger.warn(

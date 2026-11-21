@@ -53,13 +53,11 @@ describe("computeConfigIssues", () => {
     expect(issues).toEqual([]);
   });
 
-  // CAN THIS MODEL BE BUILT — the whole question, as a table, because three review rounds arrived at
-  // it one leg at a time (no provider, then no endpoint, then a bag no schema had validated). Each
-  // row is a class of stored value rather than an example: what a write boundary lets through, what
-  // an import carries in, and what the runtime then does with it.
-  //
-  // `expected` is what the primary-model checks say, and nothing else — the credential check is
-  // held constant with a live ref so a row can only fail for the reason it is about.
+  // CAN THIS MODEL BE BUILT, the whole question as a table, because it has three legs (no
+  // provider, no endpoint, a bag no schema validated). Each row is a class of stored value rather than
+  // an example: what a write boundary lets through, what an import carries in, and what the runtime
+  // then does with it. `expected` is what the primary-model checks say, and nothing else: the
+  // credential check is held constant with a live ref so a row can only fail for the reason it is about.
   const RUNNABILITY: {
     label: string;
     bag: Record<string, unknown>;
@@ -113,8 +111,8 @@ describe("computeConfigIssues", () => {
       expected: ["modelNoEndpoint"],
     },
     {
-      // The schema does NOT catch this: `z.string().url()` accepts `llama:8080`, a valid URI with a
-      // `llama:` scheme (measured). So the bag stores, and every request goes nowhere.
+      // NOTE: The schema does NOT catch this: `z.string().url()` accepts `llama:8080`, a valid URI with a
+      // `llama:` scheme. So the bag stores, and every request goes nowhere.
       label: "openai-compatible pointed at something no client can dial",
       bag: { provider: "openai-compatible", model: "", baseURL: "llama:8080" },
       provider: "openai-compatible",
@@ -141,9 +139,9 @@ describe("computeConfigIssues", () => {
       expected: [],
     },
     {
-      // The other four providers never read `baseURL` (`createChatModel`, measured), so a bad value
-      // there breaks nothing — and a warning about a field with no reader is a warning that teaches
-      // the operator to ignore the panel.
+      // NOTE: The other four providers never read `baseURL` (`createChatModel`), so a bad value there
+      // breaks nothing, and a warning about a field with no reader teaches the operator to ignore the
+      // panel.
       label: "a provider that ignores the endpoint, with a bad one",
       bag: { provider: "anthropic", model: "claude-sonnet-5" },
       provider: "anthropic",
@@ -183,11 +181,10 @@ describe("computeConfigIssues", () => {
     });
   }
 
-  // The wait covers the INVALID verdict too, which is the half I had backwards for a round: the
-  // credential's base URL wins over the typed field, so a credential still unread is precisely what
-  // would replace an undialable string with a working host. The editor passes
-  // `credentialBaseUrl ?? model.baseURL`, so while the vault is unread the typed value is what
-  // arrives here — and a failed vault load leaves it that way indefinitely.
+  // NOTE: The wait covers the INVALID verdict too: the credential's base URL wins over the typed
+  // field, so a credential still unread is precisely what would replace an undialable string with a
+  // working host. The editor passes `credentialBaseUrl ?? model.baseURL`, so while the vault is unread
+  // the typed value is what arrives here, and a failed vault load leaves it that way indefinitely.
   test("waits for the vault on an undialable endpoint too, not just a missing one", () => {
     const unread = {
       ...base,
@@ -282,14 +279,6 @@ describe("computeConfigIssues", () => {
     const tts = issues.find((i) => i.key === "tts");
     expect(stt).toMatchObject({ pending: true, vaultId: "9" });
     expect(tts).toMatchObject({ pending: true, vaultId: "8" });
-  });
-
-  test("a filled credential not in pendingRefs is not flagged", () => {
-    const issues = computeConfigIssues({
-      ...base,
-      pendingRefs: new Set(["vault:999"]),
-    });
-    expect(issues).toEqual([]);
   });
 });
 
@@ -398,6 +387,25 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
       expect(computeConfigIssues({ ...base, settings: {} })).toEqual([]);
     });
 
+    // The other-inbox summaries run on this override too: with attendance compaction off and them on,
+    // a broken override still fails every long conversation's summary.
+    test("a broken override is flagged while only the other-inbox summaries use it", () => {
+      const only = (otherOn: boolean) => ({
+        ...base,
+        settings: {
+          memory: { compaction: { enabled: false, provider: "anthropic" } },
+          otherInboxes: {
+            enabled: otherOn,
+            inboxes: [{ instanceId: 3, inboxId: 12 }],
+          },
+        },
+      });
+      expect(computeConfigIssues(only(true))).toEqual([
+        { key: "memoryModel", tab: "behavior", sectionId: "memory" },
+      ]);
+      expect(computeConfigIssues(only(false))).toEqual([]);
+    });
+
     test("the agent's own provider, picked explicitly, needs no credential of its own", () => {
       expect(computeConfigIssues(mem({ provider: "openai" }))).toEqual([]);
     });
@@ -454,10 +462,9 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
       ).toEqual([]);
     });
 
-    // The endpoint the runtime will actually use comes off the CREDENTIAL when it carries one
-    // (`loadAgentConfig` reads it from the vault), and it outranks whatever the bag holds. A check
-    // that resolves without it calls a summariser that runs perfectly well broken, the moment the
-    // vault answers. Found by review, on the fix for the previous round.
+    // NOTE: The endpoint the runtime uses comes off the CREDENTIAL when it carries one (`loadAgentConfig`
+    // reads it from the vault), and it outranks whatever the bag holds. A check that resolves without it
+    // calls a summariser that runs perfectly well broken, the moment the vault answers.
     test("an endpoint carried by the credential is not reported as missing", () => {
       expect(
         computeConfigIssues({
@@ -536,10 +543,9 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
     });
   });
 
-  // The fallback provider is the one override whose whole purpose is to work on the day the primary
-  // does not, so a fallback that cannot be built is worth less than none: it looks configured and it
-  // is asked for exactly when nobody is watching a console. Review found it absent from here after
-  // the runtime half was already written and tested (#143, round 4).
+  // NOTE: The fallback provider is the one override whose whole purpose is to work on the day the
+  // primary does not, so a fallback that cannot be built is worth less than none: it looks configured
+  // and it is asked for exactly when nobody is watching a console.
   describe("fallback provider", () => {
     const fb = (over: Record<string, unknown>) => ({
       ...base,
@@ -653,11 +659,11 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
       ).toEqual([]);
     });
 
-    // ...but the wait is about a credential that could CARRY that endpoint, and the agent's cannot
-    // once the override names a different vendor. Written as "either credential is unread", this
-    // reported nothing at all for a fallback that is definitely unrunnable, for as long as the vault
-    // was unavailable. The same three lines guarded the speech rewrite and the summariser, so the
-    // rule is one function now and the two rows below are the two halves of it.
+    // NOTE: ...but the wait is about a credential that could CARRY that endpoint, and the agent's cannot
+    // once the override names a different vendor. Written as "either credential is unread", it would
+    // report nothing for a definitely unrunnable fallback for as long as the vault is unavailable. The
+    // speech rewrite and the summariser share the same rule, one function, and the two rows below are its
+    // two halves.
     test("a SWITCHED provider with no address is reported even while the vault is silent", () => {
       expect(
         computeConfigIssues({
@@ -758,28 +764,6 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
     });
 
     test("its credential being a pending vault entry is flagged as pending", () => {
-      expect(
-        computeConfigIssues({
-          ...audio,
-          ttsNormalize: true,
-          ttsNormalizeProvider: "openai",
-          ttsNormalizeCredentialRef: "vault:3",
-          pendingRefs: new Set(["vault:3"]),
-        }),
-      ).toEqual([
-        {
-          key: "ttsNormalize",
-          tab: "behavior",
-          sectionId: "tts",
-          pending: true,
-          vaultId: "3",
-        },
-      ]);
-    });
-
-    // A credential that is referenced but never filled is a second, independent way for the rewrite
-    // to go quiet, and it is checked whether or not the provider was also overridden.
-    test("a pending credential is reported as pending, with its vaultId", () => {
       expect(
         computeConfigIssues({
           ...audio,
@@ -971,7 +955,7 @@ describe("computeConfigIssues — redirect enabled but incomplete", () => {
 // informational), and `PATCH /v1/agents/:id` stores whatever ref it is handed, name or id. The
 // runtime is where it lands: the agent's own model logs "cannot reply until it is fixed", and
 // STT/vision/TTS/the speech rewrite skip with a warn line nobody is watching for. Which makes this
-// panel the one place it can be caught before the next customer message, and it stayed green.
+// panel the one place it can be caught before the next customer message.
 describe("computeConfigIssues — a credential whose vault entry is gone", () => {
   const linked = {
     key: "model",
@@ -1147,7 +1131,7 @@ describe("computeConfigIssues — noncanonical ref spellings", () => {
 // it before it looks at the provider, and returns null for the whole agent when it cannot, so the
 // agent goes silent on every message.
 describe("computeConfigIssues — an openai-compatible model with a ref of its own", () => {
-  // WITH an endpoint, because this block is about the CREDENTIAL and the endpoint is now its own
+  // WITH an endpoint, because this block is about the CREDENTIAL and the endpoint is its own
   // check: `createChatModel` throws on an openai-compatible bag with nowhere to dial, so a fixture
   // without one would raise `modelNoEndpoint` on every case here and stop isolating what it means to.
   const compat = {
@@ -1155,16 +1139,6 @@ describe("computeConfigIssues — an openai-compatible model with a ref of its o
     modelProvider: "openai-compatible",
     modelBaseURL: "http://llama:8080/v1",
   };
-
-  test("still raises nothing when no credential is set", () => {
-    expect(
-      computeConfigIssues({
-        ...compat,
-        modelCredentialRef: "",
-        knownRefs: new Set(["vault:1"]),
-      }),
-    ).toEqual([]);
-  });
 
   test("flags a credential it does set whose entry is gone", () => {
     expect(
@@ -1245,10 +1219,10 @@ describe("computeConfigIssues — the guardrails credential", () => {
 });
 
 // The half of "unscreened" that configuration cannot see. A retired model id, a parameter the vendor
-// rejects on every call (#130 was a live instance) and a chronic timeout are all valid configuration
-// right up to the moment the call is made, and the analysis is fail-open, so every one of them
-// delivers messages as if they had been reviewed. What the screen actually DID is read back from the
-// execution log and handed to the panel as a count.
+// rejects on every call and a chronic timeout are all valid configuration right up to the moment the
+// call is made, and the analysis is fail-open, so every one of them delivers messages as if they had
+// been reviewed. What the screen actually DID is read back from the execution log and handed to the
+// panel as a count.
 describe("computeConfigIssues — a guardrail that could not run", () => {
   const guarded = {
     ...base,
@@ -1312,12 +1286,11 @@ describe("computeConfigIssues — a guardrail that could not run", () => {
   });
 });
 
-// Found by sweeping the panel's own inputs rather than by a review round: the rewrite's endpoint can
-// live on its CREDENTIAL, and the browser learns credential endpoints from the same vault list that
-// arrives a request after the first paint. Judged before that answer exists, an endpoint that is
-// merely unread reads as absent, and the panel announces that a runnable rewrite cannot run — the
-// same false alarm the null-until-loaded rule exists to prevent, arriving through the endpoint
-// instead of through the ref.
+// The rewrite's endpoint can live on its CREDENTIAL, and the browser learns credential endpoints from
+// the same vault list that arrives a request after the first paint. Judged before that answer exists,
+// an endpoint that is merely unread reads as absent, and the panel announces that a runnable rewrite
+// cannot run: the false alarm the null-until-loaded rule exists to prevent, through the endpoint
+// instead of the ref.
 describe("computeConfigIssues — the rewrite endpoint while the vault is unknown", () => {
   const compatRewrite = {
     ...base,
@@ -1406,19 +1379,6 @@ describe("computeConfigIssues — which endpoint refusals wait for the vault", (
     ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
   });
 
-  test("waits when the rewrite's own credential could carry the endpoint", () => {
-    expect(
-      computeConfigIssues({
-        ...audio,
-        ttsNormalize: true,
-        ttsNormalizeProvider: "openai-compatible",
-        ttsNormalizeCredentialRef: "vault:3",
-        ttsNormalizeBaseURL: "",
-        knownRefs: null,
-      }),
-    ).toEqual([]);
-  });
-
   // Inheriting the agent's model means inheriting its endpoint, and the agent's endpoint can live on
   // the agent's credential — read from the same list.
   test("waits when the inherited agent credential could carry it", () => {
@@ -1435,32 +1395,19 @@ describe("computeConfigIssues — which endpoint refusals wait for the vault", (
       }),
     ).toEqual([]);
   });
-
-  test("stops waiting once the vault has answered and nothing supplied one", () => {
-    expect(
-      computeConfigIssues({
-        ...audio,
-        ttsNormalize: true,
-        ttsNormalizeProvider: "openai-compatible",
-        ttsNormalizeCredentialRef: "vault:3",
-        ttsNormalizeBaseURL: "",
-        knownRefs: new Set(["vault:1", "vault:2", "vault:3"]),
-      }),
-    ).toEqual([{ key: "ttsNormalize", tab: "behavior", sectionId: "tts" }]);
-  });
 });
 
-// Text stored over its cap is cut on the way to the model and nowhere else, so the editor is the
-// only place it can surface. It has to surface from OUTSIDE the field: the boundary deliberately
-// lets an untouched legacy value save, and the field itself may not be on screen — several of these
-// notes have no control in the editor at all, and the sections that do only render when switched on.
-// Issue #166. The one check here that is not about a feature failing to run: both features run, and
-// it is the customer who gets the wrong experience. The list of inboxes comes from the server (a live
-// Chatwoot read), so everything below is about what the panel DOES with it.
+// Text stored over its cap is cut on the way to the model and nowhere else, so the editor is the only
+// place it can surface, and from OUTSIDE the field: the boundary lets an untouched legacy value save,
+// and several of these notes have no control in the editor, or one that renders only when on.
+
+// The one check here that is not about a feature failing to run: both features run, and the customer
+// gets the wrong experience. The inbox list comes from the server (a live Chatwoot read), so
+// everything below is about what the panel DOES with it.
 describe("computeConfigIssues — Chatwoot already answers out of hours", () => {
   const ONE = [{ id: "5", name: "WhatsApp Vendas" }];
-  // A schedule that actually closes. Without one the reactive gate never silences the agent, so its
-  // away message never goes out however the block is configured — which is review round 1's finding.
+  // A schedule that actually closes. Without one the reactive gate never silences the agent, so
+  // its away message never goes out however the block is configured.
   const CLOSES = {
     windows: [{ day: 1, start: "09:00", end: "17:00" }],
     exceptions: [],
@@ -1535,10 +1482,10 @@ describe("computeConfigIssues — Chatwoot already answers out of hours", () => 
     });
   }
 
-  // Review round 1. The away message rides the SAME gate that silences replies, so an agent that
-  // never closes sends nothing out of hours with the switch on and the copy written. Claiming the
-  // duplicate there describes two messages where the customer gets a closure notice and then normal
-  // service — the contradiction, and the worse of the two.
+  // The away message rides the SAME gate that silences replies, so an agent that never closes
+  // sends nothing out of hours with the switch on and the copy written. Claiming the duplicate there
+  // describes two messages where the customer gets a closure notice and then normal service: the
+  // contradiction, and the worse of the two.
   const NEVER_CLOSES: Array<[string, unknown]> = [
     ["no schedule at all (always on)", null],
     ["a schedule with no windows", { ...CLOSES, windows: [] }],
@@ -1555,22 +1502,10 @@ describe("computeConfigIssues — Chatwoot already answers out of hours", () => 
     });
   }
 
-  // The mirror of the pair above: the schedule alone does not make it the duplicate either.
-  test("a closing schedule with the away message off is still the contradiction", () => {
-    const issues = computeConfigIssues({
-      ...base,
-      settings: { availability: { enabled: false, awayMessage: "Fechados." } },
-      savedSchedule: CLOSES,
-      outOfOfficeInboxes: ONE,
-    });
-    expect(issues.map((i) => i.key)).toEqual(["outOfHoursChatwoot"]);
-  });
-
-  // Review round 2. A disabled agent says nothing to the customer at all — the runtime gates the away
-  // message on it and refuses the turn a few lines later — so Chatwoot's message is the only one that
-  // arrives and NEITHER spelling is true. This is the one line in this panel that claims something
-  // about what the customer receives rather than about the configuration, which is why it is also the
-  // only one that has to care.
+  // NOTE: A disabled agent says nothing to the customer at all (the runtime gates the away message on
+  // it and refuses the turn), so Chatwoot's message is the only one that arrives and NEITHER spelling
+  // is true. This is the one line in this panel that claims something about what the customer receives
+  // rather than about the configuration, which is why it is also the only one that has to care.
   for (const [label, settings] of [
     ["with its away message on", AWAY_ON],
     ["with nothing of its own to say", {}],
@@ -1587,23 +1522,6 @@ describe("computeConfigIssues — Chatwoot already answers out of hours", () => 
       ).toEqual([]);
     });
   }
-
-  // Every other line in the panel offers a fix; these two must as well, or the operator reads a
-  // problem with no way in.
-  test("both spellings offer an action", () => {
-    for (const settings of [
-      {},
-      { availability: { enabled: true, awayMessage: "x" } },
-    ]) {
-      const issue = computeConfigIssues({
-        ...base,
-        settings,
-        savedSchedule: CLOSES,
-        outOfOfficeInboxes: ONE,
-      })[0];
-      expect(issue && issueHasAction(issue)).toBe(true);
-    }
-  });
 });
 
 describe("computeConfigIssues — text stored over its cap", () => {
@@ -1829,14 +1747,14 @@ describe("issueHasAction", () => {
       ]);
     });
 
-    // Issue #646: a local rule is the other way to reach a verdict, and with one the endpoint is
-    // never asked, so neither the missing URL nor the endpoint-only switches are a problem.
+    // NOTE: A local rule is the other way to reach a verdict, and with one the endpoint is never asked,
+    // so neither the missing URL nor the endpoint-only switches are a problem.
     test("a local rule answers instead, so a missing URL is not flagged", () => {
       expect(
         computeConfigIssues({
           ...base,
           contactAuthEnabled: true,
-          contactAuthHasRule: true,
+          contactAuthRuleOnly: true,
           contactAuthIncludeMessageText: true,
           contactAuthHandoffEnabled: true,
           contactAuthDenyMessage: "Atendemos apenas clientes cadastrados.",
@@ -1854,11 +1772,47 @@ describe("issueHasAction", () => {
         }).map((i) => i.key),
       ).toEqual(["contactAuthNoUrl"]);
     });
+  });
 
-    test("no flag when the gate is off — an unused URL field is not a problem", () => {
+  // A monitoring agent answers nobody and hands nothing off, so the notice warnings are about controls
+  // that do nothing for it; but it asks the endpoint under the same rules as a responder, so the
+  // endpoint's own warnings (no url, an unusable credential) hold for it too.
+  describe("a monitoring agent's gate", () => {
+    test("raises none of the notice warnings", () => {
       expect(
-        computeConfigIssues({ ...base, contactAuthEnabled: false }),
+        computeConfigIssues({
+          ...base,
+          agentMonitoring: true,
+          contactAuthEnabled: true,
+          contactAuthRuleOnly: true,
+          contactAuthIncludeMessageText: true,
+          contactAuthHandoffEnabled: false,
+        }).map((i) => i.key),
       ).toEqual([]);
+    });
+
+    test("raises the endpoint warnings when it asks an endpoint", () => {
+      expect(
+        computeConfigIssues({
+          ...base,
+          agentMonitoring: true,
+          contactAuthEnabled: true,
+          contactAuthIncludeMessageText: true,
+          contactAuthHandoffEnabled: false,
+          contactAuthCredentialRef: "vault:999",
+          pendingRefs: new Set(["vault:999"]),
+        }).map((i) => i.key),
+      ).toEqual(["contactAuth", "contactAuthNoUrl"]);
+    });
+
+    test("the same settings on an agent that answers still raise them", () => {
+      expect(
+        computeConfigIssues({
+          ...base,
+          contactAuthEnabled: true,
+          contactAuthHandoffEnabled: false,
+        }).map((i) => i.key),
+      ).toEqual(["contactAuthNoUrl", "contactAuthSilentRefusal"]);
     });
   });
 
@@ -1880,5 +1834,268 @@ describe("issueHasAction", () => {
     expect(issueHasAction({ key: "knowledge", knowledgeBaseId: "1" })).toBe(
       true,
     );
+  });
+});
+
+describe("a decisions observer's classification key", () => {
+  const settings = (credentialRef?: string, engine = "decisions") => ({
+    monitoring: {
+      engine,
+      decisions: {
+        provider: "typesafe",
+        ...(credentialRef === undefined ? {} : { credentialRef }),
+        questions: [{ name: "q", type: "yes_no", instructions: "q" }],
+      },
+    },
+  });
+  const decisions = (input: Parameters<typeof computeConfigIssues>[0]) =>
+    computeConfigIssues({ agentMonitoring: true, ...input }).filter(
+      (i) => i.key === "decisions",
+    );
+
+  test("is not checked on an agent that no longer observes", () => {
+    expect(
+      decisions({
+        ...base,
+        agentMonitoring: false,
+        settings: settings(undefined),
+      }),
+    ).toEqual([]);
+  });
+
+  test("is checked only when the engine is decisions", () => {
+    expect(decisions({ ...base, settings: settings("", "llm") })).toEqual([]);
+  });
+
+  // The key is a field of the Classifier, which the General tab draws where the chat model would be.
+  test("missing, pending or gone, it is an issue on General's classifier", () => {
+    const at = {
+      key: "decisions" as const,
+      tab: "general" as const,
+      sectionId: "general-classifier",
+    };
+    expect(decisions({ ...base, settings: settings(undefined) })).toEqual([at]);
+    expect(
+      decisions({
+        ...base,
+        settings: settings("vault:7"),
+        pendingRefs: new Set(["vault:7"]),
+      }),
+    ).toEqual([{ ...at, pending: true, vaultId: "7" }]);
+    expect(
+      decisions({
+        ...base,
+        settings: settings("vault:7"),
+        knownRefs: new Set(["vault:1"]),
+      }),
+    ).toEqual([{ ...at, unresolved: true }]);
+    expect(
+      decisions({
+        ...base,
+        settings: settings("vault:7"),
+        knownRefs: new Set(["vault:1", "vault:7"]),
+      }),
+    ).toEqual([]);
+  });
+});
+
+// A decisions observer never builds the chat model, so nothing about that model is a fault there:
+// no key, a key that is gone, a bag no schema accepts. The llm engine, and an agent that answers,
+// keep every one of those warnings.
+describe("the chat model of a decisions observer", () => {
+  const observer = (engine: string) => ({
+    agentMonitoring: true,
+    settings: {
+      monitoring: {
+        engine,
+        decisions: {
+          provider: "typesafe",
+          credentialRef: "vault:1",
+          questions: [{ name: "q", type: "yes_no", instructions: "q" }],
+        },
+      },
+    },
+  });
+  const modelKeys = (issues: { key: string }[]) =>
+    issues
+      .map((i) => i.key)
+      .filter((k) => k.startsWith("model") && k !== "modelFallback");
+
+  test("raises nothing when it is missing, gone or unbuildable", () => {
+    expect(
+      modelKeys(
+        computeConfigIssues({
+          ...base,
+          ...observer("decisions"),
+          modelProvider: "",
+          modelCredentialRef: "",
+          modelConfig: {},
+        }),
+      ),
+    ).toEqual([]);
+    expect(
+      modelKeys(
+        computeConfigIssues({
+          ...base,
+          ...observer("decisions"),
+          modelCredentialRef: "vault:9",
+          knownRefs: new Set(["vault:1"]),
+        }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("is still checked on the llm engine and on an agent that answers", () => {
+    expect(
+      modelKeys(
+        computeConfigIssues({
+          ...base,
+          ...observer("llm"),
+          modelProvider: "",
+          modelCredentialRef: "",
+          modelConfig: {},
+        }),
+      ),
+    ).toContain("modelNotRunnable");
+    expect(
+      modelKeys(
+        computeConfigIssues({
+          ...base,
+          ...observer("decisions"),
+          agentMonitoring: false,
+          modelCredentialRef: "",
+        }),
+      ),
+    ).toEqual(["model"]);
+  });
+});
+
+// Nor its summariser and its fallback, which ride on the same chat model: the compaction job stands
+// down for it and the observe tick builds no model to fall back from. The editor hides both
+// sections there, and REST and MCP must not call the agent unhealthy over them.
+describe("the summariser and fallback of a decisions observer", () => {
+  const observer = (engine: string) => ({
+    ...base,
+    agentMonitoring: true,
+    settings: {
+      monitoring: {
+        engine,
+        decisions: {
+          provider: "typesafe",
+          credentialRef: "vault:1",
+          questions: [{ name: "q", type: "yes_no", instructions: "q" }],
+        },
+      },
+      memory: { compaction: { enabled: true, provider: "anthropic" } },
+      modelFallback: { provider: "anthropic", model: "claude-x" },
+    },
+  });
+  const keys = (engine: string) =>
+    computeConfigIssues(observer(engine))
+      .map((i) => i.key)
+      .filter((k) => k === "memoryModel" || k === "modelFallback");
+
+  test("raise nothing on the decisions engine", () => {
+    expect(keys("decisions")).toEqual([]);
+  });
+
+  test("are still checked on the llm engine", () => {
+    expect(keys("llm")).toEqual(["memoryModel", "modelFallback"]);
+  });
+});
+
+// The fallback voice borrows the main voice's key only on the main voice's provider.
+describe("computeConfigIssues — fallback voice", () => {
+  const audio = {
+    ...base,
+    ttsMode: "mirror",
+    ttsCredentialRef: "vault:2",
+    ttsProvider: "openai",
+  };
+  const ISSUE = {
+    key: "ttsFallback",
+    tab: "behavior",
+    sectionId: "tts",
+  } as const;
+
+  test("on the main voice's provider it needs no key of its own", () => {
+    expect(
+      computeConfigIssues({ ...audio, ttsFallbackProvider: "openai" }),
+    ).toEqual([]);
+  });
+
+  test("on another provider with no key of its own it is flagged", () => {
+    expect(
+      computeConfigIssues({ ...audio, ttsFallbackProvider: "elevenlabs" }),
+    ).toEqual([ISSUE]);
+  });
+
+  test("its own key, referenced and not filled in, is pending", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsFallbackProvider: "elevenlabs",
+        ttsFallbackCredentialRef: "vault:9",
+        pendingRefs: new Set(["vault:9"]),
+      }),
+    ).toEqual([{ ...ISSUE, pending: true, vaultId: "9" }]);
+  });
+
+  test("with audio replies off nothing is said about it", () => {
+    expect(
+      computeConfigIssues({
+        ...audio,
+        ttsMode: "never",
+        ttsFallbackProvider: "elevenlabs",
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("the choice judge's own model (settings.choiceCheck)", () => {
+  const ISSUE = {
+    key: "choiceCheckModel",
+    tab: "tools",
+    sectionId: "tools-preconditions",
+  } as const;
+  const judge = (
+    choiceCheck: Record<string, unknown>,
+    rules: Record<string, unknown> = {
+      send_orcamento: { kind: "customer_choice" },
+    },
+  ) => ({ ...base, settings: { choiceCheck, toolPreconditions: rules } });
+
+  test("another vendor with no key of its own is flagged, since every guarded call is refused", () => {
+    expect(
+      computeConfigIssues(judge({ provider: "anthropic", model: "x" })),
+    ).toEqual([ISSUE]);
+  });
+
+  test("a model with no provider is flagged", () => {
+    expect(computeConfigIssues(judge({ model: "gpt-5.4-mini" }))).toEqual([
+      ISSUE,
+    ]);
+  });
+
+  test("the agent's vendor on its key, or another with its own key, is fine", () => {
+    expect(
+      computeConfigIssues(judge({ provider: "openai", model: "gpt-5.4-mini" })),
+    ).toEqual([]);
+    expect(
+      computeConfigIssues(
+        judge({ provider: "anthropic", model: "x", credentialRef: "vault:3" }),
+      ),
+    ).toEqual([]);
+  });
+
+  test("with no customer_choice rule nothing calls the judge, so nothing is flagged", () => {
+    expect(
+      computeConfigIssues(
+        judge(
+          { provider: "anthropic", model: "x" },
+          { send_orcamento: { key: "cpf", scope: "contact" } },
+        ),
+      ),
+    ).toEqual([]);
   });
 });

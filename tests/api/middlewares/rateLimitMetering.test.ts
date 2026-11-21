@@ -4,15 +4,10 @@ import { clientKeyFor, rateLimitMiddleware } from "@/api/middlewares/rateLimit";
 import { buildApp } from "@/app";
 import { AppError, ForbiddenError, NotFoundError } from "@/lib/errors";
 
-// What a REJECTED request costs. Separate from rateLimit.test.ts, which is about who a bucket
-// belongs to: this file is about whether the bucket is charged at all.
-//
-// It goes through the REAL app rather than a rebuilt one, because the thing under test is the
-// REGISTRATION ORDER in src/app.ts. `elysia-rate-limit` counts in `onBeforeHandle`, which a request
-// rejected before the handler never reaches, so the plugin charges those from its own `onError`.
-// Elysia stops at the first error handler that RETURNS a value, so an app-level `onError` registered
-// before the limiters silences that branch. A test that built its own app would pin its own ordering
-// and pass either way.
+// What a REJECTED request costs (rateLimit.test.ts covers who a bucket belongs to). It runs the
+// real app because the subject is the hook REGISTRATION ORDER in src/app.ts: the plugin charges
+// pre-handler rejections from its own `onError`, and Elysia stops at the first error handler that
+// returns a value. A hand-built app would pin its own ordering and pass either way.
 const nativeGlobals = globalThis as unknown as { BunResponse: typeof Response };
 const BunResponse = nativeGlobals.BunResponse;
 const happyResponse = globalThis.Response;
@@ -26,20 +21,20 @@ let server: ListeningApp["server"] | undefined;
 
 beforeAll(async () => {
   (globalThis as { Response: typeof Response }).Response = BunResponse;
-  // NOTE: `buildApp()` is what src/app.ts builds its own default export from, so the hooks this
-  // exercises are the ones that file installs, in the order it installs them — which is the whole
-  // point, since there is no unauthenticated route in the app that throws a 404 to borrow, and a
-  // hand-rolled equivalent would pin this test's ordering instead of the app's. It used to mutate
-  // the exported singleton, and both halves of that (a route AND a `listen`) reached every file
-  // that ran afterwards: a stopped-but-compiled app answered their `handle()` calls with 500s.
+  // `buildApp()` installs the same hooks in the same order as src/app.ts's default export.
+  // A fresh instance, not the singleton: a route plus a `listen` on the shared export leaks into
+  // every later file, whose `handle()` calls then answer 500.
   const app = await buildApp();
   app.get("/__metering/thrown-404", () => {
     throw new NotFoundError("gone");
   });
-  const listening = app.listen(0) as unknown as ListeningApp;
+  const listening = app.listen({
+    port: 0,
+    hostname: "127.0.0.1",
+  }) as unknown as ListeningApp;
   if (!listening.server?.port) throw new Error("Failed to start the app");
   server = listening.server;
-  base = `http://localhost:${listening.server.port}`;
+  base = `http://127.0.0.1:${listening.server.port}`;
 });
 
 afterAll(() => {
@@ -75,25 +70,20 @@ const json = (body: string): RequestInit => ({
 });
 
 describe("rate-limit metering (what a rejected request costs)", () => {
-  // The regression this pins. Before the reorder these came back 404 with no `RateLimit-*` header
-  // and no budget spent, so anyone could hold a connection open against missing paths for free.
+  // An unmetered 404 would let anyone hold a connection open against missing paths for free.
   test("a route that does not exist is charged", async () => {
     expect(await costOf(() => send("POST", "/api/nope"))).toBe(1);
     expect(await costOf(() => send("POST", "/nope/at/all"))).toBe(1);
   });
 
-  // This one was already metered before the change, and only by accident: the `.get("/api/*")` guard
-  // in src/app.ts turns an unknown GET into a MATCHED route, which the normal counting hook sees.
-  // Asserted so the gap cannot silently come back if that guard is ever removed.
+  // The `.get("/api/*")` guard in src/app.ts turns an unknown GET into a MATCHED route, so the
+  // normal counting hook sees it. Asserted so metering survives that guard's removal.
   test("an unknown GET under /api is charged too", async () => {
     expect(await costOf(() => send("GET", "/api/nope"))).toBe(1);
   });
 
-  // A body that is not JSON (PARSE) and a body that fails the route schema (VALIDATION) are both
-  // rejected before the handler. On 4.6.2 the plugin REFUNDED these: measured against this app,
-  // three requests took the budget from 599 to 597, five malformed POSTs carried no header, and the
-  // next legitimate request reported 601, above where it started. Sending garbage refilled the
-  // bucket, so the ceiling was not a ceiling for anyone willing to interleave it.
+  // PARSE and VALIDATION failures are rejected before the handler. The plugin's default is to
+  // REFUND them, which lets interleaved garbage refill the bucket past its ceiling.
   test("a malformed body is charged, and never refunds", async () => {
     expect(
       await costOf(() =>
@@ -107,26 +97,20 @@ describe("rate-limit metering (what a rejected request costs)", () => {
     ).toBe(1);
   });
 
-  // The complement, and the reason `countFailedRequest: true` is not optional once `onError` moved
-  // behind the limiters: from that position the plugin sees every thrown error first, and its
-  // default is to REFUND anything outside the codes it charges. A rejected login would have cost
-  // nothing at all.
+  // Why `countFailedRequest: true` is required with `onError` behind the limiters: the plugin sees
+  // every thrown error first and by default REFUNDS anything outside the codes it charges, so a
+  // rejected login would cost nothing.
   test("an unauthenticated request is charged", async () => {
     expect(await costOf(() => send("GET", "/api/v1/agents"))).toBe(1);
   });
 
-  // The regression test for the SPLIT in src/app.ts, run against src/app.ts. A matched route that
-  // throws a 404 is charged on the way in by the counting hook; if the AppError handler were
-  // registered behind the limiters instead of ahead of them, the plugin would see the error first,
-  // read `statusCode: 404`, take it for a route that never existed, and charge a second time. This
-  // reads 2 the moment that ordering is undone. What a second charge DOES at the ceiling is pinned
-  // separately below, on a probe small enough to reach the ceiling.
+  // Pins the handler SPLIT in src/app.ts: with the AppError handler behind the limiters, the plugin
+  // reads `statusCode: 404` as a route that never existed and charges a second time, so this reads 2.
+  // The effect at the ceiling is pinned below.
   test("a matched route that throws a 404 is charged once, not twice", async () => {
-    // NOTE: the status is asserted before the cost, because the cost alone cannot tell this case
-    // from the case where the probe route is not there at all: a request that falls through to the
-    // SPA catch-all spends exactly the same 1 and would leave this test green while it stopped
-    // testing a matched route entirely. The route is registered on this file's OWN app, before any
-    // request compiles it, so nothing another file does can drop it.
+    // Status first, because a fall-through to the SPA catch-all also costs 1 and would keep
+    // this green without a matched route. The probe is registered on this file's own app before any
+    // request compiles it.
     const answered = await send("GET", "/__metering/thrown-404");
     expect(answered.status).toBe(404);
     expect(await answered.json()).toEqual({ error: "gone" });
@@ -164,7 +148,10 @@ describe("a thrown 404 on a matched route", () => {
       .get("/forbidden", () => {
         throw new ForbiddenError("no");
       });
-    const listening = probe.listen(0) as unknown as ListeningApp;
+    const listening = probe.listen({
+      port: 0,
+      hostname: "127.0.0.1",
+    }) as unknown as ListeningApp;
     if (!listening.server?.port) throw new Error("Failed to start the probe");
     return listening.server;
   };
@@ -172,7 +159,7 @@ describe("a thrown 404 on a matched route", () => {
   test("costs exactly one, like any other matched route", async () => {
     const probe = serveWithAppOrdering(20);
     const rem = async (path: string) => {
-      const res = await Bun.fetch(`http://localhost:${probe.port}${path}`);
+      const res = await Bun.fetch(`http://127.0.0.1:${probe.port}${path}`);
       return Number(res.headers.get("ratelimit-remaining"));
     };
     try {
@@ -186,13 +173,12 @@ describe("a thrown 404 on a matched route", () => {
     }
   });
 
-  // The half that made this worth fixing rather than documenting. With one request of budget left
-  // the double charge crossed the ceiling: measured at 429, carrying the rate-limit body, on a
-  // request the limiter had just admitted.
+  // With one request of budget left, a double charge crosses the ceiling and answers 429 on a
+  // request the limiter just admitted.
   test("still answers 404 on the last request of the budget", async () => {
     const probe = serveWithAppOrdering(4);
     const get = (path: string) =>
-      Bun.fetch(`http://localhost:${probe.port}${path}`);
+      Bun.fetch(`http://127.0.0.1:${probe.port}${path}`);
     try {
       for (let i = 0; i < 3; i++) expect((await get("/ok")).status).toBe(200);
       const last = await get("/missing");
@@ -207,7 +193,7 @@ describe("a thrown 404 on a matched route", () => {
   test("the budget is still spent, so the next request is rejected", async () => {
     const probe = serveWithAppOrdering(4);
     const get = (path: string) =>
-      Bun.fetch(`http://localhost:${probe.port}${path}`);
+      Bun.fetch(`http://127.0.0.1:${probe.port}${path}`);
     try {
       for (let i = 0; i < 3; i++) await get("/ok");
       await get("/missing");

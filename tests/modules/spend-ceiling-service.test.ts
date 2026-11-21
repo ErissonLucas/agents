@@ -6,10 +6,11 @@ import {
   expect,
   test,
 } from "bun:test";
+
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
-import { encryptJson } from "@/api/lib/crypto";
 import type { TenantContext } from "@/lib/tenancy";
+import { projectMonthEnd } from "@/modules/spend-ceiling/decide";
 import {
   readSpendSnapshot,
   readTenantSpendCeiling,
@@ -18,14 +19,11 @@ import {
   spendCeilingVerdict,
   spendUsedInMonth,
 } from "@/modules/spend-ceiling/service";
-import {
-  updateLangfuse,
-  updateSpendCeiling,
-} from "@/modules/tenant-settings/service";
-import { formatVaultRef } from "@/modules/vault/service";
+import { updateSpendCeiling } from "@/modules/tenant-settings/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// What the gate READS (issue #426): the month's cost as the Langfuse poll last wrote it, one row per
-// (tenant, source, month), never Langfuse itself. The rule is proved without a database in
+// What the gate READS: the month's cost as the poll last summed it from the ledger, one row per
+// (tenant, source, month), never the ledger itself. The rule is proved without a database in
 // ./spend-ceiling-decide.test.ts; the poll that writes the row in ./spend-ceiling-poll.test.ts.
 
 let appDb: PrismaClient;
@@ -48,8 +46,8 @@ if (!process.env.TEST_APP_DATABASE_URL) {
   });
   try {
     await suDb.$queryRaw`SELECT 1`;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -66,10 +64,6 @@ async function seedSnapshot(row: {
   costUsd: number;
   polledAt?: string | null;
   pollError?: string | null;
-  tracedCalls?: number;
-  costedCalls?: number;
-  unpricedModels?: string[];
-  carriedUsd?: number;
   tenant?: bigint;
 }) {
   await suDb.spendCostSnapshot.create({
@@ -85,10 +79,6 @@ async function seedSnapshot(row: {
             ? null
             : new Date(row.polledAt),
       pollError: row.pollError ?? null,
-      tracedCalls: row.tracedCalls ?? 0,
-      costedCalls: row.costedCalls ?? 0,
-      unpricedModels: row.unpricedModels ?? [],
-      carriedUsd: row.carriedUsd ?? 0,
     },
   });
 }
@@ -103,9 +93,6 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
       source: "inbox",
       month: "2026-08-01T00:00:00Z",
       costUsd: 22.5,
-      tracedCalls: 40,
-      costedCalls: 38,
-      unpricedModels: ["openrouter/free-model"],
     });
     await seedSnapshot({
       source: "playground",
@@ -125,7 +112,8 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
       month: "2026-09-01T00:00:00Z",
       costUsd: 7000.01,
     });
-    // The local ledger keeps counting calls; the console shows how many of them Langfuse costed.
+    // The ledger the console reads beside the figure: one priced August call, two the table could not
+    // price, and one from July.
     await suDb.llmUsage.createMany({
       data: [
         {
@@ -134,15 +122,24 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
           source: "inbox",
           promptTokens: 10,
           completionTokens: 1,
+          costUsd: 1.5,
           createdAt: new Date("2026-08-02T10:00:00Z"),
         },
         {
           tenantId,
-          model: "gpt-5.4-mini",
+          model: "openrouter/free-model",
           source: "inbox",
           promptTokens: 10,
           completionTokens: 1,
           createdAt: new Date("2026-08-14T10:00:00Z"),
+        },
+        {
+          tenantId,
+          model: "openrouter/free-model",
+          source: "inbox",
+          promptTokens: 10,
+          completionTokens: 1,
+          createdAt: new Date("2026-08-14T11:00:00Z"),
         },
         {
           tenantId,
@@ -232,9 +229,6 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
       const row = await readSpendSnapshot(tenantId, "inbox", AUG, appDb);
       expect(row).toMatchObject({
         costUsd: 22.5,
-        tracedCalls: 40,
-        costedCalls: 38,
-        unpricedModels: ["openrouter/free-model"],
         pollError: null,
       });
       expect(row?.polledAt?.toISOString()).toBe("2026-08-15T11:58:00.000Z");
@@ -254,13 +248,10 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
       expect(v.snapshot).toBeNull();
     });
 
-    // A ROW THE POLL COULD NOT REFRESH FOR WANT OF A LANGFUSE IS NO FIGURE TO ENFORCE (review
-    // round 2). The poll keeps the last figure on the row and marks it `langfuse-not-configured`;
-    // the console says the ceiling cannot be enforced, and the gate has to agree with that
-    // sentence: a tenant that switched Langfuse off at $50 of a $10 ceiling would otherwise be
-    // refused for the rest of the month on a number nothing can refresh. Any OTHER failure keeps
-    // deciding on the floor, which is the staleness rule.
-    test("a row the poll marked not-configured lets the call through, whatever the figure", async () => {
+    // NOTE: A FAILING POLL LEAVES A FLOOR THE GATE STILL DECIDES ON. The old poll had one failure that
+    // opened the gate (a tenant without Langfuse); with the ledger as the source there is no such
+    // state, and every failure is staleness.
+    test("a row whose poll is failing still decides on its figure", async () => {
       const t = await suDb.tenant.create({
         data: { name: "SC-NC", slug: `sc-nc-${process.pid}` },
       });
@@ -275,7 +266,7 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
           source: "inbox",
           month: "2026-08-01T00:00:00Z",
           costUsd: 50,
-          pollError: "langfuse-not-configured",
+          pollError: "statement timeout",
         });
         const cfg = {
           ...(await readTenantSpendCeiling(t.id, appDb)),
@@ -289,37 +280,9 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
           now: AUG,
           cfg,
         });
-        expect(v.state).toBe("allowed");
-        // The figure is still said, so a reader can see WHAT stopped being enforced.
+        expect(v.state).toBe("over");
         expect(v.usedUsd).toBe(50);
-        expect(v.ceilingUsd).toBe(10);
-        expect(v.snapshot?.pollError).toBe("langfuse-not-configured");
-        // The console shows the same verdict beside its own sentence.
-        const usage = await spendCeilingUsage({
-          ctx: tctx,
-          base: appDb,
-          now: AUG,
-          cfg,
-        });
-        expect(usage.entries.find((e) => e.source === "inbox")).toMatchObject({
-          usedUsd: 50,
-          ceilingUsd: 10,
-          state: "allowed",
-        });
-
-        // The contrast: the same figure under any other failure is a floor the gate refuses on.
-        await suDb.spendCostSnapshot.updateMany({
-          where: { tenantId: t.id },
-          data: { pollError: "Langfuse metrics API responded with 503" },
-        });
-        const failing = await spendCeilingVerdict({
-          tenantId: t.id,
-          source: "inbox",
-          base: appDb,
-          now: AUG,
-          cfg,
-        });
-        expect(failing.state).toBe("over");
+        expect(v.snapshot?.pollError).toBe("statement timeout");
         expect(
           (
             await spendCeilingUsage({ ctx: tctx, base: appDb, now: AUG, cfg })
@@ -396,9 +359,9 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
       });
     });
 
-    // A ROW NOBODY HAS REFRESHED IS STILL THE FLOOR OF THE TRUTH. Spend only grows inside a month,
-    // so the last good figure under-counts by the lag and never over-refuses; the verdict stands on
-    // it and SAYS it is stale, which is what the console and the alert line read (issue #426).
+    // NOTE: A ROW NOBODY HAS REFRESHED IS STILL THE FLOOR OF THE TRUTH. Spend only grows inside a
+    // month, so the last good figure under-counts by the lag and never over-refuses; the verdict
+    // stands on it and SAYS it is stale, which is what the console and the alert line read.
     test("a stale snapshot still decides, and is reported as stale", async () => {
       const polledAt = new Date("2026-08-15T11:58:00Z").getTime();
       const later = new Date(polledAt + SPEND_SNAPSHOT_STALE_AFTER_MS + 1);
@@ -519,11 +482,11 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
     });
   });
 
-  // WHAT THE CONSOLE SHOWS: both halves, always, with the health of the figure beside it, and the
-  // reconciliation against the local ledger, because a ceiling that undercounts has to say so on
-  // the same screen that shows the bar.
+  // WHAT THE CONSOLE SHOWS: both halves, always, with the health of the figure beside it and the
+  // month's calls no price covered, because a ceiling that undercounts has to say so on the same
+  // screen that shows the bar.
   describe("the console's read", () => {
-    test("carries cost, health, coverage and the ledger's own count per source", async () => {
+    test("carries cost, health and the unpriced calls per source", async () => {
       const usage = await spendCeilingUsage({
         ctx: ctx(),
         base: appDb,
@@ -534,8 +497,8 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
           monthlyInboxUsd: 20,
         },
       });
+      expect(usage.enabled).toBe(true);
       expect(usage.periodStart).toBe("2026-08-01T00:00:00.000Z");
-      expect(usage.langfuseConfigured).toBe(false);
       expect(usage.legacyTokens).toBeNull();
       expect(usage.pollIntervalMs).toBeGreaterThan(0);
       const inbox = usage.entries.find((e) => e.source === "inbox");
@@ -548,50 +511,46 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
         pollError: null,
         pollFailedAt: null,
         stale: false,
-        tracedCalls: 40,
-        costedCalls: 38,
-        // Two August rows in the ledger; July's is not this month's.
-        ledgerCalls: 2,
+        // Two unpriced August calls; July's row is not this month's.
+        unpricedCalls: 2,
         unpricedModels: ["openrouter/free-model"],
-        // Nothing was carried from another Langfuse project into this row (issue #427).
-        carriedUsd: 0,
+        // The month at August's pace so far, from the same figure as the bar.
+        projectedUsd: projectMonthEnd(22.5, AUG),
       });
       const play = usage.entries.find((e) => e.source === "playground");
       expect(play).toMatchObject({
         usedUsd: 9.9,
         ceilingUsd: null,
         state: "allowed",
-        ledgerCalls: 0,
+        unpricedCalls: 0,
       });
     });
 
-    // WHAT OF THE FIGURE CAME FROM A PROJECT THE TENANT LEFT (issue #427). The carry is what makes a
-    // month's figure exceed the current Langfuse project's own total, and the dashboard now shows
-    // the two beside each other, so the console has to be able to say which part is which.
-    test("the carry from a previous project reaches the console", async () => {
-      const month = "2026-11-01T00:00:00Z";
-      await seedSnapshot({
-        source: "inbox",
-        month,
-        costUsd: 10.02,
-        carriedUsd: 5.01,
-      });
-      await seedSnapshot({ source: "playground", month, costUsd: 0 });
+    // With the ceiling off no poll runs, so the figure is the ledger summed on this read: fresh by
+    // construction, and not the snapshot a ceiling turned off long ago left behind.
+    test("with the ceiling off the figure is the ledger's, summed now", async () => {
+      const now = new Date("2026-08-20T00:00:00Z");
       const usage = await spendCeilingUsage({
         ctx: ctx(),
         base: appDb,
-        now: new Date("2026-11-15T00:00:00Z"),
+        now,
+        cfg: {
+          ...(await readTenantSpendCeiling(tenantId, appDb)),
+          enabled: false,
+        },
       });
+      expect(usage.enabled).toBe(false);
       expect(usage.entries.find((e) => e.source === "inbox")).toMatchObject({
-        usedUsd: 10.02,
-        carriedUsd: 5.01,
+        usedUsd: 1.5,
+        ceilingUsd: null,
+        state: "allowed",
+        polledAt: now.toISOString(),
+        stale: false,
+        unpricedCalls: 2,
       });
-      expect(
-        usage.entries.find((e) => e.source === "playground"),
-      ).toMatchObject({ carriedUsd: 0 });
     });
 
-    // Nothing read is nothing fresh (review round 5): the gate lets every call through until the
+    // NOTE: nothing read is nothing fresh: the gate lets every call through until the
     // first poll lands, and a bar reading "$0 of $20" with no sentence beside it would say the
     // opposite. `polledAt: null` is what the card renders the sentence on; `stale` agrees.
     test("a month with no snapshot shows zero, and says nothing has been read", async () => {
@@ -599,80 +558,20 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
         ctx: ctx(),
         base: appDb,
         now: new Date("2026-10-15T00:00:00Z"),
+        cfg: {
+          ...(await readTenantSpendCeiling(tenantId, appDb)),
+          enabled: true,
+          monthlyInboxUsd: 20,
+        },
       });
       const inbox = usage.entries.find((e) => e.source === "inbox");
       expect(inbox).toMatchObject({
         usedUsd: 0,
         polledAt: null,
         stale: true,
-        tracedCalls: 0,
-        costedCalls: 0,
-        ledgerCalls: 0,
+        unpricedCalls: 0,
         unpricedModels: [],
       });
-    });
-
-    // "CONFIGURED" MEANS THE POLL CAN USE IT (review round 1). A block that is switched on with a
-    // credential reference whose vault entry is gone, or holds no usable keys, is what the poll
-    // reports as `langfuse-not-configured`; the console must not call the same tenant configured on
-    // the strength of the reference alone, or the screen shows $0 with no sentence saying why.
-    test("langfuse is configured only when its credential resolves", async () => {
-      const usable = await suDb.vaultEntry.create({
-        data: {
-          tenantId,
-          name: "lf-usable",
-          kind: "langfuse",
-          secret: encryptJson({ publicKey: "pk", secretKey: "sk" }),
-          baseUrl: "https://langfuse.example.test",
-        },
-        select: { id: true },
-      });
-      const broken = await suDb.vaultEntry.create({
-        data: {
-          tenantId,
-          name: "lf-broken",
-          kind: "langfuse",
-          secret: encryptJson({ token: "not-a-key-pair" }),
-        },
-        select: { id: true },
-      });
-      try {
-        await updateLangfuse(
-          ctx(),
-          { enabled: true, credentialRef: formatVaultRef(usable.id) },
-          appDb,
-        );
-        expect(
-          (await spendCeilingUsage({ ctx: ctx(), base: appDb, now: AUG }))
-            .langfuseConfigured,
-        ).toBe(true);
-        await updateLangfuse(
-          ctx(),
-          { enabled: true, credentialRef: formatVaultRef(broken.id) },
-          appDb,
-        );
-        expect(
-          (await spendCeilingUsage({ ctx: ctx(), base: appDb, now: AUG }))
-            .langfuseConfigured,
-        ).toBe(false);
-        await updateLangfuse(
-          ctx(),
-          { enabled: true, credentialRef: formatVaultRef(usable.id) },
-          appDb,
-        );
-        await suDb.vaultEntry.delete({ where: { id: usable.id } });
-        expect(
-          (await spendCeilingUsage({ ctx: ctx(), base: appDb, now: AUG }))
-            .langfuseConfigured,
-        ).toBe(false);
-      } finally {
-        await suDb.vaultEntry.deleteMany({ where: { tenantId } });
-        await updateLangfuse(
-          ctx(),
-          { enabled: false, credentialRef: null },
-          appDb,
-        );
-      }
     });
 
     test("a block written in tokens is reported as such", async () => {
@@ -690,7 +589,7 @@ describe.skipIf(!dbUp)("the spend ceiling against the cost snapshot", () => {
     });
   });
 
-  // A PATCH THAT NAMES NO DOLLAR FIGURE LEAVES A TOKEN BLOCK IN TOKENS (review round 1). The console
+  // NOTE: A PATCH THAT NAMES NO DOLLAR FIGURE LEAVES A TOKEN BLOCK IN TOKENS. The console
   // saves the whole block on every change, but the API takes partial patches, and an operator who
   // only changes the customer's sentence has not seen the new unit: merging that against the
   // synthesized zeroes would store a dollar block and drop the one warning that the old ceiling is

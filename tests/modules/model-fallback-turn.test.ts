@@ -7,17 +7,15 @@ import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
 import { FailingModel, UsageReportingModel } from "../utils/scripted-models";
 
-// WHAT THE CUSTOMER GETS WHEN THE AGENT'S PROVIDER CANNOT TAKE THE TURN (issue #143).
-//
-// The effect the issue names is the reply that never arrives, so that is what every test here reads:
-// the text a stub Chatwoot client received, not the return value of a function. The two rows behind
-// it are read from the real tables, because an answer the operator cannot account for is its own
-// defect — a fallback turn billed to the primary's name makes the cost break-down wrong, and one
-// with no line on the trail makes a provider that is down invisible on a turn that succeeded.
+// What the customer gets when the agent's provider cannot take the turn. Every test reads the text a
+// stub Chatwoot client received, not a function's return value. The usage and trail rows are read
+// from the real tables: a fallback turn billed to the primary's name breaks the cost break-down, and
+// one with no trail line hides a provider that is down on a turn that succeeded.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -35,8 +33,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -53,7 +51,7 @@ let noFallbackAgentId = 0n;
 // shared name would let the wrong attribution pass.
 const PRIMARY_MODEL = "primary-mini";
 // A model the price table knows, on another provider than the primary, so the row's price shows
-// whose rates it was written at (issue #863).
+// whose rates it was written at.
 const FALLBACK_MODEL = "claude-haiku-4-5";
 const REPLY = "Claro, posso agendar.";
 
@@ -125,7 +123,13 @@ function usageRows(threadId: string) {
 function generateRows(threadId: string) {
   return flowLogRows(suDb, {
     where: { tenantId, threadId, stage: "generate" },
-    select: { level: true, provider: true, model: true, detail: true },
+    select: {
+      level: true,
+      status: true,
+      provider: true,
+      model: true,
+      detail: true,
+    },
     orderBy: { id: "asc" },
   });
 }
@@ -191,8 +195,8 @@ describe.skipIf(!dbUp)("a provider that cannot take the turn", () => {
       select: { id: true },
     });
     primaryAgentId = withFallback.id;
-    // The same agent minus the fallback block. It is what proves the fix buys something: the two
-    // differ in one setting and in nothing else.
+    // The same agent minus the fallback block. The two differ in that one setting only, so the
+    // pair proves what the fallback buys.
     const without = await suDb.agent.create({
       data: {
         tenantId,
@@ -272,8 +276,8 @@ describe.skipIf(!dbUp)("a provider that cannot take the turn", () => {
     await appDb.$disconnect();
   });
 
-  // THE HALF THE ISSUE REPORTS. One setting apart from the test below it, and the difference is a
-  // customer who is answered versus one who is not.
+  // NOTE: one setting apart from the test below it; the difference is a customer who is answered
+  // versus one who is not.
   test("with nothing behind it, a 503 costs the customer the reply", async () => {
     await seedConversation(9401, noFallbackAgentId);
     const rec = { text: [] as string[] };
@@ -393,6 +397,91 @@ describe.skipIf(!dbUp)("a provider that cannot take the turn", () => {
       (line?.detail as Record<string, unknown> | undefined)?.fallbackReason,
     ).toBe("HTTP 503");
     expect(JSON.stringify(line?.detail)).not.toContain("overloaded");
+  });
+
+  test("the trail names the provider it took the turn from, and the closing line the model that answered", async () => {
+    await seedConversation(9406, primaryAgentId);
+    const primary = new FailingModel(overloaded());
+    const fallback = new UsageReportingModel([REPLY]);
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: textEvent(9406),
+      base: appDb,
+      deps: {
+        makeModel: ((args: { model: string }) =>
+          args.model === FALLBACK_MODEL
+            ? fallback
+            : primary) as unknown as never,
+        makeClient: makeStub({ text: [] }),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    const rows = await generateRows(`${tenantId}:${instanceId}:9406`);
+    const took = rows.find(
+      (r) => (r.detail as Record<string, unknown> | null)?.fallbackReason,
+    );
+    expect(
+      (took?.detail as Record<string, unknown> | undefined)?.fallbackFrom,
+    ).toBe("openai");
+    // The stage's own line closes the turn, and the turn was answered by the fallback.
+    const closing = rows.find(
+      (r) => (r.detail as Record<string, unknown> | null)?.systemPrompt,
+    );
+    expect(closing?.status).toBe("ok");
+    expect([closing?.provider, closing?.model]).toEqual([
+      "anthropic",
+      FALLBACK_MODEL,
+    ]);
+  });
+
+  // Nothing answered, so no line may say the fallback took the turn. The primary's failure keeps a
+  // line of its own, under its own name, which is what its rate and cause alerts read.
+  test("a fallback that fails too leaves no ok line, and the primary's failure a line of its own", async () => {
+    await seedConversation(9407, primaryAgentId);
+    const primary = new FailingModel(overloaded());
+    const fallback = new FailingModel(
+      Object.assign(new Error("fallback down"), { status: 500 }),
+    );
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: textEvent(9407),
+      base: appDb,
+      deps: {
+        makeModel: ((args: { model: string }) =>
+          args.model === FALLBACK_MODEL
+            ? fallback
+            : primary) as unknown as never,
+        makeClient: makeStub({ text: [] }),
+        checkpointer: new MemorySaver(),
+      },
+    }).catch(() => "threw" as const);
+    expect(fallback.calls).toBeGreaterThan(0);
+    const rows = await generateRows(`${tenantId}:${instanceId}:9407`);
+    const detail = (r: (typeof rows)[number]) =>
+      (r.detail ?? {}) as Record<string, unknown>;
+    expect(rows.filter((r) => detail(r).fallbackReason)).toEqual([]);
+    expect(
+      rows.filter((r) => r.status === "ok" && r.model === FALLBACK_MODEL),
+    ).toEqual([]);
+    const primaryLine = rows.find((r) => detail(r).handedToFallback);
+    expect(primaryLine).toMatchObject({
+      level: "info",
+      status: "error",
+      provider: "openai",
+      model: PRIMARY_MODEL,
+    });
+    expect(detail(primaryLine as (typeof rows)[number]).failure).toBe(
+      "HTTP 503",
+    );
+    const died = rows.find((r) => detail(r).fallbackFailed);
+    expect(died).toMatchObject({ status: "error", model: FALLBACK_MODEL });
+    expect(died?.detail).toMatchObject({ failure: "HTTP 500" });
+    // One alarm for one failed turn: the stage's own line.
+    expect(rows.filter((r) => r.level === "error")).toHaveLength(1);
   });
 
   // The masking rule, at the level where it costs money. A dead primary key answered by the fallback

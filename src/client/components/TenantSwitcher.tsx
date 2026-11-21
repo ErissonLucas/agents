@@ -25,9 +25,9 @@ export function TenantSwitcher() {
   return <TenantPicker tenants={tenants} activeId={activeId} canCreate />;
 }
 
-// The same picker for a PERSON with several memberships (issue #756): their tenants come on the
-// session (`/auth/me`), the active one is the tenant the session runs under, and there is nothing to
-// create. Choosing one is the same persisted X-Tenant-Id and the same full reload.
+// The same picker for a PERSON with several memberships: their tenants come on the session
+// (`/auth/me`), the active one is the tenant the session runs under, and there is nothing to create.
+// Choosing one is the same persisted X-Tenant-Id and the same full reload.
 export function MembershipSwitcher({
   tenants,
   activeId,
@@ -55,8 +55,8 @@ function TenantPicker({
   const upgrade = useModalController();
   const active = activeId ?? "";
 
-  // The fallback label now only ever means what it says. A stored id the list does not have is
-  // cleared by the hook, so "Select tenant" no longer doubles as the display for a dead selection.
+  // The fallback label means only what it says: the hook clears a stored id the list does not
+  // have, so "Select tenant" is never the display for a dead selection.
   const activeName =
     tenants.find((tn) => tn.id === active)?.name ??
     t("tenant.select", "Select tenant");
@@ -68,7 +68,7 @@ function TenantPicker({
           <button
             type="button"
             aria-label={t("tenant.switcher", "Switch tenant")}
-            className="group inline-flex max-w-50 items-center gap-2 rounded-lg border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary"
+            className="group border-border bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary inline-flex max-w-50 items-center gap-2 rounded-md border px-2 py-1 text-sm transition-colors"
           >
             <Building2 className="h-4 w-4 shrink-0" aria-hidden="true" />
             <span className="hidden truncate sm:inline">{activeName}</span>
@@ -83,13 +83,13 @@ function TenantPicker({
           <DropdownMenuPrimitive.Content
             align="start"
             sideOffset={6}
-            className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 z-(--z-dropdown) max-h-80 min-w-56 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
+            className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 border-border bg-bg-secondary data-[state=closed]:animate-out data-[state=open]:animate-in z-(--z-dropdown) max-h-80 min-w-56 overflow-y-auto rounded-lg border p-1 shadow-lg"
           >
-            <DropdownMenuPrimitive.Label className="px-2 py-1 font-medium text-text-muted text-xs uppercase">
+            <DropdownMenuPrimitive.Label className="text-text-muted px-2 py-1 text-xs font-medium uppercase">
               {t("tenant.label", "Tenant")}
             </DropdownMenuPrimitive.Label>
             {tenants.length === 0 ? (
-              <p className="px-2 py-1.5 text-sm text-text-muted">
+              <p className="text-text-muted px-2 py-1.5 text-sm">
                 {t("tenant.none", "No tenants yet.")}
               </p>
             ) : (
@@ -131,7 +131,7 @@ function TenantPicker({
             )}
             {canCreate && (
               <>
-                <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
+                <DropdownMenuPrimitive.Separator className="bg-border my-1 h-px" />
                 <DropdownMenuPrimitive.Item
                   className={cn(itemCls, "text-text-secondary")}
                   onSelect={() =>

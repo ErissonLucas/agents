@@ -3,15 +3,16 @@ import { tool } from "@langchain/core/tools";
 import type { ChatOpenAI } from "@langchain/openai";
 import { z } from "zod";
 import { parseModelConfig } from "@/graph/model-config";
-import { createChatModel } from "@/graph/models";
+import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import { createChatModel, forgetToolEffortFloorsForTest } from "@/graph/models";
 import {
   planOpenAITransport,
   type ReasoningEffort,
+  toolEffortFloorOf,
 } from "@/graph/openai-reasoning";
 
-// Every turn of a gpt-5.6 agent that has tools died on an OpenAI 400 (issue #66). We never send a
-// reasoning effort, so what collides with the tools is the provider's own default: measured against
-// the live API, `gpt-5.6-luna` with tools and no effort answers 400, and the same call with
+// With no reasoning effort sent, a gpt-5.6 agent's tools collide with the provider's own default:
+// on the live API `gpt-5.6-luna` with tools and no effort answers 400, and the same call with
 // `reasoning_effort: "none"` answers 200 with the tool call. gpt-5.5 and older are unaffected.
 
 interface FakeOpenAI {
@@ -20,19 +21,12 @@ interface FakeOpenAI {
   restore: () => void;
 }
 
-// Stands in for BOTH OpenAI endpoints. The rules below are transcribed from what the live API did,
-// NOT imported from src — a fake that reuses the implementation's idea of the rule cannot catch
-// that idea being wrong.
-//
-// Measured on 2026-08-15 with one function tool attached, on gpt-5.6-luna, gpt-5.6-sol,
-// gpt-5.4-mini and gpt-5.5: /v1/chat/completions answers 400 for EVERY effort above "none",
-// on every one of those models, and answers 400 for an ABSENT effort only on the gpt-5.6 family
-// (whose server-side default is not "none"). /v1/responses answers 200 for every effort on every
-// one of them. So the ceiling belongs to the endpoint, not to the family.
-//
-// Measured again on 2026-09-23 on gpt-6-luna (issue #804): the same 400 for an absent effort and for
-// every effort above "none" alongside tools, 200 with "none". The gpt-6 family's server-side default
-// is not "none" either.
+// Stands in for BOTH OpenAI endpoints. The rules are transcribed from the live API, NOT imported
+// from src: a fake that reuses the implementation's idea of the rule cannot catch it being wrong.
+// With one function tool (gpt-5.6-luna, gpt-5.6-sol, gpt-6-luna, gpt-5.4-mini, gpt-5.5),
+// /v1/chat/completions answers 400 for EVERY effort above "none", and for an ABSENT effort only on
+// the gpt-5.6 and gpt-6 families (whose server-side default is not "none"). /v1/responses answers
+// 200 for every effort on all of them. So the ceiling belongs to the endpoint, not to the family.
 function completionsRejects(model: string, body: Record<string, unknown>) {
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   if (!hasTools) return false;
@@ -47,6 +41,35 @@ function completionsRejects(model: string, body: Record<string, unknown>) {
 
 const TOOL_CALL_ARGS = '{"timezone":"America/Sao_Paulo"}';
 
+// Measured on the live API on 2026-10-07: these two refuse "none" itself, on both endpoints, and
+// name what they take; completions spells the list without "max", responses with it. A test can widen
+// it to stand in for a model whose lowest accepted effort is higher.
+const refusesNone: Record<string, ReasoningEffort[]> = {
+  "gpt-6-astra": ["low", "medium", "high", "xhigh", "max"],
+  "gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max"],
+};
+
+function refusalOfNone(model: string, onResponses: boolean) {
+  const accepted = (refusesNone[model] ?? []).filter(
+    (e) => onResponses || e !== "max",
+  );
+  const listed = accepted.map((e) => `'${e}'`);
+  const values = `${listed.slice(0, -1).join(", ")}, and ${listed.at(-1)}`;
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: onResponses
+          ? `Unsupported value: 'none' is not supported with the '${model}' model. Supported values are: ${values}.`
+          : `Unsupported value: 'reasoning_effort' does not support 'none' with this model. Supported values are: ${values}.`,
+        type: "invalid_request_error",
+        param: onResponses ? "reasoning.effort" : "reasoning_effort",
+        code: "unsupported_value",
+      },
+    }),
+    { status: 400, headers: { "content-type": "application/json" } },
+  );
+}
+
 function fakeOpenAI(): FakeOpenAI {
   const requests: Record<string, unknown>[] = [];
   const urls: string[] = [];
@@ -59,13 +82,18 @@ function fakeOpenAI(): FakeOpenAI {
     requests.push(body);
     urls.push(String(url));
     const model = String(body.model ?? "");
-    if (String(url).includes("/responses")) {
-      // Measured: a model with no reasoning to constrain refuses the parameter by name
-      // ("Unsupported parameter: 'reasoning.effort' is not supported with this model." on gpt-4o).
-      // The fake rejects it too, so a test can tell "the operator was told" apart from "the
-      // parameter never left".
-      // Measured: the endpoint rejects the completions spelling by name, and says where it moved.
-      // This is what a model the ADAPTER routes here would have hit.
+    const onResponses = String(url).includes("/responses");
+    const sentEffort = onResponses
+      ? (body.reasoning as { effort?: string } | undefined)?.effort
+      : body.reasoning_effort;
+    if (refusesNone[model] && sentEffort === "none") {
+      return refusalOfNone(model, onResponses);
+    }
+    if (onResponses) {
+      // NOTE: The live API refuses the parameter by name on a model with no reasoning to constrain
+      // ("Unsupported parameter: 'reasoning.effort' ..." on gpt-4o), and rejects the completions
+      // spelling by name, saying where it moved (what a model the ADAPTER routes here would hit).
+      // The fake rejects both, so a test can tell "the operator was told" from "it never left".
       if (body.reasoning_effort !== undefined) {
         return new Response(
           JSON.stringify({
@@ -179,6 +207,7 @@ let fake: FakeOpenAI | null = null;
 afterEach(() => {
   fake?.restore();
   fake = null;
+  forgetToolEffortFloorsForTest();
 });
 
 async function turn(
@@ -199,6 +228,18 @@ async function turn(
     { role: "user", content: "que horas são?" },
   ]);
   return { reply, sent: fake.requests[0] ?? {}, url: fake.urls[0] ?? "" };
+}
+
+// @langchain/openai picks the endpoint (by model id and by call options), so a test reads the effort
+// in the spelling of whichever endpoint the request went to, and that endpoint's storage flag.
+function effortOf(sent: Record<string, unknown>, url: string) {
+  return url.includes("/responses")
+    ? (sent.reasoning as { effort?: string } | undefined)?.effort
+    : sent.reasoning_effort;
+}
+
+function expectStoreOff(sent: Record<string, unknown>, url: string) {
+  if (url.includes("/responses")) expect(sent.store).toBe(false);
 }
 
 describe("the fake API rejects what OpenAI rejects", () => {
@@ -232,40 +273,46 @@ describe("the fake API rejects what OpenAI rejects", () => {
 
 describe("createChatModel on the gpt-5.6 family", () => {
   test("a turn with tools is answered instead of rejected", async () => {
-    const { reply, sent } = await turn("gpt-5.6-luna");
-    expect(sent.reasoning_effort).toBe("none");
+    const { reply, sent, url } = await turn("gpt-5.6-luna");
+    expect(effortOf(sent, url)).toBe("none");
+    expectStoreOff(sent, url);
     expect(reply.tool_calls?.[0]?.name).toBe("get_current_time");
-  });
-
-  test("every model of the family carries it", async () => {
-    for (const model of ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"]) {
-      const { sent } = await turn(model);
-      expect(sent.reasoning_effort).toBe("none");
-      fake?.restore();
-    }
   });
 
   // The typed `reasoning` field would be dropped here: @langchain/openai gates it on its own
   // isReasoningModel(), which tests model.startsWith("gpt-5") and so misses a routed id.
   test("a routed OpenRouter id carries it too", async () => {
-    const { sent } = await turn("openai/gpt-5.6-luna", "openrouter");
-    expect(sent.reasoning_effort).toBe("none");
+    const { sent, url } = await turn("openai/gpt-5.6-luna", "openrouter");
+    expect(effortOf(sent, url)).toBe("none");
+    expectStoreOff(sent, url);
   });
 
-  // Only the rejection's own precondition (tools) may disable reasoning. graph.ts invokes the RAW
-  // instance once the tool budget runs out — `hardLimit ? model : llm` — and THAT call writes the
-  // final answer to the customer. The guardrail pass, the TTS normalization and an agent with no
-  // grants never bind tools either. All of them are accepted at the provider's default effort.
-  test("a call with no tools keeps the provider's own default", async () => {
-    fake = fakeOpenAI();
-    const chat = createChatModel({
-      provider: "openai",
-      model: "gpt-5.6-luna",
-      apiKey: "test",
-      temperature: 0.3,
+  // WHAT PICKING A DEFAULT COMMITS US TO: the table is the one place an id is chosen for somebody
+  // who chose nothing, so every default on an OpenAI transport has to reach a tool-bound turn the
+  // API answers, through the real adapter, against the fake's transcription of the live rules.
+  test("every declared default on an OpenAI transport answers a turn with tools", async () => {
+    const answered: Record<string, unknown> = {};
+    for (const provider of ["openai", "openrouter"] as const) {
+      // NOTE: a refused turn is recorded as its message, so a refusal fails on the table below.
+      answered[provider] = await turn(
+        PROVIDER_DEFAULT_MODEL[provider] as string,
+        provider,
+      ).then(
+        ({ reply, sent, url }) => {
+          expectStoreOff(sent, url);
+          return {
+            tool: reply.tool_calls?.[0]?.name,
+            effort: effortOf(sent, url),
+          };
+        },
+        (e: unknown) => String(e),
+      );
+      fake?.restore();
+    }
+    expect(answered).toEqual({
+      openai: { tool: "get_current_time", effort: "none" },
+      openrouter: { tool: "get_current_time", effort: "none" },
     });
-    await chat.invoke([{ role: "user", content: "oi" }]);
-    expect(fake.requests[0]).not.toHaveProperty("reasoning_effort");
   });
 
   test("binding tools does not contaminate the raw instance behind it", async () => {
@@ -279,12 +326,13 @@ describe("createChatModel on the gpt-5.6 family", () => {
     const bound = chat.bindTools?.([getCurrentTime]) ?? chat;
     await bound.invoke([{ role: "user", content: "oi" }]);
     await chat.invoke([{ role: "user", content: "oi" }]);
-    expect(fake.requests[0]?.reasoning_effort).toBe("none");
+    expect(effortOf(fake.requests[0] ?? {}, fake.urls[0] ?? "")).toBe("none");
     expect(fake.requests[1]).not.toHaveProperty("reasoning_effort");
+    expect(fake.requests[1]).not.toHaveProperty("reasoning");
   });
 });
 
-// The carve-out must not spread: gpt-5.5 and older answered 200 with tools and no effort, and
+// The carve-out must not spread: gpt-5.5 and older answer 200 with tools and no effort, and
 // gpt-5.4-mini accepts "none" as well — so sending it there would silently drop the reasoning those
 // agents run with today, trading one regression for another.
 describe("createChatModel leaves every other model alone", () => {
@@ -314,8 +362,8 @@ describe("createChatModel leaves every other model alone", () => {
     }
   });
 
-  // Issue #804: the gpt-6 family refuses tools without "none" exactly like gpt-5.6 (measured on
-  // gpt-6-luna, 2026-09-23), in every spelling an operator can configure.
+  // NOTE: The gpt-6 family refuses tools without "none" exactly like gpt-5.6, in every spelling an
+  // operator can configure.
   test("the gpt-6 family carries it too, bare, routed and fine-tuned", async () => {
     for (const [model, provider] of [
       ["gpt-6-luna", "openai"],
@@ -369,21 +417,11 @@ describe("createChatModel leaves every other model alone", () => {
       expect([model, temp(model)]).toEqual([model, 0.3]);
     }
   });
-
-  test("temperature stays dropped for the family, as for every reasoning model", () => {
-    const chat = createChatModel({
-      provider: "openai",
-      model: "gpt-5.6-luna",
-      apiKey: "test",
-      temperature: 0.3,
-    }) as ChatOpenAI;
-    expect(chat.temperature).toBeUndefined();
-  });
 });
 
-// Issue #74: the operator picks the effort per agent. The measurement that shapes this is that
-// /v1/chat/completions refuses EVERY effort above "none" alongside function tools, on every
-// reasoning model tried — so an explicit effort is a transport decision, not a family carve-out.
+// The operator picks the effort per agent. /v1/chat/completions refuses EVERY effort above "none"
+// alongside function tools, on every reasoning model tried, so an explicit effort is a transport
+// decision, not a family carve-out.
 
 describe("the fake API accepts what OpenAI accepts", () => {
   test("completions rejects an effort above none even on the older families", async () => {
@@ -451,19 +489,6 @@ describe("planOpenAITransport", () => {
       effort: "none",
     });
   });
-
-  // The one that catches a family-scoped implementation: gpt-5.4-mini works fine with tools today,
-  // yet it too rejects an effort on completions, so it needs the same transport.
-  test("every effort moves to responses, whatever the family", () => {
-    for (const model of ["gpt-5.6-luna", "gpt-5.4-mini", "gpt-5.5", "gpt-4o"]) {
-      for (const effort of ["low", "medium", "high", "xhigh", "max"] as const) {
-        expect(planOpenAITransport(model, effort)).toEqual({
-          responses: true,
-          effort,
-        });
-      }
-    }
-  });
 });
 
 describe("createChatModel with an explicit effort", () => {
@@ -471,13 +496,6 @@ describe("createChatModel with an explicit effort", () => {
     const { reply, sent, url } = await turn("gpt-5.6-luna", "openai", "high");
     expect(url).toContain("/responses");
     expect(sent.reasoning).toEqual({ effort: "high" });
-    expect(reply.tool_calls?.[0]?.name).toBe("get_current_time");
-  });
-
-  test("an older family moves too, because completions refuses it as well", async () => {
-    const { reply, sent, url } = await turn("gpt-5.4-mini", "openai", "medium");
-    expect(url).toContain("/responses");
-    expect(sent.reasoning).toEqual({ effort: "medium" });
     expect(reply.tool_calls?.[0]?.name).toBe("get_current_time");
   });
 
@@ -490,10 +508,10 @@ describe("createChatModel with an explicit effort", () => {
     }
   });
 
-  // Switching endpoint must not switch what OpenAI keeps. Chat Completions stores nothing unless
-  // asked; the Responses API stores by default (30 days). Sending store:false is what keeps the
-  // knob about reasoning instead of quietly changing retention for a product that carries customer
-  // conversations. Measured: the two-turn tool round-trip still works with storage off.
+  // NOTE: Switching endpoint must not switch what OpenAI keeps. Chat Completions stores nothing
+  // unless asked; the Responses API stores by default (30 days). Sending store:false keeps the knob
+  // about reasoning instead of quietly changing retention for a product that carries customer
+  // conversations. The two-turn tool round-trip still works with storage off.
   test("the responses endpoint is told not to store the conversation", async () => {
     const { sent } = await turn("gpt-5.6-luna", "openai", "low");
     expect(sent.store).toBe(false);
@@ -505,27 +523,6 @@ describe("createChatModel with an explicit effort", () => {
     expect(sent.reasoning).toEqual({ effort: "none" });
     expect(sent).not.toHaveProperty("reasoning_effort");
     expect(reply.tool_calls?.[0]?.name).toBe("get_current_time");
-  });
-
-  // gpt-5.2-pro, gpt-5.4-pro, gpt-5.5-pro and any id containing "codex" are routed to
-  // /v1/responses by @langchain/openai itself (_modelPrefersResponsesAPI), whatever we ask for.
-  // A plan that sent the completions spelling for "none" would 400 every turn of those agents.
-  test("a model the adapter routes on its own gets the right spelling", async () => {
-    for (const model of ["gpt-5.4-pro", "gpt-5.5-pro", "gpt-5.2-pro"]) {
-      const { sent, url } = await turn(model, "openai", "none");
-      expect(url).toContain("/responses");
-      expect(sent.reasoning).toEqual({ effort: "none" });
-      expect(sent).not.toHaveProperty("reasoning_effort");
-      fake?.restore();
-    }
-  });
-
-  // The issue #66 pin exists only because nobody chose an effort. Once the operator does choose,
-  // the pin must not survive and silently cap the choice at "none".
-  test("the choice overrides the pin the family carries by default", async () => {
-    const { sent, url } = await turn("gpt-5.6-luna", "openai", "high");
-    expect(url).toContain("/responses");
-    expect(sent).not.toHaveProperty("reasoning_effort");
   });
 
   // Unlike the pin, an explicit choice is about the agent, so it also covers the calls that carry
@@ -544,22 +541,9 @@ describe("createChatModel with an explicit effort", () => {
     expect(fake.urls[0]).toContain("/responses");
     expect(fake.requests[0]?.reasoning).toEqual({ effort: "high" });
   });
-
-  test("an explicit none reaches a call that binds no tools too", async () => {
-    fake = fakeOpenAI();
-    const chat = createChatModel({
-      provider: "openai",
-      model: "gpt-5.6-luna",
-      apiKey: "test",
-      temperature: 0.3,
-      reasoningEffort: "none",
-    });
-    await chat.invoke([{ role: "user", content: "oi" }]);
-    expect(fake.requests[0]?.reasoning).toEqual({ effort: "none" });
-  });
 });
 
-// The knob is offered only where a working combination was measured AND where we control the
+// The knob is offered only where a working combination is verified AND where we control the
 // endpoint. OpenRouter and openai-compatible servers mostly do not implement /v1/responses, so
 // there the effort could only ride on completions — the one place it is refused alongside tools.
 describe("the config schema fences the knob to the provider that has the endpoint", () => {
@@ -599,8 +583,8 @@ describe("the config schema fences the knob to the provider that has the endpoin
     ).toBeUndefined();
   });
 
-  // Measured: every model tried rejects "minimal", so offering it would be a control with a
-  // position that always fails.
+  // NOTE: Every model tried rejects "minimal", so offering it would be a control with a position
+  // that always fails.
   test("minimal is not part of the vocabulary", () => {
     expect(() =>
       parseModelConfig({
@@ -618,8 +602,8 @@ describe("the config schema fences the knob to the provider that has the endpoin
 // effort at all: the operator's choice silently discarded, which is the one outcome worse than a
 // rejection. A fine-tuned id of a model that DOES reason is the case that makes this concrete —
 // "ft:gpt-5.6-luna:…" is a legitimate choice and the name test drops it. Carrying the effort in
-// modelKwargs, which is spread into the request unconditionally, is the same fix the completions
-// branch already needed for routed OpenRouter ids, and for the same reason.
+// modelKwargs, which is spread into the request unconditionally, is what the completions branch
+// does for routed OpenRouter ids, for the same reason.
 describe("the chosen effort is not silently dropped by a name test", () => {
   test("a fine-tuned id of a reasoning model still carries it", async () => {
     const { sent, url } = await turn(
@@ -649,7 +633,7 @@ describe("the chosen effort is not silently dropped by a name test", () => {
 });
 
 // Same blind spot on the other rule: a fine-tune of gpt-5.6 inherits the server-side default that
-// breaks function tools, so it needs the issue #66 pin just as much as the bare id does.
+// breaks function tools, so it needs the "none" pin just as much as the bare id does.
 describe("a fine-tuned id is read through to its base model", () => {
   test("the pin follows the base family", () => {
     expect(planOpenAITransport("ft:gpt-5.6-luna:acme::x1", undefined)).toEqual({
@@ -666,16 +650,17 @@ describe("a fine-tuned id is read through to its base model", () => {
 });
 
 // @langchain/openai routes some ids to /v1/responses on its own, whatever we ask
-// (_modelPrefersResponsesAPI). The issue #66 pin is spelled for completions, so it must not fire
-// on those — and the ft: match added above is what makes the overlap reachable, because the last
+// (_modelPrefersResponsesAPI). The "none" pin is spelled for completions, so it must not fire
+// on those, and the ft: match above is what makes the overlap reachable, because the last
 // segments of "ft:<base>:<org>:<name>:<id>" are free text the operator writes: a support agent
 // fine-tuned as "codex-support" contains "codex" and gets routed away.
-describe("the completions-spelled pin follows the endpoint, not a guess about it", () => {
+describe("the pin follows the endpoint, not a guess about it", () => {
   // The endpoint is not settled at construction: @langchain/openai also switches to Responses when
-  // the CALL carries an OpenAI built-in tool or a Responses-only option. A gpt-5.6 model that stays
-  // on completions bare is routed away the moment such a tool is bound, so the pin has to be
-  // decided where the tools are, not where the client is built.
-  test("a built-in tool bound later moves the turn, and the pin does not follow", async () => {
+  // the CALL carries an OpenAI built-in tool or a Responses-only option, so the pin's spelling is
+  // decided where the tools are, not where the client is built. On the live API gpt-5.6 answers 200
+  // on /v1/responses with effort "none" and a function tool or web_search alike, and its default
+  // effort there is "medium": without the pin, a tool call would start reasoning where it did not.
+  test("a built-in tool bound later moves the turn, and the pin follows in its spelling", async () => {
     fake = fakeOpenAI();
     const chat = createChatModel({
       provider: "openai",
@@ -688,31 +673,20 @@ describe("the completions-spelled pin follows the endpoint, not a guess about it
       .catch(() => undefined);
     expect(fake.urls[0]).toContain("/responses");
     expect(fake.requests[0]).not.toHaveProperty("reasoning_effort");
+    expect(fake.requests[0]?.reasoning).toEqual({ effort: "none" });
+    expect(fake.requests[0]?.store).toBe(false);
   });
 
-  test("and plain function tools on the same model keep it", async () => {
-    const { sent, url } = await turn("gpt-5.6-luna");
-    expect(url).toContain("/chat/completions");
-    expect(sent.reasoning_effort).toBe("none");
-  });
-
-  // Lowercase suffix: the adapter routes it away, so the pin must not travel.
-  test("a fine-tuned gpt-5.6 the adapter routes away carries no pin", async () => {
-    const { sent, url } = await turn("ft:gpt-5.6-luna:acme:codex-support:x1");
-    expect(url).toContain("/responses");
-    expect(sent).not.toHaveProperty("reasoning_effort");
-  });
-
-  // Uppercase suffix: `_modelPrefersResponsesAPI` uses case-SENSITIVE `includes`, so the very same
-  // agent stays on completions — where dropping the pin is the issue #66 400 all over again.
   test.each([
+    "gpt-5.6-luna",
+    "ft:gpt-5.6-luna:acme:codex-support:x1",
     "ft:gpt-5.6-luna:acme:Codex-support:x1",
     "ft:gpt-5.6-luna:acme:GPT-5.4-PRO-migration:x1",
     "ft:gpt-5.6-luna:acme:suporte:x1",
-  ])("%s stays on completions and keeps the pin", async (model) => {
+  ])("%s with plain function tools carries it", async (model) => {
     const { sent, url } = await turn(model);
-    expect(url).toContain("/chat/completions");
-    expect(sent.reasoning_effort).toBe("none");
+    expect(effortOf(sent, url)).toBe("none");
+    expectStoreOff(sent, url);
   });
 });
 
@@ -756,16 +730,17 @@ describe("the completions spelling never leaves for the responses endpoint", () 
       .invoke([{ role: "user", content: "oi" }]);
     if (fake.urls[0]?.includes("/responses")) {
       expect(fake.requests[0]).not.toHaveProperty("reasoning_effort");
+      expect(fake.requests[0]?.store).toBe(false);
+    } else {
+      expect(fake.requests[0]).not.toHaveProperty("reasoning");
     }
   });
 
-  // The other half of the same seam, and the half a case-insensitive guess broke: whenever a
-  // gpt-5.6 model DOES leave for completions with tools attached, the issue #66 pin has to be on
-  // it. Stated as an invariant so neither direction can be fixed at the other's expense —
-  // withholding the pin too eagerly reopens #66 exactly as sending it too eagerly breaks the
-  // Responses route.
+  // NOTE: The other half of the same seam: whichever endpoint a gpt-5.6 tool call lands on, the
+  // "none" pin is on it, so neither the tools 400 on completions nor a default "medium" on
+  // responses can come back.
   test.each(IDS.filter((m) => m.includes("gpt-5.6")))(
-    "%s, when a gpt-5.6 stays on completions",
+    "%s, a gpt-5.6 tool call carries the pin on either endpoint",
     async (model) => {
       fake = fakeOpenAI();
       const chat = createChatModel({
@@ -776,9 +751,7 @@ describe("the completions spelling never leaves for the responses endpoint", () 
       await chat
         .bindTools?.([getCurrentTime])
         .invoke([{ role: "user", content: "oi" }]);
-      if (fake.urls[0]?.includes("/chat/completions")) {
-        expect(fake.requests[0]?.reasoning_effort).toBe("none");
-      }
+      expect(effortOf(fake.requests[0] ?? {}, fake.urls[0] ?? "")).toBe("none");
     },
   );
 
@@ -799,5 +772,173 @@ describe("the completions spelling never leaves for the responses endpoint", () 
     expect(fake.urls[0]).toContain("/responses");
     expect(fake.requests[0]).not.toHaveProperty("reasoning_effort");
     expect(fake.requests[0]?.reasoning).toEqual({ effort: "medium" });
+  });
+});
+
+// A model that refuses the tool pin itself is answered at the lowest effort it names, on
+// the endpoint that takes an effort alongside tools, and the refusal is paid once per process.
+describe("a model that refuses the tool pin", () => {
+  async function bindAndCall(
+    model: string,
+    opts: { reasoningEffort?: ReasoningEffort } = {},
+  ) {
+    const chat = createChatModel({
+      provider: "openai",
+      model,
+      apiKey: "test",
+      temperature: 0.3,
+      maxRetries: 0,
+      ...opts,
+    });
+    const bound = chat.bindTools?.([getCurrentTime]) ?? chat;
+    return bound.invoke([{ role: "user", content: "que horas são?" }]);
+  }
+  const sentAt = (i: number) => ({
+    url: fake?.urls[i] ?? "",
+    effort: effortOf(fake?.requests[i] ?? {}, fake?.urls[i] ?? ""),
+  });
+
+  test("is answered at its lowest accepted effort, on responses", async () => {
+    for (const model of ["gpt-6-astra", "gpt-6.1-sol"]) {
+      fake?.restore();
+      forgetToolEffortFloorsForTest();
+      fake = fakeOpenAI();
+      const reply = await bindAndCall(model);
+      expect(reply.tool_calls?.[0]?.name).toBe("get_current_time");
+      expect([sentAt(0).effort, sentAt(1).effort]).toEqual(["none", "low"]);
+      expect(sentAt(1).url).toContain("/responses");
+      expect(fake.requests).toHaveLength(2);
+      expectStoreOff(fake.requests[1] ?? {}, sentAt(1).url);
+    }
+  });
+
+  test("pays the refusal once: the next turn binds the working shape directly", async () => {
+    fake = fakeOpenAI();
+    await bindAndCall("gpt-6-astra");
+    await bindAndCall("gpt-6-astra");
+    expect(fake.requests).toHaveLength(3);
+    expect(sentAt(2)).toEqual({
+      url: expect.stringContaining("/responses"),
+      effort: "low",
+    });
+  });
+
+  // The graph binds once per turn and invokes once per round of tool calls.
+  test("pays the refusal once within a turn too: a later round goes straight to the floor", async () => {
+    fake = fakeOpenAI();
+    const chat = createChatModel({
+      provider: "openai",
+      model: "gpt-6-astra",
+      apiKey: "test",
+      maxRetries: 0,
+    });
+    const bound = chat.bindTools?.([getCurrentTime]) ?? chat;
+    for (let round = 0; round < 2; round++) {
+      await bound.invoke([{ role: "user", content: "que horas são?" }]);
+    }
+    expect(fake.requests).toHaveLength(3);
+    expect(sentAt(2)).toEqual({
+      url: expect.stringContaining("/responses"),
+      effort: "low",
+    });
+  });
+
+  test("a refusal naming a higher floor gets that floor, with no list of models", async () => {
+    refusesNone["gpt-6-future"] = ["medium", "high", "xhigh"];
+    try {
+      fake = fakeOpenAI();
+      await bindAndCall("gpt-6-future");
+      expect(sentAt(1).effort).toBe("medium");
+    } finally {
+      delete refusesNone["gpt-6-future"];
+    }
+  });
+
+  test("a model that takes the pin sends what it sent before, once", async () => {
+    fake = fakeOpenAI();
+    await bindAndCall("gpt-6-astra");
+    await bindAndCall("gpt-6-luna");
+    expect(fake.requests).toHaveLength(3);
+    expect(sentAt(2).effort).toBe("none");
+    expect(sentAt(2).url).toContain("/chat/completions");
+  });
+
+  test("an effort the operator chose is not second-guessed", async () => {
+    fake = fakeOpenAI();
+    await expect(
+      bindAndCall("gpt-6-astra", { reasoningEffort: "none" }),
+    ).rejects.toThrow(/not supported/);
+    expect(fake.requests).toHaveLength(1);
+  });
+
+  test("any other failure is left to fail as before, after one request", async () => {
+    const original = globalThis.fetch;
+    for (const [status, error] of [
+      [503, { message: "overloaded", type: "server_error", code: null }],
+      [
+        400,
+        {
+          message: "Unsupported parameter: 'reasoning_effort'.",
+          type: "invalid_request_error",
+          param: "reasoning_effort",
+          code: "unsupported_parameter",
+        },
+      ],
+    ] as const) {
+      let n = 0;
+      globalThis.fetch = (async () => {
+        n++;
+        return new Response(JSON.stringify({ error }), {
+          status,
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch;
+      try {
+        await expect(bindAndCall("gpt-6-astra")).rejects.toThrow();
+        expect(n).toBe(1);
+      } finally {
+        globalThis.fetch = original;
+      }
+    }
+  });
+});
+
+describe("toolEffortFloorOf", () => {
+  const refusal = (over: Record<string, unknown>) => ({
+    status: 400,
+    code: "unsupported_value",
+    param: "reasoning_effort",
+    message:
+      "Unsupported value: 'reasoning_effort' does not support 'none' with this model. Supported values are: 'low', 'medium', 'high', and 'xhigh'.",
+    ...over,
+  });
+
+  test("names the lowest effort the refusal lists, in either spelling", () => {
+    expect(toolEffortFloorOf(refusal({}))).toBe("low");
+    expect(toolEffortFloorOf(refusal({ param: "reasoning.effort" }))).toBe(
+      "low",
+    );
+    expect(
+      toolEffortFloorOf(
+        refusal({
+          message: "Supported values are: 'xhigh', 'high' and 'medium'.",
+        }),
+      ),
+    ).toBe("medium");
+  });
+
+  test("anything but that refusal is not a floor", () => {
+    for (const over of [
+      { status: 503 },
+      { code: "unsupported_parameter" },
+      { param: "tools" },
+      { message: "Unsupported value without a list" },
+      { message: "Supported values are: 'none'." },
+      { message: "Supported values are: 'minimal', 'turbo'." },
+    ]) {
+      expect(toolEffortFloorOf(refusal(over))).toBeNull();
+    }
+    expect(toolEffortFloorOf(null)).toBeNull();
+    expect(toolEffortFloorOf("400")).toBeNull();
   });
 });

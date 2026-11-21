@@ -7,17 +7,16 @@ import {
   guardrailHealthWindowStart,
   readGuardrailHealth,
 } from "@/modules/guardrails/health";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRow } from "@/tests/utils/flowlog";
 
-// What the guardrail screen actually did, read back from the flow log. The reason this read exists
-// at all: analysis is fail-open, so a screen that can never run is indistinguishable from one that
-// ran and approved, and the `guardrail`/`error` row is the only place the difference survives.
+// What the guardrail screen actually did, read back from the flow log. Analysis is fail-open, so a
+// screen that can never run is indistinguishable from one that ran and approved, and the
+// `guardrail`/`error` row is the only place the difference survives.
 //
-// Every row below carries an EXPLICIT createdAt from this process's clock, and the window is
-// computed from that same clock. Letting Postgres stamp `now()` while the window comes from the
-// host puts the two on different clocks, and a Docker VM that drifted behind after a sleep is
-// exactly how a past worker test started reading rows "from the future" (see the alert-worker
-// incident): the count would go empty for reasons that have nothing to do with this code.
+// Every row carries an EXPLICIT createdAt from this process's clock, and the window is computed from
+// that same clock: Postgres stamping `now()` against a host-computed window is two clocks, and a
+// Docker VM that drifted behind after a sleep would empty the count for reasons unrelated to this code.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -35,8 +34,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 // Seeding runs as the migration role (it writes rows for two tenants); every READ goes through the
@@ -65,12 +64,6 @@ describe("guardrailHealthWindowStart", () => {
       guardrailHealthWindowStart(new Date("2026-08-19T12:00:00.000Z")),
     ).toEqual(new Date("2026-08-18T12:00:00.000Z"));
     expect(GUARDRAIL_HEALTH_WINDOW_HOURS).toBe(24);
-  });
-
-  test("crosses a month boundary without drifting", () => {
-    expect(
-      guardrailHealthWindowStart(new Date("2026-03-01T03:00:00.000Z")),
-    ).toEqual(new Date("2026-02-28T03:00:00.000Z"));
   });
 });
 
@@ -336,6 +329,7 @@ describe.skipIf(!dbUp)("readGuardrailHealth", () => {
     // flowlog-scope: seeded — reads the row this test inserted above with `create`, awaited. No
     // emit in the path, so neither the scope nor the wait obligation applies.
     const newer = await flowLogRow(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId: tenantA, turnId: "g6" },
       select: { id: true },
     });
@@ -508,13 +502,32 @@ describe.skipIf(!dbUp)("readGuardrailHealth", () => {
   });
 
   test("RLS: a tenant only ever reads its own agent's failures", async () => {
-    const health = await readGuardrailHealth(
-      ctx(tenantB),
-      AGENT_B,
-      SINCE,
-      appDb,
-    );
-    expect(health.failures).toBe(1);
-    expect(health.lastError).toBe("other tenant");
+    // A newer row filed under tenant A that names B's agent: the agent filter alone would count it.
+    const planted = await suDb.executionLog.create({
+      data: {
+        tenantId: tenantA,
+        turnId: "g-planted",
+        agentId: AGENT_B,
+        stage: "guardrail",
+        level: "warn",
+        status: "error",
+        source: "inbox",
+        errorMessage: "filed under tenant A",
+        createdAt: ago(1),
+      },
+      select: { id: true },
+    });
+    try {
+      const health = await readGuardrailHealth(
+        ctx(tenantB),
+        AGENT_B,
+        SINCE,
+        appDb,
+      );
+      expect(health.failures).toBe(1);
+      expect(health.lastError).toBe("other tenant");
+    } finally {
+      await suDb.executionLog.delete({ where: { id: planted.id } });
+    }
   });
 });

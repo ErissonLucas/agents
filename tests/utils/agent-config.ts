@@ -6,14 +6,14 @@ import { GUARDRAILS_DEFAULTS } from "@/modules/guardrails/settings";
 import { HANDOFF_DEFAULTS } from "@/modules/handoff/settings";
 import { SEND_IMAGE_DEFAULTS } from "@/modules/images/settings";
 import { KANBAN_DEFAULTS } from "@/modules/kanban/settings";
+import { OTHER_INBOXES_DEFAULTS } from "@/modules/other-inboxes/settings";
 import { SERVICE_WINDOW_DEFAULTS } from "@/modules/service-window/service";
 import { SIGNATURE_DEFAULTS } from "@/modules/signature/service";
 import { SPLIT_DEFAULTS } from "@/modules/split/service";
 import { TTS_DEFAULTS } from "@/modules/tts/settings";
 
-// The AgentConfig stub `buildModelAndGraph` reads, shared by the two files that drive it. It moved
-// out of prepare.test.ts when the fallback tests needed the same twenty-odd fields: a second copy
-// would have started identical and drifted the first time AgentConfig grew one.
+// The AgentConfig stub `buildModelAndGraph` reads, shared by the files that drive it: a second copy
+// would drift the first time AgentConfig grew a field.
 
 // Minimal AgentConfig stub for buildModelAndGraph — only fields it reads.
 export function makeConfig(
@@ -29,7 +29,7 @@ export function makeConfig(
       | "modelFallbackApiKey"
       | "modelFallbackCredentialBaseUrl"
       // As entradas de que o prompt foi renderizado, para o teste da recomposição da idade poder
-      // montar uma config com template, vars e seções coerentes entre si (issue #749).
+      // montar uma config com template, vars e seções coerentes entre si.
       | "systemPrompt"
       | "promptTemplate"
       | "promptVars"
@@ -60,6 +60,10 @@ export function makeConfig(
     guardrails: GUARDRAILS_DEFAULTS,
     guardrailsApiKey: "",
     guardrailsCredentialBaseUrl: null,
+    guardrailsExternalSecret: null,
+    guardrailsExternalSecretMissing: false,
+    groundingReviewer: null,
+    groundingReference: null,
     transferWithSummary: false,
     nativeToolsAllow: undefined,
     httpToolDefs: [],
@@ -95,12 +99,19 @@ export function makeConfig(
     sendImageConfig: SEND_IMAGE_DEFAULTS,
     jevConfig: null,
     crossInboxCaseConfig: { ...CROSS_INBOX_CASE_DEFAULTS },
+    otherInboxesConfig: { ...OTHER_INBOXES_DEFAULTS, inboxes: [] },
+    chatwootInboxId: null,
+    contactFieldsConfig: { context: [], writable: [] },
     chatwootContactId: null,
     kanbanConfig: KANBAN_DEFAULTS,
     toolGuidance: {},
     protectedLabels: [],
+    resolveLabels: [],
+    resolveCaseHold: null,
     allowedLabels: [],
     outsideAllowedLabels: "refuse",
+    labelRemoval: "any",
+    writableAttributes: [],
     toolPreconditions: {},
     httpToolContext: {},
     contactName: null,
@@ -108,13 +119,24 @@ export function makeConfig(
     maxToolCalls: 10,
     maxHistoryTokens: null,
     retrySilence: true,
+    maxTurnsPerHour: 0,
+    maxProactivePerDay: 0,
     memoryCompaction: true,
     historyDates: true,
     memoryCompactionOverride: {},
     memoryCompactionApiKey: "",
     memoryCompactionCredentialBaseUrl: null,
+    suggestionReviewOverride: {},
+    suggestionReviewApiKey: "",
+    suggestionReviewCredentialBaseUrl: null,
+    choiceCheckOverride: {},
+    choiceCheckApiKey: "",
+    choiceCheckCredentialBaseUrl: null,
     logToolValues: false,
     fullDetail: false,
+    fullDetailRetentionDays: null,
+    toolsUsedNote: "off",
+    turnErrors: "off",
     ...over,
   } as AgentConfig;
 }

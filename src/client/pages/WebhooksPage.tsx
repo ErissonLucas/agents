@@ -24,24 +24,29 @@ import {
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { formatDate } from "@/client/lib/utils";
-import { webhookEventLabel } from "@/client/lib/webhookEvents";
+import {
+  summarizeSubscription,
+  type WebhookEventGroup,
+} from "@/client/lib/webhookEventGroups";
+import {
+  webhookEventLabel,
+  webhookFamilyLabel,
+} from "@/client/lib/webhookEvents";
 
 // Outbound webhook subscriptions console (TENANT_ADMIN). Lists targets, creates/edits via a modal,
 // toggles enabled inline, and deletes with a confirm. The secret value never appears here — only
 // the vault reference name. The event catalog is fetched once for the modal.
 
-// WHAT THIS SUBSCRIPTION DOES, never what its column holds. This used to decide between three
-// states off the row, and a ref whose vault entry had been DELETED fell into the first one: the same
-// "Signed with: vault:11" the live credential gets, on the page that now also shows a delivery row
-// saying that very POST went out unsigned (issue #724). Three of the four values need the vault, so
-// the server answers the whole question in one field and this reads it.
-//
-// The ref is still named in the one case where naming it helps — it resolves, so there is a
-// credential to go look at. In the three that do not resolve the ref is not the useful half; the
-// errand is: nothing to go look at, a credential to recreate, a value to fill in.
+// WHAT THIS SUBSCRIPTION DOES, never what its column holds: a ref whose vault entry is gone must not
+// read "Signed with" like a live credential. Three of the four states need the vault, so the server
+// answers in `signingState` and this reads it. The ref is named only when it resolves, the one case
+// with a credential to go look at.
 function signingLabel(
   sub: { signingState: string; secretRef: string | null },
-  t: (k: string, d: string, o?: Record<string, unknown>) => string,
+  t: {
+    (k: string, d: string): string;
+    (k: string, d: string, o: Record<string, unknown>): string;
+  },
 ): string {
   switch (sub.signingState) {
     case "signed":
@@ -68,11 +73,64 @@ function signingLabel(
   }
 }
 
+// What a subscription receives, one badge per family it touches ("Documents 2 of 3", "Conversations,
+// all"), with the event names in the badge's tooltip. A stored name the catalog no longer lists keeps
+// its own badge, so nothing the subscription holds goes unseen.
+function SubscriptionEvents({
+  events,
+  groups,
+}: {
+  events: readonly string[];
+  groups: readonly WebhookEventGroup[];
+}) {
+  const { t } = useTranslation();
+  const summary = summarizeSubscription(events, groups);
+  return (
+    <div className="flex flex-wrap gap-1">
+      {summary.groups.map(({ group, selection }) => {
+        const family = webhookFamilyLabel(group.family, t);
+        const names = selection.wildcard
+          ? (group.wildcard ?? "")
+          : group.events.filter((e) => events.includes(e)).join(", ");
+        return (
+          <Badge key={group.family ?? "system"} variant="secondary">
+            <Tooltip content={names}>
+              <span>
+                {selection.wildcard
+                  ? t("webhooks.summaryAll", "{{family}} (all)", { family })
+                  : selection.covered === selection.total &&
+                      group.wildcard === null
+                    ? family
+                    : t(
+                        "webhooks.summaryCount",
+                        "{{family}} {{covered}} of {{total}}",
+                        {
+                          family,
+                          covered: selection.covered,
+                          total: selection.total,
+                        },
+                      )}
+              </span>
+            </Tooltip>
+          </Badge>
+        );
+      })}
+      {summary.unknown.map((ev) => (
+        <Badge key={ev} variant="secondary">
+          <Tooltip content={ev}>
+            <span>{webhookEventLabel(ev, t)}</span>
+          </Tooltip>
+        </Badge>
+      ))}
+    </div>
+  );
+}
+
 export function WebhooksPage() {
   const { t } = useTranslation();
   const { showToast } = useToast();
   const [subscriptions, setSubscriptions] = useState<WebhookSubscription[]>([]);
-  const [events, setEvents] = useState<readonly string[]>([]);
+  const [groups, setGroups] = useState<readonly WebhookEventGroup[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
@@ -92,7 +150,7 @@ export function WebhooksPage() {
         return;
       }
       setSubscriptions(subs.data?.subscriptions ?? []);
-      setEvents(evs.data?.events ?? []);
+      setGroups(evs.data?.families ?? []);
     } catch {
       setError(true);
     } finally {
@@ -141,11 +199,8 @@ export function WebhooksPage() {
         return;
       }
       if (result.ok) {
-        // Delivered, and then the thing a bare success would let the operator believe wrongly: that
-        // it was signed. Until #724 this case never reached here — the probe refused outright, with
-        // a red toast — so a green "Test delivered" is exactly the feedback the refusal used to
-        // give, minus the reason. The probe stopped refusing because its own worker never did; that
-        // only improves the answer if the answer still carries the warning.
+        // NOTE: Delivered, but possibly unsigned: the probe delivers without a signature, as the worker
+        // does, so the warning is the only thing telling the operator a green result was not signed.
         if (result.warning) {
           showToast(
             t(
@@ -212,10 +267,10 @@ export function WebhooksPage() {
     <PageContainer className="space-y-6">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h1 className="font-bold text-2xl text-text-primary">
+          <h1 className="text-text-primary text-2xl font-bold">
             {t("webhooks.title", "Webhooks")}
           </h1>
-          <p className="mt-1 text-sm text-text-secondary">
+          <p className="text-text-secondary mt-1 text-sm">
             {t(
               "webhooks.subtitle",
               "Send signed events to your own endpoints when things happen in this workspace.",
@@ -230,7 +285,7 @@ export function WebhooksPage() {
 
       <WebhookSubscriptionModal
         modal={modal}
-        events={events}
+        groups={groups}
         onSaved={() => {
           showToast(t("webhooks.saved", "Subscription saved"), "success");
           void fetchAll();
@@ -262,7 +317,7 @@ export function WebhooksPage() {
             >
               <div className="flex min-w-0 flex-col gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="truncate font-medium text-sm text-text-primary">
+                  <span className="text-text-primary truncate text-sm font-medium">
                     {sub.url}
                   </span>
                   {!sub.enabled && (
@@ -271,15 +326,7 @@ export function WebhooksPage() {
                     </Badge>
                   )}
                 </div>
-                <div className="flex flex-wrap gap-1">
-                  {sub.events.map((ev) => (
-                    <Badge key={ev} variant="secondary">
-                      <Tooltip content={ev}>
-                        <span>{webhookEventLabel(ev, t)}</span>
-                      </Tooltip>
-                    </Badge>
-                  ))}
-                </div>
+                <SubscriptionEvents events={sub.events} groups={groups} />
                 <span className="text-text-muted text-xs">
                   {signingLabel(sub, t)}
                   {" · "}

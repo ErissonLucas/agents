@@ -35,16 +35,11 @@ import {
 } from "@/modules/agents/service";
 import CONSOLE_BEHAVIOR_SAVE from "@/tests/fixtures/console-behavior-save-settings.json";
 
-// A CLOSED SETTINGS VALUE THE READER WOULD THROW AWAY IS REFUSED ON REST (#622).
-//
-// #612, #616 and #618 closed this one field at a time. The rest of the bag had the same hole: REST
-// parsed `settings` as a record of unknown, the block's reader replaced an unknown value with its
-// default, the runtime acted on the default, and GET echoed what was sent. MCP already refused all of
-// it through BEHAVIOR_PATCH_SHAPE, whose documented rule is exactly this question (a value the reader
-// throws away is declared; one it honours after measuring must still parse). REST now asks it too.
-//
-// Asked through `assertAgentCreatable` (the create path, where nothing is stored) and without naming
-// a new symbol, so on the base these fail on the assertion rather than on an import.
+// A closed settings value the reader would throw away is refused on REST, as MCP refuses it through
+// BEHAVIOR_PATCH_SHAPE (a value the reader throws away is declared; one it honours after measuring
+// must still parse). Accepting it would save a value the block's reader replaces with its default,
+// the runtime acting on the default while GET echoes what was sent. Asked through
+// `assertAgentCreatable` (the create path, where nothing is stored).
 function refusal(settings: Record<string, unknown>) {
   try {
     assertAgentCreatable({ name: "x", settings });
@@ -71,9 +66,11 @@ describe("closed settings values on the create path", () => {
       { followUp: { steps: [{ delayUnit: "semanas" }] } },
     ],
     ["monitoring.analysis", { monitoring: { analysis: "sempre" } }],
+    ["vision.reasoningEffort", { vision: { reasoningEffort: "turbo" } }],
+    ["vision.maxOutputTokens", { vision: { maxOutputTokens: "4096" } }],
     ["memory.compaction.enabled", { memory: { compaction: { enabled: 1 } } }],
-    // Keys the schema declares `never` under `input` are tolerated only with the type the reader
-    // reads there, so a value it throws away is still refused (#626's acceptance run: "sim" saved).
+    // NOTE: keys the schema declares `never` under `input` are tolerated only with the type the
+    // reader reads there, so a value it throws away (such as "sim") is still refused.
     [
       "guardrails.input.checks.promptAdherence",
       { guardrails: { input: { checks: { promptAdherence: "sim" } } } },
@@ -103,6 +100,7 @@ describe("closed settings values on the create path", () => {
         handoff: { mode: "route" },
         contactAuth: { mode: "once" },
         monitoring: { analysis: "on_resolve" },
+        vision: { maxOutputTokens: 4096, reasoningEffort: "medium" },
         followUp: { enabled: true, steps: [{ delayUnit: "hours" }] },
       }),
     ).toBeNull();
@@ -120,6 +118,34 @@ describe("closed settings values on the create path", () => {
 // THE CONSOLE IS THE CALLER THAT MUST NEVER BE REFUSED FOR ITS OWN OUTPUT. A boundary that trades the
 // silence for a 400 on the editor's own save is the failure this rule could introduce, so two bags the
 // console really produces are asked here.
+// A number of the right type outside its range is 422, not 400: the body parsed, and the value is what
+// the server will not store.
+describe("numbers outside their range on the create path", () => {
+  const cases: [string, Record<string, unknown>][] = [
+    ["debounce.windowSeconds", { debounce: { windowSeconds: -10 } }],
+    [
+      "debounce.maxMessagesPerBurst",
+      { debounce: { maxMessagesPerBurst: -509 } },
+    ],
+    ["vision.maxOutputTokens", { vision: { maxOutputTokens: 0 } }],
+    ["vision.maxOutputTokens", { vision: { maxOutputTokens: 1.5 } }],
+    ["vision.maxOutputTokens", { vision: { maxOutputTokens: 1_000_000 } }],
+  ];
+  for (const [path, settings] of cases) {
+    test(`${path} = ${JSON.stringify(Object.values(settings)[0])} is refused with 422`, () => {
+      const err = refusal(settings);
+      expect(err?.statusCode).toBe(422);
+      expect(err?.field).toBe(path);
+    });
+  }
+
+  test("the edges of a range pass", () => {
+    expect(
+      refusal({ debounce: { windowSeconds: 3, maxMessagesPerBurst: 50 } }),
+    ).toBeNull();
+  });
+});
+
 describe("what the console sends", () => {
   // Captured from the running console on 13/09/2026: the body of an ordinary Behavior-tab save. It
   // carries `vision.extractionPrompt: null`, which the reader honours as "use the default prompt".
@@ -199,7 +225,7 @@ describe("assertSettingsClosedValues", () => {
     }
   });
 
-  // A block NAMED as null is an edit of it (#619), which the reader answers with its defaults.
+  // NOTE: a block NAMED as null is an edit of it, which the reader answers with its defaults.
   test("a block named as null passes", () => {
     expect(caught({ split: null, tts: null }, undefined)).toBeNull();
   });
@@ -221,29 +247,13 @@ describe("assertSettingsClosedValues", () => {
     ).toBe("tts.mode");
   });
 
-  // The schema's `never`: keys the runtime does not read in that position. Tolerated on REST because
-  // the console's Guardrails save materialises them (the describe block above measures that save), but
-  // only with the type the reader reads there: anything else is a value it throws away.
-  test("a key the schema declares never passes with the type the reader reads there", () => {
-    expect(
-      caught(
-        {
-          guardrails: {
-            input: { checks: { promptAdherence: true }, generationPrompt: "x" },
-          },
-        },
-        undefined,
-      ),
-    ).toBeNull();
-  });
-
   test("a never key with another type names the reader's type, not never", () => {
     const err = caught(
       { guardrails: { input: { checks: { promptAdherence: "sim" } } } },
       undefined,
     );
     expect(err?.field).toBe("guardrails.input.checks.promptAdherence");
-    expect(err?.translationParams?.expected).toBe("boolean");
+    expect(err?.translationParams?.expected).toBe("a value of type boolean");
     expect(err?.translationParams?.got).toBe('"sim"');
     expect(
       caught(

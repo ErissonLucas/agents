@@ -1,10 +1,13 @@
 import { openapi } from "@elysiajs/openapi";
 import Elysia from "elysia";
+import { FormatRegistry } from "elysia/type-system";
+import { fullFormats } from "elysia/type-system/format";
 import { adminController } from "@/api/features/admin/admin.controller";
 import { authController } from "@/api/features/auth/auth.controller";
 import { brandingController } from "@/api/features/branding/branding.controller";
 import { healthController } from "@/api/features/health/health.controller";
 import { i18nController } from "@/api/features/i18n/i18n.controller";
+import { passkeysController } from "@/api/features/passkeys/passkeys.controller";
 import { realtimeController } from "@/api/features/realtime/realtime.controller";
 import { updatesController } from "@/api/features/updates/updates.controller";
 import { agentsController } from "@/api/v1/agents.controller";
@@ -15,9 +18,12 @@ import { businessHoursController } from "@/api/v1/business-hours.controller";
 import { chatwootController } from "@/api/v1/chatwoot.controller";
 import { chatwootAdminController } from "@/api/v1/chatwoot-admin.controller";
 import { codeToolsController } from "@/api/v1/code-tools.controller";
+import { dashboardController } from "@/api/v1/dashboard.controller";
+import { documentApprovalsController } from "@/api/v1/document-approvals.controller";
 import { documentTemplatesController } from "@/api/v1/document-templates.controller";
 import { documentsController } from "@/api/v1/documents.controller";
 import { experimentsController } from "@/api/v1/experiments.controller";
+import { instanceHealthController } from "@/api/v1/instance-health.controller";
 import { integrationsController } from "@/api/v1/integrations.controller";
 import { integrationsAdminController } from "@/api/v1/integrations-admin.controller";
 import { knowledgeController } from "@/api/v1/knowledge.controller";
@@ -36,6 +42,7 @@ import {
   oauthMcpCallbackController,
   oauthMcpVaultController,
 } from "@/api/v1/oauth-mcp.controller";
+import { occurrencesController } from "@/api/v1/occurrences.controller";
 import {
   ryzeAdminController,
   ryzeWebhookController,
@@ -44,18 +51,24 @@ import { tenantSettingsController } from "@/api/v1/tenant-settings.controller";
 import { toolsController } from "@/api/v1/tools.controller";
 import { v1Controller } from "@/api/v1/v1.controller";
 import { vaultController } from "@/api/v1/vault.controller";
+import {
+  voiceController,
+  voicePlaygroundController,
+} from "@/api/v1/voice.controller";
 import { webhooksController } from "@/api/v1/webhooks.controller";
 import config from "@/config";
 
-// DEV docs (Scalar): the x-tenant-id header is the SUPER_ADMIN tenant selector, read only on
-// tenant-scoped requests (tenancyPlugin) and ignored for non-super-admin principals (who are pinned
-// to their own tenant). It lives in no route schema, so it would never show in "Try it". We inject it
-// into every authenticated operation of the generated spec, prefilled with "1", purely as a docs
-// convenience. The default is not a grant — auth still decides whether the header is honored.
-//
-// `required: true` is DISPLAY-ONLY: Scalar pre-enables (checks) required params and skips optional
-// ones, so this is the only lever to have x-tenant-id sent by default. It is injected only into the
-// dev spec, never into a route's runtime validation schema, so it imposes no real requirement.
+// NOTE: @elysiajs/openapi replaces the "email" format on the TypeBox registry the whole app shares
+// when it is imported, with a stricter check that refuses valid addresses such as `a%b@x.com` and
+// accepts `a@x-.com`. Every `format: "email"` body (login, invites, tenant creation) is checked by
+// Elysia's own pattern instead, so a docs plugin never decides who can log in.
+FormatRegistry.Set("email", (value) => fullFormats.email.test(value));
+
+// DEV docs (Scalar): x-tenant-id, the SUPER_ADMIN tenant selector, lives in no route schema, so it is
+// injected into every authenticated operation of the dev spec, prefilled with "1", to show in
+// "Try it". The default is not a grant: auth still decides whether the header is honored.
+// `required: true` is DISPLAY-ONLY (Scalar sends required params by default and skips optional
+// ones); it never reaches a route's runtime validation schema.
 const TENANT_HEADER_PARAM = {
   name: "x-tenant-id",
   in: "header",
@@ -107,6 +120,7 @@ function injectTenantHeaderParam(spec: unknown): void {
 }
 
 const api = new Elysia()
+  // Off, the client channel answers like a missing route, ahead of auth and the body (see the gate).
   // DEV-only: post-process the OpenAPI document served at /docs/json to prefill x-tenant-id (see
   // injectTenantHeaderParam). Registered before the openapi plugin so this global hook also wraps the
   // plugin's own spec route; a no-op outside dev or off the spec path.
@@ -114,7 +128,7 @@ const api = new Elysia()
     if (config.env === "production" || !path.endsWith("/docs/json")) return;
     injectTenantHeaderParam(response);
   })
-  // API docs (Scalar) — DEV ONLY (enabled:false in prod skips the routes + spec entirely). Mounted
+  // API docs (Scalar), DEV ONLY (enabled:false in prod skips the routes + spec entirely). Mounted
   // on the API instance so the OpenAPI spec is generated ONLY from the API route schemas (enums,
   // descriptions, tags), never the SPA/static/catch-all routes. Served at /api/docs (+ /api/docs/json).
   .use(
@@ -162,8 +176,8 @@ const api = new Elysia()
           },
         },
         security: [{ bearerToken: [] }, { sessionCookie: [] }],
-        // NOTE: every controller assigns a matching instance-level `tags` (or per-route
-        // `detail.tags` for the mixed v1 controller). Keep this list in sync — a tag declared
+        // Every controller assigns a matching instance-level `tags` (or per-route
+        // `detail.tags` for the mixed v1 controller). Keep this list in sync: a tag declared
         // here with no operations shows as an empty group; an operation with no tag shows loose.
         tags: [
           {
@@ -208,6 +222,11 @@ const api = new Elysia()
           },
           { name: "Audit", description: "Audit log." },
           {
+            name: "Instance health",
+            description:
+              "The instance's own load (pools, queues, ingress lag, event loop) and its alert channels. SUPER_ADMIN only.",
+          },
+          {
             name: "Logs",
             description: "Execution-flow logs & external alert channels.",
           },
@@ -222,6 +241,7 @@ const api = new Elysia()
     }),
   )
   .use(authController)
+  .use(passkeysController)
   .use(healthController)
   .use(i18nController)
   .use(updatesController)
@@ -234,6 +254,7 @@ const api = new Elysia()
   .use(codeToolsController)
   .use(mcpConnectionsController)
   .use(businessHoursController)
+  .use(occurrencesController)
   .use(experimentsController)
   .use(vaultController)
   .use(oauthGoogleVaultController)
@@ -244,19 +265,24 @@ const api = new Elysia()
   .use(webhooksController)
   .use(apiKeysController)
   .use(auditController)
+  .use(dashboardController)
   .use(logsController)
   .use(alertChannelsController)
+  .use(instanceHealthController)
   .use(integrationsController)
   .use(integrationsAdminController)
   .use(knowledgeController)
   .use(n8nExportController)
   .use(documentTemplatesController)
   .use(documentsController)
+  .use(documentApprovalsController)
   .use(mcpOAuthController)
   .use(mcpController)
   .use(mcpMeController)
   .use(mcpAdminController)
   .use(chatwootController)
+  .use(voiceController)
+  .use(voicePlaygroundController)
   .use(chatwootAdminController)
   .use(ryzeWebhookController)
   .use(ryzeAdminController);

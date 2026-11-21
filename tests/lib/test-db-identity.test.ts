@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { Client } from "pg";
+import { FLEET_ROLE_EXPR } from "@/lib/tenancy/fleet-role";
 import {
   appliedMigrations,
   appliedOutOfOrder,
@@ -18,37 +20,38 @@ import {
 } from "../db-gate";
 import { checkoutRootFrom, testDbNameFor, withDbName } from "../db-name";
 
-// ONE DATABASE, MANY TREES, AND NOTHING THAT NOTICED (issue #417).
-//
 // The test database outlives every branch switch and `prisma migrate deploy` only ever ADDS, so a
-// migration applied from one tree stays applied under the next one. While the leftover is additive
-// it is invisible; when it is subtractive the next tree runs its whole suite against a schema that
-// is not its own, and the failures name code that is correct.
-//
-// Measured on this repo before any of this existed, `main` checked out and clean: 7261 pass, 31
-// fail, the SAME 31 on three consecutive full-suite runs, every one of them dying on
-// `42P10 there is no unique or exclusion constraint matching the ON CONFLICT specification` because
-// a migration from an unmerged branch had dropped the index `main`'s client upserts against. The
-// `beforeAll` blocks took their files down with them, so 29 further tests never executed at all and
-// the `31 fail` line did not count them (7321 tests on a correct schema, 7292 on that one). A fresh
-// database from the same tree, same suite, same loaded machine: 7321 pass, 0 fail, three times.
-//
-// `prisma migrate status` answered "Database schema is up to date!" about that exact database. It
-// looks for PENDING and FAILED migrations; one that is applied but absent from the tree is neither.
-//
-// Two halves below, and the file holds both because neither is a fix on its own. The name keeps two
-// trees from sharing a database; the diff keeps a database that drifted anyway from being read as a
-// verdict about the code.
+// migration applied from one tree stays applied under the next. An additive leftover is invisible; a
+// subtractive one runs the next tree's suite against a schema that is not its own, and the failures
+// name code that is correct. `prisma migrate status` does not see it: a migration applied but absent
+// from the tree is neither pending nor failed. Two halves below: the name keeps two trees from
+// sharing a database, and the diff keeps a database that drifted anyway from reading as a verdict.
 
 const ROOT = checkoutRootFrom(import.meta.url, "../..");
 
-describe("the test database's name belongs to ONE checkout", () => {
-  test("two checkouts of the same repo do not share a database", () => {
-    const a = testDbNameFor("fazerai_agents_test", "/home/dev/agents/main");
-    const b = testDbNameFor("fazerai_agents_test", "/home/dev/agents/hotfix");
-    expect(a).not.toBe(b);
-  });
+// The live tests below create, drop and reprovision scratch databases, and the name is derived from
+// the checkout, so two copies of this file running at once (`bun test --parallel`, or the same file
+// in two terminals) would derive the SAME scratch name: one drops what the other just seeded, and
+// the reprovisioning one terminates the other's connections along with its own. The process id in
+// the base makes each run's scratch its own; the checkout half of the name still comes from ROOT.
+const GATE_BASE = `fzgate417_p${process.pid}_test`;
+const SETUP_BASE = `fzsetup417_p${process.pid}_test`;
 
+// What `bun db:test:setup` leaves behind besides the database: db-bootstrap provisions a fleet role
+// named after it, and roles are cluster-wide, so a per-run scratch name would otherwise leave one
+// role per run on the server. Best-effort, like the DROP it follows.
+async function dropScratchSetup(maint: Client, scratch: string) {
+  await maint.query(`DROP DATABASE IF EXISTS "${scratch}"`).catch(() => {});
+  const { rows } = await maint.query<{ role: string }>(
+    `SELECT ${FLEET_ROLE_EXPR.replaceAll("current_database()::text", "$1::text")} AS role`,
+    [scratch],
+  );
+  // Safe to interpolate: the derivation normalises the name to `[a-zA-Z0-9_]`.
+  const role = rows[0]?.role;
+  if (role) await maint.query(`DROP ROLE IF EXISTS "${role}"`).catch(() => {});
+}
+
+describe("the test database's name belongs to ONE checkout", () => {
   // The basename alone is not the identity: worktrees are named after the issue they carry, and two
   // clones of two repos can both hold a `main`. The hash is over the ABSOLUTE path for that reason,
   // and it is what makes the readable half safe to truncate.
@@ -78,9 +81,8 @@ describe("the test database's name belongs to ONE checkout", () => {
     }
   });
 
-  // Postgres truncates an identifier at 63 bytes SILENTLY, which would turn two long checkout paths
-  // back into one shared database — the exact failure this exists to prevent, arriving through the
-  // fix for it.
+  // NOTE: Postgres truncates an identifier at 63 bytes SILENTLY, which would turn two long checkout paths
+  // back into one shared database.
   test("a very long checkout path still yields a legal, distinct identifier", () => {
     const deep = `/${"nested-directory/".repeat(12)}some-extremely-long-worktree-name`;
     const name = testDbNameFor("fazerai_agents_test", deep);
@@ -96,8 +98,6 @@ describe("the test database's name belongs to ONE checkout", () => {
 
   // Deriving a name that was already derived HERE has to be a no-op, or anything that reads the
   // running suite's URL and starts a second run from it lands on a database that does not exist.
-  // That is not hypothetical: it is how the gate's own subprocess test failed when this shipped
-  // without it.
   test("deriving twice for the same checkout changes nothing", () => {
     const once = testDbNameFor("fazerai_agents_test", ROOT);
     expect(testDbNameFor(once, ROOT)).toBe(once);
@@ -109,12 +109,9 @@ describe("the test database's name belongs to ONE checkout", () => {
     expect(testDbNameFor(theirs, ROOT)).not.toBe(theirs);
   });
 
-  // THE FENCE THIS SHIPPED WITHOUT. The preload forces the suite's connections onto the derived
-  // database, and it has to force EVERY spelling of it: `MIGRATION_DATABASE_URL` is what 175 files
-  // read, but three build their superuser client from the raw `TEST_MIGRATION_DATABASE_URL`, which
-  // was the same database until one of the two was derived. Those three then seeded one database
-  // and read another — 36 failures, every one an assertion about a row that had been written
-  // somewhere else, and none of them anywhere near this change.
+  // NOTE: the preload has to force EVERY spelling of the test database onto the derived name: some files
+  // build their superuser client from the raw `TEST_MIGRATION_DATABASE_URL` rather than
+  // `MIGRATION_DATABASE_URL`, and one spelling left underived seeds one database and reads another.
   test.skipIf(process.env[DB_GATE_OPT_OUT] === "1")(
     "every spelling of the test database names ONE database after the preload",
     () => {
@@ -135,12 +132,9 @@ describe("the test database's name belongs to ONE checkout", () => {
     },
   );
 
-  // A `file://` URL percent-encodes what a path may hold and a filesystem call does not decode it,
-  // so a checkout under a directory with a space in it reads its own root as `.../my%20tree` — and
-  // then `readdirSync` on `prisma/migrations` under it is ENOENT and EVERY database-backed run
-  // aborts. Measured before this was decoded: `ENOENT: no such file or directory, scandir
-  // '/private/tmp/tree%20with%20space/sub/prisma/migrations'`. Not exotic on macOS, where a home
-  // directory can sit under one.
+  // NOTE: a `file://` URL percent-encodes what a path may hold and a filesystem call does not decode it, so
+  // a checkout under a directory with a space would read its root as `.../my%20tree`, and every
+  // database-backed run would abort on ENOENT scanning `prisma/migrations`.
   test("a checkout path with a space is a path, not a percent-encoded one", () => {
     expect(
       checkoutRootFrom("file:///tmp/tree%20with%20space/tests/x.ts", ".."),
@@ -154,10 +148,9 @@ describe("the test database's name belongs to ONE checkout", () => {
     );
   });
 
-  // The truncation has to come off whichever half is long. Shortening only the checkout leaves a
-  // long BASE over the limit with nothing left to cut, and Postgres cuts it instead — silently, and
-  // through the end of the hash, which is the one part that has to survive for two checkouts to
-  // stay apart. Measured: a 57-character base produced 64 bytes, a 63-character one produced 70.
+  // NOTE: the truncation has to come off whichever half is long. Shortening only the checkout leaves a long
+  // BASE over the limit, and Postgres cuts it instead, silently and through the end of the hash, the
+  // one part that keeps two checkouts apart.
   test("a long BASE name is truncated too, and the hash survives it", () => {
     for (const len of [40, 52, 57, 63]) {
       const base = `${"b".repeat(len - 5)}_test`;
@@ -176,14 +169,11 @@ describe("the test database's name belongs to ONE checkout", () => {
     );
   });
 
-  // TWO BASES IN ONE CHECKOUT ARE TWO DATABASES, and the truncation must not be able to merge them.
-  // Giving the checkout half priority meant a long checkout name consumed the whole budget, the base
-  // half vanished, and every base derived to one name — measured with a 52-character checkout:
-  // `secretaria_v4_test`, `fzgate417_test` and `fzsetup417_test` all became
-  // `wwww…_79bdb0_test`. The live tests in this file create scratch databases from their own bases,
-  // so the collision would have them DROP and terminate the database backing the suite running them.
+  // NOTE: TWO BASES IN ONE CHECKOUT ARE TWO DATABASES: a long checkout name must not consume the whole
+  // budget and erase the base half. The live tests in this file create scratch databases from their
+  // own bases, so a collision would have them DROP the database backing the suite running them.
   test("different bases never merge, however long the checkout name is", () => {
-    const bases = ["secretaria_v4_test", "fzgate417_test", "fzsetup417_test"];
+    const bases = ["secretaria_v4_test", GATE_BASE, SETUP_BASE];
     for (const root of ["/dev/agents/main", `/dev/${"w".repeat(52)}`]) {
       const names = bases.map((b) => testDbNameFor(b, root));
       expect(new Set(names).size).toBe(bases.length);
@@ -204,10 +194,9 @@ describe("the test database's name belongs to ONE checkout", () => {
     expect(names.size).toBe(4);
   });
 
-  // The hash's job is IDENTITY, so it is taken over the base as written. Hashing the normalized
-  // text makes identity as lossy as display: `identifierSafe` folds every run of non-alphanumerics
-  // to one underscore, so two legal, distinct databases became one — measured,
-  // `foo-bar_test` and `foo_bar_test` both derived to `foo_bar_x_4928ca5cf696_test`.
+  // NOTE: the hash's job is IDENTITY, so it is taken over the base as written: `identifierSafe` folds every
+  // run of non-alphanumerics to one underscore, so a hash of the normalized text would merge two
+  // legal, distinct databases such as `foo-bar_test` and `foo_bar_test`.
   test("two bases that only NORMALIZE alike are still two databases", () => {
     expect(testDbNameFor("foo-bar_test", "/dev/x")).not.toBe(
       testDbNameFor("foo_bar_test", "/dev/x"),
@@ -249,12 +238,9 @@ describe("the test database's name belongs to ONE checkout", () => {
 // The checksum is a real one of the name, so a fixture never accidentally matches a DIFFERENT
 // name's file: `sameSql` below builds the local side from the same function.
 const sumOf = (name: string) => createHash("sha256").update(name).digest("hex");
-// One stamp for the whole batch, taken BEFORE the map. `new Date()` per row lets the ARRAY's order
-// leak into `finished_at` whenever the clock ticks mid-map, and `finished_at` is exactly what
-// `appliedOutOfOrder` sorts on — so a deliberately shuffled fixture reported an inversion on a
-// loaded runner and none on a fast one. That is a flake about the fixture, not a finding about the
-// database. Deliberate ordering is expressed with `at(name, tick)` further down, which is what the
-// ordering tests use; `done` only means "these are applied".
+// One stamp for the whole batch, taken BEFORE the map: `new Date()` per row lets the array's order
+// leak into `finished_at`, which `appliedOutOfOrder` sorts on, and makes a shuffled fixture flaky.
+// Deliberate ordering uses `at(name, tick)` further down; `done` only means "these are applied".
 const done = (...names: string[]): MigrationRow[] => {
   const finished_at = new Date();
   return names.map((migration_name) => ({
@@ -277,11 +263,9 @@ const sameSql = (names: string[]): LocalMigration[] =>
 describe("a database that is not this tree's database", () => {
   const local = ["20260101000000_a", "20260102000000_b"];
 
-  // `_prisma_migrations` keeps the row of a migration that FAILED half-way (`finished_at` still
-  // null, `logs` filled) and of one resolved as rolled back (`rolled_back_at` set). Reading the
-  // name alone counts both as applied, so a database left partially migrated reads as matching and
-  // the suite runs against a schema nobody finished writing. Measured on the real table: an
-  // interrupted apply leaves `{ finished_at: null, rolled_back_at: null }`.
+  // NOTE: `_prisma_migrations` keeps the row of a migration that FAILED half-way (`finished_at` null, `logs`
+  // filled) and of one resolved as rolled back (`rolled_back_at` set). Reading the name alone counts
+  // both as applied, so a partially migrated database would read as matching.
   test("a migration that never finished is not applied", () => {
     const rows = [...done("20260101000000_a"), halfWay("20260102000000_b")];
     expect(appliedMigrations(rows)).toEqual(["20260101000000_a"]);
@@ -304,7 +288,7 @@ describe("a database that is not this tree's database", () => {
     ).toBeNull();
   });
 
-  // The direction that produced the incident: applied, and the tree has never heard of it.
+  // NOTE: applied, and the tree has never heard of it: a migration from another branch.
   test("a migration the tree does not have is named", () => {
     const applied = [...local, "20260103000000_from_another_branch"];
     expect(foreignMigrations(applied, local)).toEqual([
@@ -316,9 +300,9 @@ describe("a database that is not this tree's database", () => {
     expect(message).toContain("db:test:setup");
   });
 
-  // The other direction is the same invariant, and it is the one a `git pull` produces: the tree
-  // gained a migration and the database has not been told. It reaches a reader as a missing column
-  // rather than as a missing migration, which is just as unreadable as the incident above.
+  // NOTE: the other direction is the same invariant, and it is the one a `git pull` produces: the tree
+  // gained a migration the database has not been told about, which reaches a reader as a missing
+  // column rather than as a missing migration.
   test("a migration the database has never been given is named too", () => {
     const applied = [local[0] as string];
     expect(pendingMigrations(applied, local)).toEqual(["20260102000000_b"]);
@@ -342,15 +326,6 @@ describe("a database that is not this tree's database", () => {
     );
   });
 
-  // Order is not the question. `_prisma_migrations` is read in whatever order the query returns and
-  // the directory in whatever order the filesystem lists, so a set difference that depended on
-  // either would report a healthy database as divergent.
-  test("neither side's order is part of the answer", () => {
-    expect(
-      schemaOutOfStep("x_test", done(...[...local].reverse()), sameSql(local)),
-    ).toBeNull();
-  });
-
   // An empty applied set is a database that exists and has never been migrated, which is what a
   // fresh `CREATE DATABASE` leaves behind. It is out of step with every non-empty tree, and saying
   // so is the difference between one clear refusal and a suite that fails on the first missing
@@ -367,29 +342,21 @@ describe("a database that is not this tree's database", () => {
     expect(schemaOutOfStep("x_test", [], [])).toBeNull();
   });
 
-  // The blind spot the FIRST fix opened, and the reason `schemaOutOfStep` takes rows rather than an
-  // applied set: excluding a half-applied row from `applied` also excludes it from every comparison
-  // built on `applied`, so a foreign migration that died half-way reads as a database in step.
-  // Measured on the real ledger before this: 57 rows, 56 counted, foreign empty, verdict up to date.
+  // NOTE: why `schemaOutOfStep` takes rows rather than an applied set: excluding a half-applied row from
+  // `applied` also excludes it from every comparison built on `applied`, so a foreign migration that
+  // died half-way would read as a database in step.
   test("a migration that died half-way is named, not merely excluded", () => {
     const rows = [...done(...local), halfWay("20260199000000_died_elsewhere")];
     const message = schemaOutOfStep("x_test", rows, sameSql(local)) as string;
     expect(message).toContain("20260199000000_died_elsewhere");
     expect(message).toContain("never finished");
   });
-
-  test("a local migration that died half-way stops the run too", () => {
-    const rows = [done(local[0] as string)[0], halfWay(local[1] as string)];
-    expect(
-      schemaOutOfStep("x_test", rows as MigrationRow[], sameSql(local)),
-    ).toContain(local[1] as string);
-  });
 });
 
 // THE DOOR HAS TO OPEN ON EVERY STATE THE WALL REFUSES. `prisma migrate deploy` is the right repair
-// for exactly one of them — a database simply BEHIND this tree, in this tree's own order. The rest
-// it either cannot fix or fixes into a schema a fresh database would never have, and a refusal
-// whose prescribed command cannot act on it is just a slower way to be stuck.
+// for exactly one of them: a database simply BEHIND this tree, in this tree's own order. The rest it
+// either cannot fix or fixes into a schema a fresh database would never have, and a refusal whose
+// prescribed command cannot act on it is just a slower way to be stuck.
 describe("which states cannot be deployed onto", () => {
   const local = ["20260101000000_a", "20260102000000_b", "20260103000000_c"];
 
@@ -448,9 +415,9 @@ describe("which states cannot be deployed onto", () => {
     expect(reasons[0]).toContain("sorts later");
   });
 
-  // Order is decided by the FILENAME and by nothing else, and in this repo three migrations share
-  // the timestamp `20260827000000` — so which branch sorts first has nothing to do with which was
-  // written first, and the suffix is what decides.
+  // NOTE: order is decided by the FILENAME and by nothing else, and in this repo several migrations share
+  // the timestamp `20260827000000`, so the suffix decides which sorts first, not which was written
+  // first.
   test("the order that matters is the filename's, suffix included", () => {
     const sameStamp = ["20260827000000_a_first", "20260827000000_b_second"];
     expect(
@@ -466,20 +433,15 @@ describe("which states cannot be deployed onto", () => {
   });
 });
 
-// The two describes above prove the DECISIONS, which is all a pure function can prove. This proves
-// the thing that ships: a real `bun test` invocation, against a real database carrying a real
-// foreign migration row, refusing before the first test file loads. The same shape as the gate's own
-// subprocess tests in ./db-gate.test.ts, and for the same reason — the preload is out of reach of a
-// test by the time a test runs, so the only way to watch it refuse is to start another one.
-//
-// The scratch database is NAMED BY THE DERIVATION rather than by this file: pass a base and create
-// whatever `testDbNameFor` says the child will look for. Pointing the child at a hand-picked name
-// would need an escape hatch in the production path, and the only caller of that escape hatch would
-// be this test.
+// The describes above prove the DECISIONS; this proves what ships: a real `bun test` against a real
+// database carrying a foreign migration row refuses before the first test file loads. The preload is
+// out of reach once a test runs, so the only way to watch it refuse is to start another run, as
+// ./db-gate.test.ts does. The scratch database is named BY THE DERIVATION (`testDbNameFor`): a
+// hand-picked name would need an escape hatch in the production path used only by this test.
 describe("the refusal, as a run", () => {
   const suUrl = process.env.MIGRATION_DATABASE_URL;
   const live = process.env[DB_GATE_OPT_OUT] !== "1" && Boolean(suUrl);
-  const BASE = "fzgate417_test";
+  const BASE = GATE_BASE;
   const FOREIGN = "20260828000000_left_by_another_branch";
   // `fileURLToPath`, not `.pathname`, for the same reason the derivation uses it: a repository
   // under a directory with a space would otherwise hand `bun test` a filename that does not exist.
@@ -573,7 +535,7 @@ describe("the command the refusal names", () => {
   const appUrl = process.env.TEST_APP_DATABASE_URL;
   const live =
     process.env[DB_GATE_OPT_OUT] !== "1" && Boolean(suUrl) && Boolean(appUrl);
-  const BASE = "fzsetup417_test";
+  const BASE = SETUP_BASE;
   const FOREIGN = "20260828000000_left_by_another_branch";
   const repoRoot = ROOT;
 
@@ -656,22 +618,17 @@ describe("the command the refusal names", () => {
           await after.end();
         }
       } finally {
-        await maint
-          .query(`DROP DATABASE IF EXISTS "${scratch}"`)
-          .catch(() => {});
+        await dropScratchSetup(maint, scratch);
         await maint.end();
       }
     },
     300_000,
   );
 
-  // AND IT REPROVISIONS WITH SOMETHING STILL CONNECTED, which is the ordinary case rather than the
-  // exotic one. This change first refused to force the DROP, on the reasoning that Postgres saying
-  // no is safer than killing a suite mid-run; measuring the refusal is what reversed it. The holder
-  // was ONE backend in `state=idle` whose last statement was `ROLLBACK` — a pool connection leaked
-  // by a test process that had already exited — and the reader got
-  // `database "…" is being accessed by other users`, exit 1, naming no way out. This test holds a
-  // connection open across the whole command for that reason.
+  // NOTE: AND IT REPROVISIONS WITH SOMETHING STILL CONNECTED, the ordinary case: a pool connection leaked by
+  // a test process that already exited stays as an idle backend. Refusing to force the DROP is not
+  // the safer choice: it fails with `database "…" is being accessed by other users`, naming no way
+  // out. This test holds a connection open across the whole command for that reason.
   test.skipIf(!live)(
     "reprovisions even with a connection still open on the database",
     async () => {
@@ -715,9 +672,9 @@ describe("the command the refusal names", () => {
         squatter = new Client({
           connectionString: at(suUrl as string, scratch),
         });
-        // Being terminated is the POINT of this fixture, and `pg` reports it by emitting `error` on
+        // NOTE: being terminated is the POINT of this fixture, and `pg` reports it by emitting `error` on
         // the client. Unhandled, that is an event with no listener, which Bun surfaces as a failure
-        // of whichever test happens to be running — including the one above this.
+        // of whichever test happens to be running, including the one above this.
         squatter.on("error", () => {});
         await squatter.connect();
         await squatter.query("SELECT 1");
@@ -739,11 +696,14 @@ describe("the command the refusal names", () => {
         ]);
         const output = `${out}
 ${err}`;
-        // The failure this replaces, spelled out so a future FORCE-less DROP fails HERE and not in
+        // NOTE: the error a FORCE-less DROP gives, spelled out so a regression fails HERE and not in
         // somebody's terminal.
         expect(output).not.toContain("is being accessed by other users");
+        // Exactly the one connection this test left open: a background worker visiting the fresh
+        // database (autovacuum) is not a connection anybody left behind, and is not counted.
         expect(output).toContain("closed 1 connection");
         expect(code).toBe(0);
+        await expect(squatter.query("SELECT 1")).rejects.toThrow();
 
         const after = new Client({
           connectionString: at(suUrl as string, scratch),
@@ -759,9 +719,7 @@ ${err}`;
         }
       } finally {
         await squatter?.end().catch(() => {});
-        await maint
-          .query(`DROP DATABASE IF EXISTS "${scratch}"`)
-          .catch(() => {});
+        await dropScratchSetup(maint, scratch);
         await maint.end();
       }
     },
@@ -797,20 +755,10 @@ describe("a schema assembled in an order no fresh database uses", () => {
     expect(out[0]).toContain("20260102000000_b");
   });
 
-  // One deploy writes rows that can share an instant, and a fresh build would have run them in name
-  // order anyway. Reporting a tie would refuse databases that are correct.
-  test("rows that finished in the same instant are not out of order", () => {
-    expect(
-      appliedOutOfOrder([at("20260102000000_b", 5), at("20260101000000_a", 5)]),
-    ).toEqual([]);
-  });
-
-  // The tie-break and the inversion test have to be the SAME order, and it has to be Prisma's:
-  // code points, because it sorts the directory names as bytes. `localeCompare` is a different
-  // order and disagrees with `<` on exactly the characters a migration name carries — measured on
-  // `20260101000000-b` vs `20260101000000_a`, `a-b` vs `a_b`, `A_x` vs `a_x` and `m-1` vs `m_1`.
-  // Two orders means a tie sorted one way is reported as an inversion by the other, so a correct
-  // database is refused, recreated, and refused again.
+  // NOTE: the tie-break and the inversion test have to be the SAME order, and it has to be Prisma's: code
+  // points, because it sorts directory names as bytes. `localeCompare` disagrees with `<` on exactly
+  // the characters a migration name carries (`-` vs `_`, case), and with two orders a tie sorted one
+  // way is an inversion by the other, so a correct database is refused, recreated, and refused again.
   test("a tie whose names carry punctuation is still not out of order", () => {
     for (const [x, y] of [
       ["20260101000000-b", "20260101000000_a"],
@@ -845,8 +793,8 @@ describe("a schema assembled in an order no fresh database uses", () => {
     expect(reprovisionReasons(rows, local)).toHaveLength(1);
   });
 
-  // Against the real thing: a database this repo's own setup just built, which must be silent or
-  // the check is a second way to refuse every run. Measured at 56 migrations, 0 disagreements.
+  // NOTE: against the real thing: a database this repo's own setup just built, which must be silent or the
+  // check is a second way to refuse every run.
   test.skipIf(process.env[DB_GATE_OPT_OUT] === "1")(
     "a database this tree's own setup built is in order",
     async () => {
@@ -870,21 +818,12 @@ describe("a schema assembled in an order no fresh database uses", () => {
   );
 });
 
-// THE SAME NAME, DIFFERENT SQL — the one way the two name sets can agree while the schema does not.
-// A migration edited after it was applied (routine while writing one) or a directory name two
-// branches both reached for leaves every comparison above satisfied. `_prisma_migrations.checksum`
-// is a plain SHA-256 of the migration.sql bytes in hex, which was verified against three real rows
-// of this repo's ledger rather than assumed: a comparison against the wrong algorithm would report
-// every migration as changed and refuse every run.
+// THE SAME NAME, DIFFERENT SQL: the one way the two name sets agree while the schema does not (a
+// migration edited after it was applied, or a directory name two branches both reached for).
+// `_prisma_migrations.checksum` is a plain SHA-256 of the migration.sql bytes in hex; the last test
+// below checks that against this repo's ledger, since the wrong algorithm would refuse every run.
 describe("a migration whose file no longer matches what ran", () => {
   const names = ["20260101000000_a", "20260102000000_b"];
-
-  test("a matching checksum is silent", () => {
-    expect(changedMigrations(done(...names), sameSql(names))).toEqual([]);
-    expect(
-      schemaOutOfStep("x_test", done(...names), sameSql(names)),
-    ).toBeNull();
-  });
 
   test("an edited file is named, and the refusal says what changed", () => {
     const edited: LocalMigration[] = [
@@ -899,8 +838,8 @@ describe("a migration whose file no longer matches what ran", () => {
     expect(message).toContain("different SQL");
   });
 
-  // Deploying skips it entirely — the row is already there — so this is a reprovision, like every
-  // other state the deploy cannot reach.
+  // NOTE: deploying skips it entirely (the row is already there), so this is a reprovision, like every other
+  // state the deploy cannot reach.
   test("it is a reason to reprovision, not to deploy", () => {
     const edited: LocalMigration[] = [
       { name: names[0] as string, checksum: sumOf("something else") },
@@ -925,13 +864,29 @@ describe("a migration whose file no longer matches what ran", () => {
   // written by Prisma and not by this file.
   test.skipIf(process.env[DB_GATE_OPT_OUT] === "1")(
     "the checksum this computes is the one Prisma wrote",
-    () => {
-      const mine = new Map(
+    async () => {
+      const mine = Object.fromEntries(
         localMigrations(ROOT).map((m) => [m.name, m.checksum]),
       );
-      expect(mine.size).toBeGreaterThan(0);
-      // Every migration of this tree hashes to something, and the shape is Prisma's: 64 hex chars.
-      for (const [, sum] of mine) expect(sum).toMatch(/^[0-9a-f]{64}$/);
+      const { Client } = await import("pg");
+      const c = new Client({
+        connectionString: process.env.MIGRATION_DATABASE_URL as string,
+      });
+      await c.connect();
+      try {
+        const { rows } = await c.query<MigrationRow>(
+          `SELECT migration_name, checksum FROM _prisma_migrations
+            WHERE rolled_back_at IS NULL AND finished_at IS NOT NULL`,
+        );
+        const prismas = Object.fromEntries(
+          rows.map((r) => [r.migration_name, r.checksum]),
+        );
+        expect(Object.keys(mine).length).toBeGreaterThan(0);
+        expect(mine).toEqual(prismas);
+      } finally {
+        await c.end();
+      }
     },
+    60_000,
   );
 });

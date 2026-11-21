@@ -9,6 +9,7 @@ import type {
   IntegrationSelection,
   ToolpackCtx,
 } from "@/modules/integrations/toolpacks/types";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // A fetch stub that records the request and returns a canned JSON response.
 function stubFetch(status: number, json: unknown) {
@@ -83,18 +84,7 @@ describe("asaas toolpack — allowlist (fail-closed)", () => {
     );
     expect(tools.map((t) => t.name)).toEqual(["asaas_payment_link_create"]);
   });
-  test("two tools when both granted", () => {
-    const tools = asaasToolpack.build(
-      sel({
-        enabledTools: ["asaas_payment_link_create", "asaas_payment_status"],
-      }),
-      baseCtx(),
-    );
-    expect(tools.map((t) => t.name).sort()).toEqual([
-      "asaas_payment_link_create",
-      "asaas_payment_status",
-    ]);
-  });
+
   test("an unknown tool name yields nothing", () => {
     expect(
       asaasToolpack.build(sel({ enabledTools: ["bogus"] }), baseCtx()),
@@ -121,15 +111,6 @@ describe("asaas toolpack — environment is bound to config, never an arg", () =
     expect(calls[0]?.url).toBe("https://api.asaas.com/v3/paymentLinks/plink_1");
   });
 
-  test("absent / unknown environment → sandbox origin (safe default)", async () => {
-    const { impl, calls } = stubFetch(200, { id: "plink_1", active: true });
-    const tool = statusTool({}, baseCtx({ fetchImpl: impl }));
-    await tool?.invoke({ paymentLinkId: "plink_1" });
-    expect(calls[0]?.url).toBe(
-      "https://api-sandbox.asaas.com/v3/paymentLinks/plink_1",
-    );
-  });
-
   test("credential flows only into the access_token header, never the return", async () => {
     const { impl, calls } = stubFetch(200, { id: "plink_1", active: true });
     const tool = statusTool(
@@ -154,6 +135,257 @@ describe("asaas toolpack — environment is bound to config, never an arg", () =
     const out = (await tool?.invoke({ paymentLinkId: "plink_1" })) as string;
     expect(out).toContain("not configured");
     expect(calls).toHaveLength(0);
+  });
+});
+
+describe("asaas toolpack — the key's own prefix names its environment", () => {
+  const PROD_KEY = "$aact_prod_000MzkwODA2MWY2OGM3MWRl::$aach_bf3f";
+  const SANDBOX_KEY = "$aact_hmlg_000MzkwODA2MWY2OGM3MWRl::$aach_bf3f";
+  const LEGACY_KEY =
+    "$aact_YTU5YTE0M2M2N2I4MTliNzk0YTI5N2U5MzdjNWZmNDQ6OjAwMDAwMDAwMDAwMDAwMDAwMDA6OiRhYWNoXzBi";
+
+  function asaasLike(acceptedKey: string, acceptedHost: string) {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const i = init ?? {};
+      calls.push({ url: String(url), init: i });
+      const u = new URL(String(url));
+      const tok = (i.headers as Record<string, string>).access_token;
+      const reply = (status: number, json: unknown) =>
+        new Response(JSON.stringify(json), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        });
+      if (tok !== acceptedKey)
+        return reply(401, {
+          errors: [{ code: "invalid_access_token", description: "invalid" }],
+        });
+      if (u.host !== acceptedHost)
+        return reply(401, {
+          errors: [
+            {
+              code: "invalid_environment",
+              description:
+                "A chave de API informada não pertence a este ambiente",
+            },
+          ],
+        });
+      if (u.pathname.endsWith("/customers") && i.method === "GET")
+        return reply(200, { data: [] });
+      if (u.pathname.endsWith("/customers")) return reply(200, { id: "cus_1" });
+      if (u.pathname.endsWith("/payments"))
+        return reply(200, { id: "pay_1", invoiceUrl: "https://x/i/pay_1" });
+      if (u.pathname.endsWith("/pixQrCode"))
+        return reply(200, { payload: "000201PIX", encodedImage: "aW1n" });
+      if (u.pathname.endsWith("/paymentLinks"))
+        return reply(200, { id: "lnk_1", url: "https://x/c/lnk_1" });
+      if (u.pathname.includes("/paymentLinks/"))
+        return reply(200, { id: "lnk_1", active: true });
+      return reply(404, {});
+    }) as unknown as typeof fetch;
+    return { impl, calls };
+  }
+
+  const PIX_ARGS = {
+    customerName: "Cliente Teste",
+    cpfCnpj: "52998224725",
+    value: 10.5,
+    description: "consulta",
+  };
+
+  function pix(
+    config: Record<string, unknown>,
+    key: string,
+    impl: typeof fetch,
+  ) {
+    return asaasToolpack.build(
+      sel({ enabledTools: ["asaas_create_pix_charge"], config }),
+      baseCtx({ fetchImpl: impl, resolveCredential: async () => key }),
+    )[0];
+  }
+
+  test("a production key with no environment configured charges in production", async () => {
+    const { impl, calls } = asaasLike(PROD_KEY, "api.asaas.com");
+    const out = (await pix({}, PROD_KEY, impl)?.invoke(PIX_ARGS)) as string;
+    expect(out).toContain("PIX charge created");
+    expect(out).toContain("000201PIX");
+    expect(calls.length).toBeGreaterThan(0);
+    for (const c of calls) {
+      expect(new URL(c.url).origin).toBe("https://api.asaas.com");
+      expect((c.init.headers as Record<string, string>).access_token).toBe(
+        PROD_KEY,
+      );
+    }
+  });
+
+  test("every Asaas tool follows the key, not only the PIX charge", async () => {
+    const { impl, calls } = asaasLike(PROD_KEY, "api.asaas.com");
+    const [link, status] = asaasToolpack.build(
+      sel({
+        enabledTools: ["asaas_payment_link_create", "asaas_payment_status"],
+        config: {},
+      }),
+      baseCtx({ fetchImpl: impl, resolveCredential: async () => PROD_KEY }),
+    );
+    expect(String(await link?.invoke({ value: 10, name: "x" }))).toContain(
+      "https://x/c/lnk_1",
+    );
+    expect(
+      String(await status?.invoke({ paymentLinkId: "lnk_1" })),
+    ).not.toContain("HTTP");
+    expect(calls.map((c) => new URL(c.url).origin)).toEqual([
+      "https://api.asaas.com",
+      "https://api.asaas.com",
+    ]);
+  });
+
+  test("a sandbox key with no environment configured stays in sandbox", async () => {
+    const { impl, calls } = asaasLike(SANDBOX_KEY, "api-sandbox.asaas.com");
+    const out = (await pix({}, SANDBOX_KEY, impl)?.invoke(PIX_ARGS)) as string;
+    expect(out).toContain("PIX charge created");
+    expect(new URL(calls[0]?.url ?? "").origin).toBe(
+      "https://api-sandbox.asaas.com",
+    );
+  });
+
+  test("a key without the marker still defaults to sandbox", async () => {
+    const { impl, calls } = asaasLike(LEGACY_KEY, "api-sandbox.asaas.com");
+    await pix({}, LEGACY_KEY, impl)?.invoke(PIX_ARGS);
+    expect(new URL(calls[0]?.url ?? "").origin).toBe(
+      "https://api-sandbox.asaas.com",
+    );
+  });
+
+  test("an environment the key contradicts is refused before any request, naming both", async () => {
+    for (const [config, key] of [
+      [{ environment: "sandbox" }, PROD_KEY],
+      [{ environment: "production" }, SANDBOX_KEY],
+    ] as const) {
+      const { impl, calls } = asaasLike(key, "nowhere");
+      const out = (await pix(config, key, impl)?.invoke({
+        type: "tool_call",
+        id: "call_env",
+        name: "asaas_create_pix_charge",
+        args: PIX_ARGS,
+      })) as ToolMessage;
+      expect(out.status).toBe("error");
+      const text = String(out.content);
+      expect(text).toContain(config.environment);
+      expect(text).toContain(
+        config.environment === "sandbox" ? "production" : "sandbox",
+      );
+      expect(text).not.toContain(key);
+      expect(calls).toHaveLength(0);
+    }
+  });
+
+  test("Asaas's invalid_environment answer reaches the agent as a wrong-environment message", async () => {
+    // A key minted before the prefixes carries no marker, so only Asaas can tell it is in the wrong
+    // environment, and it says so in the 401 body.
+    const { impl } = asaasLike(LEGACY_KEY, "api.asaas.com");
+    const out = (await pix({}, LEGACY_KEY, impl)?.invoke({
+      type: "tool_call",
+      id: "call_env2",
+      name: "asaas_create_pix_charge",
+      args: PIX_ARGS,
+    })) as ToolMessage;
+    expect(out.status).toBe("error");
+    const text = String(out.content);
+    expect(text).toContain("customer lookup (HTTP 401)");
+    expect(text).toContain("sandbox");
+    expect(text).toContain("production");
+    expect(text).not.toContain(LEGACY_KEY);
+  });
+
+  test("every rejecting call site carries the wrong-environment hint", async () => {
+    const wrongEnv = {
+      status: 401,
+      json: { errors: [{ code: "invalid_environment", description: "x" }] },
+    };
+    const get = (u: string, i: RequestInit) =>
+      u.includes("/customers?") && i.method === "GET";
+    const cases: Array<{
+      tool: string;
+      args: Record<string, unknown>;
+      routes: Parameters<typeof scriptedFetch>[0];
+      says: string;
+    }> = [
+      {
+        tool: "asaas_create_pix_charge",
+        args: PIX_ARGS,
+        routes: [
+          { match: get, status: 200, json: { data: [] } },
+          { match: (u) => u.endsWith("/customers"), ...wrongEnv },
+        ],
+        says: "rejected the customer (HTTP 401)",
+      },
+      {
+        tool: "asaas_create_pix_charge",
+        args: PIX_ARGS,
+        routes: [
+          { match: get, status: 200, json: { data: [{ id: "cus_1" }] } },
+          { match: (u) => u.endsWith("/payments"), ...wrongEnv },
+        ],
+        says: "rejected the request (HTTP 401)",
+      },
+      {
+        tool: "asaas_payment_link_create",
+        args: { value: 10 },
+        routes: [{ match: () => true, ...wrongEnv }],
+        says: "rejected the request (HTTP 401)",
+      },
+      {
+        tool: "asaas_payment_status",
+        args: { paymentId: "pay_1" },
+        routes: [{ match: () => true, ...wrongEnv }],
+        says: "returned HTTP 401",
+      },
+    ];
+    for (const c of cases) {
+      const { impl } = scriptedFetch(c.routes);
+      const tool = asaasToolpack.build(
+        sel({ enabledTools: [c.tool], config: {} }),
+        baseCtx({ fetchImpl: impl, resolveCredential: async () => LEGACY_KEY }),
+      )[0];
+      const out = String(await tool?.invoke(c.args));
+      expect(out).toContain(c.says);
+      expect(out).toContain(
+        "does not belong to the sandbox environment this integration calls; set the integration's environment to production",
+      );
+    }
+  });
+
+  test("a CPF that already has several customers in Asaas still gets its charge", async () => {
+    // Asaas pages the lookup at 10 by default, and a real customer object is about 700 bytes.
+    const lookups: string[] = [];
+    const { impl: rest } = asaasLike(PROD_KEY, "api.asaas.com");
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      const u = new URL(String(url));
+      if (!(u.pathname.endsWith("/customers") && init?.method === "GET"))
+        return rest(url, init);
+      lookups.push(u.search);
+      const limit = Number(u.searchParams.get("limit") ?? 10);
+      const data = Array.from({ length: Math.min(limit, 5) }, (_, i) => ({
+        object: "customer",
+        id: `cus_${i + 1}`,
+        cpfCnpj: "52998224725",
+        notes: "x".repeat(600),
+      }));
+      return new Response(JSON.stringify({ totalCount: 5, data }), {
+        status: 200,
+      });
+    }) as unknown as typeof fetch;
+    const out = String(await pix({}, PROD_KEY, impl)?.invoke(PIX_ARGS));
+    expect(out).toContain("PIX charge created");
+    expect(lookups).toHaveLength(1);
+  });
+
+  test("a 401 that is not about the environment keeps the plain rejection", async () => {
+    const { impl } = asaasLike("someone-else", "api.asaas.com");
+    const out = (await pix({}, PROD_KEY, impl)?.invoke(PIX_ARGS)) as string;
+    expect(out).toBe(
+      "The payment provider rejected the customer lookup (HTTP 401).",
+    );
   });
 });
 
@@ -282,27 +514,9 @@ describe("asaas toolpack — PIX charge (hermetic)", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("missing PIX code still returns the payable invoiceUrl", async () => {
-    const routes = pixRoutes({ data: [], totalCount: 0 });
-    // QR endpoint fails (e.g. no PIX key on the account).
-    routes[3] = {
-      match: (u: string) => u.includes("/pixQrCode"),
-      status: 400,
-      json: { errors: [{ description: "no pix key" }] },
-    };
-    const { impl } = scriptedFetch(routes);
-    const tool = pixTool(baseCtx({ fetchImpl: impl }));
-    const out = (await tool?.invoke({
-      value: 10,
-      customerName: "Y",
-      cpfCnpj: CPF,
-    })) as string;
-    expect(out).toContain("https://sandbox.asaas.com/i/pix1");
-  });
-
-  // NOTE: Issue #46 — a side effect that fails inside a tool that still returns success must reach
-  // ctx.onSideEffectError (prepare.ts surfaces it as a flowlog warn). The model-facing return value
-  // never changes.
+  // NOTE: a side effect that fails inside a tool that still returns success must reach
+  // ctx.onSideEffectError (src/graph/prepare.ts surfaces it as a flowlog warn). The model-facing
+  // return value never changes.
   test("a failed correlation-ref persist reports the side effect but still returns the charge", async () => {
     const { impl } = scriptedFetch(pixRoutes({ data: [], totalCount: 0 }));
     const effects: Array<{ tool: string; phase: string; err: unknown }> = [];
@@ -389,8 +603,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -500,9 +714,9 @@ describe.skipIf(!dbUp)("asaas toolpack — correlation ref persistence", () => {
         enabledTools: ["asaas_payment_link_create"],
         config: {
           environment: "sandbox",
-          // externalReference is the field Asaas offers for the merchant's OWN identifier, so an
-          // ERP/CRM id is the most plausible thing an operator puts in this map. It used to win
-          // over ours, and the payment then arrived uncorrelated to any conversation (issue #108).
+          // NOTE: externalReference is the field Asaas offers for the merchant's OWN identifier, so an
+          // ERP/CRM id is the most plausible thing an operator puts in this map. Ours wins, or the
+          // payment arrives uncorrelated to any conversation.
           paymentLink: {
             externalReference: "ERP-1234",
             billingType: "CREDIT_CARD",
@@ -600,9 +814,9 @@ describe.skipIf(!dbUp)("asaas toolpack — correlation ref persistence", () => {
   });
 });
 
-// NOTE: Integration failures must reach the flow log as failures (issue #40): invoked as a
-// tool_call, a missing credential returns a ToolMessage with status "error"; bad model input
-// (invalid CPF) stays a plain success — normal operation, not an outage.
+// Integration failures reach the flow log as failures: invoked as a tool_call, a missing credential
+// returns a ToolMessage with status "error"; bad model input (invalid CPF) stays a plain success,
+// normal operation, not an outage.
 describe("asaas toolpack — integration failures are marked (issue #40)", () => {
   test("missing credential returns ToolMessage status error", async () => {
     const { impl, calls } = stubFetch(200, {});

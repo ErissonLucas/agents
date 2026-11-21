@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { z } from "zod";
@@ -14,19 +14,19 @@ import {
 } from "@/modules/flowlog/settings";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { buildMcpServer } from "@/modules/mcp/server";
+import * as mcpWrite from "@/modules/mcp/write";
 import { readMemoryConfig } from "@/modules/memory/settings";
 import { STT_PROVIDER_NAMES } from "@/modules/stt/providers";
 import { VISION_PROVIDER_NAMES } from "@/modules/vision/providers";
 import { followUpStepFields } from "../utils/followup-step-fields";
 
-// Issue #174. The blocks of `agent_settings_set` were `z.record(z.string(), z.unknown())`, so the
-// shape lived in the description and drifted there unwatched: `vision.provider` was published as
-// three providers while the registry had five.
+// The blocks of `agent_settings_set` are typed rather than `z.record(z.string(), z.unknown())`: a
+// shape that lives only in the description drifts there unwatched.
 //
-// The line these tests hold is the one the schema had to be built on. A reader either HONORS a value
-// (clamps it, trims it, keeps a legacy spelling) or DISCARDS it (replaces it with a default). The
-// schema may refuse the second kind and must still accept the first — copying a clamp into zod turns
-// it into a refusal, and the same write would then succeed in the console and fail through MCP.
+// The line these tests hold: a reader either HONORS a value (clamps it, trims it, keeps a legacy
+// spelling) or DISCARDS it (replaces it with a default). The schema may refuse the second kind and
+// must still accept the first: copying a clamp into zod turns it into a refusal, and the same write
+// would then succeed in the console and fail through MCP.
 
 const patch = z.object(BEHAVIOR_PATCH_SHAPE);
 
@@ -90,12 +90,9 @@ function keywordOf(
   return hit[keyword];
 }
 
-// The blocks `agent_settings_set` exposes — now ALL of them. `guardrails` used to be filtered out
-// here, and that line was the only record anywhere that its absence was a decision rather than an
-// oversight; it did not say why, which is how it became indistinguishable from the four blocks that
-// were simply never registered (issue #402). Everything the aggregate owns is published, so the
-// filter is gone rather than re-pointed: a future exemption belongs in
-// tests/modules/agent-settings-mcp-parity.test.ts, whose NOT_PUBLISHED demands a written reason.
+// The blocks `agent_settings_set` exposes: ALL of them. Everything the aggregate owns is published; a
+// future exemption belongs in tests/modules/agent-settings-mcp-parity.test.ts, whose NOT_PUBLISHED
+// demands a written reason, so an exemption never reads like an oversight.
 const EXPOSED = BEHAVIOR_SETTINGS_KEYS;
 
 // Fields a reader DERIVES rather than stores. Computed from the block's own storable projection, so
@@ -113,9 +110,9 @@ describe("agent_settings_set argument schema", () => {
     );
   });
 
-  // The drift check, and the reason this file exists. A field added to a reader without being
-  // declared here is a field a client is never told about — which is the state the whole tool was
-  // in. Read off the readers themselves, so it cannot go stale the way a list in prose did.
+  // NOTE: The drift check, and the reason this file exists. A field added to a reader without being declared
+  // here is a field a client is never told about. Read off the readers themselves, so it cannot go
+  // stale the way a list in prose does.
   test("every field the readers produce is declared", () => {
     const produced = readBehaviorSettings({}) as unknown as Record<
       string,
@@ -133,13 +130,13 @@ describe("agent_settings_set argument schema", () => {
     expect(missing).toEqual([]);
   });
 
-  // The one field a reader produces that must NOT be declared, and why the exception is COMPUTED
+  // NOTE: The one field a reader produces that must NOT be declared, and why the exception is COMPUTED
   // rather than written down: `observability.fullDetail` is derived from `fullDetailUntil` on every
-  // read (issue #58), so declaring it would let a caller write a value the next read recomputes,
-  // and the stored answer and the computed one could then disagree. `storableObservability` is
-  // already the single projection every writer of that block goes through, so the difference
-  // between what the reader answers and what that projection stores IS the derived set. Written by
-  // hand it would go stale the moment the block gains or loses one.
+  // read, so declaring it would let a caller write a value the next read recomputes, and the stored
+  // answer and the computed one could disagree. `storableObservability` is the single projection every
+  // writer of that block goes through, so the difference between what the reader answers and what that
+  // projection stores IS the derived set. Written by hand it would go stale the moment the block
+  // changes.
   test("the derived set is exactly what the storable projection drops", () => {
     const read = readObservabilityConfig({});
     const dropped = Object.keys(read).filter(
@@ -157,9 +154,9 @@ describe("agent_settings_set argument schema", () => {
     }
   });
 
-  // The two nested shapes the loop above only sees the top of.
-  // Issue #802: the agent's audio check mode is one of three, or null for the instance's; anything
-  // else is refused on write rather than stored and read back as the default.
+  // NOTE: The two nested shapes the loop above only sees the top of.
+  // The agent's audio check mode is one of three, or null for the instance's; anything else is refused
+  // on write rather than stored and read back as the default.
   test("the audio check mode accepts the three and null, and refuses anything else", () => {
     for (const ok of ["off", "shadow", "enforce", null]) {
       expect(patch.safeParse({ tts: { checkMode: ok } }).success).toBe(true);
@@ -185,12 +182,12 @@ describe("agent_settings_set argument schema", () => {
     expect(Object.keys(step).sort()).toEqual(followUpStepFields());
   });
 
-  // What the stale prose got wrong, asserted against the registry rather than against a copy of it —
-  // and read off the PUBLISHED schema, which is the artifact a client actually receives. Poking at
-  // the zod object instead would have missed that `tools/list` drops what it cannot express.
+  // NOTE: Asserted against the registry rather than against a copy of it, and read off the PUBLISHED schema,
+  // which is the artifact a client actually receives: poking at the zod object instead would miss that
+  // `tools/list` drops what it cannot express.
   test("the published choices are the registry's own", async () => {
     const published = await publishedSchema();
-    // NOTE: compared as sets. The claim is membership — every provider the build registers is
+    // Compared as sets. The claim is membership — every provider the build registers is
     // offered, and nothing else is — and the registries are live arrays another test can reorder.
     const choices = (block: string, field: string) =>
       [...(keywordOf(published, block, field, "enum") as string[])].sort();
@@ -250,28 +247,83 @@ describe("agent_settings_set argument schema", () => {
     expect(guidance).toBe("\\S");
   });
 
-  // THE OTHER DIRECTION OF THE SAME INVARIANT, and the reason it needed its own round: on the
-  // guidance side blank was ACCEPTED and thrown away; on the precondition side the server REFUSES it
-  // (`parseToolPrecondition` trims, the write boundary refuses what does not parse), so a
-  // schema-valid call came back as an MCP error with nothing published to predict it.
+  // NOTE: THE OTHER DIRECTION OF THE SAME INVARIANT: on the guidance side blank is ACCEPTED and thrown away;
+  // on the precondition side the server REFUSES it (`parseToolPrecondition` trims, the write boundary
+  // refuses what does not parse), so unpublished, a schema-valid call would come back as an MCP error
+  // with nothing to predict it.
   test("the published precondition refuses the blank the write refuses", async () => {
-    const published = await publishedSchema();
-    const value = published.toolPreconditions?.handoff_to_human;
-    if (!value)
-      throw new Error("toolPreconditions.handoff_to_human not published");
-    const branches = Array.isArray(value.anyOf)
-      ? (value.anyOf as Record<string, unknown>[])
-      : [value];
-    const object = branches.find((b) => b.type === "object") as {
+    // The rule is published once, as the shape of any key (a precondition is keyed by any tool name).
+    const tools = await withClient(async (c) => (await c.listTools()).tools);
+    const tool = tools.find((t) => t.name === "agent_settings_set");
+    if (!tool) throw new Error("agent_settings_set is not listed");
+    const value = (
+      tool.inputSchema as {
+        properties: Record<string, { additionalProperties?: unknown }>;
+      }
+    ).properties.toolPreconditions?.additionalProperties as
+      | Record<string, unknown>
+      | undefined;
+    if (!value) throw new Error("toolPreconditions publishes no rule shape");
+    const flat = (b: Record<string, unknown>): Record<string, unknown>[] => [
+      b,
+      ...((b.anyOf ?? b.oneOf ?? []) as Record<string, unknown>[]).flatMap(
+        flat,
+      ),
+    ];
+    const object = flat(value).find(
+      (b) =>
+        b.type === "object" &&
+        (b.properties as { kind?: { const?: unknown } } | undefined)?.kind
+          ?.const === "attribute",
+    ) as {
       properties: Record<string, { pattern?: string }>;
     };
     expect(object.properties.key?.pattern).toBe("\\S");
     expect(object.properties.equals?.pattern).toBe("\\S");
   });
 
-  // The refusal now happens in the PARSE, before the handler — which is the whole point, since a
-  // client validating against tools/list refuses it before sending. Asserted by the error text: a
-  // blank key must never reach `assertSettingsToolPreconditions`.
+  // NOTE: The refusal happens in the PARSE, before the handler, which is the whole point, since a client
+  // validating against tools/list refuses it before sending. Asserted by the error text: a blank key
+  // must never reach `assertSettingsToolPreconditions`.
+  // A removal is not a new rule: a rule stored under a name that is no longer valid can still go.
+  test("a removal parses whatever its name", () => {
+    expect(
+      z
+        .object(BEHAVIOR_PATCH_SHAPE)
+        .safeParse({ toolPreconditions: { "legacy tool": null } }).success,
+    ).toBe(true);
+  });
+
+  // Any tool's name is a key, and the parse refuses one no tool can carry, before the handler.
+  test("a precondition on any tool name parses, and a name no tool can carry is refused", () => {
+    const rule = { kind: "attribute", scope: "conversation", key: "dia" };
+    // The schema reads every valid name the same way, so one name stands for all of them.
+    expect(
+      z
+        .object(BEHAVIOR_PATCH_SHAPE)
+        .safeParse({ toolPreconditions: { mcp__crm__create_deal: rule } })
+        .success,
+    ).toBe(true);
+    expect(() =>
+      z
+        .object(BEHAVIOR_PATCH_SHAPE)
+        .parse({ toolPreconditions: { "has space": rule } }),
+    ).toThrow(/tool name/);
+  });
+
+  test("a precondition is one condition or a list of 1 to 10, and the parse says so", () => {
+    const rule = { kind: "attribute", scope: "conversation", key: "dia" };
+    const parse = (value: unknown) =>
+      z
+        .object(BEHAVIOR_PATCH_SHAPE)
+        .safeParse({ toolPreconditions: { calendar_create_event: value } })
+        .success;
+    expect(parse([rule, { ...rule, key: "turno" }])).toBe(true);
+    expect(parse([])).toBe(false);
+    expect(parse(Array.from({ length: 11 }, () => rule))).toBe(false);
+    expect(parse([rule, { ...rule, key: " " }])).toBe(false);
+  });
+
   test("a blank precondition key is refused by the schema, not by the write boundary", () => {
     const patch = {
       toolPreconditions: {
@@ -281,8 +333,8 @@ describe("agent_settings_set argument schema", () => {
     expect(() => z.object(BEHAVIOR_PATCH_SHAPE).parse(patch)).toThrow(
       /toolPreconditions/,
     );
-    // And `equals`, whose blank the reader refuses rather than treats as absent — a rule the write
-    // boundary already enforced and the schema did not publish.
+    // NOTE: And `equals`, whose blank the reader refuses rather than treats as absent: a rule the write
+    // boundary enforces, so the schema publishes it.
     expect(() =>
       z.object(BEHAVIOR_PATCH_SHAPE).parse({
         toolPreconditions: {
@@ -302,22 +354,22 @@ describe("agent_settings_set argument schema", () => {
   // BETWEEN fields. docs/mcp.md puts those in the description, so the schema must NOT carry it —
   // copying it in would refuse the half-pair a stored bag legitimately re-sends.
   test("a between-fields requirement stays out of the schema", () => {
-    expect(() =>
+    expect(
       z.object(BEHAVIOR_PATCH_SHAPE).parse({
         modelFallback: { provider: "openai" },
       }),
-    ).not.toThrow();
+    ).toStrictEqual({ modelFallback: { provider: "openai" } });
   });
 
-  // The other half, and the half that made round 9 of this PR a regression: `null` is the documented
-  // way to clear, so it must still parse everywhere blank is refused.
+  // NOTE: The other half: `null` is the documented way to clear, so it must still parse everywhere blank is
+  // refused.
   test("null still clears every field where blank is refused", () => {
     for (const patch of [
       { handoff: { instructions: null } },
       { kanban: { instructions: null } },
       { toolGuidance: { handoff_to_human: null } },
     ]) {
-      expect(() => z.object(BEHAVIOR_PATCH_SHAPE).parse(patch)).not.toThrow();
+      expect(z.object(BEHAVIOR_PATCH_SHAPE).parse(patch)).toStrictEqual(patch);
     }
   });
 
@@ -335,14 +387,10 @@ describe("agent_settings_set argument schema", () => {
   });
 
   // A value the readers HONOR has to parse. Each row is a real reader behavior, not a hypothetical:
-  // the number is clamped, the text is capped only when the write changes it, the list is truncated,
-  // the undeclared key is merged and then normalized away.
+  // the text is capped only when the write changes it, the list is truncated, the undeclared key is
+  // merged and then normalized away. A number is not among them: it is refused outside its range
+  // below.
   const honored: [string, Record<string, unknown>][] = [
-    [
-      "a number past its ceiling (clamped to 120)",
-      { debounce: { windowSeconds: 9999 } },
-    ],
-    ["a number under its floor (clamped to 80)", { split: { maxChars: 1 } }],
     // Zero is a value only where the consumer treats it as one. Here it is the documented way to say
     // OFF, which is why this row and "a zero Chatwoot id" below sit on opposite sides of the line.
     [
@@ -350,7 +398,6 @@ describe("agent_settings_set argument schema", () => {
       { limits: { maxHistoryTokens: 0 } },
     ],
     ["null, which also means OFF", { limits: { maxHistoryTokens: null } }],
-    ["a voice knob past its band (clamped to 4)", { tts: { speed: 9 } }],
     [
       "operator text over its cap (refused only when the write CHANGES it)",
       { handoff: { instructions: "x".repeat(2_000) } },
@@ -358,6 +405,10 @@ describe("agent_settings_set argument schema", () => {
     [
       "a step instruction over its cap",
       { followUp: { steps: [{ instructions: "x".repeat(3_000) }] } },
+    ],
+    [
+      "a writable contact field the agent does not see (dropped on read)",
+      { contactFields: { context: ["name"], writable: ["name", "email"] } },
     ],
     [
       "more attribute keys than the reader keeps",
@@ -390,7 +441,19 @@ describe("agent_settings_set argument schema", () => {
     expect(parsed.success).toBe(true);
   });
 
-  // What the readers DISCARD may be refused, and refusing it is the point: today the call succeeds
+  // The readers used to clamp these silently, so the row kept what was sent while the agent ran on the
+  // edge. They are refused now, with the range in the schema a client reads.
+  const outOfRange: [string, Record<string, unknown>][] = [
+    ["a number past its ceiling", { debounce: { windowSeconds: 9999 } }],
+    ["a number under its floor", { split: { maxChars: 1 } }],
+    ["a voice knob past its band", { tts: { speed: 9 } }],
+  ];
+
+  test.each(outOfRange)("refused: %s", (_label, value) => {
+    expect(patch.safeParse(value).success).toBe(false);
+  });
+
+  // What the readers DISCARD may be refused, and refusing it is the point: otherwise the call succeeds
   // and stores a default nobody asked for.
   const discarded: [string, Record<string, unknown>][] = [
     ["a boolean spelled as a word", { debounce: { enabled: "yes" } }],
@@ -414,9 +477,17 @@ describe("agent_settings_set argument schema", () => {
       "attribute keys that are not strings",
       { attributeContext: { conversation: [1, 2] } },
     ],
+    [
+      "a contact field outside the closed set",
+      { contactFields: { context: ["name", "phone_number"] } },
+    ],
+    [
+      "the identifier as a writable contact field",
+      { contactFields: { writable: ["identifier"] } },
+    ],
     ["a block sent as an array", { debounce: [] }],
-    // The identifier family. `posInt`/`inboxRef` keep a positive integer and drop everything else, so
-    // each of these used to store as null: the pinned target the caller named, silently cleared.
+    // NOTE: The identifier family. `posInt`/`inboxRef` keep a positive integer and drop everything else, so each
+    // of these would store as null: the pinned target the caller named, silently cleared.
     ["a fractional Chatwoot id", { handoff: { targetAgentId: 1.5 } }],
     ["a zero Chatwoot id", { handoff: { targetTeamId: 0 } }],
     ["a negative Chatwoot id", { handoff: { targetInstanceId: -3 } }],
@@ -441,7 +512,7 @@ describe("agent_settings_set argument schema", () => {
       "a padded delay unit",
       { followUp: { steps: [{ delayUnit: " minutes " }] } },
     ],
-    // A model id where a model PROVIDER goes: stored without complaint today, and then
+    // NOTE: A model id where a model PROVIDER goes: it would be stored without complaint, and then
     // resolveNormalizeModel returns `provider_unknown` and the rewrite never runs.
     [
       "a model id in normalizeProvider",
@@ -568,13 +639,25 @@ describe("agent_settings_set over MCP", () => {
     expect(r.text).toContain("toolPreconditions.set_labels.key");
   });
 
-  test("a clamped value is NOT refused, it goes through to the readers", async () => {
-    const r = await callSettingsSet({
-      agent_id: "1",
-      debounce: { windowSeconds: 9999 },
-    });
-    // It fails on the unreachable database, which is the proof: the argument passed validation and
-    // the handler ran. A bound copied into the schema would have stopped it one layer earlier.
-    expect(r.text).not.toContain("Invalid arguments");
+  test("a value outside its range is refused before the handler, naming the field", async () => {
+    // The handler is stubbed: a call that reached it would have been let through by the SDK's parse.
+    let received: Record<string, unknown> | undefined;
+    const handler = spyOn(mcpWrite, "agentSettingsSet").mockImplementation(
+      async (_eff, args) => {
+        received = args as unknown as Record<string, unknown>;
+        return { ok: true, data: { applied: true } };
+      },
+    );
+    try {
+      const r = await callSettingsSet({
+        agent_id: "1",
+        debounce: { windowSeconds: 9999 },
+      });
+      expect(r.isError).toBe(true);
+      expect(r.text).toContain("windowSeconds");
+      expect(received).toBeUndefined();
+    } finally {
+      handler.mockRestore();
+    }
   });
 });

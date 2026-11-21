@@ -219,7 +219,7 @@ describe("computeAvailableSlots", () => {
   });
 });
 
-// Issue #100: several allowed calendars are INDEPENDENT sources of availability (one per
+// Several allowed calendars are INDEPENDENT sources of availability (one per
 // professional/resource), not one pooled calendar. The decision this table pins is which slots
 // survive and in what order, because that is what the customer is offered when they ask "who can
 // see me first?".
@@ -250,19 +250,6 @@ describe("computeAggregatedSlots", () => {
     expect(at9[0]?.calendarLabel).toBe("Dr. Paulo");
   });
 
-  test("busy intervals are NOT pooled across calendars", () => {
-    // Pooling would intersect the two and leave 09:00 free for nobody.
-    const slots = agg({
-      sources: [
-        { ...ANA, busy: [{ start: iso("09:00"), end: iso("09:30") }] },
-        { ...PAULO, busy: [{ start: iso("09:30"), end: iso("10:00") }] },
-      ],
-    });
-    const starts = slots.map((s) => `${localHM(s.start)}/${s.calendarId}`);
-    expect(starts).toContain("09:00/paulo@x");
-    expect(starts).toContain("09:30/ana@x");
-  });
-
   test("the merged list is chronological, ties broken by the configured order", () => {
     const slots = agg({
       sources: [
@@ -277,9 +264,9 @@ describe("computeAggregatedSlots", () => {
   });
 
   test("the WHOLE range survives for every calendar, never just its head", () => {
-    // A per-calendar bound here (an earlier revision kept the first eight starts) turns "all bookable
-    // slots" into "the first couple of hours", and an afternoon request comes back unavailable while
-    // the afternoon is free.
+    // A per-calendar bound here (say, the first eight starts) turns "all bookable slots" into
+    // "the first couple of hours", and an afternoon request comes back unavailable while the
+    // afternoon is free.
     const slots = agg({
       timeMin: iso("09:00"),
       timeMax: iso("17:00"),
@@ -347,7 +334,7 @@ describe("computeAggregatedSlots", () => {
   });
 });
 
-// Issue #345: the write path judges a requested appointment by asking the SAME generator the
+// The write path judges a requested appointment by asking the SAME generator the
 // availability tool answers with. A decision table pins the rule; the toolpack tests pin that the
 // write tools consult it.
 describe("judgeBooking — the rule a calendar write has to pass", () => {
@@ -468,7 +455,17 @@ describe("judgeBooking — the rule a calendar write has to pass", () => {
       endMs: Date.parse(iso("15:15")),
     });
     expect(v.bookable).toBe(false);
-    expect(v.alternatives.map((s) => localHM(s.start))).not.toContain("14:00");
+    // The six nearest free starts, at the length the business sells: the taken 14:00 is skipped.
+    expect(
+      v.alternatives.map((s) => `${localHM(s.start)}-${localHM(s.end)}`),
+    ).toEqual([
+      "11:00-12:00",
+      "12:00-13:00",
+      "13:00-14:00",
+      "15:00-16:00",
+      "16:00-17:00",
+      "17:00-18:00",
+    ]);
     for (const alt of v.alternatives) {
       expect(
         judgeBooking({

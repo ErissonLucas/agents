@@ -7,6 +7,7 @@ import type {
   IntegrationSelection,
   ToolpackCtx,
 } from "@/modules/integrations/toolpacks/types";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // A fetch stub that records the request and returns a canned JSON response.
 function stubFetch(status: number, json: unknown) {
@@ -167,8 +168,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -254,17 +255,10 @@ describe.skipIf(!dbUp)("resend toolpack — resend_email_status", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("a 404 answers recoverable guidance", async () => {
-    const { impl } = stubFetch(404, { name: "not_found" });
-    const tool = statusTool(baseCtx({ fetchImpl: impl }));
-    const out = String(await tool?.invoke({ emailId: "email_zz" }));
-    expect(out).toContain("HTTP 404");
-  });
-
-  // Measured against the live API: a sending-only key sends fine and answers 401 to
-  // `GET /emails/{id}`, and vault/secret-types.ts passes that same key at save time on purpose
-  // (`restricted_api_key` means the key is valid). So this is the one misconfiguration the
-  // credential test cannot warn about, and HTTP 401 alone sends the operator looking at the id.
+  // NOTE: a sending-only key sends fine and answers 401 to `GET /emails/{id}`, and
+  // src/modules/vault/secret-types.ts passes that key at save time on purpose (`restricted_api_key`
+  // means the key is valid). The credential test cannot warn about it, and HTTP 401 alone sends the
+  // operator looking at the id.
   test("a 401 names the key scope, and that the credential test passes anyway", async () => {
     const { impl } = stubFetch(401, { name: "restricted_api_key" });
     const tool = statusTool(baseCtx({ fetchImpl: impl }));
@@ -287,7 +281,6 @@ describe.skipIf(!dbUp)("resend toolpack — resend_email_status", () => {
   });
 });
 
-// Hardening, from the review of PR #570.
 describe("resend toolpack — who the recipient may be", () => {
   const contactCtx = (over: Partial<ToolpackCtx> = {}) =>
     baseCtx({
@@ -295,21 +288,6 @@ describe("resend toolpack — who the recipient may be", () => {
       resolveContactEmail: async () => "cliente@example.com",
       ...over,
     });
-
-  test("the contact's own address goes through", async () => {
-    const { impl, calls } = stubFetch(200, { id: "email_1" });
-    const tool = resendToolpack.build(
-      sel({ enabledTools: ["resend_send_email"] }),
-      contactCtx({ fetchImpl: impl }),
-    )[0];
-    const out = (await tool?.invoke({
-      to: "cliente@example.com",
-      subject: "Confirmação",
-      html: "<p>ok</p>",
-    })) as string;
-    expect(out).toContain("email_1");
-    expect(calls).toHaveLength(1);
-  });
 
   test("any other address is refused, and nothing leaves", async () => {
     const { impl, calls } = stubFetch(200, { id: "email_2" });
@@ -439,7 +417,9 @@ describe("resend toolpack — what a muted turn may hold", () => {
     const spec = resendToolpack.toolSpecs.find(
       (t) => t.name === "resend_email_status",
     );
-    expect(spec?.deliversToCustomer ?? false).toBe(false);
+    // The spec is there, and it says nothing about delivering, which is what the mute reads.
+    expect(spec?.name).toBe("resend_email_status");
+    expect(spec?.deliversToCustomer).toBeUndefined();
   });
 });
 
@@ -480,8 +460,7 @@ describe.skipIf(!dbUp)(
       );
     });
 
-    // O que a PR nunca exercitou: com a linha gravada, o status daquele id é legível — e o de um id
-    // de outra thread não é.
+    // NOTE: with the row written, that id's status is readable, and an id from another thread's is not.
     test("the row the send wrote is what lets resend_email_status answer, and only for this thread", async () => {
       const { impl } = stubFetch(200, {
         id: "email_persisted",

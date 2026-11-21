@@ -2,9 +2,23 @@
 // turns a file (image or PDF) + an instruction into extracted text. Adding a provider = one function
 // + one registry entry. The key never lands in the URL or logs.
 
+import logger from "@/api/lib/logger";
+import { clipText } from "@/lib/text";
 import { reportedCostFromUsage } from "@/modules/pricing/reported";
 import { mediaSubtype, normalizeMediaType } from "./media-conversion";
 export type VisionKind = "image" | "document";
+
+import {
+  ANTHROPIC_VISION_DEFAULT_MAX_TOKENS,
+  type VisionReasoningEffort,
+} from "./output-limits";
+
+export {
+  ANTHROPIC_VISION_DEFAULT_MAX_TOKENS,
+  VISION_MAX_OUTPUT_TOKENS_CAP,
+  VISION_REASONING_EFFORTS,
+  type VisionReasoningEffort,
+} from "./output-limits";
 
 export interface VisionRequest {
   bytes: ArrayBuffer;
@@ -19,12 +33,22 @@ export interface VisionRequest {
   // constant here on purpose: the caller owns the total, so it can spend what is left of it rather
   // than granting every attempt the whole ceiling.
   timeoutMs: number;
+  // The caller's deadline, on top of the attempt's: past it the request in flight is aborted.
+  signal?: AbortSignal;
+  // From `settings.vision`, already validated by the reader. Absent or null = not configured, and the
+  // request carries no field for it (anthropic's required `max_tokens` takes its default).
+  maxOutputTokens?: number | null;
+  reasoningEffort?: VisionReasoningEffort | null;
 }
 
-// What a vision call cost, in the provider's own numbers. Every one of the three endpoints below
-// returns this alongside the text; the contract used to be `Promise<string>`, which made it
-// unrepresentable, so it was parsed away and the spend reached no ledger (issue #316). Optional
-// because an endpoint may omit the block, and an absent count must not be recorded as zero spend.
+function visionSignal(req: VisionRequest): AbortSignal {
+  const own = AbortSignal.timeout(req.timeoutMs);
+  return req.signal ? AbortSignal.any([own, req.signal]) : own;
+}
+
+// What a vision call cost, in the provider's own numbers, returned alongside the text by every
+// endpoint below. Optional because an endpoint may omit the block, and an absent count must not be
+// recorded as zero spend.
 export interface VisionUsage {
   promptTokens: number;
   completionTokens: number;
@@ -33,13 +57,17 @@ export interface VisionUsage {
   // summing both must not have to know which one wrote the row.
   cachedReadTokens: number;
   cacheCreationTokens: number;
-  // What the provider said the call cost, when it did (OpenRouter's `usage.cost`, issue #866).
+  // What the provider said the call cost, when it did (OpenRouter's `usage.cost`).
   reportedCostUsd?: number | null;
 }
 
 export interface VisionResult {
   text: string;
   usage: VisionUsage | null;
+  // The provider stopped at the output ceiling (`max_tokens`, `length`, `MAX_TOKENS`): the text is
+  // what was read before the cut, and the reply does not say so anywhere else.
+  // Absent reads as false, for a provider that has no stop signal to report.
+  truncated?: boolean;
 }
 
 export interface VisionProvider {
@@ -88,11 +116,96 @@ export class VisionError extends Error {
   constructor(
     readonly provider: string,
     readonly status: number,
+    // The provider's own `error.message` on a failed response (see readProviderMessage), kept for
+    // whoever holds the error object and NEVER put in `.message`: the server chose those words, so
+    // they may quote the customer's content, and `.message` reaches execution_logs, alerts and the
+    // conversation's private note (docs/logs.md, the provider boundary).
+    readonly providerMessage: string | null = null,
   ) {
-    // NOTE: never capture the response body — it carries the extracted content (potential PII).
-    super(`vision ${provider} failed with ${status}`);
+    const refusal = refusalOf(providerMessage);
+    super(
+      `vision ${provider} failed with ${status}${refusal ? ` (${refusal})` : ""}`,
+    );
     this.name = "VisionError";
   }
+}
+
+// The refusals a provider states about the file we sent, named in OUR words. A predicate over the
+// provider's text only chooses among these constants, so nothing it wrote crosses into `.message`;
+// an unrecognised refusal stays a bare status, and its words are in the process log.
+const REFUSALS: ReadonlyArray<readonly [RegExp, string]> = [
+  [
+    /dimensions? exceeds? max allowed size/i,
+    "image dimensions exceed max allowed size",
+  ],
+  [/image exceeds .*maximum/i, "image bytes exceed max allowed size"],
+  [/requires \d+ patches/i, "image patches exceed max allowed count"],
+];
+
+function refusalOf(providerMessage: string | null): string | null {
+  if (!providerMessage) return null;
+  for (const [pattern, refusal] of REFUSALS)
+    if (pattern.test(providerMessage)) return refusal;
+  return null;
+}
+
+// How much of a failed body is read (the rest is cancelled, so an enormous one costs nothing) and
+// how much of the message is kept on the line.
+const MAX_ERROR_BODY = 16_384;
+const MAX_PROVIDER_MESSAGE = 300;
+// How long the failed body may take to arrive. It is diagnosis only, and a body that stalls must not
+// spend the time a retry of a 503 needs: past this, what arrived is read and the rest cancelled.
+const ERROR_BODY_DEADLINE_MS = 2_000;
+
+// The `error.message` every vendor here nests the same way (Anthropic, OpenAI, Gemini). Read off the
+// prefix and not only through JSON.parse, because a body cut at the read cap is no longer JSON and
+// its message is still the first thing in it. Anything that is not that field is dropped: an HTML
+// error page or a proxy's prose says nothing the status does not.
+async function readProviderMessage(res: Response): Promise<string | null> {
+  try {
+    if (!res.body) return null;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const deadline = setTimeout(
+      () => reader.cancel().catch(() => {}),
+      ERROR_BODY_DEADLINE_MS,
+    );
+    let text = "";
+    try {
+      while (text.length < MAX_ERROR_BODY) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        text += decoder.decode(value, { stream: true });
+      }
+    } finally {
+      clearTimeout(deadline);
+    }
+    await reader.cancel().catch(() => {});
+    const raw = /"message"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(text)?.[1];
+    if (!raw) return null;
+    let message: string;
+    try {
+      message = JSON.parse(`"${raw}"`) as string;
+    } catch {
+      message = raw;
+    }
+    message = message.replace(/\s+/g, " ").trim();
+    return message ? clipText(message, MAX_PROVIDER_MESSAGE) : null;
+  } catch {
+    return null;
+  }
+}
+
+// The provider's words go to the process log, which makes no PII promise and is the only place a
+// refusal outside REFUSALS is explained.
+async function failure(provider: string, res: Response): Promise<VisionError> {
+  const providerMessage = await readProviderMessage(res);
+  if (providerMessage)
+    logger.warn(
+      { provider, status: res.status, providerMessage },
+      "vision provider refused the request",
+    );
+  return new VisionError(provider, res.status, providerMessage);
 }
 
 function base64(bytes: ArrayBuffer): string {
@@ -100,11 +213,9 @@ function base64(bytes: ArrayBuffer): string {
 }
 
 // The file a chat-completions request carries, as the endpoint spells it. An image goes in an
-// `image_url` part and a PDF in a `file` part, and the endpoint refuses each in the other's place —
-// measured live against gpt-4o (2026-08-26): a PDF sent as `image_url` answers 400 "Invalid MIME
-// type. Only image types are supported.", and an image sent as a `file` part answers 400
-// "unsupported MIME type 'image/png'". So this is decided per REQUEST, the way anthropicExtract
-// already decides between its document and image blocks.
+// `image_url` part and a PDF in a `file` part, and the endpoint answers 400 to each in the other's
+// place. So this is decided per REQUEST, the way anthropicExtract decides between its document and
+// image blocks.
 function chatContentPart(req: VisionRequest): Record<string, unknown> {
   if (req.kind !== "document")
     return {
@@ -139,7 +250,7 @@ async function chatCompletionsExtract(
   defaultBase: string,
 ): Promise<VisionResult> {
   const base = (req.baseURL ?? defaultBase).replace(/\/+$/, "");
-  const body = {
+  const body: Record<string, unknown> = {
     model: req.model,
     messages: [
       {
@@ -148,6 +259,14 @@ async function chatCompletionsExtract(
       },
     ],
   };
+  // NOTE: Each key only when configured, so an agent that set neither sends today's body.
+  // OpenAI's own endpoint refuses `max_tokens` on its reasoning models and asks for
+  // `max_completion_tokens`; OpenRouter and self-hosted servers are only known to read the older
+  // spelling. The call carries no tools, which is what lets chat completions take `reasoning_effort`.
+  if (req.maxOutputTokens != null)
+    body[providerName === "openai" ? "max_completion_tokens" : "max_tokens"] =
+      req.maxOutputTokens;
+  if (req.reasoningEffort != null) body.reasoning_effort = req.reasoningEffort;
   const res = await req.fetchImpl(`${base}/chat/completions`, {
     method: "POST",
     headers: {
@@ -156,11 +275,14 @@ async function chatCompletionsExtract(
     },
     body: JSON.stringify(body),
     redirect: "error",
-    signal: AbortSignal.timeout(req.timeoutMs),
+    signal: visionSignal(req),
   });
-  if (!res.ok) throw new VisionError(providerName, res.status);
+  if (!res.ok) throw await failure(providerName, res);
   const json = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
+    choices?: Array<{
+      message?: { content?: string };
+      finish_reason?: string | null;
+    }>;
     usage?: {
       prompt_tokens?: number;
       completion_tokens?: number;
@@ -182,6 +304,7 @@ async function chatCompletionsExtract(
       usage && reported != null
         ? { ...usage, reportedCostUsd: reported }
         : usage,
+    truncated: json.choices?.[0]?.finish_reason === "length",
   };
 }
 
@@ -213,7 +336,7 @@ async function geminiExtract(req: VisionRequest): Promise<VisionResult> {
   const base = (
     req.baseURL ?? "https://generativelanguage.googleapis.com/v1beta"
   ).replace(/\/+$/, "");
-  const body = {
+  const body: Record<string, unknown> = {
     contents: [
       {
         role: "user",
@@ -224,6 +347,10 @@ async function geminiExtract(req: VisionRequest): Promise<VisionResult> {
       },
     ],
   };
+  // NOTE: `reasoningEffort` is not mapped here: Gemini's thinking levels are a different scale per
+  // model family, and a guessed translation would be a setting that silently means something else.
+  if (req.maxOutputTokens != null)
+    body.generationConfig = { maxOutputTokens: req.maxOutputTokens };
   const res = await req.fetchImpl(
     `${base}/models/${encodeURIComponent(req.model)}:generateContent`,
     {
@@ -234,12 +361,15 @@ async function geminiExtract(req: VisionRequest): Promise<VisionResult> {
       },
       body: JSON.stringify(body),
       redirect: "error",
-      signal: AbortSignal.timeout(req.timeoutMs),
+      signal: visionSignal(req),
     },
   );
-  if (!res.ok) throw new VisionError("gemini", res.status);
+  if (!res.ok) throw await failure("gemini", res);
   const json = (await res.json()) as {
-    candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+    candidates?: Array<{
+      content?: { parts?: Array<{ text?: string }> };
+      finishReason?: string;
+    }>;
     usageMetadata?: {
       promptTokenCount?: number;
       candidatesTokenCount?: number;
@@ -265,7 +395,22 @@ async function geminiExtract(req: VisionRequest): Promise<VisionResult> {
       // this is the discounted subset and never an addition.
       cachedRead: json.usageMetadata?.cachedContentTokenCount,
     }),
+    truncated: json.candidates?.[0]?.finishReason === "MAX_TOKENS",
   };
+}
+
+// The lowest reasoning each Claude family accepts, for `reasoningEffort: "none"`. The API answers 400
+// to the wrong spelling, and a refused call leaves the attachment unread, so the family decides:
+// Sonnet 5.5 refuses `disabled` and takes `between_tools` (thinking only between tool calls, and a
+// vision call has none); Opus 5.5 and Fable 5/5.1 refuse both and cannot turn thinking off at all, so
+// they get the lowest effort instead; every other model takes `disabled`.
+export function anthropicThinkingOff(model: string): Record<string, unknown> {
+  const m = model.toLowerCase();
+  if (m.startsWith("claude-sonnet-5-5"))
+    return { thinking: { type: "between_tools" } };
+  if (m.startsWith("claude-opus-5-5") || m.startsWith("claude-fable-5"))
+    return { output_config: { effort: "low" } };
+  return { thinking: { type: "disabled" } };
 }
 
 // Anthropic messages API. Images use an `image` content block; PDFs use a `document` block.
@@ -283,9 +428,9 @@ async function anthropicExtract(req: VisionRequest): Promise<VisionResult> {
     req.kind === "document"
       ? { type: "document", source }
       : { type: "image", source };
-  const body = {
+  const body: Record<string, unknown> = {
     model: req.model,
-    max_tokens: 2048,
+    max_tokens: req.maxOutputTokens ?? ANTHROPIC_VISION_DEFAULT_MAX_TOKENS,
     messages: [
       {
         role: "user",
@@ -293,6 +438,13 @@ async function anthropicExtract(req: VisionRequest): Promise<VisionResult> {
       },
     ],
   };
+  // NOTE: Current Claude models think adaptively by default, and the effort is what bounds it.
+  // `none` is the switch instead of a level, and each model spells "off" differently (see
+  // anthropicThinkingOff). Unset sends neither key.
+  if (req.reasoningEffort === "none")
+    Object.assign(body, anthropicThinkingOff(req.model));
+  else if (req.reasoningEffort != null)
+    body.output_config = { effort: req.reasoningEffort };
   const res = await req.fetchImpl(`${base}/messages`, {
     method: "POST",
     headers: {
@@ -302,11 +454,12 @@ async function anthropicExtract(req: VisionRequest): Promise<VisionResult> {
     },
     body: JSON.stringify(body),
     redirect: "error",
-    signal: AbortSignal.timeout(req.timeoutMs),
+    signal: visionSignal(req),
   });
-  if (!res.ok) throw new VisionError("anthropic", res.status);
+  if (!res.ok) throw await failure("anthropic", res);
   const json = (await res.json()) as {
     content?: Array<{ type?: string; text?: string }>;
+    stop_reason?: string | null;
     usage?: {
       input_tokens?: number;
       output_tokens?: number;
@@ -326,6 +479,7 @@ async function anthropicExtract(req: VisionRequest): Promise<VisionResult> {
       cacheCreation: json.usage?.cache_creation_input_tokens,
       promptExcludesCached: true,
     }),
+    truncated: json.stop_reason === "max_tokens",
   };
 }
 
@@ -372,12 +526,9 @@ const UNSUPPORTED_IMAGE_SUBTYPES = new Set(["svg+xml", "svg"]);
 
 // Classifies a downloaded file's mime into the extraction kind, or null when unextractable.
 //
-// Normalised through `./media-conversion` rather than parsed here, so there is ONE parser: two of
-// them drift, and they drift on the exotic spellings, which is the whole population these functions
-// exist to classify. Deduping also fixed a case the copy here got wrong — a PDF whose content type
-// carried a parameter (`application/pdf; charset=binary`; Chatwoot serves whatever the uploader's
-// server declared) matched neither the equality nor the `/pdf` suffix, so it was classified
-// unextractable and the document was never read.
+// Normalised through `./media-conversion`, the ONE parser: Chatwoot serves whatever content type the
+// uploader's server declared, so a parameter (`application/pdf; charset=binary`) must not make a
+// document unextractable.
 export function visionKindForMime(mimeType: string | null): VisionKind | null {
   const m = normalizeMediaType(mimeType);
   if (m.startsWith("image/")) {

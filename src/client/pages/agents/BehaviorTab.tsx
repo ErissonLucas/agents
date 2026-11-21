@@ -1,23 +1,30 @@
 import {
   AlertTriangle,
   ArrowRightLeft,
+  BellRing,
   Brain,
   CalendarClock,
   Eye,
   Gauge,
   Image,
+  Inbox,
   Layers,
   LifeBuoy,
   ListChecks,
   Megaphone,
   Mic,
   PenLine,
+  Play,
   Plus,
   Scissors,
   ScrollText,
   ShieldCheck,
+  Square,
+  StickyNote,
   Tag,
   Trash2,
+  UserCheck,
+  UserMinus,
   UserRoundCheck,
   Volume2,
 } from "lucide-react";
@@ -25,6 +32,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
+  ChoiceCards,
   ComboBox,
   type ComboItem,
   CredentialPicker,
@@ -32,6 +40,7 @@ import {
   HelpPopover,
   Input,
   ModelPicker,
+  NumberInput,
   type ScheduleOption,
   SchedulePicker,
   Select,
@@ -40,6 +49,7 @@ import {
 } from "@/client/components";
 import { Markdown } from "@/client/components/Markdown";
 import { useTtsCheckInfo } from "@/client/contexts/AuthContext";
+import { stopSampleOf, useSamplePlayer } from "@/client/hooks/useSamplePlayer";
 import { api } from "@/client/lib/api";
 import { credentialCompat } from "@/client/lib/credentialCompat";
 import { AGENTS_REPO_URL } from "@/client/lib/navigation";
@@ -52,7 +62,11 @@ import {
 } from "@/client/lib/providerDefaults";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { serverNow, serverNowDate } from "@/client/lib/serverClock";
+import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
+import { pickVoiceSample, type VoiceSamples } from "@/client/lib/voiceSample";
+import { formatters } from "@/client/pages/admin/database/format";
+import { MODEL_FALLBACK_TIMEOUT_DEFAULT_MS } from "@/graph/fallback-settings";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import {
@@ -64,42 +78,74 @@ import {
   PROMPT_PREVIEW_CONTACT,
   type PromptRenderOpts,
 } from "@/graph/prompt";
+import { REPLY_AS_TEXT_TOOL } from "@/graph/tools/catalog";
+import { inRange, type NumberRange, numberRange } from "@/lib/number-range";
 import { clipText } from "@/lib/text";
 import type { AgentMode } from "@/modules/agents/mode";
+import {
+  CONTACT_AUTH_RANGES,
+  DEBOUNCE_RANGES,
+  delayRange,
+  LIMITS_RANGES,
+  MODEL_FALLBACK_RANGES,
+  OBSERVABILITY_RANGES,
+  SERVICE_WINDOW_RANGES,
+  SPLIT_RANGES,
+  TTS_SPEAKABLE_RANGES,
+  TTS_TIMEOUT_RANGES,
+  TTS_VOICE_RANGES,
+} from "@/modules/agents/number-ranges";
 import {
   EXTRACTION_PROMPT_MAX,
   FOLLOW_UP_INSTRUCTIONS_MAX,
   SIGNATURE_MAX,
+  SNOOZED_CADENCE_LABEL_MAX,
   TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
 import { formatWindowsSummary } from "@/modules/business-hours/announce";
 import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
 import {
-  CONTACT_AUTH_IDENTIFIERS_TEXT_MAX,
-  CONTACT_AUTH_PHONES_TEXT_MAX,
-} from "@/modules/contact-auth/settings";
+  CONTACT_FIELDS,
+  type ContactField,
+  type ContactFieldsConfig,
+} from "@/modules/chatwoot/contact-fields";
 import { debugModesFrom } from "@/modules/flowlog/debug-mode";
 import {
   FULL_DETAIL_ARM_HOURS,
+  FULL_DETAIL_RETENTION_DEFAULT_DAYS,
   isFullDetailWindowOpen,
   type ObservabilityConfig,
 } from "@/modules/flowlog/settings";
 import { FOLLOW_UP_MAX_STEPS } from "@/modules/followups/settings";
+import { SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES } from "@/modules/followups/snoozed-settings";
 import { looksLikeFishVoiceId } from "@/modules/tts/catalog";
 import {
   SPOKEN_NOTICE_DEFAULT,
   TTS_CHECK_MODES,
+  TTS_TIMEOUT_DEFAULT_MS,
   type TtsCheckMode,
   VOICE_CHOICE_TEXT_MAX,
 } from "@/modules/tts/settings-shared";
 import { visionAcceptsDocuments } from "@/modules/vision/document-support";
+import type { VisionReasoningEffort } from "@/modules/vision/output-limits";
 import { DEFAULT_EXTRACTION_PROMPT } from "@/modules/vision/prompt-default";
 import {
+  type CallFloor,
+  CallFloorContext,
+  CallFloorLine,
+  FieldSize,
+  ToolTokens,
+} from "./CallFloor";
+import { ContactAuthConditionList } from "./ContactAuthConditionFields";
+import {
   type ContactAuthRuleForm,
+  contactAuthGateEmpty,
   contactAuthRuleInvalid,
 } from "./contactAuthRuleForm";
+import { watcherSectionUsed } from "./editorTabs";
 import { HighlightedPromptEditor } from "./HighlightedPromptEditor";
 import { type InboxLabelOption, LabelPicker } from "./LabelPicker";
+import { ModelOverrideFields } from "./ModelOverrideFields";
 import {
   fallbackIsConfigured,
   fallbackModelIsMissing,
@@ -113,13 +159,32 @@ import {
   overrideProviderChanged,
 } from "./modelOverrideForm";
 import { ObservationSection } from "./ObservationSection";
+import {
+  OtherInboxesFields,
+  type OtherInboxesState,
+  otherInboxesBlocksSave,
+} from "./OtherInboxesFields";
 import type { ObservationState } from "./observationFormState";
 import { Section, SectionNav } from "./SectionNav";
-import { signatureOnToggle } from "./signatureFormState";
+import {
+  type ServiceWindowForm,
+  ServiceWindowTemplates,
+} from "./ServiceWindowTemplates";
+import { type SignatureSeed, signatureOnToggle } from "./signatureFormState";
+import {
+  newSnoozedStep,
+  type SnoozedCadenceState,
+  type SnoozedFollowUpIssues,
+  type SnoozedFollowUpState,
+  snoozedFollowUpBlocksSave,
+  snoozedFollowUpIssues,
+} from "./snoozedFollowUpFormState";
 import { TabActionBar } from "./TabActionBar";
 import {
   fishVoiceCheck,
   type TtsFormState,
+  ttsFallbackNeedsOwnCredential,
+  ttsFallbackProviderChanged,
   ttsNormalizerBaseUrlInvalid,
   ttsNormalizerBaseUrlUnsupported,
   ttsNormalizerNeedsOwnCredential,
@@ -131,6 +196,10 @@ import {
 import type { BehaviorRefusals, Hours } from "./types";
 
 // Transcription providers (mirror src/modules/stt/providers.ts).
+// Fish Audio's own speed band: the stored knob takes TTS_VOICE_RANGES.speed, and the adapter clamps it
+// to this, so the field holds Save outside it rather than letting a value go out that Fish never uses.
+const FISH_SPEED_RANGE = numberRange(0.5, 2);
+
 const STT_PROVIDERS = [
   "openai",
   "openai-compatible",
@@ -187,10 +256,14 @@ interface SttState {
   baseURL: string;
 }
 
-// NOTE: The contact authorization gate (agent.settings.contactAuth). Numbers stay text so a
+// The contact authorization gate (agent.settings.contactAuth). Numbers stay text so a
 // half-typed value survives editing; the runtime reader clamps on read and the save normalizes.
 export interface ContactAuthState extends ContactAuthRuleForm {
   enabled: boolean;
+  // The editor's endpoint switch: with conditions, ask the endpoint about what they let through
+  // (saved as `askEndpointAfterRule`); with none, the endpoint decides alone. See
+  // readContactAuthEndpointEnabled for how a stored gate reads.
+  endpointEnabled: boolean;
   url: string;
   credentialRef: string;
   timeoutMs: string;
@@ -206,6 +279,8 @@ export interface ContactAuthState extends ContactAuthRuleForm {
   // The ChatwootInstance the team above was picked from, recorded with it: a team id belongs to one
   // account, and the runtime only assigns it in that one.
   handoffTeamInstanceId: string;
+  // Whether a denial writes the operator's private note.
+  operatorNoteEnabled: boolean;
 }
 
 interface SplitState {
@@ -215,31 +290,12 @@ interface SplitState {
   maxDelayMs: string;
 }
 
-// The operator's closing line (issue #599), mirroring modules/signature. One text, on every channel
-// the agent answers on, and an empty text is the off switch.
-//
-// The bytes the customer receives, built by the SAME rule the runtime applies (modules/signature:
-// blank is two newlines, `--` is two newlines around a `--` line). An operator who has to guess what
-// "separator" means reads it here instead.
-//
-// RENDERED, not shown raw, and that is the point of having it. The field is a plain textarea rather
-// than a rich editor, so `**Gi**` is what the operator types; the preview is the only place that
-// answers whether it lands as bold or as four asterisks. It renders through the same <Markdown> the
-// conversation view and the playground use, which is what a channel that understands Markdown does
-// with it — on one that does not, the characters go out as typed (#603, and the field's own hint).
-// THROUGH `buildPromptVars`, not a hand-written map, so the example context cannot fall behind the
-// chips: it was written by hand first and omitted `{{email_contato}}`, `{{telefone_contato}}` and
-// `{{canal}}`, which the chips offer — so the preview rendered three supported variables as literal
-// text and taught the operator they do not work. Review of #599. The names come from the same
-// function production builds them with, so a variable added there appears here without anyone
-// remembering to.
-//
-// The CONTACT is an example, and the preview says so; the agent and the company are the operator's
-// OWN, the way the prompt editor already renders them. A signature is mostly those two names, so a
-// preview that shows somebody else's is a preview of a message the operator will never send — the
-// acceptance run put it plainly: "o operador que olha a prévia vê um nome de exemplo, não o dele".
-// The generic stand-ins survive for what the editor cannot know yet: an agent still being named,
-// and a tenant with no company name set.
+// The example context for the signature preview, built through `buildPromptVars` (the function
+// production uses), so every variable the chips offer resolves here too. The CONTACT is an example;
+// the agent and the company are the operator's OWN, since a signature is mostly those two names.
+// The stand-ins cover an agent still being named and a tenant with no company name set. The preview
+// RENDERS through <Markdown>: the field is a plain textarea, so the preview is the only place that
+// shows whether `**Gi**` lands as bold or as four asterisks.
 export function signaturePreviewVars(
   agentName?: string | null,
   companyName?: string | null,
@@ -251,24 +307,11 @@ export function signaturePreviewVars(
   });
 }
 
-// THE OPTIONS, not only the variables, because `interpolatePromptVars` answers a schedule name from
-// `opts.availability` and a time name from `opts.now`/`opts.timezone`. Passing the map alone left
-// `{{horario_atendimento}}` literal in the preview while production rendered the real hours — the
-// third finding in this family, after the map itself was completed and after the live path got its
-// options. `tests/client/signature-preview-vars.test.ts` now fences the whole set rather than the
-// name that happened to be reported.
-//
-// The schedule is the operator's OWN, looked up from the Availability the agent is on, so the
-// preview shows the hours they configured instead of a plausible fake. No Availability means
-// `schedule: null`, which is what production passes and what the gate reads as always on.
-// ONE ARRAY PER MESSAGE, since #616, because repetition is the thing being previewed and a preview
-// of one balloon cannot show it. It also makes `once` legible for the first time: the operator sees
-// WHICH of the two messages carries the signature, which is the half of the old rule nobody could
-// read off a single bubble.
-//
-// The message count follows the SPLIT, not the frequency: with the split off the agent sends one
-// message and the two frequencies are the same thing, so showing two balloons there would preview
-// a delivery that never happens.
+// The signature preview, one array per message: repetition is what is being previewed, and under
+// `once` it shows WHICH message carries the signature. The message count follows the SPLIT, not the
+// frequency: with the split off the agent sends one message. `opts` carries the operator's own
+// availability and clock, since `interpolatePromptVars` resolves schedule and time names from it
+// (fenced by tests/client/signature-preview-vars.test.ts).
 export function signaturePreviewParts(
   sig: SignatureState,
   t: (k: string, d: string) => string,
@@ -308,13 +351,18 @@ export interface SignatureState {
   separator: "blank" | "--";
 }
 
-interface VisionState {
+export interface VisionState {
   enabled: boolean;
   provider: string;
   model: string;
   credentialRef: string;
   baseURL: string;
   extractionPrompt: string;
+  // No control on the tab: carried through the save so a value set over the API survives it
+  // (./visionFormState).
+  pdfText: boolean;
+  maxOutputTokens: number | null;
+  reasoningEffort: VisionReasoningEffort | null;
 }
 
 export interface LimitsState {
@@ -322,18 +370,20 @@ export interface LimitsState {
   // Empty string = no ceiling. Kept as text so an operator can clear the field to disable it; the
   // reader turns anything non-positive into null.
   maxHistoryTokens: string;
-  // No control on the tab: carried so the save does not delete it (issue #885, ./limitsFormState).
+  // No control on the tab: carried so the save does not delete it (see ./limitsFormState).
   retrySilence: boolean;
+  // Empty string = no limit, stored as 0 so it is told apart from a key never set (which reads as
+  // the default).
+  maxTurnsPerHour: string;
+  // Same reading as maxTurnsPerHour.
+  maxProactivePerDay: string;
 }
 
-// NOTE: The allowed-host list is edited as raw textarea text (one per line) and only turns into an
-// array on save — the runtime reader normalizes and drops what does not resolve to a hostname, so
-// the operator's half-typed line survives editing instead of vanishing under them.
 // The summarizer's block. The four model fields are an OVERRIDE of the agent's model: all blank is
-// "run on the agent's model", which is what every agent that never touched this means.
+// "run on the agent's model", the default for every agent.
 export interface MemoryState {
   compactionEnabled: boolean;
-  // Each message reaches the model behind the date it was sent (issue #755). On by default.
+  // Each message reaches the model behind the date it was sent. On by default.
   historyDatesEnabled: boolean;
   provider: string;
   model: string;
@@ -349,15 +399,24 @@ export interface ModelFallbackState {
   model: string;
   credentialRef: string;
   baseURL: string;
+  // Seconds in the form, milliseconds in the bag; "" = the default, stored as null.
+  timeoutSeconds: string;
 }
 
-// NOTE: Mirrors agent.settings.takeover / readTakeoverConfig. Its own block rather than a field on
+// Mirrors agent.settings.takeover / readTakeoverConfig. Its own block rather than a field on
 // `handoff`, because the Tools tab REPLACES that one wholesale on every save.
 export interface TakeoverState {
   onHumanReply: boolean;
 }
 
-// NOTE: Mirrors agent.settings.replyGate / readReplyGateConfig (docs/LIVARE-F21-PORTAO-ETIQUETA.md).
+// Mirrors agent.settings.conversationNotes / readConversationNotesConfig.
+export type ConversationNoteFormat = "off" | "activity" | "note";
+export interface ConversationNotesState {
+  toolsUsed: ConversationNoteFormat;
+  errors: ConversationNoteFormat;
+}
+
+// Mirrors agent.settings.replyGate / readReplyGateConfig (docs/LIVARE-F21-PORTAO-ETIQUETA.md).
 // Off by default; the labels are kept as typed, and blank means none.
 export interface ReplyGateState {
   enabled: boolean;
@@ -366,7 +425,7 @@ export interface ReplyGateState {
   removeOnHandoff: boolean;
 }
 
-// NOTE: Which Chatwoot custom attributes the agent sees the CURRENT VALUES of (one key list per
+// Which Chatwoot custom attributes the agent sees the CURRENT VALUES of (one key list per
 // scope). Mirrors agent.settings.attributeContext / readAttributeContextConfig.
 interface AttributeContextState {
   conversation: string[];
@@ -374,14 +433,7 @@ interface AttributeContextState {
   task: string[];
 }
 
-interface ServiceWindowState {
-  enabled: boolean;
-  windowHours: string;
-  templateName: string;
-  templateLanguage: string;
-  templateParams: string;
-  templateContent: string;
-}
+type ServiceWindowState = ServiceWindowForm;
 
 export interface FollowUpStepState {
   delayValue: string;
@@ -403,10 +455,9 @@ interface BehaviorTabProps {
   // The name being edited on General, live, so the signature preview signs with the operator's own
   // agent instead of a stand-in. Empty while a new agent is still unnamed.
   agentName: string;
-  // The active tenant's display name, RESOLVED BY THE PAGE rather than by a hook in here. Reaching
-  // for `useActiveTenantName()` from this tab made it unrenderable without an AuthProvider, which
-  // the full suite hid (an earlier file leaves the context standing) and a sharded CI run would not.
-  // Null while it is still resolving, or when a fleet session has nothing selected.
+  // The active tenant's display name, resolved by the page rather than by a hook here, so this tab
+  // renders without an AuthProvider. Null while it is still resolving, or when a fleet session has
+  // nothing selected.
   companyName: string | null;
   // The refused input this tab draws, if the standing refusal is about one of them. Read in
   // AgentEditorPage and passed as answers -- see the note on the type.
@@ -437,18 +488,24 @@ interface BehaviorTabProps {
   agentModelCredentialRef: string;
   agentModelBaseUrl: string;
   ttsNormalizeCredBaseUrl: string | null;
+  // What every call sends before the history, loaded by the editor; null until it loads.
+  callFloor: CallFloor | null;
+  // The instructions as typed on General, unsaved included: the floor counts them live.
+  draftPrompt: string;
   split: SplitState;
   setSplit: React.Dispatch<React.SetStateAction<SplitState>>;
   signature: SignatureState;
   setSignature: React.Dispatch<React.SetStateAction<SignatureState>>;
+  // What the switch last seeded (`signatureOnToggle`), held by the page so it outlives the tab.
+  signatureSeed: React.MutableRefObject<SignatureSeed | null>;
   vision: VisionState;
   setVision: React.Dispatch<React.SetStateAction<VisionState>>;
   visionCredBaseUrl: string | null;
   limits: LimitsState;
   memory: MemoryState;
   setMemory: React.Dispatch<React.SetStateAction<MemoryState>>;
-  // The agent's mode decides which sections are drawn (issue #494): a watcher never answers, so
-  // the sections that configure how it answers are hidden, and the Observation block appears.
+  // The agent's mode decides which sections are drawn: a watcher never answers, so the sections that
+  // configure how it answers are hidden, and the Observation block appears.
   mode: AgentMode;
   observation: ObservationState;
   setObservation: React.Dispatch<React.SetStateAction<ObservationState>>;
@@ -474,12 +531,20 @@ interface BehaviorTabProps {
   setLimits: React.Dispatch<React.SetStateAction<LimitsState>>;
   takeover: TakeoverState;
   setTakeover: React.Dispatch<React.SetStateAction<TakeoverState>>;
+  conversationNotes: ConversationNotesState;
+  setConversationNotes: React.Dispatch<
+    React.SetStateAction<ConversationNotesState>
+  >;
   replyGate: ReplyGateState;
   setReplyGate: React.Dispatch<React.SetStateAction<ReplyGateState>>;
   attributeContext: AttributeContextState;
   setAttributeContext: React.Dispatch<
     React.SetStateAction<AttributeContextState>
   >;
+  otherInboxes: OtherInboxesState;
+  setOtherInboxes: React.Dispatch<React.SetStateAction<OtherInboxesState>>;
+  contactFields: ContactFieldsConfig;
+  setContactFields: React.Dispatch<React.SetStateAction<ContactFieldsConfig>>;
   serviceWindow: ServiceWindowState;
   setServiceWindow: React.Dispatch<React.SetStateAction<ServiceWindowState>>;
   followUp: FollowUpState;
@@ -487,13 +552,17 @@ interface BehaviorTabProps {
   // True when the WhatsApp→chat redirect is enabled with an inbox wired: the follow-up below is then
   // suppressed for the redirect's entry + widget inboxes (a callout in the section explains it).
   redirectSuppressesFollowUp: boolean;
+  snoozedFollowUp: SnoozedFollowUpState;
+  setSnoozedFollowUp: React.Dispatch<
+    React.SetStateAction<SnoozedFollowUpState>
+  >;
   onScheduleSaved: (savedId: string, setter: (v: string) => void) => void;
   dirty: boolean;
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
-  // Absent for a watcher (issue #494): the bar then shows no playground entry, the way the tab
-  // itself is not drawn for one.
+  // Absent for a watcher: the bar then shows no playground entry, the way the tab itself is not drawn
+  // for one.
   onOpenPlayground?: () => void;
 }
 
@@ -510,119 +579,15 @@ function toScheduleOption(h: Hours): ScheduleOption {
 // Service-window HSM template field: a picker populated with the approved templates of the agent's
 // inbox(es) (live from Chatwoot), over a free-text input that stays the source of truth. With no
 // templates (e.g. baileys channels have none) only the input shows, plus a note. Derived Eden type.
-type SwTemplate = NonNullable<
-  Awaited<
-    ReturnType<
-      ReturnType<
-        (typeof api.api.v1.chatwoot)["service-window-templates"]
-      >["get"]
-    >
-  >["data"]
->["templates"][number];
 
-function ServiceWindowTemplateField({
-  agentId,
-  serviceWindow,
-  setServiceWindow,
-}: {
-  agentId: string;
-  serviceWindow: ServiceWindowState;
-  setServiceWindow: React.Dispatch<React.SetStateAction<ServiceWindowState>>;
-}) {
-  const { t } = useTranslation();
-  const [templates, setTemplates] = useState<SwTemplate[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  useEffect(() => {
-    let cancelled = false;
-    void (async () => {
-      try {
-        const { data } = await api.api.v1.chatwoot["service-window-templates"]({
-          agentId,
-        }).get();
-        if (!cancelled && data) setTemplates(data.templates);
-      } catch {
-        // best-effort: leave the free-text field as the fallback
-      } finally {
-        if (!cancelled) setLoaded(true);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [agentId]);
-  return (
-    <FormField
-      label={t("editor.svcWindowTemplate", "Template name (HSM)")}
-      group
-      description={t(
-        "editor.svcWindowTemplateHint",
-        "Approved template sent outside the window. Blank → skip (private note).",
-      )}
-    >
-      <div className="flex flex-col gap-2">
-        {templates.length > 0 && (
-          <Select
-            value={
-              templates.some((x) => x.name === serviceWindow.templateName)
-                ? serviceWindow.templateName
-                : ""
-            }
-            onChange={(e) => {
-              const tpl = templates.find((x) => x.name === e.target.value);
-              if (tpl) {
-                setServiceWindow({
-                  ...serviceWindow,
-                  templateName: tpl.name,
-                  templateLanguage:
-                    tpl.language || serviceWindow.templateLanguage,
-                });
-              }
-            }}
-            aria-label={t("editor.svcWindowTemplate", "Template name (HSM)")}
-          >
-            <option value="">
-              {t(
-                "editor.svcWindowTemplatePick",
-                "Choose an approved template…",
-              )}
-            </option>
-            {templates.map((tpl) => (
-              <option key={tpl.name} value={tpl.name}>
-                {tpl.language ? `${tpl.name} (${tpl.language})` : tpl.name}
-              </option>
-            ))}
-          </Select>
-        )}
-        <Input
-          value={serviceWindow.templateName}
-          onChange={(e) =>
-            setServiceWindow({
-              ...serviceWindow,
-              templateName: e.target.value,
-            })
-          }
-          placeholder="reengajamento"
-        />
-        {loaded && templates.length === 0 && (
-          <span className="text-text-muted text-xs">
-            {t(
-              "editor.svcWindowNoTemplates",
-              "No approved templates found for this agent's inbox. Type a name manually.",
-            )}
-          </span>
-        )}
-      </div>
-    </FormField>
-  );
-}
-
-// TTS voice/model picker backed by the live listing endpoint (item 10): OpenAI returns a curated set,
+// TTS voice/model picker backed by the live listing endpoint: OpenAI returns a curated set,
 // ElevenLabs is fetched with the vault credential so the operator picks a real per-account voice by
 // name. Eager-loads (when it won't error for lack of a credential) so the trigger shows the human
-// label; typing a custom value still works (parity with the old free input). Fish voices are the
-// exception: searched on the server (by name, or a pasted id looked up), never typed in raw, and a
-// saved id is looked up so the trigger shows its title, or says Fish does not know it.
-function TtsOptionPicker({
+// label; typing a custom value still works. A voice the provider ships a sample for gets a play
+// control beside the field (the chosen voice) and on its row in the list. Fish voices are the
+// exception to typing: searched on the server (by name, or a pasted id looked up), never typed in raw,
+// and a saved id is looked up so the trigger shows its title, or says Fish does not know it.
+export function TtsOptionPicker({
   kind,
   provider,
   credentialRef,
@@ -641,8 +606,12 @@ function TtsOptionPicker({
   placeholder?: string;
   ariaLabel: string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const fishVoices = provider === "fish" && kind === "voices";
+  // The samples each listed voice ships, and the name to announce on its control.
+  const [samples, setSamples] = useState<
+    ReadonlyMap<string, VoiceSamples & { name: string }>
+  >(() => new Map());
   const loaderKey = `${kind}||${provider}||${credentialRef ?? ""}||${baseURL ?? ""}`;
   // Every voice a list or a search returned, so picking one needs no second lookup for its title.
   const known = useRef(new Map<string, ComboItem>());
@@ -656,6 +625,20 @@ function TtsOptionPicker({
         ...(search ? { search } : {}),
       });
       if (error || !data) throw new Error("tts list failed");
+      // Read here, not inside the updater: a malformed answer rejects the loader (the field
+      // shows the list error) instead of throwing while React renders.
+      const rows = data.items.map(
+        (i) =>
+          [
+            i.id,
+            {
+              previewUrl: i.previewUrl,
+              languageSamples: i.languageSamples,
+              name: i.label ?? i.id,
+            },
+          ] as const,
+      );
+      setSamples((prev) => new Map([...prev, ...rows]));
       const items = data.items.map((i) => ({
         id: i.id,
         label: i.label ?? undefined,
@@ -666,7 +649,10 @@ function TtsOptionPicker({
     },
     [provider, kind, credentialRef, baseURL],
   );
-  const loader = useCallback(() => fetchItems(), [fetchItems]);
+  const loader = useCallback(() => {
+    setSamples(new Map());
+    return fetchItems();
+  }, [fetchItems]);
   const searchLoader = useCallback(
     (q: string) =>
       fetchItems(looksLikeFishVoiceId(q) ? q.trim().toLowerCase() : q),
@@ -697,46 +683,120 @@ function TtsOptionPicker({
     };
   }, [fishVoices, credentialRef, value, fetchItems]);
   const check = fishVoices ? fishVoiceCheck(value, lookup) : null;
+  // The sample to play for a voice, in the console's language when the voice has one.
+  const sampleOf = (id: string) => {
+    const voice = samples.get(id);
+    const url = voice && pickVoiceSample(voice, i18n.language);
+    return url && voice ? { url, name: voice.name } : undefined;
+  };
+  const chosenSample = sampleOf(value);
+  // This picker, as the owner of the samples it starts. A new listing (another key, provider or
+  // language) and leaving the page stop its sample, so it never plays on with no control left to stop
+  // it; a sample another picker started is left alone, even when it is the same voice.
+  const me = useRef(Symbol("voice picker")).current;
+  const player = useSamplePlayer(me);
+  const play = (url: string) => player.toggle(url);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: each listing or language change is the trigger.
+  useEffect(() => () => stopSampleOf(me), [loaderKey, i18n.language]);
+  // Choosing another voice stops this picker's sample of the old one, whose control is gone from the
+  // field; a sample of the voice just chosen (heard on its row, then picked) plays on under its Stop.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the chosen voice is the trigger.
+  useEffect(() => stopSampleOf(me, chosenSample?.url), [value]);
+  const sampleLabel = (name: string, on: boolean) =>
+    on
+      ? t("editor.voiceSampleStop", "Stop the sample of {{name}}", { name })
+      : t("editor.voiceSamplePlay", "Play a sample of {{name}}", { name });
+  const sampleTitle = (on: boolean) =>
+    on
+      ? t("editor.voiceSampleStopShort", "Stop sample")
+      : t("editor.voiceSamplePlayShort", "Play sample");
+  const sampleIcon = (on: boolean) =>
+    on ? (
+      <Square className="h-3.5 w-3.5" aria-hidden="true" />
+    ) : (
+      <Play className="h-3.5 w-3.5" aria-hidden="true" />
+    );
+  const chosenOn =
+    chosenSample !== undefined && player.playing === chosenSample.url;
   return (
-    <div className="flex flex-col gap-1">
-      <ComboBox
-        value={value}
-        onChange={onChange}
-        loader={loader}
-        loaderKey={loaderKey}
-        eager
-        items={
-          check?.state === "found"
-            ? [{ id: value.trim(), label: check.label, hint: value.trim() }]
-            : undefined
-        }
-        allowCustom={!fishVoices}
-        searchLoader={fishVoices ? searchLoader : undefined}
-        searchEmptyText={
-          fishVoices
-            ? (q) =>
-                looksLikeFishVoiceId(q)
-                  ? t(
-                      "editor.ttsFishVoiceNotFound",
-                      "Voice not found on Fish Audio.",
-                    )
-                  : t(
-                      "editor.ttsFishVoiceNoMatch",
-                      "No Fish Audio voice with that name. Paste its id to look it up.",
-                    )
-            : undefined
-        }
-        needsCredential={
-          (provider === "elevenlabs" || fishVoices) && !credentialRef
-        }
-        placeholder={placeholder}
-        searchPlaceholder={
-          fishVoices
-            ? t("editor.ttsFishVoiceSearch", "Search by name or paste the id")
-            : t("common.search", "Search")
-        }
-        aria-label={ariaLabel}
-      />
+    <div className="flex w-full flex-col gap-1">
+      <div className="flex w-full items-center gap-1.5">
+        <div className="min-w-0 flex-1">
+          <ComboBox
+            value={value}
+            onChange={onChange}
+            loader={loader}
+            loaderKey={loaderKey}
+            eager
+            items={
+              check?.state === "found"
+                ? [{ id: value.trim(), label: check.label, hint: value.trim() }]
+                : undefined
+            }
+            allowCustom={!fishVoices}
+            searchLoader={fishVoices ? searchLoader : undefined}
+            searchEmptyText={
+              fishVoices
+                ? (q) =>
+                    looksLikeFishVoiceId(q)
+                      ? t(
+                          "editor.ttsFishVoiceNotFound",
+                          "Voice not found on Fish Audio.",
+                        )
+                      : t(
+                          "editor.ttsFishVoiceNoMatch",
+                          "No Fish Audio voice with that name. Paste its id to look it up.",
+                        )
+                : undefined
+            }
+            needsCredential={
+              (provider === "elevenlabs" || fishVoices) && !credentialRef
+            }
+            placeholder={placeholder}
+            searchPlaceholder={
+              fishVoices
+                ? t(
+                    "editor.ttsFishVoiceSearch",
+                    "Search by name or paste the id",
+                  )
+                : t("common.search", "Search")
+            }
+            aria-label={ariaLabel}
+            itemAction={(item) => {
+              const sample = sampleOf(item.id);
+              if (!sample) return null;
+              const on = player.playing === sample.url;
+              return {
+                label: sampleLabel(sample.name, on),
+                hint: sampleTitle(on),
+                pressed: on,
+                icon: sampleIcon(on),
+                onPress: () => play(sample.url),
+              };
+            }}
+          />
+        </div>
+        {chosenSample && (
+          // Beside the field the control says what it does in words; on a row of the list the icon is enough.
+          <button
+            type="button"
+            aria-pressed={chosenOn}
+            aria-label={sampleLabel(chosenSample.name, chosenOn)}
+            onClick={() => play(chosenSample.url)}
+            className={cn(
+              "border-border-hover text-text-muted hover:bg-bg-hover hover:text-text-primary focus-visible:ring-accent-soft inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-md border px-2.5 text-sm transition-colors focus:outline-none focus-visible:ring-2",
+              { "text-accent": chosenOn },
+            )}
+          >
+            {sampleIcon(chosenOn)}
+            <span>
+              {chosenOn
+                ? t("editor.voiceSampleStopText", "Stop")
+                : t("editor.voiceSamplePlayText", "Listen")}
+            </span>
+          </button>
+        )}
+      </div>
       {check?.state === "notFound" && (
         <span className="text-error text-xs" role="alert">
           {t(
@@ -757,7 +817,7 @@ function TtsOptionPicker({
   );
 }
 
-// NOTE: Chatwoot attribute definition (Eden-derived), for the attribute-context pickers below.
+// Chatwoot attribute definition (Eden-derived), for the attribute-context pickers below.
 type InboxCustomAttribute = NonNullable<
   Awaited<
     ReturnType<
@@ -766,7 +826,7 @@ type InboxCustomAttribute = NonNullable<
   >["data"]
 >["attributes"][number];
 
-// NOTE: The three attribute pickers (conversation / contact / kanban card). Each lists the account's
+// The three attribute pickers (conversation / contact / kanban card). Each lists the account's
 // definitions for that scope, and still accepts a typed key the listing doesn't know (an unreachable
 // Chatwoot, or an attribute created after this page loaded) — the runtime only needs the key.
 function AttributeContextPickers({
@@ -880,6 +940,97 @@ function AttributeContextPickers({
   );
 }
 
+// The contact's standard Chatwoot fields, one row each: whether the agent sees the current value,
+// and whether update_contact may change it. A field the agent cannot see cannot be writable, so
+// clearing "in context" clears "can update" too. Mirrors readContactFieldsConfig.
+function ContactFieldsPicker({
+  contactFields,
+  setContactFields,
+}: {
+  contactFields: ContactFieldsConfig;
+  setContactFields: React.Dispatch<React.SetStateAction<ContactFieldsConfig>>;
+}) {
+  const { t } = useTranslation();
+  const labels: Record<ContactField, string> = {
+    name: t("editor.contactFieldName", "Name"),
+    email: t("editor.contactFieldEmail", "Email"),
+    company_name: t("editor.contactFieldCompany", "Company"),
+    city: t("editor.contactFieldCity", "City"),
+    country: t("editor.contactFieldCountry", "Country"),
+    description: t("editor.contactFieldDescription", "Description"),
+  };
+  const setVisible = (field: ContactField, on: boolean) =>
+    setContactFields((prev) => ({
+      context: on
+        ? CONTACT_FIELDS.filter((f) => f === field || prev.context.includes(f))
+        : prev.context.filter((f) => f !== field),
+      writable: on ? prev.writable : prev.writable.filter((f) => f !== field),
+    }));
+  const setWritable = (field: ContactField, on: boolean) =>
+    setContactFields((prev) => ({
+      ...prev,
+      writable: on
+        ? CONTACT_FIELDS.filter((f) => f === field || prev.writable.includes(f))
+        : prev.writable.filter((f) => f !== field),
+    }));
+  return (
+    <FormField
+      group
+      label={t("editor.contactFields", "Contact details")}
+      description={t(
+        "editor.contactFieldsHint",
+        "The contact's own Chatwoot fields. The agent sees the current value of each one you check, and can save what the customer tells it in the ones marked as updatable.",
+      )}
+    >
+      <div className="flex flex-col gap-1.5">
+        {CONTACT_FIELDS.map((field) => {
+          const visible = contactFields.context.includes(field);
+          return (
+            <div
+              key={field}
+              className="flex flex-wrap items-center gap-x-4 gap-y-1"
+            >
+              <span className="text-text-primary w-28 text-sm">
+                {labels[field]}
+              </span>
+              <label className="text-text-secondary flex items-center gap-1.5 text-xs">
+                <input
+                  type="checkbox"
+                  checked={visible}
+                  onChange={(e) => setVisible(field, e.target.checked)}
+                />
+                {t("editor.contactFieldVisible", "In context")}
+              </label>
+              <label
+                className={cn(
+                  "text-text-secondary flex items-center gap-1.5 text-xs",
+                  { "opacity-50": !visible },
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={contactFields.writable.includes(field)}
+                  disabled={!visible}
+                  onChange={(e) => setWritable(field, e.target.checked)}
+                />
+                {t("editor.contactFieldWritable", "Agent can update")}
+              </label>
+              {field === "email" && contactFields.writable.includes(field) && (
+                <span className="text-warning basis-full text-xs">
+                  {t(
+                    "editor.contactFieldEmailGate",
+                    "The email is one of the values contact authorization sends to identify the person, so an agent that can change it changes who that check asks about.",
+                  )}
+                </span>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </FormField>
+  );
+}
+
 // Team a refused conversation is assigned to after the open. Fed by the same live listing the
 // handoff pinned-target picker uses, which only lists when the agent serves exactly ONE Chatwoot
 // account (teams are account-scoped). A stored id that is not in the listing still shows, so a
@@ -938,13 +1089,10 @@ function ContactAuthTeamSelect({
   // offers teams in.
   const instanceId =
     accounts.length === 1 ? (accounts[0]?.instanceId ?? "") : "";
-  // A Chatwoot team id means something inside ONE account, so what makes a stored target usable is
-  // the ACCOUNT RECORDED NEXT TO IT — the same rule the runtime applies per conversation
-  // (`teamTargetUsable` in modules/chatwoot/webhook.ts): the recorded account decides, and counting
-  // accounts is only the fallback for a value stored before that field existed. Judging by the count
-  // alone, as this did, threw away a target the runtime would have used: an agent bound to one inbox
-  // per account (a test inbox beside the live one) had its team wiped just by opening this tab, and
-  // the write marked the tab unsaved on top of it.
+  // A Chatwoot team id means something inside ONE account, so the ACCOUNT RECORDED NEXT TO IT
+  // decides whether a stored target is usable, the same rule as `teamTargetUsable` in
+  // modules/chatwoot/webhook.ts. Counting accounts is only the fallback for a value stored without
+  // one; judged by the count alone, an agent with one inbox per account would lose its team here.
   const storedAccount = accounts.find((a) => a.instanceId === storedInstanceId);
   const storedUsable = storedInstanceId
     ? !!storedAccount
@@ -994,7 +1142,7 @@ function ContactAuthTeamSelect({
             {accounts.length === 0
               ? t(
                   "editor.handoffPinnedNoInbox",
-                  "Bind at least one inbox in the Channels tab first.",
+                  "Attach this agent to at least one inbox in the Channels tab first, to answer or to observe it.",
                 )
               : keptElsewhere
                 ? t(
@@ -1017,22 +1165,12 @@ function ContactAuthTeamSelect({
   );
 }
 
-// The multi-step follow-up editor: an ordered list of step cards (delay + instructions + optional
-// label, and a resolve toggle on the LAST step). Labels are fetched once per agent from the inbox.
-function FollowUpStepsEditor({
-  agentId,
-  followUp,
-  setFollowUp,
-  stepRefusals,
-}: {
-  agentId: string;
-  followUp: FollowUpState;
-  setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
-  // By index: the server refuses a note as `followUp.steps[2].instructions`, and the step it names is
-  // the one that has to carry the mark.
-  stepRefusals: readonly (string | null)[];
-}) {
-  const { t } = useTranslation();
+// The agent inbox's labels, for the label pickers of a step list (and the snoozed ladder's cadence
+// label). Fetched once per agent; best-effort, the pickers stay free-text without it.
+function useInboxLabels(agentId: string): {
+  labels: InboxLabelOption[];
+  multiAccount: boolean;
+} {
   const [labels, setLabels] = useState<InboxLabelOption[]>([]);
   const [multiAccount, setMultiAccount] = useState(false);
   useEffect(() => {
@@ -1052,33 +1190,83 @@ function FollowUpStepsEditor({
       cancelled = true;
     };
   }, [agentId]);
+  return { labels, multiAccount };
+}
 
-  const steps = followUp.steps;
+// The multi-step follow-up editor: an ordered list of step cards (delay + instructions + optional
+// label, and a resolve toggle on the LAST step). Labels are fetched once per agent from the inbox.
+function FollowUpStepsEditor({
+  agentId,
+  followUp,
+  setFollowUp,
+  stepRefusals,
+}: {
+  agentId: string;
+  followUp: FollowUpState;
+  setFollowUp: React.Dispatch<React.SetStateAction<FollowUpState>>;
+  // By index: the server refuses a note as `followUp.steps[2].instructions`, and the step it names is
+  // the one that has to carry the mark.
+  stepRefusals: readonly (string | null)[];
+}) {
+  const { t } = useTranslation();
+  const { labels, multiAccount } = useInboxLabels(agentId);
+  return (
+    <StepsEditor
+      steps={followUp.steps}
+      setSteps={(update) =>
+        setFollowUp((prev) => ({ ...prev, steps: update(prev.steps) }))
+      }
+      labels={labels}
+      multiAccount={multiAccount}
+      stepRefusals={stepRefusals}
+      showAppointmentPause={followUp.pauseWhileAppointment}
+      firstDelayLabel={t("editor.followUpDelay", "Inactivity delay")}
+      newStep={() => ({
+        delayValue: "1",
+        delayUnit: "days",
+        instructions: "",
+        assignLabels: [],
+        resolve: false,
+        ignoreAppointmentPause: false,
+      })}
+    />
+  );
+}
+
+// One ladder's step cards, shared by the follow-up and the snoozed follow-up, whose steps are the
+// same shape (one step reader on the server, one step mapper in ./followUpFormState): delay + unit,
+// instructions, labels to assign, and "resolve" on the LAST step only.
+function StepsEditor({
+  steps,
+  setSteps,
+  labels,
+  multiAccount,
+  stepRefusals,
+  showAppointmentPause,
+  firstDelayLabel,
+  newStep,
+}: {
+  steps: FollowUpStepState[];
+  setSteps: (
+    update: (prev: FollowUpStepState[]) => FollowUpStepState[],
+  ) => void;
+  labels: InboxLabelOption[];
+  multiAccount: boolean;
+  stepRefusals: readonly (string | null)[];
+  // The per-step appointment exemption, drawn only where the ladder has the agent-wide pause on. The
+  // snoozed ladder has no appointment pause, so it never draws it (the value is still carried).
+  showAppointmentPause: boolean;
+  firstDelayLabel: string;
+  newStep: () => FollowUpStepState;
+}) {
+  const { t } = useTranslation();
   const updateStep = (index: number, patch: Partial<FollowUpStepState>) =>
-    setFollowUp((prev) => ({
-      ...prev,
-      steps: prev.steps.map((s, i) => (i === index ? { ...s, ...patch } : s)),
-    }));
-  const addStep = () =>
-    setFollowUp((prev) => ({
-      ...prev,
-      steps: [
-        ...prev.steps,
-        {
-          delayValue: "1",
-          delayUnit: "days",
-          instructions: "",
-          assignLabels: [],
-          resolve: false,
-          ignoreAppointmentPause: false,
-        },
-      ],
-    }));
+    setSteps((prev) =>
+      prev.map((s, i) => (i === index ? { ...s, ...patch } : s)),
+    );
+  const addStep = () => setSteps((prev) => [...prev, newStep()]);
   const removeStep = (index: number) =>
-    setFollowUp((prev) => ({
-      ...prev,
-      steps: prev.steps.filter((_, i) => i !== index),
-    }));
+    setSteps((prev) => prev.filter((_, i) => i !== index));
 
   return (
     <div className="flex flex-col gap-3">
@@ -1088,10 +1276,10 @@ function FollowUpStepsEditor({
           <div
             // biome-ignore lint/suspicious/noArrayIndexKey: steps are positional (no stable id); reorder is add/remove only
             key={index}
-            className="flex flex-col gap-3 rounded-lg border border-border bg-bg-secondary p-3"
+            className="border-border bg-bg-secondary flex flex-col gap-3 rounded-lg border p-3"
           >
             <div className="flex items-center justify-between gap-2">
-              <h5 className="font-medium text-sm text-text-secondary">
+              <h5 className="text-text-secondary text-sm font-medium">
                 {t("editor.followUpStep", "Step {{n}}", { n: index + 1 })}
               </h5>
               {steps.length > 1 && (
@@ -1099,7 +1287,7 @@ function FollowUpStepsEditor({
                   type="button"
                   onClick={() => removeStep(index)}
                   aria-label={t("editor.followUpRemoveStep", "Remove step")}
-                  className="flex h-7 w-7 items-center justify-center rounded text-text-muted transition-colors hover:text-error"
+                  className="text-text-muted hover:text-error flex h-7 w-7 items-center justify-center rounded transition-colors"
                 >
                   <Trash2 className="h-4 w-4" aria-hidden="true" />
                 </button>
@@ -1108,15 +1296,14 @@ function FollowUpStepsEditor({
             <FormField
               label={
                 index === 0
-                  ? t("editor.followUpDelay", "Inactivity delay")
+                  ? firstDelayLabel
                   : t("editor.followUpStepDelay", "Wait after previous step")
               }
               group
             >
               <div className="flex items-stretch gap-2">
-                <Input
-                  type="number"
-                  min={1}
+                <NumberInput
+                  range={delayRange(step.delayUnit)}
                   value={step.delayValue}
                   onChange={(e) =>
                     updateStep(index, { delayValue: e.target.value })
@@ -1157,6 +1344,11 @@ function FollowUpStepsEditor({
                   "E.g.: Greet the customer warmly, remind them of the open question, and offer to help.",
                 )}
               />
+              <FieldSize
+                max={FOLLOW_UP_INSTRUCTIONS_MAX}
+                text={step.instructions}
+                sentWith="followUp"
+              />
             </FormField>
             <FormField
               label={t("editor.followUpAssignLabel", "Assign label")}
@@ -1176,7 +1368,7 @@ function FollowUpStepsEditor({
             </FormField>
             {/* Only while the agent-wide pause is ON: with it off nothing pauses, so this switch
                 would decide nothing. Hidden is not off — the value is kept and saved either way. */}
-            {followUp.pauseWhileAppointment && (
+            {showAppointmentPause && (
               <div className="flex flex-col gap-1.5">
                 <SwitchField
                   checked={step.ignoreAppointmentPause}
@@ -1197,14 +1389,24 @@ function FollowUpStepsEditor({
               </div>
             )}
             {isLast && (
-              <SwitchField
-                checked={step.resolve}
-                onCheckedChange={(v) => updateStep(index, { resolve: v })}
-                label={t(
-                  "editor.followUpResolve",
-                  "Resolve the conversation on this step",
+              <div className="flex flex-col gap-1.5">
+                <SwitchField
+                  checked={step.resolve}
+                  onCheckedChange={(v) => updateStep(index, { resolve: v })}
+                  label={t(
+                    "editor.followUpResolve",
+                    "Resolve the conversation on this step",
+                  )}
+                />
+                {step.resolve && !step.instructions.trim() && (
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.followUpResolveSilentHint",
+                      "With no instructions, this step sends no message: it only applies the labels and resolves the conversation.",
+                    )}
+                  </p>
                 )}
-              />
+              </div>
             )}
           </div>
         );
@@ -1219,39 +1421,379 @@ function FollowUpStepsEditor({
   );
 }
 
-// What a WATCHER's Behavior tab shows. It used to be a short list, because a monitoring agent ran
-// one model call and wrote labels: everything about ANSWERING was hidden, and so was everything a
-// classifier had no use for. A watcher now runs the ordinary graph (issue #568), so the rule is a
-// different one — hide what is about SPEAKING TO THE CUSTOMER, show everything else, because
-// everything else runs.
-//
-// Hidden, therefore: availability and the away message (when it answers), grouping (the responder's
-// debounce; a watcher has its own burst window on Observation), audio, splitting, images,
-// contact authorization, takeover and the proactive ladder. Each of those either decides how a reply
-// goes out or gates one, and a watcher has no reply.
-//
-// Shown, and new here: DATA IN CONTEXT, which builds a prompt block on every turn including this
-// one, and EXECUTION LIMITS, which bound the tool calls a watcher now actually makes.
-//
-// Hidden, not unmounted (`Section.hidden`): the form keeps its state, and flipping the mode back
-// shows it again untouched.
+// The snoozed follow-up (settings.snoozedFollowUp, docs/snoozed-followup.md): reminders on a PERSON's
+// behalf when they snoozed a conversation "until next reply" and the customer never answered. A list
+// of cadences, each a step list in the follow-up's own editor: the default one (label null, optional)
+// first, then up to SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES picked by a Chatwoot label. What the reader
+// would drop (a label taken twice, a cadence with no step) is flagged here and blocks Save, instead of
+// being saved and silently ignored.
+function SnoozedFollowUpEditor({
+  agentId,
+  snoozedFollowUp,
+  setSnoozedFollowUp,
+  issues,
+  stepRefusals,
+}: {
+  agentId: string;
+  snoozedFollowUp: SnoozedFollowUpState;
+  setSnoozedFollowUp: React.Dispatch<
+    React.SetStateAction<SnoozedFollowUpState>
+  >;
+  issues: SnoozedFollowUpIssues;
+  // By cadence, then by step: the server refuses a note as
+  // `snoozedFollowUp.cadences[1].steps[0].instructions`.
+  stepRefusals: readonly (readonly (string | null)[])[];
+}) {
+  const { t } = useTranslation();
+  const { labels, multiAccount } = useInboxLabels(agentId);
+  const cadences = snoozedFollowUp.cadences;
+  const hasDefault = cadences.some((c) => c.label === null);
+  const labeledCount = cadences.filter((c) => c.label !== null).length;
+  const updateCadence = (
+    index: number,
+    update: (c: SnoozedCadenceState) => SnoozedCadenceState,
+  ) =>
+    setSnoozedFollowUp((prev) => ({
+      ...prev,
+      cadences: prev.cadences.map((c, i) => (i === index ? update(c) : c)),
+    }));
+  const removeCadence = (index: number) =>
+    setSnoozedFollowUp((prev) => ({
+      ...prev,
+      cadences: prev.cadences.filter((_, i) => i !== index),
+    }));
+  // The default goes first, where the form keeps it; a labeled one goes last, which is also the last
+  // place the reader tries.
+  const addDefault = () =>
+    setSnoozedFollowUp((prev) => ({
+      ...prev,
+      cadences: [{ label: null, steps: [newSnoozedStep()] }, ...prev.cadences],
+    }));
+  const addLabeled = () =>
+    setSnoozedFollowUp((prev) => ({
+      ...prev,
+      cadences: [...prev.cadences, { label: "", steps: [newSnoozedStep()] }],
+    }));
+
+  return (
+    <div className="flex flex-col gap-4">
+      <SwitchField
+        checked={snoozedFollowUp.enabled}
+        onCheckedChange={(v) =>
+          setSnoozedFollowUp((prev) => ({ ...prev, enabled: v }))
+        }
+        label={t(
+          "editor.snoozedFollowUpEnabled",
+          "Remind the customer when a person snoozed the conversation and got no reply",
+        )}
+      />
+      {snoozedFollowUp.enabled && (
+        <>
+          <div className="flex flex-col gap-1.5">
+            <SwitchField
+              checked={snoozedFollowUp.signature}
+              onCheckedChange={(v) =>
+                setSnoozedFollowUp((prev) => ({ ...prev, signature: v }))
+              }
+              label={t(
+                "editor.snoozedFollowUpSignature",
+                "Sign the reminders with the agent's signature",
+              )}
+            />
+            <p className="text-text-muted text-xs">
+              {t(
+                "editor.snoozedFollowUpSignatureHint",
+                "Off by default: the reminder speaks for the person who asked, so the agent's sign-off is usually wrong there.",
+              )}
+            </p>
+          </div>
+          <div>
+            <h4 className="text-text-secondary text-sm font-medium">
+              {t("editor.snoozedFollowUpCadences", "Cadences")}
+            </h4>
+            <p className="text-text-muted text-xs">
+              {t(
+                "editor.snoozedFollowUpCadencesHint",
+                "A conversation follows the first cadence below whose label it carries, and otherwise the default cadence.",
+              )}
+            </p>
+          </div>
+          {!hasDefault && (
+            <p className="border-border bg-bg-tertiary text-text-secondary rounded-md border px-3 py-2 text-xs">
+              {t(
+                "editor.snoozedFollowUpNoDefault",
+                "No default cadence: only conversations carrying one of the labels below are chased. A plain snooze, with none of them, gets no reminder.",
+              )}
+            </p>
+          )}
+          {issues.tooManyLabeled && (
+            <p role="alert" className="text-error text-xs">
+              {t(
+                "editor.snoozedFollowUpTooMany",
+                "Up to {{max}} cadences by label. Remove the extra ones to save.",
+                { max: SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES },
+              )}
+            </p>
+          )}
+          {cadences.map((cadence, index) => {
+            const issue = issues.cadences[index];
+            const isDefault = cadence.label === null;
+            return (
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: cadences are positional (no stable id); reorder is add/remove only
+                key={index}
+                className="border-border flex flex-col gap-3 rounded-lg border p-3"
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <h5 className="text-sm font-medium">
+                    {isDefault
+                      ? t(
+                          "editor.snoozedFollowUpDefaultCadence",
+                          "Default cadence",
+                        )
+                      : t(
+                          "editor.snoozedFollowUpLabeledCadence",
+                          "Cadence by label",
+                        )}
+                  </h5>
+                  <button
+                    type="button"
+                    onClick={() => removeCadence(index)}
+                    aria-label={
+                      isDefault
+                        ? t(
+                            "editor.snoozedFollowUpRemoveDefault",
+                            "Remove the default cadence",
+                          )
+                        : t(
+                            "editor.snoozedFollowUpRemoveCadence",
+                            "Remove cadence",
+                          )
+                    }
+                    className="text-text-muted hover:text-error flex h-7 w-7 items-center justify-center rounded transition-colors"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </button>
+                </div>
+                {isDefault ? (
+                  <p className="text-text-muted text-xs">
+                    {/* With no labeled cadence there is no "below" to point at. */}
+                    {labeledCount === 0
+                      ? t(
+                          "editor.snoozedFollowUpDefaultHintAlone",
+                          "Applies to every snoozed conversation.",
+                        )
+                      : t(
+                          "editor.snoozedFollowUpDefaultHint",
+                          "For a snoozed conversation that carries none of the labels below.",
+                        )}
+                  </p>
+                ) : (
+                  <FormField
+                    label={t("editor.snoozedFollowUpLabel", "Label")}
+                    group
+                    description={t(
+                      "editor.snoozedFollowUpLabelHint",
+                      "A snoozed conversation with this label follows this cadence.",
+                    )}
+                    error={
+                      issue?.label === "missing"
+                        ? t(
+                            "editor.snoozedFollowUpLabelMissing",
+                            "Pick a label. Without one, this cadence would be read as a second default.",
+                          )
+                        : issue?.label === "duplicate"
+                          ? t(
+                              "editor.snoozedFollowUpLabelDuplicate",
+                              "Another cadence above already uses this label (case is ignored). Only the first one would ever be picked.",
+                            )
+                          : issue?.label === "tooLong"
+                            ? t(
+                                "editor.snoozedFollowUpLabelTooLong",
+                                "This label is longer than the reminder reads ({{max}} characters). Use a shorter label.",
+                                { max: SNOOZED_CADENCE_LABEL_MAX },
+                              )
+                            : null
+                    }
+                  >
+                    <LabelPicker
+                      single
+                      value={cadence.label ?? ""}
+                      onChange={(v) =>
+                        updateCadence(index, (c) => ({ ...c, label: v }))
+                      }
+                      labels={labels}
+                      multiAccount={multiAccount}
+                      placeholder={t(
+                        "editor.snoozedFollowUpLabelPlaceholder",
+                        "Pick a label…",
+                      )}
+                      ariaLabel={t("editor.snoozedFollowUpLabel", "Label")}
+                    />
+                  </FormField>
+                )}
+                {isDefault && issue?.label === "duplicate" && (
+                  <p role="alert" className="text-error text-xs">
+                    {t(
+                      "editor.snoozedFollowUpDefaultDuplicate",
+                      "There is already a default cadence above. Only the first one would ever be used.",
+                    )}
+                  </p>
+                )}
+                <StepsEditor
+                  steps={cadence.steps}
+                  setSteps={(update) =>
+                    updateCadence(index, (c) => ({
+                      ...c,
+                      steps: update(c.steps),
+                    }))
+                  }
+                  labels={labels}
+                  multiAccount={multiAccount}
+                  stepRefusals={stepRefusals[index] ?? []}
+                  showAppointmentPause={false}
+                  firstDelayLabel={t(
+                    "editor.snoozedFollowUpFirstDelay",
+                    "Wait after the person's message",
+                  )}
+                  newStep={newSnoozedStep}
+                />
+                {issue?.noSteps && (
+                  <p role="alert" className="text-error text-xs">
+                    {t(
+                      "editor.snoozedFollowUpNoSteps",
+                      "A cadence with no step reminds nobody. Add a step or remove the cadence.",
+                    )}
+                  </p>
+                )}
+              </div>
+            );
+          })}
+          <div className="flex flex-wrap gap-2">
+            {!hasDefault && (
+              <Button variant="secondary" size="sm" onClick={addDefault}>
+                <Plus className="h-4 w-4" aria-hidden="true" />
+                {t("editor.snoozedFollowUpAddDefault", "Add default cadence")}
+              </Button>
+            )}
+            {labeledCount < SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES && (
+              <Button variant="secondary" size="sm" onClick={addLabeled}>
+                <Plus className="h-4 w-4" aria-hidden="true" />
+                {t("editor.snoozedFollowUpAddLabeled", "Add cadence by label")}
+              </Button>
+            )}
+            {/* At the limit the button is gone, and this says why. Past it, the refusal above says
+                it already, and holds Save. */}
+            {labeledCount === SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "editor.snoozedFollowUpAtLimit",
+                  "Up to {{max}} cadences by label.",
+                  { max: SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES },
+                )}
+              </p>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// What a WATCHER's Behavior tab shows. A watcher runs the ordinary graph, so the rule is: hide what
+// is about SPEAKING TO THE CUSTOMER (availability and away message, grouping, audio, splitting,
+// images, takeover, the proactive ladder), show everything else, because everything else runs. The
+// contact gate is drawn with its rule alone: on the observer path the rule decides which
+// conversations are observed, and nothing of the endpoint or the notices runs. Hidden, not unmounted (`Section.hidden`): the form keeps its state, and
+// flipping the mode back shows it again untouched.
 export const MONITORING_SECTIONS: ReadonlySet<string> = new Set([
   "observation",
   "memory",
   "observability",
   "modelFallback",
   "attributeContext",
+  "contactAuth",
   "limits",
-  // NOTE: STT AND VISION RUN FOR A WATCHER (issue #494 review, round 2), so their controls have to
-  // be reachable. The receiver's `watcherReads` path runs `runEagerMedia` under the OBSERVER's own
-  // settings whenever that route is the one that will remember the message — an observer on an inbox
-  // with no responder is exactly that — and a watcher that remembers an audio as an attachment
-  // marker instead of its transcription remembers nothing of it. Hidden here, together with their
-  // configuration warnings, the operator could neither switch them on nor repair a broken
-  // credential, and audio, images and documents reached observation with nothing extracted.
+  // NOTE: STT and vision run for a watcher: the receiver's `watcherReads` path runs `runEagerMedia`
+  // under the observer's own settings when that route remembers the message, so their controls and
+  // configuration warnings have to be reachable.
   "stt",
   "vision",
 ]);
+
+// The one timeout field both fallbacks draw, under the fallback it bounds: each attempt, the
+// primary's and the fallback's, gets this long before the next one runs. Seconds on screen.
+function FallbackTimeoutField({
+  value,
+  onChange,
+  defaultSeconds,
+  range,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  defaultSeconds: number;
+  // In seconds, as the field asks for it.
+  range: NumberRange;
+}) {
+  const { t } = useTranslation();
+  return (
+    <FormField
+      label={t("editor.fallbackTimeout", "Timeout per attempt (seconds)")}
+      description={t(
+        "editor.fallbackTimeoutHint",
+        "Empty = {{seconds}} s ({{min}}-{{max}}). Past it, the request goes to the fallback; the fallback gets the same time.",
+        { seconds: defaultSeconds, min: range.min, max: range.max },
+      )}
+    >
+      <NumberInput
+        range={range}
+        optional
+        placeholder={String(defaultSeconds)}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      />
+    </FormField>
+  );
+}
+
+// What this agent's kept full turn detail is using, read again whenever the SAVED
+// retention changes, since only a save changes what the server keeps. Best-effort: a failed read
+// leaves the sentence out rather than showing a zero.
+function useFullDetailUsage(
+  agentId: string,
+  savedDays: number | null,
+): {
+  lines: number;
+  bytes: number;
+  effectiveDays: number | null;
+  logRetentionDays: number;
+} | null {
+  const [usage, setUsage] = useState<{
+    lines: number;
+    bytes: number;
+    effectiveDays: number | null;
+    logRetentionDays: number;
+  } | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: savedDays is the refetch trigger, not an input
+  useEffect(() => {
+    if (!agentId) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const { data } = await api.api.v1
+          .agents({ id: agentId })
+          ["full-detail-usage"].get();
+        if (!cancelled && data) setUsage(data);
+      } catch {
+        // NOTE: best-effort, see above.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, savedDays]);
+  return usage;
+}
 
 export function BehaviorTab({
   agentId,
@@ -1281,10 +1823,13 @@ export function BehaviorTab({
   agentModelCredentialRef,
   agentModelBaseUrl,
   ttsNormalizeCredBaseUrl,
+  callFloor,
+  draftPrompt,
   split,
   setSplit,
   signature,
   setSignature,
+  signatureSeed,
   vision,
   setVision,
   visionCredBaseUrl,
@@ -1305,15 +1850,23 @@ export function BehaviorTab({
   setLimits,
   takeover,
   setTakeover,
+  conversationNotes,
+  setConversationNotes,
   replyGate,
   setReplyGate,
   attributeContext,
   setAttributeContext,
+  otherInboxes,
+  setOtherInboxes,
+  contactFields,
+  setContactFields,
   serviceWindow,
   setServiceWindow,
   followUp,
   setFollowUp,
   redirectSuppressesFollowUp,
+  snoozedFollowUp,
+  setSnoozedFollowUp,
   onScheduleSaved,
   dirty,
   saving,
@@ -1322,7 +1875,7 @@ export function BehaviorTab({
   onOpenPlayground,
 }: BehaviorTabProps) {
   const { t, i18n } = useTranslation();
-  // Whether this install runs the audio detector, and its default mode (issue #802).
+  // Whether this install runs the audio detector, and its default mode.
   const ttsCheck = useTtsCheckInfo();
   const checkModeLabel = (m: TtsCheckMode) =>
     m === "enforce"
@@ -1331,15 +1884,10 @@ export function BehaviorTab({
         ? t("editor.ttsCheckShadow", "Record only")
         : t("editor.ttsCheckOff", "Off");
 
-  // The signature's "insert variable" helper, the same affordance the prompt editor has and for the
-  // same reason: `{{nome_agente}}` is only useful to someone who knows it exists, and a chip that
-  // writes it at the caret is how they find out. `HighlightedPromptEditor` forwards its ref to the
-  // inner <textarea> precisely so this works.
-  //
-  // CONTEXT VARS ONLY, not the prompt's whole list. The time and schedule names interpolate here too
-  // (it is the same function), but a closing line that announces the current minute is not a
-  // signature, and offering it invites a signature that changes on every message — which is the one
-  // property this feature exists to remove.
+  // The signature's "insert variable" helper, the same affordance as the prompt editor's
+  // (`HighlightedPromptEditor` forwards its ref to the inner <textarea> for it). Context vars only:
+  // a time or schedule name would make the signature change on every message, the one property the
+  // feature exists to remove.
   const signatureRef = useRef<HTMLTextAreaElement>(null);
   // How much a SELECTION would free, since an insert REPLACES it. Tracked in state because the
   // chips' disabled state is decided at render and a selection change does not otherwise cause one:
@@ -1352,10 +1900,9 @@ export function BehaviorTab({
       Math.max(0, (el.selectionEnd ?? 0) - (el.selectionStart ?? 0)),
     );
   }, []);
-  // What is left before the cap. A chip whose token does not fit is DISABLED rather than clipped:
-  // clipping an insert cuts the TAIL of what the operator already wrote, which is the one thing a
-  // helper button must never do — the caret is at the front, the loss is at the back, and nothing
-  // on screen connects the two. Found in review of #599.
+  // What is left before the cap. A chip whose token does not fit is DISABLED rather than
+  // clipped: clipping cuts the TAIL of what the operator already wrote, far from the caret, with
+  // nothing on screen connecting the two.
   const signatureRoom =
     SIGNATURE_MAX - signature.text.length + signatureSelected;
   // The agent's own Availability, so a `{{horario_atendimento}}` in the signature previews the hours
@@ -1413,7 +1960,7 @@ export function BehaviorTab({
     });
   }
 
-  // NOTE: the `enabled` guards are load-bearing, not defensive. Each block is HIDDEN when its
+  // The `enabled` guards are load-bearing, not defensive. Each block is HIDDEN when its
   // feature is off, so a leftover openai-compatible provider with no endpoint would disable Save for
   // the whole tab with nothing on screen to explain it — including the save that turns the feature
   // off. A disabled feature cannot be misconfigured.
@@ -1423,22 +1970,30 @@ export function BehaviorTab({
     !sttCredBaseUrl &&
     !isValidHttpUrl(stt.baseURL);
 
-  // Required while the gate is on: an enabled gate with no reachable URL fails closed on every
-  // message, which is the whole agent going silent with nothing on screen to explain it. A URL
-  // carrying `user:pass@` is refused here for the same reason the reader refuses it (credentials
-  // belong in the vault); without this check the save would succeed and the runtime would read the
-  // field as unconfigured.
-  // The shared warning of #58. It reads all three switches that widen what is recorded, INCLUDING
-  // the tenant-level one that lives on another page, because an operator does not remember which of
-  // three unrelated screens they touched last week. Empty (falsy) when nothing is on, so the block
-  // renders only when there is something to say.
-  // The saved config was read at load or at save, and one of its fields STOPS BEING TRUE ON ITS OWN:
-  // the size switch expires. An editor left open past the deadline would otherwise keep saying full
-  // detail is being recorded while the runtime already stopped, which is the same lie as the one
-  // this warning was just fixed for, arriving by the clock instead of by a click. So the state is
+  // The saved config's size switch expires on its own, so an editor left open past the
+  // deadline would keep saying full detail is recorded after the runtime stopped. The state is
   // re-derived once, exactly when the window closes.
   const [judgedAt, setJudgedAt] = useState(() => serverNowDate());
   const savedUntilMs = savedObservability.fullDetailUntil?.getTime() ?? null;
+  const fullDetailUsage = useFullDetailUsage(
+    agentId,
+    savedObservability.fullDetailRetentionDays,
+  );
+  // The days field's text while it is typed: the form holds a number, and an intermediate value
+  // ("" or "1" on the way to "14") must not be written into it. Re-synced whenever the form's
+  // block is replaced (load, discard, the switch, a valid keystroke): keyed on the object and not
+  // on the number, because a discard that puts back the same number must still clear a field left
+  // empty, or the field keeps blocking Save.
+  const [retentionDraft, setRetentionDraft] = useState(
+    String(observability.fullDetailRetentionDays ?? ""),
+  );
+  useEffect(() => {
+    setRetentionDraft((d) =>
+      Number(d) === observability.fullDetailRetentionDays && d.trim() !== ""
+        ? d
+        : String(observability.fullDetailRetentionDays ?? ""),
+    );
+  }, [observability]);
   const formUntilMs = observability.fullDetailUntil?.getTime() ?? null;
   // The deadlines are TRIGGERS here, not reads: the body uses neither, and their changing is the
   // whole signal.
@@ -1493,6 +2048,9 @@ export function BehaviorTab({
     return on;
   }, [savedObservability, langfuseSendContent, judgedAt, t]);
 
+  // Required while the gate is on: an enabled gate with no URL fails closed on every message.
+  // A `user:pass@` URL is refused as the reader refuses it (credentials belong in the vault), or the
+  // save would succeed on a field the runtime reads as unconfigured. See docs/contact-auth.md.
   const contactAuthUrlHasCredentials = (() => {
     try {
       const u = new URL(contactAuth.url.trim());
@@ -1501,13 +2059,23 @@ export function BehaviorTab({
       return false;
     }
   })();
-  // With a local rule the endpoint is never asked (issue #646), so an empty URL is not an error.
-  const contactAuthUsesRule = contactAuth.ruleKind !== "";
+  // The conditions are the local rule; with none there is no rule.
+  const contactAuthUsesRule = contactAuth.ruleConditions.length > 0;
+  // The endpoint is asked only with its switch on: after the conditions when there are some, alone
+  // when there are none. Off, its URL is kept but not asked, so an empty one is not an error.
+  const contactAuthAsksEndpoint = contactAuth.endpointEnabled;
+  const contactAuthEmpty = contactAuthGateEmpty(contactAuth);
+  // The quiet refusal: no message, no note, and the conversation handed to humans. What a gate used
+  // as a scope filter looks like, said in the section so it reads as a setup rather than a gap.
+  const contactAuthQuietRefusal =
+    !contactAuth.denyMessage.trim() &&
+    !contactAuth.operatorNoteEnabled &&
+    contactAuth.handoffEnabled;
   const contactAuthRuleBad =
     contactAuth.enabled && contactAuthRuleInvalid(contactAuth);
   const contactAuthUrlInvalid =
     contactAuth.enabled &&
-    !contactAuthUsesRule &&
+    contactAuthAsksEndpoint &&
     (!contactAuth.url.trim() ||
       !isValidHttpUrl(contactAuth.url) ||
       contactAuthUrlHasCredentials);
@@ -1534,6 +2102,11 @@ export function BehaviorTab({
   // Blank means "the agent's", both here and in the resolver, so the fields below follow THIS
   // rather than the raw override: an openai-compatible agent whose rewrite inherits the provider
   // still runs against an endpoint, and hiding that field made it un-inspectable.
+  // The key the fallback's voice and model lists are read with: its own, or the main voice's on the
+  // same provider (the one it would run on).
+  const fallbackPickerCredential =
+    tts.fallbackCredentialRef ||
+    (tts.fallbackProvider === tts.provider ? tts.credentialRef : "");
   const normalizeEffectiveProvider =
     tts.normalizeProvider || agentModelProvider;
 
@@ -1545,32 +2118,23 @@ export function BehaviorTab({
     credentialRef: memory.credentialRef,
     baseURL: memory.baseURL,
   };
-  const memorySource = overridePickerSource(
-    memoryOverride,
-    agentModel,
-    memoryCredBaseUrl,
-  );
-  const memoryEffectiveProvider = memory.provider || agentModelProvider;
-  const memoryNeedsOwnCredential = overrideNeedsOwnCredential(
-    memoryOverride,
-    agentModel,
-    memoryCredBaseUrl,
-  );
   // The endpoint half of the same resolution, and the reason it is here rather than only on the
   // field: the summariser is the second override in this tab, and the first one already blocks the
   // save on both of these. A section that renders the picker without them saves a configuration the
   // runtime refuses, and the operator's only signal is attendances quietly staying raw.
+  // The summary model serves both summarisers: the attendance's and the contact's other inboxes'.
+  const summaryModelInUse = memory.compactionEnabled || otherInboxes.enabled;
   const memoryBaseUrlInvalid = overrideBaseUrlInvalid(
     memoryOverride,
     agentModel,
     memoryCredBaseUrl,
-    memory.compactionEnabled,
+    summaryModelInUse,
   );
   const memoryBaseUrlUnsupported = overrideBaseUrlUnsupported(
     memoryOverride,
     agentModel,
     memoryCredBaseUrl,
-    memory.compactionEnabled,
+    summaryModelInUse,
   );
   const fallbackOverride = {
     provider: modelFallback.provider,
@@ -1578,12 +2142,9 @@ export function BehaviorTab({
     credentialRef: modelFallback.credentialRef,
     baseURL: modelFallback.baseURL,
   };
-  // A fallback is CONFIGURED once a destination is named, and that is the flag every check below
-  // reads — including the endpoint ones, which is why it has to agree with the backend rather than
-  // approximate it. Written as "both halves are named", it answered NO for a model-less
-  // `openai-compatible` fallback, which the backend calls configured: the base-URL checks switched
-  // themselves off, Save went through on a missing or malformed endpoint, the server stored it, and
-  // the runtime could not build it. Same rule, same predicate, one place.
+  // A fallback is CONFIGURED once a destination is named, and every check below reads this
+  // flag, including the endpoint ones, so it has to be the backend's own predicate: a model-less
+  // `openai-compatible` fallback is configured, and its base URL must still be checked.
   const fallbackConfigured = fallbackIsConfigured(modelFallback);
   // Named, and on the save gate, because the round trip does not survive it: `modelFallbackToStored`
   // persists `{provider: "openai", model: null}`, `hasModelFallback` answers false, and the form
@@ -1592,6 +2153,17 @@ export function BehaviorTab({
   // (`assertSettingsModelFallback`, which is what covers the MCP patch); this is what keeps the
   // operator from meeting that refusal as a 400 on a button they were never stopped from pressing.
   const fallbackModelMissing = fallbackModelIsMissing(modelFallback);
+  // The snoozed ladder's cadences, checked the way its reader reads them (a label taken twice, a
+  // cadence with no step). On the gate only while its fields are drawn: a watcher hides the section and
+  // the switch hides the cadences, and a Save held by a field nobody can see is a dead button.
+  const snoozedIssues = useMemo(
+    () => snoozedFollowUpIssues(snoozedFollowUp),
+    [snoozedFollowUp],
+  );
+  const snoozedFollowUpInvalid = snoozedFollowUpBlocksSave(
+    snoozedFollowUp,
+    mode,
+  );
   const fallbackSource = overridePickerSource(
     fallbackOverride,
     agentModel,
@@ -1643,8 +2215,8 @@ export function BehaviorTab({
     return name && name !== code ? `${name} (${code})` : code;
   };
 
-  // Section index (item 9): the left-rail nav + scroll-spy track these in order. Labels reuse the
-  // section titles; icons are thematic.
+  // Section index: the left-rail nav + scroll-spy track these in order. Labels reuse the section
+  // titles; icons are thematic.
   const sections = [
     {
       id: "availability",
@@ -1686,13 +2258,18 @@ export function BehaviorTab({
       icon: ListChecks,
       label: t("editor.attributeContext", "Data in context"),
     },
+    {
+      id: "otherInboxes",
+      icon: Inbox,
+      label: t("editor.otherInboxes.title", "Other inboxes of the contact"),
+    },
     // Last of the behaviour sections and before the operational ones: most agents never turn this
     // on, so it does not belong above the grouping/audio/memory settings every agent uses — but it
     // decides whether the agent speaks at all, so it does not belong at the very bottom either.
     {
       id: "contactAuth",
       icon: ShieldCheck,
-      label: t("editor.contactAuth", "Contact authorization"),
+      label: t("editor.contactAuth", "Who this agent serves"),
     },
     {
       id: "takeover",
@@ -1703,6 +2280,11 @@ export function BehaviorTab({
       id: "replyGate",
       icon: Tag,
       label: t("editor.replyGate", "Answer only with a label"),
+    },
+    {
+      id: "conversationNotes",
+      icon: StickyNote,
+      label: t("editor.conversationNotes", "Notes in the conversation"),
     },
     {
       id: "limits",
@@ -1729,9 +2311,17 @@ export function BehaviorTab({
       icon: Megaphone,
       label: t("editor.proactiveSection", "Proactive messages"),
     },
+    {
+      id: "snoozedFollowUp",
+      icon: BellRing,
+      label: t("editor.snoozedFollowUp", "Snoozed follow-up"),
+    },
   ];
 
   const watcher = mode === "monitoring";
+  // A watcher deciding with questions and rules runs no chat model, so the sections that configure
+  // one (memory is compacted by it, the fallback stands in for it) are not drawn for it (agents#1224).
+  const chatModelUnused = watcher && observation.engine === "decisions";
   const visibleSections = watcher
     ? [
         {
@@ -1739,9 +2329,57 @@ export function BehaviorTab({
           icon: Eye,
           label: t("editor.observation", "Observation"),
         },
-        ...sections.filter((s) => MONITORING_SECTIONS.has(s.id)),
+        ...sections.filter(
+          (s) =>
+            MONITORING_SECTIONS.has(s.id) &&
+            watcherSectionUsed(observation.engine, s.id),
+        ),
       ]
     : sections;
+
+  // The follow-up's schedule (`followUpHoursId`, else the agent's main one) holds BOTH ladders, so it
+  // is drawn under each one that is on: an operator with only the snoozed ladder on would otherwise
+  // have no way to see or change when its reminders fire.
+  const followUpScheduleField = (description: string) => (
+    <FormField
+      label={t("editor.followUpWindowField", "Allowed schedule")}
+      group
+      description={description}
+    >
+      <SchedulePicker
+        value={followUpHoursId}
+        onChange={setFollowUpHoursId}
+        schedules={hours.map(toScheduleOption)}
+        emptyLabel={t(
+          "editor.followUpHoursDefault",
+          "Follow agent's main schedule",
+        )}
+        emptySummary={(() => {
+          if (businessHoursId) {
+            const inherited = hours.find(
+              (h) => String(h.id) === businessHoursId,
+            );
+            if (inherited) {
+              const summary = formatWindowsSummary(
+                toScheduleOption(inherited).windows,
+                t("schedule.noWindows", "No windows"),
+                i18n.language,
+              );
+              return `${t("editor.followUpHoursInherited", "Inherited:")} ${inherited.name} — ${summary}`;
+            }
+          }
+          return t(
+            "editor.followUpHoursAnyTime",
+            "No schedule set — follow-up may fire at any time.",
+          );
+        })()}
+        aria-label={t("editor.followUpWindowField", "Allowed schedule")}
+        onScheduleSaved={(savedId) => {
+          onScheduleSaved(savedId, setFollowUpHoursId);
+        }}
+      />
+    </FormField>
+  );
 
   return (
     <div className="flex grow flex-col gap-4">
@@ -1837,10 +2475,8 @@ export function BehaviorTab({
                     "Idle time after the last message before replying (3-120).",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={3}
-                    max={120}
+                  <NumberInput
+                    range={DEBOUNCE_RANGES.windowSeconds}
                     value={debounce.windowSeconds}
                     onChange={(e) =>
                       setDebounce({
@@ -1860,10 +2496,8 @@ export function BehaviorTab({
                     "Cap on messages grouped into one turn (1-50).",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={1}
-                    max={50}
+                  <NumberInput
+                    range={DEBOUNCE_RANGES.maxMessagesPerBurst}
                     value={debounce.maxMessagesPerBurst}
                     onChange={(e) =>
                       setDebounce({
@@ -1880,10 +2514,8 @@ export function BehaviorTab({
                     "Reply at most this long after the first message, even if more keep arriving.",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={3}
-                    max={600}
+                  <NumberInput
+                    range={DEBOUNCE_RANGES.maxWindowSeconds}
                     value={debounce.maxWindowSeconds}
                     onChange={(e) =>
                       setDebounce({
@@ -2053,8 +2685,8 @@ export function BehaviorTab({
                 <div className="grid gap-4 sm:grid-cols-2">
                   <FormField
                     label={t("editor.visionProvider", "Provider")}
-                    // Said here, and not only in the docs, because the alternative way to learn it
-                    // is a PDF that comes back unextracted mid-attendance (issue #324).
+                    // NOTE: Said here, and not only in the docs, because the alternative way to learn it is a PDF
+                    // that comes back unextracted mid-attendance.
                     hint={
                       visionAcceptsDocuments(
                         vision.provider,
@@ -2102,10 +2734,8 @@ export function BehaviorTab({
                 <FormField
                   label={t("editor.visionModel", "Model")}
                   group
-                  // The per-provider sentence used to live here, as a static list naming which
-                  // providers read PDFs. It went stale the moment one of them changed (issue #324),
-                  // and it was in the wrong field anyway: what a provider reads is a property of the
-                  // provider, so it is said above, next to the provider.
+                  // NOTE: What a provider reads is a property of the provider, so it is said on the provider
+                  // field above, not listed here.
                   description={t(
                     "editor.visionModelHint",
                     "Leave blank for the provider default.",
@@ -2163,7 +2793,7 @@ export function BehaviorTab({
                         DEFAULT_EXTRACTION_PROMPT && (
                         <button
                           type="button"
-                          className="font-normal text-accent text-xs hover:underline"
+                          className="text-accent text-xs font-normal hover:underline"
                           onClick={() =>
                             setVision({
                               ...vision,
@@ -2184,11 +2814,20 @@ export function BehaviorTab({
                   <Textarea
                     value={vision.extractionPrompt}
                     onChange={(e) =>
-                      setVision({ ...vision, extractionPrompt: e.target.value })
+                      setVision({
+                        ...vision,
+                        extractionPrompt: e.target.value,
+                      })
                     }
                     rows={3}
                     maxLength={EXTRACTION_PROMPT_MAX}
                     placeholder={DEFAULT_EXTRACTION_PROMPT}
+                  />
+                  <FieldSize
+                    max={EXTRACTION_PROMPT_MAX}
+                    text={vision.extractionPrompt}
+                    fallback={DEFAULT_EXTRACTION_PROMPT}
+                    sentWith="vision"
                   />
                 </FormField>
               </>
@@ -2257,9 +2896,9 @@ export function BehaviorTab({
                   </FormField>
                 </div>
                 {tts.provider === "openrouter" && (
-                  <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+                  <div className="border-warning bg-warning-soft text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs">
                     <AlertTriangle
-                      className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                      className="text-warning mt-0.5 h-4 w-4 shrink-0"
                       aria-hidden="true"
                     />
                     <span>
@@ -2340,7 +2979,7 @@ export function BehaviorTab({
                 </div>
                 {tts.normalize && (
                   <div className="flex flex-col gap-3">
-                    <p className="flex items-center gap-1.5 font-medium text-sm">
+                    <p className="flex items-center gap-1.5 text-sm font-medium">
                       {t("editor.ttsNormalizeModel", "Rewrite model")}
                       <HelpPopover
                         content={t(
@@ -2494,10 +3133,109 @@ export function BehaviorTab({
                     )}
                   </div>
                 )}
+                {/* Fallback voice */}
+                <div className="border-border flex flex-col gap-3 border-t pt-4">
+                  <div>
+                    <h4 className="text-text-secondary text-sm font-medium">
+                      {t("editor.ttsFallback", "Fallback voice")}
+                    </h4>
+                    <p className="text-text-muted text-xs">
+                      {t(
+                        "editor.ttsFallbackHint",
+                        "Tried once when the main voice times out or its provider is overloaded (5xx, 429). An invalid key or request goes straight to text, so a broken main voice is never hidden.",
+                      )}
+                    </p>
+                  </div>
+                  <FormField label={t("editor.provider", "Provider")}>
+                    <Select
+                      value={tts.fallbackProvider}
+                      onChange={(e) =>
+                        setTts(ttsFallbackProviderChanged(tts, e.target.value))
+                      }
+                    >
+                      <option value="">
+                        {t("editor.ttsFallbackNone", "No fallback voice")}
+                      </option>
+                      {TTS_PROVIDERS.map((p) => (
+                        <option key={p} value={p}>
+                          {providerLabel(p, t)}
+                        </option>
+                      ))}
+                    </Select>
+                  </FormField>
+                  {tts.fallbackProvider && (
+                    <>
+                      <FormField
+                        label={t("editor.credential", "API key")}
+                        error={refusals.ttsFallbackCredential}
+                        description={t(
+                          "editor.ttsFallbackCredentialHint",
+                          "Empty uses the main voice's key on the same provider. Another provider needs its own: a key is never sent to another vendor.",
+                        )}
+                        group
+                      >
+                        <CredentialPicker
+                          value={tts.fallbackCredentialRef}
+                          onChange={(v) =>
+                            setTts({ ...tts, fallbackCredentialRef: v })
+                          }
+                          required={ttsFallbackNeedsOwnCredential(tts)}
+                          compatibleTypes={credentialCompat.tts(
+                            tts.fallbackProvider,
+                          )}
+                          defaultCreateType={
+                            credentialCompat.tts(tts.fallbackProvider)[0]
+                          }
+                          ariaLabel={t("editor.credential", "API key")}
+                        />
+                      </FormField>
+                      <FormField
+                        label={t("editor.ttsVoice", "Voice")}
+                        // A ComboBox-based picker, not one focusable control: `group` per the
+                        // repo rule, so the label names the group instead of dangling.
+                        group
+                      >
+                        <TtsOptionPicker
+                          kind="voices"
+                          provider={tts.fallbackProvider}
+                          credentialRef={fallbackPickerCredential}
+                          value={tts.fallbackVoice}
+                          onChange={(v) => setTts({ ...tts, fallbackVoice: v })}
+                          placeholder={
+                            TTS_DEFAULT_VOICE[tts.fallbackProvider] ||
+                            t("editor.ttsVoiceRequired", "required")
+                          }
+                          ariaLabel={t("editor.ttsVoice", "Voice")}
+                        />
+                      </FormField>
+                      <FormField label={t("editor.ttsModel", "Model")} group>
+                        <TtsOptionPicker
+                          kind="models"
+                          provider={tts.fallbackProvider}
+                          credentialRef={fallbackPickerCredential}
+                          value={tts.fallbackModel}
+                          onChange={(v) => setTts({ ...tts, fallbackModel: v })}
+                          placeholder={
+                            TTS_DEFAULT_MODEL[tts.fallbackProvider] ?? ""
+                          }
+                          ariaLabel={t("editor.ttsModel", "Model")}
+                        />
+                      </FormField>
+                      <FallbackTimeoutField
+                        value={tts.fallbackTimeoutSeconds}
+                        onChange={(v) =>
+                          setTts({ ...tts, fallbackTimeoutSeconds: v })
+                        }
+                        defaultSeconds={TTS_TIMEOUT_DEFAULT_MS / 1000}
+                        range={TTS_TIMEOUT_RANGES.fallbackTimeoutSeconds}
+                      />
+                    </>
+                  )}
+                </div>
                 {tts.provider === "elevenlabs" && (
                   <div className="flex flex-col gap-3">
                     <div>
-                      <p className="font-medium text-sm">
+                      <p className="text-sm font-medium">
                         {t("editor.ttsDelivery", "Voice delivery")}
                       </p>
                       <p className="text-text-muted text-xs">
@@ -2515,11 +3253,9 @@ export function BehaviorTab({
                           "0 = expressive, 1 = monotone (0-1).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step={0.05}
+                        <NumberInput
+                          range={TTS_VOICE_RANGES.stability}
+                          optional
                           value={tts.stability}
                           onChange={(e) =>
                             setTts({ ...tts, stability: e.target.value })
@@ -2533,11 +3269,9 @@ export function BehaviorTab({
                           "How closely to match the original voice (0-1).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step={0.05}
+                        <NumberInput
+                          range={TTS_VOICE_RANGES.similarityBoost}
+                          optional
                           value={tts.similarityBoost}
                           onChange={(e) =>
                             setTts({ ...tts, similarityBoost: e.target.value })
@@ -2551,11 +3285,9 @@ export function BehaviorTab({
                           "Extra emphasis. Costs latency and can destabilize (0-1).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={0}
-                          max={1}
-                          step={0.05}
+                        <NumberInput
+                          range={TTS_VOICE_RANGES.style}
+                          optional
                           value={tts.style}
                           onChange={(e) =>
                             setTts({ ...tts, style: e.target.value })
@@ -2569,11 +3301,9 @@ export function BehaviorTab({
                           "Speaking rate, 1 being natural speed (0.25-4).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={0.25}
-                          max={4}
-                          step={0.05}
+                        <NumberInput
+                          range={TTS_VOICE_RANGES.speed}
+                          optional
                           value={tts.speed}
                           onChange={(e) =>
                             setTts({ ...tts, speed: e.target.value })
@@ -2623,7 +3353,7 @@ export function BehaviorTab({
                 {tts.provider === "fish" && (
                   <div className="flex flex-col gap-3">
                     <div>
-                      <p className="font-medium text-sm">
+                      <p className="text-sm font-medium">
                         {t("editor.ttsDelivery", "Voice delivery")}
                       </p>
                       <p className="text-text-muted text-xs">
@@ -2641,11 +3371,9 @@ export function BehaviorTab({
                           "Speaking rate, 1 being natural speed (0.5-2).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={0.5}
-                          max={2}
-                          step={0.05}
+                        <NumberInput
+                          range={FISH_SPEED_RANGE}
+                          optional
                           value={tts.speed}
                           onChange={(e) =>
                             setTts({ ...tts, speed: e.target.value })
@@ -2745,7 +3473,7 @@ export function BehaviorTab({
                     ))}
                   </Select>
                 </FormField>
-                {/* Issue #856: a reply built to be read goes as text even when audio is on. */}
+                {/* A reply built to be read goes as text even when audio is on. */}
                 <div className="flex flex-col gap-3">
                   <SwitchField
                     checked={tts.textInstead}
@@ -2771,11 +3499,9 @@ export function BehaviorTab({
                           "Links do not count (80-4000).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={80}
-                          max={4000}
-                          step={10}
+                        <NumberInput
+                          range={TTS_SPEAKABLE_RANGES.textOverChars}
+                          optional
                           value={tts.textOverChars}
                           onChange={(e) =>
                             setTts({ ...tts, textOverChars: e.target.value })
@@ -2792,11 +3518,9 @@ export function BehaviorTab({
                           "Bullets, numbered steps or table rows (2-50).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={2}
-                          max={50}
-                          step={1}
+                        <NumberInput
+                          range={TTS_SPEAKABLE_RANGES.textOverListItems}
+                          optional
                           value={tts.textOverListItems}
                           onChange={(e) =>
                             setTts({
@@ -2816,11 +3540,9 @@ export function BehaviorTab({
                           "Money values, or numbers of 4+ digits (2-50).",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={2}
-                          max={50}
-                          step={1}
+                        <NumberInput
+                          range={TTS_SPEAKABLE_RANGES.textOverNumbers}
+                          optional
                           value={tts.textOverNumbers}
                           onChange={(e) =>
                             setTts({ ...tts, textOverNumbers: e.target.value })
@@ -2830,7 +3552,7 @@ export function BehaviorTab({
                     </div>
                   )}
                 </div>
-                {/* Issue #859: the model is told its reply will be spoken, and may choose text. */}
+                {/* The model is told its reply will be spoken, and may choose text. */}
                 <div className="flex flex-col gap-3">
                   <SwitchField
                     checked={tts.spokenNotice}
@@ -2862,6 +3584,12 @@ export function BehaviorTab({
                           setTts({ ...tts, spokenNoticeText: e.target.value })
                         }
                       />
+                      <FieldSize
+                        max={VOICE_CHOICE_TEXT_MAX}
+                        text={tts.spokenNoticeText}
+                        fallback={SPOKEN_NOTICE_DEFAULT}
+                        sentWith="spokenNotice"
+                      />
                     </FormField>
                   )}
                   <SwitchField
@@ -2876,6 +3604,11 @@ export function BehaviorTab({
                       "Offers the agent a tool to send one reply as a text message instead of a voice note, when the customer needs to read it: prices, steps, a code to copy.",
                     )}
                   />
+                  {tts.textChoice && (
+                    <CallFloorContext.Provider value={callFloor}>
+                      <ToolTokens tool={{ system: REPLY_AS_TEXT_TOOL }} />
+                    </CallFloorContext.Provider>
+                  )}
                   {tts.textChoice && (
                     <FormField
                       label={t("editor.ttsTextChoiceNote", "When to use it")}
@@ -2892,6 +3625,11 @@ export function BehaviorTab({
                         onChange={(e) =>
                           setTts({ ...tts, textChoiceNote: e.target.value })
                         }
+                      />
+                      <FieldSize
+                        max={VOICE_CHOICE_TEXT_MAX}
+                        text={tts.textChoiceNote}
+                        sentWith="toolDescription"
                       />
                     </FormField>
                   )}
@@ -2927,10 +3665,8 @@ export function BehaviorTab({
                     "Longer paragraphs are split further.",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={80}
-                    max={4000}
+                  <NumberInput
+                    range={SPLIT_RANGES.maxChars}
                     value={split.maxChars}
                     onChange={(e) =>
                       setSplit({ ...split, maxChars: e.target.value })
@@ -2944,10 +3680,8 @@ export function BehaviorTab({
                     "Higher = shorter pauses.",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={40}
-                    max={1000}
+                  <NumberInput
+                    range={SPLIT_RANGES.typingWpm}
                     value={split.typingWpm}
                     onChange={(e) =>
                       setSplit({ ...split, typingWpm: e.target.value })
@@ -2961,11 +3695,8 @@ export function BehaviorTab({
                     "Cap on the typing pause per message.",
                   )}
                 >
-                  <Input
-                    type="number"
-                    min={0}
-                    max={30000}
-                    step={500}
+                  <NumberInput
+                    range={SPLIT_RANGES.maxDelayMs}
                     value={split.maxDelayMs}
                     onChange={(e) =>
                       setSplit({ ...split, maxDelayMs: e.target.value })
@@ -2995,9 +3726,15 @@ export function BehaviorTab({
               // Through the pair, not a second copy of the rule here: what the toggle does to the
               // text is a decision (seed an empty box, never touch a kept one) and it belongs where
               // a test can reach it.
-              onCheckedChange={(v) =>
-                setSignature(signatureOnToggle(signature, v))
-              }
+              onCheckedChange={(v) => {
+                const next = signatureOnToggle(
+                  signature,
+                  v,
+                  signatureSeed.current,
+                );
+                signatureSeed.current = next.seed;
+                setSignature(next.form);
+              }}
               label={t(
                 "editor.signatureEnabled",
                 "Add a signature to the agent's messages",
@@ -3035,7 +3772,7 @@ export function BehaviorTab({
                       in docs/ui.md: the app can tell the limit now applies, so it says so, at that
                       moment, and goes away again on its own. */}
                       {signatureVarsBlocked && (
-                        <span className="ml-1 text-warning">
+                        <span className="text-warning ml-1">
                           {t(
                             "editor.signatureVarNoRoom",
                             "Not enough room left before the limit.",
@@ -3052,7 +3789,7 @@ export function BehaviorTab({
                             type="button"
                             disabled={!fits}
                             onClick={() => insertSignatureVar(v)}
-                            className="rounded border border-border bg-bg-tertiary px-1.5 py-0.5 font-mono text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-bg-tertiary disabled:hover:text-text-secondary"
+                            className="border-border bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary disabled:hover:bg-bg-tertiary disabled:hover:text-text-secondary rounded border px-1.5 py-0.5 font-mono text-xs disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {`{{${v}}}`}
                           </button>
@@ -3150,12 +3887,9 @@ export function BehaviorTab({
                 </div>
                 <FormField
                   label={t("editor.signaturePreview", "Preview")}
-                  // THE SECOND SENTENCE ONLY WHEN THERE IS A SECOND BALLOON, and it names the
-                  // setting that put it there. Two stacked boxes under a label reading "an example
-                  // reply", singular, look like the same preview rendered twice, and were reported
-                  // as exactly that: a duplicated section. The split section's own label is
-                  // interpolated rather than retyped, so renaming that section cannot leave this
-                  // sentence pointing at a control nobody can find.
+                  // NOTE: The second sentence only when there is a second balloon, naming the setting that put
+                  // it there: two stacked boxes under "an example reply" otherwise read as a duplicated preview.
+                  // The split section's label is interpolated, so renaming it keeps this sentence accurate.
                   description={[
                     t(
                       "editor.signaturePreviewHint",
@@ -3194,10 +3928,8 @@ export function BehaviorTab({
                         key={parts.join("\u0000")}
                         className="flex flex-col gap-1"
                       >
-                        {/* Numbered only when there is more than one, because "message 1 of 1" is
-                        noise on a delivery with no repetition to show. Under `once` the number is
-                        also the answer to WHICH balloon carries the signature, the half of that
-                        rule the per-message preview exists to make readable (#616). */}
+                        {/* Numbered only when there is more than one, since "message 1 of 1" is noise. Under
+                            `once` the number also answers WHICH balloon carries the signature. */}
                         {msgs.length > 1 && (
                           <span className="text-text-muted text-xs">
                             {t(
@@ -3207,12 +3939,12 @@ export function BehaviorTab({
                             )}
                           </span>
                         )}
-                        <div className="rounded-lg border border-border bg-bg-tertiary px-3 py-2">
+                        <div className="border-border bg-bg-tertiary rounded-lg border px-3 py-2">
                           {parts.map((part, i) => (
                             <div key={part}>
                               {i > 0 &&
                                 (signature.separator === "--" ? (
-                                  <div className="py-1 font-mono text-sm text-text-secondary">
+                                  <div className="text-text-secondary py-1 font-mono text-sm">
                                     {/* Not translatable: these are the bytes the separator puts on
                                     the wire, the same two `DELIMITERS` writes. */}
                                     {"--"}
@@ -3246,185 +3978,199 @@ export function BehaviorTab({
               attributeContext={attributeContext}
               setAttributeContext={setAttributeContext}
             />
+            <ContactFieldsPicker
+              contactFields={contactFields}
+              setContactFields={setContactFields}
+            />
+          </Section>
+
+          <Section
+            id="otherInboxes"
+            hidden={watcher}
+            icon={Inbox}
+            title={t(
+              "editor.otherInboxes.title",
+              "Other inboxes of the contact",
+            )}
+            help={t(
+              "editor.otherInboxes.help",
+              "When the team merges two Chatwoot contacts, the same person can have conversations in more than one inbox. With this on, every reply also carries that person's conversations in the inboxes picked here: whole when short, as a summary when long.\n\nThe summary is written in the background with the memory summary's model and is billed like it. While it is not ready, the agent only sees that the conversation exists.\n\nPick only inboxes this agent may see. Private notes are never read.",
+            )}
+          >
+            <OtherInboxesFields
+              value={otherInboxes}
+              onChange={setOtherInboxes}
+            />
           </Section>
 
           <Section
             id="contactAuth"
-            hidden={watcher}
             icon={ShieldCheck}
-            title={t("editor.contactAuth", "Contact authorization")}
-            help={t(
-              "editor.contactAuthHelp",
-              "Before answering, ask an external system whether this contact may be served, by the identity Chatwoot holds for them (phone, email, identifier). By default every message is re-checked, so revoking on your side takes effect immediately. While the check denies or cannot answer, the agent stays silent to the customer and the operator gets a private note. It does not run in the playground.",
-            )}
+            title={t("editor.contactAuth", "Who this agent serves")}
+            help={
+              watcher
+                ? t(
+                    "editor.contactAuthWatcherHelp",
+                    "Decides which conversations this agent observes, so a conversation it refuses costs no analysis. Nothing is sent to the customer and no note is written.\n\nThe conditions, and the external endpoint when it is on, are checked before an observation is scheduled: on every new message and when a conversation is resolved.",
+                  )
+                : t(
+                    "editor.contactAuthHelp",
+                    "Decides, before the agent answers, whether this conversation is one it serves. Every message is checked again, and the check does not run in the Playground.\n\nConditions decide here, from what Chatwoot already holds (the conversation type, a label, a list, an attribute), before the other checks, so a conversation the agent does not serve gets no away message or redirect first.\n\nAn external endpoint decides from your own system, by the phone number, email and identifier Chatwoot holds for the contact, after the other checks: alone, or about what the conditions let through.",
+                  )
+            }
           >
             <SwitchField
               checked={contactAuth.enabled}
               onCheckedChange={(v) =>
                 setContactAuth({ ...contactAuth, enabled: v })
               }
-              label={t(
-                "editor.contactAuthEnabled",
-                "Only answer authorized contacts",
-              )}
+              label={
+                watcher
+                  ? t(
+                      "editor.contactAuthWatcherEnabled",
+                      "Only observe the conversations a rule lets through",
+                    )
+                  : t(
+                      "editor.contactAuthEnabled",
+                      "Only answer authorized contacts",
+                    )
+              }
             />
+            {!contactAuth.enabled && (
+              <p className="text-text-muted text-xs">
+                {watcher
+                  ? t(
+                      "editor.contactAuthOffWatcher",
+                      "Off: this agent observes every conversation on its inboxes.",
+                    )
+                  : t(
+                      "editor.contactAuthOff",
+                      "Off: this agent answers every contact on its inboxes.",
+                    )}
+              </p>
+            )}
             {contactAuth.enabled && (
               <>
                 <FormField
-                  label={t("editor.contactAuthSource", "Who decides")}
+                  group
+                  label={
+                    watcher
+                      ? t(
+                          "editor.contactAuthRuleEffectWatcher",
+                          "This agent observes",
+                        )
+                      : t("editor.contactAuthRuleEffect", "This agent serves")
+                  }
+                >
+                  <ChoiceCards
+                    value={
+                      contactAuth.ruleEffect === "exclude" ? "exclude" : "serve"
+                    }
+                    onChange={(v) =>
+                      setContactAuth({ ...contactAuth, ruleEffect: v })
+                    }
+                    aria-label={
+                      watcher
+                        ? t(
+                            "editor.contactAuthRuleEffectWatcher",
+                            "This agent observes",
+                          )
+                        : t("editor.contactAuthRuleEffect", "This agent serves")
+                    }
+                    className="sm:grid-cols-2"
+                    options={[
+                      {
+                        value: "serve",
+                        icon: UserCheck,
+                        title: t(
+                          "editor.contactAuthRuleEffectServeTitle",
+                          "Only who meets the conditions",
+                        ),
+                        hint: t(
+                          "editor.contactAuthRuleEffectServeHint",
+                          "Everyone else is refused.",
+                        ),
+                      },
+                      {
+                        value: "exclude",
+                        icon: UserMinus,
+                        title: t(
+                          "editor.contactAuthRuleEffectExcludeTitle",
+                          "Everyone, except who meets the conditions",
+                        ),
+                        hint: t(
+                          "editor.contactAuthRuleEffectExcludeHint",
+                          "To leave a few contacts out, like the team's own numbers.",
+                        ),
+                      },
+                    ]}
+                  />
+                </FormField>
+                <FormField
+                  group
+                  label={t("editor.contactAuthConditions", "Conditions")}
                   help={t(
-                    "editor.contactAuthSourceHelp",
-                    "An external endpoint answers from your own system (a CRM, a customer list).\n\nA list or an attribute decides here, from what Chatwoot already holds for the contact, with no service to host. The endpoint is then never called.\n\nA list or an attribute is checked on every message, so an edit takes effect on the contact's next message.",
+                    "editor.contactAuthConditionsHelp",
+                    "Decided here, from what Chatwoot already holds for the contact and the conversation (the conversation type, a label, a list of phones or identifiers, an attribute), with no service to host and no cost.\n\nThey can name who the agent serves, or who it stays out of (for example the team's own numbers). Checked on every message, so an edit takes effect on the next one.",
                   )}
                 >
-                  <Select
-                    value={contactAuth.ruleKind}
-                    onChange={(e) =>
-                      setContactAuth({
-                        ...contactAuth,
-                        ruleKind: e.target.value,
-                      })
+                  <ContactAuthConditionList
+                    form={contactAuth}
+                    onChange={(next) =>
+                      setContactAuth({ ...contactAuth, ...next })
                     }
-                  >
-                    <option value="">
-                      {t(
-                        "editor.contactAuthSourceEndpoint",
-                        "External endpoint",
-                      )}
-                    </option>
-                    <option value="allowlist">
-                      {t(
-                        "editor.contactAuthSourceAllowlist",
-                        "A list of phones or identifiers",
-                      )}
-                    </option>
-                    <option value="attribute">
-                      {t(
-                        "editor.contactAuthSourceAttribute",
-                        "A contact or conversation attribute",
-                      )}
-                    </option>
-                  </Select>
+                    showErrors={contactAuthRuleBad}
+                  />
                 </FormField>
-                {contactAuth.ruleKind === "allowlist" && (
-                  <>
-                    <FormField
-                      label={t("editor.contactAuthRulePhones", "Phones")}
-                      description={t(
-                        "editor.contactAuthRulePhonesHint",
-                        "One per line, with the country code (+55 11 99999-0000). Compared by digits, never by the end of the number.",
-                      )}
-                      error={
-                        contactAuthRuleBad
-                          ? t(
-                              "editor.contactAuthRuleListInvalid",
-                              "The list needs 1 to 500 entries in total; each phone needs 8 to 15 digits and each identifier at most 200 characters.",
-                            )
-                          : null
-                      }
-                    >
-                      <Textarea
-                        rows={4}
-                        maxLength={CONTACT_AUTH_PHONES_TEXT_MAX}
-                        value={contactAuth.rulePhones}
-                        onChange={(e) =>
-                          setContactAuth({
-                            ...contactAuth,
-                            rulePhones: e.target.value,
-                          })
-                        }
-                        placeholder="+55 11 99999-0000"
-                      />
-                    </FormField>
-                    <FormField
-                      label={t(
-                        "editor.contactAuthRuleIdentifiers",
-                        "Identifiers",
-                      )}
-                      description={t(
-                        "editor.contactAuthRuleIdentifiersHint",
-                        "One per line: the contact's identifier in Chatwoot, compared exactly.",
-                      )}
-                    >
-                      <Textarea
-                        rows={3}
-                        maxLength={CONTACT_AUTH_IDENTIFIERS_TEXT_MAX}
-                        value={contactAuth.ruleIdentifiers}
-                        onChange={(e) =>
-                          setContactAuth({
-                            ...contactAuth,
-                            ruleIdentifiers: e.target.value,
-                          })
-                        }
-                      />
-                    </FormField>
-                  </>
+                {watcher && contactAuthUsesRule && (
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.contactAuthWatcherRule",
+                      "On a monitoring agent, the rule decides which conversations it observes. A conversation the rule refuses is not observed, and nothing is sent or noted.",
+                    )}
+                  </p>
                 )}
-                {contactAuth.ruleKind === "attribute" && (
-                  <div className="grid gap-4 sm:grid-cols-3">
-                    <FormField
-                      label={t("editor.contactAuthRuleScope", "Attribute of")}
-                    >
-                      <Select
-                        value={contactAuth.ruleScope}
-                        onChange={(e) =>
-                          setContactAuth({
-                            ...contactAuth,
-                            ruleScope: e.target.value,
-                          })
-                        }
-                      >
-                        <option value="contact">
-                          {t("editor.contactAuthRuleScopeContact", "Contact")}
-                        </option>
-                        <option value="conversation">
-                          {t(
-                            "editor.contactAuthRuleScopeConversation",
-                            "Conversation",
-                          )}
-                        </option>
-                      </Select>
-                    </FormField>
-                    <FormField
-                      label={t("editor.contactAuthRuleKey", "Attribute key")}
-                      error={
-                        contactAuthRuleBad
-                          ? t("editor.contactAuthRuleKeyRequired", "Required.")
-                          : null
-                      }
-                    >
-                      <Input
-                        value={contactAuth.ruleKey}
-                        onChange={(e) =>
-                          setContactAuth({
-                            ...contactAuth,
-                            ruleKey: e.target.value,
-                          })
-                        }
-                        placeholder="plano"
-                      />
-                    </FormField>
-                    <FormField
-                      label={t("editor.contactAuthRuleEquals", "Equal to")}
-                      description={t(
-                        "editor.contactAuthRuleEqualsHint",
-                        "Empty: any value counts.",
-                      )}
-                    >
-                      <Input
-                        value={contactAuth.ruleEquals}
-                        onChange={(e) =>
-                          setContactAuth({
-                            ...contactAuth,
-                            ruleEquals: e.target.value,
-                          })
-                        }
-                        placeholder="ativo"
-                      />
-                    </FormField>
-                  </div>
+                {contactAuthEmpty && (
+                  <p className="text-error text-xs">
+                    {t(
+                      "editor.contactAuthEmpty",
+                      "Add at least one condition or turn on the external endpoint, or turn the gate off.",
+                    )}
+                  </p>
                 )}
-                {!contactAuthUsesRule && (
+                <SwitchField
+                  checked={contactAuth.endpointEnabled}
+                  onCheckedChange={(v) =>
+                    setContactAuth({
+                      ...contactAuth,
+                      endpointEnabled: v,
+                    })
+                  }
+                  label={t(
+                    "editor.contactAuthEndpoint",
+                    "Ask an external endpoint",
+                  )}
+                  help={
+                    contactAuthUsesRule
+                      ? t(
+                          "editor.contactAuthEndpointAfterHelp",
+                          "Asked after the conditions, only about what they let through: what they refuse is refused without calling it. The endpoint has the final word, from your own system (a CRM, a customer list), by the phone, email and identifier Chatwoot holds for the contact.",
+                        )
+                      : t(
+                          "editor.contactAuthEndpointAloneHelp",
+                          "With no conditions, the endpoint decides alone, from your own system (a CRM, a customer list), by the phone, email and identifier Chatwoot holds for the contact. It is asked after the other checks, and a failure refuses.",
+                        )
+                  }
+                />
+                {watcher && contactAuthAsksEndpoint && (
+                  <p className="text-text-muted text-xs">
+                    {t(
+                      "editor.contactAuthWatcherEndpoint",
+                      "On a monitoring agent, the endpoint's answer only decides which conversations this agent observes. It is asked once before each observation is scheduled, and a denial or a failure leaves the conversation unobserved, with nothing sent or noted.",
+                    )}
+                  </p>
+                )}
+                {contactAuthAsksEndpoint && (
                   <>
                     <FormField
                       label={t("editor.contactAuthUrl", "Authorization URL")}
@@ -3481,15 +4227,20 @@ export function BehaviorTab({
                     </FormField>
                     <FormField
                       label={t("editor.contactAuthTimeout", "Timeout (ms)")}
-                      description={t(
-                        "editor.contactAuthTimeoutHint",
-                        "1,000-10,000. Past it the check counts as failed and the agent stays silent.",
-                      )}
+                      description={
+                        watcher
+                          ? t(
+                              "editor.contactAuthWatcherTimeoutHint",
+                              "1,000-10,000. Past it the check counts as failed and the conversation is not observed.",
+                            )
+                          : t(
+                              "editor.contactAuthTimeoutHint",
+                              "1,000-10,000. Past it the check counts as failed and the agent stays silent.",
+                            )
+                      }
                     >
-                      <Input
-                        type="number"
-                        min={1000}
-                        max={10000}
+                      <NumberInput
+                        range={CONTACT_AUTH_RANGES.timeoutMs}
                         value={contactAuth.timeoutMs}
                         onChange={(e) =>
                           setContactAuth({
@@ -3562,10 +4313,9 @@ export function BehaviorTab({
                           "Sets how long an approval may be reused, from 60 to 2,592,000 seconds, or 30 days.\n\nDenials are never stored. An approval stops applying when the contact's phone number, email, or identifier changes.\n\nChanging the period, address, or credential does not delete stored approvals. To stop reusing them, choose to check every message.",
                         )}
                       >
-                        <Input
-                          type="number"
-                          min={60}
-                          max={2592000}
+                        <NumberInput
+                          range={CONTACT_AUTH_RANGES.grantTtlSeconds}
+                          optional
                           value={contactAuth.grantTtlSeconds}
                           onChange={(e) =>
                             setContactAuth({
@@ -3578,81 +4328,109 @@ export function BehaviorTab({
                     )}
                   </>
                 )}
-                <FormField
-                  label={t(
-                    "editor.contactAuthNoticeCooldown",
-                    "Notice cooldown (s)",
-                  )}
-                  description={t(
-                    "editor.contactAuthNoticeCooldownHint",
-                    "This only spaces the deny message and the private note for the same conversation; it never spaces the check itself. 0-3,600; 0 notifies on every refused message.",
-                  )}
-                >
-                  <Input
-                    type="number"
-                    min={0}
-                    max={3600}
-                    value={contactAuth.noticeCooldownSeconds}
-                    onChange={(e) =>
-                      setContactAuth({
-                        ...contactAuth,
-                        noticeCooldownSeconds: e.target.value,
-                      })
-                    }
-                  />
-                </FormField>
-                <FormField
-                  label={t(
-                    "editor.contactAuthDenyMessage",
-                    "Message to a denied contact",
-                  )}
-                  error={refusals.contactAuthDenyMessage}
-                  description={t(
-                    "editor.contactAuthDenyMessageHint",
-                    "Sent when the check denies the contact, at most once per notice cooldown. Leave empty to send nothing.",
-                  )}
-                >
-                  <Textarea
-                    value={contactAuth.denyMessage}
-                    onChange={(e) =>
-                      setContactAuth({
-                        ...contactAuth,
-                        denyMessage: e.target.value,
-                      })
-                    }
-                    rows={2}
-                    maxLength={TEMPLATE_MESSAGE_MAX}
-                    placeholder={t(
-                      "editor.contactAuthDenyMessagePlaceholder",
-                      "This channel serves registered customers only.",
+                {!watcher && (
+                  <>
+                    <FormField
+                      label={t(
+                        "editor.contactAuthNoticeCooldown",
+                        "Notice cooldown (s)",
+                      )}
+                      description={t(
+                        "editor.contactAuthNoticeCooldownHint",
+                        "This only spaces the deny message and the private note for the same conversation; it never spaces the check itself. 0-3,600; 0 notifies on every refused message.",
+                      )}
+                    >
+                      <NumberInput
+                        range={CONTACT_AUTH_RANGES.noticeCooldownSeconds}
+                        optional
+                        value={contactAuth.noticeCooldownSeconds}
+                        onChange={(e) =>
+                          setContactAuth({
+                            ...contactAuth,
+                            noticeCooldownSeconds: e.target.value,
+                          })
+                        }
+                      />
+                    </FormField>
+                    <FormField
+                      label={t(
+                        "editor.contactAuthDenyMessage",
+                        "Message to a denied contact",
+                      )}
+                      error={refusals.contactAuthDenyMessage}
+                      description={t(
+                        "editor.contactAuthDenyMessageHint",
+                        "Sent when the check denies the contact, at most once per notice cooldown. Leave empty to send nothing.",
+                      )}
+                    >
+                      <Textarea
+                        value={contactAuth.denyMessage}
+                        onChange={(e) =>
+                          setContactAuth({
+                            ...contactAuth,
+                            denyMessage: e.target.value,
+                          })
+                        }
+                        rows={2}
+                        maxLength={TEMPLATE_MESSAGE_MAX}
+                        placeholder={t(
+                          "editor.contactAuthDenyMessagePlaceholder",
+                          "This channel serves registered customers only.",
+                        )}
+                      />
+                    </FormField>
+                    <SwitchField
+                      checked={contactAuth.handoffEnabled}
+                      onCheckedChange={(v) =>
+                        setContactAuth({ ...contactAuth, handoffEnabled: v })
+                      }
+                      label={t(
+                        "editor.contactAuthHandoff",
+                        "Open refused conversations for humans",
+                      )}
+                    />
+                    {contactAuth.handoffEnabled && (
+                      <ContactAuthTeamSelect
+                        agentId={agentId}
+                        value={contactAuth.handoffTeamId}
+                        instanceId={contactAuth.handoffTeamInstanceId}
+                        onChange={(v, instanceId) =>
+                          setContactAuth({
+                            ...contactAuth,
+                            handoffTeamId: v,
+                            // Cleared with the team: a recorded account with no team pins nothing, and
+                            // a stale one would outlive the choice it belonged to.
+                            handoffTeamInstanceId: v ? instanceId : "",
+                          })
+                        }
+                      />
                     )}
-                  />
-                </FormField>
-                <SwitchField
-                  checked={contactAuth.handoffEnabled}
-                  onCheckedChange={(v) =>
-                    setContactAuth({ ...contactAuth, handoffEnabled: v })
-                  }
-                  label={t(
-                    "editor.contactAuthHandoff",
-                    "Open refused conversations for humans",
-                  )}
-                />
-                {contactAuth.handoffEnabled && (
-                  <ContactAuthTeamSelect
-                    agentId={agentId}
-                    value={contactAuth.handoffTeamId}
-                    instanceId={contactAuth.handoffTeamInstanceId}
-                    onChange={(v, instanceId) =>
-                      setContactAuth({
-                        ...contactAuth,
-                        handoffTeamId: v,
-                        // Cleared with the team: a recorded account with no team pins nothing, and
-                        // a stale one would outlive the choice it belonged to.
-                        handoffTeamInstanceId: v ? instanceId : "",
-                      })
-                    }
-                  />
+                    <SwitchField
+                      checked={contactAuth.operatorNoteEnabled}
+                      onCheckedChange={(v) =>
+                        setContactAuth({
+                          ...contactAuth,
+                          operatorNoteEnabled: v,
+                        })
+                      }
+                      label={t(
+                        "editor.contactAuthOperatorNote",
+                        "Write a private note when a contact is refused",
+                      )}
+                      help={t(
+                        "editor.contactAuthOperatorNoteHelp",
+                        "Turn it off when most conversations are refused on purpose, so each one does not get a note. A check that fails, or a contact with nothing to check, always gets a note, since those need fixing.",
+                      )}
+                    />
+                    {contactAuthQuietRefusal && (
+                      <p className="text-text-muted text-xs">
+                        {t(
+                          "editor.contactAuthQuietRefusal",
+                          "Quiet refusal: conversations this agent does not serve go to the human queue with no message to the customer and no note. This is the setup for an agent that should act on only part of an inbox.",
+                        )}
+                      </p>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -3751,12 +4529,52 @@ export function BehaviorTab({
           </Section>
 
           <Section
+            id="conversationNotes"
+            hidden={watcher}
+            icon={StickyNote}
+            title={t("editor.conversationNotes", "Notes in the conversation")}
+            help={t(
+              "editor.conversationNotesHelp",
+              "Notes and messages the agent leaves in the Chatwoot conversation for your team. The customer never sees them, and the agent does not read them back on later turns.",
+            )}
+          >
+            <NoteFormatField
+              label={t(
+                "editor.conversationNotesToolsUsed",
+                "Tools used in each turn",
+              )}
+              help={t(
+                "editor.conversationNotesToolsUsedHelp",
+                "One message per turn that used a tool, with the tool names only. What each tool was given and returned stays out, since it can carry the customer's data; the Logs page shows it.",
+              )}
+              value={conversationNotes.toolsUsed}
+              onChange={(v) =>
+                setConversationNotes({ ...conversationNotes, toolsUsed: v })
+              }
+            />
+            <NoteFormatField
+              label={t(
+                "editor.conversationNotesErrors",
+                "Errors in the middle of a turn",
+              )}
+              help={t(
+                "editor.conversationNotesErrorsHelp",
+                "When a tool fails, only the fallback model answers or a guardrail holds the reply, and the turn still ends, one message per turn says what failed, a short reason and whether the turn recovered, with a link to the turn on the Logs page. The same failure is not repeated.",
+              )}
+              value={conversationNotes.errors}
+              onChange={(v) =>
+                setConversationNotes({ ...conversationNotes, errors: v })
+              }
+            />
+          </Section>
+
+          <Section
             id="limits"
             icon={Gauge}
             title={t("editor.limits", "Execution limits")}
             description={t(
               "editor.limitsHint",
-              "Cap how much work the agent does in a single turn before it must answer.",
+              "Cap how much work the agent does in a turn, and how often it answers one conversation.",
             )}
           >
             <div className="grid gap-4 sm:grid-cols-2">
@@ -3767,58 +4585,113 @@ export function BehaviorTab({
                   "After this many tool uses the agent is forced to reply with what it has (no error). 1-50.",
                 )}
               >
-                <Input
-                  type="number"
-                  min={1}
-                  max={50}
+                <NumberInput
+                  range={LIMITS_RANGES.maxToolCalls}
                   value={limits.maxToolCalls}
                   onChange={(e) =>
                     setLimits({ ...limits, maxToolCalls: e.target.value })
                   }
                 />
               </FormField>
-              <FormField
-                label={t("editor.limitsMaxHistoryTokens", "History ceiling")}
-                description={t(
-                  "editor.limitsMaxHistoryTokensHint",
-                  "Empty means no ceiling. Between 2,000 and 1,000,000.",
-                )}
-                // WHAT IT DOES IS NOT THE SAME FOR A WATCHER (review round 40). An observation does
-                // not travel with the contact's history at all: the tick rebuilds the conversation
-                // from Chatwoot into a single message and keeps its own thread, and the window
-                // always keeps the current turn, so nothing is ever trimmed off a tick. The setting
-                // is NOT inert for it, though, which is why it stays on screen: `runCompaction`
-                // loads a watcher's config with `ignoreMode` and hands this same ceiling to the
-                // summariser, so it bounds the transcript the watcher's memory reads when an
-                // attendance closes. The help says which of the two the operator is buying.
-                help={
-                  watcher
-                    ? t(
-                        "editor.limitsMaxHistoryTokensHelpObserving",
-                        "An observation does not carry this contact's history: each tick rebuilds the conversation from the channel, so this ceiling never trims one.\n\nWhat it does bound is this agent's memory: when an attendance closes, the transcript handed to the summariser is cut to fit.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions.",
-                      )
-                    : t(
-                        "editor.limitsMaxHistoryTokensHelp",
-                        "The agent sends this contact's whole history on every turn. The more a customer talks, the slower and costlier their answers get.\n\nThe ceiling cuts that off: once it is reached, the oldest attendances stop travelling. The conversation being answered never does.\n\nThe count is an estimate, runs low on tool-heavy threads, and leaves out the instructions and the tool definitions. Set it under the budget you actually have.",
-                      )
-                }
-              >
-                <Input
-                  type="number"
-                  min={2000}
-                  max={1000000}
-                  placeholder={t("editor.limitsNoCeiling", "No ceiling")}
-                  value={limits.maxHistoryTokens}
-                  onChange={(e) =>
-                    setLimits({ ...limits, maxHistoryTokens: e.target.value })
+              {/* The part of every call this ceiling does not govern, next to the number it sizes. */}
+              <div>
+                <FormField
+                  label={t(
+                    "editor.limitsMaxHistoryTokens",
+                    "History ceiling (tokens)",
+                  )}
+                  description={t(
+                    "editor.limitsMaxHistoryTokensHint",
+                    "Empty means no ceiling. Between 2,000 and 1,000,000.",
+                  )}
+                  // NOTE: Not the same for a watcher: an observation rebuilds the conversation from Chatwoot
+                  // each tick, so the ceiling never trims one, but `runCompaction` hands this same ceiling to
+                  // the summariser, bounding the transcript the watcher's memory reads. The help says which applies.
+                  help={
+                    watcher
+                      ? t(
+                          "editor.limitsMaxHistoryTokensHelpObserving",
+                          "An observation does not carry this contact's history: each tick rebuilds the conversation from the channel, so this ceiling never trims one.\n\nWhat it does bound is this agent's memory: when an attendance closes, the transcript handed to the summariser is cut to fit.\n\nThe count is in tokens, about 4 characters of text each, and an estimate: it runs low on tool-heavy threads and leaves out the instructions and the tool definitions.",
+                        )
+                      : t(
+                          "editor.limitsMaxHistoryTokensHelp",
+                          "The agent sends this contact's whole history on every turn. The more a customer talks, the slower and costlier their answers get.\n\nThe ceiling cuts that off: once it is reached, the oldest attendances stop travelling. The conversation being answered never does.\n\nThe count is in tokens, about 4 characters of text each, and an estimate: it runs low on tool-heavy threads and leaves out the instructions and the tool definitions. Set it under the budget you actually have.",
+                        )
                   }
-                />
-              </FormField>
+                >
+                  <NumberInput
+                    range={LIMITS_RANGES.maxHistoryTokens}
+                    optional
+                    placeholder={t("editor.limitsNoCeiling", "No ceiling")}
+                    value={limits.maxHistoryTokens}
+                    onChange={(e) =>
+                      setLimits({ ...limits, maxHistoryTokens: e.target.value })
+                    }
+                  />
+                </FormField>
+                <CallFloorLine floor={callFloor} draftPrompt={draftPrompt} />
+              </div>
+              {!watcher && (
+                <FormField
+                  label={t(
+                    "editor.limitsMaxTurnsPerHour",
+                    "Max replies / conversation / hour",
+                  )}
+                  description={t(
+                    "editor.limitsMaxTurnsPerHourHint",
+                    "Past this, the conversation goes to your team with a note. Empty means no limit. 1-1000.",
+                  )}
+                  help={t(
+                    "editor.limitsMaxTurnsPerHourHelp",
+                    "Counts the agent's replies in one conversation over the last hour, follow-ups included. A reply split into several messages counts once, and private notes do not count.\n\nWhen the other side is another bot or an automatic e-mail reply, the two answer each other without end, and every message is billed. A person rarely gets past a few dozen replies in an hour.\n\nPast the limit the agent stops, opens the conversation for your team and leaves a note saying why. Giving it back to the agent starts the count from zero.",
+                  )}
+                >
+                  <NumberInput
+                    range={LIMITS_RANGES.maxTurnsPerHour}
+                    optional
+                    placeholder={t("editor.limitsNoLimit", "No limit")}
+                    value={limits.maxTurnsPerHour}
+                    onChange={(e) =>
+                      setLimits({ ...limits, maxTurnsPerHour: e.target.value })
+                    }
+                  />
+                </FormField>
+              )}
+              {!watcher && (
+                <FormField
+                  label={t(
+                    "editor.limitsMaxProactivePerDay",
+                    "Max proactive / conversation / 24h",
+                  )}
+                  description={t(
+                    "editor.limitsMaxProactivePerDayHint",
+                    "Past this, follow-ups and integration events stop reaching that customer for the day. Empty means no limit. 1-1000.",
+                  )}
+                  help={t(
+                    "editor.limitsMaxProactivePerDayHelp",
+                    "Counts the messages the agent starts on its own in one conversation over the last 24 hours: follow-up steps, appointment reminders, integration events and templates. Replies to the customer and private notes do not count.\n\nAn integration that keeps firing events can otherwise message the same customer every few minutes, and each message is billed.\n\nPast the limit the message is not sent and the Logs say why. The conversation stays with the agent, which still answers when the customer writes.",
+                  )}
+                >
+                  <NumberInput
+                    range={LIMITS_RANGES.maxProactivePerDay}
+                    optional
+                    placeholder={t("editor.limitsNoLimit", "No limit")}
+                    value={limits.maxProactivePerDay}
+                    onChange={(e) =>
+                      setLimits({
+                        ...limits,
+                        maxProactivePerDay: e.target.value,
+                      })
+                    }
+                  />
+                </FormField>
+              )}
             </div>
           </Section>
 
           <Section
             id="memory"
+            hidden={chatModelUnused}
             icon={Brain}
             title={t("editor.memory", "Memory")}
             help={t(
@@ -3836,9 +4709,9 @@ export function BehaviorTab({
                 "Summarize attendances that have ended",
               )}
             />
-            {memory.compactionEnabled && (
+            {summaryModelInUse && (
               <div className="flex flex-col gap-3">
-                <p className="flex items-center gap-1.5 font-medium text-sm">
+                <p className="flex items-center gap-1.5 text-sm font-medium">
                   {t("editor.memoryModel", "Summary model")}
                   <HelpPopover
                     content={t(
@@ -3848,146 +4721,48 @@ export function BehaviorTab({
                     label={t("editor.memoryModel", "Summary model")}
                   />
                 </p>
-                <FormField label={t("editor.provider", "Provider")}>
-                  <Select
-                    value={memory.provider}
-                    onChange={(e) =>
-                      setMemory((prev) => ({
-                        ...prev,
-                        ...overrideProviderChanged(
-                          {
-                            provider: prev.provider,
-                            model: prev.model,
-                            credentialRef: prev.credentialRef,
-                            baseURL: prev.baseURL,
-                          },
-                          e.target.value,
-                        ),
-                      }))
-                    }
-                  >
-                    <option value="">
-                      {t("editor.memorySameAsAgent", "Same as the agent")}
-                    </option>
-                    {MODEL_PROVIDERS.map((p) => (
-                      <option key={p} value={p}>
-                        {providerLabel(p, t)}
-                      </option>
-                    ))}
-                  </Select>
-                </FormField>
-                <FormField
-                  label={t("editor.credential", "API key")}
-                  error={refusals.memoryCredential}
-                  description={t(
+                {otherInboxes.enabled && (
+                  <p className="text-text-secondary text-xs">
+                    {t(
+                      "editor.memoryModelOtherInboxes",
+                      "Also writes the summaries of this contact's conversations in other inboxes.",
+                    )}
+                  </p>
+                )}
+                <ModelOverrideFields
+                  value={{
+                    provider: memory.provider,
+                    model: memory.model,
+                    credentialRef: memory.credentialRef,
+                    baseURL: memory.baseURL,
+                  }}
+                  onChange={(update) =>
+                    setMemory((prev) => ({
+                      ...prev,
+                      ...update({
+                        provider: prev.provider,
+                        model: prev.model,
+                        credentialRef: prev.credentialRef,
+                        baseURL: prev.baseURL,
+                      }),
+                    }))
+                  }
+                  parent={agentModel}
+                  credBaseUrl={memoryCredBaseUrl}
+                  credentialError={refusals.memoryCredential ?? undefined}
+                  sameAsLabel={t(
+                    "editor.memorySameAsAgent",
+                    "Same as the agent",
+                  )}
+                  credentialHint={t(
                     "editor.memoryCredentialHint",
                     "Required when summaries use another provider; without its own key, the attendance is not summarized.",
                   )}
-                  group
-                >
-                  <CredentialPicker
-                    value={memory.credentialRef}
-                    onChange={(v) =>
-                      setMemory((prev) => ({
-                        ...prev,
-                        ...overridePicked(
-                          {
-                            provider: prev.provider,
-                            model: prev.model,
-                            credentialRef: prev.credentialRef,
-                            baseURL: prev.baseURL,
-                          },
-                          "credentialRef",
-                          v,
-                          agentModelProvider,
-                        ),
-                      }))
-                    }
-                    required={memoryNeedsOwnCredential}
-                    compatibleTypes={credentialCompat.model(
-                      memoryEffectiveProvider,
-                    )}
-                    defaultCreateType={
-                      credentialCompat.model(memoryEffectiveProvider)[0]
-                    }
-                    ariaLabel={t("editor.credential", "API key")}
-                  />
-                </FormField>
-                <FormField label={t("editor.model", "Model")} group>
-                  <ModelPicker
-                    value={memory.model}
-                    onChange={(v) =>
-                      setMemory((prev) => ({
-                        ...prev,
-                        ...overridePicked(
-                          {
-                            provider: prev.provider,
-                            model: prev.model,
-                            credentialRef: prev.credentialRef,
-                            baseURL: prev.baseURL,
-                          },
-                          "model",
-                          v,
-                          agentModelProvider,
-                        ),
-                      }))
-                    }
-                    provider={memoryEffectiveProvider}
-                    credentialRef={memorySource.credentialRef || undefined}
-                    baseURL={memorySource.baseURL || undefined}
-                    // NOTE: blank inherits the AGENT's model while the provider is unchanged, and
-                    // only falls back to the provider default once it differs. The placeholder has
-                    // to say the same thing, or the operator reads one model here and another runs.
-                    placeholder={
-                      memoryEffectiveProvider === agentModelProvider
-                        ? t("editor.memorySameAsAgent", "Same as the agent")
-                        : undefined
-                    }
-                  />
-                </FormField>
-                {(memoryEffectiveProvider === "openai-compatible" ||
-                  !!memoryCredBaseUrl ||
-                  !!memory.baseURL.trim()) && (
-                  <FormField
-                    label={t("editor.baseURL", "Base URL")}
-                    description={
-                      memoryCredBaseUrl
-                        ? t(
-                            "editor.baseURLFromCredential",
-                            "Defined by the selected credential.",
-                          )
-                        : t(
-                            "editor.memoryBaseURLHint",
-                            "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
-                          )
-                    }
-                    error={
-                      memoryBaseUrlUnsupported
-                        ? t(
-                            "editor.baseURLNotSentByProvider",
-                            "This provider does not send a base URL: the request would go to its own endpoint instead. Pick a credential without one, or use an OpenAI-compatible provider.",
-                          )
-                        : memoryBaseUrlInvalid && memory.baseURL.trim()
-                          ? t(
-                              "common.invalidUrl",
-                              "Must be a valid http(s) URL.",
-                            )
-                          : null
-                    }
-                  >
-                    <Input
-                      value={memoryCredBaseUrl ?? memory.baseURL}
-                      onChange={(e) =>
-                        setMemory((prev) => ({
-                          ...prev,
-                          baseURL: e.target.value,
-                        }))
-                      }
-                      disabled={!!memoryCredBaseUrl}
-                      placeholder="https://api.groq.com/openai/v1"
-                    />
-                  </FormField>
-                )}
+                  baseURLHint={t(
+                    "editor.memoryBaseURLHint",
+                    "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                  )}
+                />
               </div>
             )}
             <SwitchField
@@ -4008,6 +4783,7 @@ export function BehaviorTab({
 
           <Section
             id="modelFallback"
+            hidden={chatModelUnused}
             icon={LifeBuoy}
             title={t("editor.modelFallback", "Fallback provider")}
             help={t(
@@ -4027,6 +4803,8 @@ export function BehaviorTab({
                 onChange={(e) =>
                   setModelFallback((prev) => ({
                     ...prev,
+                    // NOTE: the timeout goes with the fallback, and survives a switch of provider.
+                    ...(e.target.value ? {} : { timeoutSeconds: "" }),
                     ...overrideProviderChanged(
                       {
                         provider: prev.provider,
@@ -4169,6 +4947,14 @@ export function BehaviorTab({
                     />
                   </FormField>
                 )}
+                <FallbackTimeoutField
+                  value={modelFallback.timeoutSeconds}
+                  onChange={(v) =>
+                    setModelFallback((prev) => ({ ...prev, timeoutSeconds: v }))
+                  }
+                  defaultSeconds={MODEL_FALLBACK_TIMEOUT_DEFAULT_MS / 1000}
+                  range={MODEL_FALLBACK_RANGES.timeoutSeconds}
+                />
               </div>
             )}
           </Section>
@@ -4183,9 +4969,9 @@ export function BehaviorTab({
             )}
           >
             {debugModesOn && (
-              <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+              <div className="border-warning bg-warning-soft text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs">
                 <AlertTriangle
-                  className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                  className="text-warning mt-0.5 h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
                 <span>
@@ -4221,15 +5007,10 @@ export function BehaviorTab({
                 setObservability((o) => ({
                   ...o,
                   fullDetail: v,
-                  // The stored value IS the end of the window, so turning the switch on is choosing
-                  // an instant. It cannot be armed for longer than the schema accepts, and it stops
-                  // on its own, which is the point: an operator who forgets loses at most one day of
-                  // full-size rows instead of the whole retention window.
-                  //
-                  // Chosen on the SERVER's clock, because the server is what enforces it. Off the
-                  // browser's, a wrong machine arms a window of a different length than the one the
-                  // screen names, and a machine wrong by more than the arming gap arms one that was
-                  // already over.
+                  // NOTE: The stored value IS the end of the window, so turning the switch on picks an
+                  // instant, capped by the schema, and the window stops on its own: a forgotten switch
+                  // costs at most one day of full-size rows. Chosen on the SERVER's clock, which enforces
+                  // it, so a wrong browser clock cannot arm a window of another length or one already over.
                   fullDetailUntil: v
                     ? new Date(serverNow() + FULL_DETAIL_ARM_HOURS * 3_600_000)
                     : null,
@@ -4245,16 +5026,13 @@ export function BehaviorTab({
                 hours: FULL_DETAIL_ARM_HOURS,
               })}
             />
-            {/* State, not help: the sentence exists only while the window is open, which is
-                exactly when the operator needs to know when it closes. What the switch DOES moved
-                to the `?` on its label. A permanent explanation under a switch is the shape this
-                page had too much of (docs/ui.md → Where help goes). */}
+            {/* State, not help: the sentence exists only while the window is open, which is exactly
+                when the operator needs to know when it closes. What the switch DOES is behind the `?`
+                on its label (docs/ui.md, Where help goes). */}
             <p className="text-text-secondary text-xs">
-              {/* Which of the two sentences depends on whether this deadline is the SAVED one.
-                  Both are "the window is open until X", and only the unsaved one is waiting on a
-                  click: an armed-and-saved window that kept saying "Save to apply" contradicted the
-                  warning above it, which speaks for the server, and left an operator no way to tell
-                  a mode that is running from one that is merely typed. */}
+              {/* Which sentence depends on whether this deadline is the SAVED one: only the unsaved
+                  one waits on a click. A saved window saying "Save to apply" would contradict the
+                  warning above, which speaks for the server. */}
               {isFullDetailWindowOpen(observability.fullDetailUntil, judgedAt)
                 ? formUntilMs === savedUntilMs
                   ? t("editor.observabilityFullDetailUntil", {
@@ -4269,6 +5047,91 @@ export function BehaviorTab({
                     })
                 : null}
             </p>
+            <SwitchField
+              checked={observability.fullDetailRetentionDays !== null}
+              onCheckedChange={(v) =>
+                setObservability((o) => ({
+                  ...o,
+                  fullDetailRetentionDays: v
+                    ? FULL_DETAIL_RETENTION_DEFAULT_DAYS
+                    : null,
+                }))
+              }
+              label={t(
+                "editor.observabilityRetention",
+                "Keep each turn's full detail",
+              )}
+              help={t(
+                "editor.observabilityRetentionHelp",
+                "Log lines cut each tool result and the system prompt at 2,000 characters. Turn this on to also keep them whole for the days you choose, so a complaint that arrives days later can be checked against what the agent actually received. They show on the conversation page.\n\nTool results are kept only while “Log the values sent to tools” is on. Identical results are stored once, and the detail is deleted on its own when the days run out.",
+              )}
+            />
+            {observability.fullDetailRetentionDays !== null && (
+              <FormField
+                label={t("editor.observabilityRetentionDays", "Days to keep")}
+                description={
+                  fullDetailUsage
+                    ? t("editor.observabilityRetentionDaysHint", {
+                        defaultValue:
+                          "{{min}}-{{max}}. Never longer than the Logs retention ({{log}} days).",
+                        min: OBSERVABILITY_RANGES.fullDetailRetentionDays.min,
+                        max: OBSERVABILITY_RANGES.fullDetailRetentionDays.max,
+                        log: fullDetailUsage.logRetentionDays,
+                      })
+                    : t("editor.observabilityRetentionDaysRange", {
+                        defaultValue: "{{min}}-{{max}}.",
+                        min: OBSERVABILITY_RANGES.fullDetailRetentionDays.min,
+                        max: OBSERVABILITY_RANGES.fullDetailRetentionDays.max,
+                      })
+                }
+              >
+                <NumberInput
+                  range={OBSERVABILITY_RANGES.fullDetailRetentionDays}
+                  value={retentionDraft}
+                  onChange={(e) => {
+                    setRetentionDraft(e.target.value);
+                    const n = Number(e.target.value);
+                    if (
+                      e.target.value.trim() !== "" &&
+                      inRange(n, OBSERVABILITY_RANGES.fullDetailRetentionDays)
+                    )
+                      setObservability((o) => ({
+                        ...o,
+                        fullDetailRetentionDays: n,
+                      }));
+                  }}
+                  className="w-24 text-sm"
+                />
+              </FormField>
+            )}
+            {/* State, not help: what the SAVED setting is using now, which is how a retention meant
+                to stay on is watched (docs/ui.md, Where help goes). */}
+            {fullDetailUsage &&
+              (savedObservability.fullDetailRetentionDays !== null ||
+                fullDetailUsage.lines > 0) && (
+                <p className="text-text-secondary text-xs">
+                  {savedObservability.fullDetailRetentionDays !== null
+                    ? t("editor.observabilityRetentionUsage", {
+                        defaultValue:
+                          "Keeping {{days}} days. In use: {{size}} for {{count}} log lines.",
+                        days:
+                          fullDetailUsage.effectiveDays ??
+                          savedObservability.fullDetailRetentionDays,
+                        size: formatters(i18n.language).bytes(
+                          fullDetailUsage.bytes,
+                        ),
+                        count: fullDetailUsage.lines,
+                      })
+                    : t("editor.observabilityRetentionUsageOff", {
+                        defaultValue:
+                          "Off. Still in use until it expires: {{size}} for {{count}} log lines.",
+                        size: formatters(i18n.language).bytes(
+                          fullDetailUsage.bytes,
+                        ),
+                        count: fullDetailUsage.lines,
+                      })}
+                </p>
+              )}
           </Section>
 
           <Section
@@ -4284,7 +5147,7 @@ export function BehaviorTab({
             {/* When to reach out */}
             <div className="flex flex-col gap-4">
               <div>
-                <h4 className="font-medium text-sm text-text-secondary">
+                <h4 className="text-text-secondary text-sm font-medium">
                   {t("editor.followUp", "Follow-up")}
                 </h4>
                 <p className="text-text-muted text-xs">
@@ -4295,9 +5158,9 @@ export function BehaviorTab({
                 </p>
               </div>
               {redirectSuppressesFollowUp && (
-                <div className="flex items-start gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-secondary text-xs">
+                <div className="border-border bg-bg-tertiary text-text-secondary flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
                   <ArrowRightLeft
-                    className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent"
+                    className="text-accent mt-0.5 h-3.5 w-3.5 shrink-0"
                     aria-hidden="true"
                   />
                   <span>
@@ -4320,50 +5183,12 @@ export function BehaviorTab({
               />
               {followUp.enabled && (
                 <>
-                  <FormField
-                    label={t("editor.followUpWindowField", "Allowed schedule")}
-                    group
-                    description={t(
+                  {followUpScheduleField(
+                    t(
                       "editor.followUpScheduleHint",
                       "Applies to the whole sequence. Steps only fire inside this schedule.",
-                    )}
-                  >
-                    <SchedulePicker
-                      value={followUpHoursId}
-                      onChange={setFollowUpHoursId}
-                      schedules={hours.map(toScheduleOption)}
-                      emptyLabel={t(
-                        "editor.followUpHoursDefault",
-                        "Follow agent's main schedule",
-                      )}
-                      emptySummary={(() => {
-                        if (businessHoursId) {
-                          const inherited = hours.find(
-                            (h) => String(h.id) === businessHoursId,
-                          );
-                          if (inherited) {
-                            const summary = formatWindowsSummary(
-                              toScheduleOption(inherited).windows,
-                              t("schedule.noWindows", "No windows"),
-                              i18n.language,
-                            );
-                            return `${t("editor.followUpHoursInherited", "Inherited:")} ${inherited.name} — ${summary}`;
-                          }
-                        }
-                        return t(
-                          "editor.followUpHoursAnyTime",
-                          "No schedule set — follow-up may fire at any time.",
-                        );
-                      })()}
-                      aria-label={t(
-                        "editor.followUpWindowField",
-                        "Allowed schedule",
-                      )}
-                      onScheduleSaved={(savedId) => {
-                        onScheduleSaved(savedId, setFollowUpHoursId);
-                      }}
-                    />
-                  </FormField>
+                    ),
+                  )}
                   <FollowUpStepsEditor
                     stepRefusals={refusals.followUpSteps}
                     agentId={agentId}
@@ -4396,9 +5221,9 @@ export function BehaviorTab({
             </div>
 
             {/* How it is delivered: WhatsApp's 24h window governs every proactive send */}
-            <div className="flex flex-col gap-4 border-border border-t pt-4">
+            <div className="border-border flex flex-col gap-4 border-t pt-4">
               <div>
-                <h4 className="font-medium text-sm text-text-secondary">
+                <h4 className="text-text-secondary text-sm font-medium">
                   {t("editor.svcWindow", "WhatsApp 24h window")}
                 </h4>
                 <p className="text-text-muted text-xs">
@@ -4424,10 +5249,8 @@ export function BehaviorTab({
                     <FormField
                       label={t("editor.svcWindowHours", "Window (hours)")}
                     >
-                      <Input
-                        type="number"
-                        min={1}
-                        max={168}
+                      <NumberInput
+                        range={SERVICE_WINDOW_RANGES.windowHours}
                         value={serviceWindow.windowHours}
                         onChange={(e) =>
                           setServiceWindow({
@@ -4437,51 +5260,45 @@ export function BehaviorTab({
                         }
                       />
                     </FormField>
-                    <ServiceWindowTemplateField
-                      agentId={agentId}
-                      serviceWindow={serviceWindow}
-                      setServiceWindow={setServiceWindow}
-                    />
                   </div>
-                  {serviceWindow.templateName.trim() !== "" && (
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <FormField
-                        label={t("editor.svcWindowLang", "Template language")}
-                      >
-                        <Input
-                          value={serviceWindow.templateLanguage}
-                          onChange={(e) =>
-                            setServiceWindow({
-                              ...serviceWindow,
-                              templateLanguage: e.target.value,
-                            })
-                          }
-                          placeholder="pt_BR"
-                        />
-                      </FormField>
-                      <FormField
-                        label={t("editor.svcWindowParams", "Body params")}
-                        description={t(
-                          "editor.svcWindowParamsHint",
-                          "Comma-separated; variables like nome_contato / primeiro_nome are interpolated.",
-                        )}
-                      >
-                        <Input
-                          value={serviceWindow.templateParams}
-                          onChange={(e) =>
-                            setServiceWindow({
-                              ...serviceWindow,
-                              templateParams: e.target.value,
-                            })
-                          }
-                          placeholder="{{primeiro_nome}}"
-                        />
-                      </FormField>
-                    </div>
-                  )}
+                  <ServiceWindowTemplates
+                    agentId={agentId}
+                    value={serviceWindow}
+                    onChange={setServiceWindow}
+                  />
                 </>
               )}
             </div>
+          </Section>
+
+          <Section
+            id="snoozedFollowUp"
+            hidden={watcher}
+            icon={BellRing}
+            title={t("editor.snoozedFollowUp", "Snoozed follow-up")}
+            description={t(
+              "editor.snoozedFollowUpSectionHint",
+              "Remind the customer on a person's behalf when a conversation they snoozed until the next reply gets no answer, then close it.",
+            )}
+            help={t(
+              "editor.snoozedFollowUpHelp",
+              "A person on the team asks the customer for something, such as an order number or a document, and snoozes the conversation in Chatwoot until the next reply. If the customer never answers, nothing else reminds them or closes it.\n\nEach step is a reminder the agent writes on that person's behalf, with no tools; the last step can add labels and resolve. The customer answering ends the reminders.\n\nSteps fire inside the follow-up's allowed schedule. To pick the pace in one click, create a Chatwoot macro that snoozes and adds a cadence's label.",
+            )}
+          >
+            {snoozedFollowUp.enabled &&
+              followUpScheduleField(
+                t(
+                  "editor.snoozedFollowUpScheduleHint",
+                  "Shared with the follow-up above. Reminders only fire inside this schedule.",
+                ),
+              )}
+            <SnoozedFollowUpEditor
+              agentId={agentId}
+              snoozedFollowUp={snoozedFollowUp}
+              setSnoozedFollowUp={setSnoozedFollowUp}
+              issues={snoozedIssues}
+              stepRefusals={refusals.snoozedFollowUpSteps}
+            />
           </Section>
         </div>
       </div>
@@ -4492,29 +5309,80 @@ export function BehaviorTab({
         onSave={onSave}
         onDiscard={onDiscard}
         saveDisabled={
-          // NOTE: Only what a DRAWN section can explain and fix (issue #494 review, round 3). These
-          // read the STORED bag as well as the form, so a watcher carrying a legacy bad TTS
-          // normalizer or authorization URL — an import, an API write, a mode flipped on a
-          // configured agent — had Save dead on a tab whose only editable block is Observation, with
-          // no field on screen saying why. The sections a watcher draws keep their validators; the
-          // answer-only ones are asked only where their fields are.
+          // NOTE: Only what a DRAWN section can explain and fix. These read the STORED bag as well as
+          // the form, so a watcher's leftover bad TTS normalizer or authorization URL would kill Save
+          // on a tab where no field says why. Answer-only validators are asked only where their fields are.
           sttBaseUrlInvalid ||
           visionBaseUrlInvalid ||
-          memoryBaseUrlInvalid ||
-          memoryBaseUrlUnsupported ||
-          // The fallback's three moved back OUT of the watcher exemption with the section (issue
-          // #567): they are asked wherever their fields are, and the fields are on screen again.
-          fallbackBaseUrlInvalid ||
-          fallbackBaseUrlUnsupported ||
-          fallbackModelMissing ||
-          (!watcher &&
-            (contactAuthUrlInvalid ||
-              contactAuthRuleBad ||
-              normalizeBaseUrlInvalid ||
-              normalizeBaseUrlUnsupported))
+          // NOTE: Memory and the fallback are asked wherever their fields are, a watcher on the
+          // language model included; a watcher on questions and rules does not draw them.
+          (!chatModelUnused &&
+            (memoryBaseUrlInvalid ||
+              memoryBaseUrlUnsupported ||
+              fallbackBaseUrlInvalid ||
+              fallbackBaseUrlUnsupported ||
+              fallbackModelMissing)) ||
+          // NOTE: Asked only where the section is drawn and switched on (see its declaration).
+          snoozedFollowUpInvalid ||
+          otherInboxesBlocksSave(otherInboxes, mode) ||
+          // NOTE: A watcher draws the gate's conditions and its endpoint's fields, so a rule or a url
+          // it cannot use is said there.
+          contactAuthRuleBad ||
+          contactAuthEmpty ||
+          contactAuthUrlInvalid ||
+          (!watcher && (normalizeBaseUrlInvalid || normalizeBaseUrlUnsupported))
         }
         onOpenPlayground={onOpenPlayground}
       />
     </div>
+  );
+}
+
+// One kind of conversation note: the same three formats and the same words about them for every kind,
+// after what that kind says.
+function NoteFormatField({
+  label,
+  help,
+  value,
+  onChange,
+}: {
+  label: string;
+  help: string;
+  value: ConversationNoteFormat;
+  onChange: (v: ConversationNoteFormat) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <FormField
+      label={label}
+      help={`${help}\n\n${t(
+        "editor.conversationNoteFormatHelp",
+        "An activity message is a gray line in the timeline that notifies nobody. A private note stands out to whoever handles the conversation. The customer sees neither.",
+      )}\n\n${t(
+        "editor.conversationNoteFormatActivityContact",
+        "In the current Chatwoot version, an activity message shows as sent by the contact, and in a follow-up it also updates the contact's last activity.",
+      )}`}
+    >
+      <Select
+        value={value}
+        onChange={(e) => onChange(e.target.value as ConversationNoteFormat)}
+      >
+        <option value="off">
+          {t("editor.conversationNoteFormatOff", "Do not show")}
+        </option>
+        <option value="activity">
+          {t(
+            "editor.conversationNoteFormatActivity",
+            "Activity message (discreet, notifies nobody)",
+          )}
+        </option>
+        <option value="note">
+          {t(
+            "editor.conversationNoteFormatNote",
+            "Private note (stands out to the team)",
+          )}
+        </option>
+      </Select>
+    </FormField>
   );
 }

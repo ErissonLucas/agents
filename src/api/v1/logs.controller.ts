@@ -18,7 +18,7 @@ import { listExecutionLogs } from "@/modules/flowlog/read";
 
 // Execution-flow log read surface (the Logs page). TENANT_ADMIN; RLS-scoped. Keyset pagination by
 // id desc (pass `cursor` back for the next page). `source` defaults to "inbox" (real traffic);
-// pass source=all|playground to widen. SUPER_ADMIN picks the tenant via the X-Tenant-Id header
+// pass source=all|playground|client to widen. SUPER_ADMIN picks the tenant via the X-Tenant-Id header
 // (resolved by tenancyPlugin → ctxOrThrow demands a concrete tenant).
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
@@ -46,9 +46,13 @@ export const logsController = new Elysia({
         level: parseQueryText(query.level, "level"),
         stage: parseQueryText(query.stage, "stage"),
         agentId: parseQueryId(query.agentId, "agentId"),
+        inboxId: parseQueryId(query.inboxId, "inboxId"),
+        tool: parseQueryText(query.tool, "tool"),
+        noTool: query.noTool === "true",
         conversationId: parseQueryId(query.conversationId, "conversationId"),
         turnId: parseQueryText(query.turnId, "turnId"),
         source: query.source,
+        audience: query.audience,
         search: parseQueryText(query.search, "search"),
         limit: parseQueryCount(query.limit, "limit"),
         cursor: parseQueryId(query.cursor, "cursor"),
@@ -76,6 +80,21 @@ export const logsController = new Elysia({
         agentId: t.Optional(
           t.String({ description: "Filter by agent id (BigInt string)." }),
         ),
+        inboxId: t.Optional(
+          t.String({ description: "Filter by inbox id (BigInt string)." }),
+        ),
+        tool: t.Optional(
+          t.String({
+            description:
+              "Filter tool lines by the tool's name (the line's detail.tool).",
+          }),
+        ),
+        noTool: t.Optional(
+          t.String({
+            description:
+              "true: only lines that name no tool (detail.tool absent), the tool warnings written before any tool was known. Ignored with tool.",
+          }),
+        ),
         conversationId: t.Optional(
           t.String({
             description: "Filter by conversation id (BigInt string).",
@@ -87,7 +106,13 @@ export const logsController = new Elysia({
         source: t.Optional(
           t.String({
             description:
-              'Traffic segment: "inbox" (default), "all", or "playground".',
+              'Traffic segment: "inbox" (default), "all", "playground" or "client".',
+          }),
+        ),
+        audience: t.Optional(
+          t.Union([t.Literal("identified"), t.Literal("anonymous")], {
+            description:
+              "Client-channel traffic of one audience only: identified (a host's signed-in users) or anonymous (anonymous visitors' sessions). Implies the client source; omit for both.",
           }),
         ),
         search: t.Optional(
@@ -109,7 +134,7 @@ export const logsController = new Elysia({
         "List execution logs",
         "Lists tenant-scoped execution-flow logs with keyset pagination.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   // Bulk export of the (filtered) execution-flow log as a downloadable file. Same filter surface as
@@ -126,9 +151,13 @@ export const logsController = new Elysia({
         level: parseQueryText(query.level, "level"),
         stage: parseQueryText(query.stage, "stage"),
         agentId: parseQueryId(query.agentId, "agentId"),
+        inboxId: parseQueryId(query.inboxId, "inboxId"),
+        tool: parseQueryText(query.tool, "tool"),
+        noTool: query.noTool === "true",
         conversationId: parseQueryId(query.conversationId, "conversationId"),
         turnId: parseQueryText(query.turnId, "turnId"),
         source: query.source,
+        audience: query.audience,
         search: parseQueryText(query.search, "search"),
         format: parseFormat(query.format),
         maxRows: parseQueryCount(query.maxRows, "maxRows"),
@@ -156,6 +185,21 @@ export const logsController = new Elysia({
         agentId: t.Optional(
           t.String({ description: "Filter by agent id (BigInt string)." }),
         ),
+        inboxId: t.Optional(
+          t.String({ description: "Filter by inbox id (BigInt string)." }),
+        ),
+        tool: t.Optional(
+          t.String({
+            description:
+              "Filter tool lines by the tool's name (the line's detail.tool).",
+          }),
+        ),
+        noTool: t.Optional(
+          t.String({
+            description:
+              "true: only lines that name no tool (detail.tool absent), the tool warnings written before any tool was known. Ignored with tool.",
+          }),
+        ),
         conversationId: t.Optional(
           t.String({
             description: "Filter by conversation id (BigInt string).",
@@ -167,7 +211,13 @@ export const logsController = new Elysia({
         source: t.Optional(
           t.String({
             description:
-              'Traffic segment: "inbox" (default), "all", or "playground".',
+              'Traffic segment: "inbox" (default), "all", "playground" or "client".',
+          }),
+        ),
+        audience: t.Optional(
+          t.Union([t.Literal("identified"), t.Literal("anonymous")], {
+            description:
+              "Client-channel traffic of one audience only: identified (a host's signed-in users) or anonymous (anonymous visitors' sessions). Implies the client source; omit for both.",
           }),
         ),
         search: t.Optional(
@@ -189,6 +239,6 @@ export const logsController = new Elysia({
         "Export execution logs",
         "Exports the tenant-scoped execution-flow logs (matching the given filters) as a CSV or JSON file, newest first, up to a bounded row cap.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
     },
   );

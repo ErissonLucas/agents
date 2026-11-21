@@ -17,26 +17,22 @@ import {
 import { disconnectClient } from "@/modules/mcp/oauth/connections";
 import { upsertApproval } from "@/modules/mcp/oauth/consent";
 import { issueAccessToken } from "@/modules/mcp/oauth/tokens";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
+import {
+  blockedByChain,
+  underConcurrentEdit,
+  withAuditTriggerFixture,
+} from "@/tests/utils/pg-waits";
+import { until } from "@/tests/utils/poll";
 
-// THE ACTOR FAMILY (issue #400): revoking a token, changing a role, inviting a user.
-//
-// The last three groups of #306, and the only ones with no MCP twin at all — every action name here
-// is invented rather than moved down, because before this nothing on any transport recorded them.
-// They are also the group a compliance reader asks about first: who was invited, who became an
-// admin, whose token was revoked.
-//
-// The question this file exists to hold is WHICH TRAIL each row joins, because these are the
-// families whose tables carry no tenant to follow. `users`, `invitations` and `mcp_oauth_*` are all
-// global (no RLS), so the row's tenant is a decision and not a consequence, and it is made twice in
-// two different directions:
-//
+// THE ACTOR FAMILY: revoking a token, changing a role, inviting a user. The question this file holds
+// is WHICH TRAIL each row joins: `users`, `invitations` and `mcp_oauth_*` are global (no RLS), so the
+// row's tenant is a decision, made in two directions (docs/api-and-fleet.md, "A row about a person"):
 //   - the MCP OAuth surface is the DEPLOYMENT's, so its rows are fleet-level (`tenant_id NULL`);
 //   - a user's or an invitation's row belongs to the tenant of the SUBJECT, which for a SUPER_ADMIN
-//     acting across tenants is never the actor's own.
-//
-// Getting the second one wrong is invisible from the writing side and total from the reading side:
-// the tenant the change happened to would never see it.
+//     acting across tenants is never the actor's own. Keyed wrong, the tenant the change happened to
+//     never sees it.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -56,8 +52,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -323,9 +319,8 @@ describe.skipIf(!dbUp)("the actor family records its own changes", () => {
       select: { revokedAt: true },
     });
     expect(access.revokedAt).not.toBeNull();
-    // The half that used to live in its own statement, outside any transaction: a failure between
-    // the two left the access token denylisted and the refresh alive, which is the client minting a
-    // fresh access token on the spot.
+    // NOTE: both revocations share one transaction: a failure between them would leave the access
+    // token denylisted and the refresh alive, and the client would mint a fresh access token.
     expect(
       await suDb.mcpOAuthRefreshToken.count({
         where: { clientId: client.clientId, revokedAt: null },
@@ -482,14 +477,14 @@ describe.skipIf(!dbUp)("the actor family records its own changes", () => {
   });
 
   test("a cross-tenant id never takes the lock it is about to be refused for", async () => {
-    // `users` and `invitations` are global, so an unscoped `FOR UPDATE` by id locks a row the caller
-    // has no business touching — BEFORE the scoped read decides it is a 404. A tenant admin could
+    // `users` and `invitations` are global, so an unscoped `FOR UPDATE` by id locks a row the
+    // caller has no business touching, BEFORE the scoped read decides it is a 404. A tenant admin could
     // then hold another tenant's user row for the length of their own transaction, and somebody
-    // else's role change, deletion or login write waits behind it. Round 1 on #498.
+    // else's role change, deletion or login write waits behind it.
     //
     // Asserted as an ORDER and not as a duration: the refusal has to arrive while the lock is still
-    // held by somebody else. Unscoped, the call blocks until the holder commits, so `released` would
-    // already be true by the time it returned.
+    // held by somebody else. Unscoped, the call parks behind the holder, which commits only after
+    // the attempt has either answered or shown up waiting on it.
     const outsider = await newUser(otherTenantId, "AGENT");
     const invite = await createInvite(
       { ...fleetAdmin },
@@ -513,20 +508,37 @@ describe.skipIf(!dbUp)("the actor family records its own changes", () => {
       () => deleteUser(tenantAdmin(), outsider.id, appDb),
       () => revokeInvite(tenantAdmin(), invite.id, appDb),
     ]) {
-      let released = false;
+      const locked = Promise.withResolvers<number>();
+      const release = Promise.withResolvers<void>();
       const holder = suDb.$transaction(
         async (tx) => {
           await tx.$queryRaw`SELECT id FROM users WHERE id = ${outsider.id} FOR UPDATE`;
           await tx.$queryRaw`SELECT id FROM invitations WHERE id = ${invite.id} FOR UPDATE`;
-          await new Promise((r) => setTimeout(r, 2_000));
-          released = true;
+          const [me] = await tx.$queryRaw<{ pid: number }[]>`
+            SELECT pg_backend_pid() AS pid`;
+          locked.resolve(me?.pid ?? -1);
+          await release.promise;
         },
         { timeout: 15_000 },
       );
-      await new Promise((r) => setTimeout(r, 250));
-      await expect(attempt()).rejects.toThrow();
-      expect(released).toBe(false);
-      await holder;
+      try {
+        const holderPid = await locked.promise;
+        let settled = false;
+        const answer = attempt().finally(() => {
+          settled = true;
+        });
+        answer.catch(() => {});
+        // Refused while the rows are still held, or parked behind them: the second is the defect.
+        await until(
+          "the attempt refused, or parked behind the held rows",
+          async () => settled || (await blockedByChain(suDb, holderPid)) >= 1,
+        );
+        expect(settled).toBe(true);
+        await expect(answer).rejects.toThrow();
+      } finally {
+        release.resolve();
+        await holder;
+      }
     }
     await suDb.$executeRawUnsafe(
       `DELETE FROM audit_logs WHERE tenant_id = ${otherTenantId}`,
@@ -651,87 +663,238 @@ describe.skipIf(!dbUp)("the actor family records its own changes", () => {
     }
   });
 
-  test("every mutation in the MCP admin module writes inside ONE transaction", async () => {
-    const src = await Bun.file("src/modules/mcp/oauth/admin.ts").text();
-    // The defect this replaces was structural rather than a missing row: `revokeToken` performed two
-    // writes with no transaction at all, and the audit row could only ever have been a third. A
-    // mutation is recognised by the writes it makes, and every one of them has to sit inside the
-    // module's single transaction opener.
-    const bodies = src.split(/\nexport async function /).slice(1);
-    for (const body of bodies) {
-      const name = body.slice(0, body.indexOf("("));
-      const writes = body.match(
-        /\b(?:create|update|updateMany|delete|deleteMany|upsert)\(/g,
-      );
-      if (!writes) continue;
-      expect(`${name}: ${body.includes("asSuperAdminOn(base,")}`).toBe(
-        `${name}: true`,
-      );
-      // No write may reach the base client, which is the one path outside the transaction.
-      expect(
-        `${name}: ${/\bbase\.\w+\.(create|update|delete|upsert)/.test(body)}`,
-      ).toBe(`${name}: false`);
+  // A failed audit write has to take the change down with it. A function in the MCP admin module that
+  // wrote outside its transaction (or with no transaction at all) commits the change and loses the
+  // row that records it. The refusal is a trigger on this file's own actor and one action, so no other
+  // writer in the database is touched.
+  async function withAuditRefused(action: string, act: () => Promise<unknown>) {
+    await withAuditTriggerFixture(suDb, () => refusingAudit(action, act));
+  }
+
+  async function refusingAudit(action: string, act: () => Promise<unknown>) {
+    const fn = `refuse_audit_${process.pid}`;
+    await suDb.$executeRawUnsafe(
+      `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit insert refused'; END $$`,
+    );
+    await suDb.$executeRawUnsafe(
+      `CREATE TRIGGER ${fn} BEFORE INSERT ON audit_logs FOR EACH ROW WHEN (NEW.actor_id = ${FLEET_ACTOR} AND NEW.action = '${action}') EXECUTE FUNCTION ${fn}()`,
+    );
+    try {
+      await expect(act()).rejects.toThrow();
+    } finally {
+      await suDb.$executeRawUnsafe(`DROP TRIGGER ${fn} ON audit_logs`);
+      await suDb.$executeRawUnsafe(`DROP FUNCTION ${fn}()`);
     }
+  }
+
+  test("every mutation in the MCP admin module rolls back when its audit row cannot be written", async () => {
+    const name = `NeverRegistered${uniq()}`;
+    await withAuditRefused("mcp_client.create", () => newClient(name));
+    expect(await suDb.mcpOAuthClient.count({ where: { name } })).toBe(0);
+
+    const client = await newClient("Atomic");
+    await withAuditRefused("mcp_client.update", () =>
+      updateClient(
+        fleetAdmin,
+        client.clientId,
+        { redirectUris: ["https://moved.example.com/cb"] },
+        appDb,
+      ),
+    );
+    expect(
+      (
+        await suDb.mcpOAuthClient.findUniqueOrThrow({
+          where: { clientId: client.clientId },
+        })
+      ).redirectUris,
+    ).toEqual(["https://app.example.com/cb"]);
+
+    const user = await newUser(tenantId);
+    const issued = await issueAccessToken({
+      clientId: client.clientId,
+      userId: user.id,
+      tenantId,
+      role: "TENANT_ADMIN",
+      scopes: ["mcp:read"],
+      base: appDb,
+    });
+    await suDb.mcpOAuthRefreshToken.create({
+      data: {
+        tokenHash: `rt-${uniq()}`,
+        jti: `rtj-${uniq()}`,
+        clientId: client.clientId,
+        userId: user.id,
+        tenantId,
+        scopes: ["mcp:read"],
+        familyId: `fam-${uniq()}`,
+        expiresAt: new Date(Date.now() + 86_400_000),
+      },
+    });
+    await withAuditRefused("mcp_token.revoke", () =>
+      revokeToken(fleetAdmin, issued.jti, appDb),
+    );
+    const live = async () => [
+      (
+        await suDb.mcpOAuthAccessToken.findFirstOrThrow({
+          where: { jti: issued.jti },
+        })
+      ).revokedAt,
+      await suDb.mcpOAuthRefreshToken.count({
+        where: { clientId: client.clientId, revokedAt: null },
+      }),
+    ];
+    expect(await live()).toEqual([null, 1]);
+
+    await upsertApproval(user.id, client.clientId, ["mcp:read"], appDb);
+    const approval = await suDb.mcpOAuthClientApproval.findFirstOrThrow({
+      where: { userId: user.id, clientId: client.clientId },
+      select: { id: true },
+    });
+    await withAuditRefused("mcp_approval.revoke", () =>
+      deleteClientApproval(fleetAdmin, approval.id, appDb),
+    );
+    expect(
+      await suDb.mcpOAuthClientApproval.count({ where: { id: approval.id } }),
+    ).toBe(1);
+
+    await withAuditRefused("mcp_client.delete", () =>
+      deleteClient(fleetAdmin, client.clientId, appDb),
+    );
+    expect(
+      await suDb.mcpOAuthClient.count({ where: { clientId: client.clientId } }),
+    ).toBe(1);
+    expect(await live()).toEqual([null, 1]);
   });
+
+  // The lock is what makes the recorded `before` the value this write actually replaced. Without it
+  // two acts on the same row both read the same one, and the trail shows one of the two changes twice
+  // and the other not at all. Each case changes the row in a superuser transaction, starts the act,
+  // waits until a backend is parked on a row lock, and only then commits: an act that read under the
+  // lock records the committed change, one that read first records the value the change replaced.
+  const underEdit = (
+    edit: Parameters<typeof underConcurrentEdit>[1],
+    act: () => Promise<unknown>,
+  ) => underConcurrentEdit(suDb, edit, act);
 
   test("every recorded mutation reads its `before` under the row's own lock", async () => {
-    // Per FUNCTION, not per module. A fence that only counts locks across a file passes while one of
-    // its mutations has none: measured — removing the lock from `updateUserRole` entirely left the
-    // module-wide check green, because `deleteUser` still carried one.
-    //
-    // The lock is what makes the recorded `before` the value this write actually replaced. Without
-    // it two acts on the same row both read the same one, and the trail shows one of the two changes
-    // twice and the other not at all.
-    const blocks: [string, string][] = [];
-    for (const path of [
-      "src/api/features/admin/admin.service.ts",
-      "src/api/features/invitations/invitation.service.ts",
-      "src/modules/mcp/oauth/admin.ts",
-    ]) {
-      const src = await Bun.file(path).text();
-      // One level of indirection is followed, and no more: a module may spell its lock in a helper
-      // (`lockUserInScope` carries the tenant fence the lock has to have), and a mutation that calls
-      // it has taken the lock as surely as one that writes the SQL. Anything deeper would make the
-      // fence agree with a call chain nobody can see from the mutation.
-      const lockHelpers = [
-        ...src.matchAll(/\nasync function (\w+)\(([\s\S]*?)\n}/g),
-      ]
-        .filter(([, , body]) => /FOR UPDATE/.test(body ?? ""))
-        .map(([, fnName]) => fnName);
-      const takesLock = (chunk: string) =>
-        /FOR UPDATE/.test(chunk) ||
-        lockHelpers.some((fn) => new RegExp(`\\b${fn}\\(`).test(chunk));
-      for (const chunk of src.split(/\nexport async function /).slice(1)) {
-        const name = `${path.split("/").pop()}:${chunk.slice(0, chunk.indexOf("("))}`;
-        // A mutation that records a `before` is the one this is about. A pure create has nothing to
-        // compare against and nothing to lock.
-        if (/\bbefore:/.test(chunk)) blocks.push([name, `${takesLock(chunk)}`]);
-      }
-    }
-    expect(blocks.length).toBeGreaterThanOrEqual(4);
-    for (const [name, locked] of blocks) {
-      expect(`${name}: ${locked}`).toBe(`${name}: true`);
-    }
-  });
+    const client = await newClient("Locked");
+    await clearAudit();
+    await underEdit(
+      (tx) =>
+        tx.mcpOAuthClient.update({
+          where: { clientId: client.clientId },
+          data: { name: "Renamed meanwhile" },
+        }),
+      () =>
+        updateClient(
+          fleetAdmin,
+          client.clientId,
+          { redirectUris: ["https://locked.example.com/cb"] },
+          appDb,
+        ),
+    );
+    expect((await fleetRows("mcp_client.update"))[0]?.before).toMatchObject({
+      name: "Renamed meanwhile",
+    });
 
-  test("the module takes one lock mode and takes it everywhere", async () => {
-    const sources = [
-      "src/modules/mcp/oauth/admin.ts",
-      "src/api/features/admin/admin.service.ts",
-      "src/api/features/invitations/invitation.service.ts",
-    ];
-    for (const path of sources) {
-      const src = await Bun.file(path).text();
-      const locks = src.match(
-        /FOR (?:NO KEY )?UPDATE|FOR KEY SHARE|FOR SHARE/g,
-      );
-      expect(`${path}: ${locks?.length ?? 0}`).not.toBe(`${path}: 0`);
-      // Uniform on purpose: a module that mixes `FOR UPDATE` with `FOR NO KEY UPDATE` deadlocks over
-      // a key nobody was changing, and a deadlock has no green test to show it (#395). Nothing
-      // references these rows by foreign key, so nothing takes KEY SHARE on them and `FOR UPDATE` is
-      // the mode that fits.
-      expect(`${path}: ${new Set(locks).size}`).toBe(`${path}: 1`);
-      expect(`${path}: ${locks?.[0]}`).toBe(`${path}: FOR UPDATE`);
-    }
+    const user = await newUser(tenantId);
+    const issued = await issueAccessToken({
+      clientId: client.clientId,
+      userId: user.id,
+      tenantId,
+      role: "TENANT_ADMIN",
+      scopes: ["mcp:read"],
+      base: appDb,
+    });
+    await underEdit(
+      (tx) =>
+        tx.mcpOAuthAccessToken.updateMany({
+          where: { jti: issued.jti },
+          data: { revokedAt: new Date() },
+        }),
+      () => revokeToken(fleetAdmin, issued.jti, appDb),
+    );
+    expect((await fleetRows("mcp_token.revoke"))[0]?.before).toMatchObject({
+      alreadyRevoked: true,
+    });
+
+    await upsertApproval(user.id, client.clientId, ["mcp:read"], appDb);
+    const approval = await suDb.mcpOAuthClientApproval.findFirstOrThrow({
+      where: { userId: user.id, clientId: client.clientId },
+      select: { id: true },
+    });
+    await underEdit(
+      (tx) =>
+        tx.mcpOAuthClientApproval.update({
+          where: { id: approval.id },
+          data: { scopes: ["mcp:read", "mcp:write"] },
+        }),
+      () => deleteClientApproval(fleetAdmin, approval.id, appDb),
+    );
+    expect((await fleetRows("mcp_approval.revoke"))[0]?.before).toMatchObject({
+      scopes: ["mcp:read", "mcp:write"],
+    });
+
+    await underEdit(
+      (tx) =>
+        tx.mcpOAuthClient.update({
+          where: { clientId: client.clientId },
+          data: { name: "Renamed again" },
+        }),
+      () => deleteClient(fleetAdmin, client.clientId, appDb),
+    );
+    expect((await fleetRows("mcp_client.delete"))[0]?.before).toMatchObject({
+      name: "Renamed again",
+    });
+
+    // A re-role to the role the concurrent edit already gave records nothing: read before the lock,
+    // the act would record the transition the edit made as its own.
+    const member = await newUser(tenantId, "AGENT");
+    await underEdit(
+      (tx) =>
+        tx.tenantUser.update({
+          where: { tenantId_userId: { tenantId, userId: member.id } },
+          data: { role: "TENANT_ADMIN" },
+        }),
+      () =>
+        updateUserRole(
+          tenantAdmin(),
+          member.id,
+          { role: "TENANT_ADMIN" },
+          appDb,
+        ),
+    );
+    expect(await tenantRows(tenantId, "user.role_set")).toEqual([]);
+
+    await newUser(tenantId, "TENANT_ADMIN");
+    const leaving = await newUser(tenantId, "AGENT");
+    await underEdit(
+      (tx) =>
+        tx.tenantUser.update({
+          where: { tenantId_userId: { tenantId, userId: leaving.id } },
+          data: { role: "TENANT_ADMIN" },
+        }),
+      () => deleteUser(tenantAdmin(), leaving.id, appDb),
+    );
+    expect(
+      (await tenantRows(tenantId, "user.delete"))[0]?.before,
+    ).toMatchObject({ role: "TENANT_ADMIN" });
+
+    const invite = await createInvite(
+      tenantAdmin(),
+      { tenantId, email: `race${uniq()}@aud400.test`, role: "AGENT" },
+      appDb,
+    );
+    await underEdit(
+      (tx) =>
+        tx.invitation.update({
+          where: { id: invite.id },
+          data: { role: "TENANT_ADMIN" },
+        }),
+      () => revokeInvite(tenantAdmin(), invite.id, appDb),
+    );
+    expect(
+      (await tenantRows(tenantId, "invitation.revoke"))[0]?.before,
+    ).toMatchObject({ role: "TENANT_ADMIN" });
   });
 });

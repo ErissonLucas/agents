@@ -9,13 +9,14 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import { runDebounceTick } from "@/modules/debounce/worker";
 import type { ClaimedJob } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { burnSchedulerJobId } from "../utils/scheduler";
 
-// Issue #807, at the effect the customer feels: conversation A's model call does not return, and
-// conversation B, which comes due after it, still gets its reply. Drives real flushes through the
-// actual tick (runDebounceTick → flushDebounceJob → graph → runModelCall) with a stub Chatwoot client
-// and a fake model that hangs on A's turn. The harness is debounce-parallelism.test.ts's.
+// At the effect the customer feels: conversation A's model call does not return, and conversation
+// B, which comes due after it, still gets its reply. Drives real flushes through the actual tick
+// (runDebounceTick → flushDebounceJob → graph → runModelCall) with a stub Chatwoot client and a
+// fake model that hangs on A's turn. The harness is debounce-parallelism.test.ts's.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -33,8 +34,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -50,13 +51,12 @@ let inboxDbId = 0n;
 
 const REPLY = "Claro, posso ajudar!";
 const CHATWOOT_INBOX_ID = 7;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 function threadOf(convId: number) {
   return `${tenantId}:${instanceId}:${convId}`;
 }
 
-// One new incoming message per conversation; sendMessage records the post. Shared across turns —
+// One new incoming message per conversation; sendMessage records the post. Shared across turns:
 // getMessages keys off conversationId, so each turn sees its own message.
 function parallelStub(sent: Array<[number, string]>) {
   const client = {
@@ -111,14 +111,14 @@ const CONV_B = 2002;
 // Resolves to "timeout" when `p` has not settled within `ms`, so a drain that waits on a call that
 // never returns fails an assertion instead of the runner's own timeout.
 function within<T>(p: Promise<T>, ms: number): Promise<T | "timeout"> {
-  return Promise.race([p, sleep(ms).then(() => "timeout" as const)]);
+  return Promise.race([p, Bun.sleep(ms).then(() => "timeout" as const)]);
 }
 
 async function until(cond: () => boolean, ms = 3_000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (cond()) return true;
-    await sleep(10);
+    await Bun.sleep(10);
   }
   return cond();
 }

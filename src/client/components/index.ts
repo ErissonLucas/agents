@@ -1,3 +1,4 @@
+export { Avatar } from "./Avatar";
 export { Badge } from "./Badge";
 export { BrandFooter } from "./BrandFooter";
 export { Breadcrumbs } from "./Breadcrumbs";
@@ -8,12 +9,13 @@ export {
 } from "./BusinessHoursForm";
 export { Button } from "./Button";
 export { Card } from "./Card";
+export { type ChoiceCardOption, ChoiceCards } from "./ChoiceCards";
 export {
   CodeEditor,
   type CodeEditorProps,
   scopeKeyLabel,
 } from "./CodeEditor";
-export { ComboBox, type ComboItem } from "./ComboBox";
+export { ComboBox, type ComboItem, type ComboItemAction } from "./ComboBox";
 export { ConfirmDialog, type ConfirmPayload } from "./ConfirmDialog";
 export { CredentialForm } from "./CredentialForm";
 export { CredentialPicker } from "./CredentialPicker";
@@ -34,6 +36,7 @@ export { HighlightedTemplateField } from "./HighlightedTemplateField";
 export { InboxRow, type InboxRowStatus } from "./InboxRow";
 export { Input } from "./Input";
 export { Layout } from "./Layout";
+export { LinkifiedText } from "./LinkifiedText";
 export { Logo } from "./Logo";
 export { Markdown } from "./Markdown";
 export { MediaAudio } from "./MediaAudio";
@@ -49,22 +52,35 @@ export {
   useUnsavedChanges,
 } from "./Modal";
 export { ModelPicker } from "./ModelPicker";
+export {
+  NumberInput,
+  numberProblem,
+  RangeHolds,
+  RangeHoldsSuspended,
+  useHoldSave,
+  useRangeHeld,
+} from "./NumberInput";
 export { OutOfHoursBadge } from "./OutOfHoursBadge";
 export { PageContainer } from "./PageContainer";
 export { Popover } from "./Popover";
 export { type ProFeature, ProGate } from "./ProGate";
 export { ProtectedRoute } from "./ProtectedRoute";
 export { type AgentRef, AgentReferences } from "./ResourceReferences";
+export { RoleBadge, useRoleLabel } from "./RoleBadge";
 export {
   type ScheduleOption,
   SchedulePicker,
 } from "./SchedulePicker";
+export { SectionLayout, type SectionTab } from "./SectionLayout";
+export {
+  SegmentedControl,
+  type SegmentedOption,
+} from "./SegmentedControl";
 export { Select } from "./Select";
 export { SelectableCard } from "./SelectableCard";
 export { Sidebar } from "./Sidebar";
 export { Skeleton } from "./Skeleton";
 export {
-  SPEND_NOT_CONFIGURED,
   SpendBar,
   SpendHealthLines,
   type SpendUsageEntry,

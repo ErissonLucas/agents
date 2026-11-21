@@ -1,0 +1,277 @@
+import type { TFunction } from "i18next";
+import { Download, type LucideIcon } from "lucide-react";
+import type { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
+import { Badge, Card, HelpPopover } from "@/client/components";
+import { readRefusal } from "@/client/lib/fieldRefusal";
+import { type CsvCell, downloadCsv } from "./csv";
+import type { BlockCoverage } from "./useMetrics";
+
+// What a block shows, as a table: the same rows feed the CSV export and the screen-reader table that
+// stands in for a chart, so the file, the chart and what a screen reader hears cannot disagree.
+export interface BlockTable {
+  // File name without extension.
+  name: string;
+  header: string[];
+  // Raw values, for the file.
+  rows: CsvCell[][];
+  // The same cells formatted for reading (currency, percent), for the screen-reader table. Defaults
+  // to the raw values.
+  display?: string[][];
+}
+
+// What a failed metrics request carries: its HTTP status, and the input the server says the refusal
+// is about. A refusal about `since` with a 503 is the server's time budget for the period
+// (MetricsTooSlowError); any other 503 (the database down, a session that could not be read) is not
+// something a shorter period fixes.
+export function failureOf(error: unknown): {
+  status?: number;
+  field?: string;
+} {
+  if (!error || typeof error !== "object") return {};
+  const status = (error as { status?: unknown }).status;
+  return {
+    status: typeof status === "number" ? status : undefined,
+    field: readRefusal(error)?.field,
+  };
+}
+
+export function metricsErrorMessage(
+  t: TFunction,
+  status: number | null | undefined,
+  field: string | null | undefined,
+): string {
+  return status === 503 && field === "since"
+    ? t(
+        "dashboard.tooSlow",
+        "This period took too long to compute. Try a shorter period, or try again in a moment.",
+      )
+    : t("dashboard.error", "Could not load metrics.");
+}
+
+// The flow-log days of the window that have no data (emptied by retention), which read as missing,
+// never as 0. A block whose days all have data shows nothing in their place.
+export function CoverageChip({
+  coverage,
+}: {
+  coverage: BlockCoverage | null | undefined;
+}) {
+  const { t } = useTranslation();
+  if (!coverage || coverage.noData === 0) return null;
+  return (
+    <Badge variant="warning">
+      {t("dashboard.coverage.noData", "no data for {{count}} days", {
+        count: coverage.noData,
+      })}
+    </Badge>
+  );
+}
+
+// A dashboard block: a titled card with its controls, a CSV export of exactly what it shows, and,
+// when its content is a chart, a table a screen reader reads in the chart's place (the chart hides
+// its drawing from the accessibility tree, since an SVG of bars says nothing, and keeps its legend
+// and its day detail reachable).
+export function Block({
+  id,
+  icon: Icon,
+  title,
+  help,
+  actions,
+  table,
+  chart,
+  error,
+  errorStatus,
+  errorField,
+  loading,
+  onRetry,
+  footer,
+  coverage,
+  children,
+}: {
+  id?: string;
+  icon: LucideIcon;
+  title: string;
+  help?: ReactNode;
+  actions?: ReactNode;
+  table?: BlockTable;
+  // True when the children are a chart: the table is then rendered for screen readers.
+  chart?: boolean;
+  // The block's request failed: it says so, with a retry, instead of rendering an empty result
+  // that reads as "nothing happened". No CSV either, since there is nothing true to export.
+  error?: boolean;
+  // The failed request's HTTP status and refusal field, which pick the sentence (metricsErrorMessage).
+  errorStatus?: number | null;
+  errorField?: string | null;
+  // The block's figures have not arrived: no CSV and no stand-in table yet, since whatever the
+  // table holds now (zeros, an empty list) is not what the block is about to show.
+  loading?: boolean;
+  onRetry?: () => void;
+  // Figures shown under a chart that are not in its table (a period's totals, a second breakdown):
+  // rendered for everyone, since hiding them with the chart would leave a screen reader without them.
+  footer?: ReactNode;
+  // The flow-log days with no data (CoverageChip).
+  coverage?: BlockCoverage | null;
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const shown = !error;
+  const ready = shown && !loading;
+  return (
+    <Card id={id} className="flex scroll-mt-4 flex-col gap-4 lg:scroll-mt-32">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h3 className="text-text-primary flex items-center gap-2 text-sm font-medium">
+          <Icon className="text-accent h-4 w-4" aria-hidden="true" />
+          {title}
+          {help ? <HelpPopover content={help} label={title} /> : null}
+          {!error && <CoverageChip coverage={coverage} />}
+        </h3>
+        <div className="flex flex-wrap items-center gap-2">
+          {actions}
+          {table && ready && (
+            <button
+              type="button"
+              onClick={() =>
+                downloadCsv(`${table.name}.csv`, table.header, table.rows)
+              }
+              className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-xs"
+              aria-label={t(
+                "dashboard.exportCsvOf",
+                "Export {{title}} as CSV",
+                {
+                  title,
+                },
+              )}
+            >
+              <Download className="h-3.5 w-3.5" aria-hidden="true" />
+              {t("dashboard.exportCsv", "CSV")}
+            </button>
+          )}
+        </div>
+      </div>
+      {error ? (
+        <p className="text-text-muted flex items-center gap-2 py-4 text-sm">
+          {metricsErrorMessage(t, errorStatus, errorField)}
+          {onRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="text-accent text-sm hover:underline"
+            >
+              {t("dashboard.retry", "Try again")}
+            </button>
+          )}
+        </p>
+      ) : loading ? (
+        // Its own skeleton, in its own place: the other blocks do not wait for it.
+        <div role="status">
+          <span className="sr-only">
+            {t("dashboard.loading", "Loading metrics…")}
+          </span>
+          {children}
+        </div>
+      ) : (
+        // A chart hides its own drawing from a screen reader, which reads the table below in its place.
+        <div>{children}</div>
+      )}
+      {ready && footer}
+      {/* The wrapper is what hides it: a `<table>` keeps its content width whatever width it is
+          given, so `sr-only` on the table itself still widened the page into a horizontal scroll. */}
+      {ready && chart && table && (
+        <div className="sr-only">
+          <table>
+            <caption>{title}</caption>
+            <thead>
+              <tr>
+                {table.header.map((h) => (
+                  <th key={h} scope="col">
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {(
+                table.display ??
+                table.rows.map((r) => r.map((c) => String(c ?? "")))
+              ).map((r, i) => (
+                // biome-ignore lint/suspicious/noArrayIndexKey: rows have no id beyond their order
+                <tr key={i}>
+                  {r.map((c, j) => (
+                    // biome-ignore lint/suspicious/noArrayIndexKey: cells are positional
+                    <td key={j}>{c}</td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+// A figure with the previous period beside it. The change is said in words a reader can check: the
+// previous value, and the difference in points for a rate or in percent for an amount. No previous
+// value (an empty or absent previous period) shows no change at all, never an infinite one.
+export function Delta({
+  current,
+  previous,
+  kind,
+  format,
+  lowerIsBetter,
+}: {
+  current: number | null;
+  previous: number | null | undefined;
+  kind: "rate" | "amount";
+  format: (v: number) => string;
+  lowerIsBetter?: boolean;
+}) {
+  const { t, i18n } = useTranslation();
+  if (previous === null || previous === undefined || current === null)
+    return null;
+  const diff = current - previous;
+  // In the reader's own decimals, and a change that rounds to nothing reads 0, not −0.
+  const signed = (v: number, digits: number) =>
+    new Intl.NumberFormat(i18n.language, {
+      minimumFractionDigits: digits,
+      maximumFractionDigits: digits,
+      signDisplay: "exceptZero",
+    }).format(v);
+  let change: string | null = null;
+  if (kind === "rate") change = `${signed(diff * 100, 1)} pp`;
+  else if (previous > 0) change = `${signed((diff / previous) * 100, 0)}%`;
+  const better = lowerIsBetter ? diff < 0 : diff > 0;
+  const tone =
+    diff === 0 ? "text-text-muted" : better ? "text-success" : "text-warning";
+  return (
+    <span className="text-text-muted text-xs">
+      {t("dashboard.previous", "previous: {{value}}", {
+        value: format(previous),
+      })}
+      {change && (
+        <span className={`ml-1.5 whitespace-nowrap tabular-nums ${tone}`}>
+          {change}
+        </span>
+      )}
+    </span>
+  );
+}
+
+// A section's title, with the icon its entry carries in the section bar, so the bar and the page
+// read as one index. A notch above a block's own title, which it heads.
+export function SectionHeading({
+  icon: Icon,
+  children,
+}: {
+  icon: LucideIcon;
+  children: ReactNode;
+}) {
+  return (
+    <h2 className="text-text-primary flex items-center gap-2.5 text-base font-semibold">
+      <span className="bg-bg-tertiary text-accent flex h-7 w-7 shrink-0 items-center justify-center rounded-lg">
+        <Icon className="h-4 w-4" aria-hidden="true" />
+      </span>
+      {children}
+    </h2>
+  );
+}

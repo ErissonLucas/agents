@@ -65,6 +65,40 @@ services:
       - RATE_LIMIT_MCP_PER_MIN=${RATE_LIMIT_MCP_PER_MIN:-1200}
       - RATE_LIMIT_CREDENTIAL_MAX=${RATE_LIMIT_CREDENTIAL_MAX:-20}
       - RATE_LIMIT_CREDENTIAL_WINDOW_MINUTES=${RATE_LIMIT_CREDENTIAL_WINDOW_MINUTES:-5}
+      # The Chatwoot receiver: deliveries processed at once per lane (the rest wait as ledger rows) and the
+      # connections reserved for the webhook ack's own write. See .env.example and docs/deploy.md.
+      - CHATWOOT_DELIVERY_CONCURRENCY=${CHATWOOT_DELIVERY_CONCURRENCY:-15}
+      - CHATWOOT_ACK_POOL_MAX=${CHATWOOT_ACK_POOL_MAX:-4}
+      # Database pools and their time budgets (docs/deploy.md "Connection budget"). Empty takes the app
+      # default; the pools' sum per replica must fit the server's max_connections, or boot refuses.
+      - DB_POOL_MAX=${DB_POOL_MAX:-}
+      - LANGGRAPH_POOL_MAX=${LANGGRAPH_POOL_MAX:-}
+      - BACKGROUND_POOL_MAX=${BACKGROUND_POOL_MAX:-}
+      - METRICS_POOL_MAX=${METRICS_POOL_MAX:-}
+      - METRICS_TIMEOUT_MS=${METRICS_TIMEOUT_MS:-}
+      - DB_TX_MAX_WAIT_MS=${DB_TX_MAX_WAIT_MS:-}
+      - DB_TX_TIMEOUT_MS=${DB_TX_TIMEOUT_MS:-}
+      - DB_LOCK_TIMEOUT_MS=${DB_LOCK_TIMEOUT_MS:-}
+      # How long the boot waits for a database it cannot reach before exiting (docs/deploy.md). Empty
+      # takes the default, 120000.
+      - DB_BOOT_WAIT_MS=${DB_BOOT_WAIT_MS:-}
+      - DB_STATS_RETENTION_DAYS=${DB_STATS_RETENTION_DAYS:-}
+      # The turn capacities: model permits and debounce turn slots (docs/deploy.md). Empty takes the
+      # app default.
+      - AGENT_MODEL_CONCURRENCY=${AGENT_MODEL_CONCURRENCY:-}
+      - LANGFUSE_SAMPLE_RATE=${LANGFUSE_SAMPLE_RATE:-}
+      - DEBOUNCE_TURN_SLOTS=${DEBOUNCE_TURN_SLOTS:-}
+      # The background share and aging bound of the model permits (docs/deploy.md).
+      - AGENT_MODEL_BACKGROUND_SHARE_PERCENT=${AGENT_MODEL_BACKGROUND_SHARE_PERCENT:-}
+      - AGENT_MODEL_BACKGROUND_MAX_WAIT_MS=${AGENT_MODEL_BACKGROUND_MAX_WAIT_MS:-}
+      # The pass that deletes the checkpoints of threads whose owner is gone (docs/graph.md). Empty
+      # takes the app default.
+      - CHECKPOINT_RECONCILE_FIRST_DELAY_MS=${CHECKPOINT_RECONCILE_FIRST_DELAY_MS:-}
+      - CHECKPOINT_RECONCILE_INTERVAL_MS=${CHECKPOINT_RECONCILE_INTERVAL_MS:-}
+      - CHECKPOINT_RECONCILE_GRACE_MS=${CHECKPOINT_RECONCILE_GRACE_MS:-}
+      - CHECKPOINT_RETENTION_FIRST_DELAY_MS=${CHECKPOINT_RETENTION_FIRST_DELAY_MS:-}
+      - CHECKPOINT_RETENTION_INTERVAL_MS=${CHECKPOINT_RETENTION_INTERVAL_MS:-}
+      - CHECKPOINT_RETENTION_GRACE_MS=${CHECKPOINT_RETENTION_GRACE_MS:-}
       # First-run: disable the /setup token in this trusted, TLS-fronted onboarding window (the
       # advisory lock still caps /setup at one admin). Set to `true` to require it.
       - SETUP_TOKEN_REQUIRED=${SETUP_TOKEN_REQUIRED:-false}
@@ -72,6 +106,14 @@ services:
       # to THIS instance's MCP. Also the app default — pinned here so the stack works on an older
       # image too, since without it both clients abort before any login screen (docs/mcp.md).
       - MCP_DCR_ENABLED=${MCP_DCR_ENABLED:-true}
+      # The client channel (docs/client-channel.md), off unless set.
+      - CLIENT_CHANNEL_ENABLED=${CLIENT_CHANNEL_ENABLED:-false}
+      # Its limits and the suspended turn's deadline; empty keeps the app default.
+      - CLIENT_CHANNEL_SDK_USER_PER_MIN=${CLIENT_CHANNEL_SDK_USER_PER_MIN:-}
+      - CLIENT_CHANNEL_SDK_APP_PER_MIN=${CLIENT_CHANNEL_SDK_APP_PER_MIN:-}
+      - CLIENT_TURN_SUSPEND_TIMEOUT_MS=${CLIENT_TURN_SUSPEND_TIMEOUT_MS:-}
+      # Passkey sign-in (docs/passkeys.md), off unless set. The RP ID is the hostname of PUBLIC_URL.
+      - PASSKEYS_ENABLED=${PASSKEYS_ENABLED:-false}
       # NOTE: corrupted-audio check for audio replies (docs/tts.md "Checking the audio"). Empty URL = off;
       # a URL alone = shadow (records a verdict, never changes a send). enforce regenerates up to twice
       # and then replies with text.
@@ -80,6 +122,17 @@ services:
       - TTS_CHECK_MODE=${TTS_CHECK_MODE:-}
       - TTS_CHECK_TOKEN=${TTS_CHECK_TOKEN:-}
       - TTS_CHECK_TIMEOUT_MS=${TTS_CHECK_TIMEOUT_MS:-}
+      # Outgoing mail (the sign-in code of a dashboard's viewers). Unset, the provider follows the
+      # credentials, and with none production sends no mail (.env.example).
+      - MAIL_PROVIDER=${MAIL_PROVIDER:-}
+      - MAIL_FROM=${MAIL_FROM:-}
+      - MAIL_REPLY_TO=${MAIL_REPLY_TO:-}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-}
+      - SMTP_SECURE=${SMTP_SECURE:-}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
       - LOG_LEVEL=${LOG_LEVEL:-info}
       - JWT_SECRET=${JWT_SECRET}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
@@ -120,6 +173,16 @@ services:
     # validated isolation spike. Not published to the host — only the app reaches it over the network.
     image: 'pgvector/pgvector:pg17'
     restart: always
+    # The Database screen's query statistics (docs/logs.md, "Database"): pg_stat_statements has to be
+    # preloaded, and changing these restarts Postgres. Without them the screen still works and says so.
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - pg_stat_statements.track_utility=off
     environment:
       - POSTGRES_DB=${DATABASE_NAME:-fazerai_agents_db}
       - POSTGRES_USER=${POSTGRES_USER}
@@ -136,8 +199,8 @@ services:
 
 
   # OPTIONAL: the corrupted-audio detector (docs/tts.md "Checking the audio"). Uncomment only if this
-  # install sends audio replies. It is heavy: reserve about 4 GB of memory for it (measured, 2.2 GB
-  # and 5 to 7 s on 4 cores per check). No public image is published: point TTS_CHECK_IMAGE at a
+  # install sends audio replies. It is heavy: reserve about 3 GB of memory for it (measured in
+  # production, 1.5 to 2.3 GB in use, and about 5 s per check, up to 26 s, on 4 to 8 shared cores). No public image is published: point TTS_CHECK_IMAGE at a
   # detector that answers the contract in docs/tts.md, then set TTS_CHECK_URL=http://audio-check:<its
   # port> (and TTS_CHECK_TOKEN, if it takes one) on the agents service.
   # The thresholds of a detector are calibrated on one provider's audio: on another provider, keep
@@ -145,7 +208,7 @@ services:
   # audio-check:
   #   image: ${TTS_CHECK_IMAGE}
   #   restart: always
-  #   mem_limit: 5g
+  #   mem_limit: 3g
 
 volumes:
   storage:

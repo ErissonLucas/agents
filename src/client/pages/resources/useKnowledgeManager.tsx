@@ -23,6 +23,7 @@ import {
   Input,
   Modal,
   ModalCancelButton,
+  NumberInput,
   Skeleton,
   SwitchField,
   type TabItem,
@@ -39,6 +40,7 @@ import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { docErrorEntry, mergeDocumentEvent } from "@/client/lib/knowledgeDocs";
 import { cn } from "@/client/lib/utils";
+import { CHUNK_SIZE_RANGE, chunkOverlapRange } from "@/modules/rag/ranges";
 import {
   KnowledgeSourceSection,
   SyncedDocNote,
@@ -117,11 +119,6 @@ export interface KnowledgeManager {
   modals: ReactNode;
 }
 
-// Owns every knowledge-base management modal (create/edit base, add content, documents, doc preview)
-// plus its state, handlers and the live ingestion-status WebSocket. Shared by the Components →
-// Knowledge panel and the agent editor's Knowledge tab so a base can be created/edited/fed documents
-// without leaving the agent. `onChanged` is called after any mutation so the consumer refetches its
-// own list (the bases list itself is NOT owned here — each consumer renders its own).
 // The keys of the bodies these forms write, spelled the way the routes refuse them.
 const BASE_FIELDS = [
   "name",
@@ -131,6 +128,11 @@ const BASE_FIELDS = [
 ] as const;
 const DOC_FIELDS = ["title", "text"] as const;
 
+// Owns every knowledge-base management modal (create/edit base, add content, documents, doc preview)
+// plus its state, handlers and the live ingestion-status WebSocket. Shared by the Components →
+// Knowledge panel and the agent editor's Knowledge tab so a base can be created/edited/fed documents
+// without leaving the agent. `onChanged` is called after any mutation so the consumer refetches its
+// own list (the bases list itself is NOT owned here: each consumer renders its own).
 export function useKnowledgeManager(opts: {
   onChanged: () => void | Promise<void>;
   // Optional: called with the freshly-created base so a caller (the agent editor) can auto-select it.
@@ -151,7 +153,7 @@ export function useKnowledgeManager(opts: {
   const createModal = useModalController();
   const editModal = useModalController<Base>();
   const docsModal = useModalController<BaseRef>();
-  // Whether the open base mirrors a help center (issue #798): its synced documents are then the
+  // Whether the open base mirrors a help center: its synced documents are then the
   // source's to change, and the API refuses an edit or a delete with a 409.
   const [docsHaveSource, setDocsHaveSource] = useState(false);
   // The last answer about it for the open base, and when its last run landed; null until the section
@@ -334,8 +336,8 @@ export function useKnowledgeManager(opts: {
   // Which documents modal a list response belongs to. Separate from the block's clock on purpose:
   // the two arrive in one response but answer different questions. The rows are this base's, and
   // only a newer OPENING makes them wrong; the block is the workspace's, and a dedicated read that
-  // is faster than the list makes it wrong. Judging the rows by the block's clock let a list
-  // response be refused outright, which left the modal on its skeleton with nothing to retry it.
+  // is faster than the list makes it wrong. Judged by the block's clock, a list response could be
+  // refused outright, leaving the modal on its skeleton with nothing to retry it.
   const docsSession = useRef(0);
 
   // Trailing window rather than a suppress-while-in-flight guard: the scheduler awaits its claimed
@@ -358,12 +360,8 @@ export function useKnowledgeManager(opts: {
     [],
   );
 
-  // The events above only fire when a job runs. Filling, deleting or replacing the credential is a
-  // configuration change with no job attached, so nothing would tell an open modal about it, and the
-  // banner would go on describing a block that was resolved — or stay silent about one that appeared
-  // — until the operator reopened it or tried to index. A slow poll closes that without a new
-  // realtime channel: the read is one workspace-scoped question, and the window above already
-  // collapses it against the event-driven reads.
+  // NOTE: the events above only fire when a job runs, and a credential change has no job, so a slow
+  // poll keeps an open modal's banner current without a new realtime channel.
   // `recheckBlock` reads only refs and the api client, so the closure captured here behaves the same
   // on every render; listing it would tear the interval down and rebuild it on each one, which never
   // reaches 30s and so never polls at all.
@@ -374,9 +372,8 @@ export function useKnowledgeManager(opts: {
     return () => clearInterval(id);
   }, [docsModal.isOpen]);
 
-  // Asks the workspace-scoped endpoint, not a base's document list: the question has nothing to do
-  // with which base is open, and answering it by re-downloading a list was what forced every caller
-  // to remember that the answer's scope and the request's scope were different things.
+  // Asks the workspace-scoped endpoint, not a base's document list: the question has nothing
+  // to do with which base is open.
   async function recheckBlock() {
     const ticket = claimBlockAnswer();
     try {
@@ -596,9 +593,9 @@ export function useKnowledgeManager(opts: {
       if (docsModal.payload) await reloadDocs(docsModal.payload.id);
       void onChanged();
     } catch (e) {
-      // The server's own message when it sent one: a refusal that names the field and the character
-      // is the whole answer, and collapsing it into "Could not add document" throws away the only
-      // part the operator can act on (issue #247) — at the input it named, when this form draws one.
+      // The server's own message when it sent one: a refusal naming the field and the
+      // character is the part the operator can act on, shown at the input it named when this form
+      // draws one.
       const toast = addDocRefusal.capture(
         e,
         t("knowledge.addError", "Could not add document."),
@@ -645,7 +642,7 @@ export function useKnowledgeManager(opts: {
     useTitle: boolean,
   ): Promise<{ status: number; message?: string } | undefined> {
     try {
-      // NOTE: the treaty serializes a File body as multipart AND injects the
+      // The treaty serializes a File body as multipart AND injects the
       // X-Tenant-Id header (SUPER_ADMIN target tenant); a raw fetch here 500s
       // for super admins because the tenant gate never resolves a target.
       const { error: err } = await api.api.v1.knowledge
@@ -880,8 +877,7 @@ export function useKnowledgeManager(opts: {
       );
       if (data?.blocked) {
         revert();
-        // Same text as the banner, from the same function: two wordings for one reason is how the
-        // third one ended up described as the second (review finding, round 6).
+        // NOTE: same text as the banner, from the same function, so one reason has one wording.
         showToast(blockTextFor(data.blocked.reason), "warning");
         return;
       }
@@ -956,10 +952,8 @@ export function useKnowledgeManager(opts: {
 
   // Localizes a document's failure reason. The ingest job stores a stable i18n token for known
   // failures (e.g. a missing embedding credential); anything else is a raw diagnostic message.
-  //
-  // The branch table moved to src/client/lib/knowledgeDocs.ts, keyed on the SAME map the server
-  // throws from, because the two used to spell the tokens differently and neither branch ever fired
-  // (issue #256). Only the `t` call is left here: `t` is a hook binding this component owns.
+  // The branch table is src/client/lib/knowledgeDocs.ts, keyed on the SAME map the server throws
+  // from; only the `t` call is here, since `t` is a hook binding this component owns.
   //
   // t('knowledge.docError.embeddingEmpty', 'The embedding credential is empty. Fill it in, then index again.')
   // t('knowledge.docError.embeddingNotConfigured', 'The embedding credential is not configured for this workspace. Set it under Components, then index again.')
@@ -1004,10 +998,10 @@ export function useKnowledgeManager(opts: {
   function docStatusBadge(doc: KnowledgeDoc) {
     if (doc.status === "READY") {
       return (
-        <span className="rounded-full bg-success/10 px-2 py-0.5 text-success text-xs">
+        <span className="bg-success/10 text-success rounded-full px-2 py-0.5 text-xs">
           {t("knowledge.docStatus.READY", "{{count}} chunks", {
-            // `?? 0` because the column is nullable and i18next resolves the plural from a NUMBER:
-            // a null lands in the `other` form for every value, which is the bug this key just left.
+            // NOTE: `?? 0` because the column is nullable and i18next resolves the plural from a NUMBER:
+            // a null lands in the `other` form for every value.
             count: doc.chunkCount ?? 0,
           })}
         </span>
@@ -1017,7 +1011,7 @@ export function useKnowledgeManager(opts: {
       const badge = (
         <span
           className={cn(
-            "rounded-full bg-error/10 px-2 py-0.5 text-error text-xs",
+            "bg-error/10 text-error rounded-full px-2 py-0.5 text-xs",
             {
               "cursor-help underline decoration-dotted underline-offset-2":
                 !!doc.error,
@@ -1039,7 +1033,7 @@ export function useKnowledgeManager(opts: {
       return (
         <span
           className={cn(
-            "rounded-full bg-bg-tertiary px-2 py-0.5 text-text-muted text-xs",
+            "bg-bg-tertiary text-text-muted rounded-full px-2 py-0.5 text-xs",
             { "animate-pulse": true },
           )}
         >
@@ -1051,13 +1045,13 @@ export function useKnowledgeManager(opts: {
       // Imported-but-never-indexed: a deliberate waiting state (warning tint), not an error (no red).
       // While the workspace is blocked it is NOT merely waiting — nothing the operator does on this
       // screen will index it until a credential is sorted out — so the badge says which of the two
-      // this is (issue #80) instead of reading identically in both cases. Keyed off the CURRENT
+      // this is instead of reading identically in both cases. Keyed off the CURRENT
       // block, so it stops saying "blocked" the moment the block is gone.
       const blockText = embeddingBlockText();
       const badge = (
         <span
           className={cn(
-            "rounded-full bg-warning-soft px-2 py-0.5 text-warning text-xs",
+            "bg-warning-soft text-warning rounded-full px-2 py-0.5 text-xs",
             {
               "cursor-help underline decoration-dotted underline-offset-2":
                 !!blockText,
@@ -1078,7 +1072,7 @@ export function useKnowledgeManager(opts: {
       );
     }
     return (
-      <span className="rounded-full bg-bg-tertiary px-2 py-0.5 text-text-muted text-xs">
+      <span className="bg-bg-tertiary text-text-muted rounded-full px-2 py-0.5 text-xs">
         {t("knowledge.docStatus.PENDING", "Pending")}
       </span>
     );
@@ -1094,16 +1088,16 @@ export function useKnowledgeManager(opts: {
   function sourceIcon(doc: KnowledgeDoc) {
     if (doc.sourceType === "file")
       return (
-        <FileText className="h-3.5 w-3.5 text-text-muted" aria-hidden="true" />
+        <FileText className="text-text-muted h-3.5 w-3.5" aria-hidden="true" />
       );
     if (doc.sourceType === "approval")
       return (
         <ClipboardCheck
-          className="h-3.5 w-3.5 text-text-muted"
+          className="text-text-muted h-3.5 w-3.5"
           aria-hidden="true"
         />
       );
-    return <Type className="h-3.5 w-3.5 text-text-muted" aria-hidden="true" />;
+    return <Type className="text-text-muted h-3.5 w-3.5" aria-hidden="true" />;
   }
 
   const addContentValid =
@@ -1113,7 +1107,7 @@ export function useKnowledgeManager(opts: {
 
   // Same switch in both dialogs. Worded for what it does to the agent, because that is the reason
   // to turn it on: the footer of an article written for a website reads, inside an agent, as an
-  // order to hand the customer off (issue #747).
+  // order to hand the customer off.
   const contactFooterSwitch = (
     <SwitchField
       checked={stripContactFooters}
@@ -1139,7 +1133,12 @@ export function useKnowledgeManager(opts: {
         footer={
           <div className="flex justify-end gap-2">
             <ModalCancelButton disabled={busy} />
-            <Button onClick={create} loading={busy} disabled={!name.trim()}>
+            <Button
+              onClick={create}
+              loading={busy}
+              disabled={!name.trim()}
+              holdOnRange
+            >
               {t("common.create", "Create")}
             </Button>
           </div>
@@ -1165,9 +1164,8 @@ export function useKnowledgeManager(opts: {
           </FormField>
           {/* `||` and not `??`: these two hold "" when there is nothing wrong, so a nullish fallback
               never reaches the refusal behind it. The local check tests BOUNDS only, and the schema
-              is `t.Integer` — a chunk size of 100.5 passes here and is refused there by name, which
-              is exactly the case that was landing on a reading nobody could reach. Local first
-              because it is about what the box holds now. */}
+              is `t.Integer`, so a chunk size of 100.5 passes here and is refused there by name.
+              Local first because it is about what the box holds now. */}
           <FormField
             label={t("knowledge.chunkSize", "Chunk size (chars)")}
             hint={t(
@@ -1176,10 +1174,8 @@ export function useKnowledgeManager(opts: {
             )}
             error={chunkSizeError || baseRefusal.at("chunkSize", chunkSize)}
           >
-            <Input
-              type="number"
-              min={100}
-              max={8000}
+            <NumberInput
+              range={CHUNK_SIZE_RANGE}
               value={chunkSize}
               onChange={(e) => setChunkSize(Number(e.target.value))}
             />
@@ -1194,10 +1190,8 @@ export function useKnowledgeManager(opts: {
               chunkOverlapError || baseRefusal.at("chunkOverlap", chunkOverlap)
             }
           >
-            <Input
-              type="number"
-              min={0}
-              max={Math.floor(chunkSize / 2)}
+            <NumberInput
+              range={chunkOverlapRange(chunkSize)}
               value={chunkOverlap}
               onChange={(e) => setChunkOverlap(Number(e.target.value))}
             />
@@ -1214,7 +1208,12 @@ export function useKnowledgeManager(opts: {
         footer={
           <div className="flex justify-end gap-2">
             <ModalCancelButton disabled={busy} />
-            <Button onClick={saveEdit} loading={busy} disabled={!name.trim()}>
+            <Button
+              onClick={saveEdit}
+              loading={busy}
+              disabled={!name.trim()}
+              holdOnRange
+            >
               {t("common.save", "Save")}
             </Button>
           </div>
@@ -1246,10 +1245,8 @@ export function useKnowledgeManager(opts: {
             )}
             error={chunkSizeError || baseRefusal.at("chunkSize", chunkSize)}
           >
-            <Input
-              type="number"
-              min={100}
-              max={8000}
+            <NumberInput
+              range={CHUNK_SIZE_RANGE}
               value={chunkSize}
               onChange={(e) => setChunkSize(Number(e.target.value))}
             />
@@ -1264,10 +1261,8 @@ export function useKnowledgeManager(opts: {
               chunkOverlapError || baseRefusal.at("chunkOverlap", chunkOverlap)
             }
           >
-            <Input
-              type="number"
-              min={0}
-              max={Math.floor(chunkSize / 2)}
+            <NumberInput
+              range={chunkOverlapRange(chunkSize)}
               value={chunkOverlap}
               onChange={(e) => setChunkOverlap(Number(e.target.value))}
             />
@@ -1376,7 +1371,7 @@ export function useKnowledgeManager(opts: {
                   className={cn(
                     "flex w-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed py-8 text-center transition-colors",
                     {
-                      "border-accent bg-accent/10": dragOver,
+                      "border-accent bg-accent-soft": dragOver,
                       "border-border bg-bg-secondary hover:bg-bg-tertiary":
                         !dragOver,
                     },
@@ -1391,7 +1386,7 @@ export function useKnowledgeManager(opts: {
                     aria-hidden="true"
                   />
                   <span
-                    className={cn("font-medium text-sm", {
+                    className={cn("text-sm font-medium", {
                       "text-accent": dragOver,
                       "text-text-primary": !dragOver,
                     })}
@@ -1412,13 +1407,13 @@ export function useKnowledgeManager(opts: {
                   {picked.map((p) => (
                     <li
                       key={p.id}
-                      className="flex items-center gap-2 rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm"
+                      className="border-border bg-bg-tertiary flex items-center gap-2 rounded-lg border px-3 py-2 text-sm"
                     >
                       <FileText
-                        className="h-4 w-4 shrink-0 text-text-muted"
+                        className="text-text-muted h-4 w-4 shrink-0"
                         aria-hidden="true"
                       />
-                      <span className="min-w-0 flex-1 truncate text-text-primary">
+                      <span className="text-text-primary min-w-0 flex-1 truncate">
                         {p.file.name}{" "}
                         <span className="text-text-muted text-xs">
                           {t("knowledge.fileSize", "({{kb}} KB)", {
@@ -1428,13 +1423,13 @@ export function useKnowledgeManager(opts: {
                       </span>
                       {p.status === "uploading" && (
                         <Loader2
-                          className="h-4 w-4 shrink-0 animate-spin text-text-muted"
+                          className="text-text-muted h-4 w-4 shrink-0 animate-spin"
                           aria-label={t("knowledge.uploading", "Uploading…")}
                         />
                       )}
                       {p.status === "done" && (
                         <Check
-                          className="h-4 w-4 shrink-0 text-success"
+                          className="text-success h-4 w-4 shrink-0"
                           aria-label={t("knowledge.uploadQueued", "Queued")}
                         />
                       )}
@@ -1446,7 +1441,7 @@ export function useKnowledgeManager(opts: {
                           )}
                           side="top"
                         >
-                          <span className="shrink-0 cursor-help rounded-full bg-error/10 px-2 py-0.5 text-error text-xs">
+                          <span className="bg-error/10 text-error shrink-0 cursor-help rounded-full px-2 py-0.5 text-xs">
                             {t("knowledge.uploadFailed", "Failed")}
                           </span>
                         </Tooltip>
@@ -1456,7 +1451,7 @@ export function useKnowledgeManager(opts: {
                           type="button"
                           aria-label={t("knowledge.clearFile", "Clear file")}
                           onClick={() => removeFile(p.id)}
-                          className="shrink-0 rounded p-0.5 text-text-muted transition-colors hover:text-text-primary"
+                          className="text-text-muted hover:text-text-primary shrink-0 rounded p-0.5 transition-colors"
                         >
                           <X className="h-4 w-4" aria-hidden="true" />
                         </button>
@@ -1548,13 +1543,13 @@ export function useKnowledgeManager(opts: {
               ))}
             </div>
           ) : docs.length === 0 ? (
-            <p className="text-sm text-text-muted">
+            <p className="text-text-muted text-sm">
               {t("knowledge.noDocs", "No documents yet.")}
             </p>
           ) : (
             <div className="flex flex-col gap-2">
               {docs.some((d) => d.status === "UNINDEXED") && (
-                <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-warning bg-warning-soft px-3 py-2">
+                <div className="border-warning bg-warning-soft flex flex-wrap items-center justify-between gap-3 rounded-lg border px-3 py-2">
                   <span className="text-text-secondary text-xs">
                     {embeddingBlockText() ??
                       t(
@@ -1583,20 +1578,20 @@ export function useKnowledgeManager(opts: {
                   return (
                     <li
                       key={d.id}
-                      className="rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm"
+                      className="border-border bg-bg-tertiary rounded-lg border px-3 py-2 text-sm"
                     >
                       <div className="flex items-start gap-2">
                         <div className="min-w-0 flex-1">
-                          <span className="block truncate font-medium text-text-primary">
+                          <span className="text-text-primary block truncate font-medium">
                             {d.title}
                           </span>
                           {d.fileName && (
-                            <span className="break-all text-text-muted text-xs">
+                            <span className="text-text-muted text-xs break-all">
                               {d.fileName}
                             </span>
                           )}
                           <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                            <span className="flex shrink-0 items-center gap-1 text-text-muted text-xs">
+                            <span className="text-text-muted flex shrink-0 items-center gap-1 text-xs">
                               {sourceIcon(d)}
                             </span>
                             {d.contentChars != null && (
@@ -1615,7 +1610,7 @@ export function useKnowledgeManager(opts: {
                             )}
                           </div>
                           {synced && opts.allowDocumentEdits && (
-                            <p className="mt-0.5 text-text-muted text-xs">
+                            <p className="text-text-muted mt-0.5 text-xs">
                               {syncedRefusal}
                             </p>
                           )}
@@ -1711,7 +1706,7 @@ export function useKnowledgeManager(opts: {
         ) : (
           <>
             {docPreview != null && (
-              <p className="mb-2 text-text-muted text-xs">
+              <p className="text-text-muted mb-2 text-xs">
                 {t("knowledge.charCount", "{{n}} characters", {
                   count: docPreview.length,
                   n: new Intl.NumberFormat(i18n.language).format(
@@ -1720,7 +1715,7 @@ export function useKnowledgeManager(opts: {
                 })}
               </p>
             )}
-            <pre className="max-h-[60vh] overflow-y-auto whitespace-pre-wrap text-sm text-text-secondary">
+            <pre className="text-text-secondary max-h-[60vh] overflow-y-auto text-sm whitespace-pre-wrap">
               {docPreview ?? ""}
             </pre>
           </>

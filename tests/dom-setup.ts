@@ -1,33 +1,189 @@
+import { expect } from "bun:test";
 import { GlobalRegistrator } from "@happy-dom/global-registrator";
 
-// NOTE: this module MUST be preloaded BEFORE ./setup.ts (see `preload` in
-// bunfig.toml). happy-dom has to install `document` on globalThis before any
-// @testing-library module is evaluated: `@testing-library/dom` builds its
-// `screen` export at import time and, with no global document, replaces it with
-// a proxy that throws "For queries bound to document.body a global document has
-// to be available" on every query. Since @testing-library/jest-dom 6.10.0 pulls
-// @testing-library/dom in through its own entrypoint (it declares it as a peer),
-// keeping register() in the same module as that import cannot work: ESM imports
-// are hoisted and run before any statement, and Biome's organizeImports would
-// reorder them anyway. Splitting the two into separate preloads is what makes
-// the ordering explicit and enforceable.
+// Preloaded BEFORE ./setup.ts (`preload` in bunfig.toml): `@testing-library/dom` builds `screen` at
+// import time and, with no global document, makes every query throw. `@testing-library/jest-dom`
+// imports it through its own entrypoint, and ESM imports are hoisted above any statement, so
+// `register()` cannot share a module with that import.
 
-// NOTE: Bun's native WebSocket, Response and Request constructors are captured
-// before happy-dom replaces them globally. Backend tests that run a real
-// Bun.serve need the native Response (the spec one from happy-dom is not
-// recognized by Bun's TCP socket layer); WebSocket tests need the Bun-only
-// `{ headers }` option that the spec WebSocket rejects; and happy-dom's Request
-// silently DROPS forbidden request headers, `Cookie` among them — so any test
-// that drives a cookie-authenticated route through `app.handle()` must build
-// its Request with the native constructor or the header never arrives. Reach
-// for them via `globalThis.BunWebSocket` / `BunResponse` / `BunRequest`.
+// Bun's native WebSocket, Response and Request, captured before happy-dom replaces them. A real
+// `Bun.serve` needs the native Response, WebSocket tests need the Bun-only `{ headers }` option, and
+// happy-dom's Request silently DROPS forbidden headers such as `Cookie`, so a cookie-authenticated
+// route driven through `app.handle()` needs `globalThis.BunRequest` (also `BunWebSocket`, `BunResponse`).
+// A client that has to reach a real socket (an MCP SDK transport) needs the native fetch, Headers and
+// abort pair together: Bun's fetch refuses happy-dom's AbortSignal.
 const __nativeBunGlobals = globalThis as {
   BunWebSocket?: typeof WebSocket;
   BunResponse?: typeof Response;
   BunRequest?: typeof Request;
+  BunFetch?: typeof fetch;
+  BunHeaders?: typeof Headers;
+  BunAbortController?: typeof AbortController;
+  BunAbortSignal?: typeof AbortSignal;
 };
 __nativeBunGlobals.BunWebSocket = WebSocket;
 __nativeBunGlobals.BunResponse = Response;
 __nativeBunGlobals.BunRequest = Request;
+__nativeBunGlobals.BunFetch = fetch;
+__nativeBunGlobals.BunHeaders = Headers;
+__nativeBunGlobals.BunAbortController = AbortController;
+__nativeBunGlobals.BunAbortSignal = AbortSignal;
 
 GlobalRegistrator.register();
+
+// A failing assertion pretty-prints what it received, and a happy-dom node reaches its document and
+// the window, so one failing `expect(dialog).toBeNull()` builds a message of hundreds of millions of
+// characters and blocks for seconds, on every `waitFor` attempt. A node prints as one line that
+// still says which node it is; the window is the global object, so it gets its own.
+const shown = (text: string, max = 60) =>
+  text.length > max ? `${text.slice(0, max)}…` : text;
+function nodeLine(node: Node): string {
+  if (node instanceof Element) {
+    const attributes = [...node.attributes]
+      .slice(0, 8)
+      .map((a) => ` ${a.name}="${shown(a.value)}"`);
+    const more = node.attributes.length > 8 ? " …" : "";
+    return `<${node.localName}${attributes.join("")}${more}>`;
+  }
+  if (node.nodeType === Node.TEXT_NODE)
+    return `#text ${JSON.stringify(shown(node.textContent ?? ""))}`;
+  if (node.nodeType === Node.COMMENT_NODE)
+    return `<!--${shown(node.textContent ?? "")}-->`;
+  return node.nodeName || node.constructor.name;
+}
+Object.defineProperty(Node.prototype, Bun.inspect.custom, {
+  value(this: Node) {
+    return nodeLine(this);
+  },
+});
+Object.defineProperty(globalThis, Bun.inspect.custom, {
+  value: () => "[window]",
+});
+
+// toEqual builds its diff from the node's own fields, not from the form above. The override takes
+// the verdict from `this.equals`, the same equality, on the original values. Only a failure message
+// calls the native matcher, and with a node in a plain object, array or class instance on either
+// side, it diffs a copy in which each node is a stand-in holding its one-line form. toStrictEqual
+// and toMatchObject stay native: Bun exposes no equality for them, and a substitute could turn a
+// real failure green.
+class DomNode {
+  constructor(readonly node: string) {}
+}
+function isPlain(value: object): boolean {
+  return (
+    Array.isArray(value) ||
+    Object.prototype.toString.call(value) === "[object Object]"
+  );
+}
+function holdsNode(value: unknown, seen = new Set<unknown>()): boolean {
+  if (value instanceof Node || value === globalThis) return true;
+  if (typeof value !== "object" || value === null || seen.has(value)) {
+    return false;
+  }
+  if (!isPlain(value)) return false;
+  seen.add(value);
+  return Reflect.ownKeys(value).some((key) => {
+    const d = Object.getOwnPropertyDescriptor(value, key);
+    return d?.enumerable && "value" in d && holdsNode(d.value, seen);
+  });
+}
+function standIns(value: unknown, made: Map<unknown, unknown>): unknown {
+  if (value instanceof Node || value === globalThis) {
+    let standIn = made.get(value);
+    if (!standIn) {
+      standIn = new DomNode(Bun.inspect(value));
+      made.set(value, standIn);
+    }
+    return standIn;
+  }
+  if (typeof value !== "object" || value === null || !isPlain(value)) {
+    return value;
+  }
+  const done = made.get(value);
+  if (done) return done;
+  const copy = Array.isArray(value)
+    ? []
+    : Object.create(Object.getPrototypeOf(value));
+  made.set(value, copy);
+  for (const key of Reflect.ownKeys(value)) {
+    const d = Object.getOwnPropertyDescriptor(value, key) as PropertyDescriptor;
+    if ("value" in d) d.value = standIns(d.value, made);
+    Object.defineProperty(copy, key, d);
+  }
+  return copy;
+}
+const nativeToEqual = (
+  expect(null) as unknown as {
+    toEqual: (this: unknown, expected: unknown) => void;
+  }
+).toEqual;
+/** The native diff for a failed toEqual, without its header line. */
+function toEqualDiff(received: unknown, expected: unknown, not: boolean) {
+  try {
+    nativeToEqual.call(not ? expect(received).not : expect(received), expected);
+    return null;
+  } catch (error) {
+    const message = Bun.stripANSI(error instanceof Error ? error.message : "");
+    if (!message.startsWith("expect(received)")) throw error;
+    return message.replace(/^expect\(received\)[^\n]*\n\n/, "");
+  }
+}
+expect.extend({
+  toEqual(
+    this: { isNot: boolean; equals: (a: unknown, b: unknown) => boolean },
+    received: unknown,
+    expected: unknown,
+  ) {
+    return {
+      pass: this.equals(received, expected),
+      message: () => {
+        if (!holdsNode(received) && !holdsNode(expected)) {
+          return toEqualDiff(received, expected, this.isNot) ?? "";
+        }
+        const made = new Map<unknown, unknown>();
+        const shown = toEqualDiff(
+          standIns(received, made),
+          standIns(expected, made),
+          this.isNot,
+        );
+        return (
+          shown ??
+          `Expected: ${this.isNot ? "not " : ""}${Bun.inspect(expected)}\nReceived: ${Bun.inspect(received)}`
+        );
+      },
+    };
+  },
+});
+
+// A page that subscribes to the tenant's realtime events opens a socket on render. happy-dom's
+// WebSocket dials through `ws`, and a refused connection emits an `error` nobody listens to, which
+// surfaces as an unhandled error inside whichever test happens to be running when it lands. No DOM
+// test talks to a live socket (the realtime tests use `BunWebSocket`, the hook tests a fake), so the
+// global one never connects: it stays CONNECTING until closed, and emits nothing.
+class InertWebSocket extends EventTarget {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSING = 2;
+  static readonly CLOSED = 3;
+  readonly CONNECTING = 0;
+  readonly OPEN = 1;
+  readonly CLOSING = 2;
+  readonly CLOSED = 3;
+  readyState = 0;
+  binaryType: BinaryType = "blob";
+  bufferedAmount = 0;
+  extensions = "";
+  protocol = "";
+  onopen: ((ev: Event) => unknown) | null = null;
+  onmessage: ((ev: MessageEvent) => unknown) | null = null;
+  onerror: ((ev: Event) => unknown) | null = null;
+  onclose: ((ev: CloseEvent) => unknown) | null = null;
+  constructor(readonly url: string | URL) {
+    super();
+  }
+  send(): void {}
+  close(): void {
+    this.readyState = 3;
+  }
+}
+globalThis.WebSocket = InertWebSocket as unknown as typeof WebSocket;

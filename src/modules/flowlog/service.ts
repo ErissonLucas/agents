@@ -2,15 +2,36 @@ import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import { failureDetail } from "@/lib/provider-failure";
 import {
   MAX_STRING,
   redactSecretsDeep,
   sanitizeErrorMessage,
 } from "@/lib/redact";
-import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { dispatchAlertsForEvent } from "./alerts";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import {
+  causeKeyOf,
+  dispatchAlertsForEvent,
+  dispatchRateAlert,
+  dispatchRecoveryRateAlert,
+  rateSubjectOf,
+  recoverySubjectOf,
+} from "./alerts";
+import {
+  type FullDetailCapture,
+  fullDetailExpiry,
+  KEPT_UNTIL_KEY,
+  OUTPUT_CUT_KEY,
+  storeFullDetail,
+} from "./full-detail";
 import { trackFlowWrite } from "./scheduled";
-import type { FlowLevel, FlowSource, FlowStage, FlowStatus } from "./stages";
+import {
+  type FlowLevel,
+  type FlowSource,
+  type FlowStage,
+  type FlowStatus,
+  pagesAlerts,
+} from "./stages";
 
 // Execution-flow log emit core. Verbose, per-stage operational telemetry (one row per stage per
 // turn) written FIRE-AND-FORGET: unlike UsageCapture (which awaits its single billing row), the
@@ -19,50 +40,19 @@ import type { FlowLevel, FlowSource, FlowStage, FlowStatus } from "./stages";
 // write (or alert dispatch) never escapes into the turn. NEVER log message text / PII: `detail`
 // carries only ids/counts/enums and is passed through redactSecretsDeep as defense-in-depth.
 
-// The ceiling a `detail` string is written under while the agent's debug mode is on (#58).
-//
-// Derived, not chosen. The largest operator-authored string the API accepts is `AGENT_PROMPT_MAX_CHARS`
-// (100k by default, `src/api/v1/agents.controller.ts`), and the field the mode exists for is that
-// prompt's AUDIT, which is the same text with its context placeholders rewritten as
-// `{{canal: string(1234)}}`. Measured, that rewrite expands the template by 1.08x on ordinary prose
-// and at most 2.56x in the worst case the closed context-variable set allows — `{{canal}}` is the
-// shortest placeholder there is, at 9 characters, and its audited form is at most 23
-// (`tests/modules/flowlog-debug-mode.test.ts` pins both numbers). Three times the prompt ceiling
-// therefore covers any prompt this API would have accepted, with margin.
-//
-// It is still a BOUND, and that is the point of not simply removing the cap: `detail` also carries
-// tool arguments and results, which no configuration limits, so an unbounded write would let one
-// runaway tool response into a row.
-//
-// `Math.max` because the prompt ceiling is an operator's env var and nothing stops it being small:
-// under 667 the derivation falls below the ordinary 2,000, and arming the debug mode would then
-// SHRINK what a line stores. A mode that records less than the default is not a weaker version of
-// itself, it is the opposite of what it says.
-//
-// The `+` term is the SCHEDULE allowance, and it is there because the audit does not only mask: it
-// keeps the agent's own configured hours resolved, since those are often the whole answer to "why
-// did it say we were closed". A rendered schedule is not small — at `MAX_SCHEDULE_WINDOWS` it turns
-// a 23-character placeholder into ~2.6k — so the audit collapses repeats and keeps ONE full
-// rendering per schedule variable name (`prompt-audit.ts`). Six names, and 4k each is generous for
-// a 200-window summary (measured: 2,639 characters, ~13 per window), so this reserves what that
-// rule can still add on top of the template.
-//
-// A bound, and only since issue #346. `MAX_SCHEDULE_WINDOWS` is asked at the READER (`parseWindows`),
-// so no stored row surfaces more than it however it was written, and the reserve above therefore
-// covers every schedule this runtime can render. It was a MARGIN while the number bounded only the
-// business-hours API: the agent import wrote `windows` unvalidated, and one past the cap rendered
-// past what is reserved here. That fallback is still here and still right — the audit is cut and the
-// row stays bounded, because the ceiling is also a budget — but reaching it no longer takes a
-// schedule. Reserving for an unbounded input is not possible, and that is why the input is bounded.
+// The ceiling a `detail` string is written under while the agent's debug mode is on. Three times
+// `AGENT_PROMPT_MAX_CHARS` covers the audited prompt (placeholders expand it at most 2.56x, pinned
+// in tests/modules/flowlog-debug-mode.test.ts); the allowance reserves one rendered schedule per
+// variable name (six names, bounded by `MAX_SCHEDULE_WINDOWS` at the reader). Still a bound,
+// because `detail` also carries tool arguments and results, which nothing limits.
 const SCHEDULE_AUDIT_ALLOWANCE = 6 * 4_000;
 
 // The derivation as a FUNCTION, so it can be measured at a prompt ceiling other than this
 // deployment's: the schedule allowance only carries weight when `promptMaxChars` is small, and a
 // test that could only ask about the default would never see it do anything.
 export function debugCeilingFor(promptMaxChars: number): number {
-  // No floor at `MAX_STRING`: the schedule allowance alone is more than ten times it, so the sum
-  // cannot come out below the ordinary cap however small the prompt ceiling is set. A `Math.max`
-  // here was a condition no input could reach, which is how the mutation battery found it.
+  // NOTE: No floor at `MAX_STRING`: the schedule allowance alone is more than ten times it, so the
+  // sum cannot come out below the ordinary cap however small the prompt ceiling is set.
   return promptMaxChars * 3 + SCHEDULE_AUDIT_ALLOWANCE;
 }
 
@@ -73,6 +63,8 @@ export interface FlowContext {
   // Correlates every stage of one turn (crypto.randomUUID() once per turn).
   turnId: string;
   source: FlowSource;
+  // A client-channel turn served to an anonymous visitor's session: its lines and its usage say so.
+  anonymous?: boolean;
   conversationId?: bigint | null;
   agentId?: bigint | null;
   inboxId?: bigint | null;
@@ -82,6 +74,10 @@ export interface FlowContext {
   // read, and this emit is on the hot path and fire-and-forget). Absent means off, which is what
   // every context that does not know an agent must be.
   fullDetail?: boolean;
+  // How many days this agent keeps a line's FULL text beside the cut one, or
+  // null/absent when it keeps none. Read with the agent's settings, like `fullDetail`; only a line
+  // whose event carries `full` writes anything (src/modules/flowlog/full-detail.ts).
+  fullDetailRetentionDays?: number | null;
 }
 
 export interface FlowEvent {
@@ -94,6 +90,9 @@ export interface FlowEvent {
   // Allowlisted ids/counts/enums only — never message text/PII. Redacted on write.
   detail?: Record<string, unknown>;
   errorMessage?: string;
+  // The whole text behind one of this line's cut strings (a tool's result, the audited prompt), kept
+  // only when the context's agent retains full detail. Never part of `detail`.
+  full?: FullDetailCapture;
 }
 
 function sysCtx(tenantId: bigint): TenantContext {
@@ -106,27 +105,66 @@ export function emitFlowEvent(ctx: FlowContext, ev: FlowEvent): void {
   trackFlowWrite(writeFlowEvent(ctx, ev));
 }
 
-// THE SAME WRITE, AWAITED, and it exists for a caller whose line is the only record there will be.
-//
-// Every turn-time caller wants the fire-and-forget form: the line describes work that already
-// happened, and making a customer wait on a log write would be the wrong trade. The stranded-delivery
-// sweep is the opposite case — it retires the ledger row that is the line's only other trace, so a
-// swallowed failure loses the report permanently and no later pass can find the row again. Awaiting
-// lets that caller write the line FIRST and retire the row only if it landed.
-//
-// Failures are still swallowed here, for the same reason they are swallowed above: a caller asking
-// for the line is not asking to fail if it cannot be written. What awaiting buys is ORDERING, not an
-// exception — the caller learns the outcome from `delivered`.
+// The same write, awaited, for a caller whose line is the only record left: the stranded-delivery
+// sweep writes the line FIRST and retires its ledger row only if it landed. Failures are still
+// swallowed; what awaiting buys is ORDERING, and the outcome comes back in `delivered`.
+// A line written at most once per key: the check and the insert run in one transaction under an
+// advisory lock on `lockKey`, so two writers racing for the same fact cannot both find it missing.
+export interface WriteOnce {
+  lockKey: string;
+  already: (db: ScopedDb) => Promise<boolean>;
+}
+
 export async function writeFlowEvent(
   ctx: FlowContext,
   ev: FlowEvent,
-): Promise<{ delivered: boolean }> {
+  opts: { once?: WriteOnce } = {},
+): Promise<{ delivered: boolean; skipped?: true }> {
   const base = ctx.base ?? basePrisma;
   const level: FlowLevel = ev.level ?? "info";
   let delivered = true;
+  const keepDays = ev.full ? (ctx.fullDetailRetentionDays ?? null) : null;
+  const keptUntil = keepDays ? fullDetailExpiry(keepDays) : null;
+  const detail =
+    ev.detail && keptUntil
+      ? { ...ev.detail, [KEPT_UNTIL_KEY]: keptUntil.toISOString() }
+      : ev.detail;
+  // Whether the stored `output` lost anything, decided while it is being cut: the conversation page
+  // offers the kept whole text only where the cut one is short, and the stored value alone cannot
+  // say (a result that itself ends in the marker, an array clipped item by item).
+  let outputCut = false;
+  const tracksOutput = !!detail && "output" in detail;
+  const storedDetail = detail
+    ? (redactSecretsDeep(
+        detail,
+        0,
+        ctx.fullDetail ? DEBUG_MAX_STRING : MAX_STRING,
+        // The raised ceiling comes with an aggregate budget, because a per-string cap
+        // bounds no ROW: `detail` is a tree and nothing here bounds an object's key
+        // count, so fifty leaves at 300k each would be a 15 MB row. The default path
+        // passes none and keeps the per-string behaviour every existing line has.
+        ctx.fullDetail ? { left: DEBUG_MAX_STRING } : undefined,
+        tracksOutput
+          ? {
+              only: "output",
+              onCut: () => {
+                outputCut = true;
+              },
+            }
+          : undefined,
+      ) as Record<string, unknown>)
+    : null;
+  if (storedDetail && tracksOutput) storedDetail[OUTPUT_CUT_KEY] = outputCut;
+  let lineId: bigint | null = null;
   try {
-    await runScopedOn(base, sysCtx(ctx.tenantId), (db) =>
-      db.executionLog.create({
+    const wrote = await runScopedOn(base, sysCtx(ctx.tenantId), async (db) => {
+      const once = opts.once;
+      if (once) {
+        await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${once.lockKey}, 0))`;
+        if (await once.already(db)) return false;
+      }
+      const line = await db.executionLog.create({
+        select: { id: true },
         data: {
           tenantId: ctx.tenantId,
           turnId: ctx.turnId,
@@ -141,39 +179,84 @@ export async function writeFlowEvent(
           model: ev.model ?? undefined,
           durationMs: ev.durationMs ?? undefined,
           source: ctx.source,
-          detail: ev.detail
-            ? (redactSecretsDeep(
-                ev.detail,
-                0,
-                ctx.fullDetail ? DEBUG_MAX_STRING : MAX_STRING,
-                // The raised ceiling comes with an aggregate budget, because a per-string cap
-                // bounds no ROW: `detail` is a tree and nothing here bounds an object's key
-                // count, so fifty leaves at 300k each would be a 15 MB row. The default path
-                // passes none and keeps the per-string behaviour every existing line has.
-                ctx.fullDetail ? { left: DEBUG_MAX_STRING } : undefined,
-              ) as Prisma.InputJsonValue)
+          anonymous: ctx.anonymous ?? false,
+          detail: storedDetail
+            ? (storedDetail as Prisma.InputJsonValue)
             : Prisma.DbNull,
           // NOTE: `errorMessage` keeps its own 500-char cut, debug mode or not. That cut is not
           // the size policy `detail` is under — it is standing in for a scrub that does not
           // exist: a provider's error text is not allowlisted the way `detail` is, and it can
           // echo the customer's own message back (a content-filter refusal quoting the input).
-          // Lifting it would widen PII exposure to buy nothing this issue asked for.
+          // Lifting it would widen PII exposure for no gain.
           errorMessage: ev.errorMessage
             ? sanitizeErrorMessage(ev.errorMessage)
             : undefined,
         },
-      }),
-    );
+      });
+      lineId = line.id;
+      return true;
+    });
+    // NOTE: Already written by another writer: nothing new happened, so nothing alerts either.
+    if (!wrote) return { delivered: false, skipped: true };
   } catch (err) {
     delivered = false;
     logger.warn({ err, turnId: ctx.turnId }, "flowlog emit failed");
   }
-  // Alerting: only warn/error, and only real (inbox) traffic — a playground error must not page.
-  if ((level === "warn" || level === "error") && ctx.source === "inbox") {
+  // In its own transaction, after the line: the full text is the optional half, and a failure writing
+  // it must not cost the line every other reader depends on. A line whose text did not land reads as
+  // `gone` (its marker says it was meant to be kept), never as the whole thing.
+  if (lineId !== null && keptUntil && ev.full) {
+    const capture = ev.full;
+    const executionLogId = lineId;
+    try {
+      await runScopedOn(base, sysCtx(ctx.tenantId), (db) =>
+        storeFullDetail(db, {
+          tenantId: ctx.tenantId,
+          executionLogId,
+          agentId: ctx.agentId ?? null,
+          capture,
+          expiresAt: keptUntil,
+        }),
+      );
+    } catch (err) {
+      logger.warn(
+        { err, turnId: ctx.turnId },
+        "flowlog: could not keep a line's full detail",
+      );
+    }
+  }
+  // Alerting is warn/error, plus a cause alert at any level (a run the job retries against a
+  // dead key is an `info`, and the key still needs a person), and only for a source with real users
+  // on the other end: a playground error must not page.
+  //
+  // A stranded delivery that ended well pages nobody alone: it counts toward the recovery rate
+  // instead, one alert per window (`dispatchRecoveryRateAlert`).
+  const recovered = recoverySubjectOf(ev);
+  if (
+    (level === "warn" || level === "error" || causeKeyOf(ev) !== null) &&
+    pagesAlerts(ctx.source) &&
+    !recovered
+  ) {
     try {
       await dispatchAlertsForEvent(ctx, { ...ev, level }, base);
     } catch (err) {
       logger.warn({ err, turnId: ctx.turnId }, "flowlog alert dispatch failed");
+    }
+  }
+  if (recovered && ctx.source === "inbox") {
+    try {
+      await dispatchRecoveryRateAlert(ctx, base);
+    } catch (err) {
+      logger.warn({ err, turnId: ctx.turnId }, "flowlog recovery alert failed");
+    }
+  }
+  // A transient provider failure also counts toward that provider's rate, at any level: the attempt
+  // a retry recovers is `info` and pages nobody alone, and many of them are a degraded provider.
+  if (pagesAlerts(ctx.source) && rateSubjectOf(ev) !== null) {
+    try {
+      await dispatchRateAlert(ctx, ev, base);
+    } catch (err) {
+      logger.warn({ err, turnId: ctx.turnId }, "flowlog rate alert failed");
     }
   }
   return { delivered };
@@ -190,6 +273,8 @@ export async function withFlowStage<T>(
     provider?: string | null;
     model?: string | null;
     detail?: Record<string, unknown>;
+    // The whole text behind a cut string of `detail`, kept when the agent retains full detail.
+    full?: FullDetailCapture;
     // Extra detail derived FROM the result, merged over `detail` on the success line, for a stage
     // whose interesting numbers only exist once it returned (how much the speech normalizer rewrote,
     // say). Same PII rule as `detail`: counts, ids and enums, never text. It runs on the hot path, so
@@ -199,6 +284,18 @@ export async function withFlowStage<T>(
     // RECOVERS from (e.g. TTS → text fallback) pass "warn" so the conversation/Logs show an advisory
     // rather than a red error. The status stays "error" (the stage itself did fail).
     errorLevel?: FlowLevel;
+    // The labels of the success line, decided once the work returned, for a stage whose model can
+    // change inside it (a fallback that took the turn answers under its own name). Null keeps
+    // `provider`/`model`.
+    labelsOf?: () => { provider: string; model: string } | null;
+    // The failure line's level and extra detail, decided by the caller from the error, for a caller
+    // that knows what comes next: a retry it is about to make is `info` with `willRetry`, and only the
+    // failure that ends the work keeps the severity. Wins over `errorLevel`. A throw here falls back
+    // to `errorLevel`, for the same reason `detailOf` is guarded.
+    failureOf?: (err: unknown) => {
+      level: FlowLevel;
+      detail?: Record<string, unknown>;
+    };
   },
   fn: () => Promise<T>,
 ): Promise<T> {
@@ -220,20 +317,40 @@ export async function withFlowStage<T>(
       status: "ok",
       provider: meta.provider ?? null,
       model: meta.model ?? null,
+      ...(meta.labelsOf?.() ?? {}),
       durationMs: Date.now() - start,
       detail,
+      ...(meta.full ? { full: meta.full } : {}),
     });
     return out;
   } catch (err) {
+    let level = meta.errorLevel ?? "error";
+    // What kind of failure it was, in the closed vocabulary (`timeout`, `HTTP <nnn>`,
+    // `provider error`), never the server's text: the alert dispatcher keys causes and rates on it,
+    // and the message beside it is free text no rule should parse.
+    let detail: Record<string, unknown> = {
+      ...meta.detail,
+      ...failureDetail(err),
+    };
+    if (meta.failureOf) {
+      try {
+        const failure = meta.failureOf(err);
+        level = failure.level;
+        if (failure.detail) detail = { ...detail, ...failure.detail };
+      } catch (e) {
+        logger.warn({ err: e, stage }, "flow stage failureOf failed");
+      }
+    }
     emitFlowEvent(ctx, {
       stage,
-      level: meta.errorLevel ?? "error",
+      level,
       status: "error",
       provider: meta.provider ?? null,
       model: meta.model ?? null,
       durationMs: Date.now() - start,
-      detail: meta.detail,
+      detail,
       errorMessage: sanitizeErrorMessage(err),
+      ...(meta.full ? { full: meta.full } : {}),
     });
     throw err;
   }

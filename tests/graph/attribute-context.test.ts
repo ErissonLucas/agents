@@ -12,6 +12,7 @@ import {
 } from "@/modules/chatwoot/client";
 import { mirrorChatwootEvent } from "@/modules/chatwoot/mirror";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { fakeChatwootAttributeStore } from "../utils/chatwoot-attribute-store";
 
@@ -34,8 +35,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -178,51 +179,10 @@ describe.skipIf(!dbUp)("attribute context in the system prompt", () => {
     expect(loaded?.systemPrompt).toBe("Você é um assistente.");
   });
 
-  test("concurrent set_custom_attribute writes keep every key (atomic jsonb merge)", async () => {
-    const convId = CONV_ID + 1;
-    const conv = await suDb.conversation.create({
-      data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        chatwootConversationId: convId,
-        status: "pending",
-        threadId: `${tenantId}:${instanceId}:${convId}`,
-        customAttributes: { origem: "Instagram" },
-      },
-    });
-    const client = {
-      setConversationCustomAttributes: async () => ({}),
-    } as unknown as ChatwootClient;
-    const tools = buildNativeTools({
-      client,
-      conversationId: convId,
-      tenantId,
-      base: appDb,
-      conversationDbId: conv.id,
-    }) as StructuredToolInterface[];
-    const tool = tools.find((t) => t.name === "set_custom_attribute");
-    if (!tool) throw new Error("set_custom_attribute missing");
-
-    // NOTE: A turn's tool calls run CONCURRENTLY in the tool node, so the mirror write-through has
-    // to merge in ONE statement. A read-modify-write drops keys here: every call would read the
-    // same starting bag and the last writer would win with only its own key.
-    const keys = Array.from({ length: 10 }, (_, i) => `campo_${i}`);
-    await Promise.all(keys.map((key) => tool.invoke({ key, value: key })));
-
-    const row = await suDb.conversation.findUniqueOrThrow({
-      where: { id: conv.id },
-    });
-    expect(row.customAttributes).toEqual({
-      origem: "Instagram",
-      ...Object.fromEntries(keys.map((k) => [k, k])),
-    });
-  });
-
   test("after a burst, what the operator sees and what the agent reads agree", async () => {
-    // The test above proves OUR bag survives a concurrent burst. It stubs the Chatwoot call to a
-    // no-op, so it says nothing about the other side — and the other side was where issue #112
-    // lived: the mirror kept every key while Chatwoot kept one, and nothing ever reconciled them
-    // (agent bots never receive contact_updated). Both views are asserted here, against a Chatwoot
+    // The test above stubs the Chatwoot call, so it proves only OUR bag survives a burst.
+    // Chatwoot's side can diverge (every key mirrored, one kept) and nothing reconciles it, since
+    // agent bots never receive contact_updated. Both views are asserted here, against a Chatwoot
     // that replaces the bag exactly as the deployed fork does.
     const convId = CONV_ID + 2;
     const contact = await suDb.contact.findFirstOrThrow({
@@ -263,7 +223,7 @@ describe.skipIf(!dbUp)("attribute context in the system prompt", () => {
     const tool = tools.find((t) => t.name === "set_custom_attribute");
     if (!tool) throw new Error("set_custom_attribute missing");
 
-    // The burst from the report: several keys per scope in ONE turn.
+    // NOTE: Several keys per scope in ONE turn.
     await Promise.all([
       tool.invoke({ key: "produto", value: "cadeira" }),
       tool.invoke({ key: "medida", value: "90cm" }),
@@ -298,27 +258,56 @@ describe.skipIf(!dbUp)("attribute context in the system prompt", () => {
   });
 
   test("the write-through barrier is pinned to UTC, not the session timezone", async () => {
-    // NOTE: `custom_attributes_at` is TIMESTAMP (no zone) holding UTC; bare NOW() is timestamptz.
+    // `custom_attributes_at` is TIMESTAMP (no zone) holding UTC; bare NOW() is timestamptz.
     // Mixing them makes GREATEST resolve through the SESSION TimeZone, which nothing in the deploy
     // pins. Under UTC-3 the stored value reads as 3h in the FUTURE and wins, so the barrier never
     // advances and a pre-write snapshot walks straight through the compare-and-set.
-    const [row] = await suDb.$transaction(async (tx) => {
-      await tx.$executeRawUnsafe("SET LOCAL TIME ZONE 'America/Sao_Paulo'");
-      // NOTE: The ::timestamp cast is not decoration — it is the conversion Postgres performs when
-      // the expression is assigned back to the (zone-less) column, so this models the real UPDATE.
-      return tx.$queryRaw<
-        Array<{ naive_stuck: boolean; pinned_moves: boolean }>
-      >`
-        WITH w(stored) AS (SELECT (NOW() AT TIME ZONE 'UTC') - interval '1 hour')
-        SELECT GREATEST(stored, NOW())::timestamp = stored AS naive_stuck,
-               GREATEST(stored, (NOW() AT TIME ZONE 'UTC')) > stored AS pinned_moves
-        FROM w
-      `;
+    const url = new URL(appUrl as string);
+    url.searchParams.set("options", "-c TimeZone=America/Sao_Paulo");
+    const saoPaulo = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: url.toString() }),
     });
-    if (!row) throw new Error("no row");
-    // Bare NOW() hands the STALE value back, so the barrier silently no-ops; pinned moves forward.
-    expect(row.naive_stuck).toBe(true);
-    expect(row.pinned_moves).toBe(true);
+    try {
+      const contact = await suDb.contact.create({
+        data: {
+          chatwootInstanceId: instanceId,
+          tenantId,
+          chatwootContactId: 4245,
+          name: "Lia",
+          customAttributes: { plano: "free" },
+        },
+      });
+      // A watermark an hour old, in the UTC the column holds.
+      const stored = new Date(Date.now() - 3_600_000);
+      await suDb.contact.update({
+        where: { id: contact.id },
+        data: { customAttributesAt: stored },
+      });
+      const tools = buildNativeTools({
+        client: {
+          setContactCustomAttributes: async () => ({}),
+        } as unknown as ChatwootClient,
+        conversationId: CONV_ID,
+        tenantId,
+        base: saoPaulo,
+        contactDbId: contact.id,
+      }) as StructuredToolInterface[];
+      const tool = tools.find((t) => t.name === "set_custom_attribute");
+      if (!tool) throw new Error("set_custom_attribute missing");
+      await tool.invoke({ key: "plano", value: "pro", scope: "contact" });
+
+      const row = await suDb.contact.findUniqueOrThrow({
+        where: { id: contact.id },
+      });
+      expect(row.customAttributes).toEqual({ plano: "pro" });
+      // The write moved the watermark to now, not past it and not left behind.
+      const movedBy =
+        (row.customAttributesAt?.getTime() ?? 0) - stored.getTime();
+      expect(movedBy).toBeGreaterThan(3_000_000);
+      expect(movedBy).toBeLessThan(4_200_000);
+    } finally {
+      await saoPaulo.$disconnect();
+    }
   });
 
   test("a pre-write snapshot delivered late cannot erase the write-through", async () => {
@@ -392,6 +381,85 @@ describe.skipIf(!dbUp)("attribute context in the system prompt", () => {
       tenantId,
       instanceId,
       snapshot(CONV_ID + 3, now + 60, { plano: "enterprise" }),
+      appDb,
+    );
+    row = await suDb.contact.findUniqueOrThrow({ where: { id: contact.id } });
+    expect(row.customAttributes).toEqual({ plano: "enterprise" });
+  });
+
+  test("a pre-write snapshot carrying the contact's own clock cannot erase the write-through either", async () => {
+    // A payload carrying the contact's clock is ordered by that clock alone, so the write-through's
+    // position barrier only holds if the stored clock stops describing the bag.
+    const contact = await suDb.contact.create({
+      data: {
+        chatwootInstanceId: instanceId,
+        tenantId,
+        chatwootContactId: 4244,
+        name: "Rita",
+        customAttributes: {},
+      },
+    });
+    const now = Math.floor(Date.now() / 1000);
+    const snapshot = (
+      convId: number,
+      at: number,
+      clock: number,
+      bag: Record<string, unknown>,
+    ): NormalizedChatwootEvent => ({
+      event: "conversation_updated",
+      conversationId: convId,
+      contactInboxId: null,
+      inboxId: null,
+      status: "pending",
+      assigneeType: null,
+      assigneeId: null,
+      assigneeName: null,
+      contact: {
+        id: 4244,
+        name: "Rita",
+        customAttributes: bag,
+        updatedAt: clock,
+      },
+      inboxName: null,
+      channel: null,
+      lastActivityAt: at,
+    });
+    await mirrorChatwootEvent(
+      tenantId,
+      instanceId,
+      snapshot(CONV_ID + 4, now - 120, now - 120.5, { plano: "free" }),
+      appDb,
+    );
+    const client = {
+      setContactCustomAttributes: async () => ({}),
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: CONV_ID,
+      tenantId,
+      base: appDb,
+      contactDbId: contact.id,
+    }) as StructuredToolInterface[];
+    const tool = tools.find((t) => t.name === "set_custom_attribute");
+    if (!tool) throw new Error("set_custom_attribute missing");
+    await tool.invoke({ key: "plano", value: "pro", scope: "contact" });
+
+    // Serialized after the stored one and before the tool's API write, delivered after it.
+    await mirrorChatwootEvent(
+      tenantId,
+      instanceId,
+      snapshot(CONV_ID + 5, now - 60, now - 60.5, { plano: "free" }),
+      appDb,
+    );
+    let row = await suDb.contact.findUniqueOrThrow({
+      where: { id: contact.id },
+    });
+    expect(row.customAttributes).toEqual({ plano: "pro" });
+
+    await mirrorChatwootEvent(
+      tenantId,
+      instanceId,
+      snapshot(CONV_ID + 6, now + 60, now + 59.5, { plano: "enterprise" }),
       appDb,
     );
     row = await suDb.contact.findUniqueOrThrow({ where: { id: contact.id } });

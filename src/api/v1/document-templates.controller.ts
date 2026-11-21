@@ -1,18 +1,23 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
+import { tRanged } from "@/api/lib/ranged";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
+import { intRange } from "@/lib/number-range";
 import type { TenantContext } from "@/lib/tenancy";
+import { NEXT_NUMBER_RANGE } from "@/modules/documents/numbering";
 import { documentStarters } from "@/modules/documents/starters";
 import {
+  APPROVAL_TTL_HOURS,
   // translate('errors.invalidId', 'Not a valid {{label}}')
   createDocumentTemplate,
   deleteDocumentTemplate,
   documentTemplateReferences,
   getDocumentTemplate,
   listDocumentTemplates,
+  nextNumberUnderPrefix,
   previewDocumentTemplate,
   updateDocumentTemplate,
 } from "@/modules/documents/templates";
@@ -36,8 +41,8 @@ const STYLE_DESC =
   'Rendering style: {"font":"sans"|"serif"|"mono","baseFontSize":8-14,"accentColor":"#rrggbb","margin":"narrow"|"normal"|"wide","pageSize":"A4"|"LETTER","locale":"pt-BR"|"en-US","currency":"BRL","footerText"?,"showPageNumbers":bool}. baseFontSize outside 8-14 is clamped, not refused.';
 
 // Exported for the schema-drift guard in tests: every field the service accepts must appear here, or
-// Elysia's `normalize` silently strips it from the request body — which is how a whole block list
-// arrives as `[]` and the operator sees a saved template with nothing in it.
+// Elysia's `normalize` silently strips it from the request body (a block list would arrive as `[]`
+// and save an empty template).
 export const writeBody = t.Object({
   name: t.Optional(t.String({ maxLength: 120, description: "Template name." })),
   slug: t.Optional(
@@ -52,9 +57,9 @@ export const writeBody = t.Object({
       description: "What this template is for, for the operator.",
     }),
   ),
-  // NOTE: deliberately permissive Records, not the structural union. Elysia's `normalize` STRIPS
+  // Deliberately permissive Records, not the structural union. Elysia's `normalize` STRIPS
   // what a schema does not declare, and a discriminated union of six block types declared field by
-  // field would drop every property it does not name — silently, with a 200. Passing the array
+  // field would drop every property it does not name, silently, with a 200. Passing the array
   // through intact is what lets the service refuse it with a message that says what to write.
   blocks: t.Optional(
     t.Array(t.Record(t.String(), t.Unknown()), { description: BLOCKS_DESC }),
@@ -77,8 +82,26 @@ export const writeBody = t.Object({
         'Prefix for the document number, e.g. "ORC-" produces ORC-0001.',
     }),
   ),
+  nextNumber: t.Optional(
+    tRanged(NEXT_NUMBER_RANGE, {
+      description:
+        "The number the next document issued from this template prints (without the prefix), to continue a sequence started elsewhere. Refused (409) at or below a number this workspace already issued under the template's prefix, by any template; a new prefix starts a new sequence. The template's `nextNumber` reads where numbering continues now.",
+    }),
+  ),
   enabled: t.Optional(
     t.Boolean({ description: "Whether agents may issue this document." }),
+  ),
+  requiresApproval: t.Optional(
+    t.Boolean({
+      description:
+        "Whether a person approves each document an agent issues from this template before the customer receives it. Off by default.",
+    }),
+  ),
+  approvalTtlHours: t.Optional(
+    tRanged(intRange(APPROVAL_TTL_HOURS.min, APPROVAL_TTL_HOURS.max), {
+      description:
+        "How long an approval request waits, in whole hours. Defaults to 24.",
+    }),
   ),
 });
 
@@ -122,7 +145,7 @@ export const documentTemplatesController = new Elysia({
       }),
       detail: doc(
         "List starter templates",
-        "Ready-made templates (quote, proposal, receipt) to create one from.",
+        "Ready-made templates (quote, proposal, receipt, and a blank one) to create one from.",
       ),
       response: errors(401, 403),
     },
@@ -150,9 +173,8 @@ export const documentTemplatesController = new Elysia({
     "/preview",
     async ({ tenantContext, body }) => {
       const bytes = await previewDocumentTemplate(ctxOrThrow(tenantContext), {
-        // `!== undefined`, not truthiness: "0" is a supplied id, and reading it as "no id given"
-        // answers a lookup for a template that does not exist with a blank draft preview — telling
-        // the operator their template rendered.
+        // NOTE: `!== undefined`, not truthiness: "0" is a supplied id, and reading it as "no id
+        // given" would answer a template that does not exist with a blank draft preview.
         id:
           body.id !== undefined
             ? requireDbId(body.id, "template id")
@@ -219,16 +241,10 @@ export const documentTemplatesController = new Elysia({
         "Preview document template",
         "Renders a saved template or an unsaved draft to PDF, without issuing anything.",
       ),
-      // 404 included: previewing by `id` LOOKS the template up, and a well-formed id that names
-      // nothing in this tenant answers the same way a GET does. Leaving it out publishes a union
-      // the endpoint does not honour, and an Eden caller narrowing on the declared statuses is
-      // handed a status its types say cannot happen.
-      //
-      // 409 for the same reason, and it is the one this rule was stated for and then missed: a
-      // preview by id alone authored neither blocks nor fields, so it takes the same refusal the
-      // write takes for a template a newer build wrote (`documentTemplateUnreadable`). Create and
-      // patch both declared it; nothing at runtime told anyone this one did not, because Elysia
-      // answers the 409 either way and only the generated client is left holding the wrong union.
+      // 404 and 409 because a preview by `id` looks the template up: an id naming nothing here is a
+      // 404 as on a GET, and a template a newer build wrote takes the write's 409
+      // (`documentTemplateUnreadable`). Elysia answers an undeclared status anyway, and the Eden
+      // client's types then say it cannot happen.
       response: errors(400, 401, 403, 404, 409, 422),
     },
   )
@@ -249,6 +265,38 @@ export const documentTemplatesController = new Elysia({
         }),
       }),
       detail: doc("Get document template", "Returns one document template."),
+      response: errors(400, 401, 403, 404),
+    },
+  )
+  .get(
+    "/:id/next-number",
+    async ({ tenantContext, params, query }) => ({
+      instance: instanceIdentity,
+      nextNumber: await nextNumberUnderPrefix(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        query.prefix,
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Template id (BigInt string).",
+        }),
+      }),
+      query: t.Object({
+        prefix: t.Optional(
+          t.String({
+            description:
+              "The prefix to ask about; the template's own when omitted, no prefix when empty.",
+          }),
+        ),
+      }),
+      detail: doc(
+        "Next number under a prefix",
+        "Where this template's numbering would continue if its prefix were `prefix`: the larger of its counter and the highest number the workspace issued under that prefix, plus one. For an editor or a preview that moves the prefix before saving.",
+      ),
       response: errors(400, 401, 403, 404),
     },
   )

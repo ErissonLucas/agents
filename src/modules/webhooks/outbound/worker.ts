@@ -2,9 +2,13 @@ import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import { runInPoolClass } from "@/lib/pool-class";
 import { sanitizeErrorMessage } from "@/lib/redact";
+import { isDraining } from "@/lib/shutdown";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { tickFailures } from "@/lib/tick-failure";
+import { runWithWorkLabel } from "@/lib/work-label";
 import { emitDeliveryDead } from "@/modules/flowlog/webhook";
 import { resolveSigningSecret } from "@/modules/vault/service";
 import { nextBackoffMs } from "./service";
@@ -13,10 +17,10 @@ import { outboundHeaders } from "./signing";
 // Outbound webhook delivery worker (claim + deliver side). A single-replica tick claims due
 // PENDING deliveries cross-tenant (asSuperAdmin / FOR UPDATE SKIP LOCKED), then for each:
 // resolves the per-tenant signing secret (RLS-scoped), POSTs the signed payload OUTSIDE any
-// transaction (SSRF-checked, no redirects, timeout), and records the outcome — DELIVERED,
+// transaction (SSRF-checked, no redirects, timeout), and records the outcome: DELIVERED,
 // back to PENDING with full-jitter backoff, or DEAD after MAX_ATTEMPTS. The delivery id is a
 // stable dedupe key (x-fazerai-delivery) so at-least-once retries are safe for receivers.
-//
+
 // Crash safety: the claim flips status to SENDING; a crash between claim and outcome would
 // strand the row, so each tick first reaps stale SENDING rows back to PENDING. The reentrancy
 // guard makes this safe under a single replica; FOR UPDATE SKIP LOCKED future-proofs it.
@@ -65,15 +69,15 @@ interface ClaimedDelivery {
 
 type DeliveryOutcome = "delivered" | "retried" | "dead";
 
-// NOTE: system worker context. tenantId pins the RLS scope for the row's own tenant; role is
+// System worker context. tenantId pins the RLS scope for the row's own tenant; role is
 // only carried for the TenantContext shape (no authorization decision is made off it here).
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
 // `sanitizeErrorMessage` rather than a bare cut: this string is stored in `last_error`, and the
-// exceptions a delivery produces wrap what the remote endpoint answered. See issue #243 and the
-// function's own header for why a NUL or an orphan surrogate costs the whole write.
+// exceptions a delivery produces wrap what the remote endpoint answered. See the function's own
+// header for why a NUL or an orphan surrogate costs the whole write.
 function errMsg(err: unknown): string {
   return sanitizeErrorMessage(err, MAX_ERROR_LEN);
 }
@@ -128,6 +132,8 @@ async function claimDueDeliveries(
   limit: number,
   tenantId?: bigint,
 ): Promise<ClaimedDelivery[]> {
+  // NOTE: a tick already past its timer when SIGTERM arrives claims nothing new (src/lib/shutdown.ts).
+  if (isDraining()) return [];
   const tenantClause =
     tenantId != null
       ? Prisma.sql`AND d2.tenant_id = ${tenantId}`
@@ -165,10 +171,8 @@ async function claimDueDeliveries(
 }
 
 // `unsignedReason` rides along on EVERY terminal write, including this one, because it describes the
-// attempt and not its outcome (issue #724). The delivered row is the one that needed it most: it is
-// the one nothing else marks, and the receiver rejecting an unsigned POST does it in ITS log, not
-// ours, so without this column the ledger shows a clean 2xx history against a subscription whose
-// deliveries are being thrown away on arrival.
+// attempt and not its outcome. A receiver rejecting an unsigned POST does it in ITS log, so without
+// this column the ledger would show a clean 2xx history for deliveries thrown away on arrival.
 async function finalizeDelivered(
   base: PrismaClient,
   d: ClaimedDelivery,
@@ -189,11 +193,8 @@ async function finalizeDelivered(
   );
 }
 
-// THE ONLY WRITE OF DEAD, and it is one function for that reason rather than for tidiness. There
-// are two roads here — the retry budget running out, and a URL the SSRF guard refuses on sight —
-// and issue #325 is what happens when a road forgets to tell anybody: both of them wrote the row
-// and returned, and the operator's only trace was a counter in a process log. A third road will be
-// added one day; going through here is what makes it announce itself without anyone remembering to.
+// THE ONLY WRITE OF DEAD, so every road to it (the retry budget running out, a URL the SSRF guard
+// refuses on sight, any future one) announces the death without anyone remembering to.
 async function finalizeDead(
   base: PrismaClient,
   d: ClaimedDelivery,
@@ -266,16 +267,10 @@ async function deliverClaimed(
     return finalizeDead(base, d, d.attempts + 1, errMsg(err), null);
   }
 
-  // Per-tenant signing secret, resolved through a tenant-scoped read (RLS active, not the
-  // cross-tenant bypass) — least privilege. A read that THROWS is transient (the vault is down, the
-  // decryption key rotated mid-flight), so it falls through to retry/backoff.
-  //
-  // A ref that simply does not resolve is a different thing and was the silent one (issue #724): it
-  // comes back with no secret, the POST goes out UNSIGNED, and the row was written DELIVERED with
-  // `lastError` cleared. The send is kept — a receiver that does not verify keeps working, and this
-  // path has always behaved this way — but the sentence now travels to the row, per state, because a
-  // deleted credential and one that was never filled send the operator to different pages. The old
-  // comment here said a missing secret "falls through to retry/backoff"; it never did.
+  // Per-tenant signing secret, through a tenant-scoped read (RLS active, least privilege). A
+  // read that THROWS is transient, so it falls through to retry/backoff. A ref that does not resolve
+  // still sends, UNSIGNED, so a receiver that does not verify keeps working, and the row carries
+  // `unsignedReason` naming which credential problem the operator has to fix.
   let secret: string | null = null;
   let unsignedReason: string | null = null;
   try {
@@ -379,13 +374,15 @@ interface WorkerState {
   running: boolean;
 }
 
-// NOTE: the state lives on globalThis (not a module `let`) so `bun --hot` re-evaluating this
+// The state lives on globalThis (not a module `let`) so `bun --hot` re-evaluating this
 // module does not orphan the old interval and spawn a phantom second worker.
 function workerState(): WorkerState {
   const g = globalThis as unknown as Record<symbol, WorkerState | undefined>;
   if (!g[WORKER_KEY]) g[WORKER_KEY] = { running: false };
   return g[WORKER_KEY] as WorkerState;
 }
+
+const outboundTickFailures = tickFailures();
 
 async function tick(base: PrismaClient, state: WorkerState): Promise<void> {
   if (state.running) return; // single-replica reentrancy guard
@@ -402,22 +399,36 @@ async function tick(base: PrismaClient, state: WorkerState): Promise<void> {
         summary.dead,
       );
     }
+    outboundTickFailures.succeeded();
   } catch (err) {
-    logger.error("Outbound webhook tick failed: %s", errMsg(err));
+    outboundTickFailures.failed(
+      err,
+      {},
+      "Outbound webhook tick failed: %s",
+      errMsg(err),
+    );
   } finally {
     state.running = false;
   }
 }
 
+// The outbound webhook deliveries run as `webhooks:delivery`: the label is entered where the timer is created, so every pass
+// inherits it, and a statement that times out in one names this work (docs/logs.md, "Database").
 export function startOutboundWorker(opts: OutboundWorkerOptions = {}): void {
-  const state = workerState();
-  if (state.timer) return; // singleton (survives bun --hot via globalThis)
-  const base = opts.base ?? basePrisma;
-  const intervalMs = config.webhookWorker.intervalMs;
-  state.timer = setInterval(() => void tick(base, state), intervalMs);
-  // NOTE: unref so the tick timer never keeps the process alive at shutdown.
-  state.timer.unref?.();
-  logger.info("Outbound webhook worker started (interval %dms)", intervalMs);
+  runWithWorkLabel("webhooks:delivery", () => {
+    const state = workerState();
+    if (state.timer) return; // singleton (survives bun --hot via globalThis)
+    const base = opts.base ?? basePrisma;
+    const intervalMs = config.webhookWorker.intervalMs;
+    // NOTE: background pool: nobody is waiting on a delivery to a third party this second.
+    state.timer = setInterval(
+      () => void runInPoolClass("background", () => tick(base, state)),
+      intervalMs,
+    );
+    // NOTE: unref so the tick timer never keeps the process alive at shutdown.
+    state.timer.unref?.();
+    logger.info("Outbound webhook worker started (interval %dms)", intervalMs);
+  });
 }
 
 export function stopOutboundWorker(): void {

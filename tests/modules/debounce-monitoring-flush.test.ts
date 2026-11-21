@@ -3,20 +3,21 @@ import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
-import { encryptJson } from "@/api/lib/crypto";
+import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import { followUpDedupeKey } from "@/modules/channel-redirect/followup";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import { debounceDedupeKey } from "@/modules/debounce/service";
 import { monthStart } from "@/modules/spend-ceiling/decide";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // A DEBOUNCE job armed for a PRODUCTION agent, flushed after the operator flipped the agent to
-// monitoring (issue #209 review, round 5). The receiver expected the turn to cover the burst, so it
-// neither ingested the messages nor advanced the watermark; the config load then refuses a
-// monitoring agent. The flush has to do what the observer would have done for those messages —
-// hand each to ingestion and move the handled watermark past them — and post nothing. A disabled
-// agent's burst, the exit this used to share, is the control: it waits for the switch, untouched.
+// monitoring. The receiver expected the turn to cover the burst, so it neither ingested the
+// messages nor advanced the watermark; the config load then refuses a monitoring agent. The flush
+// has to do what the observer would have done for those messages (hand each to ingestion and move
+// the handled watermark past them) and post nothing. A disabled agent's burst is the control: it
+// waits for the switch, untouched.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -34,8 +35,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -71,6 +72,10 @@ const CONV_CEILING_CLIENT = 9432;
 const CONV_PAST_BOUND = 9433;
 const CONV_CEILING_REMEMBERED = 9436;
 const CONV_REACTION = 9437;
+const CONV_RULE_REFUSED = 9438;
+const CONV_RULE_ALLOWED = 9439;
+const CONV_ENDPOINT_DENIED = 9440;
+const CONV_SUBJECT_ONLY = 9441;
 let tenantId = 0n;
 let instanceId = 0n;
 let inboxDbId = 0n;
@@ -84,12 +89,14 @@ function page(
   msgs: Array<{
     id: number;
     content: string;
-    // Uma saída, e de quem: o que separa a resposta de uma PESSOA da nossa (PR #701).
+    // Uma saída, e de quem: o que separa a resposta de uma PESSOA da nossa.
     type?: number;
     sender?: string;
     senderId?: number;
-    // Epoch seconds, as Chatwoot sends `created_at` (issue #755).
+    // Epoch seconds, as Chatwoot sends `created_at`.
     createdAt?: number;
+    // An email's Subject header, which the mailbox writes into `content_attributes.email`.
+    subject?: string;
   }>,
 ) {
   return {
@@ -99,6 +106,9 @@ function page(
       message_type: m.type ?? 0,
       private: false,
       ...(m.createdAt ? { created_at: m.createdAt } : {}),
+      ...(m.subject
+        ? { content_attributes: { email: { subject: m.subject } } }
+        : {}),
       ...(m.sender ? { sender: { id: m.senderId ?? 9, type: m.sender } } : {}),
     })),
   };
@@ -113,7 +123,7 @@ function stub(
     onFirstFetch?: () => Promise<void>;
     // Every fetch after the first fails: the observer's own re-read of the burst, in particular.
     laterFetchesFail?: boolean;
-    // The page Chatwoot answers for `after=<id>`, whatever the id (issue #746).
+    // The page Chatwoot answers for `after=<id>`, whatever the id.
     after?: unknown;
   } = {},
 ) {
@@ -321,6 +331,37 @@ describe.skipIf(!dbUp)(
       await seedConversation(CONV_CEILING_CLIENT, 94_320);
       await seedConversation(CONV_PAST_BOUND, 94_330);
       await seedConversation(CONV_REACTION, 94_370);
+      await seedConversation(CONV_SUBJECT_ONLY, 94_410);
+      for (const [convId, type] of [
+        [CONV_RULE_REFUSED, "individual"],
+        [CONV_RULE_ALLOWED, "group"],
+        [CONV_ENDPOINT_DENIED, "individual"],
+      ] as const) {
+        const contact = await suDb.contact.create({
+          data: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootContactId: convId,
+            name: "Contato",
+            phone: `+5511900${convId}`,
+          },
+        });
+        await suDb.conversation.create({
+          data: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootConversationId: convId,
+            status: "pending",
+            assigneeType: null,
+            inboxId: inboxDbId,
+            contactId: contact.id,
+            contactInboxId: convId * 10,
+            threadId: threadOf(convId),
+            lastEventAt: new Date(),
+            conversationType: type,
+          },
+        });
+      }
     });
 
     afterAll(async () => {
@@ -364,7 +405,7 @@ describe.skipIf(!dbUp)(
       const s = stub([
         page([
           { id: 1, content: "oi" },
-          // Issue #755: this one carries its instant, and it has to reach the fold.
+          // NOTE: this one carries its instant, and it has to reach the fold.
           { id: 2, content: "quero cancelar", createdAt: 1_789_563_900 },
         ]),
       ]);
@@ -410,8 +451,183 @@ describe.skipIf(!dbUp)(
       }
     });
 
-    // ISSUE #746: a reaction no default page carries is remembered by the observer as well. The
-    // walk reads pages; the burst's reaction mark asks the catch-up read for what they leave out.
+    // An email whose whole request is its subject is remembered as the subject, the text a turn
+    // would have read, and not dropped as a message with nothing in it.
+    test("an email whose only words are its subject is remembered as its subject", async () => {
+      const job = await claimedJob(CONV_SUBJECT_ONLY, 1);
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: { mode: "monitoring" },
+      });
+      const s = stub([page([{ id: 1, content: "", subject: "Reembolso" }])]);
+      try {
+        await flushDebounceJob({
+          job,
+          base: appDb,
+          deps: {
+            makeModel: () => {
+              throw new Error("a monitoring agent must not reach the model");
+            },
+            makeClient: s.makeClient as never,
+          },
+        });
+        const row = await suDb.schedulerJob.findFirst({
+          where: {
+            tenantId,
+            kind: "INGEST_MESSAGE",
+            dedupeKey: { endsWith: "94410:1" },
+          },
+          select: { payloadSecret: true },
+        });
+        expect(
+          row?.payloadSecret ? decryptJson<string>(row.payloadSecret) : null,
+        ).toBe("<assunto>Reembolso</assunto>");
+      } finally {
+        await suDb.agent.update({
+          where: { id: agentDbId },
+          data: { mode: "production" },
+        });
+      }
+    });
+
+    // THE CONTACT GATE'S RULE decides whether the handed-over burst is OBSERVED, not whether it is
+    // remembered: the memory still gets every message and the watermark moves, while a conversation
+    // the rule refuses arms no OBSERVE row (no tick, no model call) and gets nothing posted.
+    test("a burst the agent's rule refuses is remembered but not observed; one it lets through is observed", async () => {
+      const refused = await claimedJob(CONV_RULE_REFUSED, 3);
+      const allowed = await claimedJob(CONV_RULE_ALLOWED, 3);
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          mode: "monitoring",
+          settings: {
+            debounce: { enabled: true, windowSeconds: 15 },
+            contactAuth: {
+              enabled: true,
+              rule: { kind: "conversation_type", type: "group" },
+            },
+          },
+        },
+      });
+      const observeRows = (convId: number) =>
+        suDb.schedulerJob.findMany({
+          where: {
+            tenantId,
+            kind: "OBSERVE",
+            dedupeKey: { startsWith: `observe:${threadOf(convId)}:` },
+          },
+          select: { id: true },
+        });
+      try {
+        for (const [job, convId] of [
+          [refused, CONV_RULE_REFUSED],
+          [allowed, CONV_RULE_ALLOWED],
+        ] as const) {
+          const s = stub([page([{ id: 3, content: "bom dia" }])]);
+          const out = await flushDebounceJob({
+            job,
+            base: appDb,
+            deps: {
+              makeModel: () => {
+                throw new Error("a monitoring agent must not reach the model");
+              },
+              makeClient: s.makeClient as never,
+            },
+          });
+          expect(out).toEqual({ outcome: "done" });
+          expect(s.sent).toEqual([]);
+          expect(s.notes).toEqual([]);
+          expect(s.toggles).toEqual([]);
+          expect(await watermarkOf(convId)).toBe(3);
+        }
+        expect(
+          ingestedIds(
+            (await ingestJobs()).map((j) => j.dedupeKey),
+            CONV_RULE_REFUSED * 10,
+          ),
+        ).toEqual([3]);
+        expect(await observeRows(CONV_RULE_REFUSED)).toEqual([]);
+        expect(await observeRows(CONV_RULE_ALLOWED)).toHaveLength(1);
+      } finally {
+        await suDb.agent.update({
+          where: { id: agentDbId },
+          data: {
+            mode: "production",
+            settings: { debounce: { enabled: true, windowSeconds: 15 } },
+          },
+        });
+      }
+    });
+
+    // THE ENDPOINT on the hand-over: a watcher whose gate asks an endpoint asks it once before it arms
+    // the burst's observation, and a denial leaves the burst remembered but not observed.
+    test("a burst the watcher's endpoint denies is remembered but not observed, with one ask", async () => {
+      const job = await claimedJob(CONV_ENDPOINT_DENIED, 3);
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          mode: "monitoring",
+          settings: {
+            debounce: { enabled: true, windowSeconds: 15 },
+            contactAuth: {
+              enabled: true,
+              url: "https://203.0.113.94:9443/check",
+            },
+          },
+        },
+      });
+      let asks = 0;
+      try {
+        const s = stub([page([{ id: 3, content: "bom dia" }])]);
+        const out = await flushDebounceJob({
+          job,
+          base: appDb,
+          deps: {
+            makeModel: () => {
+              throw new Error("a monitoring agent must not reach the model");
+            },
+            makeClient: s.makeClient as never,
+            contactAuthFetch: (async () => {
+              asks += 1;
+              return new Response(JSON.stringify({ authorized: false }), {
+                status: 200,
+              });
+            }) as unknown as typeof fetch,
+          },
+        });
+        expect(out).toEqual({ outcome: "done" });
+        expect(s.sent).toEqual([]);
+        expect(s.notes).toEqual([]);
+        expect(s.toggles).toEqual([]);
+        expect(await watermarkOf(CONV_ENDPOINT_DENIED)).toBe(3);
+        expect(asks).toBe(1);
+        const rows = await suDb.schedulerJob.findMany({
+          where: {
+            tenantId,
+            kind: "OBSERVE",
+            // The denial leaves a retired row carrying its mark (`retireRefusedObserve`), never a
+            // runnable one.
+            status: { in: ["PENDING", "CLAIMED"] },
+            dedupeKey: {
+              startsWith: `observe:${threadOf(CONV_ENDPOINT_DENIED)}:`,
+            },
+          },
+          select: { id: true },
+        });
+        expect(rows).toEqual([]);
+      } finally {
+        await suDb.agent.update({
+          where: { id: agentDbId },
+          data: {
+            mode: "production",
+            settings: { debounce: { enabled: true, windowSeconds: 15 } },
+          },
+        });
+      }
+    });
+
+    // NOTE: a reaction no default page carries is remembered by the observer as well. The walk
+    // reads pages; the burst's reaction mark asks the catch-up read for what they leave out.
     test("a reaction no page carries is handed to ingestion with the rest of the burst", async () => {
       const job = await claimedJob(CONV_REACTION, 3, { reactionArmed: true });
       await suDb.agent.update({
@@ -463,10 +679,10 @@ describe.skipIf(!dbUp)(
     });
 
     test("the orphan below the mark is handed over too, not left without a row", async () => {
-      // PR #701, review round 6. A observação ingere e MARCA a rajada, então ela tem que enxergar o
-      // mesmo conjunto que o flush: a órfã abaixo da marca, que esta PR ensinou a seleção a oferecer,
-      // ficava sem ser ingerida e sem linha nenhuma, com a passagem declarada bem-sucedida. Voltando
-      // para produção, um flush depois executa aquele pedido velho.
+      // A observação ingere e MARCA a rajada, então ela tem que enxergar o mesmo conjunto que
+      // o flush: uma órfã abaixo da marca, que a seleção oferece, ficaria sem ser ingerida e sem
+      // linha nenhuma, com a passagem declarada bem-sucedida, e um flush depois da volta para
+      // produção executaria aquele pedido velho.
       const conv = await suDb.conversation.findFirstOrThrow({
         where: { tenantId, chatwootConversationId: CONV_ORPHAN },
         select: { id: true },
@@ -514,11 +730,10 @@ describe.skipIf(!dbUp)(
     });
 
     test("a human reply does not hide the customer's questions from the observer", async () => {
-      // PR #701, review round 7. Elegibilidade para RESPONDER e elegibilidade para LEMBRAR são
-      // perguntas diferentes, e a cerca da resposta de terceiro só responde a primeira. Ligada aqui,
-      // uma resposta humana esconde da memória do agente as perguntas atrás dela, e a passagem
-      // declara sucesso sem ter lembrado nada — que é exatamente o que a observação existe para
-      // fazer.
+      // Elegibilidade para RESPONDER e elegibilidade para LEMBRAR são perguntas diferentes, e
+      // a cerca da resposta de terceiro só responde a primeira. Ligada aqui, uma resposta humana
+      // esconderia da memória do agente as perguntas atrás dela, e a passagem declararia sucesso
+      // sem ter lembrado nada, que é o que a observação existe para fazer.
       const job = await claimedJob(CONV_HUMAN_REPLIED, 2);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -564,9 +779,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flip inside the flush's own model call: the burst is remembered and marked handled, nothing posted", async () => {
-      // The turn LOADED as production and stood down at the send fence. It ran over the burst, so
-      // the watermark is past it, and the rolled-back turn left it in nobody's memory: the flush
-      // reads the agent again and hands the burst to the observer's ingestion (review round 6).
+      // The turn LOADED as production and stood down at the send fence. It ran over the
+      // burst, so the watermark is past it, and the rolled-back turn left it in nobody's memory:
+      // the flush reads the agent again and hands the burst to the observer's ingestion.
       const job = await claimedJob(CONV_FLIPPED_MID_TURN, 3);
       class FlippingModel extends FakeListChatModel {
         override bindTools(): this {
@@ -608,8 +823,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flip inside the burst fetch of a flush over the spend ceiling posts none of the ceiling's actions", async () => {
-      // The ceiling's copy, note and handoff are outputs of this flush like a reply is, decided
-      // under a config the burst fetch made old (review round 6).
+      // The ceiling's copy, note and handoff are outputs of this flush like a reply is,
+      // decided under a config the burst fetch made old.
       const before = await suDb.tenant.findUniqueOrThrow({
         where: { id: tenantId },
         select: { settings: true },
@@ -627,8 +842,8 @@ describe.skipIf(!dbUp)(
           },
         },
       });
-      // The month's cost as the poll would have left it (#426): the gate reads the snapshot, not
-      // the ledger.
+      // NOTE: the month's cost as the poll would have left it: the gate reads the snapshot, not the
+      // ledger.
       await suDb.spendCostSnapshot.create({
         data: {
           tenantId,
@@ -663,8 +878,8 @@ describe.skipIf(!dbUp)(
         expect(s.sent).toEqual([]);
         expect(s.toggles).toEqual([]);
         expect(s.notes).toEqual([]);
-        // And the burst is the observer's (round 9): the flip landed inside the ceiling's own
-        // waits, and the exit hands it over like the turn's does.
+        // And the burst is the observer's: the flip landed inside the ceiling's own waits,
+        // and the exit hands it over like the turn's does.
         const keys = (await ingestJobs()).map((j) => j.dedupeKey);
         expect(ingestedIds(keys, 94_130)).toEqual([7]);
         expect(await watermarkOf(CONV_CEILING)).toBe(7);
@@ -682,16 +897,14 @@ describe.skipIf(!dbUp)(
     });
 
     test("what the ceiling REFUSED is still the observer's to remember", async () => {
-      // PR #701, review round 8. Uma dispensa diz que ninguém vai RESPONDER àquela mensagem. Ela não
-      // diz nada sobre a memória — e a recusa por teto é justamente a que nomeia cada membro da
-      // rajada que recusou. Lida pela ingestão, ela esconde do observador exatamente o que o cliente
-      // pediu enquanto o orçamento estava estourado, e a passagem declara sucesso sem ter lembrado
-      // nada. A meia escalar desse mesmo problema é o que o `watermarkPastBurst` sempre compensou.
-      //
-      // A corrida é a outra porta de entrada: uma virada para monitoramento que caia entre o
-      // `stillWanted("settlement")` e a passagem abaixo dele chega no mesmo lugar por dois writes de
-      // distância. Esta sequência não precisa dela, e é a que o operador realmente faz: o teto
-      // recusa, ele devolve a conversa e vira o agente para observar enquanto o orçamento não volta.
+      // Uma dispensa diz que ninguém vai RESPONDER àquela mensagem, e nada sobre a memória; a
+      // recusa por teto nomeia cada membro da rajada que recusou. Lida pela ingestão, ela
+      // esconderia do observador o que o cliente pediu com o orçamento estourado, e a passagem
+      // declararia sucesso sem ter lembrado nada (a meia escalar do mesmo problema é o que
+      // `watermarkPastBurst` compensa). Uma virada para monitoramento entre o
+      // `stillWanted("settlement")` e a passagem abaixo dele chega ao mesmo lugar; esta sequência
+      // dispensa a corrida e é a que o operador faz: o teto recusa, ele devolve a conversa e vira o
+      // agente para observar.
       const before = await suDb.tenant.findUniqueOrThrow({
         where: { id: tenantId },
         select: { settings: true },
@@ -745,9 +958,9 @@ describe.skipIf(!dbUp)(
         // lembrou nada dela. Sem isto o teste passaria medindo outra coisa.
         expect(s1.sent).toEqual(["Orçamento do mês esgotado."]);
         expect(await watermarkOf(CONV_CEILING_REMEMBERED)).toBe(7);
-        // NOMEADA, e a linha mora no `message_reply_claims` com a palavra `DISPENSED` — a tabela
-        // `reply_dispensals` é só para a faixa que o chamador não conseguiu enumerar, e a recusa por
-        // teto consegue.
+        // NOTE: NOMEADA, e a linha mora no `message_reply_claims` com a palavra `DISPENSED`; a
+        // tabela `reply_dispensals` é só para a faixa que o chamador não conseguiu enumerar, e a
+        // recusa por teto consegue.
         expect(
           await suDb.messageReplyClaim.findFirst({
             where: { conversationId: conv.id, messageId: 7 },
@@ -811,9 +1024,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst pushed off the newest page by what came after the flip is still found, one page back", async () => {
-      // Twenty observed messages arrived after the flip; the armed burst (1, 2) is on the page
-      // before them. Read from the newest page alone the burst would be empty and the watermark
-      // would move anyway (review round 6).
+      // Twenty observed messages arrived after the flip; the armed burst (1, 2) is on the
+      // page before them. Read from the newest page alone the burst would be empty and the
+      // watermark would move anyway.
       const job = await claimedJob(CONV_PAGED, 2);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -856,10 +1069,10 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst the bounded walk cannot bring into view is left unmarked, and fails the flush", async () => {
-      // Five full pages back and the floor is still not in sight: nothing of the burst was read, so
-      // nothing of it is marked handled (review round 7) — and the flush fails rather than
-      // completing, since the ordinary flush reads one page and would advance the watermark past
-      // what the bound left out (review round 25).
+      // Five full pages back and the floor is still not in sight: nothing of the burst was
+      // read, so nothing of it is marked handled, and the flush fails rather than completing, since
+      // the ordinary flush reads one page and would advance the watermark past what the bound left
+      // out.
       const job = await claimedJob(CONV_OUT_OF_REACH, 2);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -907,7 +1120,7 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst on a conversation with no contact-inbox thread is left unmarked", async () => {
-      // Nothing of it can be remembered here, so nothing of it is marked (review round 8).
+      // Nothing of it can be remembered here, so nothing of it is marked.
       const job = await claimedJob(CONV_NO_THREAD, 4);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -937,8 +1150,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flip inside the contact-authorization call of a flush hands the refused burst to the observer", async () => {
-      // The refusal marks the burst handled and drops it; under an observer it is remembered too
-      // (round 9).
+      // The refusal marks the burst handled and drops it; under an observer it is remembered
+      // too.
       const before = await suDb.agent.findUniqueOrThrow({
         where: { id: agentDbId },
         select: { settings: true },
@@ -1015,10 +1228,10 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flip inside the flush's model call whose hand-over cannot read the burst leaves it unmarked, and retries the flush", async () => {
-      // The turn ran over the burst and stood down; the observer's re-read fails. Marked, the burst
-      // would be below the watermark with nothing remembering it (round 9) — and completed, the job
-      // would never try again while the next observed message moves the watermark past it (round
-      // 17): the flush fails, for the scheduler to retry.
+      // The turn ran over the burst and stood down; the observer's re-read fails. Marked, the
+      // burst would be below the watermark with nothing remembering it, and completed, the job
+      // would never try again while the next observed message moves the watermark past it: the
+      // flush fails, for the scheduler to retry.
       const job = await claimedJob(CONV_FETCH_FAILS, 3);
       class FlippingModel extends FakeListChatModel {
         override bindTools(): this {
@@ -1064,8 +1277,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a human taking the conversation during the authorization call, under a flip, still hands the burst to the observer", async () => {
-      // The authorization allows, the conversation is no longer the bot's, and the flush marks the
-      // burst on its way out (round 10): under an observer it is remembered too.
+      // The authorization allows, the conversation is no longer the bot's, and the flush
+      // marks the burst on its way out: under an observer it is remembered too.
       const before = await suDb.agent.findUniqueOrThrow({
         where: { id: agentDbId },
         select: { settings: true },
@@ -1149,8 +1362,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a refused burst whose hand-over cannot read Chatwoot is left unmarked and unsettled, and retries the flush", async () => {
-      // The refusal used to mark and settle the burst before asking the observer (round 11); a
-      // read that failed is a flush worth retrying (round 17).
+      // The refusal asks the observer before it marks and settles the burst, and a read that
+      // failed is a flush worth retrying.
       const before = await suDb.agent.findUniqueOrThrow({
         where: { id: agentDbId },
         select: { settings: true },
@@ -1246,8 +1459,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flush whose turn flips and then throws still hands the burst to the observer before rethrowing", async () => {
-      // The retry the scheduler owes a failed flush could land after a flip back to production and
-      // answer a burst that was watched (round 13).
+      // The retry the scheduler owes a failed flush could land after a flip back to
+      // production and answer a burst that was watched.
       const job = await claimedJob(CONV_THROWS, 5);
       class FlipThenThrowModel extends FakeListChatModel {
         override bindTools(): this {
@@ -1287,8 +1500,7 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst whose conversation a human took, under a flip, is handed to the observer at the gate exit", async () => {
-      // The gate closes before the mode is read, so the exits after it never see an observer
-      // (round 15).
+      // The gate closes before the mode is read, so the exits after it never see an observer.
       const job = await claimedJob(CONV_GATE_TAKEN, 15);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -1332,8 +1544,7 @@ describe.skipIf(!dbUp)(
     });
 
     test("the observed burst's deliveries are settled on the ledger, so the sweep does not re-run them", async () => {
-      // A delivery whose process died between arming the job and writing its final status
-      // (round 15).
+      // A delivery whose process died between arming the job and writing its final status.
       const job = await claimedJob(CONV_LEDGER, 17);
       const delivery = await suDb.chatwootWebhookDelivery.create({
         data: {
@@ -1381,8 +1592,7 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst on a conversation another bot holds is remembered, but its delivery rows are left to that bot", async () => {
-      // Chatwoot fans one message out to both routes; the owner's delivery may be in flight
-      // (round 16).
+      // Chatwoot fans one message out to both routes; the owner's delivery may be in flight.
       const job = await claimedJob(CONV_OTHER_BOT, 19);
       const delivery = await suDb.chatwootWebhookDelivery.create({
         data: {
@@ -1443,7 +1653,7 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flush that finds the agent observing but cannot read the burst fails, for the scheduler to retry", async () => {
-      // The armed burst is the observer's, and nothing else will arm a flush for it (round 17).
+      // The armed burst is the observer's, and nothing else will arm a flush for it.
       const job = await claimedJob(CONV_OBS_FAILS, 21);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -1488,10 +1698,10 @@ describe.skipIf(!dbUp)(
     });
 
     test("the walk reads down to the handled watermark, not to a reply a hundred messages back", async () => {
-      // The watermark sits just under the armed burst (201, 202) and the agent never replied: read
-      // down to the reply, the walk would page to its bound with the whole burst already in hand,
-      // return it unread, and a flush after a flip back to production would answer a burst the
-      // observer already remembers (review round 18).
+      // The watermark sits just under the armed burst (201, 202) and the agent never replied:
+      // read down to the reply, the walk would page to its bound with the whole burst already in
+      // hand, return it unread, and a flush after a flip back to production would answer a burst
+      // the observer already remembers.
       const job = await claimedJob(CONV_HANDLED_FLOOR, 202);
       await suDb.conversation.updateMany({
         where: { tenantId, chatwootConversationId: CONV_HANDLED_FLOOR },
@@ -1541,9 +1751,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("observed traffic that moved the watermark past the burst: the reply is the floor again", async () => {
-      // Twenty observed messages after the flip moved the watermark to 49, past the armed burst
-      // (1, 2) nothing ever folded in. Above the watermark there is nothing to read; the reply is
-      // the one mark those messages did not move (review rounds 6 and 18).
+      // Twenty observed messages after the flip moved the watermark to 49, past the armed
+      // burst (1, 2) nothing ever folded in. Above the watermark there is nothing to read; the
+      // reply is the one mark those messages did not move.
       const job = await claimedJob(CONV_WATERMARK_PAST, 2);
       await suDb.conversation.updateMany({
         where: { tenantId, chatwootConversationId: CONV_WATERMARK_PAST },
@@ -1636,7 +1846,7 @@ describe.skipIf(!dbUp)(
     test("a gate exit whose agent cannot be read fails the flush, for the scheduler to retry", async () => {
       // The gate closed (a human took the conversation) and the exit asks the agent itself
       // whether it observes. A read that failed, taken for "not observing", would mark the burst
-      // handled and complete the job on an answer nobody got (review round 20).
+      // handled and complete the job on an answer nobody got.
       const job = await claimedJob(CONV_GATE_UNREADABLE, 23);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -1694,9 +1904,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("a stand-down whose observer read fails fails the flush, for the scheduler to retry", async () => {
-      // The turn stood down at the send fence (flipped inside the model call); the flush then asks
-      // whether the agent observes, and that read fails. Taken for "not observing", the burst —
-      // already run over, its watermark left where it was — would be nobody's (review round 20).
+      // The turn stood down at the send fence (flipped inside the model call); the flush then
+      // asks whether the agent observes, and that read fails. Taken for "not observing", the burst
+      // (already run over, its watermark left where it was) would be nobody's.
       const job = await claimedJob(CONV_TURN_UNREADABLE, 3);
       const armed = { on: false, reads: 0 };
       class FlippingModel extends FakeListChatModel {
@@ -1764,9 +1974,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("the observed burst's hand-over retires the redirect ladder on the widget conversation", async () => {
-      // The receiver re-armed the ladder when it dispatched this burst's turn; the turn never ran.
-      // Left armed, it waits out the mode and the first flip back to production sends a template
-      // to a lead the observer remembers (review round 22).
+      // The receiver re-armed the ladder when it dispatched this burst's turn; the turn never
+      // ran. Left armed, it waits out the mode and the first flip back to production sends a
+      // template to a lead the observer remembers.
       const job = await claimedJob(CONV_LADDER_FLIP, 30);
       await suDb.agent.update({
         where: { id: agentDbId },
@@ -1833,8 +2043,8 @@ describe.skipIf(!dbUp)(
     });
 
     test("a flip inside the ceiling's own client build posts none of the ceiling's actions", async () => {
-      // The ceiling's mode fence used to be asked before the client was built and ownership was
-      // probed, two waits of their own; a flip inside them sent the copy anyway (review round 23).
+      // The ceiling's mode fence is asked after the client is built and ownership is probed,
+      // two waits of their own: asked before them, a flip inside them would send the copy anyway.
       const before = await suDb.tenant.findUniqueOrThrow({
         where: { id: tenantId },
         select: { settings: true },
@@ -1852,8 +2062,8 @@ describe.skipIf(!dbUp)(
           },
         },
       });
-      // The month's cost as the poll would have left it (#426): the gate reads the snapshot, not
-      // the ledger.
+      // NOTE: the month's cost as the poll would have left it: the gate reads the snapshot, not the
+      // ledger.
       await suDb.spendCostSnapshot.create({
         data: {
           tenantId,
@@ -1911,9 +2121,9 @@ describe.skipIf(!dbUp)(
     });
 
     test("a burst the bound leaves out of view, with the watermark already past it, fails the flush", async () => {
-      // Observed traffic moved the watermark past the armed burst, so no later flush reads below
-      // it; the reply floor is a hundred messages back and the walk stops at its bound with the
-      // burst out of view. Completed as "unread", the burst would be gone quietly (review round 23).
+      // Observed traffic moved the watermark past the armed burst, so no later flush reads
+      // below it; the reply floor is a hundred messages back and the walk stops at its bound with
+      // the burst out of view. Completed as "unread", the burst would be gone quietly.
       const job = await claimedJob(CONV_PAST_BOUND, 2);
       await suDb.conversation.updateMany({
         where: { tenantId, chatwootConversationId: CONV_PAST_BOUND },

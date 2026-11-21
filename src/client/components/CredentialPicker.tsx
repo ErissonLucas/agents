@@ -56,6 +56,9 @@ interface CredentialPickerProps {
   // Called when the selected entry changes (or on initial load if value already resolves). Use to
   // read baseUrl / paramName of the selected credential without re-fetching the vault.
   onEntryChange?: (entry: VaultEntry | null) => void;
+  // A visible button beside an empty picker that opens the inline create form, for a screen where
+  // adding the first key is the next step rather than one option inside the menu.
+  createLabel?: string;
 }
 
 const itemCls =
@@ -78,10 +81,14 @@ export function CredentialPicker({
   ariaLabel,
   required = false,
   onEntryChange,
+  createLabel,
 }: CredentialPickerProps) {
   const { t } = useTranslation();
   const [entries, setEntries] = useState<VaultEntry[]>([]);
   const [loaded, setLoaded] = useState(false);
+  // The last read of the vault failed: a saved ref is then unknown, not deleted, and the trigger
+  // must not read as "None" (the field is not empty) nor as a credential that was removed.
+  const [loadFailed, setLoadFailed] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<CredentialTestState>(null);
@@ -94,8 +101,10 @@ export function CredentialPicker({
   const load = useCallback(async () => {
     try {
       setEntries(await loadVault());
+      setLoadFailed(false);
     } catch {
       // a failed load leaves an empty list; the operator can still create one
+      setLoadFailed(true);
     } finally {
       setLoaded(true);
     }
@@ -135,7 +144,7 @@ export function CredentialPicker({
   // biome-ignore lint/correctness/useExhaustiveDependencies: focus search on open; showSearchInput derived from entries
   useEffect(() => {
     if (open && showSearchInput) {
-      // NOTE: rAF defers until after Radix positions the floating panel and its own focus logic runs.
+      // rAF defers until after Radix positions the floating panel and its own focus logic runs.
       const id = requestAnimationFrame(() => searchRef.current?.focus());
       return () => cancelAnimationFrame(id);
     }
@@ -159,7 +168,16 @@ export function CredentialPicker({
     return nameMatch || kindIdMatch || kindLabelMatch;
   };
 
-  const compatible = entries.filter((e) => isCompatible(e) && matchesSearch(e));
+  // The compatible group follows `compatibleTypes`' order: the context lists its own kind first (the
+  // classifier's provider kind before a generic key), and the vault's name order holds within a kind,
+  // since `sort` is stable.
+  const kindRank = (e: VaultEntry) =>
+    hasFilter && e.kind ? compatibleTypes.indexOf(e.kind) : 0;
+  const byKindRank = (a: VaultEntry, b: VaultEntry) =>
+    kindRank(a) - kindRank(b);
+  const compatible = entries
+    .filter((e) => isCompatible(e) && matchesSearch(e))
+    .sort(byKindRank);
   const others = hasFilter
     ? entries.filter((e) => !isCompatible(e) && matchesSearch(e))
     : [];
@@ -170,12 +188,12 @@ export function CredentialPicker({
     entries.find((e) => formatVaultRef(e.id) === canonicalVaultRef(value)) ??
     null;
   const unresolved = !selected && !!value;
-  // The entry is there and its secret is not: `credential_create` (MCP) and the vault's own "add a
-  // reference now, fill it later" both produce this, deliberately: resolveSecretRef says so and
-  // points at the alert that would surface it. That alert only ever existed for the agent's own
-  // credentials (config-health), so every other field wired to a pending entry failed with nothing
-  // said anywhere: an integration's inbound secret failed as a bare 401 (issue #124). Saying it in
-  // the picker says it once, for every field that references a credential.
+  // A saved ref whose entry cannot be named yet: the vault is still loading, or its read failed.
+  // Neither says the field is empty or the credential is gone, so neither shows "None".
+  const pending = unresolved && (!loaded || loadFailed);
+  // The entry is there and its secret is not, which `credential_create` (MCP) and the vault's
+  // "add a reference now, fill it later" both produce on purpose. Only the agent's own credentials
+  // have an alert for it (config-health), so the picker says it, once, for every referencing field.
   const unfilled = selected?.status === "pending";
   const canTest = !!selected && isTestableSecretType(selected.kind);
   // Same compatibility rule as the list ranking: flags a selection left behind after the
@@ -186,17 +204,17 @@ export function CredentialPicker({
   // pick no longer fits, drop to the first compatible credential — or clear it — so the field never
   // stays stuck on a stale, incompatible selection. Gated on a types CHANGE (tracked below) so a
   // deliberate cross-type pick via "show all" is never yanked back, and a deleted/unresolved cred is
-  // surfaced rather than silently swapped.
-  const prevTypesRef = useRef<string | null>(null);
+  // surfaced rather than silently swapped. The baseline is the types the picker mounted with, not the
+  // ones it first saw loaded: a switch made while the vault was loading is still a switch.
+  const prevTypesRef = useRef((compatibleTypes ?? []).join(","));
   // biome-ignore lint/correctness/useExhaustiveDependencies: isCompatible derives from compatibleTypes (tracked via key)
   useEffect(() => {
     if (!loaded) return;
     const key = (compatibleTypes ?? []).join(",");
-    const changed =
-      prevTypesRef.current !== null && prevTypesRef.current !== key;
+    const changed = prevTypesRef.current !== key;
     prevTypesRef.current = key;
     if (!changed || !hasFilter || !selectedIncompatible) return;
-    const firstCompatible = entries.find(isCompatible);
+    const firstCompatible = entries.filter(isCompatible).sort(byKindRank)[0];
     const next = firstCompatible ? formatVaultRef(firstCompatible.id) : "";
     if (next !== value) onChange(next);
   }, [
@@ -252,18 +270,18 @@ export function CredentialPicker({
       >
         <ServiceLogo
           service={secretTypeService(e.kind)}
-          className="h-4 w-4 shrink-0 text-text-secondary"
+          className="text-text-secondary h-4 w-4 shrink-0"
         />
         <div className="flex min-w-0 flex-1 flex-col">
           <span className="truncate font-mono text-xs">{e.name}</span>
           {e.baseUrl && (
-            <span className="truncate text-text-muted text-xs">
+            <span className="text-text-muted truncate text-xs">
               {e.baseUrl}
             </span>
           )}
         </div>
         {e.kind && e.kind !== "generic" && (
-          <span className="shrink-0 text-text-muted text-xs">
+          <span className="text-text-muted shrink-0 text-xs">
             {/* biome-ignore lint/plugin/no-dynamic-i18n-key: secret-type keys registered in CredentialForm/VaultPanel */}
             {t(`vault.secretType.${e.kind}`, e.kind)}
           </span>
@@ -292,30 +310,43 @@ export function CredentialPicker({
               type="button"
               disabled={disabled}
               aria-label={ariaLabel}
-              className="flex min-h-[38px] flex-1 items-center gap-2 rounded-lg border border-border bg-bg-tertiary py-2 pr-3 pl-3 text-sm text-text-primary focus:border-border-focus focus:outline-none disabled:opacity-60"
+              className="border-border-hover bg-bg-tertiary text-text-primary focus:border-border-focus focus:ring-accent-soft flex min-h-8 min-w-0 flex-1 items-center gap-2 rounded-md border py-1 pr-2.5 pl-2.5 text-sm transition-colors focus:ring-2 focus:outline-none disabled:opacity-60"
             >
               {selected ? (
                 <>
                   <ServiceLogo
                     service={secretTypeService(selected.kind)}
-                    className="h-4 w-4 shrink-0 text-text-secondary"
+                    className="text-text-secondary h-4 w-4 shrink-0"
                   />
                   <span className="flex-1 truncate text-left font-mono text-xs">
                     {selected.name}
                   </span>
                   {selectedIncompatible && (
                     <TriangleAlert
-                      className="h-3.5 w-3.5 shrink-0 text-warning"
+                      className="text-warning h-3.5 w-3.5 shrink-0"
                       aria-hidden="true"
                     />
                   )}
                 </>
-              ) : loaded && unresolved ? (
-                <span className="flex-1 truncate text-left text-text-muted">
+              ) : pending ? (
+                <span
+                  className="text-text-muted flex-1 truncate text-left"
+                  aria-busy={!loaded || undefined}
+                  data-testid="credential-picker-pending"
+                >
+                  {loaded
+                    ? t(
+                        "credentialPicker.loadFailed",
+                        "Could not read the vault",
+                      )
+                    : t("credentialPicker.loading", "Loading…")}
+                </span>
+              ) : unresolved ? (
+                <span className="text-text-muted flex-1 truncate text-left">
                   {t("credentialPicker.unavailable", "Credential unavailable")}
                 </span>
               ) : (
-                <span className="flex-1 truncate text-left text-text-muted">
+                <span className="text-text-muted flex-1 truncate text-left">
                   {allowNone
                     ? t("credentialPicker.none", "None")
                     : t("credentialPicker.select", "Select a credential")}
@@ -323,7 +354,7 @@ export function CredentialPicker({
               )}
               <ChevronDown
                 aria-hidden="true"
-                className="h-4 w-4 shrink-0 text-text-muted"
+                className="text-text-muted h-4 w-4 shrink-0"
               />
             </button>
           </DropdownMenuPrimitive.Trigger>
@@ -338,12 +369,12 @@ export function CredentialPicker({
                 zIndex: "calc(var(--z-modal) + 5)",
                 minWidth: "var(--radix-dropdown-menu-trigger-width)",
               }}
-              className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 max-h-72 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
+              className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 border-border bg-bg-secondary data-[state=closed]:animate-out data-[state=open]:animate-in max-h-72 overflow-y-auto rounded-lg border p-1 shadow-lg"
             >
               {showSearchInput && (
-                <div className="mb-1 flex items-center gap-1.5 border-border border-b px-2 py-1.5">
+                <div className="border-border mb-1 flex items-center gap-1.5 border-b px-2 py-1.5">
                   <Search
-                    className="pointer-events-none h-4 w-4 shrink-0 text-text-muted"
+                    className="text-text-muted pointer-events-none h-4 w-4 shrink-0"
                     aria-hidden="true"
                   />
                   <input
@@ -370,7 +401,7 @@ export function CredentialPicker({
                       "vault.searchPlaceholder",
                       "Search by name or type…",
                     )}
-                    className="flex-1 bg-transparent text-sm text-text-primary outline-none placeholder:text-text-muted"
+                    className="text-text-primary placeholder:text-text-muted flex-1 bg-transparent text-sm outline-none"
                   />
                 </div>
               )}
@@ -381,7 +412,7 @@ export function CredentialPicker({
                   onSelect={() => onChange("")}
                 >
                   <KeyRound
-                    className="h-4 w-4 shrink-0 text-text-muted"
+                    className="text-text-muted h-4 w-4 shrink-0"
                     aria-hidden="true"
                   />
                   <span className="flex-1">
@@ -397,14 +428,14 @@ export function CredentialPicker({
               )}
 
               {compatible.length === 0 && !allowNone && !search && (
-                <div className="px-2 py-1.5 text-text-muted text-xs">
+                <div className="text-text-muted px-2 py-1.5 text-xs">
                   {t("credentialPicker.empty", "No credentials yet")}
                 </div>
               )}
               {compatible.map(renderEntry)}
 
               {search && compatible.length === 0 && others.length === 0 && (
-                <div className="px-2 py-1.5 text-sm text-text-muted">
+                <div className="text-text-muted px-2 py-1.5 text-sm">
                   {t("vault.noSearchResults", "No secrets match your search.")}
                 </div>
               )}
@@ -431,7 +462,7 @@ export function CredentialPicker({
                 </>
               )}
 
-              <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
+              <DropdownMenuPrimitive.Separator className="bg-border my-1 h-px" />
               <DropdownMenuPrimitive.Item
                 className={itemCls}
                 onSelect={() => createModal.open()}
@@ -443,6 +474,17 @@ export function CredentialPicker({
           </DropdownMenuPrimitive.Portal>
         </DropdownMenuPrimitive.Root>
 
+        {!selected && createLabel && !disabled && (
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => createModal.open()}
+          >
+            <Plus className="h-4 w-4" aria-hidden="true" />
+            {createLabel}
+          </Button>
+        )}
         {selected && (
           <Button
             type="button"
@@ -477,18 +519,18 @@ export function CredentialPicker({
         </span>
       )}
 
-      {loaded && unresolved && (
+      {loaded && unresolved && !loadFailed && (
         <span className="text-warning text-xs" role="status">
           {t(
             "credentialPicker.unresolvedMissing",
-            "The selected credential was deleted — pick another.",
+            "The selected credential was deleted. Pick another.",
           )}
         </span>
       )}
 
       {unfilled && (
         <span
-          className="flex flex-wrap items-center gap-2 text-warning text-xs"
+          className="text-warning flex flex-wrap items-center gap-2 text-xs"
           role="status"
         >
           {t(
@@ -509,7 +551,7 @@ export function CredentialPicker({
         <span className="text-warning text-xs" role="status">
           {t(
             "credentialPicker.requiredMissing",
-            "This feature is enabled but has no credential — select one.",
+            "Select an API key to use this feature.",
           )}
         </span>
       )}

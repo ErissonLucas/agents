@@ -6,17 +6,13 @@ import {
   knowledgeCreate,
   knowledgeUpdate,
 } from "@/modules/mcp/write-knowledge";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // `chunkOverlap` is bounded by `floor(chunkSize/2)`, and a knowledge base carries BOTH values, so
-// the question is about the row rather than about the arguments. `updateKnowledgeBase` asked it of
-// the arguments: it validated the pair when both arrived and, when only one did, fell through to a
-// branch that compared against a constant. Either single-field update therefore landed a state the
-// two-field update refuses by name. Issue #524.
-//
-// The same gap left the MCP preview unable to ask at all: `getKnowledgeBase` is the only knowledge
-// read that does NOT carry the chunking pair (`listKnowledgeBases` has carried it all along, and
-// `knowledge_list` advertises it), so the preview had nothing to compare against and approved what
-// the apply refused -- the #490 divergence, on a tool whose fence row only ever proved ownership.
+// the bound is a question about the resulting row, not the arguments: a single-field update is
+// refused when it lands a pair the two-field update refuses. The MCP preview asks the same question
+// and has to read the stored pair to do it; a preview with nothing to compare against approves what
+// the apply refuses.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -34,8 +30,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -100,7 +96,7 @@ describe.skipIf(!dbUp)(
 
     test("an overlap alone is measured against the STORED chunk size", async () => {
       const id = await freshBase();
-      // NOTE: the row is 1000/200, so the ceiling is 500. The old branch compared against a constant
+      // The row is 1000/200, so the ceiling is 500. The old branch compared against a constant
       // 4000.
       const r = await apply(id, { chunk_overlap: 4000 });
       expect(r.ok).toBe(false);
@@ -112,15 +108,14 @@ describe.skipIf(!dbUp)(
       const id = await freshBase();
       const wide = await apply(id, { chunk_size: 8000, chunk_overlap: 4000 });
       expect(wide.ok).toBe(true);
-      // NOTE: shrinking the chunk alone would now leave overlap 4000 against a ceiling of 100.
+      // Shrinking the chunk alone would leave overlap 4000 against a ceiling of 100.
       const r = await apply(id, { chunk_size: 200 });
       expect(r.ok).toBe(false);
       expect(await stored(id)).toEqual({ chunkSize: 8000, chunkOverlap: 4000 });
     });
 
-    // NOTE: the control that makes the two above mean something. The SAME end state, asked for in one
-    // call, was already refused before this change; without it they would pass on a tool that simply
-    // refuses every chunking update.
+    // NOTE: the control that makes the two above mean something: without it they would pass on a
+    // tool that simply refuses every chunking update.
     test("the pair that is legal together is still accepted", async () => {
       const id = await freshBase();
       const r = await apply(id, { chunk_size: 400, chunk_overlap: 200 });
@@ -134,12 +129,10 @@ describe.skipIf(!dbUp)(
       expect(r.ok).toBe(false);
     });
 
-    // NOTE: rows already holding an invalid pair exist precisely because the old branch let them
-    // through, so the guard has to reach them without holding their metadata hostage. Enforcing an
-    // invariant going forward is not the same as refusing every unrelated edit until someone
-    // repairs the row, and the refusal it produced named a bound on a field the caller never sent.
-    // Review found this; the row here is written straight through Prisma because the fixed code can
-    // no longer produce it.
+    // NOTE: rows holding an invalid pair can exist, and the guard must not hold their metadata
+    // hostage: enforcing the invariant going forward is not refusing every unrelated edit (naming a
+    // bound on a field the caller never sent) until someone repairs the row. The row is written
+    // straight through Prisma because the service cannot produce it.
     test("a row left invalid by the old behaviour can still be renamed", async () => {
       const legacy = await suDb.knowledgeBase.create({
         data: { tenantId, name: "legacy", chunkSize: 200, chunkOverlap: 4000 },
@@ -156,7 +149,7 @@ describe.skipIf(!dbUp)(
       expect(applied.ok).toBe(true);
       expect(await stored(id)).toEqual({ chunkSize: 200, chunkOverlap: 4000 });
 
-      // NOTE: the other half of the same sentence. Touching either number on that row IS a chunking
+      // The other half of the same sentence. Touching either number on that row IS a chunking
       // patch, so it is judged, and the pair it would leave is still illegal.
       const half = await apply(id, { chunk_overlap: 300 });
       expect(half.ok).toBe(false);

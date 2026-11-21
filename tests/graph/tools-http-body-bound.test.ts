@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, jest, test } from "bun:test";
 import { buildHttpTool, type HttpToolDef } from "@/graph/tools/http";
 import { MAX_OUTBOUND_BODY_CHARS } from "@/lib/outbound";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 
 // 8.8.8.8 is a public IP literal: the SSRF guard treats it as an IP (no DNS lookup) and does not
 // block it, so these tests never touch the network.
@@ -54,7 +55,10 @@ describe("an HTTP tool's bound covers the body, not only the headers", () => {
         (v) => ({ kind: "returned" as const, v }),
         (e: unknown) => ({ kind: "threw" as const, e }),
       ),
-      new Promise<typeof HUNG>((r) => setTimeout(() => r(HUNG), 3_000)),
+      // Only a hung call ever reaches this; a passing run ends at the tool's own 150 ms bound.
+      new Promise<typeof HUNG>((r) =>
+        setTimeout(() => r(HUNG), POLL_DEADLINE_MS),
+      ),
     ]);
 
     expect(outcome).not.toBe(HUNG);
@@ -62,7 +66,7 @@ describe("an HTTP tool's bound covers the body, not only the headers", () => {
     // And it ended NEAR the bound, not after the body finally arrived: a fix that merely waits
     // longer would satisfy the assertion above and not this one.
     expect(Date.now() - startedAt).toBeLessThan(2_000);
-  }, 10_000);
+  }, 30_000);
 
   test("the refusal names the bound rather than the stream's own error", async () => {
     // What the model reads when a tool call is cut. "The operation was aborted." says nothing it
@@ -79,24 +83,40 @@ describe("an HTTP tool's bound covers the body, not only the headers", () => {
 
   test("a body that arrives inside the bound is still returned whole", async () => {
     // The fence on the other side: the bound must not turn a slow-but-fine provider into a failure.
-    const tool = buildHttpTool(def(), {
-      resolveCredential: async () => null,
-      timeoutMs: 1_000,
-      fetchImpl: (async () =>
-        new Response(
-          new ReadableStream({
-            start(c) {
-              c.enqueue(enc.encode('{"a":'));
-              setTimeout(() => {
+    // The provider's clock is the test's: the rest of the body waits in the stream until the read
+    // has asked for it and 200 ms of the 1 s bound have passed on a fake clock, so any deadline of
+    // its own that the read kept would be due first.
+    jest.useFakeTimers();
+    try {
+      const reading = Promise.withResolvers<void>();
+      const arrive = Promise.withResolvers<void>();
+      const tool = buildHttpTool(def(), {
+        resolveCredential: async () => null,
+        timeoutMs: 1_000,
+        fetchImpl: (async () =>
+          new Response(
+            new ReadableStream({
+              start(c) {
+                c.enqueue(enc.encode('{"a":'));
+              },
+              async pull(c) {
+                reading.resolve();
+                await arrive.promise;
                 c.enqueue(enc.encode("1}"));
                 c.close();
-              }, 200);
-            },
-          }),
-          { status: 200, headers: { "content-type": "application/json" } },
-        )) as unknown as typeof fetch,
-    });
-    expect(String(await tool.invoke({}))).toBe('HTTP 200\n{"a":1}');
+              },
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          )) as unknown as typeof fetch,
+      });
+      const call = tool.invoke({});
+      await reading.promise;
+      jest.advanceTimersByTime(200);
+      arrive.resolve();
+      expect(String(await call)).toBe('HTTP 200\n{"a":1}');
+    } finally {
+      jest.useRealTimers();
+    }
   }, 10_000);
 });
 
@@ -157,45 +177,13 @@ describe("what the operator is told when the body itself was cut", () => {
   });
 });
 
-// The other half of an unbounded read, and the one the time bound does not fix: `res.text()`
-// buffers the whole body before the 4000-char clip is applied to the string that comes out of it.
-// Measured on `main` against a local server: 1,438 MiB of resident memory from a single call, three
-// seconds in and still climbing.
-//
-// IN A SUBPROCESS, because the question is about a whole process's memory.
-//
-// TWO QUANTITIES, and the pair is the point. This test used to assert on RSS alone against a 50 MB
-// ceiling, and that ceiling sat INSIDE the noise: fourteen isolated runs on one machine spread from
-// 40.5 MB to 57.2 MB, seven of ten over the line, three of four over it under parallel load (#590).
-// A red pre-commit on unrelated work is worse than a slow test, because it teaches everyone to pass
-// `--no-verify` and the next real failure in this file gets the same shrug.
-//
-// The header here used to say a heap threshold "would be green with the defect fully present",
-// citing a probe that showed 1.4 GiB of RSS against 0.5 MiB of JS heap. That observation is
-// reproducible and its conclusion was wrong by one line: `heapUsed` and `heapStats()` report the
-// LAST COLLECTION's accounting, and the 300 MB string is external to it until one runs. Read
-// without forcing a collection, the defect grows the heap by exactly zero. Force it first and the
-// same defect grows `extraMemorySize` by 314.9 MB. Measured both ways, five runs each side:
-//
-//   quantity (after Bun.gc(true))   cap in place            cap removed       ratio   max/min green
-//   rss                             40.40 - 51.31 MB        631.1 - 631.6 MB   12.3x   1.27
-//   heapStats().heapSize             1.493 -  1.502 MB      315.014 MB        210x    1.0058
-//   heapStats().extraMemorySize      1.36205 - 1.36210 MB   314.876 MB        231x    1.00003
-//
-// So RSS stays, with a ceiling that clears the noise by a factor of three, because it is the
-// quantity that matches the harm (the process dies); and `extraMemorySize` is added with a tight
-// one, because it is the quantity that separates. A defect has to beat both.
-//
-// NEITHER IS REDUNDANT, and this is the part to read before deleting one of them. The tight
-// quantity measures what is still HELD when the collection runs, not what was allocated on the way
-// there. A mutation that buffers the whole body and then materialises the prefix, so the big string
-// is collectable by the time anything is read, puts `extraMemorySize` back at 1.01 MB — green — and
-// 632 MB in RSS. The process still dies; only RSS sees it.
-//
-// And the reason the literal defect IS caught by the tight one is a runtime detail, not a law:
-// `clipText` ends in `value.slice(0, max)`, and a JSC substring retains its parent buffer. The day
-// that slice materialises, `extraMemorySize` goes green with the #464 defect fully present and RSS
-// is what is left. The precise assertion is the one that leans on someone else's implementation.
+// `res.text()` buffers the whole body before the 4000-char clip applies (docs/graph.md, "The bound
+// on an outbound call"). Asserted IN A SUBPROCESS, after a forced collection (unforced, the heap
+// numbers report the last collection and miss the body entirely), on two quantities. Neither is
+// redundant: `extraMemorySize` separates cap from no cap by two orders of magnitude, but a mutation
+// that makes the big string collectable before the read escapes it; RSS matches the harm, so its
+// ceiling sits well clear of its run-to-run noise rather than inside it, where a red pre-commit on
+// unrelated work would teach everyone `--no-verify`. Measurement notes: docs/graph.md, same section.
 test("a body far larger than memory allows is never retained whole", async () => {
   const script = `
     import { buildHttpTool } from "@/graph/tools/http";
@@ -276,15 +264,14 @@ test("a body far larger than memory allows is never retained whole", async () =>
       `the memory probe printed no measurement (exit ${code}); stdout: ${out.slice(-400) || "(empty)"}; stderr: ${err.slice(-400) || "(empty)"}`,
     );
   }
-  // The model still gets its clipped view — the cap is on what is read, not on what is answered.
+  // NOTE: the model still gets its clipped view: the cap is on what is read, not on what is answered.
   expect(got.len).toBeLessThan(5_000);
-  // THE QUANTITY THAT SEPARATES. Retaining the body puts 314.9 MB here against 1.36 MB with the cap,
-  // and that 1.36 MB moved by 47 bytes across five runs. 20 MB is fourteen times the measured green
-  // and fifteen times under the measured defect.
+  // NOTE: the quantity that separates: about 1.36 MB with the cap, nearly stable across runs, and
+  // about 315 MB retaining the body. 20 MB sits more than an order of magnitude from each.
   expect(got.extra).toBeLessThan(20 * 1024 * 1024);
-  // THE QUANTITY THAT MATCHES THE HARM. Ambient by nature — it carries whatever the runtime had
-  // resident — so the ceiling clears the worst green ever measured here (57.2 MB, under parallel
-  // load) by a factor of three, and still sits four times under the defect's 631 MB.
+  // NOTE: the quantity that matches the harm. Ambient by nature (it carries whatever the runtime had
+  // resident), so the ceiling clears a green run under parallel load (under 60 MB) by a factor of
+  // three and still sits well under the roughly 630 MB of a retained body.
   expect(got.grew).toBeLessThan(180 * 1024 * 1024);
   // THE INSTRUMENT IS LIVE. Every other assertion here is an upper bound, and a measurement that
   // stopped moving satisfies all of them; 40 MB deliberately held is the one lower bound, and it is

@@ -1,22 +1,37 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
+import { Client } from "pg";
+import {
+  OUTLIVES_SET_ROLE,
+  RLS_DEFEATING,
+} from "@/lib/tenancy/privileged-reach";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // `scripts/db-bootstrap.ts` and `scripts/db-bootstrap.sql` provision the same thing by two routes:
-// the first runs unattended on every container boot, the second is the by-hand psql equivalent for a
-// bare Postgres (both say so in their headers). They are the same question asked in two places, and
-// that is the shape that goes stale — measured: the membership RECONCILE was added to the TypeScript
-// and not to the SQL, so the documented manual path went on leaving a recreated database readable by
-// the previous installation's runtime role. Nothing was red, because the `.sql` has no test at all.
-//
-// This is the cheapest fence that would have caught it. It cannot execute the psql script (the
-// `\set` / `:'var'` syntax is a psql feature, not SQL), so it asks whether each file CONTAINS the
-// construct for each invariant. A rename breaks it loudly, which is the failure mode to want here.
+// the first runs unattended on every container boot, the second is the by-hand psql equivalent for
+// a bare Postgres. Two copies of one answer drift silently (the `.sql` has no test of its own): a
+// membership RECONCILE in one and not the other leaves a recreated database readable by the
+// previous installation's runtime role. The psql script cannot run here (`\set` / `:'var'` are psql
+// features), so this asks whether each file CONTAINS the construct for each invariant; a rename
+// breaks it loudly, which is the failure mode to want.
 
 const INVARIANTS: Array<{
   what: string;
   ts: RegExp;
   sql: RegExp;
 }> = [
+  {
+    // A bare Postgres provisioned by hand would otherwise show the database screen's statement
+    // texts only for the runtime role's own statements, never the fleet path's.
+    what: "lets the runtime role read every statement's text in pg_stat_statements",
+    ts: /GRANT pg_read_all_stats TO \$\{ident\}/,
+    sql: /GRANT pg_read_all_stats TO :"app_role"/,
+  },
+  {
+    what: "creates pg_stat_statements without making its absence fatal",
+    ts: /CREATE EXTENSION IF NOT EXISTS pg_stat_statements;\s*\n\s*EXCEPTION WHEN OTHERS/,
+    sql: /CREATE EXTENSION IF NOT EXISTS pg_stat_statements;\s*\nEXCEPTION WHEN OTHERS/,
+  },
   {
     what: "creates the fleet role when it is absent",
     ts: /CREATE ROLE %I NOLOGIN NOSUPERUSER NOBYPASSRLS/,
@@ -46,11 +61,10 @@ const INVARIANTS: Array<{
     sql: /INHERITS/,
   },
   {
-    // The half that covers the FIRST boot: the grant below is skipped there because the migration
-    // has not created the function yet, and on an install that revoked PUBLIC's default the
-    // function would then carry nothing. ALTER DEFAULT PRIVILEGES is scoped to the role that runs
-    // it — the same role that creates the function one step later — so it reaches forward.
-    // Measured on a database with the default revoked: EXECUTE is true after the first boot.
+    // NOTE: The half that covers the FIRST boot: the grant below is skipped there because the migration
+    // has not created the function yet, and on an install that revoked PUBLIC's default the function
+    // would then carry nothing. ALTER DEFAULT PRIVILEGES is scoped to the role that runs it, the same
+    // role that creates the function one step later, so it reaches forward.
     what: "sets a DEFAULT privilege so the resolver is executable when it is created",
     ts: /ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO \$\{ident\}/,
     sql: /ALTER DEFAULT PRIVILEGES IN SCHEMA public'\s*\n?\s*' GRANT EXECUTE ON FUNCTIONS TO %I/,
@@ -84,8 +98,8 @@ const INVARIANTS: Array<{
     sql: /'CREATEDB'[\s\S]{0,200}'CREATEROLE'[\s\S]{0,200}'REPLICATION'/,
   },
   {
-    // PL/pgSQL's RAISE knows only `%`, so an identifier it prints has to be quoted in the ARGUMENT.
-    // Measured: `%I` there emits the value followed by a literal `I` and quotes nothing.
+    // NOTE: PL/pgSQL's RAISE knows only `%`, so an identifier it prints has to be quoted in the
+    // ARGUMENT: `%I` there emits the value followed by a literal `I` and quotes nothing.
     what: "quotes identifiers it PRINTS, in the argument rather than the format string",
     ts: /quote_ident\(\$1::text\)/,
     sql: /quote_ident\(v_fleet\), quote_ident\(v_fleet\)/,
@@ -116,14 +130,12 @@ const INVARIANTS: Array<{
     sql: /pg_stat_activity[\s\S]{0,200}?a\.usename = r\.rolname/,
   },
   {
-    // And the session is only HALF of it. Measured: a stale installation, after its database was
-    // dropped and recreated under the same name, reconnects and presents the same open session as a
-    // rotation — so the exemption is DECLARED by the operator, and the session only bounds it. A
-    // file that kept inferring it from the session alone passes the invariant above and is wrong.
-    // Reachability is asked with the SAME attribute set the direct list refuses, minus LOGIN, which
-    // does not survive a SET ROLE. A file asking only about the two that defeat RLS calls a fleet
-    // role that can become CREATEROLE unprivileged — measured, and the runtime role then minted a
-    // cluster role through it.
+    // NOTE: And the session is only HALF of it. A stale installation whose database was dropped and
+    // recreated under the same name reconnects with the same open session as a rotation, so the
+    // exemption is DECLARED by the operator and the session only bounds it. Reachability is asked with
+    // the SAME attribute set the direct list refuses, minus LOGIN (it does not survive a SET ROLE):
+    // asking only about the two that defeat RLS calls a fleet role that can become CREATEROLE
+    // unprivileged, and the runtime role could mint a cluster role through it.
     what: "counts CREATEDB, CREATEROLE and REPLICATION as reachable privilege too",
     // By the CONSTANT on this side, because the columns live in the shared module the two callers
     // import — which is the arrangement, not a gap. The test below holds that module to them.
@@ -136,9 +148,9 @@ const INVARIANTS: Array<{
     sql: /r\.rolname = ANY \(v_retained\)/,
   },
   {
-    // A `fleet_super_admin` policy naming SOMEONE ELSE's fleet role is what a restore or a clone
-    // under a different name leaves behind, and measured across two real databases the source
-    // installation's runtime role then read 30 of 30 rows of the restored one.
+    // NOTE: A `fleet_super_admin` policy naming SOMEONE ELSE's fleet role is what a restore or a clone
+    // under a different name leaves behind, and through it the source installation's runtime role
+    // reads every row of the restored one.
     what: "revokes the privileges of a FOREIGN fleet role named by the policies here",
     ts: /REVOKE ALL ON ALL TABLES IN SCHEMA public FROM %I/,
     sql: /REVOKE ALL ON ALL TABLES IN SCHEMA public FROM %I/,
@@ -151,28 +163,22 @@ const INVARIANTS: Array<{
     sql: /LIKE 'fazerai\\_fleet\\_%'/,
   },
   {
-    // The foreign role's CLUSTER-WIDE membership is deliberately untouched: it belongs to a source
-    // installation still running on its own database, and revoking it from here would break that
-    // one. Measured: the source keeps reading its own 30 of 30 after this runs.
+    // NOTE: The foreign role's CLUSTER-WIDE membership is deliberately untouched: it belongs to a
+    // source installation still running on its own database, and revoking it from here would break it.
     what: "says it leaves the foreign role's cluster-wide membership alone",
     ts: /cluster-wide membership is[\s\S]{0,40}?deliberately untouched/,
     sql: /cluster-wide[\s\S]{0,200}?left\s*\n?--\s*alone on purpose/,
   },
   {
-    // Severity, not just presence, and the two files diverged on exactly this: one raised and the
-    // other warned past a membership that can read every tenant. A fence that only asks whether
-    // both mention the state would have passed that.
+    // NOTE: Severity, not just presence: one file raising and the other warning past a membership that
+    // can read every tenant is the divergence to catch, and a fence that only asks whether both mention
+    // the state passes it.
     what: "REFUSES a membership it could not clear, rather than warning past it",
     ts: /if \(after\.length > 0\) \{[\s\S]{0,600}?throw new Error\(/,
     sql: /IF v_left IS NOT NULL THEN[\s\S]{0,200}?RAISE EXCEPTION/,
   },
 ];
 
-const reach = await Bun.file(
-  fileURLToPath(
-    new URL("../../src/lib/tenancy/privileged-reach.ts", import.meta.url),
-  ),
-).text();
 const ts = await Bun.file(
   fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
 ).text();
@@ -181,9 +187,8 @@ const sql = await Bun.file(
 ).text();
 
 // PL/pgSQL's `RAISE` knows only `%`. `%I` there is not an identifier placeholder: it emits the value
-// followed by a literal `I` and quotes nothing — measured as `DROP ROLE some_roleI;`, a statement the
-// operator it was written for cannot run. It reads exactly like the `format()` spelling one line
-// away, which is why it survived a review round and appeared TWICE in one file.
+// followed by a literal `I` and quotes nothing (`DROP ROLE some_roleI;`, which the operator cannot
+// run). It reads exactly like the `format()` spelling one line away, so it is easy to miss.
 const migration = await Bun.file(
   fileURLToPath(
     new URL(
@@ -234,50 +239,67 @@ describe("no RAISE prints an identifier through %I", () => {
   });
 });
 
-// The repair has to OUTLIVE the refusal, and in the SQL that is a statement boundary rather than a
-// line of prose. Measured with both in one DO block: the script revoked the foreign role's
-// privileges, raised, and the RAISE rolled the revoke back with it — the restored database read 30
-// of 30 again immediately after the boot that had just announced closing it. At psql's top level
-// each statement is its own transaction, so the two must stay two blocks.
-// The columns the invariant above names by constant. Kept here rather than inlined into the pattern
-// pair, because only one of the twins has a module to import from and a fence that pretended
-// otherwise would be asking the `.ts` about text that is correctly not in it.
-describe("the reachable-privilege set matches the direct one", () => {
-  const definition = reach.slice(
-    reach.indexOf("export const OUTLIVES_SET_ROLE"),
-  );
-
-  test("it carries every attribute that survives a SET ROLE", () => {
-    for (const column of [
-      "rolsuper",
-      "rolbypassrls",
-      "rolcreatedb",
-      "rolcreaterole",
-      "rolreplication",
-    ]) {
-      expect([column, definition.includes(column)]).toEqual([column, true]);
-    }
-  });
-
-  // And NOT the one that does not: a session is already open by the time a SET ROLE happens, so
-  // LOGIN is refused directly on the fleet role and is meaningless on a role it can become.
-  test("and not LOGIN, which does not", () => {
-    expect(definition.split(";")[0]).not.toContain("rolcanlogin");
-  });
-
-  // The boot guard's set stays narrower on purpose: it refuses to SERVE when RLS is a no-op, and
-  // CREATEDB does not make it one. A single shared set would newly refuse installs that work.
-  test("the guard's set stays the RLS pair", () => {
-    const rls = reach.slice(
-      reach.indexOf("export const RLS_DEFEATING"),
-      reach.indexOf("export const OUTLIVES_SET_ROLE"),
-    );
-    expect(rls).toContain("rolsuper");
-    expect(rls).toContain("rolbypassrls");
-    expect(rls).not.toContain("rolcreatedb");
-  });
+// What each attribute set counts as elevated, asked of Postgres itself: the predicate runs over one
+// row per attribute, shaped like `pg_roles`, so no role has to be created to ask it.
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let pg: Client | undefined;
+if (suUrl) {
+  try {
+    pg = new Client({ connectionString: suUrl });
+    await pg.connect();
+  } catch (err) {
+    pg = dbProbeFailed(err) || undefined;
+  }
+}
+afterAll(async () => {
+  await pg?.end();
 });
 
+async function elevatedUnder(attributes: string): Promise<string[]> {
+  const rows = await (pg as Client).query<{ name: string }>(
+    `SELECT name FROM (VALUES
+       ('rolsuper', true, false, false, false, false, false),
+       ('rolbypassrls', false, true, false, false, false, false),
+       ('rolcreatedb', false, false, true, false, false, false),
+       ('rolcreaterole', false, false, false, true, false, false),
+       ('rolreplication', false, false, false, false, true, false),
+       ('rolcanlogin', false, false, false, false, false, true)
+     ) AS m(name, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolreplication, rolcanlogin)
+     WHERE (${attributes})
+     ORDER BY name`,
+  );
+  return rows.rows.map((r) => r.name);
+}
+
+describe.skipIf(!pg)(
+  "the reachable-privilege set matches the direct one",
+  () => {
+    // Every attribute the runtime role ACQUIRES on entering the fleet role, and not LOGIN: a session
+    // is already open by the time a SET ROLE happens, so LOGIN is refused directly on the fleet role
+    // and is meaningless on a role it can become.
+    test("it carries every attribute that survives a SET ROLE, and not LOGIN", async () => {
+      expect(await elevatedUnder(OUTLIVES_SET_ROLE)).toEqual([
+        "rolbypassrls",
+        "rolcreatedb",
+        "rolcreaterole",
+        "rolreplication",
+        "rolsuper",
+      ]);
+    });
+
+    // The boot guard's set stays narrower on purpose: it refuses to SERVE when RLS is a no-op, and
+    // CREATEDB does not make it one. A single shared set would newly refuse installs that work.
+    test("the guard's set stays the RLS pair", async () => {
+      expect(await elevatedUnder(RLS_DEFEATING)).toEqual([
+        "rolbypassrls",
+        "rolsuper",
+      ]);
+    });
+  },
+);
+
+// The repair has to OUTLIVE the refusal: in one DO block the RAISE rolls the revoke back with it.
+// At psql's top level each statement is its own transaction, so the two stay two blocks.
 describe("the foreign-fleet repair survives the refusal", () => {
   // Top-level `DO $$ ... $$;` blocks. The script has no nested dollar-quoting, so splitting on the
   // terminator is exact; a future nested `$tag$` would break this loudly rather than quietly.
@@ -293,10 +315,10 @@ describe("the foreign-fleet repair survives the refusal", () => {
     expect(repairing[0]).not.toContain("RAISE EXCEPTION");
   });
 
-  // And it comes after the block that CREATES this database's fleet role, which is a SECOND measured
-  // ordering: the statement the refusal prints names that role, so raised from where the repair sits
-  // the script aborted before provisioning it and pasting the repair answered `role … does not
-  // exist`. Moved to the end, the same paste rewrites every policy to the name the copy derives.
+  // NOTE: And it comes after the block that CREATES this database's fleet role: the statement the
+  // refusal prints names that role, so raised any earlier the script would abort before provisioning
+  // it and pasting the repair would answer `role … does not exist`. At the end, the same paste
+  // rewrites every policy to the name the copy derives.
   test("the refusal comes after both the repair and the provisioning", () => {
     const refusing = blocks.filter(
       (b) =>

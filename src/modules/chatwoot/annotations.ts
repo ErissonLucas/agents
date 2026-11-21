@@ -1,27 +1,31 @@
+import type { UnreadFile } from "@/modules/vision/unread";
 import type { ChatwootMessageRow } from "./messages";
 
-// In-process fallback for the eager media annotations (STT transcription, vision extraction).
-// The canonical store is the Chatwoot attachment meta (updateAttachmentMeta write-back), but that
-// PATCH route only exists on the fazer.ai Chatwoot fork — on upstream Chatwoot it 404s and the
-// debounce flush re-fetch reads an empty meta, so the agent answered "não audível" to a voice note
-// it had already transcribed (issue #49). The eager pass stashes every completed annotation here and
-// the flush (and the quote page) overlays whatever the meta is missing, so the fork write-back
-// becomes an ENRICHMENT (human agents see the transcription in Chatwoot), never a requirement.
-// Ephemeral BY DESIGN: memory only, TTL + size bound — the anti-PII rule (never mirror message
-// bodies into our DB) stays intact, and the single-replica deploy invariant (docs/deploy.md) makes
-// this process's memory reach both the webhook and the flush worker.
+// In-process fallback for the eager media annotations (STT transcription, vision extraction). The
+// canonical store is the Chatwoot attachment meta, but that PATCH route only exists on the fazer.ai
+// fork; on upstream it 404s and the flush re-fetch reads an empty meta. The eager pass stashes every
+// annotation here and the flush (and the quote page) overlays what the meta is missing, so the fork
+// write-back is an enrichment, never a requirement. Memory only, TTL and size bound: message bodies
+// never reach our DB, and the single-replica invariant (docs/deploy.md) lets this process's memory
+// reach both the webhook and the flush worker.
 
 export interface MediaAnnotation {
   transcribedText?: string;
+  // The voice note was transcribed and nothing usable came back (empty, or withheld for low
+  // confidence). Kept so a later delivery of the same message does not draw a new sample, which
+  // could be a hallucination the model happens to be sure of.
+  transcriptionEmpty?: boolean;
   imageDescription?: string;
   extractedText?: string;
-  // How many attachments the eager pass did NOT read: over the per-message cap, or attempted and
-  // failed. One count because the model's move is the same for both — name what is missing and ask
-  // for it again. A COUNT, never text: it crosses the debounce re-fetch, where the notice this
-  // becomes is phrased by the renderer like every other marker (PR #692 review, rounds 1 and 3).
+  // How many attachments the eager pass did NOT read (over the cap, or failed): the model's move is
+  // the same for both. A count, never text: it crosses the debounce re-fetch, and the renderer
+  // phrases the notice like every other marker.
   attachmentsUnread?: number;
-  // The pass that wrote this went through the email body's images too (issue #864). They leave no
-  // meta anywhere, so this is the only record that they were read, or were all ornaments.
+  // The unread files the pass tried, each with its name and cause, so the renderer can say what to
+  // ask for. Memory only, like everything here: the name is the customer's text.
+  unreadFiles?: UnreadFile[];
+  // The pass went through the email body's images too. They leave no meta anywhere, so this is the
+  // only record that they were read, or were all ornaments.
   bodyRead?: boolean;
 }
 
@@ -52,7 +56,7 @@ export function sweepMediaAnnotations(nowMs: number = Date.now()): void {
   }
 }
 
-// NOTE: Second, independent bound: a burst that outruns the TTL is capped by entry count. Map
+// Second, independent bound: a burst that outruns the TTL is capped by entry count. Map
 // iteration is insertion-ordered and stash() re-inserts on update, so the front is the oldest.
 function enforceSizeCap(): void {
   for (const map of [store, fileReads] as Map<string, unknown>[]) {
@@ -75,7 +79,7 @@ export function nextSweepDelayMs(nowMs: number = Date.now()): number | null {
   return Math.max(0, at + TTL_MS - nowMs);
 }
 
-// NOTE: One rescheduled timer, armed only while the store holds something and unref'd (same idiom
+// One rescheduled timer, armed only while the store holds something and unref'd (same idiom
 // as the alert worker) so a pending sweep never keeps the process alive at shutdown.
 function scheduleSweep(nowMs: number): void {
   if (sweepTimer) return;
@@ -104,13 +108,17 @@ export function stashMediaAnnotation(
   sweepMediaAnnotations(nowMs);
   enforceSizeCap();
   scheduleSweep(nowMs);
+  // The words are what a waiting flush needs, and they exist from here: the pass that stashed them
+  // may still be writing them back to Chatwoot, which a flush has no reason to wait for.
+  if (note.transcribedText || note.transcriptionEmpty) {
+    const open = openTranscriptions.get(k);
+    if (open) for (const wake of [...open.waiters]) wake();
+  }
 }
 
-// Fills IN PLACE the annotation fields a fetched page is missing. A value already present on the
-// attachment meta (the fork write-back landed) is authoritative and never overwritten.
 // One message's annotation, when this process still holds it. The audio reply stashes the text it
-// spoke under the id Chatwoot gave the send, which is how a channel failure reported minutes later
-// recovers the reply on an upstream Chatwoot that drops the attachment metadata (issue #587).
+// spoke under the id Chatwoot gave the send, so a channel failure reported minutes later recovers
+// the reply on an upstream Chatwoot that drops the attachment metadata.
 export function mediaAnnotationFor(
   tenantId: bigint,
   instanceId: bigint,
@@ -122,6 +130,8 @@ export function mediaAnnotationFor(
   return hit.note;
 }
 
+// Fills IN PLACE the annotation fields a fetched page is missing. A value already present on the
+// attachment meta (the fork write-back landed) is authoritative and never overwritten.
 export function overlayMediaAnnotations(
   tenantId: bigint,
   instanceId: bigint,
@@ -132,14 +142,11 @@ export function overlayMediaAnnotations(
     const hit = store.get(keyOf(tenantId, instanceId, row.id));
     if (!hit || nowMs - hit.at >= TTL_MS) continue;
     row.transcribedText ??= hit.note.transcribedText ?? null;
-    // THE VISION FIELDS ARE AGGREGATES, and there the "meta wins" rule inverts (PR #692 review,
-    // round 2). The write-back is best-effort PER ATTACHMENT: with two images extracted and one
-    // meta write landing, the fetched page carries a non-null description built from that one
-    // attachment, and `??=` would let the partial suppress the complete. The stash is written by
-    // the pass that produced ALL of them, in one call after the loop, so when it is present it is
-    // the more complete reading of the same extraction — never a different one, since the pass is
-    // idempotent per message and the store is message-keyed with a 15-minute TTL. Absent (another
-    // process, or past the TTL), the meta still answers, which is what it is for.
+    // NOTE: the vision fields are aggregates, so "meta wins" inverts. The write-back is per
+    // attachment, so a page with one of two meta writes landed carries a partial description that
+    // `??=` would keep. The stash is written once by the pass that produced all of them (idempotent
+    // per message, message-keyed, 15-minute TTL), so when present it is the more complete reading of
+    // the same extraction. Absent (another process, past the TTL), the meta answers.
     if (hit.note.bodyRead) row.bodyRead = true;
     row.imageDescription =
       hit.note.imageDescription ?? row.imageDescription ?? null;
@@ -148,6 +155,7 @@ export function overlayMediaAnnotations(
     // pass declined to open, so the stash is the only source and always wins here.
     if (hit.note.attachmentsUnread)
       row.attachmentsUnread = hit.note.attachmentsUnread;
+    if (hit.note.unreadFiles?.length) row.unreadFiles = hit.note.unreadFiles;
   }
 }
 
@@ -172,17 +180,92 @@ export function fileReadFor(
   return { value: hit.value };
 }
 
-// NOTE: Test isolation only — production never clears the store wholesale (the TTL sweep does).
+// Transcriptions this process is running right now, per message, so a flush that re-reads the thread
+// while one is in flight can wait for its words instead of rendering the audio as unheard. Opened by
+// the eager pass before it resolves anything and closed when it settles, with or without text; a
+// count, because two deliveries of one message can run the pass at once.
+const openTranscriptions = new Map<
+  string,
+  { count: number; waiters: Set<() => void> }
+>();
+
+// Announces a transcription in flight for a message. The returned function closes it, once.
+export function openTranscription(target: {
+  tenantId: bigint;
+  instanceId: bigint;
+  messageId: number;
+}): () => void {
+  const k = keyOf(target.tenantId, target.instanceId, target.messageId);
+  const entry = openTranscriptions.get(k) ?? { count: 0, waiters: new Set() };
+  entry.count += 1;
+  openTranscriptions.set(k, entry);
+  let closed = false;
+  return () => {
+    if (closed) return;
+    closed = true;
+    entry.count -= 1;
+    if (entry.count > 0) return;
+    openTranscriptions.delete(k);
+    for (const wake of entry.waiters) wake();
+  };
+}
+
+// Waits until every one of these messages has its transcription settled (closed, or its words
+// stashed), the time runs out, or the signal aborts, whichever comes first; one deadline for all of
+// them, never one per message. Resolves to whether anything was open to wait for. A message with
+// nothing open, or whose words are already stashed, costs nothing.
+export async function awaitOpenTranscriptions(
+  tenantId: bigint,
+  instanceId: bigint,
+  messageIds: number[],
+  opts: { timeoutMs: number; signal?: AbortSignal },
+): Promise<boolean> {
+  const open = messageIds
+    .filter((id) => {
+      const note = mediaAnnotationFor(tenantId, instanceId, id);
+      return !note?.transcribedText && !note?.transcriptionEmpty;
+    })
+    .map((id) => openTranscriptions.get(keyOf(tenantId, instanceId, id)))
+    .filter((e): e is { count: number; waiters: Set<() => void> } => !!e);
+  if (open.length === 0 || opts.signal?.aborted) return open.length > 0;
+  await new Promise<void>((resolve) => {
+    let pending = open.length;
+    const wakes: Array<[Set<() => void>, () => void]> = [];
+    const finish = () => {
+      clearTimeout(timer);
+      opts.signal?.removeEventListener("abort", finish);
+      for (const [set, wake] of wakes) set.delete(wake);
+      resolve();
+    };
+    const timer = setTimeout(finish, opts.timeoutMs);
+    timer.unref?.();
+    opts.signal?.addEventListener("abort", finish, { once: true });
+    for (const entry of open) {
+      // Leaves the set on its first call, so a stash and a close for the same message count once.
+      const wake = () => {
+        entry.waiters.delete(wake);
+        pending -= 1;
+        if (pending === 0) finish();
+      };
+      entry.waiters.add(wake);
+      wakes.push([entry.waiters, wake]);
+    }
+  });
+  return true;
+}
+
+// Test isolation only — production never clears the store wholesale (the TTL sweep does).
 export function clearMediaAnnotations(): void {
   store.clear();
   fileReads.clear();
+  openTranscriptions.clear();
   if (sweepTimer) {
     clearTimeout(sweepTimer);
     sweepTimer = undefined;
   }
 }
 
-// NOTE: How many annotations are actually RETAINED (not merely hidden from the overlay). Exposed so
+// How many annotations are actually RETAINED (not merely hidden from the overlay). Exposed so
 // the TTL-deletion contract is assertable.
 export function mediaAnnotationCount(): number {
   return store.size + fileReads.size;

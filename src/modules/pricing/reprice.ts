@@ -4,36 +4,19 @@ import { type PriceOverridesBlock, readPriceOverrides } from "./overrides";
 import { callCostUsd, type PricedTokens, priceCall } from "./price";
 import { PRICE_TABLE_VERSION } from "./version";
 
-// RE-PRICING LEDGER ROWS when the table that priced them was wrong (issue #867). A row's cost is
-// written once, from the table in force then (#863), and every row keeps its four token counts and
-// the name of that table, so it can be priced again from the table in the tree now. The operator runs
-// it through `scripts/reprice-usage.ts`; this module is the part that decides and writes, so it is
-// testable without spawning the script.
-//
-// THE PROVIDER IS THE OPERATOR'S TO NAME. `llm_usage` stores the model and not the provider that
-// answered, and the table cannot be asked which provider a model id belongs to: `callCostUsd` looks a
-// bare id up for openai, anthropic AND deepseek alike, so `deepseek-chat` prices under `openai` (at
-// the peak rate, with no off-peak half) and `gpt-4o` prices under `deepseek` (at OpenAI's rate, halved
-// off-peak), and an `openai-compatible` server serving either id has no price at all. Guessing would
-// write a confident, wrong figure, which is the thing this command exists to undo. So the run names
-// one provider and one model, and the provider only decides how the rows of that model are priced:
-// it filters nothing, because there is nothing on the row to filter it by.
-//
-// Three rules the writes keep:
-// - a row the table cannot price now is left exactly as it was and counted, so a priced row never
-//   becomes `null` and a `null` never becomes zero;
-// - each row is priced at its own `created_at`, because DeepSeek's rate depends on the hour;
-// - only a row whose figure CHANGES is written, and it is stamped with what priced it now. A row
-//   priced to the same figure keeps its stamp: whatever priced it then priced it right.
-//
-// Rows nothing priced (written before the column, `price_table` null) are left out unless the run
-// asks for them with `priceTable: null`: their token counts predate fixes to how the capture reads
-// them, and the screens promise those rows stay unpriced rather than half-priced.
-//
-// EACH ROW IS PRICED AS THE CAPTURE WOULD PRICE IT NOW, in the capture's order: the tenant's own
-// price for the model (issue #865) first, saved after the fact included, which is one of the two
-// reasons this exists; then, for a row OpenRouter reported (`openrouter:reported`, issue #866), the
-// figure OpenRouter charged, which the table never replaces; then the table.
+// Re-pricing ledger rows when the table that priced them was wrong, the deciding and writing half of
+// `scripts/reprice-usage.ts` (the full contract is in docs/playground.md). The PROVIDER is the
+// operator's to name: `llm_usage` stores only the model, and the table looks a bare id up under
+// several providers, so guessing would write a confident wrong figure; it decides pricing, filters
+// nothing. A row the table cannot price now is left as it was; each row is priced at its own
+// `created_at` (DeepSeek's rate depends on the hour); only a changed figure is written and restamped.
+// Order is the capture's: the tenant's own price, then an OpenRouter-reported figure, then the table.
+// Rows with a null `price_table` are left out unless asked for (their token counts predate fixes).
+
+// What `price_table` says on a row no table priced because the provider reported nothing to price
+// (a speech-to-text call answers words, not tokens). Never repriced: its zero tokens are no count
+// of the call, and pricing them would turn an unknown cost into a confident $0.
+export const UNMETERED_PRICE_TABLE = "unmetered";
 
 export type PriceFn = (
   provider: string,
@@ -51,6 +34,7 @@ export interface LedgerRow {
   completionTokens: number;
   cachedReadTokens: number;
   cacheCreationTokens: number;
+  cacheCreation1hTokens: number;
   costUsd: Prisma.Decimal | null;
   createdAt: Date;
 }
@@ -98,6 +82,7 @@ export function capturePricer(
         promptTokens: row.promptTokens,
         cachedReadTokens: row.cachedReadTokens,
         cacheCreationTokens: row.cacheCreationTokens,
+        cacheCreation1hTokens: row.cacheCreation1hTokens,
         completionTokens: row.completionTokens,
       },
       row.createdAt,
@@ -119,6 +104,7 @@ export function tablePricer(
         promptTokens: row.promptTokens,
         cachedReadTokens: row.cachedReadTokens,
         cacheCreationTokens: row.cacheCreationTokens,
+        cacheCreation1hTokens: row.cacheCreation1hTokens,
         completionTokens: row.completionTokens,
       },
       row.createdAt,
@@ -236,7 +222,10 @@ function rowFilter(opts: RepriceOptions): Prisma.LlmUsageWhereInput {
     model: opts.model,
     ...(opts.tenant === "all" ? {} : { tenantId: opts.tenant }),
     ...(opts.from || opts.to ? { createdAt } : {}),
-    priceTable: opts.priceTable === undefined ? { not: null } : opts.priceTable,
+    priceTable:
+      opts.priceTable === undefined
+        ? { not: null, notIn: [UNMETERED_PRICE_TABLE] }
+        : opts.priceTable,
   };
 }
 
@@ -249,6 +238,10 @@ export async function runReprice(
   base: TransactionCapable,
   opts: RepriceOptions,
 ): Promise<RepriceReport> {
+  if (opts.priceTable === UNMETERED_PRICE_TABLE)
+    throw new Error(
+      `rows stamped "${UNMETERED_PRICE_TABLE}" have no tokens to price`,
+    );
   const batchSize = opts.batchSize ?? 1000;
   const where = rowFilter(opts);
   // Each tenant's saved prices, read once per run.
@@ -270,6 +263,7 @@ export async function runReprice(
           completionTokens: true,
           cachedReadTokens: true,
           cacheCreationTokens: true,
+          cacheCreation1hTokens: true,
           costUsd: true,
           priceTable: true,
           createdAt: true,

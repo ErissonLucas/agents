@@ -1,0 +1,168 @@
+/// <reference lib="dom" />
+
+import { afterEach, describe, expect, test } from "bun:test";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { useEffect } from "react";
+import { useModalController } from "@/client/components";
+import {
+  CodeToolTestModal,
+  type CodeToolTestTarget,
+  contextNamesUsedBy,
+  contextToSend,
+} from "@/client/pages/resources/CodeToolTestModal";
+import { CONTEXT_VAR_NAMES } from "@/modules/tool-definitions/normalize";
+import { withI18n } from "../../utils/i18n";
+
+afterEach(() => cleanup());
+
+// The test dialog, open on a body.
+function OpenDialog({ code }: { code: string }) {
+  const modal = useModalController<CodeToolTestTarget>();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: opened once, on mount
+  useEffect(() => {
+    modal.open({ definition: { code }, aiFields: [] });
+  }, []);
+  return <CodeToolTestModal modal={modal} />;
+}
+
+// The test dialog runs the body as the agent would, so it has to send `context`, or every variable
+// arrives `undefined`. The HTTP tool's dialog asks `contextNamesReferencedBy` which `{{names}}` its
+// template mentions and draws a field per name (ToolEditModal.tsx); this is the same question for a
+// body: which of the runtime's names does this code read.
+describe("contextNamesUsedBy", () => {
+  const rows: Array<[string, string, string[]]> = [
+    ["dot access", "return context.contact_name;", ["contact_name"]],
+    [
+      "bracket access, both quotes",
+      `return [context["contact_email"], context['inbox_name']];`,
+      ["contact_email", "inbox_name"],
+    ],
+    [
+      "canonical order, not the order they appear",
+      "return [context.agent_name, context.conversation_id];",
+      ["conversation_id", "agent_name"],
+    ],
+    [
+      "each name once",
+      "context.contact_id; context.contact_id;",
+      ["contact_id"],
+    ],
+    // Not a runtime name: the two attribute bags are objects, not strings, and no field can be
+    // typed for them. A name the runtime does not expose is not invented either.
+    [
+      "only names the runtime exposes",
+      "return [context.conversationAttributes, context.whatever, context.contact_id];",
+      ["contact_id"],
+    ],
+    // The word has to be a WHOLE name: `contact_name_2` is somebody else's variable.
+    [
+      "not a prefix of a longer identifier",
+      "return context.contact_name_2;",
+      [],
+    ],
+    // NOTE: optional chaining is how a careful body reads a variable a turn may not have, so it is
+    // the FIRST spelling to expect here, not an exotic one.
+    [
+      "optional chaining, dot and bracket",
+      `return [context?.contact_email, context?.["inbox_name"]];`,
+      ["contact_email", "inbox_name"],
+    ],
+    ["a body that reads no context", "return input.cpf.length;", []],
+    ["something that is not code", "", []],
+  ];
+  for (const [name, code, want] of rows) {
+    test(name, () => {
+      expect(contextNamesUsedBy(code)).toEqual(want);
+    });
+  }
+});
+
+// The scan is a shortcut over arbitrary JavaScript, and these two spellings are ordinary. No
+// property scan can promise to see them, so the dialog must never be the reason a value cannot be
+// supplied: the full list is one click away, and the scan only decides what the dialog OPENS with.
+describe("what the scan cannot see", () => {
+  const invisible = [
+    "const { contact_email } = context;\nreturn contact_email;",
+    "const c = context;\nreturn c.contact_email;",
+  ];
+  test("destructuring and aliases are missed, which is why the full list exists", () => {
+    for (const code of invisible) {
+      expect(contextNamesUsedBy(code)).toEqual([]);
+    }
+    // The escape hatch is the constant itself, so the dialog can always offer every name.
+    expect(CONTEXT_VAR_NAMES).toContain("contact_email");
+  });
+
+  // What the scan saw only decides what the dialog OPENS with: the button to the full list is there
+  // either way, and every name is one click away.
+  test("the dialog always offers the way out, whether or not the scan saw anything", async () => {
+    for (const [code, button] of [
+      [
+        "const { contact_email } = context;\nreturn contact_email;",
+        "Show all variables",
+      ],
+      ["return context.contact_name;", "Show the other variables"],
+    ] as const) {
+      render(withI18n(<OpenDialog code={code} />));
+      expect(screen.queryAllByLabelText("contact_email").length).toBe(0);
+      fireEvent.click(await screen.findByRole("button", { name: button }));
+      const boxes = CONTEXT_VAR_NAMES.filter(
+        (name) => screen.queryByLabelText(name) !== null,
+      );
+      cleanup();
+      expect(boxes).toEqual([...CONTEXT_VAR_NAMES]);
+    }
+  });
+});
+
+// A blank box means "the turn did not have it", which is the case a body has to survive, EXCEPT for
+// the one variable a turn always has. `httpToolContext` spreads `agent_name` unconditionally and
+// the vocabulary says `always: true` on that basis, so a body may read it without a `??`. A dialog
+// that can omit it simulates a turn that cannot happen and fails a body the runtime never fails.
+describe("what the dialog sends", () => {
+  test("a blank box is an ABSENT variable, for everything that can be absent", () => {
+    expect(
+      contextToSend(
+        { contact_name: "Maria", contact_email: "" },
+        ["contact_name", "contact_email", "inbox_name"],
+        "Agent",
+      ),
+      // `agent_name` rides along on every send, scanned or not: the two tests below say why.
+    ).toEqual({ contact_name: "Maria", agent_name: "Agent" });
+  });
+
+  test("agent_name is never absent: blank sends the default", () => {
+    expect(contextToSend({ agent_name: "" }, ["agent_name"], "Agent")).toEqual({
+      agent_name: "Agent",
+    });
+    expect(contextToSend({}, ["agent_name"], "Agente")).toEqual({
+      agent_name: "Agente",
+    });
+    // What the operator typed still wins over the default.
+    expect(
+      contextToSend({ agent_name: "Sofia" }, ["agent_name"], "Agent"),
+    ).toEqual({ agent_name: "Sofia" });
+  });
+
+  // The list is the one the dialog drew, so a variable it never asked about is not sent either.
+  // `agent_name` is the one exception, and the test below is why.
+  test("a name outside the collected list is not invented", () => {
+    expect(contextToSend({ inbox_id: "7" }, ["contact_name"], "Agent")).toEqual(
+      {
+        agent_name: "Agent",
+      },
+    );
+  });
+
+  // NOTE: the list is a SCAN of member access, so a body that destructures or aliases `context`
+  // names nothing and `names` comes back empty. `agent_name` must still be sent, or the dialog
+  // tests a turn that cannot happen: the guarantee belongs to the runtime, not to the scanner.
+  test("agent_name survives a body whose read the scan cannot see", () => {
+    expect(contextNamesUsedBy("const { agent_name } = context;")).toEqual([]);
+    expect(contextToSend({}, [], "Agente")).toEqual({ agent_name: "Agente" });
+    // And what the operator typed still wins, even with the box off screen.
+    expect(contextToSend({ agent_name: "Sofia" }, [], "Agente")).toEqual({
+      agent_name: "Sofia",
+    });
+  });
+});

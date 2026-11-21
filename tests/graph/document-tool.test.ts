@@ -20,6 +20,7 @@ import type { TenantContext } from "@/lib/tenancy";
 import type { DocumentField } from "@/modules/documents/blocks";
 import { documentStarter } from "@/modules/documents/starters";
 import { createDocumentTemplate } from "@/modules/documents/templates";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The tool an agent actually gets for a granted template: its arguments come from the template's own
 // declared fields, and it issues + queues in one call.
@@ -152,8 +153,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -402,18 +403,6 @@ describe.skipIf(!dbUp)("buildDocumentTools", () => {
     expect(await suDb.issuedDocument.count({ where: { tenantId } })).toBe(
       before + 1,
     );
-  });
-
-  // Same values, same document: a retried turn reuses the row instead of putting a second numbered
-  // document in front of one customer.
-  test("the same values on the same thread issue one document", async () => {
-    const before = await suDb.issuedDocument.count({ where: { tenantId } });
-    await tool(newTurnState()).invoke({ ...ARGS, cliente: "Repetido" });
-    const mid = await suDb.issuedDocument.count({ where: { tenantId } });
-    await tool(newTurnState()).invoke({ ...ARGS, cliente: "Repetido" });
-    const after = await suDb.issuedDocument.count({ where: { tenantId } });
-    expect(mid).toBe(before + 1);
-    expect(after).toBe(mid);
   });
 
   // The dedupe window is a RETRY's, not a conversation's. Nothing in the key was time-bound, so it

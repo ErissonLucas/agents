@@ -20,6 +20,7 @@ import { RyzeEmulator, setRyzeClientFactory } from "@/modules/ryze/emulator";
 import { drainLabelSyncs } from "@/modules/ryze/labels";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import { connectRyzeGateway } from "@/modules/ryze/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRows } from "../utils/flowlog";
 import { outboundUrl } from "../utils/outbound";
 
@@ -44,8 +45,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

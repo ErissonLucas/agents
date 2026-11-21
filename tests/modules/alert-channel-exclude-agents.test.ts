@@ -15,13 +15,14 @@ import {
   alertChannelCreate,
   alertChannelUpdate,
 } from "@/modules/mcp/write-webhooks";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 import { outboundUrl } from "../utils/outbound";
 
-// Issue #843: an evaluation battery runs test agents on the same instance as production, and their
-// deliberate warnings flooded the operator's alert channel. A channel can now leave named agents out.
-// Two things are asserted together because the issue asked for both: the excluded agent's line does
-// NOT reach this channel, and it IS still in the flow log, which the battery reads to score.
+// A channel can leave named agents out, so an evaluation battery running test agents beside
+// production does not flood it with deliberate warnings. Two things are asserted together: the
+// excluded agent's line does NOT reach this channel, and it IS still in the flow log, which the
+// battery reads to score.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -39,8 +40,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -174,6 +175,7 @@ describe.skipIf(!dbUp)("alert channel excluded agents (issue #843)", () => {
     expect(await deliveries(ops.id)).toBe(0);
     expect(await deliveries(lab.id)).toBe(1);
     const logged = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId: tenantA, turnId: "ex-battery" },
       select: { agentId: true, level: true },
     });

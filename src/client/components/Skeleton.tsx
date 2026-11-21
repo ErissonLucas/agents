@@ -1,7 +1,7 @@
 import type { HTMLAttributes } from "react";
 import { cn } from "@/client/lib/utils";
 
-// NOTE: Decorative placeholder for loading content. Skeletons are the default
+// Decorative placeholder for loading content. Skeletons are the default
 // loading indicator in this app (spinners are reserved for button states and
 // the app-boot/auth splash). Compose several to mirror the real layout, e.g.
 // <Skeleton className="h-4 w-32" />. The animate-pulse is neutralized by the
@@ -13,7 +13,7 @@ export function Skeleton({
   return (
     <div
       aria-hidden="true"
-      className={cn("animate-pulse rounded-md bg-bg-tertiary", className)}
+      className={cn("bg-bg-tertiary animate-pulse rounded-md", className)}
       {...props}
     />
   );

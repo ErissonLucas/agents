@@ -56,7 +56,7 @@ describe("isJsonSchemaShape", () => {
 
 describe("prototype-safe output maps", () => {
   test('a field literally named "__proto__" survives conversion as an own key', () => {
-    // NOTE: JSON.parse creates "__proto__" as an OWN key; a plain out[name] assignment would
+    // JSON.parse creates "__proto__" as an OWN key; a plain out[name] assignment would
     // invoke the inherited setter and silently drop it.
     const raw = JSON.parse(
       '{"properties":{"__proto__":{"type":"string"}},"required":["__proto__"]}',
@@ -119,7 +119,7 @@ describe("compactFromJsonSchema", () => {
     expect(out.misto).toEqual({ type: "string" });
     expect(warnings).toHaveLength(4);
     expect(warnings[0]).toContain('"nivel"');
-    // NOTE: the lossy-enum warnings surface through normalizeToolShapes with the conversion notice.
+    // The lossy-enum warnings surface through normalizeToolShapes with the conversion notice.
     const { warnings: shapeWarnings } = normalizeToolShapes({
       inputSchema: { properties: { nivel: { enum: [1, 2] } } },
     });
@@ -164,7 +164,7 @@ describe("compactFromJsonSchema", () => {
     // A list of objects is now expressible (itemType "object"), so it maps faithfully and silently.
     expect(out.docs).toEqual({ type: "array", itemType: "object" });
     expect(out.plain_obj).toEqual({ type: "object" });
-    // NOTE: allOf is a composition keyword like anyOf/oneOf; an allOf-only field must degrade to
+    // allOf is a composition keyword like anyOf/oneOf; an allOf-only field must degrade to
     // "object" with a warning, never to a silent "string".
     const allOfWarnings: string[] = [];
     const allOfOut = compactFromJsonSchema(
@@ -308,6 +308,12 @@ describe("normalizeInputSchemaShape / CONTEXT_VAR_NAMES", () => {
       "agent_name",
     ]) {
       expect(CONTEXT_VAR_NAMES as readonly string[]).toContain(name);
+      // And normalization reads it: the single-brace spelling becomes the placeholder, unwarned.
+      const { shapes, warnings } = normalizeToolShapes({
+        urlTemplate: `https://api.example.com/x/{${name}}`,
+      });
+      expect(shapes.urlTemplate).toBe(`https://api.example.com/x/{{${name}}}`);
+      expect(warnings).toEqual([]);
     }
   });
 });

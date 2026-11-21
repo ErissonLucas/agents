@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
 import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
 import {
   collectOversizedTextChanges,
@@ -13,36 +15,19 @@ import {
 } from "../utils/operator-text-classes";
 import { withoutComments } from "../utils/source-text";
 
-// THE SURFACE A RENAME HAS TO FOLLOW, asked once here instead of once per rename (issue #604).
-//
-// A rename of a model-visible name has to follow the operator's own prose, and that prose lives in
-// eleven sites of one walker. `20260909120000_rename_http_tools_named_after_natives` rewrote one of
-// them (the system prompt) and moved the KEY of another without its text, which left the model
-// reading, on the description of `set_labels`, a rule about calling `assign_label`: a name it is
-// never shown and cannot call. The follow-up migration
-// `20260917120000_rename_tool_names_in_operator_settings_text` rewrote the sites whose text reaches
-// a model that has tools, and `tests/prisma/settings-text-rename-migration.test.ts` measures that
-// against Postgres, field by field.
-//
-// What no migration can carry is the NEXT site. `text-caps.ts` says of itself that it is the one
-// place that knows where operator text lives, and a site added to its walk is invisible to every
-// rename written before it: nothing anywhere would say whether a tool name there reaches a model. So
-// this file asks that every site be classified, and fails on one it does not know.
-//
-// IT DOES NOT ASK FOR A MIGRATION PER SITE. A field added next year holds no old tool name, and a
-// fence demanding a migration for it would be asking for an empty one. What it demands is the
-// DECISION, in `tests/utils/operator-text-classes.ts`, which the next rename then inherits.
-//
-// NOTHING HERE READS THE `.sql`. A test that asserted the migration's text would go red on a
-// reformat that changes nothing a database does, which is coverage in appearance only; the
-// migration's surface is measured where it happens, in the rows it rewrites.
+// The surface a rename of a model-visible name has to follow: the operator's prose, in the sites of
+// the `src/modules/agents/text-caps.ts` walker. A site added to the walk is invisible to every
+// rename written before it, so every site must be classified in
+// `tests/utils/operator-text-classes.ts`, which the next rename inherits. It demands that decision,
+// not a migration per site (a new field holds no old tool name). Nothing here reads a migration's
+// `.sql`, which a reformat would turn red while changing nothing;
+// `tests/prisma/settings-text-rename-migration.test.ts` checks the rows.
 
 // An interpolated segment is a family of paths, and the family is one site.
 const collapse = (path: string): string => path.replace(/\$\{[^}]*\}/g, "*");
 
-// The walker's sites, read from its SOURCE. This is the direction that catches a field somebody
-// adds: an enumeration driven by a FIXTURE can only ever yield the fields the fixture carries, which
-// is what the first version of this file measured, and a new `add()` call left it green.
+// The walker's sites, read from its SOURCE, which catches a field somebody adds: an enumeration
+// driven by a FIXTURE only yields the fields the fixture carries, so a new `add()` call stays green.
 async function sitesInSource(): Promise<string[]> {
   const src = withoutComments(
     await Bun.file("src/modules/agents/text-caps.ts").text(),
@@ -84,6 +69,12 @@ const EVERY_BLOCK = {
   signature: { text: HUGE },
   vision: { extractionPrompt: HUGE },
   followUp: { steps: [{ instructions: HUGE }, { instructions: HUGE }] },
+  snoozedFollowUp: {
+    cadences: [
+      { steps: [{ instructions: HUGE }] },
+      { steps: [{ instructions: HUGE }] },
+    ],
+  },
   tts: { spokenNoticeText: HUGE, textChoiceNote: HUGE },
 };
 
@@ -91,7 +82,11 @@ const collapseYielded = (path: string): string =>
   path
     .replace(/^toolGuidance\..+$/, "toolGuidance.*")
     .replace(/^guardrails\.(input|output)\./, "guardrails.*.")
-    .replace(/^followUp\.steps\[\d+\]\./, "followUp.steps[*].");
+    .replace(/^followUp\.steps\[\d+\]\./, "followUp.steps[*].")
+    .replace(
+      /^snoozedFollowUp\.cadences\[\d+\]\.steps\[\d+\]\./,
+      "snoozedFollowUp.cadences[*].steps[*].",
+    );
 
 describe("the operator-text surface a rename has to follow", () => {
   test("every site in the walker's SOURCE is classified by who reads it", async () => {
@@ -109,20 +104,26 @@ describe("the operator-text surface a rename has to follow", () => {
     expect(yielded).toEqual([...CLASSIFIED].sort());
   });
 
-  // The second population, and the one the issue's own table does not mention: prose on the two tool
-  // definition tables. `text-caps.ts` cannot see it, so the scan is over the schema instead.
-  test("every STRING column of a tool definition is classified", async () => {
-    const schema = await Bun.file("prisma/schema.prisma").text();
+  // NOTE: the second population is prose on the two tool definition tables. `text-caps.ts` cannot
+  // see it, so the inventory is the generated client's own data model, which is the schema as the
+  // runtime reads it.
+  test("every STRING column of a tool definition is classified", () => {
+    const client = new PrismaClient({
+      adapter: new PrismaPg({
+        connectionString: "postgres://unused@localhost:1/unused",
+      }),
+    }) as unknown as {
+      _runtimeDataModel: {
+        models: Record<string, { fields: { name: string; type: string }[] }>;
+      };
+    };
     const found: string[] = [];
     for (const model of ["ToolDefinition", "CodeToolDefinition"]) {
-      const body = new RegExp(`^model ${model} \\{([\\s\\S]*?)^\\}`, "m").exec(
-        schema,
-      );
-      if (!body) throw new Error(`model ${model} not found in schema.prisma`);
-      for (const m of (body[1] as string).matchAll(
-        /^ {2}(\w+)\s+String\??(?:\[\])?\s/gm,
-      )) {
-        found.push(`${model}.${m[1]}`);
+      const fields = client._runtimeDataModel.models[model]?.fields;
+      if (!fields)
+        throw new Error(`model ${model} not in the generated client`);
+      for (const f of fields) {
+        if (f.type === "String") found.push(`${model}.${f.name}`);
       }
     }
     expect(found.sort()).toEqual(Object.keys(TOOL_COLUMNS).sort());

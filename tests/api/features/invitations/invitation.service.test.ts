@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import {
@@ -12,6 +13,7 @@ import {
   revokeInvite,
 } from "@/api/features/invitations/invitation.service";
 import type { TenantContext } from "@/lib/tenancy";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
 // Invitation security invariants need a real Postgres (CAS single-use, the (tenant,email) unique
@@ -33,16 +35,15 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
-// The inviter, as the principal the invite now records itself under (#400). `invitedById` used to be
-// an argument and comes off this instead, so a caller can no longer attribute an invitation to
-// somebody who never issued it.
+// The inviter, as the principal the invite records itself under. `invitedById` comes off it rather
+// than from an argument, so a caller cannot attribute an invitation to somebody who never issued it.
 const inviter = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: 9400n,
@@ -94,12 +95,16 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
       },
       appDb,
     );
-    expect(inv.token).toBeTruthy();
     const row = await suDb.invitation.findFirst({
       where: { tenantId: tenantA, email: "a1@x.com" },
     });
-    expect(row?.tokenHash).toBeTruthy();
-    expect(row?.tokenHash).not.toBe(inv.token);
+    expect(row?.tokenHash).toBe(
+      createHash("sha256").update(inv.token).digest("hex"),
+    );
+    expect(await findValidInviteByToken(inv.token, appDb)).toMatchObject({
+      email: "a1@x.com",
+      role: "AGENT",
+    });
   });
 
   test("createInvite refuses SUPER_ADMIN role", async () => {
@@ -120,16 +125,20 @@ describe.skipIf(!dbUp)("invitation service (DB)", () => {
   test("the DB CHECK also rejects a SUPER_ADMIN invitation row", async () => {
     // $executeRawUnsafe returns a (lazy) PrismaPromise, which bun's .rejects matcher does not
     // accept directly — await it inside try/catch instead.
-    let threw = false;
-    try {
-      await suDb.$executeRawUnsafe(
+    const insert = (email: string, role: string) =>
+      suDb.$executeRawUnsafe(
         `INSERT INTO invitations (tenant_id, email, role, token_hash, expires_at, updated_at)
-         VALUES (${tenantA}, 'chk@x.com', 'SUPER_ADMIN', 'h-${pid}', now() + interval '1 day', now())`,
+         VALUES (${tenantA}, '${email}', '${role}', 'h-${email}-${pid}', now() + interval '1 day', now())`,
       );
-    } catch {
-      threw = true;
+    let refusal = "";
+    try {
+      await insert("chk@x.com", "SUPER_ADMIN");
+    } catch (e) {
+      refusal = String(e);
     }
-    expect(threw).toBe(true);
+    expect(refusal).toContain("invitations_fleet_role_check");
+    // NOTE: the same row with a tenant role goes in, so the refusal is the role and nothing else.
+    expect(await insert("chk-ok@x.com", "AGENT")).toBe(1);
   });
 
   test("acceptInvite binds tenant+role from the row and is single-use", async () => {

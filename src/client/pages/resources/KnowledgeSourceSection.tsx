@@ -7,6 +7,7 @@ import {
   type ConfirmPayload,
   FormField,
   Input,
+  NumberInput,
   Skeleton,
   useModalController,
   useToast,
@@ -15,10 +16,11 @@ import {
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { cn } from "@/client/lib/utils";
+import { SYNC_INTERVAL_MINUTES } from "@/modules/rag/ranges";
 
-// A knowledge base's help center source, in the console (issue #798). #794 built the source over
-// REST and MCP only: an operator could not see that a base mirrors a portal, when it last ran or
-// whether that run failed, and could not set one up. This is that view, over the same three routes.
+// A knowledge base's help center source, in the console: whether a base mirrors a portal, when it
+// last ran and whether that run failed, and setting one up, over the same three routes REST and MCP
+// use.
 
 type BaseDetail = NonNullable<
   Awaited<
@@ -36,6 +38,13 @@ export type KnowledgeSource = NonNullable<BaseDetail["source"]>;
 // progress, so a long sync is followed to its end and a stuck one is not followed forever.
 const POLL_MS = 3_000;
 const POLL_TRIES = 20;
+
+let pollMs = POLL_MS;
+
+/** Shortens the re-read interval so a test follows a run in milliseconds; `undefined` restores it. */
+export function setSourcePollMsForTest(ms: number | undefined): void {
+  pollMs = ms ?? POLL_MS;
+}
 
 interface Draft {
   baseUrl: string;
@@ -106,7 +115,7 @@ export function KnowledgeSourceSection({
   // one, or for a section already closed, is dropped (docs/modals.md, the modal session).
   const current = useRef<string | null>(baseId);
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // Generations, as docs/modals.md prescribes for a modal that fetches (review r5). Every read bumps
+  // Generations, as docs/modals.md prescribes for a modal that fetches. Every read bumps
   // `readGen` and only the newest one may write, so a polling read still out when a removal re-reads
   // cannot land after it and bring the removed source back. `pollGen` is bumped by every stop, so a
   // tick whose read was out when polling stopped does not schedule another.
@@ -153,8 +162,8 @@ export function KnowledgeSourceSection({
   // the scheduler finishes later reaches the screen without the operator reloading.
   const pollUntilRun = useCallback(
     (since: number | null) => {
-      // Asked for by an action whose request outlived the section (a save or a sync answered after
-      // the modal closed): there is nothing left to show the outcome on (review r2).
+      // Asked for by an action whose request outlived the section (a save or a sync answered
+      // after the modal closed): there is nothing left to show the outcome on.
       const asked = current.current;
       if (asked === null) return;
       stopPolling();
@@ -183,9 +192,9 @@ export function KnowledgeSourceSection({
           stopPolling();
           return;
         }
-        pollTimer.current = setTimeout(tick, POLL_MS);
+        pollTimer.current = setTimeout(tick, pollMs);
       };
-      pollTimer.current = setTimeout(tick, POLL_MS);
+      pollTimer.current = setTimeout(tick, pollMs);
     },
     [load, stopPolling],
   );
@@ -359,17 +368,17 @@ export function KnowledgeSourceSection({
   }
 
   const heading = (
-    <h3 className="font-medium text-sm text-text-primary">
+    <h3 className="text-text-primary text-sm font-medium">
       {t("knowledge.source.title", "Help center source")}
     </h3>
   );
 
   if (source === undefined) {
     return (
-      <section className="rounded-lg border border-border px-3 py-2">
+      <section className="border-border rounded-lg border px-3 py-2">
         {heading}
         {loadFailed ? (
-          <p className="mt-1 text-text-muted text-xs">
+          <p className="text-text-muted mt-1 text-xs">
             {t(
               "knowledge.source.loadError",
               "Could not load this base's source.",
@@ -436,8 +445,8 @@ export function KnowledgeSourceSection({
       <FormField
         label={t("knowledge.source.interval", "Sync interval (minutes)")}
       >
-        <Input
-          type="number"
+        <NumberInput
+          range={SYNC_INTERVAL_MINUTES}
           value={draft.intervalMinutes}
           onChange={(e) =>
             setDraft({ ...draft, intervalMinutes: e.target.value })
@@ -467,7 +476,7 @@ export function KnowledgeSourceSection({
           onClick={() => {
             void save();
           }}
-          // The API requires all three (review r4): a blank slug or locale is refused, and the locale
+          // NOTE: The API requires all three: a blank slug or locale is refused, and the locale
           // placeholder is a hint, not a default.
           disabled={
             busy ||
@@ -475,6 +484,7 @@ export function KnowledgeSourceSection({
             draft.slug.trim() === "" ||
             draft.locale.trim() === ""
           }
+          holdOnRange
         >
           {t("knowledge.source.save", "Save source")}
         </Button>
@@ -484,7 +494,7 @@ export function KnowledgeSourceSection({
 
   if (source === null) {
     return (
-      <section className="rounded-lg border border-border px-3 py-2">
+      <section className="border-border rounded-lg border px-3 py-2">
         <div className="flex items-center justify-between gap-2">
           {heading}
           {canManage && !editing && (
@@ -494,7 +504,7 @@ export function KnowledgeSourceSection({
           )}
         </div>
         {!editing && (
-          <p className="mt-1 text-text-muted text-xs">
+          <p className="text-text-muted mt-1 text-xs">
             {t(
               "knowledge.source.none",
               "This base does not mirror a help center. Its documents are managed here.",
@@ -532,7 +542,7 @@ export function KnowledgeSourceSection({
   ];
 
   return (
-    <section className="rounded-lg border border-border px-3 py-2">
+    <section className="border-border rounded-lg border px-3 py-2">
       <div className="flex flex-wrap items-center justify-between gap-2">
         {heading}
         {canManage && !editing && (
@@ -568,7 +578,7 @@ export function KnowledgeSourceSection({
             {rows.map(([label, value]) => (
               <div key={label} className="contents">
                 <dt className="text-text-muted">{label}</dt>
-                <dd className="break-all text-text-primary">{value}</dd>
+                <dd className="text-text-primary break-all">{value}</dd>
               </div>
             ))}
           </dl>
@@ -592,14 +602,14 @@ export function KnowledgeSourceSection({
               </span>
             )}
             {syncing && (
-              <span className="animate-pulse text-text-muted">
+              <span className="text-text-muted animate-pulse">
                 {t("knowledge.source.syncing", "Syncing…")}
               </span>
             )}
           </div>
           {ran && source.lastMessage && (
             <p
-              className={cn("mt-1 break-words text-xs", {
+              className={cn("mt-1 text-xs break-words", {
                 "text-error": source.lastStatus === "error",
                 "text-warning": source.lastStatus === "warning",
                 "text-text-muted":
@@ -621,8 +631,8 @@ export function KnowledgeSourceSection({
 export function SyncedDocNote({ sourceUrl }: { sourceUrl: string | null }) {
   const { t } = useTranslation();
   return (
-    <span className="flex flex-wrap items-center gap-1 text-text-muted text-xs">
-      <span className="rounded-full bg-bg-tertiary px-2 py-0.5">
+    <span className="text-text-muted flex flex-wrap items-center gap-1 text-xs">
+      <span className="bg-bg-tertiary rounded-full px-2 py-0.5">
         {t("knowledge.source.synced", "Synced")}
       </span>
       {sourceUrl && (

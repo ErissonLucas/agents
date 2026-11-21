@@ -59,6 +59,7 @@ const NAME_RE = /^[^\x00-\x1f\x7f]{1,128}$/;
 // t('vault.secretType.deepseek', 'DeepSeek')
 // t('vault.secretType.openrouter', 'OpenRouter')
 // t('vault.secretType.openai_compatible', 'OpenAI-compatible')
+// t('vault.secretType.typesafe', 'TypeSafe')
 // t('vault.secretType.elevenlabs', 'ElevenLabs')
 // t('vault.secretType.assemblyai', 'AssemblyAI')
 // t('vault.secretType.fish', 'Fish Audio')
@@ -294,15 +295,15 @@ export function CredentialForm({
 
   useEffect(() => {
     if (typeOpen) {
-      // NOTE: rAF defers until after Radix positions the floating panel and its own focus logic runs.
+      // rAF defers until after Radix positions the floating panel and its own focus logic runs.
       const id = requestAnimationFrame(() => typeSearchRef.current?.focus());
       return () => cancelAnimationFrame(id);
     }
   }, [typeOpen]);
 
   // Build the value to send for multi-field types. Sent VERBATIM, like the single-value path: the
-  // server refuses a secret that begins or ends in whitespace rather than repairing it (#338), and
-  // trimming here would hide that refusal from the console while the MCP surface still got it.
+  // server refuses a secret that begins or ends in whitespace rather than repairing it, and trimming
+  // here would hide that refusal from the console while the MCP surface still got it.
   function buildMultiFieldValue(): Record<string, string> {
     const result: Record<string, string> = {};
     for (const f of fields ?? []) {
@@ -320,7 +321,10 @@ export function CredentialForm({
       const { data, error: err } = await api.api.v1.vault.test.post({
         kind,
         value,
-        baseURL: secretTypeNeedsBase(kind) ? effectiveBaseUrl : null,
+        // Every kind that takes a base URL probes it, the optional ones too: the requests of a
+        // typesafe key go to its base URL when it has one, so a test against the public host would
+        // judge a server the key is not used with. Kinds without one keep their fixed host.
+        baseURL: secretTypeSupportsBaseUrl(kind) ? effectiveBaseUrl : null,
         paramName: needsParamName ? paramName.trim() || null : null,
       });
       const r = data as
@@ -345,7 +349,9 @@ export function CredentialForm({
       const { data, error: err } = await api.api.v1
         .vault({ id: initialId })
         .test.post({
-          baseURL: secretTypeNeedsBase(kind) ? effectiveBaseUrl : null,
+          // The base URL on screen, unsaved edits included: the server falls back to the stored one
+          // only for a null, so an emptied optional field is sent as "" and probes the public host.
+          baseURL: secretTypeSupportsBaseUrl(kind) ? baseUrl.trim() : null,
         });
       const r = data as
         | { testable?: boolean; ok?: boolean; code?: string; status?: number }
@@ -466,16 +472,10 @@ export function CredentialForm({
     ),
   };
 
-  // The refusal, at the input it names.
-  //
-  // What this replaces was `mapSaveError`, which answered its OWN localized sentence for a 409 and
-  // the server's for a 400. The premise was that a 409 arrives unlocalized, and it does not: the
-  // server translates `errors.vaultNameInUse` for the request's Accept-Language, and its pt-BR
-  // sentence ("Já existe um segredo com esse nome e tipo") names the type as well, which the console
-  // copy did not. So the override was a shorter duplicate of a better sentence.
-  //
-  // The declared names include the per-field keys of a multi-field type (`api_key`, `public_key`):
-  // `assertNoSurroundingWhitespace` refuses by the inner key, and the form draws one input per key.
+  // The refusal, at the input it names, in the server's own sentence: a 409 arrives localized for
+  // the request's Accept-Language and names the type too, so a console override would only be a
+  // shorter duplicate. The declared names include the per-field keys of a multi-field type (`api_key`,
+  // `public_key`): `assertNoSurroundingWhitespace` refuses by the inner key.
   const held = (e: unknown, sent: Record<string, unknown>) =>
     refusal.capture(
       e,
@@ -673,10 +673,9 @@ export function CredentialForm({
   const genericTypes = GENERIC_TYPE_ORDER.filter(matchesTypeSearch);
   const noTypeResults = serviceTypes.length === 0 && genericTypes.length === 0;
 
-  // The Save button label changes to "Save anyway" after a failed test — but only for a failure the
-  // operator can decide to ignore. `surrounding_whitespace` is the write's own verdict, not a
-  // connectivity one, so saving anyway is refused by createVaultEntry/updateVaultEntry every time:
-  // offering it advertises an action that cannot succeed (#338).
+  // The Save button reads "Save anyway" after a failed test, but only for a failure the operator
+  // can decide to ignore. `surrounding_whitespace` is the write's own verdict, refused by
+  // createVaultEntry/updateVaultEntry every time, so offering it advertises an action that cannot succeed.
   const testFailedRecoverably =
     testResult?.kind === "fail" && testResult.code !== "surrounding_whitespace";
   const saveLabel = testFailedRecoverably
@@ -747,11 +746,11 @@ export function CredentialForm({
               type="button"
               disabled={isUpdate || testing || saving}
               aria-label={t("vault.type", "Type")}
-              className="flex w-full items-center gap-2 rounded-lg border border-border bg-bg-tertiary py-2 pr-3 pl-3 text-sm text-text-primary focus:border-border-focus focus:outline-none disabled:opacity-60"
+              className="border-border-hover bg-bg-tertiary text-text-primary focus:border-border-focus focus:ring-accent-soft flex min-h-8 w-full items-center gap-2 rounded-md border py-1 pr-2.5 pl-2.5 text-sm transition-colors focus:ring-2 focus:outline-none disabled:opacity-60"
             >
               <ServiceLogo
                 service={secretTypeService(kind)}
-                className="h-4 w-4 shrink-0 text-text-secondary"
+                className="text-text-secondary h-4 w-4 shrink-0"
               />
               <span className="flex-1 truncate text-left">
                 {/* biome-ignore lint/plugin/no-dynamic-i18n-key: secret-type keys registered via magic comments above */}
@@ -759,7 +758,7 @@ export function CredentialForm({
               </span>
               <ChevronDown
                 aria-hidden="true"
-                className="h-4 w-4 shrink-0 text-text-muted"
+                className="text-text-muted h-4 w-4 shrink-0"
               />
             </button>
           </DropdownMenuPrimitive.Trigger>
@@ -772,11 +771,11 @@ export function CredentialForm({
                 zIndex: "calc(var(--z-modal) + 5)",
                 minWidth: "var(--radix-dropdown-menu-trigger-width)",
               }}
-              className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 max-h-72 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
+              className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 border-border bg-bg-secondary data-[state=closed]:animate-out data-[state=open]:animate-in max-h-72 overflow-y-auto rounded-lg border p-1 shadow-lg"
             >
-              <div className="mb-1 flex items-center gap-1.5 border-border border-b px-2 py-1.5">
+              <div className="border-border mb-1 flex items-center gap-1.5 border-b px-2 py-1.5">
                 <Search
-                  className="pointer-events-none h-4 w-4 shrink-0 text-text-muted"
+                  className="text-text-muted pointer-events-none h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
                 <input
@@ -800,7 +799,7 @@ export function CredentialForm({
                     "Search types…",
                   )}
                   aria-label={t("vault.searchTypePlaceholder", "Search types…")}
-                  className="flex-1 bg-transparent text-sm text-text-primary outline-none placeholder:text-text-muted"
+                  className="text-text-primary placeholder:text-text-muted flex-1 bg-transparent text-sm outline-none"
                 />
               </div>
 
@@ -812,14 +811,14 @@ export function CredentialForm({
               ).map(([groupKey, ids]) =>
                 ids.length === 0 ? null : (
                   <div key={groupKey}>
-                    <div className="px-2 pt-1.5 pb-0.5 font-medium text-[11px] text-text-muted uppercase tracking-wide">
+                    <div className="text-text-muted px-2 pt-1.5 pb-0.5 text-[11px] font-medium tracking-wide uppercase">
                       {/* biome-ignore lint/plugin/no-dynamic-i18n-key: both group keys declared below */}
                       {t(groupKey)}
                     </div>
                     {ids.map((id) => (
                       <DropdownMenuPrimitive.Item
                         key={id}
-                        className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary"
+                        className="text-text-secondary data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary flex items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors outline-none"
                         onSelect={() => {
                           // Re-sync the name to the new provider's label only if the operator
                           // hasn't typed their own (blank or still equal to the old type's label).
@@ -844,7 +843,7 @@ export function CredentialForm({
                       >
                         <ServiceLogo
                           service={secretTypeService(id)}
-                          className="h-4 w-4 shrink-0 text-text-secondary"
+                          className="text-text-secondary h-4 w-4 shrink-0"
                         />
                         <span className="flex-1 truncate">
                           {/* biome-ignore lint/plugin/no-dynamic-i18n-key: secret-type keys registered via magic comments above */}
@@ -863,7 +862,7 @@ export function CredentialForm({
               )}
 
               {typeSearch && noTypeResults && (
-                <div className="px-2 py-1.5 text-sm text-text-muted">
+                <div className="text-text-muted px-2 py-1.5 text-sm">
                   {t("vault.noTypeResults", "No types match your search.")}
                 </div>
               )}
@@ -922,7 +921,7 @@ export function CredentialForm({
           </span>
           <button
             type="button"
-            className="shrink-0 font-normal text-accent text-xs hover:underline"
+            className="text-accent shrink-0 text-xs font-normal hover:underline"
             onClick={() => {
               setLangfusePaste((v) => !v);
               setEnvError(false);
@@ -974,7 +973,9 @@ export function CredentialForm({
                 ? "https://cloud.langfuse.com"
                 : kind === "mcp_oauth"
                   ? "https://servidor.exemplo.com/mcp"
-                  : "https://api.exemplo.com"
+                  : kind === "typesafe"
+                    ? "https://api.typesafe.ai/v1"
+                    : "https://api.exemplo.com"
             }
           />
         </FormField>
@@ -1008,7 +1009,7 @@ export function CredentialForm({
               }
             />
             {!envError && envText.trim() && (
-              <p className="mt-1 text-text-muted text-xs">
+              <p className="text-text-muted mt-1 text-xs">
                 {t(
                   "vault.langfuseEnvOk",
                   "Keys detected. Switch to manual fields to review, or test and save.",
@@ -1043,6 +1044,7 @@ export function CredentialForm({
                   <Input
                     type="password"
                     showPasswordToggle
+                    secret
                     placeholder={isUpdate ? "••••••••" : undefined}
                     value={fieldValues[f.key] ?? ""}
                     onChange={(e) => {
@@ -1097,6 +1099,7 @@ export function CredentialForm({
             <Input
               type="password"
               showPasswordToggle
+              secret
               placeholder={isUpdate ? "••••••••" : undefined}
               value={value}
               onChange={(e) => {
@@ -1121,7 +1124,7 @@ export function CredentialForm({
               href={provLink.href}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-accent hover:underline"
+              className="text-accent inline-flex items-center gap-1 hover:underline"
             >
               {t(
                 "vault.affiliateCreate",
@@ -1137,7 +1140,7 @@ export function CredentialForm({
               href={provLink.href}
               target="_blank"
               rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-accent hover:underline"
+              className="text-accent inline-flex items-center gap-1 hover:underline"
             >
               {t("vault.getKeyLink", "Get yours at {{service}}", {
                 service: typeLabel(kind),

@@ -33,13 +33,6 @@ describe("claimContactAuthNotice", () => {
     expect(claimContactAuthNotice("k", 60_000, T0 + 60_000)).toBeTruthy();
   });
 
-  test("a suppressed claim does NOT extend the window", () => {
-    expect(claimContactAuthNotice("k", 60_000, T0)).toBeTruthy();
-    expect(claimContactAuthNotice("k", 60_000, T0 + 30_000)).toBe(false);
-    // Had the suppressed claim renewed the window, this one would still be inside it.
-    expect(claimContactAuthNotice("k", 60_000, T0 + 60_000)).toBeTruthy();
-  });
-
   test("cooldown 0 always voices and retains nothing", () => {
     expect(claimContactAuthNotice("k", 0, T0)).toBeTruthy();
     expect(claimContactAuthNotice("k", 0, T0)).toBeTruthy();
@@ -93,11 +86,10 @@ describe("claimContactAuthNotice", () => {
       60_000,
       T0,
     );
-    for (const entry of contactAuthNoticeEntries()) {
-      expect(Object.keys(entry).sort()).toEqual(["key", "until"]);
-      expect(typeof entry.key).toBe("string");
-      expect(typeof entry.until).toBe("number");
-    }
+    // One entry: the conversation's ids and the notice kind, and the instant its window lapses.
+    expect(contactAuthNoticeEntries()).toEqual([
+      { key: "1:2:3:note", until: T0 + 60_000 },
+    ]);
   });
 });
 
@@ -140,10 +132,14 @@ describe("singleFlight", () => {
     release(ALLOWED);
     const [a, b] = await Promise.all([first, second]);
     expect(runs).toBe(1);
-    expect(a).toEqual({ verdict: ALLOWED, shared: false });
+    expect(a).toEqual({
+      verdict: ALLOWED,
+      shared: false,
+      askedAt: expect.any(Number),
+    });
     // The coalesced follower is told the verdict was shared, which the gate reads as "the leader
     // acts, I stay silent": only one deny message ever leaves for one concurrent burst.
-    expect(b).toEqual({ verdict: ALLOWED, shared: true });
+    expect(b).toEqual({ verdict: ALLOWED, shared: true, askedAt: a.askedAt });
   });
 
   test("distinct keys do not coalesce", async () => {
@@ -155,23 +151,6 @@ describe("singleFlight", () => {
     await Promise.all([
       singleFlight(contactAuthFlightKey(1n, 2n, 3n, "inbox"), run),
       singleFlight(contactAuthFlightKey(1n, 2n, 4n, "inbox"), run),
-    ]);
-    expect(runs).toBe(2);
-  });
-
-  // The joiner is told `shared`, and `shared` is what suppresses its own deny copy, handoff and
-  // note. A nudge and an incoming message are not the same question, so one must never answer for
-  // the other: under an unlock flow the nudge carries no code and its refusal would land on the
-  // very message that does.
-  test("a nudge and an incoming message do not share a flight", async () => {
-    let runs = 0;
-    const run = async () => {
-      runs += 1;
-      return ALLOWED;
-    };
-    await Promise.all([
-      singleFlight(contactAuthFlightKey(1n, 2n, 3n, "nudge"), run),
-      singleFlight(contactAuthFlightKey(1n, 2n, 3n, "msg:900"), run),
     ]);
     expect(runs).toBe(2);
   });

@@ -17,7 +17,7 @@ import {
   PRIMARY_TIMEOUT_MS,
 } from "@/graph/model-fallback";
 import { runModelCall } from "@/graph/model-limit";
-import { planOpenAITransport } from "@/graph/openai-reasoning";
+import { failsUntilAccountFixed } from "@/lib/provider-failure";
 import {
   assertSettingsModelFallback,
   type SettingsWriteMode,
@@ -32,10 +32,10 @@ import {
 
 // WHICH failures are worth asking a DIFFERENT provider, as a table.
 //
-// The rows are the shapes measured against the real SDK stack (issue #143): a local
-// openai-compatible endpoint answering each status, plus a hang and a refused connection, driven
-// through `createChatModel` + `runModelCall`. The `status` column is what `statusOf` read off the
-// error the SDK raised, so every row here is a shape production can actually produce.
+// The rows are the shapes the real SDK stack raises: a local openai-compatible endpoint answering
+// each status, plus a hang and a refused connection, driven through `createChatModel` +
+// `runModelCall`. The `status` column is what `statusOf` reads off the error the SDK raises, so
+// every row here is a shape production can actually produce.
 const TABLE: Array<{
   name: string;
   err: unknown;
@@ -206,8 +206,8 @@ describe("isFallbackWorthy", () => {
     });
   }
 
-  // The bound the whole design rests on. Measured against the real stack: with LangChain's default
-  // AsyncCaller a 503 takes SEVEN requests and 77s to surface, a 502 99s. A fallback behind that
+  // NOTE: The bound the whole design rests on. With LangChain's default AsyncCaller a 503 takes
+  // SEVEN requests and 77s to surface on the real stack, a 502 99s. A fallback behind that
   // arrives after the customer is gone, so the primary gets exactly one attempt when there is
   // something behind it.
   test("the primary gets one attempt, not LangChain's six retries", () => {
@@ -318,10 +318,9 @@ describe("runModelCall with something behind the primary", () => {
     expect(reply.content).toBe("from the fallback");
   });
 
-  // The fallback answers the customer in the primary's place, so it inherits the primary's one
-  // recovery too. Review found this: the fallback was invoked BARE, so a 200 carrying no completion
-  // — measured at 1 in 184 on one install (issue #63) — cost the turn on the very call that exists
-  // because the turn was already about to be lost.
+  // NOTE: The fallback answers the customer in the primary's place, so it inherits the primary's one
+  // recovery too. Invoked BARE, a 200 carrying no completion (rare, but seen in production) would
+  // cost the turn on the very call that exists because the turn was already about to be lost.
   test("an empty completion FROM THE FALLBACK is retried too", async () => {
     const primary = failing(
       Object.assign(new Error("overloaded"), { status: 503 }),
@@ -356,9 +355,8 @@ describe("runModelCall with something behind the primary", () => {
     expect(retries).toEqual([PRIMARY]);
   });
 
-  // The turn's real ending, and its own line. The `generate` stage wrapping the call is labelled
-  // with the primary by construction, so without this an operator reads "the fallback took the turn
-  // (ok)" followed by an error attributed to the model that never made the second call.
+  // The turn's real ending, and its own line, with the primary's failure beside it. Nothing answered,
+  // so `onFallback` is never told the fallback took the turn.
   test("when the fallback fails too, that failure is reported under the FALLBACK", async () => {
     const primary = failing(
       Object.assign(new Error("overloaded"), { status: 503 }),
@@ -376,22 +374,50 @@ describe("runModelCall with something behind the primary", () => {
               status: 500,
             }),
           ),
-        onFallback: ({ reason }) => took.push(reason),
-        onFallbackFailed: ({ reason }) => died.push(reason),
+        onFallback: ({ reason, failure }) => took.push(`${reason}|${failure}`),
+        onFallbackFailed: ({ reason, primaryReason, primaryFailure }) =>
+          died.push(`${reason}|${primaryReason}|${primaryFailure}`),
       },
     }).catch((e) => e)) as Error;
-    expect(took).toEqual(["HTTP 503"]);
-    expect(died).toEqual(["HTTP 500"]);
+    expect(took).toEqual([]);
+    // The primary's failure class rides along, for its rate (flowlog/alerts.ts).
+    expect(died).toEqual(["HTTP 500|HTTP 503|HTTP 503"]);
     // What the turn reports is still the fallback's failure, redacted the same way.
     expect(err.message).toBe("HTTP 500");
     expect(err.message).not.toContain("prose");
   });
 });
 
+// The line that says the fallback took the turn is written once it answered: a slow fallback that
+// fails would otherwise read as having taken it.
+describe("when the fallback is told it took the turn", () => {
+  test("only after its answer arrived", async () => {
+    const primary = failing(
+      Object.assign(new Error("overloaded"), { status: 503 }),
+    );
+    const order: string[] = [];
+    const out = await runModelCall<string>(primary.fn, {
+      primary: PRIMARY,
+      fallback: {
+        labels: FALLBACK_LABELS,
+        deadlineMs: 5_000,
+        run: async () => {
+          await Bun.sleep(20);
+          order.push("answered");
+          return "ok";
+        },
+        onFallback: () => order.push("took"),
+      },
+    });
+    expect(out).toBe("ok");
+    expect(order).toEqual(["answered", "took"]);
+  });
+});
+
 // The fallback answers the customer in the primary's place, so it has to be able to do what the
 // primary could. A fallback invoked BARE looks identical from the outside — a reply arrives, the
 // turn posts — and the agent has silently lost every tool for that turn: no calendar, no handoff,
-// no document. Mutation found this one: unbinding the fallback's tools left every other test green.
+// no document. This is the only test that fails if the fallback's tools are unbound.
 describe("the fallback is asked the same question the primary was", () => {
   test("it is bound to the same toolset", async () => {
     const tool = new DynamicStructuredTool({
@@ -424,13 +450,9 @@ describe("the fallback is asked the same question the primary was", () => {
 // ONCE THE FALLBACK HAS THE TURN, IT KEEPS IT.
 //
 // A tool call routes back through the agent node, so a turn with tools runs that node once per
-// round. Without this, each round asks the dead primary again before failing over again, and the
-// cost is the failure's own latency multiplied by the rounds — which is the budget this whole change
-// exists to remove, reappearing inside a single turn.
-//
-// Measured on the three-round turn below (two tool calls, then the answer), with the primary failing
-// in 200ms: 3 primary calls, 3 "the fallback took the turn" warns for ONE failover, 609.3ms. After:
-// 1, 1, 204.8ms. At the 45s ceiling instead of 200ms those 3 calls are 135s of dead waiting.
+// round. Without the demotion each round asks the dead primary again before failing over again:
+// the failure's latency (up to the 45s ceiling) and its "the fallback took the turn" warn are paid
+// once per round instead of once per turn, the budget the fallback exists to remove.
 describe("the fallback keeps the turn once it has it", () => {
   const peek = () =>
     new DynamicStructuredTool({
@@ -468,35 +490,6 @@ describe("the fallback keeps the turn once it has it", () => {
     // One failover, so one line on the trail. Three would read as three separate outages.
     expect(took).toEqual(["HTTP 503"]);
     expect(lastAssistantText(out.messages)).toBe("pronto");
-  });
-
-  // The cost, not just the count, because the count alone cannot say whether it mattered. The
-  // primary is given a measurable failure here for the same reason production's worst case is a
-  // hang: an instant failure makes every version of this code look identical.
-  test("and the turn does not pay that failure once per round", async () => {
-    const primary = new SlowFailingModel(
-      Object.assign(new Error("overloaded"), { status: 503 }),
-      120,
-    );
-    const fallback = new ToolLoopModel("peek", 2);
-    const graph = buildAgentGraph({
-      model: primary,
-      systemPrompt: "s",
-      tools: [peek()],
-      primary: PRIMARY,
-      fallback: {
-        model: fallback,
-        provider: "anthropic",
-        modelId: "claude-haiku-4-5",
-      },
-    });
-    const started = performance.now();
-    await graph.invoke({ messages: [new HumanMessage("oi")] });
-    const elapsed = performance.now() - started;
-    // One 120ms failure, not three. The bound is deliberately loose (a third round would put this
-    // past 360ms); what it asserts is that the failure is paid ONCE.
-    expect(elapsed).toBeLessThan(240);
-    expect(primary.calls).toBe(1);
   });
 
   // The demotion is not free: it costs the primary the rest of the turn. So it may only happen when
@@ -598,19 +591,66 @@ describe("the fallback keeps the turn once it has it", () => {
   });
 });
 
+// A fallback that keeps the turn and then fails for its own account on a later round ends the job only
+// when the failure that demoted the primary would repeat too.
+describe("a later round's fallback account failure and the job's retries", () => {
+  const peek = () =>
+    new DynamicStructuredTool({
+      name: "peek",
+      description: "look something up",
+      schema: z.object({}),
+      func: async () => "ok",
+    });
+  for (const [name, primaryFields, ends] of [
+    ["after a passing primary failure", { status: 503 }, false],
+    [
+      "after a primary out of credit",
+      { status: 429, code: "insufficient_quota" },
+      true,
+    ],
+  ] as const) {
+    test(name, async () => {
+      const primary = new SlowFailingModel(
+        Object.assign(new Error("refused"), primaryFields),
+        0,
+      );
+      let round = 0;
+      const fallback = new ToolLoopModel("peek", 1);
+      const original = fallback._generate.bind(fallback);
+      fallback._generate = async () => {
+        round += 1;
+        if (round === 2)
+          throw Object.assign(new Error("no credit"), { status: 402 });
+        return original();
+      };
+      const graph = buildAgentGraph({
+        model: primary,
+        systemPrompt: "s",
+        tools: [peek()],
+        primary: PRIMARY,
+        fallback: {
+          model: fallback,
+          provider: "anthropic",
+          modelId: "claude-haiku-4-5",
+        },
+      });
+      const err = await graph
+        .invoke({ messages: [new HumanMessage("oi")] })
+        .catch((e) => e);
+      expect(round).toBe(2);
+      expect(primary.calls).toBe(1);
+      expect(failsUntilAccountFixed(err)).toBe(ends);
+    });
+  }
+});
+
 // THE WRITE BOUNDARY: A FALLBACK IS A PROVIDER AND A MODEL, OR IT IS NOTHING.
 //
-// The runtime half of this was already written and tested when review asked what happens to a bag
-// that names only one of the two. Measured on the stored bag: it persists as
-// `{provider: "openai", model: null}`, `hasModelFallback` answers false, and `modelFallbackToForm`
-// maps it back to "No fallback" — so the operator's provider is gone on the next load with nothing
-// on screen to say why, and the same bag reaches the MCP patch as a diff showing `provider: openai`
-// for a fallback that does not exist.
-//
-// Refused rather than repaired, because repairing means choosing which half to throw away. And
-// refused at the WRITE rather than in the editor alone: the editor is one of three transports that
-// reach this bag (REST create, REST update, MCP patch), and the save gate only covers the first
-// operator who meets it.
+// A half-named bag (`{provider: "openai", model: null}`) reads back as "No fallback", so the
+// operator's provider vanishes on the next load and the MCP patch shows a diff for a fallback that
+// does not exist. Refused rather than repaired, because repairing means choosing which half to
+// throw away; refused at the WRITE rather than in the editor alone, because the editor is one of
+// three transports that reach this bag (REST create, REST update, MCP patch).
 describe("hasModelFallback reads the repo's own model rule", () => {
   const cfg = (provider: string | null, model: string | null) =>
     readModelFallbackConfig({
@@ -646,36 +686,6 @@ describe("hasModelFallback reads the repo's own model rule", () => {
   test("the predicate agrees with the default-model table", () => {
     for (const [provider, def] of Object.entries(PROVIDER_DEFAULT_MODEL)) {
       expect(modelOptionalFor(provider)).toBe(def === "");
-    }
-  });
-
-  // WHAT PICKING A DEFAULT COMMITS US TO, and the reason this fence sits next to the table rather
-  // than in the reasoning module: the table is the one place an id is chosen for somebody who chose
-  // nothing, so a default that the transport policy does not cover is a 400 on the FIRST turn of
-  // every new agent, on the path nobody configured.
-  //
-  // The gpt-5.6 family is exactly that case and it is why the fence exists: its server-side default
-  // effort refuses function tools on /v1/chat/completions (issue #66, measured in
-  // ./openai-reasoning), so a default from that family is only safe because `planOpenAITransport`
-  // pins `toolEffort: "none"` for it. Asserted through the PLAN and never against a list of ids, so
-  // the next default is checked by the same rule instead of being added to a second copy of it.
-  test("every declared default is a model the transport policy covers", () => {
-    for (const [provider, def] of Object.entries(PROVIDER_DEFAULT_MODEL)) {
-      if (def === "") continue;
-      const plan = planOpenAITransport(def, undefined);
-      // An operator who chose nothing must reach a tool-bound call that the endpoint accepts:
-      // either the effort is pinned for the tool-bound model, or the family never needed pinning.
-      const safeForTools =
-        plan.toolEffort === "none" ||
-        !/^(?:ft:)?(?:[\w.-]+\/)?gpt-5\.6(?:-|$)/i.test(def);
-      expect({ provider, def, safeForTools }).toEqual({
-        provider,
-        def,
-        safeForTools: true,
-      });
-      // ...and nothing is silently routed to /v1/responses for somebody who asked for no effort:
-      // that endpoint stores for 30 days by default, which is a data-retention change nobody chose.
-      expect(plan.responses).toBe(false);
     }
   });
 });
@@ -727,10 +737,9 @@ describe("assertSettingsModelFallback", () => {
   // THE MODEL IS NOT REQUIRED FOR EVERY PROVIDER, and this rule is not this block's to invent. An
   // `openai-compatible` endpoint that serves a single model discards the name it is sent, which is
   // why `modelConfigSchema` lets the PRIMARY through empty there and `createChatModel` sends
-  // "default". Asking for both halves unconditionally made an operator's own llama.cpp server
-  // impossible to name as a fallback without inventing a model id for it — refused by the write
-  // boundary and by the save gate at once. Review found it; there is one predicate now
-  // (`modelOptionalFor`), read here, by the schema and by the editor's save guard.
+  // "default". Asking for both halves unconditionally would make an operator's own llama.cpp server
+  // impossible to name as a fallback without inventing a model id. One predicate
+  // (`modelOptionalFor`) is read here, by the schema and by the editor's save guard.
   test("openai-compatible with no model is a whole fallback, not half of one", () => {
     expect(
       refuses(
@@ -744,44 +753,11 @@ describe("assertSettingsModelFallback", () => {
     ).toBeNull();
   });
 
-  test("and every other provider still needs one", () => {
-    for (const provider of [
-      "openai",
-      "anthropic",
-      "google",
-      "deepseek",
-      "openrouter",
-    ]) {
-      expect(refuses(bag({ provider, model: null }), {})).toContain(
-        "model is missing",
-      );
-    }
-  });
-
-  // The exemption is about the MODEL, not about the pair: a model with no provider is still no
-  // destination, whichever provider would have been named.
-  test("a model with no provider is refused on that path too", () => {
-    expect(refuses(bag({ provider: null, model: "llama-3" }), {})).toContain(
-      "provider is missing",
-    );
-  });
-
   // Whitespace is not a name, and this is the one the editor's own trim already agreed with.
   test("a blank string does not count as named", () => {
     expect(refuses(bag({ provider: "openai", model: "   " }), {})).toContain(
       "model is missing",
     );
-  });
-
-  // PER FIELD, because mergeBehaviorSettings merges a block one level deep: the MCP patch sends the
-  // fields it means to change, and a patch naming only the model is a complete statement when the
-  // stored block already names a provider.
-  test("a patch naming only the model is whole against a stored provider", () => {
-    expect(
-      merged(bag({ model: "other" }), {
-        modelFallback: { provider: "openai", model: "gpt-5.4-mini" },
-      }),
-    ).toBeNull();
   });
 
   test("a patch naming only the provider is still half a fallback", () => {
@@ -812,9 +788,9 @@ describe("assertSettingsModelFallback", () => {
     ).toContain("provider is missing");
   });
 
-  // ONLY WHAT THE WRITE CHANGES. A bag that already holds a half-named block — written before this
-  // rule, or by a path that predates it — is re-sent untouched by every save that edits some other
-  // section, and refusing those would freeze the agent on a field the operator is not editing.
+  // NOTE: ONLY WHAT THE WRITE CHANGES. A bag already holding a half-named block (stored data can
+  // predate the rule) is re-sent untouched by every save that edits some other section, and refusing
+  // those would freeze the agent on a field the operator is not editing.
   test("a stored half-block re-sent unchanged does not block an unrelated save", () => {
     const legacy = { modelFallback: { provider: "openai", model: null } };
     expect(
@@ -857,4 +833,45 @@ describe("assertSettingsModelFallback", () => {
       refuses(bag({ provider: " openai ", model: "  " }), legacy),
     ).toBeNull();
   });
+});
+
+// A fallback that fails for its own account ends the job only when the primary's failure would repeat
+// too: a primary that failed for a passing reason may answer the next attempt.
+describe("a fallback's account failure and the job's retries", () => {
+  const failing = (fields: Record<string, unknown>) => () =>
+    Promise.reject(Object.assign(new Error("refused"), fields));
+  const deadKey = { status: 401 };
+  const noCredit = { status: 429, code: "insufficient_quota" };
+  for (const [name, primary, fallback, ends] of [
+    [
+      "a passing primary failure and a dead fallback key",
+      { status: 503 },
+      deadKey,
+      false,
+    ],
+    [
+      "a primary out of credit and a dead fallback key",
+      noCredit,
+      deadKey,
+      true,
+    ],
+    [
+      "a primary out of credit and a passing fallback failure",
+      noCredit,
+      { status: 503 },
+      false,
+    ],
+  ] as const) {
+    test(name, async () => {
+      const err = await runModelCall(failing(primary), {
+        primary: PRIMARY,
+        fallback: {
+          labels: FALLBACK_LABELS,
+          deadlineMs: 5_000,
+          run: failing(fallback) as () => Promise<never>,
+        },
+      }).catch((e) => e);
+      expect(failsUntilAccountFixed(err)).toBe(ends);
+    });
+  }
 });

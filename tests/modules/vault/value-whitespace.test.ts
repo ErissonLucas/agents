@@ -8,12 +8,13 @@ import {
   testVaultValue,
   updateVaultEntry,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // A credential is stored as its exact bytes, and a paste out of a provider's panel routinely carries
 // a newline or a space. An HTTP field value has its surrounding whitespace stripped before any
 // handler sees it, so a token stored padded can never be matched by the one that arrives, and the
 // refusal is byte-identical to a wrong token: the operator retypes the value on the provider's side
-// forever (issue #338). The write refuses instead of repairing, so no secret is ever rewritten.
+// forever. The write refuses instead of repairing, so no secret is ever rewritten.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -33,8 +34,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 

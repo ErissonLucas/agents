@@ -1,13 +1,7 @@
-// {{token}} resolution for document content. A sibling of the system prompt's placeholder machinery
-// (src/graph/prompt.ts), deliberately NOT the same code, for two reasons that both bite:
-//
-//   1. `PROMPT_PLACEHOLDER_SOURCE` is a shared contract — the prompt editor's highlighter, the cache
-//      warning and the prompt audit all read it. Widening it so a document can say {{empresa_nome}}
-//      changes what the agent's system-prompt editor highlights, which is the wrong blast radius.
-//   2. An unresolved prompt placeholder is left LITERAL, which is right for a prompt (the model can
-//      still read it) and wrong for a document (the customer receives `{{validade}}` in a PDF). Here
-//      an unknown token is refused when the template is written, and renders as empty if one ever
-//      reaches the renderer anyway.
+// {{token}} resolution for document content, deliberately NOT the system prompt's placeholder code
+// (src/graph/prompt.ts): widening `PROMPT_PLACEHOLDER_SOURCE` would change the prompt editor, and an
+// unresolved prompt placeholder stays literal, which a PDF must never print. Here an unknown token
+// is refused when the template is written, and renders as empty if one reaches the renderer anyway.
 
 import { clipText } from "@/lib/text";
 
@@ -111,16 +105,9 @@ export function sanitizeDocumentValue(
 }
 
 // Every token name a piece of text asks for, in order, deduplicated.
-// Anything the resolver would NOT recognise, stated as the complement of what it does: remove every
-// VALID token and see whether a brace pair survives. {{Company_name}} (capital), {{company-name}}
-// (hyphen), {{}}, {{cliente (unclosed) and {{foo {{cliente}} (nested) all do, and all of them slip
-// past `tokensIn`, which only reports what matches. Authoring accepted them and then `resolveTokens`
-// did not match them either, so the braces printed verbatim in a document the customer keeps.
-//
-// Written as a complement rather than as a second pattern on purpose: a pattern for "looks like a
-// token but is not one" has to enumerate the ways of being wrong, and the first version of it
-// enumerated three and missed two. There is only one way to be RIGHT, and it is already written
-// down one line above.
+// Anything the resolver would NOT recognise, as the complement of what it does: remove every VALID
+// token and see whether a brace pair survives ({{Company_name}}, {{}}, {{cliente unclosed, nested).
+// A complement, not a second pattern, because only the valid shape can be listed completely.
 export function malformedTokenIn(text: string): string | null {
   const leftover = text.replace(DOCUMENT_TOKEN_RE, "\u0000");
   const at = Math.max(leftover.indexOf("{{"), leftover.indexOf("}}"));
@@ -155,4 +142,42 @@ export function resolveTokens(
   return text.replace(DOCUMENT_TOKEN_RE, (_match, name: string) =>
     sanitizeDocumentValue(vars[name] ?? ""),
   );
+}
+
+// A separator between two parts of a footer line: a middle dot, a bullet or a bar with space around.
+const FOOTER_SEPARATOR = /(\s+[·•|]\s+)/;
+const HAS_TOKEN = new RegExp(DOCUMENT_TOKEN_RE.source);
+
+// The footer joins parts that may resolve empty ("{{company_name}} · {{doc_number}}" on an account
+// with no company name), and resolved as plain text that leaves the separator hanging. Each line is
+// split at its separators; a part that holds a token and resolves to nothing is dropped with the
+// separator that led to it, and every other part and separator is printed as the author wrote it.
+export function resolveFooterText(
+  text: string,
+  vars: Record<string, string>,
+): string {
+  // Tokens are written compactly first: one may legally carry whitespace, newlines included, and
+  // splitting into lines must not cut it in half.
+  return text
+    .replace(DOCUMENT_TOKEN_RE, (_match, name: string) => `{{${name}}}`)
+    .split("\n")
+    .map((line) => {
+      const pieces = line.split(FOOTER_SEPARATOR);
+      const kept: { text: string; separatorAfter: string | undefined }[] = [];
+      for (let i = 0; i < pieces.length; i += 2) {
+        const raw = pieces[i] as string;
+        const resolved = resolveTokens(raw, vars);
+        if (HAS_TOKEN.test(raw) && resolved.trim() === "") continue;
+        kept.push({ text: resolved, separatorAfter: pieces[i + 1] });
+      }
+      return kept
+        .map((part, i) => {
+          if (i === kept.length - 1)
+            return i > 0 ? part.text.trimStart() : part.text;
+          const text = i > 0 ? part.text.trim() : part.text.trimEnd();
+          return text + (part.separatorAfter ?? " · ");
+        })
+        .join("");
+    })
+    .join("\n");
 }

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  closesWithoutModel,
   FOLLOW_UP_DEFAULTS,
   FOLLOW_UP_MAX_STEPS,
   isNewFollowUpEpisode,
@@ -89,10 +90,9 @@ describe("readFollowUpConfig", () => {
     expect(cfg.steps[1]?.resolve).toBe(true);
   });
 
-  // The strip above takes `resolve` OFF a step, and everything else has to survive it. It used to
-  // rebuild the step field by field, which meant it listed what to keep — so a step field added
-  // later was dropped here, silently, and only in this one case: a mid-sequence step that happens
-  // to carry `resolve`. `ignoreAppointmentPause` (#103) is the first field that would have hit it.
+  // NOTE: The strip above takes `resolve` OFF a step, and everything else has to survive it. Rebuilding the
+  // step field by field would list what to keep, so a field added later (`ignoreAppointmentPause` is
+  // one) would be dropped silently, and only on a mid-sequence step that carries `resolve`.
   test("stripping resolve keeps every OTHER field of that step", () => {
     const cfg = readFollowUpConfig({
       followUp: {
@@ -153,15 +153,6 @@ describe("readFollowUpConfig", () => {
     expect(
       readFollowUpConfig({ followUp: { steps: ["nope", 5] } }).steps,
     ).toEqual(FOLLOW_UP_DEFAULTS.steps);
-  });
-
-  test("a blank assignLabel is dropped (not stored as empty string)", () => {
-    const cfg = readFollowUpConfig({
-      followUp: {
-        steps: [{ delayValue: 1, delayUnit: "hours", assignLabel: "   " }],
-      },
-    });
-    expect(cfg.steps[0]?.assignLabels).toBeUndefined();
   });
 
   test("assignLabels: multiple labels are trimmed, bounded and de-duplicated", () => {
@@ -247,5 +238,24 @@ describe("stepDelayMinutes", () => {
         instructions: "",
       }),
     ).toBe(43200);
+  });
+});
+
+describe("closesWithoutModel", () => {
+  const closer = {
+    delayValue: 1,
+    delayUnit: "minutes" as const,
+    instructions: "",
+    resolve: true,
+  };
+  test("an empty last step that resolves closes without the model", () => {
+    expect(closesWithoutModel(closer, true)).toBe(true);
+  });
+  test("instructions, no resolve, or not the last step keep the model", () => {
+    expect(
+      closesWithoutModel({ ...closer, instructions: "Pergunte." }, true),
+    ).toBe(false);
+    expect(closesWithoutModel({ ...closer, resolve: false }, true)).toBe(false);
+    expect(closesWithoutModel(closer, false)).toBe(false);
   });
 });

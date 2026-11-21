@@ -1,9 +1,25 @@
-import { z } from "zod";
-import { AppError } from "@/lib/errors";
-import { modelOptionalFor } from "./model-defaults";
+import { type ZodError, z } from "zod";
+import {
+  AppError,
+  andList,
+  phrase,
+  reasonList,
+  type TranslatedParam,
+} from "@/lib/errors";
+import { numberRange } from "@/lib/number-range";
+import { modelOptionalFor, PROVIDER_DEFAULT_MODEL } from "./model-defaults";
 import { REASONING_EFFORTS } from "./openai-reasoning";
+import {
+  PROMPT_CACHE_MODES,
+  PROMPT_CACHE_TTLS,
+  PROVIDERS_WITH_PROMPT_CACHE,
+  PROVIDERS_WITH_PROMPT_CACHE_1H,
+} from "./prompt-cache";
 
-// Per-agent/per-node model config SCHEMA — deliberately LangChain-free so the config/HTTP layer
+// The sampling temperature every provider here accepts; the console holds Save outside it.
+export const TEMPERATURE_RANGE = numberRange(0, 2);
+
+// Per-agent/per-node model config SCHEMA, deliberately LangChain-free so the config/HTTP layer
 // can validate a modelConfig without importing the provider SDKs (those live in ./models, which
 // builds the actual chat model on top of this).
 
@@ -17,48 +33,35 @@ export const MODEL_PROVIDERS = [
 ] as const;
 
 // The providers whose adapter actually SENDS a configured endpoint. The rest accept one and drop it
-// without a word — measured on the built instances: deepseek keeps its own api.deepseek.com, and
-// openai/anthropic/google carry the value nowhere at all. That turns "route this through my proxy"
-// into "send it straight to the vendor", with the customer's text, which is why a caller that has an
-// endpoint to honor must ask here first rather than pass it and hope.
-//
-// NOTE: tests/graph/model-endpoint-support.test.ts probes each built instance, so this list cannot
-// drift away from what createChatModel does.
+// silently (deepseek keeps api.deepseek.com; openai, anthropic and google carry it nowhere), turning
+// "route through my proxy" into "send straight to the vendor" with the customer's text, so a caller
+// with an endpoint to honor asks here first. tests/graph/model-endpoint-support.test.ts probes each
+// built instance, so this list cannot drift from what createChatModel does.
 export const PROVIDERS_HONORING_BASE_URL = [
   "openai-compatible",
   "openrouter",
 ] as const;
 
-// How each provider is asked for a schema-constrained answer, or that it is not asked at all. A
-// claim about the ENDPOINT, never about how capable the model is, and every row was measured or
-// read off the vendor's own documentation. The consumer today is the guardrail verdict
-// (modules/guardrails/verdict.ts, issue #131):
-//
-//   * openai and anthropic take the json-schema dialect: a `strict` json_schema on one, a forced
-//     tool call on the other;
-//   * google takes the OpenAPI 3.0 subset instead, where `type` holds one value and nullability is
-//     `nullable: true`. Measured live on gemini-3.5-flash and -flash-lite: asked in the json-schema
-//     dialect the request comes back 400 and the analysis is remade in prose, so every screen costs
-//     two calls; asked in this one, a single call answers;
-//   * deepseek implements `json_object` only, and answers "unavailable now" to a json_schema;
-//   * openrouter's support is per ENDPOINT behind the router and changes without notice, so the
-//     same model id constrains today and fails the request tomorrow;
-//   * openai-compatible is an arbitrary server by definition. Measured against a local one that
-//     ignores the parameter: the client retried the same call six times across a minute and never
-//     settled, while the unconstrained call made today answered on the first try. One that refuses
-//     it outright (llama.cpp does, with a 400) fails immediately.
-//
-// Getting a row wrong is not symmetric. A provider wrongly on "prose" keeps exactly today's
-// behaviour; one asked in the wrong dialect pays a refusal on every screen, and only survives it
-// because the analysis is remade in prose when a request comes back refused.
-export type VerdictAskMode = "prose" | "json-schema" | "openapi";
+// How each provider is asked for a schema-constrained answer, if at all: a claim about the ENDPOINT,
+// never the model, read by the guardrail verdict (modules/guardrails/verdict.ts). openai takes
+// json-schema (a `strict` json_schema); anthropic the same schema as `output_config.format`, since the
+// 5-5 generation refuses a forced tool call; google the OpenAPI 3.0 subset (asked in json-schema it
+// answers 400, two calls per screen); deepseek implements only `json_object`; openrouter's support is
+// per endpoint and changes without notice; openai-compatible is arbitrary, and a server that ignores
+// the parameter makes the client retry for a minute. A row wrongly on "prose" costs nothing; one in the
+// wrong dialect pays a refusal on every screen.
+export type VerdictAskMode =
+  | "prose"
+  | "json-schema"
+  | "output-format"
+  | "openapi";
 
 const VERDICT_ASK_MODE: Record<
   (typeof MODEL_PROVIDERS)[number],
   VerdictAskMode
 > = {
   openai: "json-schema",
-  anthropic: "json-schema",
+  anthropic: "output-format",
   google: "openapi",
   deepseek: "prose",
   openrouter: "prose",
@@ -80,34 +83,139 @@ export const modelConfigSchema = z
     model: z.string().default(""),
     // Vault reference (`vault:<id>`) for the API key, never the key and never an entry name:
     // `vaultRefWhere` turns anything else into a filter that matches nothing, so the runtime
-    // finds no credential and the agent produces nothing. Refused at the write boundary (#254).
+    // finds no credential and the agent produces nothing. Refused at the write boundary.
     credentialRef: z.string().min(1).optional(),
     baseURL: z.string().url().optional(),
-    temperature: z.number().min(0).max(2).optional(),
-    // How much the model may reason before answering. Absent = whatever the provider does today.
-    // See ./openai-reasoning for the measured table behind the values and the transport.
+    temperature: z
+      .number()
+      .min(TEMPERATURE_RANGE.min)
+      .max(TEMPERATURE_RANGE.max)
+      .optional(),
+    // How much the model may reason before answering. Absent = the provider's own default.
+    // See ./openai-reasoning for the table behind the values and the transport.
     reasoningEffort: z.enum(REASONING_EFFORTS).optional(),
+    // Prompt caching on the providers that only cache what the request marks (./prompt-cache).
+    // Absent = `auto` there. The two TTLs are apart because the two spans repeat at different rates:
+    // the prefix (tools + system) is shared by every conversation of the agent, the conversation
+    // tail only by the next turn of the same customer. Absent conversation TTL follows the prefix.
+    promptCache: z.enum(PROMPT_CACHE_MODES).optional(),
+    promptCacheTtl: z.enum(PROMPT_CACHE_TTLS).optional(),
+    promptCacheConversationTtl: z.enum(PROMPT_CACHE_TTLS).optional(),
   })
   .superRefine((cfg, ctx) => {
+    // Each rule's reason is a phrase, so a refusal quotes it in the caller's language
+    // (modelConfigReason); the issue's own message is its English text.
+    const refuse = (path: string, reason: TranslatedParam) =>
+      ctx.addIssue({
+        code: "custom",
+        path: [path],
+        message: reason.message,
+        params: { phrase: reason },
+      });
     if (!cfg.model.trim() && !modelOptionalFor(cfg.provider)) {
-      ctx.addIssue({
-        code: "custom",
-        path: ["model"],
-        message: "model is required for this provider",
-      });
+      refuse(
+        "model",
+        phrase(
+          "errors.modelConfigModelRequired",
+          "model is required for this provider",
+        ),
+      );
     }
-    // Any effort above "none" needs /v1/responses, which is OpenAI's own endpoint: OpenAI-shaped
-    // servers (openrouter, openai-compatible) mostly do not implement it, and the other providers
-    // spell reasoning differently altogether (Anthropic thinking budgets, Google thinkingBudget).
-    // Accepting the field there would be a control that either does nothing or fails every turn.
+    // NOTE: any effort above "none" needs /v1/responses, OpenAI's own endpoint: OpenAI-shaped servers
+    // (openrouter, openai-compatible) mostly do not implement it, and the other providers spell
+    // reasoning differently (Anthropic thinking budgets, Google thinkingBudget). Accepting the field
+    // there would be a control that either does nothing or fails every turn.
     if (cfg.reasoningEffort !== undefined && cfg.provider !== "openai") {
-      ctx.addIssue({
-        code: "custom",
-        path: ["reasoningEffort"],
-        message: `reasoningEffort is only supported on the "openai" provider, not "${cfg.provider}"`,
-      });
+      refuse(
+        "reasoningEffort",
+        phrase(
+          "errors.modelConfigReasoningOpenaiOnly",
+          `reasoningEffort is only supported on the "openai" provider, not "${cfg.provider}"`,
+          { provider: cfg.provider },
+        ),
+      );
+    }
+    // OpenAI and the rest cache a repeated prefix on their own, so the fields would be a control
+    // that does nothing there, the same reason reasoningEffort is refused off "openai".
+    const cacheFields = [
+      "promptCache",
+      "promptCacheTtl",
+      "promptCacheConversationTtl",
+    ] as const;
+    if (
+      !(PROVIDERS_WITH_PROMPT_CACHE as readonly string[]).includes(cfg.provider)
+    ) {
+      const providers = andList(
+        PROVIDERS_WITH_PROMPT_CACHE.map((p) => JSON.stringify(p)),
+      );
+      const providersText =
+        typeof providers === "string" ? providers : providers.message;
+      for (const f of cacheFields)
+        if (cfg[f] !== undefined)
+          refuse(
+            f,
+            phrase(
+              "errors.modelConfigPromptCacheProviders",
+              `${f} is only supported on the ${providersText} providers, not "${cfg.provider}"`,
+              { field: f, providers, provider: cfg.provider },
+            ),
+          );
+    }
+    if (
+      !(PROVIDERS_WITH_PROMPT_CACHE_1H as readonly string[]).includes(
+        cfg.provider,
+      )
+    ) {
+      for (const f of ["promptCacheTtl", "promptCacheConversationTtl"] as const)
+        if (cfg[f] === "1h")
+          refuse(
+            f,
+            phrase(
+              "errors.modelConfigPromptCache1hAnthropicOnly",
+              `${f} "1h" is only supported on the "anthropic" provider, not "${cfg.provider}": its usage does not say which writes were 1h, so they could not be priced`,
+              { field: f, provider: cfg.provider },
+            ),
+          );
+    }
+    // NOTE: the API refuses a longer TTL after a shorter one, and the prefix comes first, so a 1h
+    // conversation behind a 5m prefix would fail every call.
+    if (
+      cfg.promptCacheConversationTtl === "1h" &&
+      (cfg.promptCacheTtl ?? "5m") === "5m"
+    ) {
+      refuse(
+        "promptCacheConversationTtl",
+        phrase(
+          "errors.modelConfigConversationTtlAfterPrefix",
+          `promptCacheConversationTtl "${cfg.promptCacheConversationTtl}" needs promptCacheTtl "${cfg.promptCacheConversationTtl}": a longer cache TTL cannot follow a shorter one`,
+          {
+            conversationTtl: cfg.promptCacheConversationTtl,
+            prefixTtl: cfg.promptCacheConversationTtl,
+          },
+        ),
+      );
     }
   });
+
+// Why a model config was refused, one phrase per issue in the caller's language. Ours (the rules
+// above) carry their own phrase; zod's built-in checks (a number out of range, an unknown provider)
+// answer in zod's English, quoted as the validator's words rather than read as part of our sentence.
+export function modelConfigReason(error: ZodError): TranslatedParam {
+  return reasonList(
+    error.issues.map((issue) => {
+      const own = (issue as { params?: { phrase?: TranslatedParam } }).params
+        ?.phrase;
+      if (own) return own;
+      const path = issue.path.map(String).join(".") || "modelConfig";
+      const detail = issue.message.replaceAll("`", "'");
+      return phrase(
+        "errors.modelConfigValidatorSaid",
+        `${path}: the validator answered "${detail}"`,
+        { path, detail },
+      );
+    }),
+  );
+}
 
 export type ModelConfig = z.infer<typeof modelConfigSchema>;
 
@@ -115,7 +223,7 @@ export type ModelConfig = z.infer<typeof modelConfigSchema>;
 // (the operator still needs to pick a credential before the agent can run).
 export const DEFAULT_MODEL_CONFIG: ModelConfig = {
   provider: "openai",
-  model: "gpt-5.6-luna",
+  model: PROVIDER_DEFAULT_MODEL.openai as string,
   temperature: 0.7,
 };
 

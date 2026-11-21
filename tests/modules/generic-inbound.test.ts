@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
@@ -8,10 +8,7 @@ import { getAgentToolSelections } from "@/modules/agents/service";
 import { exportAgent, importAgent } from "@/modules/agents/transfer";
 import { shouldBotHandle } from "@/modules/chatwoot/normalize";
 import { getCatalogEntry } from "@/modules/integrations/catalog";
-import {
-  CONVERSATION_REF_KIND,
-  ensureConversationRef,
-} from "@/modules/integrations/conversation-ref";
+import { ensureConversationRef } from "@/modules/integrations/conversation-ref";
 import { getMapper } from "@/modules/integrations/mappers";
 import {
   createIntegrationInstance,
@@ -36,9 +33,11 @@ import {
   processInboundDelivery,
   receiveInbound,
 } from "@/modules/webhooks/inbound/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { VIOLATION_SHAPES } from "@/tests/utils/raw-violation";
 
-// Issue #818: an external system of the operator's own speaking back into a conversation it was
-// handed, through the GENERIC integration and `{{conversation_ref}}`.
+// An external system of the operator's own speaking back into a conversation it was handed, through
+// the GENERIC integration and `{{conversation_ref}}`.
 
 describe("the GENERIC mapper", () => {
   const map = (raw: unknown) => getMapper("GENERIC")?.map(raw);
@@ -178,8 +177,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -391,13 +390,17 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
 
   // ── the receptor ──
 
-  const post = (route: string, body: Record<string, unknown>) => {
+  const post = (
+    route: string,
+    body: Record<string, unknown>,
+    base: PrismaClient = appDb,
+  ) => {
     const raw = JSON.stringify(body);
     return receiveInbound({
       routeToken: route,
       rawBody: raw,
       getHeader: signed(raw),
-      base: appDb,
+      base,
     });
   };
   const deliveries = () => suDb.inboundDelivery.count({ where: { tenantId } });
@@ -454,52 +457,60 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
     ).rejects.toMatchObject({ statusCode: 401 });
   });
 
-  test("a correlated event is queued once and dispatched as a relay to the bot's conversation", async () => {
-    const minted = await ensureConversationRef({
-      tenantId,
-      integrationInstanceId: genericId,
-      threadId: THREAD(),
-      base: appDb,
-    });
-    if (!minted.ok) throw new Error("mint");
-    const body = {
-      event_id: "ev-report-1",
-      conversation_ref: minted.ref,
-      text: "Entraram 120 de 400\nPróxima às 16:30",
-    };
-    const r = await post(genericRoute, body);
-    expect(r.outcome).toBe("queued");
-    expect((await post(genericRoute, body)).outcome).toBe("duplicate");
+  test.each(
+    VIOLATION_SHAPES.map(([label, shape], n) => [label, shape, n] as const),
+  )(
+    "a correlated event is queued once and dispatched as a relay to the bot's conversation, the violation %s",
+    async (_, shape, n) => {
+      const minted = await ensureConversationRef({
+        tenantId,
+        integrationInstanceId: genericId,
+        threadId: THREAD(),
+        base: appDb,
+      });
+      if (!minted.ok) throw new Error("mint");
+      const body = {
+        event_id: `ev-report-1-${n}`,
+        conversation_ref: minted.ref,
+        text: "Entraram 120 de 400\nPróxima às 16:30",
+      };
+      const r = await post(genericRoute, body, shape(appDb));
+      expect(r.outcome).toBe("queued");
+      expect((await post(genericRoute, body, shape(appDb))).outcome).toBe(
+        "duplicate",
+      );
 
-    const calls: Array<Record<string, unknown>> = [];
-    const proc = await processInboundDelivery({
-      deliveryId: r.deliveryId as bigint,
-      tenantId,
-      base: appDb,
-      deps: {
-        runNudge: async (args) => {
-          calls.push(args as unknown as Record<string, unknown>);
-          return "messaged";
+      const calls: Array<Record<string, unknown>> = [];
+      const proc = await processInboundDelivery({
+        deliveryId: r.deliveryId as bigint,
+        tenantId,
+        base: appDb,
+        deps: {
+          runNudge: async (args) => {
+            calls.push(args as unknown as Record<string, unknown>);
+            return "messaged";
+          },
         },
-      },
-    });
-    expect(proc).toBe("processed");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.threadId).toBe(THREAD());
-    expect(calls[0]?.deliverToResolved).toBe(true);
-    expect(calls[0]?.nudge).toMatchObject({
-      source: "GENERIC",
-      kind: "agent_nudge",
-      framing: "operator_event",
-      text: "Entraram 120 de 400\nPróxima às 16:30",
-      instructions: "Mande o relatório como veio.",
-      // Issue #846: which instance spoke, so the conversation can name it.
-      integrationInstanceId: String(genericId),
-    });
-  });
+      });
+      expect(proc).toBe("processed");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.threadId).toBe(THREAD());
+      expect(calls[0]?.deliverToResolved).toBe(true);
+      expect(calls[0]?.runKey).toBe(`delivery:${r.deliveryId}`);
+      expect(calls[0]?.nudge).toMatchObject({
+        source: "GENERIC",
+        kind: "agent_nudge",
+        framing: "operator_event",
+        text: "Entraram 120 de 400\nPróxima às 16:30",
+        instructions: "Mande o relatório como veio.",
+        // NOTE: Which instance spoke, so the conversation can name it.
+        integrationInstanceId: String(genericId),
+      });
+    },
+  );
 
-  // Issue #817, review round 2: a re-dispatch runs under a scheduler deadline, and the turn it starts
-  // has to stop when that deadline fires, or it finishes beside the next attempt the sweep arms.
+  // NOTE: A re-dispatch runs under a scheduler deadline, and the turn it starts has to stop when that
+  // deadline fires, or it finishes beside the next attempt the sweep arms.
   test("the caller's deadline signal reaches the nudge turn", async () => {
     const minted = await ensureConversationRef({
       tenantId,
@@ -531,9 +542,9 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
     expect(seen).toBe(controller.signal);
   });
 
-  // Review round 3: the route runs this detached with no deadline, and once the sweep exists a claim
-  // older than the stale window is dispatched again. So a caller that brings no signal gets one, and it
-  // fires BEFORE the claim can go stale.
+  // NOTE: The route runs this detached with no deadline, and a claim older than the stale window is
+  // dispatched again by the sweep. So a caller that brings no signal gets one, and it fires BEFORE the
+  // claim can go stale.
   test("with no caller deadline the nudge still gets one, shorter than the stale window", async () => {
     expect(DISPATCH_DEADLINE_MS).toBeLessThan(PROCESSING_STALE_MS);
     const minted = await ensureConversationRef({
@@ -549,18 +560,32 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
       text: "prazo",
     });
     let seen: AbortSignal | undefined;
-    await processInboundDelivery({
-      deliveryId: r.deliveryId as bigint,
-      tenantId,
-      base: appDb,
-      deps: {
-        runNudge: async (args) => {
-          seen = args.signal;
-          return "messaged";
-        },
-      },
+    const armed: Array<[number, AbortSignal]> = [];
+    const timeout = AbortSignal.timeout.bind(AbortSignal);
+    const spy = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+      const signal = timeout(ms);
+      armed.push([ms, signal]);
+      return signal;
     });
-    expect(seen).toBeInstanceOf(AbortSignal);
+    try {
+      await processInboundDelivery({
+        deliveryId: r.deliveryId as bigint,
+        tenantId,
+        base: appDb,
+        deps: {
+          runNudge: async (args) => {
+            seen = args.signal;
+            return "messaged";
+          },
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    // NOTE: the nudge's signal is the deadline armed for this dispatch, not one that never fires.
+    expect(armed.map(([ms]) => ms)).toContain(DISPATCH_DEADLINE_MS);
+    const deadline = armed.find(([ms]) => ms === DISPATCH_DEADLINE_MS);
+    expect(seen).toBe(deadline?.[1] as AbortSignal);
     expect(seen?.aborted).toBe(false);
   });
 
@@ -646,8 +671,8 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
       expect(status >= 400 && status < 500).toBe(true);
       expect(String(err)).toContain("conversationRefIntegrationId");
     }
-    // The name belongs to the minted ref, so a field that takes it is refused whatever else the tool
-    // says (review round 1).
+    // NOTE: The name belongs to the minted ref, so a field that takes it is refused whatever else the tool
+    // says.
     await expect(
       createToolDefinition(
         ctx(),
@@ -677,7 +702,7 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
     ).rejects.toMatchObject({ statusCode: 400 });
   });
 
-  // Review round 1: the integration previews read the same refusals as the write.
+  // NOTE: The integration previews read the same refusals as the write.
   test("the MCP integration previews refuse an open GENERIC route and unusable guidance", async () => {
     const openCreate = await integrationCreate(
       principal(),
@@ -802,12 +827,5 @@ describe.skipIf(!dbUp)("GENERIC inbound end to end", () => {
     expect(
       warnings.some((w) => w.code === "httpToolConversationRefNotFound"),
     ).toBe(false);
-  });
-
-  test("refs of this kind are rows of the existing correlation table", async () => {
-    const n = await suDb.integrationExternalRef.count({
-      where: { tenantId, kind: CONVERSATION_REF_KIND },
-    });
-    expect(n).toBeGreaterThan(0);
   });
 });

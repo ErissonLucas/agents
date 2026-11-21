@@ -15,29 +15,20 @@ import { AuthProvider } from "@/client/contexts/AuthContext";
 import { ThemeProvider } from "@/client/contexts/ThemeContext";
 import { BehaviorTab } from "@/client/pages/agents/BehaviorTab";
 import { EMPTY_CONTACT_AUTH_RULE_FORM } from "@/client/pages/agents/contactAuthRuleForm";
+import { readOtherInboxesState } from "@/client/pages/agents/OtherInboxesFields";
 import { observationToForm } from "@/client/pages/agents/observationFormState";
+import { SERVICE_WINDOW_FORM_DEFAULTS } from "@/client/pages/agents/ServiceWindowTemplates";
 import { ToolGrantsEditor } from "@/client/pages/agents/ToolGrantsEditor";
 import { readTtsFormState } from "@/client/pages/agents/ttsFormState";
 
-// OPENING A TAB MUST NOT REWRITE A TARGET THE RUNTIME STILL HONORS.
-//
-// A Chatwoot team (or agent) id belongs to ONE account, so both handoff targets are stored with the
-// account they were picked in: `contactAuth.handoffTeamInstanceId` and `handoff.targetInstanceId`.
-// The runtime reads exactly that — `teamTargetUsable` in modules/chatwoot/webhook.ts and the pinned
-// fallback in graph/prepare.ts both say the recorded account decides, per conversation, and that
-// counting accounts is only the fallback for a value stored before the field existed.
-//
-// Both editors were still deciding on the count alone. Bind one inbox per account to the same agent
-// (a test inbox beside the live one) and merely OPENING the tab wiped the stored target and left the
-// tab marked unsaved, with nobody having touched the form. The next save persisted the loss: refused
-// contacts stopped being routed to the team that had been configured for them.
-//
-// So these tests assert on the SETTER, not on pixels: the write is both the damage and the reason
-// the unsaved dot lights up, and a test that only looked at the rendered field would pass on the
-// broken code the moment the field still showed the old value for a frame.
-//
-// NOTE: every assertion reduces to a number or a boolean BEFORE expect. A failing expectation
-// holding a DOM node serializes a cyclic happy-dom tree and stalls the runner.
+// OPENING A TAB MUST NOT REWRITE A TARGET THE RUNTIME STILL HONORS. Both handoff targets are stored
+// with the account they were picked in (`contactAuth.handoffTeamInstanceId`, `handoff.targetInstanceId`),
+// and the runtime lets that recorded account decide (`teamTargetUsable` in
+// src/modules/chatwoot/webhook.ts, the pinned fallback in src/graph/prepare.ts); counting accounts is
+// only the fallback for a value stored without it. These tests assert on the SETTER, not on pixels:
+// the write is both the damage and what lights the unsaved dot. Every assertion reduces to a number
+// or a boolean BEFORE expect: a failing expectation holding a DOM node serializes a cyclic happy-dom
+// tree and stalls the runner.
 
 const realFetch = globalThis.fetch;
 
@@ -114,6 +105,8 @@ function renderContactAuth(
       handoffEnabled: true,
       handoffTeamId,
       handoffTeamInstanceId,
+      endpointEnabled: false,
+      operatorNoteEnabled: true,
     });
     const props: React.ComponentProps<typeof BehaviorTab> &
       Record<string, unknown> = {
@@ -123,6 +116,7 @@ function renderContactAuth(
         ttsVoice: null,
         ttsModel: null,
         ttsNormalizeCredential: null,
+        ttsFallbackCredential: null,
         visionCredential: null,
         visionExtractionPrompt: null,
         ttsSpokenNoticeText: null,
@@ -133,6 +127,7 @@ function renderContactAuth(
         modelFallbackCredential: null,
         awayMessage: null,
         followUpSteps: [],
+        snoozedFollowUpSteps: [],
       },
       agentId: "1",
       agentName: "Recepção",
@@ -176,6 +171,8 @@ function renderContactAuth(
       agentModelName: "gpt-4o",
       agentModelCredentialRef: "",
       agentModelBaseUrl: "",
+      callFloor: null,
+      draftPrompt: "",
       ttsNormalizeCredBaseUrl: null,
       split: {
         enabled: false,
@@ -192,6 +189,7 @@ function renderContactAuth(
         separator: "blank" as const,
       },
       setSignature: () => {},
+      signatureSeed: { current: null },
       vision: {
         enabled: false,
         provider: "openai",
@@ -199,10 +197,19 @@ function renderContactAuth(
         credentialRef: "",
         baseURL: "",
         extractionPrompt: "",
+        pdfText: true,
+        maxOutputTokens: null,
+        reasoningEffort: null,
       },
       setVision: noop,
       visionCredBaseUrl: null,
-      limits: { maxToolCalls: "10", maxHistoryTokens: "", retrySilence: true },
+      limits: {
+        maxToolCalls: "10",
+        maxHistoryTokens: "",
+        retrySilence: true,
+        maxTurnsPerHour: "60",
+        maxProactivePerDay: "10",
+      },
       setLimits: noop,
       memory: {
         compactionEnabled: false,
@@ -222,6 +229,7 @@ function renderContactAuth(
         model: "",
         credentialRef: "",
         baseURL: "",
+        timeoutSeconds: "",
       },
       setModelFallback: noop,
       modelFallbackCredBaseUrl: null,
@@ -233,16 +241,20 @@ function renderContactAuth(
         logToolValues: false,
         fullDetail: false,
         fullDetailUntil: null,
+        fullDetailRetentionDays: null,
       },
       savedObservability: {
         logToolValues: false,
         fullDetail: false,
         fullDetailUntil: null,
+        fullDetailRetentionDays: null,
       },
       langfuseSendContent: false,
       setObservability: noop,
       sendImage: { allowedHosts: "" },
       takeover: { onHumanReply: true },
+      otherInboxes: readOtherInboxesState({}),
+      setOtherInboxes: noop,
       setTakeover: noop,
       replyGate: {
         enabled: false,
@@ -251,20 +263,21 @@ function renderContactAuth(
         removeOnHandoff: true,
       },
       setReplyGate: noop,
+      conversationNotes: { toolsUsed: "off", errors: "off" },
+      setConversationNotes: noop,
       setSendImage: noop,
+      resolveConversation: { assignLabels: [] },
+      setResolveConversation: noop,
       attributeContext: { conversation: [], contact: [], task: [] },
+      contactFields: { context: [], writable: [] },
+      setContactFields: () => {},
       setAttributeContext: noop,
-      serviceWindow: {
-        enabled: false,
-        windowHours: "24",
-        templateName: "",
-        templateLanguage: "",
-        templateParams: "",
-        templateContent: "",
-      },
+      serviceWindow: { ...SERVICE_WINDOW_FORM_DEFAULTS, enabled: false },
       setServiceWindow: noop,
       followUp: { enabled: false, steps: [], pauseWhileAppointment: false },
       setFollowUp: noop,
+      snoozedFollowUp: { enabled: false, signature: false, cadences: [] },
+      setSnoozedFollowUp: noop,
       redirectSuppressesFollowUp: false,
       onScheduleSaved: noop,
       dirty: false,
@@ -407,10 +420,17 @@ function renderPinned(targetInstanceId: number | null): {
           mergeContacts: false,
           resolveOrigin: false,
           subjectTemplate: "",
+          openingTemplate: "",
+          noteTemplate: "",
+          carryMode: "off",
+          carryFileTypes: ["image", "file"],
+          carryMaxFiles: 10,
         }}
         setCrossInboxCase={noop}
         sendImage={{ allowedHosts: "" }}
         setSendImage={noop}
+        resolveConversation={{ assignLabels: [] }}
+        setResolveConversation={noop}
         setCustomAttributeInstructions={noop}
         labelInstructions=""
         protectedLabels=""
@@ -419,6 +439,10 @@ function renderPinned(targetInstanceId: number | null): {
         setAllowedLabels={noop}
         outsideAllowedLabels="refuse"
         setOutsideAllowedLabels={noop}
+        labelRemoval="any"
+        setLabelRemoval={noop}
+        writableAttributes={{ conversation: [], contact: [], task: [] }}
+        setWritableAttributes={noop}
         setLabelInstructions={noop}
         updateKanbanTaskInstructions=""
         setUpdateKanbanTaskInstructions={noop}
@@ -483,12 +507,10 @@ describe("pinned handoff target, on an agent serving several accounts", () => {
     expect(modes.length).toBe(0);
   });
 
-  // Keeping the target meant the mode menu stops being disabled while `pinned` is the mode in force
-  // — and a menu item you can reach is an item that can be CLICKED, including on the value already
-  // selected. `Dropdown` fires onChange for the current value like any other (no equality guard in
-  // `onSelect`), so the handler ran with `pinnedInstanceId`, which is null wherever the picker cannot
-  // offer targets. That null then failed the very check that keeps the target, and the config the
-  // operator was looking at was gone: a no-op click erasing the setting it named.
+  // The mode menu stays enabled while `pinned` is in force, so the value already selected can be
+  // clicked. `Dropdown` fires onChange for the current value too (no equality guard in `onSelect`),
+  // with a `pinnedInstanceId` that is null wherever the picker cannot offer targets; that click must
+  // not erase the target it names.
   test("re-picking the mode already in force keeps the target", async () => {
     stubAgentsTeams([ACCOUNT_ONE, ACCOUNT_TWO]);
     const { modes, instanceIds } = renderPinned(2);
@@ -515,10 +537,9 @@ describe("pinned handoff target, on an agent serving several accounts", () => {
     const menuOpened = item !== undefined;
     if (item) fireEvent.click(item);
     await settle();
-    // The click has to have REACHED the handler for the absence of damage to mean anything: an
-    // interaction that silently did nothing would satisfy both assertions below on the broken code.
-    // Radix opens its menu on keydown, not on a bare click, and the first version of this test
-    // passed against the defect precisely because nothing happened.
+    // NOTE: the click has to have REACHED the handler for the absence of damage to mean anything:
+    // an interaction that silently did nothing would satisfy both assertions below. Radix opens its
+    // menu on keydown, not on a bare click.
     expect(menuOpened).toBe(true);
     expect(modes.includes("agent_choice")).toBe(false);
     expect(instanceIds.includes(null)).toBe(false);

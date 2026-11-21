@@ -30,13 +30,13 @@ type ApiKeysData = Awaited<
 type ApiKey = NonNullable<ApiKeysData>["apiKeys"][number];
 
 // API keys console. The per-tenant list (TENANT_ADMIN): keys fenced to the selected tenant. Below
-// it, for a SUPER_ADMIN only, the FLEET list: keys with no home tenant and SUPER_ADMIN authority,
-// the principal the operator's own session is (issue #308). Each list creates via a modal (the
-// plaintext token is revealed once) and revokes with a confirm. The same key authenticates the REST
-// v1 API and the MCP transport. The hash/plaintext never appear here — only the display prefix.
-// A key minted before keys were confirmed with a password (`stepUpAt` null) still answers the
-// destructive routes with its creator's password; the list marks it, since rotating it is the only
-// way to a key that answers by itself, and nothing else on the page would say which one that is.
+// it, for a SUPER_ADMIN only, the FLEET list: keys with no home tenant and SUPER_ADMIN authority, the
+// principal the operator's own session is. Each list creates via a modal (the plaintext token is
+// revealed once) and revokes with a confirm. The same key authenticates the REST v1 API and the MCP
+// transport. The hash/plaintext never appear here, only the display prefix. A key with `stepUpAt`
+// null (minted without a password confirmation) still answers the destructive routes with its
+// creator's password; the list marks it, since rotating it is the only way to a key that answers by
+// itself, and nothing else on the page would say which one that is.
 export function ApiKeysPage() {
   const { t } = useTranslation();
   const { user } = useAuth();
@@ -63,7 +63,7 @@ export function ApiKeysPage() {
           title={t("apiKeys.fleetTitle", "Fleet keys")}
           subtitle={t(
             "apiKeys.fleetSubtitle",
-            "SUPER_ADMIN authority with no home tenant, for automation that operates the whole fleet: the key selects a tenant per request with X-Tenant-Id (REST) or the tenant argument (MCP), like your own session. Only a SUPER_ADMIN sees this list.",
+            "Super admin authority with no home tenant, for automation that operates the whole fleet: the key selects a tenant per request with X-Tenant-Id (REST) or the tenant argument (MCP), like your own session. Only a SUPER_ADMIN sees this list.",
           )}
           emptyTitle={t("apiKeys.fleetEmptyTitle", "No fleet keys")}
           emptyDescription={t(
@@ -164,11 +164,11 @@ function ApiKeySection({
         <div>
           <Heading
             id={`api-keys-${scope}-title`}
-            className="font-bold text-2xl text-text-primary"
+            className="text-text-primary text-2xl font-bold"
           >
             {title}
           </Heading>
-          <p className="mt-1 text-sm text-text-secondary">{subtitle}</p>
+          <p className="text-text-secondary mt-1 text-sm">{subtitle}</p>
         </div>
         <Button onClick={() => createModal.open()}>
           <Plus className="h-4 w-4" aria-hidden="true" />
@@ -206,7 +206,7 @@ function ApiKeySection({
             >
               <div className="flex min-w-0 flex-col gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="truncate font-medium text-sm text-text-primary">
+                  <span className="text-text-primary truncate text-sm font-medium">
                     {key.displayName}
                   </span>
                   {key.revokedAt && (
@@ -233,7 +233,7 @@ function ApiKeySection({
                     </Tooltip>
                   )}
                 </div>
-                <code className="w-fit rounded bg-bg-tertiary px-1.5 py-0.5 font-mono text-text-secondary text-xs">
+                <code className="bg-bg-tertiary text-text-secondary w-fit rounded px-1.5 py-0.5 font-mono text-xs">
                   {`${key.keyPrefix}…`}
                 </code>
                 <span className="text-text-muted text-xs">

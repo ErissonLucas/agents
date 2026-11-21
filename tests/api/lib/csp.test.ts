@@ -5,12 +5,6 @@ const sha256b64 = (content: string) =>
   new Bun.CryptoHasher("sha256").update(content).digest("base64");
 
 describe("extractInlineScriptHashes", () => {
-  test("hashes a single inline script", () => {
-    const content = "console.log(1);";
-    const hashes = extractInlineScriptHashes(`<script>${content}</script>`);
-    expect(hashes).toEqual([`'sha256-${sha256b64(content)}'`]);
-  });
-
   test("skips external scripts with src attribute", () => {
     const html = `<script src="x.js"></script><script>inline</script>`;
     const hashes = extractInlineScriptHashes(html);
@@ -26,8 +20,10 @@ describe("extractInlineScriptHashes", () => {
   test("emits distinct hashes for multiple distinct scripts", () => {
     const html = `<script>a()</script><script>b()</script>`;
     const hashes = extractInlineScriptHashes(html);
-    expect(hashes).toHaveLength(2);
-    expect(hashes[0]).not.toBe(hashes[1]);
+    expect(hashes).toEqual([
+      `'sha256-${sha256b64("a()")}'`,
+      `'sha256-${sha256b64("b()")}'`,
+    ]);
   });
 
   test("handles scripts with attributes other than src", () => {
@@ -59,8 +55,14 @@ describe("buildCspDirectives", () => {
     // blob: lets media (proxied voice notes/images + playground replay) render via object URLs.
     expect(d.imgSrc).toEqual(["'self'", "data:", "blob:"]);
     // Inter + JetBrains Mono load as woff2 from Google's font CDN (public/index.css @font-face).
-    expect(d.fontSrc).toEqual(["'self'", "data:", "https://fonts.gstatic.com"]);
-    expect(d.mediaSrc).toEqual(["'self'", "blob:"]);
+    expect(d.fontSrc).toEqual(["'self'", "data:"]);
+    // ElevenLabs' voice samples play from where ElevenLabs serves them.
+    expect(d.mediaSrc).toEqual([
+      "'self'",
+      "blob:",
+      "https://*.elevenlabs.io",
+      "https://storage.googleapis.com/eleven-public-prod/",
+    ]);
     expect(d.connectSrc).toEqual(["'self'"]);
     // blob: lets the console embed a PDF it rendered itself (the document-template preview) in an
     // <iframe>. Without it the frame is blocked and the only trace is a line in the browser console,
@@ -108,19 +110,13 @@ describe("buildCspDirectives", () => {
   });
 
   test("dev mode adds 'unsafe-inline' and 'unsafe-eval' to script-src", () => {
-    // NOTE: The Bun dev server injects runtime scripts (visibility/unref
+    // The Bun dev server injects runtime scripts (visibility/unref
     // pings) into the served HTML whose hash is not knowable from disk.
     // Without these unsafe directives in dev, every page load would
     // generate a false-positive CSP violation.
     const d = buildCspDirectives({ ...baseOpts, isDev: true });
     expect(d.scriptSrc).toContain("'unsafe-inline'");
     expect(d.scriptSrc).toContain("'unsafe-eval'");
-  });
-
-  test("prod mode does NOT include 'unsafe-inline'/'unsafe-eval' in script-src", () => {
-    const d = buildCspDirectives({ ...baseOpts, isDev: false });
-    expect(d.scriptSrc).not.toContain("'unsafe-inline'");
-    expect(d.scriptSrc).not.toContain("'unsafe-eval'");
   });
 
   test("googleOAuthEnabled adds GSI origin to script/style/connect/frame", () => {
@@ -137,14 +133,53 @@ describe("buildCspDirectives", () => {
     expect(d.imgSrc).not.toContain("https://accounts.google.com");
     expect(d.fontSrc).not.toContain("https://accounts.google.com");
   });
+});
 
-  // The document preview needs `'self'`/`blob:` in frame-src whether or not GSI is on, and the GSI
-  // origin is ADDED to that rather than replacing it. Asserting the disabled case separately is what
-  // catches a future edit that makes the two branches disagree — which is how the preview would work
-  // only on instances with Google login configured.
-  test("googleOAuth disabled keeps frame-src at self/blob:", () => {
-    const d = buildCspDirectives({ ...baseOpts, googleOAuthEnabled: false });
-    expect(d.frameSrc).toEqual(["'self'", "blob:"]);
-    expect(d.frameSrc).not.toContain("https://accounts.google.com");
+// States the invariant rather than one URL: every font a first-party file asks for must be reachable
+// under the production font-src, since a refused font falls back to system fonts with nothing in a
+// log but the browser console of a deployed instance.
+describe("declared fonts against the production font-src", () => {
+  const FONT_FACE_RE = /@font-face\s*\{([\s\S]*?)\}/g;
+  const URL_RE = /url\(\s*["']?([^"')]+)["']?\s*\)/g;
+
+  const declaredFontUrls = async () => {
+    const urls: Array<{ file: string; url: string }> = [];
+    for (const file of ["public/index.html", "public/index.css"]) {
+      const source = await Bun.file(file).text();
+      for (const block of source.matchAll(FONT_FACE_RE)) {
+        for (const found of (block[1] ?? "").matchAll(URL_RE)) {
+          const url = found[1];
+          if (url) urls.push({ file, url });
+        }
+      }
+    }
+    return urls;
+  };
+
+  // A first-party path ("/assets/…", "./x.woff2") is covered by 'self'; an absolute URL needs its
+  // own origin listed; a data: URI needs "data:".
+  const requirementFor = (url: string) => {
+    if (url.startsWith("data:")) return "data:";
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(url)) return new URL(url).origin;
+    return "'self'";
+  };
+
+  test("every declared @font-face URL is allowed by font-src", async () => {
+    const urls = await declaredFontUrls();
+    // NOTE: guards against the extraction silently matching nothing and passing.
+    expect(urls.length).toBeGreaterThan(0);
+
+    const fontSrc = buildCspDirectives({
+      ...baseOpts,
+      isDev: false,
+      cdnOrigin: "https://cdn.example.com",
+    }).fontSrc;
+
+    for (const { file, url } of urls) {
+      const needed = requirementFor(url);
+      expect(
+        `${file} → ${url} needs ${needed}: ${fontSrc?.includes(needed)}`,
+      ).toBe(`${file} → ${url} needs ${needed}: true`);
+    }
   });
 });

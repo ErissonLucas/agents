@@ -1,5 +1,6 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
+import { isElevenLabsMediaUrl } from "@/lib/elevenlabs-media";
 import { AppError } from "@/lib/errors";
 import { assertSafeOutboundUrl as defaultAssertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
@@ -25,6 +26,19 @@ import { TTS_PROVIDER_NAMES } from "./providers";
 export interface TtsListItem {
   id: string;
   label?: string;
+  // A short sample of the voice the console can play beside the option (ElevenLabs' `preview_url`).
+  previewUrl?: string;
+  // The same voice speaking each language it is verified in, so the console can play the sample in
+  // the operator's language instead of the general one (usually English).
+  languageSamples?: TtsLanguageSample[];
+}
+
+export interface TtsLanguageSample {
+  // ISO 639-1, as ElevenLabs reports it ("pt").
+  language: string;
+  // BCP 47 when ElevenLabs gives one ("pt-BR"), so Brazilian and European Portuguese stay apart.
+  locale?: string;
+  url: string;
 }
 
 export type TtsListKind = "voices" | "models";
@@ -41,9 +55,8 @@ async function resolveApiKey(
   const entry = await runScopedOn(base, ctx, (db) =>
     tryResolveApiKeyEntry(db, credentialRef),
   );
-  // One null for three states, and that is right here: the picker's job is to list what it can, and
-  // an unusable credential produces the same empty list as a missing one. The `state` split exists
-  // for the runtime paths, where the operator needs the reason in a log line (issue #471).
+  // NOTE: One null for three states, on purpose: the picker lists what it can, and an unusable credential
+  // yields the same empty list as a missing one. The `state` split serves the runtime's log lines.
   return entry.state === "ok" ? entry.secret : null;
 }
 
@@ -116,12 +129,9 @@ export async function listTtsOptions(
   }
   const apiKey = await resolveKey(base, ctx, credentialRef);
   if (!apiKey) {
-    // NOTE: the sentence names three possibilities and picks none, because the resolver returns
-    // `null` for all three (the ref points at nothing, the entry holds no secret, or the entry is a
-    // multi-field/managed credential whose secret is an object rather than an API key) and this
-    // code learns nothing else. Naming one of them would be inventing a cause nobody measured,
-    // which is the defect issue #292 exists to remove — one layer down. Telling them apart means
-    // reading the entry back on the failure path, and that is a behaviour change, not a wording one.
+    // NOTE: the sentence names three possibilities and picks none, because the resolver returns `null`
+    // for all three (no entry, no secret, or a multi-field credential) and naming one would invent a
+    // cause. Telling them apart would need a read-back on the failure path.
     throw new AppError(
       "credential did not resolve to an API key",
       400,
@@ -161,10 +171,20 @@ export async function listTtsOptions(
         );
       }
       return voices
-        .map((v) => v as { voice_id?: unknown; name?: unknown } | null)
+        .map(
+          (v) =>
+            v as {
+              voice_id?: unknown;
+              name?: unknown;
+              preview_url?: unknown;
+              verified_languages?: unknown;
+            } | null,
+        )
         .map((v) => ({
           id: typeof v?.voice_id === "string" ? v.voice_id : "",
           label: typeof v?.name === "string" ? v.name : undefined,
+          previewUrl: playableSampleOrUndefined(v?.preview_url),
+          languageSamples: languageSamplesOf(v?.verified_languages),
         }))
         .filter((v) => v.id.length > 0);
     }
@@ -197,12 +217,9 @@ export async function listTtsOptions(
       .filter((m) => m.id.length > 0);
   } catch (e) {
     if (e instanceof AppError) throw e;
-    // NOTE: the sentence carries the PROVIDER and not the error text. A failure to reach a host is
-    // raised by the client with the request in hand, and Bun's header validation puts the offending
-    // header VALUE in the message it throws — measured: `Header 'Authorization' has invalid value:
-    // 'Bearer <the vault secret>'`. Interpolating that would answer a write-only credential back to
-    // whoever called the listing endpoint. The text stays in `message`, which is the log line, and
-    // the catalog entry has no placeholder for it (found by review, issue #292).
+    // NOTE: the sentence carries the provider, not the error text: Bun's header validation puts the
+    // header VALUE in its message (`'Bearer <the vault secret>'`), which would echo a write-only
+    // credential to the caller. The text stays in `message`, the log line.
     throw new AppError(
       `failed to list ElevenLabs ${kind}: ${e instanceof Error ? e.message : String(e)}`,
       502,
@@ -348,4 +365,36 @@ async function listFishVoices(
       { provider: "fish" },
     );
   }
+}
+
+// The console hands this URL straight to an <audio> element, so only a sample the page's CSP lets it
+// load passes: anything else (null on a cloned voice, a relative path that would resolve against the
+// console, another host) would leave a control that can never play.
+function playableSampleOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && isElevenLabsMediaUrl(value)
+    ? value
+    : undefined;
+}
+
+function languageSamplesOf(value: unknown): TtsLanguageSample[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const samples = value.flatMap((entry): TtsLanguageSample[] => {
+    const e = entry as {
+      language?: unknown;
+      locale?: unknown;
+      preview_url?: unknown;
+    } | null;
+    const url = playableSampleOrUndefined(e?.preview_url);
+    if (!url || typeof e?.language !== "string" || !e.language) return [];
+    return [
+      {
+        language: e.language,
+        ...(typeof e.locale === "string" && e.locale
+          ? { locale: e.locale }
+          : {}),
+        url,
+      },
+    ];
+  });
+  return samples.length > 0 ? samples : undefined;
 }

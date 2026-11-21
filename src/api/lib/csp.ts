@@ -1,5 +1,6 @@
 import { join } from "node:path";
 import config from "@/config";
+import { ELEVENLABS_MEDIA_SOURCES } from "@/lib/elevenlabs-media";
 import { OAUTH_CALLBACK_SCRIPT } from "@/modules/vault/oauth-core";
 
 // Every OAuth consent popup (google_oauth, mcp_oauth) renders the SAME FIXED inline script
@@ -14,9 +15,6 @@ const DIST_HTML = join(process.cwd(), "dist", "index.html");
 const PUBLIC_HTML = join(process.cwd(), "public", "index.html");
 const INLINE_SCRIPT_RE = /<script\b(?![^>]*\bsrc=)[^>]*>([\s\S]*?)<\/script>/gi;
 const GSI_ORIGIN = "https://accounts.google.com";
-// Inter + JetBrains Mono load as woff2 from Google's font CDN via @font-face in public/index.css.
-// Allow that origin in font-src so the browser can fetch them instead of falling back to system fonts.
-const GOOGLE_FONTS_ORIGIN = "https://fonts.gstatic.com";
 
 export function extractInlineScriptHashes(html: string): string[] {
   const hashes: string[] = [];
@@ -60,7 +58,7 @@ function getCdnOrigin(): string | null {
     }
     return null;
   }
-  // NOTE: Normalize both sides via URL so a trailing slash or path in
+  // Normalize both sides via URL so a trailing slash or path in
   // PUBLIC_URL does not cause a false mismatch against the CDN origin.
   let publicOrigin: string;
   try {
@@ -83,7 +81,7 @@ export function buildCspDirectives(
 ): Record<string, string[]> {
   const cdn = opts.cdnOrigin ? [opts.cdnOrigin] : [];
   const gsi = opts.googleOAuthEnabled ? [GSI_ORIGIN] : [];
-  // NOTE: In dev, allow 'unsafe-inline'/'unsafe-eval' in script-src so the
+  // In dev, allow 'unsafe-inline'/'unsafe-eval' in script-src so the
   // Bun dev server's injected runtime scripts (visibility/unref pings, HMR)
   // do not fire false-positive CSP violations on every page load. Hashes
   // still pin scripts strictly in production.
@@ -102,8 +100,10 @@ export function buildCspDirectives(
     // `blob:` covers object URLs: media (voice notes/images proxied through our origin and the
     // playground replay) is fetched as bytes and rendered via URL.createObjectURL — a blob: src.
     imgSrc: ["'self'", "data:", "blob:", ...cdn],
-    fontSrc: ["'self'", "data:", GOOGLE_FONTS_ORIGIN, ...cdn],
-    mediaSrc: ["'self'", "blob:", ...cdn],
+    // Inter and JetBrains Mono are self-hosted under /assets/fonts/ (public/index.html).
+    fontSrc: ["'self'", "data:", ...cdn],
+    // The voice picker plays ElevenLabs' voice samples from where ElevenLabs serves them.
+    mediaSrc: ["'self'", "blob:", ...cdn, ...ELEVENLABS_MEDIA_SOURCES],
     // NOTE: Same-origin WebSocket upgrades (`ws:` in dev, `wss:` in prod)
     // are covered by `'self'` per CSP3 in all evergreen browsers.
     connectSrc: ["'self'", ...cdn, ...gsi],

@@ -10,6 +10,7 @@ import {
   Clock,
   ExternalLink,
   Eye,
+  FileCheck,
   Gauge,
   Lock,
   Megaphone,
@@ -37,7 +38,7 @@ import {
   useState,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { Link, useParams } from "react-router";
+import { Link, useParams, useSearchParams } from "react-router";
 import {
   Badge,
   Button,
@@ -61,9 +62,11 @@ import { useAuth } from "@/client/contexts/AuthContext";
 import { useTenantEvents } from "@/client/hooks/useTenantEvents";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
+import { approvalBreadcrumb } from "@/client/lib/approval-breadcrumb";
 import { isAdminRole } from "@/client/lib/roles";
 import { type TurnFacts, toolLabel } from "@/client/lib/tool-label";
 import { cn, formatRelativeTime } from "@/client/lib/utils";
+import { ConversationApprovals } from "@/client/pages/approvals/ConversationApprovals";
 import {
   buildTimeline,
   type FollowUpBadgeInfo,
@@ -72,6 +75,9 @@ import {
   type TrailEntry,
   type TurnUsageEntry,
 } from "./conversationTimeline";
+import { DecisionsTestButton } from "./DecisionsTestModal";
+import { DecisionTickMarker } from "./DecisionTickMarker";
+import { type DecisionTickView, previousDecisionTicks } from "./decisionTick";
 
 // Eden-derived types for the dynamic /conversations/:id routes (metadata shell + the separate
 // thread, fetched independently so a slow Chatwoot only spins the messages area).
@@ -114,7 +120,7 @@ function MessageAttachment({
         {att.transcribedText && (
           <p
             className={cn(
-              "whitespace-pre-wrap text-xs italic",
+              "text-xs whitespace-pre-wrap italic",
               outgoing ? "text-accent-foreground/70" : "text-text-muted",
             )}
           >
@@ -156,11 +162,16 @@ function FollowUpBadge({
   outgoing: boolean;
 }) {
   const label = useFollowUpBadgeLabel(badge);
-  const Icon = badge.kind === "event" ? Webhook : Megaphone;
+  const Icon =
+    badge.kind === "event"
+      ? Webhook
+      : badge.kind === "approval"
+        ? FileCheck
+        : Megaphone;
   return (
     <span
       className={cn(
-        "mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-medium text-[10px]",
+        "mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium",
         outgoing
           ? "bg-accent-foreground/15 text-accent-foreground/90"
           : "bg-bg-secondary text-text-muted",
@@ -183,11 +194,10 @@ function MessageBubble({
   m: Message;
   convId: string;
   followUpBadge?: FollowUpBadgeInfo;
-  // What the turn that created this message spent (issue #858), when this is the last of its
-  // messages on screen.
+  // What the turn that created this message spent, when this is the last of its messages on screen.
   turnUsage?: TurnUsageEntry;
-  // The quoted/replied-to message's preview (item 11): a short snippet + who said it. null when this
-  // message is not a reply, or the referenced message isn't in the loaded window.
+  // The quoted/replied-to message's preview: a short snippet + who said it. null when this message is
+  // not a reply, or the referenced message isn't in the loaded window.
   quotedText?: string | null;
   quotedLabel?: string | null;
 }) {
@@ -201,17 +211,17 @@ function MessageBubble({
 
   if (m.private) {
     return (
-      <div className="mx-auto w-full max-w-xl rounded-lg border border-warning/40 bg-warning-soft px-3 py-2">
-        <div className="mb-1 flex items-center gap-1.5 text-warning text-xs">
+      <div className="border-warning/40 bg-warning-soft mx-auto w-full max-w-xl rounded-lg border px-3 py-2">
+        <div className="text-warning mb-1 flex items-center gap-1.5 text-xs">
           <Lock className="h-3 w-3" aria-hidden="true" />
           {t("conversation.privateNote", "Private note")}
           {m.senderName ? ` · ${m.senderName}` : ""}
         </div>
-        <p className="whitespace-pre-wrap text-sm text-text-primary">
-          {m.content}
-        </p>
+        {/* Chatwoot renders a private note as Markdown, and the notes the platform writes link with it
+            (docs/documents.md, Approval), so the console renders it the same way. */}
+        <Markdown className="text-sm">{m.content ?? ""}</Markdown>
         {(when || turnUsage) && (
-          <div className="mt-1 flex flex-wrap items-center gap-x-1.5 text-[10px] text-text-muted">
+          <div className="text-text-muted mt-1 flex flex-wrap items-center gap-x-1.5 text-[10px]">
             {when && <span>{when}</span>}
             {when && turnUsage && <span aria-hidden="true">·</span>}
             {turnUsage && (
@@ -225,7 +235,7 @@ function MessageBubble({
 
   if (!incoming && !outgoing) {
     return (
-      <p className="text-center text-text-muted text-xs">
+      <p className="text-text-muted text-center text-xs">
         {m.content}
         {when ? ` · ${when}` : ""}
       </p>
@@ -238,14 +248,14 @@ function MessageBubble({
         className={cn(
           "max-w-[80%] rounded-2xl px-3 py-2",
           outgoing
-            ? "bg-accent text-accent-foreground"
+            ? "bg-accent-solid text-accent-foreground"
             : "bg-bg-tertiary text-text-primary",
         )}
       >
         {m.senderName && (
           <p
             className={cn(
-              "mb-0.5 font-medium text-xs",
+              "mb-0.5 text-xs font-medium",
               outgoing ? "text-accent-foreground/80" : "text-text-muted",
             )}
           >
@@ -269,13 +279,13 @@ function MessageBubble({
         )}
         {m.content &&
           (outgoing ? (
-            // Agent/bot (and human-agent) replies carry Markdown; render it (item 6). Incoming customer
-            // text stays literal — a customer typing * or _ must not become emphasis.
+            // NOTE: Agent/bot (and human-agent) replies carry Markdown; render it. Incoming customer text stays
+            // literal: a customer typing * or _ must not become emphasis.
             <Markdown tone="onAccent" className="text-sm">
               {m.content}
             </Markdown>
           ) : (
-            <p className="whitespace-pre-wrap text-sm">{m.content}</p>
+            <p className="text-sm whitespace-pre-wrap">{m.content}</p>
           ))}
         {m.attachments?.length ? (
           <div className="mt-1 flex flex-col gap-1.5">
@@ -382,16 +392,13 @@ const MessageBubbleMemo = memo(
 );
 
 // Safety net: a live indicator that never received its "finished" event (e.g. the socket dropped
-// mid-turn) self-clears after this long. Tool calls no longer need a minimum-display floor — a fast
-// tool now leaves a PERSISTENT marker in the timeline (the trail), so the live bubble can switch
-// immediately to the next step without flashing.
+// mid-turn) self-clears after this long. Tool calls need no minimum-display floor: a fast tool leaves
+// a persistent marker in the timeline, so the live bubble can switch straight to the next step.
 const ACTIVITY_STUCK_MS = 30_000;
 
-// The translated label for a known native tool name; null for an unknown/absent name (caller picks a
-// generic fallback). Static t() keys so the i18n extractor sees them.
 // Humanize a raw tool name as a last resort when no friendly label is mapped (custom HTTP / MCP
-// tools, and native tools without a dedicated phrase): snake_case → "Snake case". Beats the generic
-// "Used a tool" so the operator can tell WHICH tool ran (item 5).
+// tools, and native tools without a dedicated phrase): snake_case to "Snake case", so the operator
+// can tell WHICH tool ran rather than reading a generic "Used a tool".
 function prettyToolName(name: string): string {
   const words = name.replace(/_+/g, " ").trim();
   if (!words) return name;
@@ -420,16 +427,16 @@ type ActivityState = {
   delivered?: boolean | null;
 } | null;
 
-// What one agent turn spent, for a turn with no message of its own on screen (issue #858): a silent
-// turn, one whose messages are not loaded, one from before its messages were recorded. Drawn in the
-// timeline at the time of its last billed call, in the same form the bubbles carry.
+// What one agent turn spent, for a turn with no message of its own on screen (a silent turn, one
+// whose messages are not loaded or were never recorded). Drawn in the timeline at the time of its
+// last billed call, in the same form the bubbles carry.
 function TurnUsageMarker({ turn }: { turn: TurnUsageEntry }) {
   return (
     <div
       className="flex items-center justify-center gap-1.5"
       data-testid="turn-usage"
     >
-      <Gauge className="h-3 w-3 shrink-0 text-text-muted" aria-hidden="true" />
+      <Gauge className="text-text-muted h-3 w-3 shrink-0" aria-hidden="true" />
       <UsageFigure usage={turn.usage} timing={turn} />
     </div>
   );
@@ -439,7 +446,41 @@ function TurnUsageMarker({ turn }: { turn: TurnUsageEntry }) {
 // proactive follow-up that was sent). Distinct from the transient AgentActivityIndicator below. A tool
 // marker that captured args/result is EXPANDABLE: clicking it reveals the arguments and the result
 // (same rendering as the playground trace, via ToolCallDetails).
-function TrailMarker({ entry }: { entry: TrailEntry }) {
+function TrailMarker({
+  entry,
+  previous,
+}: {
+  entry: TrailEntry;
+  previous?: DecisionTickView;
+}) {
+  if (entry.kind === "decision") {
+    return <DecisionTickMarker entry={entry} previous={previous} />;
+  }
+  return <ActivityTrailMarker entry={entry} />;
+}
+
+// What a cut tool result says about the whole one, so the cut copy is never read as the whole thing
+// kept (no sentence, the toggle offers it), expired, or never kept.
+function cutResultNote(
+  entry: TrailEntry,
+  t: ReturnType<typeof useTranslation>["t"],
+): string | null {
+  if (entry.kind !== "tool" || entry.outputComplete !== false) return null;
+  if (entry.fullOutputStatus === "kept" && entry.fullOutputChars !== null)
+    return null;
+  if (entry.fullOutputStatus === "gone")
+    return t(
+      "conversation.trail.fullResultGone",
+      "This is the cut copy. The whole result was kept for this agent and has expired.",
+    );
+  return t(
+    "conversation.trail.fullResultNotKept",
+    "This is the cut copy. The whole result was not kept: this agent was not keeping full turn detail when the call ran.",
+  );
+}
+
+function ActivityTrailMarker({ entry }: { entry: TrailEntry }) {
+  const { id: conversationId = "" } = useParams();
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const toolPhrase = useToolLabel(entry.kind === "tool" ? entry.name : null, {
@@ -459,9 +500,27 @@ function TrailMarker({ entry }: { entry: TrailEntry }) {
             step: entry.step,
           })
         : t("conversation.trail.followUpSent", "Follow-up sent");
+  } else if (entry.kind === "snoozed") {
+    Icon = Megaphone;
+    label =
+      entry.step != null
+        ? t(
+            "conversation.trail.snoozedReminderSentN",
+            "Snoozed reminder {{step}} sent",
+            { step: entry.step },
+          )
+        : t("conversation.trail.snoozedReminderSent", "Snoozed reminder sent");
   } else if (entry.kind === "redirect") {
     Icon = Megaphone;
     label = t("conversation.trail.redirectSent", "Redirect follow-up sent");
+  } else if (entry.kind === "approval") {
+    // The bubble's own words, and no claim of a send: a marker means no message carried the PDF here
+    // (the WhatsApp window closed and only a note was posted, or the message is on an older page).
+    Icon = FileCheck;
+    label = followUpBadgeText(
+      { kind: "approval", step: null, total: 0, integrationName: null },
+      t,
+    );
   } else if (entry.kind === "event") {
     Icon = Webhook;
     label = entry.integrationName
@@ -493,7 +552,7 @@ function TrailMarker({ entry }: { entry: TrailEntry }) {
       (entry.errorMessage != null && entry.errorMessage !== ""));
 
   const line = (
-    <div className="flex items-center justify-center gap-1.5 text-text-muted text-xs">
+    <div className="text-text-muted flex items-center justify-center gap-1.5 text-xs">
       {hasDetails &&
         (expanded ? (
           <ChevronDown className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -522,12 +581,12 @@ function TrailMarker({ entry }: { entry: TrailEntry }) {
         type="button"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
-        className="rounded px-1 py-0.5 hover:bg-bg-tertiary"
+        className="hover:bg-bg-tertiary rounded px-1 py-0.5"
       >
         {line}
       </button>
       {failed && entry.errorMessage && !expanded && (
-        <span className="max-w-xs truncate text-error text-xs">
+        <span className="text-error max-w-xs truncate text-xs">
           {entry.errorMessage}
         </span>
       )}
@@ -537,6 +596,20 @@ function TrailMarker({ entry }: { entry: TrailEntry }) {
             args={entry.args}
             output={entry.output}
             error={entry.errorMessage}
+            // Offered only when the logged copy is cut: a whole `output` needs no second copy.
+            fullOutputChars={
+              entry.outputComplete === false ? entry.fullOutputChars : null
+            }
+            fullOutputCut={entry.fullOutputCut}
+            loadFullOutput={async () => {
+              const { data, error } = await api.api.v1
+                .conversations({ id: conversationId })
+                ["tool-results"]({ lineId: entry.id })
+                .get();
+              if (error) throw error;
+              return data?.text ?? null;
+            }}
+            outputNote={cutResultNote(entry, t)}
           />
         </div>
       )}
@@ -596,13 +669,13 @@ function AgentActivityIndicator({ activity }: { activity: ActivityState }) {
   }
   return (
     <div className="flex justify-start" aria-live="polite">
-      <div className="flex max-w-[80%] items-center gap-2 rounded-2xl bg-bg-tertiary px-3 py-2 text-sm text-text-secondary">
-        <Bot className="h-4 w-4 shrink-0 text-accent" aria-hidden="true" />
+      <div className="bg-bg-tertiary text-text-secondary flex max-w-[80%] items-center gap-2 rounded-2xl px-3 py-2 text-sm">
+        <Bot className="text-accent h-4 w-4 shrink-0" aria-hidden="true" />
         <span>{label}</span>
         <span className="flex items-center gap-0.5" aria-hidden="true">
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-text-muted" />
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:150ms]" />
-          <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-text-muted [animation-delay:300ms]" />
+          <span className="bg-text-muted h-1.5 w-1.5 animate-bounce rounded-full" />
+          <span className="bg-text-muted h-1.5 w-1.5 animate-bounce rounded-full [animation-delay:150ms]" />
+          <span className="bg-text-muted h-1.5 w-1.5 animate-bounce rounded-full [animation-delay:300ms]" />
         </span>
       </div>
     </div>
@@ -677,14 +750,14 @@ function formatHoursWindows(
   return lines;
 }
 
-// The "follow-up sequence complete" marker (item 19). Anchored right after the last follow-up bubble in
-// the timeline (not pinned at the foot), so it reads as the closing beat of the sequence it belongs to.
+// The "follow-up sequence complete" marker. Anchored right after the last follow-up bubble in the
+// timeline (not pinned at the foot), so it reads as the closing beat of the sequence it belongs to.
 function FollowUpComplete() {
   const { t } = useTranslation();
   return (
-    <div className="flex items-center justify-center gap-1.5 text-text-muted text-xs">
+    <div className="text-text-muted flex items-center justify-center gap-1.5 text-xs">
       <CheckCircle2
-        className="h-3 w-3 shrink-0 text-success"
+        className="text-success h-3 w-3 shrink-0"
         aria-hidden="true"
       />
       <span>
@@ -694,11 +767,10 @@ function FollowUpComplete() {
   );
 }
 
-// The proactive follow-up journey, drawn at the foot of the timeline (item 12/13): the next pending
-// step + its estimated time + the absolute clock time, the "complete" state, or "none yet". Times are
-// estimates (background job). A tooltip draws the FULL configured sequence (per-step cadence, labels,
-// the resolving step). When the estimate is past due, the line is highlighted and the tooltip explains
-// the send is imminent. Re-renders on a light timer so the relative ETA stays fresh between refetches.
+// The proactive follow-up journey, drawn at the foot of the timeline: the next pending step + its
+// estimated time + the absolute clock time. Times are estimates (background job). A tooltip draws the
+// FULL configured sequence; when the estimate is past due, the line is highlighted and the tooltip
+// says the send is imminent. Re-renders on a light timer so the relative ETA stays fresh.
 function FollowUpLine({
   followUp,
   lang,
@@ -747,8 +819,8 @@ function FollowUpLine({
       { step: followUp.nextStep, total: followUp.totalSteps, when, at },
     );
   } else {
-    // Only the forward-looking estimate lives at the foot now. "Complete" is anchored right after the
-    // last follow-up bubble (FollowUpComplete, item 19); "none yet" is hidden (item 7).
+    // NOTE: Only the forward-looking estimate lives at the foot. "Complete" is anchored right after the
+    // last follow-up bubble (FollowUpComplete); "none yet" is hidden.
     return null;
   }
 
@@ -758,13 +830,13 @@ function FollowUpLine({
   const tooltipContent = (
     <div className="flex flex-col gap-2 text-left">
       {imminentHint && (
-        <div className="flex items-start gap-1.5 rounded bg-warning/15 px-2 py-1.5 text-warning">
+        <div className="bg-warning/15 text-warning flex items-start gap-1.5 rounded px-2 py-1.5">
           <Clock className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
           <span>{imminentHint}</span>
         </div>
       )}
       {paused && (
-        <div className="flex items-start gap-1.5 rounded bg-bg-tertiary px-2 py-1.5 text-text-secondary">
+        <div className="bg-bg-tertiary text-text-secondary flex items-start gap-1.5 rounded px-2 py-1.5">
           <CalendarClock
             className="mt-0.5 h-3 w-3 shrink-0"
             aria-hidden="true"
@@ -778,7 +850,7 @@ function FollowUpLine({
         </div>
       )}
       {!imminent && followUp.nextRunAtDeferred && (
-        <div className="flex items-start gap-1.5 rounded bg-bg-tertiary px-2 py-1.5 text-text-secondary">
+        <div className="bg-bg-tertiary text-text-secondary flex items-start gap-1.5 rounded px-2 py-1.5">
           <Clock className="mt-0.5 h-3 w-3 shrink-0" aria-hidden="true" />
           <span>
             {t(
@@ -789,7 +861,7 @@ function FollowUpLine({
         </div>
       )}
       <div className="flex flex-col gap-1.5">
-        <span className="font-semibold text-[10px] text-text-muted uppercase tracking-wider">
+        <span className="text-text-muted text-[10px] font-semibold tracking-wider uppercase">
           {t("conversation.followUp.sequenceTitle", "Follow-up sequence")}
         </span>
         <ul className="flex flex-col gap-1">
@@ -812,9 +884,9 @@ function FollowUpLine({
               <li key={i} className="flex flex-wrap items-center gap-1.5">
                 <span
                   className={cn(
-                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-full font-semibold text-[10px]",
+                    "flex h-4 w-4 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold",
                     isNext
-                      ? "bg-accent text-accent-foreground"
+                      ? "bg-accent-solid text-accent-foreground"
                       : "bg-bg-tertiary text-text-secondary",
                   )}
                 >
@@ -830,14 +902,14 @@ function FollowUpLine({
                 {s.assignLabels.map((label) => (
                   <span
                     key={label}
-                    className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[10px] text-text-secondary"
+                    className="bg-bg-tertiary text-text-secondary inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
                   >
                     <Tag className="h-2.5 w-2.5 shrink-0" aria-hidden="true" />
                     {label}
                   </span>
                 ))}
                 {s.resolve && (
-                  <span className="inline-flex items-center gap-1 text-[10px] text-success">
+                  <span className="text-success inline-flex items-center gap-1 text-[10px]">
                     <CheckCircle2
                       className="h-2.5 w-2.5 shrink-0"
                       aria-hidden="true"
@@ -854,8 +926,8 @@ function FollowUpLine({
         </ul>
       </div>
       {followUp.hours && (
-        <div className="flex flex-col gap-0.5 border-border border-t pt-1.5">
-          <span className="flex items-center gap-1 font-semibold text-[10px] text-text-muted uppercase tracking-wider">
+        <div className="border-border flex flex-col gap-0.5 border-t pt-1.5">
+          <span className="text-text-muted flex items-center gap-1 text-[10px] font-semibold tracking-wider uppercase">
             <CalendarClock
               className="h-2.5 w-2.5 shrink-0"
               aria-hidden="true"
@@ -895,7 +967,7 @@ function FollowUpLine({
                   )}
             </span>
           )}
-          <span className="text-[10px] text-text-muted">
+          <span className="text-text-muted text-[10px]">
             {followUp.hours.timezone}
           </span>
         </div>
@@ -908,7 +980,7 @@ function FollowUpLine({
       <div
         className={cn(
           "flex items-center justify-center gap-1.5 text-xs",
-          imminent ? "font-medium text-accent" : "text-text-muted",
+          imminent ? "text-accent font-medium" : "text-text-muted",
         )}
       >
         <Clock className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -968,7 +1040,7 @@ function RedirectFollowUpLine({
 
   const tooltipContent = (
     <div className="flex flex-col gap-1.5 text-left">
-      <span className="font-semibold text-[10px] text-text-muted uppercase tracking-wider">
+      <span className="text-text-muted text-[10px] font-semibold tracking-wider uppercase">
         {t("conversation.followUp.redirectTitle", "WhatsApp → chat redirect")}
       </span>
       <span className="text-text-secondary">
@@ -985,7 +1057,7 @@ function RedirectFollowUpLine({
       <div
         className={cn(
           "flex items-center justify-center gap-1.5 text-xs",
-          imminent ? "font-medium text-accent" : "text-text-muted",
+          imminent ? "text-accent font-medium" : "text-text-muted",
         )}
       >
         <ArrowRightLeft className="h-3 w-3 shrink-0" aria-hidden="true" />
@@ -1053,7 +1125,7 @@ function AppointmentRemindersLine({
 
   return (
     <Tooltip content={tooltipContent}>
-      <div className="flex items-center justify-center gap-1.5 text-text-muted text-xs">
+      <div className="text-text-muted flex items-center justify-center gap-1.5 text-xs">
         <CalendarClock className="h-3 w-3 shrink-0" aria-hidden="true" />
         <span>{label}</span>
       </div>
@@ -1065,6 +1137,9 @@ export function ConversationDetailPage() {
   const { t, i18n } = useTranslation();
   const { showToast } = useToast();
   const { id = "" } = useParams();
+  // A conversation opened from a document approval's page offers the way back to it.
+  const [searchParams] = useSearchParams();
+  const backToApproval = approvalBreadcrumb(searchParams.get("from"));
   // Metadata shell (fast) and the message thread (slow, live from Chatwoot) load independently so
   // the page renders immediately and only the messages area spins.
   const [conv, setConv] = useState<ConversationDetail | null>(null);
@@ -1081,11 +1156,9 @@ export function ConversationDetailPage() {
   // After returning a conversation to the AI we reveal a "Respond now" action (it can answer the
   // pending tail immediately instead of waiting for the next inbound message). Reset once used.
   const [offerReengage, setOfferReengage] = useState(false);
-  // QUEM PODE FAZER O AGENTE FALAR COM O CLIENTE (issue #753). Esta tela é a única do console que não
-  // é admin-gated, de propósito: o atendente opera a conversa aqui (transferir, devolver à IA, mudar
-  // status). Re-engajar não é operar, é disparar um turno proativo para o cliente, e a rota passou a
-  // pedir `TENANT_ADMIN`. Oferecer o botão a quem a rota vai recusar é um 403 por aperto de botão,
-  // que lê como defeito do produto e convida a apertar de novo.
+  // Re-engaging fires a proactive turn at the customer, so its route asks `TENANT_ADMIN`, while
+  // this page is deliberately open to attendants for operating the conversation. Offering the button
+  // to someone the route refuses is a 403 per click.
   const { user } = useAuth();
   const mayReengage = isAdminRole(user?.role);
   const [activity, setActivity] = useState<ActivityState>(null);
@@ -1384,8 +1457,13 @@ export function ConversationDetailPage() {
       canLoadOlder,
     ],
   );
-  // Resolve a reply's quoted message (item 11): map id → message, so a bubble that quotes another can
-  // show a WhatsApp-style preview when the referenced message is in the loaded window.
+  // Each decision tick's previous tick of the same agent, for the collapsed marker's "what changed".
+  const previousTicks = useMemo(
+    () => previousDecisionTicks(conv?.trail ?? []),
+    [conv?.trail],
+  );
+  // Resolve a reply's quoted message: map id to message, so a bubble that quotes another can show a
+  // WhatsApp-style preview when the referenced message is in the loaded window.
   const messagesById = useMemo(() => {
     const map = new Map<number, Message>();
     for (const m of messages) if (m.id != null) map.set(m.id, m);
@@ -1471,9 +1549,9 @@ export function ConversationDetailPage() {
     }
   }
 
-  // Re-engage (item 6): re-fire the agent turn over the unanswered tail, without waiting for a new
-  // customer message. Toast reflects the outcome (posted / gate held by a human / contact not
-  // authorized / nothing to answer).
+  // Re-engage: re-fire the agent turn over the unanswered tail, without waiting for a new customer
+  // message. Toast reflects the outcome (posted / gate held by a human / contact not authorized /
+  // nothing to answer).
   async function reengage() {
     setOfferReengage(false);
     setBusy(true);
@@ -1488,10 +1566,9 @@ export function ConversationDetailPage() {
           "success",
         );
       } else if (data.outcome === "posted-partial") {
-        // NOT the `noReply` fallback it used to land in (issue #429). Part of the answer IS with the
-        // customer, and telling the operator nothing was sent invites them to re-engage again — which
-        // re-runs the turn and sends that part a second time. Warning, not success: the reply came
-        // out short and the conversation carries the badge saying so.
+        // NOTE: Not the `noReply` fallback: part of the answer IS with the customer, and saying nothing was
+        // sent invites a re-engage that sends that part a second time. Warning, not success, because the
+        // conversation carries the short-reply badge.
         showToast(
           t(
             "conversation.reengage.postedPartial",
@@ -1564,47 +1641,23 @@ export function ConversationDetailPage() {
   // places that genuinely mean a person (the header's assignee line).
   const heldByOther = conv?.heldByAnotherParty === true;
   const isHuman = conv?.assigneeType === "User";
-  // Whether anything ANSWERS this inbox (issue #495): a responder bound, switched on, and not in
-  // monitoring mode. The three actions that hand the conversation to the AI — return, reopen (the
-  // same operation on a resolved one) and respond now — are offered only then. Without one, the
-  // server refuses the return (409) and the reengage (`no-agent`); offering the button first just
-  // parked the conversation pending with nobody on it, on an inbox an observer only watches.
-  // ...AND A BOT TO ANSWER WITH (issue #495 review, round 2). A binding is not an identity: with the
-  // `ChatwootAgentBot` row gone — an instance reconnected, the bot deleted upstream, the reconcile
-  // not run — the server refuses the return with a 409 and the re-engage cannot load the agent, so
-  // offering either just hands the operator a button that fails.
+  // Whether anything ANSWERS this inbox: a responder bound, switched on, with a bot, and not in
+  // monitoring mode. Return, reopen and respond now are offered only then, because without one the
+  // server refuses them (409, `no-agent`) and the button only fails.
   const responderAnswers =
     conv?.agentId != null &&
     conv.agentEnabled === true &&
     conv.agentHasBot === true &&
     conv.agentMode !== "monitoring" &&
-    // NOTE: ...and a `test` agent answers only where `/teste` activated it (issue #495 review,
-    // round 11). The server refuses the hand-back for an unactivated one with
-    // `errors.returnAgentTestSilent`, so offering the button is offering a 409. `testActivatedAt`
-    // here is already the EPISODE's answer (issue #261) rather than this row's stamp, which is the
-    // same question the server asks, so a conversation activated through its redirect sibling keeps
-    // the button.
+    // NOTE: A `test` agent answers only where `/teste` activated it; the server refuses the hand-back
+    // otherwise (`errors.returnAgentTestSilent`). `testActivatedAt` is already the episode's answer, the
+    // same question the server asks, so activation through a redirect sibling keeps the button.
     (conv.agentMode !== "test" || conv.testActivatedAt != null);
-  // WHY the actions are missing, in the operator's words (issue #495 review, round 13). Hiding them
-  // on its own is the half that leaves somebody looking for a button that is not there, with no way
-  // to tell a deliberate rule from a bug — and this predicate reads the MIRROR, so on the one
-  // conversation where it is wrong the operator had nothing at all to go on. Derived from fields the
-  // detail already carries, so it costs no call; a null here is either "everything is fine" or "no
-  // agent is bound", which the panel above already says on its own.
-  // TWO STRINGS, NOT ONE (issue #494 manual test): a `label` short enough to sit in the action row
-  // beside the buttons it replaces, and the sentence that says what to DO about it, behind the row's
-  // `?`. One sentence inline was the first shape and it broke the layout — the row is a flex line of
-  // buttons, and a hundred-and-twenty-character sentence dropped into it wraps and pushes the
-  // navigation around. docs/ui.md is right that a detected misconfiguration belongs on screen rather
-  // than behind an affordance; what belongs there is the CONDITION, which is three words, and not
-  // the remediation, which is a sentence.
-  //
-  // NO RESPONDER AT ALL is the FIRST case, not the excluded one (issue #495 review, round 16).
-  // Round 13 left it out saying the panel above already says it, and the panel does not: with no
-  // assignee it prints the generic "AI" label, which claims an answerer this inbox does not have,
-  // and with a person on it it prints their name and the inbox. Either way the three actions vanish
-  // with nothing on screen naming the cause, which is the very state the server refuses by name
-  // (`errors.returnNoResponder`).
+  // WHY the actions are missing, derived from fields the detail already carries (no call), so the
+  // operator can tell a deliberate rule from a bug. Two strings: a `label` short enough for the action
+  // row (a full sentence wraps the flex row of buttons) and the remediation behind the row's `?`.
+  // No responder at all is covered too: the panel above prints a generic "AI" or a person's name there,
+  // which names no cause.
   const noResponder: { label: string; detail: string } | null =
     conv == null || responderAnswers
       ? null
@@ -1663,13 +1716,24 @@ export function ConversationDetailPage() {
 
   return (
     <PageContainer size="wide" className="flex h-full min-h-0 flex-col gap-4">
-      <Link
-        to="/conversations"
-        className="inline-flex w-fit items-center gap-1.5 text-sm text-text-muted hover:text-text-primary"
-      >
-        <ArrowLeft className="h-4 w-4" aria-hidden="true" />
-        {t("conversation.back", "Back to conversations")}
-      </Link>
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1.5">
+        <Link
+          to="/conversations"
+          className="text-text-muted hover:text-text-primary inline-flex w-fit items-center gap-1.5 text-sm"
+        >
+          <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+          {t("conversation.back", "Back to conversations")}
+        </Link>
+        {backToApproval && (
+          <Link
+            to={backToApproval}
+            className="text-accent inline-flex w-fit items-center gap-1.5 text-sm hover:underline"
+          >
+            <ArrowLeft className="h-4 w-4" aria-hidden="true" />
+            {t("conversation.backToApproval", "Back to the approval")}
+          </Link>
+        )}
+      </div>
 
       <DataBoundary
         loading={metaLoading}
@@ -1682,7 +1746,7 @@ export function ConversationDetailPage() {
             <Card className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
-                  <h1 className="truncate font-semibold text-lg text-text-primary">
+                  <h1 className="text-text-primary truncate text-lg font-semibold">
                     {conv.contact?.name ??
                       t("conversations.unknownContact", "Unknown contact")}
                   </h1>
@@ -1698,7 +1762,7 @@ export function ConversationDetailPage() {
                   {conv.agentMode === "monitoring" && <MonitoringBadge />}
                   {conv.outOfHours && <OutOfHoursBadge />}
                 </div>
-                <p className="mt-0.5 flex items-center gap-1.5 text-sm text-text-muted">
+                <p className="text-text-muted mt-0.5 flex items-center gap-1.5 text-sm">
                   {isHuman ? (
                     <>
                       <User className="h-3.5 w-3.5" aria-hidden="true" />
@@ -1710,7 +1774,7 @@ export function ConversationDetailPage() {
                   ) : (
                     <>
                       <Bot
-                        className="h-3.5 w-3.5 text-accent"
+                        className="text-accent h-3.5 w-3.5"
                         aria-hidden="true"
                       />
                       {conv.agentName ?? t("conversations.assignee.ai", "AI")}
@@ -1718,12 +1782,11 @@ export function ConversationDetailPage() {
                   )}
                   {conv.inbox?.name ? ` · ${conv.inbox.name}` : ""}
                   {conv.observers.length > 0 ? (
-                    <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 text-[11px] text-text-secondary">
+                    <span className="bg-bg-tertiary text-text-secondary inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px]">
                       <Eye className="h-3 w-3" aria-hidden="true" />
                       {t("conversations.observedByLabel", "Observed by")}
-                      {/* Each observer is a link to its own page (issue #494): the badge was the
-                          only place the watcher acting on this conversation was named, and it
-                          led nowhere. */}
+                      {/* Each observer is a link to its own page: the badge is the only place the watcher
+                          acting on this conversation is named. */}
                       {conv.observers.map((o, i) => (
                         <span key={o.id}>
                           {i > 0 ? ", " : null}
@@ -1738,7 +1801,7 @@ export function ConversationDetailPage() {
                     </span>
                   ) : null}
                   {!isHuman && conv.agentModel ? (
-                    <span className="inline-flex items-center gap-1 rounded bg-bg-tertiary px-1.5 py-0.5 font-mono text-[11px] text-text-secondary">
+                    <span className="bg-bg-tertiary text-text-secondary inline-flex items-center gap-1 rounded px-1.5 py-0.5 font-mono text-[11px]">
                       {conv.agentModel}
                     </span>
                   ) : null}
@@ -1756,7 +1819,7 @@ export function ConversationDetailPage() {
                     {conv.contact.voiceReply === true ? (
                       <>
                         <Volume2
-                          className="h-3.5 w-3.5 text-success"
+                          className="text-success h-3.5 w-3.5"
                           aria-hidden="true"
                         />
                         <span className="text-text-secondary">
@@ -1769,7 +1832,7 @@ export function ConversationDetailPage() {
                     ) : conv.contact.voiceReply === false ? (
                       <>
                         <Type
-                          className="h-3.5 w-3.5 text-info"
+                          className="text-info h-3.5 w-3.5"
                           aria-hidden="true"
                         />
                         <span className="text-text-secondary">
@@ -1800,21 +1863,16 @@ export function ConversationDetailPage() {
                   />
                 </div>
               </div>
-              {/* Actions + navigation. Below lg: one wrapping row (item 12) — below sm they stack
-                  full-width; at sm+ they flow right-aligned and wrap as the width shrinks. The two
-                  inner groups are `contents` here, so they vanish from layout and the buttons flow
-                  flat exactly as before. At lg+ the outer turns into a right-aligned column and each
-                  group becomes its own row: line 1 = status actions, line 2 = the links (item 4).
-                  Status IS the AI on/off signal (pending = AI handling, open/snoozed = a human owns
-                  it, resolved = closed). "Configure agent" stays last so it sits at the right edge. */}
+              {/* Actions + navigation. Below lg: one wrapping row, stacked full-width below sm and
+                  right-aligned from sm; the two inner groups are `contents` so the buttons flow flat. At lg+
+                  the outer is a right-aligned column and each group its own row (status actions, then links).
+                  Status IS the AI on/off signal (pending = AI handling, open/snoozed = a human owns it,
+                  resolved = closed). "Configure agent" stays last so it sits at the right edge. */}
               <div className="flex flex-col items-stretch gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end lg:flex-col lg:flex-nowrap lg:items-end lg:gap-2">
                 <div className="contents lg:flex lg:flex-row lg:flex-wrap lg:items-center lg:justify-end lg:gap-2">
-                  {/* Who HOLDS it, not what the status says. `pending` is the AI's state and also
-                      the state a takeover leaves behind — the hand-back sets it and then finds a
-                      person there — so keying these two buttons on status alone offered "handoff to
-                      human" on a conversation a human already had, and hid "Return to AI" on the one
-                      conversation that needed it. That is the shape of the bug this whole change is
-                      about, reappearing in the console. */}
+                  {/* Who HOLDS it, not what the status says: `pending` is also the state a takeover leaves
+                      behind, so keying on status alone would offer "handoff to human" to a conversation a human
+                      already has and hide "Return to AI" where it is needed. */}
                   {conv.status === "pending" && !heldByOther && (
                     <Button
                       variant="secondary"
@@ -1833,7 +1891,7 @@ export function ConversationDetailPage() {
                     </Button>
                   )}
                   {noResponder !== null && (
-                    <span className="inline-flex items-center gap-1 text-text-muted text-xs">
+                    <span className="text-text-muted inline-flex items-center gap-1 text-xs">
                       {noResponder.label}
                       <HelpPopover
                         content={noResponder.detail}
@@ -1856,10 +1914,8 @@ export function ConversationDetailPage() {
                       {t("conversation.reopen", "Reopen")}
                     </Button>
                   )}
-                  {/* `resolved` is excluded on BOTH sides: "Reopen" above already runs this exact
-                      operation, so letting the holder clause add "Return to AI" there rendered two
-                      differently labelled buttons for one action. Reopen is the right label for a
-                      closed conversation whoever holds it, so it keeps that state alone. */}
+                  {/* `resolved` is excluded on BOTH sides: "Reopen" above runs this same operation, so the
+                      holder clause adding "Return to AI" would render two labels for one action. */}
                   {conv.status !== "resolved" &&
                     responderAnswers &&
                     (heldByOther || conv.status !== "pending") && (
@@ -1915,7 +1971,7 @@ export function ConversationDetailPage() {
                 <div className="contents lg:flex lg:flex-row lg:flex-wrap lg:items-center lg:justify-end lg:gap-2">
                   <Link
                     to={`/logs?conversationId=${id}`}
-                    className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                    className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm"
                   >
                     <ScrollText className="h-4 w-4" aria-hidden="true" />
                     {t("conversation.viewLogs", "View logs")}
@@ -1925,29 +1981,35 @@ export function ConversationDetailPage() {
                       href={chatwootUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                      className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm"
                     >
                       <ExternalLink className="h-4 w-4" aria-hidden="true" />
                       {t("conversation.openInChatwoot", "Open in Chatwoot")}
                     </a>
                   )}
+                  {mayReengage && (
+                    <DecisionsTestButton
+                      conversationId={id}
+                      observerIds={conv.observers.map((o) => o.id)}
+                    />
+                  )}
                   {conv.agentId && (
                     <Link
                       to={`/agents/${conv.agentId}/general?from=/conversations/${id}`}
-                      className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                      className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm"
                     >
                       <Settings className="h-4 w-4" aria-hidden="true" />
                       {t("conversation.configureAgent", "Configure agent")}
                     </Link>
                   )}
-                  {/* With no responder, the observer is the only agent acting on this conversation,
-                      and the page offered no way to reach it (issue #494). */}
+                  {/* With no responder, the observer is the only agent acting on this conversation, so
+                      the page links to it. */}
                   {!conv.agentId &&
                     conv.observers.map((o) => (
                       <Link
                         key={o.id}
                         to={`/agents/${o.id}/general?from=/conversations/${id}`}
-                        className="inline-flex items-center justify-center gap-1.5 rounded-lg border border-border px-2.5 py-1.5 text-sm text-text-secondary hover:bg-bg-hover hover:text-text-primary"
+                        className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center justify-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-sm"
                       >
                         <Settings className="h-4 w-4" aria-hidden="true" />
                         {t(
@@ -1963,31 +2025,33 @@ export function ConversationDetailPage() {
               </div>
             </Card>
 
+            <ConversationApprovals
+              conversationId={id}
+              refreshKey={messages.length}
+            />
+
             {conv.lastError && (
-              <Card className="flex flex-wrap items-center justify-between gap-3 border-warning/40 bg-warning-soft">
+              <Card className="border-warning/40 bg-warning-soft flex flex-wrap items-center justify-between gap-3">
                 <div className="flex min-w-0 items-start gap-2">
                   <AlertTriangle
-                    className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                    className="text-warning mt-0.5 h-4 w-4 shrink-0"
                     aria-hidden="true"
                   />
                   <div className="min-w-0">
-                    <p className="font-medium text-sm text-text-primary">
+                    <p className="text-text-primary text-sm font-medium">
                       {t(
                         "conversation.reengage.failedTitle",
                         "The AI couldn't finish its last turn",
                       )}
                     </p>
-                    <p className="mt-0.5 break-words text-text-muted text-xs">
+                    <p className="text-text-muted mt-0.5 text-xs break-words">
                       {conv.lastError}
                     </p>
                   </div>
                 </div>
-                {/* Gated like the other two (issue #495 review, round 1): this button calls the
-                    same endpoint, which answers `no-agent` on an inbox nothing answers, and a
-                    conversation keeps its `lastError` long after its responder was unbound.
-                    E PELO RANK também (issue #753), que é a mesma razão em outra dimensão: este
-                    botão chama a mesma rota, que agora pede `TENANT_ADMIN`, e um `lastError` antigo
-                    faz este card aparecer para um atendente muito depois de o turno ter falhado. */}
+                {/* Gated like the other two: the same endpoint answers `no-agent` on an inbox nothing
+                    answers and asks `TENANT_ADMIN`, while `lastError` outlives both the unbinding of the
+                    responder and the failed turn. */}
                 {mayReengage && responderAnswers && (
                   <Button
                     variant="secondary"
@@ -2005,7 +2069,7 @@ export function ConversationDetailPage() {
             <div
               ref={scrollRef}
               onScroll={onMessagesScroll}
-              className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-xl border border-border bg-bg-secondary p-6"
+              className="border-border bg-bg-secondary flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto rounded-xl border p-6"
             >
               {messagesLoading ? (
                 <div className="flex flex-col gap-3" role="status">
@@ -2013,24 +2077,24 @@ export function ConversationDetailPage() {
                     {t("conversation.loadingMessages", "Loading messages…")}
                   </span>
                   <div className="flex justify-start">
-                    <div className="max-w-[80%] rounded-2xl bg-bg-tertiary/40 px-3 py-2">
+                    <div className="bg-bg-tertiary/40 max-w-[80%] rounded-2xl px-3 py-2">
                       <Skeleton className="h-3 w-20" />
                       <Skeleton className="mt-1.5 h-3.5 w-48" />
                     </div>
                   </div>
                   <div className="flex justify-end">
-                    <div className="max-w-[80%] rounded-2xl bg-accent/10 px-3 py-2">
+                    <div className="bg-accent-soft max-w-[80%] rounded-2xl px-3 py-2">
                       <Skeleton className="h-3.5 w-32" />
                     </div>
                   </div>
                   <div className="flex justify-start">
-                    <div className="max-w-[80%] rounded-2xl bg-bg-tertiary/40 px-3 py-2">
+                    <div className="bg-bg-tertiary/40 max-w-[80%] rounded-2xl px-3 py-2">
                       <Skeleton className="h-3.5 w-56" />
                       <Skeleton className="mt-1.5 h-3.5 w-40" />
                     </div>
                   </div>
                   <div className="flex justify-end">
-                    <div className="max-w-[80%] rounded-2xl bg-accent/10 px-3 py-2">
+                    <div className="bg-accent-soft max-w-[80%] rounded-2xl px-3 py-2">
                       <Skeleton className="h-3.5 w-44" />
                     </div>
                   </div>
@@ -2041,7 +2105,7 @@ export function ConversationDetailPage() {
                 // notice, instead of hiding the whole timeline.
                 <div className="flex flex-col gap-4">
                   <div className="flex flex-col items-center gap-3 py-6 text-center">
-                    <p className="text-sm text-text-muted">
+                    <p className="text-text-muted text-sm">
                       {t(
                         "conversation.messagesUnavailable",
                         "Couldn't load the messages from Chatwoot.",
@@ -2057,14 +2121,18 @@ export function ConversationDetailPage() {
                   </div>
                   {timeline.items.map((item) =>
                     item.kind === "trail" ? (
-                      <TrailMarker key={item.key} entry={item.entry} />
+                      <TrailMarker
+                        key={item.key}
+                        entry={item.entry}
+                        previous={previousTicks.get(item.entry.id)}
+                      />
                     ) : item.kind === "usage" ? (
                       <TurnUsageMarker key={item.key} turn={item.turn} />
                     ) : null,
                   )}
                 </div>
               ) : timeline.items.length === 0 ? (
-                <p className="py-8 text-center text-sm text-text-muted">
+                <p className="text-text-muted py-8 text-center text-sm">
                   {t("conversation.noMessages", "No messages yet.")}
                 </p>
               ) : (
@@ -2075,7 +2143,7 @@ export function ConversationDetailPage() {
                         type="button"
                         onClick={() => void loadOlder()}
                         disabled={loadingOlder}
-                        className="rounded-full border border-border px-3 py-1 text-text-muted text-xs hover:bg-bg-tertiary hover:text-text-primary disabled:opacity-60"
+                        className="border-border text-text-muted hover:bg-bg-tertiary hover:text-text-primary rounded-full border px-3 py-1 text-xs disabled:opacity-60"
                       >
                         {loadingOlder
                           ? t(
@@ -2088,7 +2156,13 @@ export function ConversationDetailPage() {
                   )}
                   {timeline.items.map((item) => {
                     if (item.kind === "trail") {
-                      return <TrailMarker key={item.key} entry={item.entry} />;
+                      return (
+                        <TrailMarker
+                          key={item.key}
+                          entry={item.entry}
+                          previous={previousTicks.get(item.entry.id)}
+                        />
+                      );
                     }
                     if (item.kind === "usage") {
                       return (

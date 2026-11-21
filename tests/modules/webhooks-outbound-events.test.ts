@@ -16,6 +16,7 @@ import {
   listWebhookSubscriptions,
   updateWebhookSubscription,
 } from "@/modules/webhooks/outbound/subscriptions";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { outboundUrl } from "../utils/outbound";
 
 // ── pure unit (no DB) ──
@@ -29,6 +30,11 @@ describe("outbound events", () => {
       "kanban.card_moved",
       "llm.usage",
       "tenant.created",
+      "document.approval_requested",
+      "document.approval_decided",
+      "document.approval_outcome",
+      "channel.connected",
+      "channel.disconnected",
       "heartbeat",
     ]);
   });
@@ -77,8 +83,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

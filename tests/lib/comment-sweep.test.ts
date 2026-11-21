@@ -8,8 +8,10 @@ import {
   overCeiling,
   overLedger,
   raisedEntries,
+  renderLedger,
   staleEntries,
   sweptFiles,
+  taggedDocstrings,
 } from "@/tests/utils/comment-blocks";
 import { COMMENT_LEDGER } from "./comment-ledger";
 
@@ -38,6 +40,40 @@ describe("what the sweep reads as provenance", () => {
       "/* see https://github.com/acme/app/issues/9#issuecomment-1 */",
     ]) {
       expect(citesProvenance(block(text))).toBe(true);
+    }
+  });
+
+  test("history told without a number", () => {
+    for (const text of [
+      "// Review found both halves of that.",
+      "// Flagged by Codex on the last pass.",
+      "// Kept after review r6.",
+      "// The branch that was dropped (r3).",
+      "// Before the fix they were identical.",
+      "// The first version of this check looked only at the product.",
+      "// This used to vanish silently.",
+      "// The order used to be the reverse.",
+      "// Measured on a real socket, the server reads the path.",
+      "// This PR moves the check to the boundary.",
+      "// Nesta PR a regra mudou.",
+      "// Caso real: o turno travou.",
+      "// The flag this\n// used to carry.",
+      "// Found during a pass, and flagged\n// by Codex.",
+    ]) {
+      expect(citesProvenance(block(text))).toBe(true);
+    }
+  });
+
+  test("the same words stating a present fact stay prose", () => {
+    for (const text of [
+      "// A read that started before the change is still on the wire.",
+      "// Used to name the downloaded graph image.",
+      "// Measured on the repaired text, not on the value.",
+      "// The first attempt fails fast.",
+      "// A token that no longer matches is refused.",
+      "// Uma correção apoiada no id erraria calada o caso real.",
+    ]) {
+      expect(citesProvenance(block(text))).toBe(false);
     }
   });
 
@@ -151,6 +187,125 @@ describe("the line ceiling", () => {
     expect(commentBlocks("// biome-ignore lint/x: reason #12")).toEqual([]);
     expect(commentBlocks("// @full-only\nconst a = 1;")).toEqual([]);
   });
+
+  test("a server i18n anchor is a directive, and the prose above it is still its own block", () => {
+    const anchors = Array.from(
+      { length: BLOCK_LINE_CEILING + 2 },
+      (_, i) => `// translate('errors.k${i}', 'Default ${i}.')`,
+    ).join("\n");
+    expect(commentBlocks(anchors)).toEqual([]);
+    const withProse = `// Declared here for the extractor.\n${anchors}`;
+    expect(commentBlocks(withProse).map((b) => b.lines)).toEqual([1]);
+    expect(commentBlocks("// we translate here before sending")).toHaveLength(
+      1,
+    );
+  });
+});
+
+describe("a comment above a declaration documents it, and takes no NOTE:", () => {
+  test("a tagged comment directly above a statement that declares a name", () => {
+    for (const decl of [
+      "const LIMIT = 3;",
+      "  let pending = 0;",
+      "export function run() {}",
+      "export default async function main() {}",
+      "export async function* rows() {}",
+      "class Queue {}",
+      "export abstract class Base {}",
+      "interface Row { id: number }",
+      "export type Id = string;",
+      "type Pair<T> = [T, T];",
+      "enum Mode { A }",
+      "declare const VERSION: string;",
+      "  const { a, b } = pick();",
+      "  const [first] = rows;",
+    ]) {
+      expect(taggedDocstrings(`// NOTE: why it exists.\n${decl}\n`)).toEqual([
+        1,
+      ]);
+    }
+    expect(
+      taggedDocstrings(
+        "/* NOTE: a block comment\n   over two lines */\nconst x = 1;\n",
+      ),
+    ).toEqual([1]);
+    expect(
+      taggedDocstrings(
+        "// NOTE: the first line carries the tag,\n// and the block ends here.\nconst x = 1;\n",
+      ),
+    ).toEqual([1]);
+  });
+
+  test("a directive between the docstring and the declaration does not hide it", () => {
+    expect(
+      taggedDocstrings(
+        "// NOTE: why it exists.\n// biome-ignore lint/x: reason\nconst x = 1;\n",
+      ),
+    ).toEqual([1]);
+    expect(
+      taggedDocstrings(
+        "// NOTE: the keys below.\n// t('a.b', 'A')\nconst x = 1;\n",
+      ),
+    ).toEqual([1]);
+  });
+
+  test("a trailing comment on the line above does not hide the run below it", () => {
+    expect(
+      taggedDocstrings(
+        "run(); // the call\n// NOTE: why it exists.\nconst x = 1;\n",
+      ),
+    ).toEqual([2]);
+  });
+
+  test("a comment-looking string is not a comment", () => {
+    expect(
+      taggedDocstrings("const a = `\n// NOTE: text\n`;\nconst x = 1;\n"),
+    ).toEqual([]);
+  });
+
+  test("an aside above a statement keeps its tag", () => {
+    for (const stmt of [
+      "  await flush();",
+      "  return rows;",
+      "  for (const row of rows) {}",
+      "  if (done) return;",
+      "  type = next;",
+      "  constant = 1;",
+      "  letters.push(x);",
+      "  classify(row);",
+    ]) {
+      expect(taggedDocstrings(`// NOTE: why.\n${stmt}\n`)).toEqual([]);
+    }
+  });
+
+  test("an untagged docstring, a trailing comment, a gap and a waiver are left alone", () => {
+    expect(taggedDocstrings("// Why it exists.\nconst x = 1;\n")).toEqual([]);
+    expect(taggedDocstrings("run(); // NOTE: aside\nconst x = 1;\n")).toEqual(
+      [],
+    );
+    expect(
+      taggedDocstrings("// NOTE: about the call above.\n\nconst x = 1;\n"),
+    ).toEqual([]);
+    expect(
+      taggedDocstrings(
+        "// NOTE: kept on purpose. comment-waiver: quoted by a test\nconst x = 1;\n",
+      ),
+    ).toEqual([]);
+    expect(taggedDocstrings("// TODO: split it.\nconst x = 1;\n")).toEqual([]);
+  });
+
+  test("no file in the tree tags a docstring", async () => {
+    const hits: string[] = [];
+    let scanned = 0;
+    for (const path of await sweptFiles()) {
+      const src = await Bun.file(path).text();
+      scanned += src.includes("NOTE:") ? 1 : 0;
+      for (const line of taggedDocstrings(src)) hits.push(`${path}:${line}`);
+    }
+    expect(hits).toEqual([]);
+    // NOTE: a scan that stopped finding files would pass the same way.
+    expect(scanned).toBeGreaterThan(500);
+  });
 });
 
 describe("history narration is reported, not enforced", () => {
@@ -182,6 +337,47 @@ describe("the ledger", () => {
       1,
     );
     expect(raisedEntries([["new.ts", [1, 0]]], {})).toHaveLength(1);
+  });
+
+  test("the rewrite prints an empty ledger the way the formatter prints an empty object", () => {
+    const header = [
+      "// Comment blocks each file may still carry, as [provenance, over the line ceiling]. Written by",
+      "// `bun run comments:ledger`; see tests/lib/comment-sweep.test.ts for what counts.",
+      'import type { FileCounts } from "@/tests/utils/comment-blocks";',
+      "",
+    ];
+    expect(renderLedger([], new Set(), new Set())).toBe(
+      [
+        ...header,
+        "export const COMMENT_LEDGER: Record<string, FileCounts> = {};",
+        "",
+      ].join("\n"),
+    );
+    expect(
+      renderLedger(
+        [
+          ["a.ts", [1, 0]],
+          ["pro.ts", [0, 2]],
+          ["master.ts", [3, 1]],
+        ],
+        new Set(["pro.ts"]),
+        new Set(["master.ts"]),
+      ),
+    ).toBe(
+      [
+        ...header,
+        "export const COMMENT_LEDGER: Record<string, FileCounts> = {",
+        '  "a.ts": [1, 0],',
+        "  // @full-only",
+        '  "pro.ts": [0, 2],',
+        "  // @full-only-end",
+        "  // @master-only",
+        '  "master.ts": [3, 1],',
+        "  // @master-only-end",
+        "};",
+        "",
+      ].join("\n"),
+    );
   });
 
   test("an entry above the file's count, or for a missing file, is stale", () => {

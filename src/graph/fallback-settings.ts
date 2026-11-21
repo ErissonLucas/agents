@@ -1,3 +1,4 @@
+import { MODEL_FALLBACK_RANGES } from "@/modules/agents/number-ranges";
 import { modelOptionalFor } from "./model-defaults";
 import {
   type ModelOverrideResolution,
@@ -5,16 +6,11 @@ import {
   resolveModelOverride,
 } from "./model-override";
 
-// THE SECOND PROVIDER, as the operator stored it and as the runtime reads it back.
-//
-// Sibling of `modules/tts/normalize-model` and of the summariser's read in `modules/memory/compact`:
-// all three name a model that is not the agent's own, and all three ask `resolveModelOverride` the
-// same four questions, because the answer that matters is the one about whose key travels where.
-//
-// What is NOT shared is the meaning of "everything absent". For the rewrite and the summariser that
-// means "run this on the agent's own model", which is the useful default that lets a feature ship on
-// by default. Here it would mean falling back to the provider that just failed, so it means the
-// opposite: no fallback exists, and the turn fails exactly as it does today.
+// The second provider, as the operator stored it and as the runtime reads it back. Like
+// `modules/tts/normalize-model` and the summariser's read in `modules/memory/compact`, it asks
+// `resolveModelOverride` whose key travels where. Unlike them, "everything absent" cannot mean "run on
+// the agent's own model", which here would retry the provider that just failed: it means no fallback
+// exists and the turn fails as it would without one.
 
 export interface FallbackOverrides {
   provider?: string | null;
@@ -28,6 +24,27 @@ export interface FallbackConfig {
   model: string | null;
   credentialRef: string | null;
   baseURL: string | null;
+  // How long each attempt may take, the primary's and the fallback's, in ms. null =
+  // MODEL_FALLBACK_TIMEOUT_DEFAULT_MS. Read only while a fallback exists: with none, the call keeps
+  // its retries under `config.agent.modelCallTimeoutMs`.
+  timeoutMs: number | null;
+}
+
+// The ceiling before this was configurable, kept as the default (see ./model-fallback). Here, not
+// there, because the editor reads it and ./model-fallback pulls in the provider-failure module.
+export const MODEL_FALLBACK_TIMEOUT_DEFAULT_MS = 45_000;
+
+// The reader's clamp, for a value stored before the schema refused it. The range itself lives with
+// every other configurable number (MODEL_FALLBACK_RANGES).
+export const MODEL_FALLBACK_TIMEOUT_RANGE_MS = [
+  MODEL_FALLBACK_RANGES.timeoutMs.min,
+  MODEL_FALLBACK_RANGES.timeoutMs.max,
+] as const;
+
+export function clampModelFallbackTimeout(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const [min, max] = MODEL_FALLBACK_TIMEOUT_RANGE_MS;
+  return Math.min(max, Math.max(min, Math.round(value)));
 }
 
 function str(v: unknown): string | null {
@@ -48,20 +65,16 @@ export function readModelFallbackConfig(settings: unknown): FallbackConfig {
     model: str(f.model),
     credentialRef: str(f.credentialRef),
     baseURL: str(f.baseURL),
+    timeoutMs: clampModelFallbackTimeout(f.timeoutMs),
   };
 }
 
-// A fallback exists once the operator named a DESTINATION, and the provider is what names it. Absent,
-// `resolveModelOverride` would happily complete the destination from the agent's own config and
-// produce the one configuration that must never exist: a second attempt against the provider that
-// just answered 503, indistinguishable in the settings from a real fallback.
-//
-// The model is required on top of that for every provider that needs one, which is the repo's
-// existing rule and not a rule of this block's own — `modelOptionalFor` is the single predicate the
-// model config's schema and the editor's save guard read too. This asked for BOTH halves for one
-// round, which made an `openai-compatible` fallback pointed at a single-model server impossible to
-// configure: that server discards the model name it is sent, so the operator would have had to
-// invent one, and the write boundary and the save gate were both refusing the empty field.
+// A fallback exists once the operator named a destination, and the provider names it. Without one,
+// `resolveModelOverride` would complete it from the agent's own config: a second attempt against the
+// provider that just answered 503, indistinguishable in the settings from a real fallback. The model
+// is also required unless `modelOptionalFor` (the predicate the schema and the editor's save guard
+// share) says the provider needs none: a single-model `openai-compatible` server discards the name it
+// is sent, so demanding one would make that fallback impossible to configure.
 export function hasModelFallback(cfg: FallbackConfig): boolean {
   if (cfg.provider === null) return false;
   return cfg.model !== null || modelOptionalFor(cfg.provider);

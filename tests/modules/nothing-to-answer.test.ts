@@ -19,14 +19,15 @@ import { closedByTheAgentSide } from "@/modules/conversations/resolution-origin"
 import { flushDebounceJob } from "@/modules/debounce/handler";
 import { debounceDedupeKey } from "@/modules/debounce/service";
 import type { ClaimedJob } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// Issue #895: a NEW conversation whose only customer message has nothing to answer (no text, no
-// attachment, no subject, no image in the body) used to stay `pending` and bot-owned forever. No turn
-// ran, so our side never spoke, so the follow-up never armed, and nothing was logged. Now the flush
-// and the direct path arm a delayed NOTHING_TO_ANSWER job, and the job closes it, with an `info` line
-// saying why, when everything it reads fresh still says there is nothing to answer.
+// A NEW conversation whose only customer message has nothing to answer (no text, no attachment, no
+// subject, no image in the body) runs no turn, so no follow-up would ever arm and it would stay
+// `pending` and bot-owned. The flush and the direct path arm a delayed NOTHING_TO_ANSWER job, which
+// closes it with an `info` line when everything it reads fresh still says there is nothing to
+// answer.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -44,8 +45,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -197,6 +198,29 @@ class Answers {
   }
 }
 
+class Silent {
+  calls = 0;
+  async invoke(): Promise<AIMessage> {
+    this.calls++;
+    return new AIMessage("");
+  }
+  bindTools(_t: unknown) {
+    return { invoke: () => this.invoke() };
+  }
+}
+
+// Answers, and keeps the text of every prompt it was handed.
+class Reads {
+  prompts: string[] = [];
+  async invoke(messages: unknown): Promise<AIMessage> {
+    this.prompts.push(JSON.stringify(messages));
+    return new AIMessage("Olá! Como posso ajudar?");
+  }
+  bindTools(_t: unknown) {
+    return { invoke: (m: unknown) => this.invoke(m) };
+  }
+}
+
 class NeverCalled {
   async invoke(): Promise<AIMessage> {
     throw new Error("nothing to answer must not reach the model");
@@ -272,7 +296,11 @@ async function flush(
   });
 }
 
-function event(convId: number, content: string): NormalizedChatwootEvent {
+function event(
+  convId: number,
+  content: string,
+  extra: { emailSubject?: string; inReplyTo?: number } = {},
+): NormalizedChatwootEvent {
   return {
     event: "message_created",
     conversationId: convId,
@@ -282,7 +310,13 @@ function event(convId: number, content: string): NormalizedChatwootEvent {
     assigneeId: OUR_BOT,
     assigneeName: null,
     contactInboxId: null,
-    message: { id: 2, content, messageType: "incoming", private: false },
+    message: {
+      id: 2,
+      content,
+      messageType: "incoming",
+      private: false,
+      ...extra,
+    },
   };
 }
 
@@ -290,15 +324,17 @@ async function direct(
   convId: number,
   cw: ReturnType<typeof chatwoot>,
   content = "",
+  opts: { emailSubject?: string; inReplyTo?: number; model?: unknown } = {},
 ) {
+  const { model, ...extra } = opts;
   return runAgentTurn({
     tenantId,
     instanceId,
     agentBotId: OUR_BOT,
-    event: event(convId, content),
+    event: event(convId, content, extra),
     base: appDb,
     deps: {
-      makeModel: () => new NeverCalled() as never,
+      makeModel: () => (model ?? new NeverCalled()) as never,
       makeClient: cw.makeClient as never,
       checkpointer: new MemorySaver(),
     },
@@ -379,6 +415,7 @@ async function resolvedBy(convId: number) {
 async function closeLines(convDbId: bigint, expectSome = true) {
   for (let i = 0; i < (expectSome ? 100 : 1); i++) {
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { conversationId: convDbId },
     });
     const mine = rows
@@ -394,7 +431,7 @@ async function closeLines(convDbId: bigint, expectSome = true) {
   return [];
 }
 
-// A customer message through the real receiver, so the retirement is measured at its call site.
+// A customer message through the real receiver, so the retirement is exercised at its call site.
 async function customerWrites(convId: number, content: string, id: number) {
   const n = normalizeChatwootEvent({
     event: "message_created",
@@ -613,6 +650,90 @@ describe.skipIf(!dbUp)(
       await flush(89_505, cw, model);
       expect(model.calls).toBeGreaterThan(0);
       expect(await armedRow(89_505)).toBeNull();
+    });
+
+    test("a flush with nothing pending arms nothing", async () => {
+      await seedConversation(89_506);
+      const cw = chatwoot([]);
+      await flush(89_506, cw, new NeverCalled());
+      expect(await armedRow(89_506)).toBeNull();
+    });
+
+    test("a turn that ran on an answerable burst and sent nothing arms nothing", async () => {
+      await seedConversation(89_507);
+      const cw = chatwoot([{ id: 2, content: "quero cancelar" }]);
+      const model = new Silent();
+      await flush(89_507, cw, model);
+      expect(model.calls).toBeGreaterThan(0);
+      expect(cw.sent).toEqual([]);
+      expect(await armedRow(89_507)).toBeNull();
+    });
+
+    test("a flush whose own message was already answered arms nothing, whatever blank sits before it", async () => {
+      // The page still carries an older blank message; the judgement is about the message that armed
+      // the flush, which had something to answer and is below the mark.
+      const conv = await seedConversation(89_601);
+      await suDb.conversation.update({
+        where: { id: conv.id },
+        data: { lastHandledMessageId: 2 },
+      });
+      const cw = chatwoot([
+        { id: 1, content: "" },
+        { id: 2, content: "quero cancelar" },
+      ]);
+      await flush(89_601, cw, new NeverCalled());
+      expect(await armedRow(89_601)).toBeNull();
+    });
+
+    test.each([
+      ["our own blank message", 89_602, { type: 1 }],
+      ["a blank private note", 89_603, { private: true }],
+    ] as const)(
+      "a flush whose message id names %s arms nothing",
+      async (_, convId, shape) => {
+        await seedConversation(convId);
+        const cw = chatwoot([{ id: 2, content: "", ...shape }]);
+        await flush(convId, cw, new NeverCalled());
+        expect(await armedRow(convId)).toBeNull();
+      },
+    );
+
+    // An email whose whole request is its subject is a message: both paths hand the model the
+    // subject, and neither arms the close.
+    test("an email whose only words are its subject reaches the model on the flush", async () => {
+      await seedConversation(89_706);
+      const cw = chatwoot([{ id: 2, content: "", subject: "Reembolso" }]);
+      const model = new Reads();
+      await flush(89_706, cw, model);
+      expect(model.prompts.join("\n")).toContain(
+        "<assunto>Reembolso</assunto>",
+      );
+      expect(await armedRow(89_706)).toBeNull();
+    });
+
+    // The reply case carries a body too: a quote is only re-rendered over a message that renders on
+    // its own, and the re-render is where the subject could be left behind.
+    test("and on the direct turn, a reply to an earlier message included", async () => {
+      for (const [convId, content, inReplyTo] of [
+        [89_707, "", undefined],
+        [89_708, "segue o número", 1],
+      ] as const) {
+        await seedConversation(convId);
+        const cw = chatwoot([
+          { id: 1, content: "pedido 4417" },
+          { id: 2, content, subject: "Reembolso" },
+        ]);
+        const model = new Reads();
+        await direct(convId, cw, content, {
+          emailSubject: "Reembolso",
+          ...(inReplyTo ? { inReplyTo } : {}),
+          model,
+        });
+        expect(
+          `${convId}: ${model.prompts.join("\n").includes("<assunto>Reembolso</assunto>")}`,
+        ).toBe(`${convId}: true`);
+        expect(await armedRow(convId)).toBeNull();
+      }
     });
 
     // ---- the job -------------------------------------------------------------------------------

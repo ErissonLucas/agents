@@ -3,9 +3,16 @@ import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
 import { DEFAULT_TIMEZONE, partsInTimezone } from "@/graph/time";
-import { AppError, NotFoundError } from "@/lib/errors";
+import {
+  AppError,
+  NotFoundError,
+  phrase,
+  quotingReason,
+  type TranslatedParam,
+} from "@/lib/errors";
+import { isForeignKeyViolation, isUniqueViolation } from "@/lib/pg-error";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
-import { unstorableProblem } from "@/lib/text";
+import { unstorablePhrase } from "@/lib/text";
 import type { CompanySettings } from "@/modules/tenant-settings/service";
 import {
   type DocumentBlock,
@@ -16,25 +23,21 @@ import {
 import { documentVerdict } from "./deliverable";
 import { documentDraws } from "./draws";
 import { formatDate, formatDocumentNumber } from "./format";
+import { lockNumbering, nextNumberFor } from "./numbering";
 import { renderDocumentPdf } from "./render";
 import { readRenderContext } from "./templates";
 import {
   type DocumentValues,
   invalidDocumentTemplate,
+  invalidDocumentValues,
   parseDocumentValues,
   parseTemplateContent,
 } from "./validate";
 
-// Issuing a document: one core, two callers (the REST route and the agent's own tool), as the API
-// contract requires.
-//
-// Two-phase and idempotent, transplanted from the quote generator it replaces because that part of
-// it was right: a burst, a retry or a resumed turn carrying the same idempotencyKey produces ONE
-// document and ONE PDF, never N numbered documents in front of one customer.
-//   Phase A (scoped): create the PENDING row race-safely on the [tenantId, idempotencyKey] unique
-//     and re-read. An already-READY row comes back untouched.
-//   Phase B (no tx): render the STORED snapshot — not the caller's argument — outside any
-//     transaction (this is CPU-bound), write it to a path derived from the row id, then CAS to READY.
+// Issuing a document: one core, two callers (the REST route and the agent's own tool). Two-phase and
+// idempotent, so a burst, retry or resumed turn with one idempotencyKey yields ONE numbered document.
+// Phase A (scoped) creates the PENDING row race-safely on [tenantId, idempotencyKey]; phase B renders
+// the STORED snapshot outside any transaction, writes it, then CASes to READY. See docs/documents.md.
 
 export interface DocumentSnapshot {
   blocks: DocumentBlock[];
@@ -99,24 +102,14 @@ export function calendarDay(at: Date, timezone: string): string {
 // The context for a tenant id this process read from a row, for the callers that HAVE one and no
 // request context: the agent's own document tool, whose tenant came off the thread it is answering.
 // `issueDocument` takes a TenantContext precisely so the id's provenance survives the call, and
-// TENANT_ADMIN is the honest answer for an id that never left the process (issue #280).
+// TENANT_ADMIN is the honest answer for an id that never left the process.
 export function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Where an issued document's bytes live, under the storage root.
-//
-// The `documents/` segment is the load-bearing part. An install upgraded from the quotes subsystem
-// keeps writing into the directory its QUOTES_STORAGE_DIR names (Coolify freezes that value, which
-// is why the fallback exists at all), and that directory already holds `<tenantId>/<quoteId>.pdf`
-// from before. `issued_documents` is a NEW table with a new sequence, so its ids start over and
-// collide with those file names — and a collision is not a lost file, it is the wrong customer's
-// document: `link` fails with EEXIST, the publish path reads that as "another renderer got here
-// first", adopts the file, and marks the row READY over a stranger's quote, which is then what the
-// download serves and what the agent attaches to the conversation.
-//
-// A segment no numeric id can produce keeps the two sets of files apart for good. Nothing has to be
-// migrated: the documents feature is new, so no install has a file under this scheme yet.
+// Where an issued document's bytes live, under the storage root. The `documents/` segment is
+// load-bearing: an upgraded install may share a directory with old `<tenantId>/<quoteId>.pdf`
+// files, and a colliding id would publish a stranger's quote (docs/documents.md, storage).
 export function storageKey(tenantId: bigint, documentId: bigint): string {
   return `${tenantId}/documents/${documentId}.pdf`;
 }
@@ -134,9 +127,32 @@ export function documentFileName(title: string, number: string | null): string {
   return `${base || "documento"}.pdf`;
 }
 
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002"
+// The key an approval issues under. Approving reuses whatever row already holds it, so a caller of
+// `issueDocument` may not write a new one: a document planted under it would be adopted by the
+// approval as if it were the snapshot the reviewer saw. A row that already holds such a key still
+// answers its retry, since older builds accepted the prefix.
+export const APPROVAL_KEY_PREFIX = "approval:";
+
+// The refusal for a key under the approval prefix, or null. Exported so the sentence can be asked
+// without the idempotency lookup that runs before it in `issueDocument`.
+export function reservedIdempotencyKeyRefusal(key: string): AppError | null {
+  return key.startsWith(APPROVAL_KEY_PREFIX)
+    ? invalidKey(
+        phrase(
+          "errors.idempotencyKeyReserved",
+          `idempotencyKey: the prefix "${APPROVAL_KEY_PREFIX}" is reserved for approved documents.`,
+          { prefix: APPROVAL_KEY_PREFIX },
+        ),
+      )
+    : null;
+}
+
+function invalidKey(reason: TranslatedParam): AppError {
+  return quotingReason(
+    new AppError(reason.message, 400, "errors.invalidIdempotencyKey", {
+      reason: reason.message,
+    }),
+    reason,
   );
 }
 
@@ -154,12 +170,8 @@ export async function issueDocument(
   // its length alone produced a 500 from the lookup — before the template, before the render, before
   // anything a caller could be told about. In the core rather than in the controller, because the
   // agent tool and MCP reach this by their own roads.
-  const unstorable = unstorableProblem(params.idempotencyKey, "idempotencyKey");
-  if (unstorable) {
-    throw new AppError(unstorable, 400, "errors.invalidIdempotencyKey", {
-      reason: unstorable,
-    });
-  }
+  const unstorable = unstorablePhrase(params.idempotencyKey, "idempotencyKey");
+  if (unstorable) throw invalidKey(unstorable);
 
   // The idempotency check comes FIRST, before the template is even read. Validating the caller's
   // values against the CURRENT template up front would make a retry fail the moment the template
@@ -178,7 +190,57 @@ export async function issueDocument(
       withBytes: params.withBytes,
     });
   }
+  const reserved = reservedIdempotencyKeyRefusal(params.idempotencyKey);
+  if (reserved) throw reserved;
 
+  const frozen = await freezeDocumentSnapshot({
+    ctx,
+    base,
+    templateId: params.templateId,
+    values: params.values,
+    now,
+    timezone: params.timezone,
+  });
+  return issueFrozenDocument({
+    ctx,
+    base,
+    storageDir: dir,
+    templateId: frozen.template.id,
+    title: frozen.template.name,
+    numberPrefix: frozen.template.numberPrefix,
+    snapshot: frozen.snapshot,
+    idempotencyKey: params.idempotencyKey,
+    threadId: params.threadId,
+    chatwootInstanceId: params.chatwootInstanceId,
+    conversationId: params.conversationId,
+    withBytes: params.withBytes,
+  });
+}
+
+export interface FrozenDocument {
+  template: {
+    id: bigint;
+    name: string;
+    numberPrefix: string | null;
+    requiresApproval: boolean;
+    approvalTtlHours: number;
+  };
+  snapshot: DocumentSnapshot;
+}
+
+// Everything a document is, short of its number: the template read, the values validated, the
+// snapshot frozen with its date. The agent's tool stores this on an approval request when the
+// template asks for one, so the reviewer previews exactly what approval issues.
+export async function freezeDocumentSnapshot(params: {
+  ctx: TenantContext;
+  base?: PrismaClient;
+  templateId: bigint;
+  values: unknown;
+  now: Date;
+  timezone?: string;
+}): Promise<FrozenDocument> {
+  const base = params.base ?? basePrisma;
+  const { ctx, now } = params;
   const prepared = await runScopedOn(base, ctx, (db) =>
     db.documentTemplate.findUnique({
       where: { id: params.templateId },
@@ -190,6 +252,8 @@ export async function issueDocument(
         style: true,
         numberPrefix: true,
         enabled: true,
+        requiresApproval: true,
+        approvalTtlHours: true,
       },
     }),
   );
@@ -212,20 +276,13 @@ export async function issueDocument(
     prepared.style,
   );
   if (!content.ok) {
-    throw invalidDocumentTemplate(content.reason);
+    throw invalidDocumentTemplate(content.phrase);
   }
   const parsedValues = parseDocumentValues(
     content.content.fields,
     params.values,
   );
-  if (!parsedValues.ok) {
-    throw new AppError(
-      parsedValues.reason,
-      400,
-      "errors.invalidDocumentValues",
-      { reason: parsedValues.reason },
-    );
-  }
+  if (!parsedValues.ok) throw invalidDocumentValues(parsedValues);
   const { company, logo } = await readRenderContext(ctx, base);
   const snapshot: DocumentSnapshot = {
     blocks: content.content.blocks,
@@ -237,10 +294,9 @@ export async function issueDocument(
     issuedDate: calendarDay(now, params.timezone ?? DEFAULT_TIMEZONE),
   };
 
-  // Refused BEFORE the insert, which is what keeps a number from being burned for it: the counter is
-  // bumped once the row exists, and an issued document is immutable, so a blank one is blank
-  // forever. This is the exact question — every value is resolved here — and it is why the authoring
-  // gate only has to answer the unconditional half.
+  // Refused BEFORE any row exists, which is what keeps a number from being burned for it: an issued
+  // document is immutable, so a blank one is blank forever. This is the exact question — every value
+  // is resolved here — and it is why the authoring gate only has to answer the unconditional half.
   //
   // The number is not assigned yet, so the meta below carries a placeholder for it. It has to be
   // NON-EMPTY: `{{doc_number}}` always resolves to something at render, and a block that is only
@@ -266,46 +322,95 @@ export async function issueDocument(
       "errors.documentWouldBeBlank",
     );
   }
+  return {
+    template: {
+      id: prepared.id,
+      name: prepared.name,
+      numberPrefix: prepared.numberPrefix,
+      requiresApproval: prepared.requiresApproval,
+      approvalTtlHours: prepared.approvalTtlHours,
+    },
+    snapshot,
+  };
+}
 
-  // `create` rather than `createMany({ skipDuplicates })` because the ROW is needed: what follows
-  // renders and publishes against this document's own id, and createMany returns a count, not rows.
-  // (The count is enough where only the fact of insertion matters — the bundle import uses exactly
-  // that, because a P2002 there would abort the transaction the whole import runs in.)
-  //
-  // Three scoped calls, not one: a P2002 ABORTS the PostgreSQL transaction it was raised in, so
-  // recovering the winner cannot happen inside the transaction that lost. Catching the conflict and
-  // re-reading in the same one turns a benign race — which the idempotency key exists to make benign
-  // — into "current transaction is aborted" and a 500 for the caller that merely arrived second.
-  const created = await runScopedOn(base, ctx, (db) =>
-    db.issuedDocument.create({
+// Issues a snapshot that is already frozen: inserts the PENDING row, numbers it, renders. The key
+// decides reuse, so a retried call with the same key returns the row the first one made.
+export async function issueFrozenDocument(params: {
+  ctx: TenantContext;
+  base?: PrismaClient;
+  storageDir?: string;
+  // Null once the template is deleted: a key that already names a row still answers with it, and
+  // only a new row needs the counter the template holds.
+  templateId: bigint | null;
+  title: string;
+  numberPrefix: string | null;
+  snapshot: DocumentSnapshot;
+  idempotencyKey: string;
+  threadId?: string | null;
+  chatwootInstanceId?: bigint | null;
+  conversationId?: bigint | null;
+  withBytes?: boolean;
+  // Run in the insert's transaction, before the row is written: a caller that answers this key from
+  // another table re-asks that table here, under its own lock.
+  guard?: (db: ScopedDb) => Promise<void>;
+}): Promise<IssuedDocumentResult> {
+  const base = params.base ?? basePrisma;
+  const dir = params.storageDir ?? config.documentsStorageDir;
+  const { ctx } = params;
+  const tenantId = ctx.tenantId as bigint;
+  const existing = await runScopedOn(base, ctx, (db) =>
+    loadByKey(db, tenantId, params.idempotencyKey),
+  );
+  if (existing) {
+    return finish(existing, {
+      base,
+      ctx,
+      dir,
+      tenantId,
+      withBytes: params.withBytes,
+    });
+  }
+
+  const templateId = params.templateId;
+  if (templateId === null) {
+    throw new AppError(
+      "this document could not be numbered",
+      409,
+      "errors.documentNotNumbered",
+    );
+  }
+  // `create`, not `createMany({ skipDuplicates })`, because the ROW is needed. Three scoped
+  // calls, not one: a P2002 ABORTS the PostgreSQL transaction it was raised in, so the winner must
+  // be re-read outside the transaction that lost, or the second caller gets a 500.
+  const created = await runScopedOn(base, ctx, async (db) => {
+    if (params.guard) await params.guard(db);
+    return db.issuedDocument.create({
       data: {
         tenantId,
-        templateId: prepared.id,
-        title: prepared.name,
+        templateId,
+        title: params.title,
         // FROZEN with the row, not joined from the template when the number is printed: the prefix
         // is part of how this document identifies itself. Read live, renaming ORC- to PROP- would
         // rewrite every number already in a customer's hands, and deleting the template (which nulls
         // the FK by design — the documents outlive it) would drop the prefix altogether.
-        numberPrefix: prepared.numberPrefix,
+        numberPrefix: params.numberPrefix,
         threadId: params.threadId ?? null,
         chatwootInstanceId: params.chatwootInstanceId ?? null,
         conversationId: params.conversationId ?? null,
         idempotencyKey: params.idempotencyKey,
         status: "PENDING",
-        snapshot: snapshot as unknown as Prisma.InputJsonValue,
+        snapshot: params.snapshot as unknown as Prisma.InputJsonValue,
       },
       select: { id: true },
-    }),
-  ).catch((err: unknown) => {
+    });
+  }).catch((err: unknown) => {
     if (isUniqueViolation(err)) return null; // lost the race → the winner is read below
-    // The template can be DELETED between the read above and this insert, and the foreign key then
+    // The template can be DELETED between the read and this insert, and the foreign key then
     // refuses the row (P2003). That is the same event as "no such template", which the read itself
     // would have reported a moment earlier — so it gets the same terminal answer instead of a 500
     // for the REST caller and an integration-failure alert for an agent turn.
-    if (
-      err instanceof Prisma.PrismaClientKnownRequestError &&
-      err.code === "P2003"
-    ) {
+    if (isForeignKeyViolation(err)) {
       throw new NotFoundError(
         "document template not found",
         "errors.documentTemplateNotFound",
@@ -318,7 +423,7 @@ export async function issueDocument(
     // A crash between the two leaves the row unnumbered, which the load below heals — monotonic,
     // with a gap only where a process actually died.
     await runScopedOn(base, ctx, (db) =>
-      assignNumber(db, prepared.id, created.id),
+      assignNumber(db, templateId, created.id),
     );
   }
   const row = await runScopedOn(base, ctx, (db) =>
@@ -386,15 +491,9 @@ async function finish(
   },
 ): Promise<IssuedDocumentResult> {
   const { base, ctx, dir, tenantId } = deps;
-  // Revocation ends the document, and the idempotency key leads straight back to it: the key is
-  // derived from the VALUES, so an agent asked to send the same quote again lands on this exact row.
-  // Without this the retry would hand back the stored bytes and attach a voided document to a
-  // customer's reply, while the operator's own download link answered 404.
-  //
-  // NOT documentVerdict, which the download route uses: that one also refuses a row with no PDF, and
-  // here a row with no PDF is the ordinary case — it is the one this function is about to render.
-  // A 409, not a 400: nothing about the caller's arguments is wrong, and there is nothing to correct
-  // that would not lead back to the same voided row.
+  // NOTE: The key is derived from the VALUES, so re-sending the same quote lands on a revoked row,
+  // which must not be handed back. NOT documentVerdict: a row with no PDF is the ordinary case here.
+  // A 409, since no correction to the arguments leads anywhere but this voided row.
   if (loaded.revoked) {
     throw new AppError(
       "this document was revoked",
@@ -449,15 +548,9 @@ async function finish(
     title: row.title,
   };
 
-  // Asked again, HERE, because the answer expires. The gate before the insert used the logo that
-  // was on disk then, and this is a different moment: a PENDING row can be adopted by a retry long
-  // afterwards. Everything else the render uses is frozen in the snapshot, so the letterhead is the
-  // one input that can have changed — and for a template whose only content IS the letterhead,
-  // changed means there is nothing left to draw.
-  //
-  // Refused instead of published, even though the number is already spent: the row stays PENDING,
-  // so nothing was delivered and restoring the logo is all a retry needs. Publishing would freeze a
-  // numbered blank page, and an issued document is immutable.
+  // NOTE: Asked again HERE: a retry can adopt a PENDING row long afterwards, and the live logo is the
+  // one render input outside the snapshot. Refused rather than published even with the number spent:
+  // the row stays PENDING, and publishing would freeze a numbered blank page.
   if (
     !documentDraws({
       blocks: stored.blocks,
@@ -489,37 +582,17 @@ async function finish(
     meta,
   });
   const key = storageKey(tenantId, row.id);
-  // Written to a temporary name first. Two callers holding the same idempotency key can both find
-  // the row PENDING and both render it, and a plain write to the final path lets the second truncate
-  // a file the first already published — so a download in that window serves a half-written PDF.
-  //
-  // Bun.write creates parent directories, which is why the temporary lives beside the target rather
-  // than in a system temp dir — and why the link below cannot cross a filesystem. The suffix keeps
-  // two concurrent renders from sharing the temporary as well.
-  //
-  // WHAT IS COVERED: that a second publisher adopts the first one's file instead of replacing it,
-  // and that no `.part` survives a successful issuance. What is NOT is the truncation itself — that
-  // needs two renders of one key overlapping AND a reader landing inside the window, which no
-  // single-process test reaches with any reliability (the last attempt at a race like it passed
-  // three times out of three with the fix removed, and was deleted rather than kept).
+  // Written to a unique temporary name beside the target first (so the link below never
+  // crosses a filesystem): two renders of one key must not truncate a file already published. Tests
+  // cover adoption and `.part` cleanup, not the truncation window itself.
   const finalPath = `${dir}/${key}`;
   const tempPath = `${finalPath}.${process.pid}-${Math.random().toString(36).slice(2, 10)}.part`;
   await Bun.write(tempPath, buffer);
 
-  // PUBLISHED BEFORE the row says READY, and published with `link` rather than `rename`.
-  //
-  // Both orders on their own leave a window, and each was tried. Renaming first lets a caller that
-  // then loses the claim replace a file the winner already published — the renders share a frozen
-  // snapshot, but the LOGO is read live, so the published document can visibly change after it was
-  // declared final. Claiming first is worse: a reader who sees READY can arrive before the file
-  // exists and get a 404, and a process killed in that window leaves a row that says READY forever
-  // with nothing behind it, which nothing re-renders.
-  //
-  // `link` closes both instead of choosing. It creates the final name from a fully-written temporary
-  // and FAILS with EEXIST if that name already exists, so the first publisher wins the file and a
-  // later one adopts it rather than replacing it; and because it happens before the CAS, a row is
-  // never READY without its bytes. A crash anywhere here leaves a PENDING row and at worst an
-  // unreferenced temporary — both recoverable, since the next call re-renders and re-adopts.
+  // NOTE: PUBLISHED BEFORE the row says READY, with `link` rather than `rename`: link FAILS with
+  // EEXIST, so the first publisher wins the file and a later one adopts it (the live logo could
+  // differ), and a row is never READY without its bytes. A crash leaves a recoverable PENDING row
+  // (docs/documents.md, Issuing).
   try {
     await link(tempPath, finalPath);
   } catch (e) {
@@ -601,6 +674,7 @@ async function finish(
 async function assignNumber(
   db: {
     $queryRaw: PrismaClient["$queryRaw"];
+    $executeRaw: PrismaClient["$executeRaw"];
     issuedDocument: PrismaClient["issuedDocument"];
   },
   templateId: bigint,
@@ -617,26 +691,37 @@ async function assignNumber(
   await db.$queryRaw`
     SELECT 1 FROM "document_templates" WHERE "id" = ${templateId} FOR UPDATE
   `;
-  // The DOCUMENT row is claimed next, and that claim is the whole point of this function. A row
-  // exists unnumbered for a moment by design — the counter is bumped after the insert, so a lost
-  // idempotency race consumes no number — and in that window a second caller re-reads it, sees no
-  // number, and heals it at the same time as the first. Without the lock both take a number from
-  // the counter, one update is discarded, and the caller whose update lost goes on to render a
-  // document with NO number and write it over the winner's PDF: the customer's link then serves a
-  // quote with a blank where its identity should be.
-  //
+  // The DOCUMENT row is claimed first (docs/documents.md, Issuing): a row is unnumbered for a
+  // moment by design, and two callers healing it at once would render one PDF with no number.
   // Scoped by RLS like every other statement in this transaction, and the id is one we inserted.
-  const claimed = await db.$queryRaw<{ number: number | null }[]>`
-    SELECT "number" FROM "issued_documents" WHERE "id" = ${documentId} FOR UPDATE
+  const claimed = await db.$queryRaw<
+    { number: number | null; tenant_id: bigint; number_prefix: string | null }[]
+  >`
+    SELECT "number", "tenant_id", "number_prefix" FROM "issued_documents" WHERE "id" = ${documentId} FOR UPDATE
   `;
   if (claimed.length === 0) return null;
-  const already = claimed[0]?.number ?? null;
+  const doc = claimed[0];
+  if (!doc) return null;
   // Someone numbered it while we waited for the lock. Their number is the document's number.
-  if (already !== null) return already;
+  if (doc.number !== null) return doc.number;
 
+  // Not the template's counter alone (numbering.ts): another template on the same prefix, a prefix
+  // this template moved to, or another prefix printing the same text may already hold the next one.
+  // Locked after the template and the document, the order every path keeps.
+  await lockNumbering(db, doc.tenant_id);
+  const counter = await db.$queryRaw<{ last_number: number }[]>`
+    SELECT "last_number" FROM "document_templates" WHERE "id" = ${templateId}
+  `;
+  if (counter.length === 0) return null;
+  const take = await nextNumberFor(
+    db,
+    doc.tenant_id,
+    doc.number_prefix,
+    counter[0]?.last_number ?? 0,
+  );
   const rows = await db.$queryRaw<{ last_number: number }[]>`
     UPDATE "document_templates"
-    SET "last_number" = "last_number" + 1
+    SET "last_number" = ${take}
     WHERE "id" = ${templateId}
     RETURNING "last_number"
   `;
@@ -715,18 +800,85 @@ export interface IssuedDocumentListItem {
   status: string;
   threadId: string | null;
   conversationId: string | null;
+  // The approval request the document was issued from, null when its template asks for none.
+  approvalRequestId: string | null;
   revoked: boolean;
   createdAt: string;
 }
 
+// LIKE's own wildcards, escaped, so a search for "10%" is the text and not a pattern.
+function likeContains(query: string): string {
+  return `%${query.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+}
+
+interface IssuedDocumentListOptions {
+  limit?: number;
+  templateId?: bigint;
+  threadId?: string;
+  // Newest first, so the next page is the documents older than the last one shown.
+  before?: bigint;
+  // Part of the printed number (as the customer reads it, prefix and padded counter) or the title.
+  query?: string;
+}
+
+function listTake(limit: number | undefined): number {
+  return Math.min(Math.max(limit ?? 50, 1), 200);
+}
+
 export async function listIssuedDocuments(
   ctx: TenantContext,
-  opts: { limit?: number; templateId?: bigint; threadId?: string } = {},
+  opts: IssuedDocumentListOptions = {},
   base: PrismaClient = basePrisma,
 ): Promise<IssuedDocumentListItem[]> {
-  const take = Math.min(Math.max(opts.limit ?? 50, 1), 200);
-  const rows = await runScopedOn(base, ctx, (db) =>
-    db.issuedDocument.findMany({
+  return readIssuedDocuments(ctx, opts, listTake(opts.limit), base);
+}
+
+// One page and where the next one starts, null on the last page. Read one row past the page, so
+// "is there more" is the answer of the same query and not a guess from a full page.
+export async function pageIssuedDocuments(
+  ctx: TenantContext,
+  opts: IssuedDocumentListOptions = {},
+  base: PrismaClient = basePrisma,
+): Promise<{ documents: IssuedDocumentListItem[]; nextBefore: string | null }> {
+  const take = listTake(opts.limit);
+  const documents = await readIssuedDocuments(ctx, opts, take + 1, base);
+  const more = documents.length > take;
+  if (more) documents.pop();
+  return {
+    documents,
+    nextBefore: more ? (documents[documents.length - 1]?.id ?? null) : null,
+  };
+}
+
+async function readIssuedDocuments(
+  ctx: TenantContext,
+  opts: IssuedDocumentListOptions,
+  take: number,
+  base: PrismaClient,
+): Promise<IssuedDocumentListItem[]> {
+  const query = opts.query?.trim() ?? "";
+  const rows = await runScopedOn(base, ctx, async (db) => {
+    // The printed number is not a column, so a search runs as SQL for the ids and the page is read
+    // by them. Same filters and order either way.
+    let ids: bigint[] | undefined;
+    if (query !== "") {
+      const like = likeContains(query);
+      const found = await db.$queryRaw<{ id: bigint }[]>`
+        SELECT "id" FROM "issued_documents"
+        WHERE "tenant_id" = ${ctx.tenantId}
+          ${opts.templateId !== undefined ? Prisma.sql`AND "template_id" = ${opts.templateId}` : Prisma.empty}
+          ${opts.threadId !== undefined ? Prisma.sql`AND "thread_id" = ${opts.threadId}` : Prisma.empty}
+          ${opts.before !== undefined ? Prisma.sql`AND "id" < ${opts.before}` : Prisma.empty}
+          AND (
+            "title" ILIKE ${like}
+            OR ("number" IS NOT NULL AND COALESCE("number_prefix", '') || lpad("number"::text, GREATEST(4, length("number"::text)), '0') ILIKE ${like})
+          )
+        ORDER BY "id" DESC
+        LIMIT ${take}
+      `;
+      ids = found.map((r) => r.id);
+    }
+    return db.issuedDocument.findMany({
       // `!== undefined`, not truthiness: a caller filtering by template 0 or by the empty thread key
       // would otherwise have its filter dropped and receive the tenant's whole recent list — the
       // widest possible answer to the narrowest possible question.
@@ -735,6 +887,11 @@ export async function listIssuedDocuments(
           ? { templateId: opts.templateId }
           : {}),
         ...(opts.threadId !== undefined ? { threadId: opts.threadId } : {}),
+        ...(ids !== undefined
+          ? { id: { in: ids } }
+          : opts.before !== undefined
+            ? { id: { lt: opts.before } }
+            : {}),
       },
       orderBy: { id: "desc" },
       take,
@@ -749,9 +906,10 @@ export async function listIssuedDocuments(
         revoked: true,
         createdAt: true,
         numberPrefix: true,
+        approvalRequest: { select: { id: true } },
       },
-    }),
-  );
+    });
+  });
   return rows.map((r) => ({
     id: String(r.id),
     title: r.title,
@@ -760,6 +918,7 @@ export async function listIssuedDocuments(
     status: r.status,
     threadId: r.threadId,
     conversationId: r.conversationId ? String(r.conversationId) : null,
+    approvalRequestId: r.approvalRequest ? String(r.approvalRequest.id) : null,
     revoked: r.revoked,
     createdAt: r.createdAt.toISOString(),
   }));

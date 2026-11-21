@@ -1,4 +1,6 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import type { BaseMessage } from "@langchain/core/messages";
+import logger from "@/api/lib/logger";
 import { verdictAskMode } from "@/graph/model-config";
 import { createChatModel } from "@/graph/models";
 import {
@@ -6,28 +8,32 @@ import {
   type LangfuseConfig,
 } from "@/graph/observability";
 import {
+  recordDirectUsage,
   UsageCapture,
   type UsagePersist,
   usageAttribution,
 } from "@/graph/usage";
+import { scrubbedClip } from "@/lib/redact";
 import { clipText } from "@/lib/text";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { literalForChatwoot } from "@/modules/chatwoot/liquid";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import { analyzeGuardrail } from "./analyze";
+import {
+  classifyGuardrail,
+  type GuardrailScore,
+  guardrailAsks,
+} from "./classify";
+import { type GuardrailContextMessage, guardrailContext } from "./context";
+import type { ExternalReport } from "./external";
+import type { FACTUAL_GROUNDING_KEY, GroundingClaim } from "./grounding";
 import { loggableCategories } from "./log-categories";
 import { judgesAnything } from "./prompts";
 import type { GuardrailAction, GuardrailsConfig } from "./settings";
 
-// The moderation gate both runtimes call. It was a closure inside runLoadedTurn until the proactive
-// path needed it too (issue #160): a follow-up is a message the customer never asked for, and it was
-// the only customer-facing text in the product that nothing screened. Copying the closure would have
-// made the two paths drift on the day one of them changed, which is why this is a unit and not a
-// second copy.
-//
-// What one screening DID, as a single value. It used to be a nullable reply, and callers then grew
-// side channels for the two questions that value cannot answer — a flag for "was anything written
-// down", set through a callback. Three consecutive review rounds found a caller reading one of the
-// three for another's question, so they became one union with the three answers in it.
+// The moderation gate both runtimes call, one unit so the reactive and proactive (follow-up) paths
+// cannot drift. `GuardrailDecision` is what one screening DID, as a single union: separate flags for
+// "was anything written down" invite a caller to read one answer for another's question.
 export type GuardrailDecision =
   // Nothing was screened: guardrails off, this direction switched off, or nothing left to ask. No
   // model call, no delay, nothing written.
@@ -40,14 +46,15 @@ export type GuardrailDecision =
   // that never resolved and a model that would not build never left this process. A caller whose
   // earlier reads go stale while the judge thinks asks that question, not the kind.
   | { kind: "unavailable"; modelRan: boolean }
-  // Tripped: send this instead of the subject. The operator note was written.
-  | { kind: "replaced"; reply: string }
+  // Tripped: send this instead of the subject. The operator note was written. `generated` marks a
+  // reply the guardrails model wrote; without it the reply is the operator's `templateMessage`.
+  | { kind: "replaced"; reply: string; generated?: true }
   // Tripped with the `silent` action: send nothing. The operator note was written.
   | { kind: "suppressed" }
-  // Tripped with the `handoff` action (issue #704): the subject is not sent, the conversation goes
-  // to the team, and the customer reads `reply` instead, or nothing when it is null. The operator
-  // note was written. The TRANSFER is the caller's to make (`applyGuardrailHandoff`), at the point
-  // where its own gates say the turn may still act: this gate runs before them.
+  // Tripped with the `handoff` action: the subject is not sent, the conversation goes to the team,
+  // and the customer reads `reply` instead, or nothing when it is null. The operator note was
+  // written. The TRANSFER is the caller's (`applyGuardrailHandoff`), at the point where its own gates
+  // say the turn may still act: this gate runs before them.
   | { kind: "handed-off"; reply: string | null };
 
 // The text to send in place of `subject`, or null to send nothing.
@@ -58,6 +65,12 @@ export function screenedText(
   if (d.kind === "suppressed") return null;
   if (d.kind === "handed-off") return d.reply;
   return d.kind === "replaced" ? d.reply : subject;
+}
+
+// Whether `screenedText` answers with text the operator wrote (the template or the hand-over
+// message) rather than a model's. The operator's text keeps Chatwoot's Liquid; a model's is escaped.
+export function screenedByOperator(d: GuardrailDecision): boolean {
+  return (d.kind === "replaced" && !d.generated) || d.kind === "handed-off";
 }
 
 // The policy acted on this text: it replaced it or removed it. The caller's OWN artefacts of the
@@ -94,22 +107,101 @@ export type GuardrailGate = (
 // caller that branched on it would be branching on model-written prose.
 export interface GuardrailReport {
   direction: "input" | "output";
-  outcome: Exclude<GuardrailDecision["kind"], "not-run">;
+  // `observed` is a trip under the `observe` action: the caller was told `clean` and went on, and
+  // this is the only place the verdict is said.
+  // `revised` is a factual-grounding trip under `revise`: the agent wrote the reply again.
+  outcome:
+    | Exclude<GuardrailDecision["kind"], "not-run">
+    | "observed"
+    | "revised";
   // As CARRIED OUT, and only on a trip. See the note on `effectiveAction` below.
-  action?: GuardrailAction;
+  action?: GuardrailAction | "revise";
+  // Set on a report of the factual-grounding check (./grounding-gate.ts), with the claims it found.
+  check?: typeof FACTUAL_GROUNDING_KEY;
+  claims?: GroundingClaim[];
   // Model-written, and only on a trip.
   categories?: string[];
   rationale?: string;
   // The text that was refused, on a hand-over only: the person taking the case over has to read what
   // the customer was not sent, and nobody else will ever show it to them.
   refused?: string;
+  // Under a decisions provider, what each question answered and the threshold it was held to, on
+  // every screening that ran (clean ones too, since "approved at 0.12 against 0.8" is what tells an
+  // operator whether a threshold is right). Numbers and our own keys only; there is no rationale.
+  scores?: GuardrailScore[];
+  // A hand-over the `hold` failure mode made: the screening could not judge, so there is no verdict
+  // to report, only the scores of the checks that did answer (decisions provider).
+  held?: true;
+  // Why a screening could not judge, on `unavailable` and on a held hand-over: the flow line's own
+  // outcome word, so the note can say it without quoting provider text.
+  cause?: GuardrailFailureCause;
+  // Set when the external check (./external.ts) made this report: its decision, latency and reason.
+  external?: ExternalReport;
 }
 
-// Where a screening gets announced to a human. The gate decides WHEN (one place, below); this
-// decides WHERE, because the two runtimes have different places: a conversation the operator can
-// open, and a transcript in a surface that is not a conversation at all (issue #136). Errors are
-// the sink's to swallow — an announcement that fails must not fail the turn it describes.
+export type GuardrailFailureCause =
+  | "credential_not_found"
+  | "model_unavailable"
+  | "analysis_failed";
+
+// The cause in the words the note's reader uses. The provider's own error stays in the flow line.
+const HELD_CAUSE: Record<GuardrailFailureCause, string> = {
+  credential_not_found: "a credencial do guardrail não foi encontrada",
+  model_unavailable:
+    "o modelo do guardrail não pôde ser usado com essa configuração",
+  analysis_failed:
+    "o modelo do guardrail falhou ou não respondeu dentro do limite",
+};
+
+// The scores as one line an operator reads in the note: the tripped ones first.
+export function scoresLine(scores: GuardrailScore[]): string {
+  const fmt = (n: number) => n.toFixed(2);
+  return [...scores]
+    .sort(
+      (a, b) =>
+        Number((b.probability ?? -1) >= b.threshold) -
+        Number((a.probability ?? -1) >= a.threshold),
+    )
+    .map(
+      (s) =>
+        `${s.category} ${s.probability === null ? "?" : fmt(s.probability)} (threshold ${fmt(s.threshold)})`,
+    )
+    .join(", ");
+}
+
+// Where a screening gets announced to a human. The gate decides WHEN (one place, below); this decides
+// WHERE: a conversation the operator can open, or a transcript in a surface that is not a
+// conversation. Errors are the sink's to swallow: a failed announcement must not fail the turn.
 export type GuardrailAnnounce = (r: GuardrailReport) => void | Promise<void>;
+
+// The external check's failure causes in the note reader's words.
+const EXTERNAL_CAUSE: Record<NonNullable<ExternalReport["cause"]>, string> = {
+  timeout: "não respondeu dentro de 15 s",
+  http_status: "respondeu com erro HTTP",
+  network: "não pôde ser alcançado",
+  malformed: "respondeu algo que não é uma decisão válida",
+  unverifiable: "respondeu sem o candidateId do pedido",
+  unsafe_url: "tem um endereço que as chamadas de saída recusam",
+  secret_not_found: "tem um segredo de assinatura que não está no cofre",
+};
+
+// What the external check decided, as the first line of its note. The reason is the endpoint's own
+// text, escaped with the rest of the note by the sink.
+function externalNoteHead(r: GuardrailReport): string {
+  const x = r.external as ExternalReport;
+  const ms = `${x.latencyMs} ms`;
+  if (x.decision === "failed") {
+    const cause = x.cause
+      ? `${EXTERNAL_CAUSE[x.cause]}${x.status ? ` (${x.status})` : ""}`
+      : "falhou";
+    return `Verificação externa (${r.direction}): o endpoint ${cause}, e a mensagem foi segurada. (${ms})`;
+  }
+  const what =
+    x.decision === "replace"
+      ? "substituiu a resposta pelo texto do endpoint"
+      : `bloqueou a resposta (ação: ${r.action})`;
+  return `Verificação externa (${r.direction}): ${what}. (${ms})${x.reason ? `\nMotivo: ${x.reason}` : ""}`;
+}
 
 // The inbox announcement, shared by the reactive and proactive paths so the two cannot drift. Only
 // a trip is posted: a private note per clean screening would bury the conversation in notes about
@@ -125,9 +217,19 @@ export function chatwootNoteSink(
       r.outcome !== "handed-off"
     )
       return;
-    const head = `Guardrail (${r.direction}): ${r.categories?.join(", ") || "policy"} — ${r.action}. ${r.rationale ?? ""}`;
+    const head = r.external
+      ? externalNoteHead(r)
+      : r.held
+        ? `Guardrail (${r.direction}): a checagem não pôde ser feita${r.cause ? ` (${HELD_CAUSE[r.cause]})` : ""}, e a mensagem foi segurada.${r.scores?.length ? ` ${scoresLine(r.scores)}` : ""}`
+        : r.scores
+          ? `Guardrail (${r.direction}): ${r.categories?.join(", ") || "policy"} — ${r.action}. ${scoresLine(r.scores)}`
+          : `Guardrail (${r.direction}): ${r.categories?.join(", ") || "policy"} — ${r.action}. ${r.rationale ?? ""}`;
     await client
-      .sendPrivateNote(conversationId, handedOffNote(head, r))
+      // The rationale and the refused reply are model text, escaped for Chatwoot's Liquid.
+      .sendPrivateNote(
+        conversationId,
+        literalForChatwoot(handedOffNote(head, r)),
+      )
       .catch(() => {});
   };
 }
@@ -166,16 +268,30 @@ export interface GuardrailGateParams {
   // asked to score relevance against silence has only wrong answers available. So the gate drops the
   // check itself, structurally, the same way the input direction drops the replacement.
   customerMessage?: string;
+  // `observability.logToolValues`: an observed trip's rationale, model text that may quote the customer,
+  // reaches the flow line only with it on. An observed trip posts no note, so the line is the one
+  // place an operator can read why it tripped.
+  logValues?: boolean;
+  // The thread the agent answers from, as it stood BEFORE this turn, for the input direction's context
+  // window. Read only when the window is on and a screening runs; absent screens the message alone.
+  inputContext?: () => Promise<readonly BaseMessage[]>;
   makeModel?: typeof createChatModel;
   // Overrides the ledger sink. Tests inject; production takes the default, which writes the row.
   persistUsage?: UsagePersist;
-  // The tenant's Langfuse, for the OTHER book (#426, review round 8). The gate runs outside the
-  // graph, so the turn's own trace handler never sees its calls: the ledger had the row and the
-  // dollar ceiling, which sums Langfuse's generations, had nothing (measured: a screened turn
-  // reached Langfuse with the agent's generation and not the guardrail's). Required rather than
-  // optional so the next call site cannot forget it; null when the tenant has none.
+  // The decisions provider's fetch, under the decisions classifier. Tests inject.
+  decisionFetch?: typeof fetch;
+  // The tenant's Langfuse, for the other book: the gate runs outside the graph, so the turn's trace
+  // handler never sees its calls, and the dollar ceiling (which sums Langfuse's generations) would miss
+  // them. Required so no call site can forget it; null when the tenant has none.
   langfuseCfg: LangfuseConfig | null;
+  // A follow-up the agent starts on its own. A screening that cannot judge lets it through whatever
+  // `onFailure` says: there is no customer message waiting, and a hand-over would open a case nobody asked for.
+  proactive?: true;
 }
+
+// An observed trip's rationale on its flow line: bounded like the trace's, since the line is kept as
+// long as the Logs are.
+const OBSERVED_RATIONALE_MAX = 2000;
 
 export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
   const gr = p.cfg;
@@ -208,6 +324,23 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
     const t = trace();
     return t ? [usage(), t] : [usage()];
   };
+  // Spread into the detail of a line for a screening that could not judge. `classifier` names the
+  // judge that failed, and `unchecked` says whether the message continued anyway: true whenever the
+  // gate fails open, false only when another check that did answer still tripped (`judgedPartly`).
+  // A direction set to only record does not hold either: holding is acting.
+  const holds = gr.onFailure === "hold" && !p.proactive;
+  const holdsOn = (direction: "input" | "output") =>
+    holds && gr[direction].action !== "observe";
+  const couldNotJudge = (direction: "input" | "output") =>
+    holdsOn(direction)
+      ? { classifier: gr.classifier, unchecked: false, held: true }
+      : { classifier: gr.classifier, unchecked: true };
+  // A trip stops the message only on a direction that acts: an observed one lets it through, so a
+  // partial failure there went on unchecked like any other.
+  const judgedPartly = (direction: "input" | "output", violated: boolean) =>
+    violated && gr[direction].action !== "observe"
+      ? { classifier: gr.classifier, unchecked: false }
+      : couldNotJudge(direction);
   // Built on FIRST CALL, not here, and never twice: a gate is constructed for every turn and every
   // follow-up, while a direction that is switched off never reaches the model. `createChatModel`
   // throws synchronously on a configuration it cannot satisfy (an `openai-compatible` provider with
@@ -216,50 +349,266 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
   // reports the follow-up as delivered. `undefined` is "not attempted yet"; `null` is "attempted
   // and unavailable", which is the same fail-open answer an analysis that could not run gives.
   let model: BaseChatModel | null | undefined;
+  let buildFailure:
+    | {
+        outcome: "credential_not_found" | "model_unavailable";
+        message?: string;
+      }
+    | undefined;
+  const reportedBuildFailure = new Set<"input" | "output">();
   const resolveModel = (
     direction: "input" | "output",
   ): BaseChatModel | null => {
-    if (model !== undefined) return model;
-    // A key that never resolved is a gate configured to run that cannot, which is the same answer
-    // as a model that refuses to build and belongs on the same side of the fence. It used to sit up
-    // in the early guard next to "the operator switched this off", so one condition answered two
-    // questions and the operator's own reading of a deleted vault entry was "no guardrail ran" —
-    // the one case of the three the issue names that stayed invisible.
-    if (!p.apiKey) {
-      model = null;
-      emitFlowEvent(p.flow, {
-        stage: "guardrail",
-        status: "error",
-        level: "warn",
-        // `credential_not_found` is the fleet's name for this, used by the speech normalizer,
-        // vision, STT, TTS and memory compaction. A seventh spelling of one condition is a filter
-        // that quietly misses a sixth of the fleet.
-        detail: { direction, outcome: "credential_not_found" },
-      });
-      return model;
+    if (model === undefined) {
+      // NOTE: a key that never resolved is a gate configured to run that cannot, the same answer as a
+      // model that refuses to build. Kept apart from "the operator switched this off", or a deleted
+      // vault entry would read as "no guardrail ran" and stay invisible. `credential_not_found` is the
+      // fleet's name for this, used by the speech normalizer, vision, STT, TTS and memory compaction.
+      if (!p.apiKey) {
+        model = null;
+        buildFailure = { outcome: "credential_not_found" };
+      } else {
+        try {
+          model = (p.makeModel ?? createChatModel)({
+            provider: gr.provider,
+            model: gr.model,
+            baseURL: p.credentialBaseUrl ?? gr.baseURL ?? undefined,
+            apiKey: p.apiKey,
+            temperature: 0,
+          });
+        } catch (e) {
+          model = null;
+          buildFailure = {
+            outcome: "model_unavailable",
+            message: e instanceof Error ? e.message : String(e),
+          };
+        }
+      }
     }
-    try {
-      model = (p.makeModel ?? createChatModel)({
-        provider: gr.provider,
-        model: gr.model,
-        baseURL: p.credentialBaseUrl ?? gr.baseURL ?? undefined,
-        apiKey: p.apiKey,
-        temperature: 0,
-      });
-    } catch (e) {
-      model = null;
+    // NOTE: one line per direction, not per gate: each direction that goes on unchecked is its own
+    // message the operator has to be able to find.
+    if (buildFailure && !reportedBuildFailure.has(direction)) {
+      reportedBuildFailure.add(direction);
       emitFlowEvent(p.flow, {
         stage: "guardrail",
         status: "error",
         level: "warn",
-        detail: { direction, outcome: "model_unavailable" },
-        errorMessage: e instanceof Error ? e.message : String(e),
+        detail: {
+          direction,
+          outcome: buildFailure.outcome,
+          ...couldNotJudge(direction),
+        },
+        errorMessage: buildFailure.message,
       });
     }
     return model;
     // NOTE: The warn above is what makes this "unavailable" and not "not-run" to the caller: a
     // configuration this gate cannot use is indistinguishable from a working one until it is tried,
     // and by then the operator has been told.
+  };
+
+  // The trip, from a verdict to what the caller does and what the operator reads. One place for both
+  // classifiers, so a new action cannot reach one of them only.
+  const tripped = (
+    direction: "input" | "output",
+    subject: string,
+    categories: string[],
+    replacement: string | null,
+    extra: Pick<GuardrailReport, "rationale" | "scores">,
+    logged: Record<string, unknown>,
+  ): { d: GuardrailDecision; r: GuardrailReport } => {
+    const dir = gr[direction];
+    // A classifier hands no replacement in, so its `generated` lands on the template below.
+    const action = dir.action;
+    // Recorded and nothing else: the caller reads `clean` and sends the subject, and no note is posted
+    // (the sink posts only for the outcomes that acted).
+    if (action === "observe") {
+      emitFlowEvent(p.flow, {
+        stage: "guardrail",
+        status: "ok",
+        level: "warn",
+        detail: {
+          direction,
+          action,
+          ...logged,
+          ...(extra.rationale
+            ? p.logValues
+              ? {
+                  rationale: scrubbedClip(
+                    extra.rationale,
+                    OBSERVED_RATIONALE_MAX,
+                  ),
+                }
+              : { rationaleChars: extra.rationale.length }
+            : {}),
+        },
+      });
+      return {
+        d: { kind: "clean" },
+        r: { direction, outcome: "observed", action, categories, ...extra },
+      };
+    }
+    // The turn trail and the operator note report what the guardrail DID, not what it was
+    // configured to do. `generated` with no replacement in hand sends the template — when the model
+    // returns none, and on the input direction every time (see ./analyze.ts) — and an operator
+    // reading "generated" on a line where the template went out is reading the config back, not the
+    // event.
+    const effectiveAction =
+      action === "generated" && replacement === null ? "template" : action;
+    emitFlowEvent(p.flow, {
+      stage: "guardrail",
+      status: "ok",
+      level: "warn",
+      detail: { direction, action: effectiveAction, ...logged },
+    });
+    const r: GuardrailReport = {
+      direction,
+      outcome:
+        action === "silent"
+          ? "suppressed"
+          : action === "handoff"
+            ? "handed-off"
+            : "replaced",
+      action: effectiveAction,
+      categories,
+      ...extra,
+      ...(action === "handoff" ? { refused: subject } : {}),
+    };
+    if (action === "silent") return { d: { kind: "suppressed" }, r };
+    if (action === "handoff")
+      return {
+        d: { kind: "handed-off", reply: dir.handoffMessage || null },
+        r,
+      };
+    return {
+      d:
+        effectiveAction === "generated" && replacement !== null
+          ? { kind: "replaced", reply: replacement, generated: true }
+          : { kind: "replaced", reply: dir.templateMessage },
+      r,
+    };
+  };
+
+  // The screening under a decisions provider (./classify). Same outcomes and the same lines as the
+  // chat verdict, with the scores in place of a rationale.
+  const screenByClassifier = async (
+    direction: "input" | "output",
+    subject: string,
+    checks: GuardrailsConfig["input"]["checks"],
+    context: readonly GuardrailContextMessage[],
+  ): Promise<{ d: GuardrailDecision; r: GuardrailReport | null }> => {
+    const params = {
+      direction,
+      text: subject,
+      checks,
+      competitors: gr.competitors,
+      customPolicy: gr.customPolicy,
+      systemPrompt: direction === "output" ? p.systemPrompt : undefined,
+      customerMessage: p.customerMessage,
+      context,
+    };
+    // Nothing to ask (competitor mentions with no names) is the same answer with or without a key:
+    // checked first, so a missing credential cannot turn an empty screening into a failed one,
+    // which under `hold` would hand the conversation over for a question nobody asked.
+    if (guardrailAsks(params, gr.decisions.thresholds).length === 0)
+      return { d: { kind: "not-run" }, r: null };
+    if (!p.apiKey) {
+      emitFlowEvent(p.flow, {
+        stage: "guardrail",
+        status: "error",
+        level: "warn",
+        detail: {
+          direction,
+          outcome: "credential_not_found",
+          ...couldNotJudge(direction),
+        },
+      });
+      return {
+        d: { kind: "unavailable", modelRan: false },
+        r: { direction, outcome: "unavailable", cause: "credential_not_found" },
+      };
+    }
+    const verdict = await classifyGuardrail(
+      gr.decisions,
+      params,
+      p.apiKey,
+      p.credentialBaseUrl ?? null,
+      p.decisionFetch,
+    );
+    // Recorded per call that came back: a failed one bills nothing either provider documents. A
+    // ledger write never breaks the screening it records.
+    for (const c of verdict.calls) {
+      await recordDirectUsage(p.flow, {
+        provider: gr.decisions.provider,
+        model: gr.decisions.model,
+        node: "guardrail",
+        promptTokens: c.inputTokens,
+        completionTokens: 0,
+        durationMs: c.durationMs,
+      }).catch(() => {});
+    }
+    // Numbers and our own question keys: nothing in a score is text the provider wrote.
+    const logged = {
+      categories: verdict.categories,
+      scores: verdict.scores,
+    };
+    if (verdict.error) {
+      emitFlowEvent(p.flow, {
+        stage: "guardrail",
+        status: "error",
+        level: "warn",
+        detail: {
+          direction,
+          outcome: "analysis_failed",
+          ...logged,
+          ...judgedPartly(direction, verdict.violated),
+        },
+        errorMessage: verdict.error,
+      });
+    }
+    // Nothing was asked: the only enabled check had nothing to judge with (competitor mentions
+    // with no names). Same answer as a direction with nothing left to ask.
+    if (verdict.scores.length === 0) return { d: { kind: "not-run" }, r: null };
+    if (!verdict.violated) {
+      // A provider was asked, however it came back, so the caller's reads are a round trip old.
+      const d: GuardrailDecision = verdict.error
+        ? { kind: "unavailable", modelRan: true }
+        : { kind: "clean" };
+      return {
+        d,
+        r: {
+          direction,
+          outcome: d.kind,
+          scores: verdict.scores,
+          ...(verdict.error ? { cause: "analysis_failed" as const } : {}),
+        },
+      };
+    }
+    return tripped(
+      direction,
+      subject,
+      verdict.categories,
+      null,
+      { scores: verdict.scores },
+      logged,
+    );
+  };
+
+  // The window's messages, or none: a thread that cannot be read leaves the message to be judged alone,
+  // which is what the screening did before the window existed, rather than leaving it unjudged.
+  const loadContext = async (
+    limit: number,
+  ): Promise<GuardrailContextMessage[]> => {
+    if (limit <= 0 || !p.inputContext) return [];
+    try {
+      return guardrailContext(await p.inputContext(), limit);
+    } catch (err) {
+      logger.warn(
+        { err },
+        "guardrails: could not read the conversation for context; screening the message alone",
+      );
+      return [];
+    }
   };
 
   // The screening itself. It returns the report alongside the decision so the ANNOUNCEMENT has a
@@ -286,11 +635,15 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
     if (!judgesAnything({ direction, checks, customPolicy: gr.customPolicy })) {
       return { d: { kind: "not-run" }, r: null };
     }
+    const context =
+      direction === "input" ? await loadContext(gr.input.contextMessages) : [];
+    if (gr.classifier === "decisions")
+      return screenByClassifier(direction, subject, checks, context);
     const model = resolveModel(direction);
     if (!model)
       return {
         d: { kind: "unavailable", modelRan: false },
-        r: { direction, outcome: "unavailable" },
+        r: { direction, outcome: "unavailable", cause: buildFailure?.outcome },
       };
     const verdict = await analyzeGuardrail(
       model,
@@ -308,11 +661,11 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
         customerMessage: p.customerMessage,
         generationPrompt:
           dir.action === "generated" ? dir.generationPrompt : undefined,
+        context,
       },
-      // Constrained where the endpoint implements it, in the dialect it speaks, and asked for in
-      // the prompt everywhere else. The provider decides, not the model id: the same adapter serves
-      // OpenAI itself and whatever an operator points `openai-compatible` at (issue #131). Reaching
-      // it through the gate is what puts the proactive path on the same footing as the reactive one.
+      // NOTE: constrained where the endpoint implements it, asked for in the prompt elsewhere. The
+      // provider decides, not the model id: one adapter serves OpenAI and whatever `openai-compatible`
+      // points at.
       verdictAskMode(gr.provider),
       callbacks(),
     );
@@ -324,7 +677,11 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
         stage: "guardrail",
         status: "error",
         level: "warn",
-        detail: { direction, outcome: "analysis_failed" },
+        detail: {
+          direction,
+          outcome: "analysis_failed",
+          ...judgedPartly(direction, verdict.violated),
+        },
         errorMessage: verdict.error,
       });
     }
@@ -334,62 +691,56 @@ export function buildGuardrailGate(p: GuardrailGateParams): GuardrailGate {
       const d: GuardrailDecision = verdict.error
         ? { kind: "unavailable", modelRan: true }
         : { kind: "clean" };
-      return { d, r: { direction, outcome: d.kind } };
-    }
-    // NOTE: The turn trail and the operator note report what the guardrail DID, not what it was
-    // configured to do. `generated` with no replacement in hand sends the template — when the model
-    // returns none, and on the input direction every time (see ./analyze.ts) — and an operator
-    // reading "generated" on a line where the template went out is reading the config back, not the
-    // event.
-    const replacement =
-      dir.action === "generated" ? verdict.suggestedReply : null;
-    const effectiveAction =
-      dir.action === "generated" && replacement === null
-        ? "template"
-        : dir.action;
-    emitFlowEvent(p.flow, {
-      stage: "guardrail",
-      status: "ok",
-      level: "warn",
-      // NOTE: `categories` and `rationale` are both model-written, so neither can be copied into
-      // this row as it stands: `rationale` explains what in the message violated the policy, so it
-      // quotes the message, and `categories` is asked for as policy keys but arrives as whatever
-      // the model wrote. What goes in is the part with a known vocabulary, plus a COUNT of what did
-      // not match it, which is how "it violated something we cannot name here" stays visible. The
-      // announcement below carries both in full, wherever the caller puts it.
-      detail: {
-        direction,
-        action: effectiveAction,
-        ...loggableCategories(verdict.categories),
-      },
-    });
-    const r: GuardrailReport = {
-      direction,
-      outcome:
-        dir.action === "silent"
-          ? "suppressed"
-          : dir.action === "handoff"
-            ? "handed-off"
-            : "replaced",
-      action: effectiveAction,
-      categories: verdict.categories,
-      rationale: verdict.rationale,
-      ...(dir.action === "handoff" ? { refused: subject } : {}),
-    };
-    if (dir.action === "silent") return { d: { kind: "suppressed" }, r };
-    if (dir.action === "handoff")
       return {
-        d: { kind: "handed-off", reply: dir.handoffMessage || null },
-        r,
+        d,
+        r: {
+          direction,
+          outcome: d.kind,
+          ...(verdict.error ? { cause: "analysis_failed" as const } : {}),
+        },
       };
-    return {
-      d: { kind: "replaced", reply: replacement ?? dir.templateMessage },
-      r,
-    };
+    }
+    // NOTE: `categories` and `rationale` are both model-written, so neither can be copied into
+    // the log row as it stands: `rationale` explains what in the message violated the policy, so it
+    // quotes the message, and `categories` is asked for as policy keys but arrives as whatever
+    // the model wrote. What goes in is the part with a known vocabulary, plus a COUNT of what did
+    // not match it, which is how "it violated something we cannot name here" stays visible. The
+    // announcement carries both in full, wherever the caller puts it.
+    return tripped(
+      direction,
+      subject,
+      verdict.categories,
+      dir.action === "generated" ? verdict.suggestedReply : null,
+      { rationale: verdict.rationale },
+      loggableCategories(verdict.categories),
+    );
   };
 
+  // `hold`: a screening that could not judge stops the message as a hand-over does, with the
+  // direction's own customer line, and the note says why there is no verdict. The scores of the
+  // checks that did answer stay, so the note and the trace still say which ones failed.
+  const held = (
+    direction: "input" | "output",
+    subject: string,
+    from: GuardrailReport | null,
+  ): { d: GuardrailDecision; r: GuardrailReport } => ({
+    d: { kind: "handed-off", reply: gr[direction].handoffMessage || null },
+    r: {
+      direction,
+      outcome: "handed-off",
+      held: true,
+      refused: subject,
+      ...(from?.scores?.length ? { scores: from.scores } : {}),
+      ...(from?.cause ? { cause: from.cause } : {}),
+    },
+  });
+
   return async (direction, subject) => {
-    const { d, r } = await screen(direction, subject);
+    const screened = await screen(direction, subject);
+    const { d, r } =
+      holdsOn(direction) && screened.d.kind === "unavailable"
+        ? held(direction, subject, screened.r)
+        : screened;
     // The one announcement point. `not-run` is the only outcome with no report, and it is the only
     // one where nothing happened for anyone to read.
     if (r) await p.announce?.(r);

@@ -3,13 +3,13 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { type Prisma, PrismaClient } from "@/../generated/prisma/client";
 import type { TenantContext } from "@/lib/tenancy";
 import { getConversationDetail } from "@/modules/conversations/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog } from "../utils/flowlog";
 
-// Issue #846: every proactive line that was not an appointment reminder came back as a "followup"
-// marker, so an inbound integration's event and a channel-redirect follow-up were badged "Follow-up"
-// on the conversation. The turn now records where it came from and which message it sent, and the
-// trail hands both to the screen. A line written before that keeps the old inference.
+// A proactive turn records where it came from and which message it sent, and the trail hands both
+// to the screen, so an inbound integration's event or a channel-redirect follow-up is not badged
+// "Follow-up". A line with no recorded origin falls back to inferring the kind from the marker.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -27,8 +27,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -316,5 +316,32 @@ describe.skipIf(!dbUp)("where a proactive turn came from (issue #846)", () => {
     expect(e?.originRecorded).toBeNull();
     expect(e?.messageId).toBeNull();
     expect(e?.integrationName).toBeNull();
+  });
+
+  // The turn's summary of a tool that failed on every call is not another call: the trail shows the
+  // call once, not twice.
+  test("a tool's failed-on-every-call summary is not a call on the trail", async () => {
+    await clearFlowLog(suDb, { tenantId });
+    for (const detail of [
+      { tool: "consulta_pedido" },
+      { tool: "consulta_pedido", failedCalls: 1 },
+    ]) {
+      await suDb.executionLog.create({
+        data: {
+          tenantId,
+          conversationId: convId,
+          turnId: "t-tool-summary",
+          source: "inbox",
+          stage: "tool",
+          level: "failedCalls" in detail ? "warn" : "info",
+          status: "error",
+          detail,
+        },
+      });
+    }
+    const entries = await trail();
+    expect(entries.map((e) => [e.kind, e.name])).toEqual([
+      ["tool", "consulta_pedido"],
+    ]);
   });
 });

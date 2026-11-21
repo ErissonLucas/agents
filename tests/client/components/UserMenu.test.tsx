@@ -17,40 +17,40 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { createTestI18n } from "@/tests/utils/i18n";
 
 const mockLogout = mock(async () => true);
 const mockSetTheme = mock((_: string) => {});
 
-mock.module("@/client/contexts/AuthContext", () => ({
+stubExports(AuthModule, {
   useAuth: () => ({
     user: { email: "admin@fazer.ai" },
     logout: mockLogout,
   }),
-  AuthProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
-mock.module("@/client/contexts/ThemeContext", () => ({
+stubExports(ThemeModule, {
   useTheme: () => ({
     theme: "dark",
     resolvedTheme: "dark",
     setTheme: mockSetTheme,
   }),
   useThemedAsset: (path: string) => ({ src: path }),
-  ThemeProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
-// A REAL i18next instance, held here so the language radio's effect can be read off it. See
-// tests/utils/i18n.tsx: a registry stub of `react-i18next` used to live here, and the `i18n` it
-// handed back was a literal `{ language: "en" }` that every file running afterwards imported.
+// A REAL i18next instance, held here so the language radio's effect can be read off it. Not a
+// registry stub of `react-i18next`: that leaks into every file the worker runs afterwards (see
+// tests/utils/i18n.tsx).
 const i18n = createTestI18n();
 const changeLanguage = spyOn(i18n, "changeLanguage");
 
 import { I18nextProvider } from "react-i18next";
 import { ToastProvider } from "@/client/components/Toast";
 import { UserMenu } from "@/client/components/UserMenu";
+import * as AuthModule from "@/client/contexts/AuthContext";
+import * as ThemeModule from "@/client/contexts/ThemeContext";
+import { stubExports } from "@/tests/utils/module-stub";
 
 function renderMenu() {
   return render(
@@ -98,13 +98,14 @@ describe("UserMenu", () => {
     ).toBeInTheDocument();
   });
 
-  test("opens dropdown with theme and language groups", () => {
+  test("opens with the signed-in identity, the theme row and the language submenu", () => {
     renderMenu();
     openDropdown();
-    expect(screen.getByText(/^theme$/i)).toBeInTheDocument();
-    expect(screen.getByText(/^language$/i)).toBeInTheDocument();
-    expect(screen.getAllByRole("menuitemradio").length).toBeGreaterThanOrEqual(
-      4,
+    expect(screen.getAllByText("admin@fazer.ai").length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("menuitemradio")).toHaveLength(3);
+    expect(screen.getByRole("menuitem", { name: /language/i })).toHaveAttribute(
+      "aria-haspopup",
+      "menu",
     );
   });
 
@@ -119,6 +120,8 @@ describe("UserMenu", () => {
   test("selecting a language radio calls i18n.changeLanguage", () => {
     renderMenu();
     openDropdown();
+    const languageTrigger = screen.getByRole("menuitem", { name: /language/i });
+    fireEvent.keyDown(languageTrigger, { key: "ArrowRight" });
     const ptRadio = screen.getByRole("menuitemradio", { name: /português/i });
     fireEvent.click(ptRadio);
     expect(changeLanguage).toHaveBeenCalledWith("pt-BR");
@@ -144,10 +147,9 @@ describe("UserMenu", () => {
     expect(screen.getByText("LOGIN_PAGE_MARKER")).toBeInTheDocument();
   });
 
-  // IT USED TO NAVIGATE WHATEVER HAPPENED, and that is the finding this replaces (#566, round 15).
-  // The cookie is HttpOnly, so a logout the server did not answer leaves the operator signed in:
-  // `/login` bounces a signed-in visitor to `redirectTo`, so the old behaviour cost them the route
-  // they were on and said nothing about why.
+  // NOTE: the cookie is HttpOnly, so a logout the server did not answer leaves the operator signed
+  // in, and `/login` bounces a signed-in visitor to `redirectTo`: navigating anyway would cost them
+  // the route they were on and say nothing about why.
   test("stays put and says so when the session did not end", async () => {
     mockLogout.mockImplementationOnce(async () => false);
     renderMenu();
@@ -159,5 +161,138 @@ describe("UserMenu", () => {
     });
     expect(screen.queryByText("LOGIN_PAGE_MARKER")).not.toBeInTheDocument();
     expect(screen.getByText(/could not sign you out/i)).toBeInTheDocument();
+  });
+
+  describe("language submenu placement", () => {
+    const originalMatchMedia = window.matchMedia;
+
+    function setViewport(wide: boolean) {
+      window.matchMedia = ((query: string) => ({
+        ...originalMatchMedia.call(window, query),
+        matches: query === "(min-width: 768px)" ? wide : false,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      })) as typeof window.matchMedia;
+    }
+
+    afterEach(() => {
+      window.matchMedia = originalMatchMedia;
+    });
+
+    // happy-dom has no layout: every rect is zero, so the popper wrapper's translate is exactly
+    // the offset the submenu was given from its trigger. The trigger is given a height, since the
+    // narrow submenu drops by it.
+    async function openLanguageSubmenu(triggerHeight = 30.6) {
+      renderMenu();
+      openDropdown();
+      const trigger = screen.getByRole("menuitem", { name: /language/i });
+      trigger.getBoundingClientRect = () =>
+        DOMRect.fromRect({ x: 0, y: 0, width: 0, height: triggerHeight });
+      fireEvent.keyDown(trigger, { key: "ArrowRight" });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      const wrapper = screen
+        .getByRole("menuitemradio", { name: /português/i })
+        .closest("[data-radix-popper-content-wrapper]") as HTMLElement;
+      return wrapper.style.transform;
+    }
+
+    // NOTE: on a phone the menu spans most of the width, so beside it the submenu opened off
+    // screen (left -56px at 393px wide). Below md it opens on top of the menu: 176px wide, its
+    // right edge 12px inside the trigger's, and one pixel short of the trigger's height, so only
+    // the "Language" row's bottom padding is covered and no pixel row is left between the two
+    // (29.6px rounds to 30).
+    test("opens on top of the menu, under its trigger, on a narrow viewport", async () => {
+      setViewport(false);
+      expect(await openLanguageSubmenu()).toBe("translate(-188px, 30px)");
+      fireEvent.click(
+        screen.getByRole("menuitemradio", { name: /português/i }),
+      );
+      expect(changeLanguage).toHaveBeenCalledWith("pt-BR");
+    });
+
+    // NOTE: the horizontal offset is spacing steps, so Comfortable density (0.3rem) and a larger
+    // browser font widen it with the `w-44` it wraps: at a 20px root, 47 steps of 6px. The drop
+    // follows the trigger, which grows with them.
+    test("scales the overlap with the density's spacing step and the root font size", async () => {
+      setViewport(false);
+      document.documentElement.style.setProperty("--spacing", "0.3rem");
+      document.documentElement.style.fontSize = "20px";
+      try {
+        expect(await openLanguageSubmenu(40)).toBe("translate(-282px, 39px)");
+      } finally {
+        document.documentElement.style.removeProperty("--spacing");
+        document.documentElement.style.fontSize = "";
+      }
+    });
+
+    // NOTE: the overlapping submenu sits left of where Radix expects a right-side submenu, so a
+    // mouse heading down into it leaves the trigger outside the pointer-grace area and Radix
+    // focuses the parent menu, which closed the submenu. Focus landing on another item still does.
+    test("stays open when focus returns to the parent menu on a narrow viewport", async () => {
+      setViewport(false);
+      await openLanguageSubmenu();
+      const [parentMenu] = screen.getAllByRole("menu");
+      // The submenu was opened by keyboard; a pointer move puts Radix back in mouse mode, where
+      // focusing the menu container does not jump to its first item.
+      fireEvent.pointerMove(document);
+      act(() => parentMenu?.focus());
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(
+        screen.getByRole("menuitemradio", { name: /português/i }),
+      ).toBeInTheDocument();
+      act(() => screen.getByRole("menuitem", { name: /settings/i }).focus());
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      expect(
+        screen.queryByRole("menuitemradio", { name: /português/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    // Focus reaches the parent container from places other than the trigger, the theme row's
+    // label among them. The submenu ignores that focus only while the pointer is over it, so each
+    // side of its box is a place the pointer can be outside it. The trigger (0 to 30.6 here) and the
+    // strip down to the submenu's top count as the submenu, over its width only.
+    const SUBMENU_BOX = { x: 100, y: 40, width: 176, height: 100 };
+    const POINTERS: [string, number, number, boolean][] = [
+      ["inside", 150, 80, true],
+      ["between its trigger and", 150, 35, true],
+      ["on its trigger's bottom edge above", 150, 30, true],
+      ["left of", 90, 80, false],
+      ["left of the strip above", 90, 35, false],
+      ["right of", 290, 80, false],
+      ["above", 150, -5, false],
+      ["below", 150, 150, false],
+    ];
+    for (const [where, clientX, clientY, staysOpen] of POINTERS) {
+      test(`${staysOpen ? "stays open" : "closes"} when focus returns to the parent menu with the pointer ${where} it`, async () => {
+        setViewport(false);
+        await openLanguageSubmenu();
+        const submenu = screen
+          .getByRole("menuitemradio", { name: /português/i })
+          .closest('[role="menu"]') as HTMLElement;
+        submenu.getBoundingClientRect = () => DOMRect.fromRect(SUBMENU_BOX);
+        const [parentMenu] = screen.getAllByRole("menu");
+        fireEvent.pointerMove(document, { clientX, clientY });
+        act(() => parentMenu?.focus());
+        await act(async () => {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        });
+        const open =
+          screen.queryByRole("menuitemradio", { name: /português/i }) !== null;
+        expect(open).toBe(staysOpen);
+      });
+    }
+
+    // NOTE: the -5px align offset reads 0 here because collision shifting pins it to the
+    // zero-sized viewport; what matters is the 6px gap to the right of the trigger.
+    test("opens beside the menu on a wide viewport", async () => {
+      setViewport(true);
+      expect(await openLanguageSubmenu()).toBe("translate(6px, 0px)");
+    });
   });
 });

@@ -4,15 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runI18nExtract } from "../../scripts/i18n-extract";
 
-// NOTE: mkdir/mkdtemp/rm still use node:fs/promises because Bun has no
+// mkdir/mkdtemp/rm still use node:fs/promises because Bun has no
 // equivalents yet; file writes use Bun.write per the project guideline.
 async function makeFixture(source: string) {
   const dir = await mkdtemp(join(tmpdir(), "i18n-extract-"));
-  await mkdir(join(dir, "src"), { recursive: true });
+  await mkdir(join(dir, "app"), { recursive: true });
   await mkdir(join(dir, "locales"), { recursive: true });
-  await Bun.write(join(dir, "src", "a.tsx"), source);
+  await Bun.write(join(dir, "app", "a.tsx"), source);
   const configPath = join(dir, "config.cjs");
-  const srcGlob = JSON.stringify(join(dir, "src"));
+  const srcGlob = JSON.stringify(join(dir, "app"));
   const outDir = JSON.stringify(join(dir, "locales"));
   await Bun.write(
     configPath,

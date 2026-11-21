@@ -31,7 +31,7 @@ Como **você gerou** as keys no passo 1, elas já estão na sua mão pra ligar n
 
 ## Verifique a ingestion (health verde NÃO basta)
 
-`scripts/langfuse-verify.py` POSTa um batch em `/api/public/ingestion` e exige **207/200** (não 500); as chaves são o par que você semeou, lidas de um arquivo `0600` (a secret key fora do argv):
+`scripts/langfuse-verify.py` POSTa um span OTLP em `/api/public/otel/v1/traces`, o mesmo endpoint para onde o app exporta os traces, e exige **200** (não 500); as chaves são o par que você semeou, lidas de um arquivo `0600` (a secret key fora do argv):
 ```sh
 echo '{"publicKey":"<pk-lf>","secretKey":"<sk-lf>"}' > langfuse.keys && chmod 600 langfuse.keys
 python3 scripts/langfuse-verify.py ingestion --base-url https://langfuse.<seu-dominio>:3000 --keys-file langfuse.keys
@@ -43,6 +43,10 @@ Status 500 = quase sempre MinIO/S3 ausente.
 O wiring é **por MCP**, num tool só: `langfuse_connect` recebe `public_key`/`secret_key`/`base_url` **inline** (as keys que você semeou), cria a credencial no vault **já preenchida** (`kind:"langfuse"`, `{publicKey, secretKey}` + `baseUrl`) e liga o tracing no tenant-settings. É dry-run por padrão: revise o preview (keys redigidas) e reenvie com `dry_run:false` pra aplicar. Mesmo padrão do `deployment_connect` do Chatwoot (segredo de infra inline). Como as keys já existem, a credencial nasce **preenchida** (NÃO `pending`): uma entry pending não resolve o segredo e o tenant-settings rejeita com `credential ref not found`. (No vault o campo é `baseUrl` camelCase, ver `gotchas.md`; doc do tool em `docs/mcp.md`.)
 
 > **Ao pedir o OK do usuário** pra aplicar, fale do benefício, não do mecanismo: "vou ligar o painel que registra as conversas do agente, pra você acompanhar e depurar depois". **Não** cite `langfuse_connect`/"tracing"/"tenant-settings"/keys. Frases boas × ruins em `guardrails.md`.
+
+## Langfuse que já existe, chaves criadas pelo operador
+
+Quando o Langfuse já está no ar e quem cria a API key é o operador (um projeto novo para mais um tenant, um Langfuse Cloud, um Langfuse que você não semeou), você não tem as chaves, então o `langfuse_connect` não serve. O caminho é a credencial pending: `credential_create` com `kind:"langfuse"` e o `base_url` do Langfuse, que devolve o `fillAt` **e um `fillHint`**. Repasse o `fillHint` ao operador junto com o link, no lugar de descrever os campos: o Langfuse imprime um bloco `.env` ao criar a key (Settings → API Keys → Create new API keys) e o formulário do console lê as duas chaves e a URL desse bloco colado inteiro no campo "Langfuse .env". Pedir para copiar a Public Key e a Secret Key uma a uma é o caminho longo e pula a URL. Depois que a entrada sair de `pending` no `vault_list`, ligue o tracing com `tenant_settings_update` (`langfuse: { enabled: true, credential_ref: <nome> }`).
 
 ## Resetar a senha do Langfuse (fora da UI, break-glass)
 

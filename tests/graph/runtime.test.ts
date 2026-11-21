@@ -20,7 +20,10 @@ import { setPublisher, TOPICS } from "@/api/features/realtime/realtime.service";
 import { encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import { CONTRADICTED_HANDOFF_RESULT } from "@/graph/contradicted-handoff";
+import * as graphModule from "@/graph/graph";
 import { SILENCE_RETRY_MARK } from "@/graph/graph";
+import * as inflight from "@/graph/inflight";
 import {
   clearTurnInFlight,
   isTurnInFlight,
@@ -34,17 +37,27 @@ import {
   humanHandbackMessage,
   isConversationDivider,
   stampedConversationId,
+  UNDELIVERED_REPLY_NOTE,
 } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { FOLLOWUP_SKIP_SENTINEL } from "@/graph/nudge";
-import { runAgentTurn } from "@/graph/runtime";
-import { clearTurnOwning, markTurnOwning } from "@/graph/thread-claim";
+import * as prepare from "@/graph/prepare";
+import { loadAgentConfig } from "@/graph/prepare";
+import { runAgentTurn, runLoadedTurn } from "@/graph/runtime";
+import * as threadClaim from "@/graph/thread-claim";
+import {
+  claimIngestWrite,
+  clearTurnOwning,
+  markTurnOwning,
+  releaseIngestWrite,
+} from "@/graph/thread-claim";
 import { buildThreadStateGraph, THREAD_STATE_NODE } from "@/graph/thread-state";
 import { HANDOFF_DONE_PREFIX } from "@/graph/tools/catalog";
+import * as nativeTools from "@/graph/tools/native";
 import { REPLY_AS_TEXT_TOOL } from "@/graph/tools/reply-as-text";
-import { withKeyedQueue } from "@/lib/locks";
-import type { TenantContext } from "@/lib/tenancy";
+import { keyedQueueTail, withKeyedQueue } from "@/lib/locks";
+import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { computeConfigIssues } from "@/modules/agents/config-health";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
@@ -57,12 +70,22 @@ import {
 import { storageKey } from "@/modules/documents/issue";
 import { documentStarter } from "@/modules/documents/starters";
 import { createDocumentTemplate } from "@/modules/documents/templates";
+import { settleFlowEvents } from "@/modules/flowlog/scheduled";
+import {
+  GROUNDING_NO_SOURCE_PROMPT,
+  REVISE_NOTE_MARK,
+} from "@/modules/guardrails/grounding";
 import { GuardrailHandoffFailedError } from "@/modules/guardrails/handoff";
 import { readGuardrailHealth } from "@/modules/guardrails/health";
 import { selectClosedPrefix } from "@/modules/memory/cut";
 import { SPOKEN_NOTICE_DEFAULT } from "@/modules/tts/settings-shared";
+import { verifyOutboundSignature } from "@/modules/webhooks/outbound/signing";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { expectFallbackLines, graphDepsOf } from "../utils/fallback-lines";
 import { flowLogRow, flowLogRows } from "../utils/flowlog";
+import { outboundUrl } from "../utils/outbound";
+import { until } from "../utils/poll";
 import {
   EmptyThenReplyModel,
   guardrailModel,
@@ -90,6 +113,8 @@ import {
   SkipThenResolveModel,
   TextBesideToolThenEmptyModel,
 } from "../utils/scripted-models";
+import { settlesDuring, throwingModel } from "../utils/tool-logger-settled";
+import { countCalls, pendingAcross, waitsForTheThread } from "../utils/waiting";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -107,8 +132,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -132,8 +157,8 @@ function fakeModel() {
   return new FakeListChatModel({ responses: [REPLY] });
 }
 
-// NOTE: Captures every message list the model is invoked with, so a test can assert what the model
-// actually SAW (issue #45: the rendered location marker).
+// Captures every message list the model is invoked with, so a test can assert what the model
+// actually SAW (e.g. the rendered location marker).
 class CaptureReplyModel {
   seen: unknown[][] = [];
   constructor(private reply: string) {}
@@ -147,7 +172,7 @@ class CaptureReplyModel {
 }
 
 // A real chat model reporting the provider's usage, so the turn's callbacks fire and `UsageCapture`
-// writes the ledger row the way it does for a provider (issue #853).
+// writes the ledger row the way it does for a provider.
 class SpendingReplyModel extends BaseChatModel {
   constructor(
     private readonly reply: string,
@@ -190,13 +215,10 @@ function makeStubClient(sent: Array<[number, string]>) {
 }
 
 // Ordered recorder for sendMessage/toggleStatus. `mirrorOnToggle` simulates the Chatwoot webhook
-// mirroring the status change into our Conversation row BEFORE the turn ends (worst case, zero
-// lag) — the production race behind the lost-final-reply bug. It advances `chatwootStatusAt` along
-// with the status, because a webhook that moved one without the other is not a webhook. The pair is
-// what makes this a faithful worst case, and it is what stops "refuse to stamp when the row moved
-// past what the caller observed" from ever looking like a safe guard (issue #188, review round 9):
-// under that guard this very case — our OWN close, mirrored fast — would be refused, and the one
-// closing the funnel counts would go unrecorded.
+// mirroring the status change into our Conversation row BEFORE the turn ends (worst case, zero lag,
+// the race that can lose a final reply). It advances `chatwootStatusAt` with the status, as a real
+// webhook does. That pair is why "refuse to stamp when the row moved past what the caller observed"
+// is not a safe guard: it would refuse our OWN close, mirrored fast, and leave it unrecorded.
 function makeResolveClient(
   calls: Array<[string, number, string]>,
   opts: { mirrorOnToggle?: number } = {},
@@ -226,6 +248,52 @@ function makeResolveClient(
     },
   } as unknown as ChatwootClient;
   return async () => client;
+}
+
+// makeResolveClient plus the label endpoints, which replace the whole set like Chatwoot's do. The
+// label calls go in the same ordered log, so a test can say where they fell against the close.
+function makeLabelledResolveClient(
+  calls: Array<[string, number, string]>,
+  opts: {
+    catalog?: string[];
+    current?: string[];
+    // Conversations by number, for a close that looks for the contact's open case.
+    conversations?: Record<number, Record<string, unknown>>;
+  } = {},
+) {
+  let current = [...(opts.current ?? [])];
+  const client = {
+    sendMessage: async (conversationId: number, content: string) => {
+      calls.push(["sendMessage", conversationId, content]);
+      return {};
+    },
+    sendPrivateNote: async (conversationId: number, content: string) => {
+      calls.push(["sendPrivateNote", conversationId, content]);
+      return {};
+    },
+    toggleStatus: async (conversationId: number, status: string) => {
+      calls.push(["toggleStatus", conversationId, status]);
+      return {};
+    },
+    listLabels: async () => opts.catalog ?? [],
+    ...(opts.conversations
+      ? {
+          getConversation: async (id: number) => {
+            const c = opts.conversations?.[id];
+            if (!c) throw new Error(`no conversation ${id}`);
+            return c;
+          },
+          listContactConversations: async () => [],
+        }
+      : {}),
+    getConversationLabels: async () => [...current],
+    setConversationLabels: async (conversationId: number, labels: string[]) => {
+      current = [...labels];
+      calls.push(["setConversationLabels", conversationId, labels.join(",")]);
+      return {};
+    },
+  } as unknown as ChatwootClient;
+  return { make: async () => client, labels: () => current };
 }
 
 // Records the customer-facing posts in order: an attachment and a text send are both "the customer
@@ -310,7 +378,7 @@ async function mirroredStatus(convId: number) {
 }
 
 // What the graph memory thread HOLDS after a turn, which is a different question from what the
-// customer received and the only one that shows a refused turn's residue (issues #251, #315). Read
+// customer received and the only one that shows a refused turn's residue. Read
 // through the same one-node graph the rollback writes with, so the test sees what the next invoke
 // will load.
 async function threadChannel(
@@ -450,29 +518,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     await appDb.$disconnect();
   });
 
-  test("incoming message → agent replies via the bot token", async () => {
-    await seedConversation(900, null);
-    const sent: Array<[number, string]> = [];
-    const outcome = await runAgentTurn({
-      tenantId,
-      instanceId,
-      agentBotId: 9,
-      event: incoming({ conversationId: 900 }),
-      base: appDb,
-      deps: {
-        makeModel: fakeModel,
-        makeClient: makeStubClient(sent),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(outcome).toBe("posted");
-    expect(sent).toEqual([[900, REPLY]]);
-  });
-
-  // NOTE: Issue #454. `[[SKIP]]` is the FOLLOW-UP's way of saying "stay silent", and it is stripped
-  // on both proactive paths. The reactive path had no equivalent, so a model that reproduced the
-  // token — it is in the shared per-contact-inbox transcript every silent follow-up leaves behind —
-  // had it delivered verbatim. On an email inbox that is a real email, to whoever wrote in.
+  // NOTE: `[[SKIP]]` is the FOLLOW-UP's way of saying "stay silent", and the model can reproduce it
+  // on a reactive turn (it is in the shared per-contact-inbox transcript every silent follow-up
+  // leaves). Delivered verbatim, on an email inbox that is a real email to whoever wrote in.
   test("a reply that is only the follow-up's skip sentinel is silence, not text", async () => {
     await seedConversation(9454, null);
     const saver9454 = new MemorySaver();
@@ -501,6 +549,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // Searched rather than taken by order: a turn writes several `generate` lines, and "the last
     // one" is whichever the stage happened to end on.
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "generate" },
       select: { level: true, detail: true },
     });
@@ -510,7 +559,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(suppressed).toHaveLength(1);
     expect(suppressed[0]?.level).toBe("warn");
 
-    // Review round 5: and the token is not left in the thread to feed itself. The raw message was
+    // And the token is not left in the thread to feed itself. The raw message was
     // already checkpointed, the thread is shared per contact-inbox, and the next turn reading one
     // more sentinel answer is what reinforces the condition that produced this one.
     const held = await threadChannel(saver9454, 9454);
@@ -519,11 +568,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // Review round 6. The rollback stands down while the GRAPH thread is in flight, and a conversation
-  // WITH a contact-inbox — the normal production shape — carries TWO claims on two different keys:
-  // the conversation one, and the durable `markTurnOwning` one on the contact-inbox thread. Placed
-  // between them, the rollback read this turn's own claim and did nothing, silently. The case above
-  // could not catch it: with no contact-inbox the two keys collapse into one.
+  // NOTE: The rollback stands down while the GRAPH thread is in flight, and a conversation WITH a
+  // contact-inbox (the normal production shape) carries TWO claims on two keys: the conversation one
+  // and the durable `markTurnOwning` one. A rollback placed between them reads this turn's own claim
+  // and silently does nothing; with no contact-inbox (the case above) the two keys collapse into one.
   test("the token is rolled back on a contact-inbox thread too", async () => {
     const contactInboxId = 7454;
     const contact = await suDb.contact.create({
@@ -583,12 +631,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toEqual([]);
   });
 
-  // Review round 11, and the twin of the case above one layer out. The rollback runs just after this
-  // turn released its durable claim, which is exactly when a turn on ANOTHER replica may start —
-  // and that one holds nothing in this process's Map. So the rollback takes the claim every write to
-  // the channel from outside an invoke takes, and stands down when the row says the thread is busy.
-  // Here to prove the WIRING: `runAgentTurn` handing its owner down is what the deferral depends on,
-  // and `tests/graph/nudge-refused-rollback.test.ts` proves the rule itself.
+  // NOTE: The twin of the case above, one layer out. The rollback runs just after this turn released
+  // its durable claim, exactly when a turn on ANOTHER replica (nothing in this process's Map) may
+  // start, so it takes the claim every out-of-invoke write takes and stands down on a busy row. This
+  // proves the WIRING (`runAgentTurn` handing its owner down); the rule itself is proved in
+  // `tests/graph/nudge-refused-rollback.test.ts`.
   test("another replica's turn is waited out, and the rollback then runs on a thread this turn owns alone", async () => {
     const contactInboxId = 7455;
     const contact = await suDb.contact.create({
@@ -620,10 +667,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
     const saver = new MemorySaver();
     const sent: Array<[number, string]> = [];
-    // The other replica is ALREADY reading this thread — on the row, not in this process's Map, so
-    // its entry is dropped at once and only the durable half answers. A turn that joined it here
-    // would have to defer its own rollback, because a removal the other invoke is about to undo
-    // leaves the same history and a checkpoint that lies. It waits instead (issue #658).
+    // The other replica is ALREADY reading this thread, on the row and not in this process's
+    // Map, so only the durable half answers. A turn that joined it would have to defer its own
+    // rollback (a removal the other invoke is about to undo leaves a checkpoint that lies), so it waits.
     const otherReplica = await markTurnOwning(owner, appDb);
     clearTurnInFlight(graphThreadId);
     let released = false;
@@ -650,14 +696,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           checkpointer: saver,
         },
       });
-      const waiting = Symbol("still waiting");
-      // It really waits: nothing on the other replica's side has moved yet.
-      expect(
-        await Promise.race([
-          turn,
-          new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-        ]),
-      ).toBe(waiting);
+      expect(await waitsForTheThread(turn, graphThreadId)).toBe(true);
       await release();
       outcome = await turn;
     } finally {
@@ -704,6 +743,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       where: { tenantId, chatwootConversationId: 9456 },
     });
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "generate" },
       select: { detail: true },
     });
@@ -735,8 +775,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // Review round 4: the token is NOT edited out of a real answer — that is the silent data loss
-    // docs/graph.md rejects. It rides along, and the operator gets a line saying so.
+    // NOTE: The token is NOT edited out of a real answer (the silent data loss docs/graph.md
+    // rejects). It rides along, and the operator gets a line saying so.
     expect(outcome).toBe("posted");
     expect(sent).toEqual([
       [9455, `${FOLLOWUP_SKIP_SENTINEL} Claro, posso ajudar.`],
@@ -745,6 +785,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       where: { tenantId, chatwootConversationId: 9455 },
     });
     const rows455 = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv455.id, stage: "generate" },
       select: { detail: true },
     });
@@ -755,10 +796,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toHaveLength(1);
   });
 
-  // Review round 1, P2. The proactive path also reads a bare "SKIP" and a parenthetical-only reply
-  // as silence, because ITS prompt asked the model to produce nothing. Nothing asks that here, a
-  // customer is waiting, and these are ordinary short answers — importing that heuristic would trade
-  // a leaked marker for an ignored customer, which is the defect this PR exists to avoid.
+  // NOTE: The proactive path also reads a bare "SKIP" and a parenthetical-only reply as silence,
+  // because ITS prompt asked the model to produce nothing. Here a customer is waiting and these are
+  // ordinary short answers: importing that heuristic would trade a leaked marker for an ignored
+  // customer.
   test("a short reply the follow-up would read as silence is still delivered", async () => {
     for (const [conv, reply] of [
       [9457, "SKIP"],
@@ -783,8 +824,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     }
   });
 
-  // Review round 1, P3. `[[SKIP]][[SKIP]]` used to fall between the two answers: not equal to the
-  // sentinel, so "not silent", yet empty once stripped — silenced with no line explaining it.
+  // NOTE: `[[SKIP]][[SKIP]]` must not fall between the two answers: not equal to the sentinel, so
+  // "not silent", yet empty once stripped, which would silence it with no line explaining it.
   test("a reply of repeated sentinels is silence, and says so", async () => {
     await seedConversation(9459, null);
     const sent: Array<[number, string]> = [];
@@ -809,6 +850,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       where: { tenantId, chatwootConversationId: 9459 },
     });
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "generate" },
       select: { detail: true },
     });
@@ -819,10 +861,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toHaveLength(1);
   });
 
-  // NOTE: Issue #63 end-to-end. A provider answering 200 with an empty completion used to end the
-  // turn, and if that was the customer's last message they were simply never answered. Both halves
-  // are asserted here: the reply IS delivered, and the recovered fault leaves a warn on the turn's
-  // trail, so a rate measured at 1 in 184 on one install can never go silent again.
+  // NOTE: A provider answering 200 with an empty completion must not end the turn, or a customer
+  // whose last message it was is never answered. Both halves are asserted: the reply IS delivered,
+  // and the recovered fault leaves a warn on the turn's trail, so it never goes silent.
   test("an empty provider response is retried and the customer still gets an answer", async () => {
     await seedConversation(995, null);
     const sent: Array<[number, string]> = [];
@@ -845,12 +886,14 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
 
     // emitFlowEvent is fire-and-forget, so poll briefly.
     let retryLogged = false;
-    for (let i = 0; i < 30 && !retryLogged; i++) {
+    await until("the retry line", async () => {
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "generate",
-          level: "warn",
+          // NOTE: Written before the retry, so `info` with `willRetry`: the recovered turn alerts nobody.
+          level: "info",
           threadId: `${tenantId}:${instanceId}:995`,
         },
         select: { detail: true },
@@ -858,15 +901,16 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       retryLogged = rows.some(
         (r) =>
           (r.detail as Record<string, unknown> | null)?.retriedEmptyResponse ===
-          1,
+            1 &&
+          (r.detail as Record<string, unknown> | null)?.willRetry === true,
       );
-      if (!retryLogged) await new Promise((r) => setTimeout(r, 100));
-    }
+      return retryLogged || null;
+    });
     expect(retryLogged).toBe(true);
   });
 
-  // NOTE: Issue #45 end-to-end (direct path): a WhatsApp location pin must reach the model as the
-  // rendered <localização> marker — before the fix it arrived as an unusable "unsupported file".
+  // NOTE: Direct path: a WhatsApp location pin must reach the model as the rendered <localização>
+  // marker, not as an unusable "unsupported file".
   test("a location pin reaches the model as a <localização> marker", async () => {
     await seedConversation(960, null);
     const model = new CaptureReplyModel(REPLY);
@@ -990,9 +1034,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // The customer's own message is untouched by the marker.
     expect(String(messages[3]?.content)).not.toContain("nova conversa");
     expect(String(messages[3]?.content)).toBe(String(messages[0]?.content));
-    // And the boundary is one the CUT can find. Recognition is by metadata, not by the text above,
-    // so a divider written without it would read as an ordinary turn here and the first attendance
-    // would never be compactable — the producer and the consumer only meet if this passes.
+    // And the boundary is one the CUT can find. Recognition is by metadata, not by the text
+    // above, so a divider written without it would read as an ordinary turn and the first attendance
+    // would never be compactable: the producer and the consumer only meet if this passes.
     const cut = selectClosedPrefix(messages as unknown as BaseMessage[], {
       currentAttendanceClosed: false,
     });
@@ -1000,15 +1044,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(cut.open).toHaveLength(3);
   });
 
-  // Round-8 review finding (P1). Ingestion decides whether an out-of-order message may still speak
-  // for the thread's attendance by comparing it against the newest inbound id the thread has seen,
-  // and this writer recorded no id at all — so the frontier was blind to the most ordinary way a new
-  // attendance opens, which is the customer writing and the bot ANSWERING. A delayed message from the
-  // previous conversation then compared newer than a mark left behind in that same conversation,
-  // claimed a boundary, walked the marker back, and armed compaction for the LIVE one.
-  //
-  // Two writers in one test on purpose: the property only exists where they meet, and each of them
-  // alone is green with the bug in.
+  // NOTE: Ingestion decides whether an out-of-order message may still speak for the thread's
+  // attendance by comparing it with the newest inbound id the thread has seen, so the turn must record
+  // its id: otherwise a delayed message from the previous conversation claims a boundary, walks the
+  // marker back, and arms compaction for the LIVE one. That holds when the boundary is DEFERRED
+  // because another invoke reads the thread too (src/graph/runtime.ts): the marker stays, the id is
+  // still recorded, or the cut reads the live conversation as closed. Two writers in one test on
+  // purpose: the property only exists where they meet, and each alone passes without it.
   test("a turn's inbound id counts in the frontier a late ingestion is measured against", async () => {
     const contactInboxId = 7011;
     const graphThreadId = contactInboxThreadId(
@@ -1095,21 +1137,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(at.lastSyncedMessageId).toBe(5003);
   });
 
-  // Round-10 review finding (P1), and the case an earlier round DISMISSED: `advanceMarker` is false
-  // in two different situations, and only one of them is harmless. Here the boundary is DEFERRED
-  // because another invoke is reading the thread (../../src/graph/attendance-boundary.ts, case 1) —
-  // the conversation really is new, this turn really is handling its first message, and the marker
-  // deliberately stays on the previous one. A turn that records no inbound id there leaves the
-  // frontier back in the previous attendance, so a delayed message from it reads as CURRENT, stamps
-  // itself at the end of the channel, and the cut then reads the live conversation as closed.
-  // UMA ESPERA É UMA JANELA, E ALGUÉM PODE ENTRAR NELA (issue #688). O portão de posse do webhook
-  // respondeu ANTES da espera, e a espera dura até o teto (`TURN_WAIT_MS`); a re-checagem que já
-  // existe roda DEPOIS da geração, onde ela suprime o envio e não desfaz uma ferramenta que já mutou
-  // alguma coisa — um ticket aberto, uma etiqueta, uma chamada HTTP de saída.
-  //
-  // A PROVA NÃO É A PALAVRA DO DESFECHO, e é por isso que o teste mede o modelo. `taken-over`
-  // também é o que volta quando a re-checagem pós-geração pega o caso, e ali as ferramentas já
-  // rodaram: quem só olhasse o desfecho leria os dois como o mesmo evento.
+  // NOTE: UMA ESPERA É UMA JANELA. O portão de posse do webhook respondeu ANTES da espera (que dura
+  // até `TURN_WAIT_MS`), e a re-checagem pós-geração só suprime o envio, não desfaz uma ferramenta
+  // que já mutou algo. O teste mede o modelo, não a palavra do desfecho: `taken-over` também volta
+  // quando a re-checagem pós-geração pega o caso, depois de as ferramentas rodarem.
   test("issue #688: a person who takes the conversation over during the wait stops the turn before the invoke", async () => {
     const contactInboxId = 7477;
     const conv = await suDb.conversation.create({
@@ -1146,13 +1177,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    const waiting = Symbol("still waiting");
-    expect(
-      await Promise.race([
-        turn,
-        new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-      ]),
-    ).toBe(waiting);
+    expect(await waitsForTheThread(turn, graphThreadId)).toBe(true);
     // Uma pessoa assume enquanto o turno está parado.
     await suDb.conversation.updateMany({
       where: { tenantId, chatwootConversationId: 9477 },
@@ -1162,14 +1187,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
 
     expect(sent).toEqual([]);
     expect(model.seen).toEqual([]);
-    // A PALAVRA É OUTRA, e a diferença é toda a contabilidade que vem depois. `taken-over` significa
-    // que o invoke rodou e a mensagem do cliente ESTÁ no canal; aqui o turno parou antes, e a
-    // mensagem não está em memória nenhuma. Lidas como a mesma palavra, é a segunda que some: foi
-    // exatamente isso que fez a tentativa anterior (`1ec96449`) ser revertida.
+    // NOTE: A PALAVRA É OUTRA, e a diferença é toda a contabilidade que vem depois. `taken-over`
+    // significa que o invoke rodou e a mensagem do cliente ESTÁ no canal; aqui o turno parou antes, e
+    // a mensagem não está em memória nenhuma. Lidas como a mesma palavra, é a segunda que some.
     expect(await turn).toBe("taken-over-unread");
-    // E A MARCA FICA ONDE ESTAVA, que é o que essa palavra compra. A lista de exclusão deste caminho
+    // NOTE: E A MARCA FICA ONDE ESTAVA, que é o que essa palavra compra. A lista de exclusão deste caminho
     // é lida por exclusão e só nomeia `superseded`, então uma palavra nova avança a marca por
-    // padrão — e uma marca por cima de uma mensagem que ninguém leu é a mensagem perdida.
+    // padrão, e uma marca por cima de uma mensagem que ninguém leu é a mensagem perdida.
     expect(
       (
         await suDb.conversation.findUniqueOrThrow({
@@ -1178,13 +1202,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         })
       ).lastHandledMessageId,
     ).toBeNull();
-    // E O OPERADOR VÊ. A #271 fixou que todo portão que fecha nesta pergunta escreve a MESMA linha,
-    // porque quem filtra o log por um desfecho tem que receber todos eles; este é o quarto, e sem a
-    // linha o turno para em silêncio e a conversa some do rastro de handoff. `emitFlowEvent` é
-    // fire-and-forget, daí o poll.
+    // E O OPERADOR VÊ. Todo portão que fecha nesta pergunta escreve a MESMA linha, porque quem
+    // filtra o log por um desfecho tem que receber todos eles; sem ela a conversa some do rastro de
+    // handoff. `emitFlowEvent` é fire-and-forget, daí o poll.
     let handoff: unknown = null;
-    for (let i = 0; i < 30 && handoff === null; i++) {
+    await until("the handoff line", async () => {
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "handoff",
@@ -1193,22 +1217,18 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         select: { detail: true },
       });
       if (rows.length > 0) handoff = rows[0]?.detail ?? null;
-      else await new Promise((r) => setTimeout(r, 50));
-    }
+      return handoff === null ? null : true;
+    });
     expect((handoff as { outcome?: string } | null)?.outcome).toBe(
       "taken_over",
     );
   }, 20_000);
 
-  // E UMA LEITURA DE POSSE QUE FALHA NÃO É UMA DESISTÊNCIA (issue #688). O `botOwnsItNow` de hoje é
-  // fail-closed: ele devolve `false` quando a query falha, o que é certo para os dois usos que ele
-  // tem (a nota de hand-back e o recibo de leitura, ambos suprimíveis — "leaving the note OWED,
-  // which costs nothing"). Usado para ENCERRAR o turno, o mesmo `false` transforma uma falha
-  // transitória de banco em desistência, e o cliente fica sem resposta com o bot ainda dono.
-  //
-  // A decisão é prosseguir, e ela é uma troca medida: prosseguir custa a janela que já existia hoje
-  // (e a re-checagem pós-geração ainda suprime o envio); parar custa uma resposta ao cliente toda
-  // vez que o banco piscar durante a espera, que é mais frequente do que um takeover dentro dela.
+  // NOTE: UMA LEITURA DE POSSE QUE FALHA NÃO É UMA DESISTÊNCIA. `botOwnsItNow` é fail-closed, certo
+  // para a nota de hand-back e o recibo de leitura (ambos suprimíveis), mas usado para ENCERRAR o
+  // turno transformaria uma falha transitória de banco em cliente sem resposta. Prosseguir custa só
+  // a janela (a re-checagem pós-geração ainda suprime o envio); parar custaria uma resposta toda vez
+  // que o banco piscar durante a espera, o que é mais frequente que um takeover dentro dela.
   test("issue #688: an ownership read that FAILS during the wait does not stand the turn down", async () => {
     const contactInboxId = 7478;
     await suDb.conversation.create({
@@ -1248,13 +1268,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
       } as never,
     });
-    const waiting = Symbol("still waiting");
-    expect(
-      await Promise.race([
-        turn,
-        new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-      ]),
-    ).toBe(waiting);
+    expect(await waitsForTheThread(turn, graphThreadId)).toBe(true);
     clearTurnInFlight(graphThreadId);
 
     // O turno segue: o modelo é chamado e o cliente é respondido. Uma leitura ilegível não pode
@@ -1262,21 +1276,17 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(await turn).toBe("posted");
     expect(model.seen.length).toBe(1);
     expect(sent.length).toBe(1);
-    // E A LEITURA FOI TENTADA. Sem esta linha o teste passa por não exercitar nada — é verde no
-    // código de hoje, que não tem portão nenhum, e continuaria verde num conserto que perguntasse a
-    // posse em outro lugar ou não perguntasse. O que ele guarda é a FALHA não virar desistência, e
-    // isso só significa alguma coisa se a falha tiver acontecido no caminho do turno.
+    // NOTE: E A LEITURA FOI TENTADA. Sem esta linha o teste passaria sem exercitar nada, inclusive
+    // num código que perguntasse a posse em outro lugar ou não perguntasse. Ele guarda a FALHA não
+    // virar desistência, o que só significa algo se a falha aconteceu no caminho do turno.
     expect(leituras).toBeGreaterThan(0);
   }, 20_000);
 
-  // THE WAIT IS OUTSIDE THE `ingest:` QUEUE (PR review round 4), and this is what says so. That key
-  // is not ours alone: the PREVIOUS turn's own rollback takes it on the way out, AFTER it has
-  // released the thread, and so does continuous ingestion. A wait that held it would starve exactly
-  // that rollback — it would sit behind the wait, the thread would come free, this turn would take
-  // it, and the rollback would then find an invoke reading and KEEP what it came to undo, so this
-  // turn would load the undelivered answer or the silence token as history. Measured on the queue
-  // rather than on the rollback, because the queue is the mechanism and the rollback is one of its
-  // several victims.
+  // NOTE: THE WAIT IS OUTSIDE THE `ingest:` QUEUE. The PREVIOUS turn's rollback takes that key on
+  // the way out, AFTER releasing the thread, and so does continuous ingestion. A wait holding it
+  // would starve that rollback, which would then find this invoke reading and KEEP what it came to
+  // undo (an undelivered answer or the silence token). Asserted on the queue, the mechanism, rather
+  // than on the rollback, one of its several victims.
   test("while a turn waits for the thread, the ingest queue stays open to everyone else", async () => {
     const contactInboxId = 7466;
     await suDb.conversation.create({
@@ -1308,26 +1318,27 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer: new MemorySaver(),
       },
     });
+    let queued: Promise<void> = Promise.resolve();
     try {
-      const waiting = Symbol("still waiting");
-      expect(
-        await Promise.race([
-          turn,
-          new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-        ]),
-      ).toBe(waiting);
+      expect(await waitsForTheThread(turn, graphThreadId)).toBe(true);
       // The turn is waiting right now, and the queue it will need is free: this callback runs
-      // instead of queueing behind the wait.
-      const tookTheQueue = Symbol("took the queue");
-      expect(
-        await Promise.race([
-          withKeyedQueue(`ingest:${graphThreadId}`, async () => tookTheQueue),
-          new Promise<"blocked">((r) => setTimeout(() => r("blocked"), 1_000)),
-        ]),
-      ).toBe(tookTheQueue);
+      // instead of queueing behind the wait. The waiting turn's own polls are the clock: three more
+      // of them with the callback still queued is a queue held across the wait.
+      const asks = countCalls(
+        inflight,
+        "isTurnRunning",
+        (id: string) => id === graphThreadId,
+      );
+      try {
+        queued = withKeyedQueue(`ingest:${graphThreadId}`, async () => {});
+        expect(await pendingAcross(queued, asks.count)).toBe(false);
+      } finally {
+        asks.restore();
+      }
     } finally {
       clearTurnInFlight(graphThreadId);
       await turn;
+      await queued;
     }
   }, 20_000);
 
@@ -1376,12 +1387,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       });
 
     expect(await turn(9320, 6001)).toBe("posted");
-    // The new conversation's first turn, arriving while ANOTHER invoke is still reading the thread.
-    // It waits that invoke out (issue #658) and then runs alone, so both the boundary and the
-    // frontier are this turn's to move.
+    // NOTE: The new conversation's first turn, arriving while ANOTHER invoke is still reading the
+    // thread. It waits that invoke out and then runs alone, so both the boundary and the frontier are
+    // this turn's to move.
     markTurnInFlight(graphThreadId);
     const second = turn(9321, 6003);
-    setTimeout(() => clearTurnInFlight(graphThreadId), 150);
+    expect(await waitsForTheThread(second, graphThreadId)).toBe(true);
+    clearTurnInFlight(graphThreadId);
     expect(await second).toBe("posted");
     const marker = await suDb.agentThread.findUniqueOrThrow({
       where: {
@@ -1394,7 +1406,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       select: { lastConversationId: true, lastSyncedMessageId: true },
     });
     expect(marker.lastConversationId).toBe(9321);
-    // THE FRONTIER IS THE POINT (issue #194), and it is what makes the message below late. It moves
+    // NOTE: THE FRONTIER IS THE POINT, and it is what makes the message below late. It moves
     // on the id the turn HANDLED, which is the ordinary way a new attendance opens: the customer
     // writes and the bot answers.
     expect(marker.lastSyncedMessageId).toBe(6003);
@@ -1423,19 +1435,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(last && stampedConversationId(last)).toBe(null);
   });
 
-  // THE BARRIER (issue #194), at the reader a customer is waiting on. Continuous ingestion is a
-  // queued job now, so a message the agent stayed silent on can still be a ROW when a turn starts,
-  // and a turn that answers without it answers without the context the feature exists to provide.
-  // Every reader of the memory thread drains it before reading; this pins the wiring at this one,
-  // which is not covered by the drain's own tests — those call it directly, and every one of them
-  // passes with this call site deleted.
-  //
-  // Asserted at MODEL time, not afterwards: "the message reached the thread eventually" is also true
-  // when the turn read the thread before it landed, which is the failure.
-  //
-  // The row is pushed into the future, which is what a deferral leaves behind and what a due-only
-  // claim would skip. It is also what makes this the barrier's test and not the tick's: no other
-  // path in this process would take this row.
+  // NOTE: THE BARRIER, at the reader a customer is waiting on. Continuous ingestion is a queued job,
+  // so a message the agent stayed silent on can still be a ROW when a turn starts; every reader of
+  // the memory thread drains it first, and this pins the wiring here (the drain's own tests call it
+  // directly). Asserted at MODEL time, since "reached the thread eventually" is also true of the
+  // failure. The row is pushed into the future (what a deferral leaves, and what a due-only claim
+  // skips), so only the barrier can take it.
   test("a turn folds in a message still queued for it, before calling the model", async () => {
     const contactInboxId = 7009;
     const graphThreadId = contactInboxThreadId(
@@ -1679,19 +1684,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       });
 
     await turn(980);
-    // A turn of the OLD conversation, still invoking when the new one arrives. It does NOT run
-    // beside it (issue #658): an invoke is a read-modify-write of the whole channel, so the one
+    // NOTE: A turn of the OLD conversation, still invoking when the new one arrives. It does NOT run
+    // beside it: an invoke is a read-modify-write of the whole channel, so the one
     // finishing second saves what it loaded and undoes the first. It waits, and the boundary is
     // then claimed in the ordinary way, by a turn that is alone on the thread.
     markTurnInFlight(graphThreadId);
     const second = turn(981);
-    const waiting = Symbol("still waiting");
-    expect(
-      await Promise.race([
-        second,
-        new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-      ]),
-    ).toBe(waiting);
+    expect(await waitsForTheThread(second, graphThreadId)).toBe(true);
     // Nothing was written while it waited, the marker included: the wait is BEFORE the divider, the
     // marker and the invoke, which is what makes standing still cost the turn a delay and nothing
     // else.
@@ -1724,9 +1723,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       }),
     ).toBe(1);
 
-    // The marker advanced, and this turn is the one that moved it — there is no second turn here,
-    // which is the difference the wait makes: the boundary used to be deferred to whatever came
-    // next, and a next turn that never comes left it unclaimed.
+    // The marker advanced, and this turn is the one that moved it: there is no second turn
+    // here. Deferring the boundary to whatever comes next would leave it unclaimed when no next turn
+    // comes.
     const after = await suDb.agentThread.findUniqueOrThrow({
       where: {
         tenantId_chatwootInstanceId_contactInboxId: {
@@ -1745,7 +1744,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(
       selectClosedPrefix(messages, { currentAttendanceClosed: false }).closed,
     ).toHaveLength(2);
-    // And the divider IS there, which it could not be while the boundary was deferred: it lands
+    // NOTE: And the divider IS there, which it could not be with the boundary deferred: it lands
     // before this conversation's own exchange, where a hint about a past attendance belongs.
     expect(messages.some(isConversationDivider)).toBe(true);
   });
@@ -1771,7 +1770,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   // The sibling state, and the reason the two are not one word: a bound agent that is switched off
   // is silent by the operator's own decision, while an unbound inbox is a channel nobody finished
   // connecting. The caller writes an operator-facing line for the second and stays quiet for the
-  // first (issue #318), so the classification has to happen HERE, in the read that decides it — a
+  // first, so the classification has to happen HERE, in the read that decides it: a
   // caller re-reading the binding afterwards would answer about a later moment.
   test("bound inbox whose agent is switched off → agent-unavailable (silent)", async () => {
     const sent: Array<[number, string]> = [];
@@ -1806,29 +1805,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     }
   });
 
-  test("human took over during the LLM call → does not post", async () => {
-    await seedConversation(901, "User");
-    const sent: Array<[number, string]> = [];
-    const outcome = await runAgentTurn({
-      tenantId,
-      instanceId,
-      agentBotId: 9,
-      event: incoming({ conversationId: 901 }),
-      base: appDb,
-      deps: {
-        makeModel: fakeModel,
-        makeClient: makeStubClient(sent),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(outcome).toBe("taken-over");
-    expect(sent).toEqual([]);
-  });
-
-  // Round 25. A turn silenced by the TOKEN arms a rollback for the `finally`, and it can still be
-  // refused afterwards — a takeover, a supersede, a `/reset`. `refuse` then removes the same
-  // messages, and the armed rollback ran a second time: it took the ingest claim, read the channel,
-  // found nothing left and logged "could not roll back" — a warning about a removal that succeeded.
+  // NOTE: A turn silenced by the TOKEN arms a rollback for the `finally`, and it can still be refused
+  // afterwards (a takeover, a supersede, a `/reset`), where `refuse` removes the same messages. The
+  // armed rollback must not run again and log "could not roll back" about a removal that succeeded.
   test("a token-silenced turn that is then refused is not rolled back twice", async () => {
     await seedConversation(9462, null);
     const warn = spyOn(logger, "warn");
@@ -1890,18 +1869,14 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     }
   });
 
-  // NOTE: Both of these lose the ownership recheck and return the same "taken-over". What they must
-  // NOT share is the flow-log detail. A human assignee is a real handoff; a conversation that merely
-  // left `pending` with nobody assigned is Chatwoot auto-escalating (most often because our webhook
-  // ack was slow), which throws away a reply that was already written. Reporting both as
-  // `taken_over` is what sent an incident investigation to the wrong half of the system (#225).
-  // NOTE: scoped to the conversation asked for, via its DB id — `execution_logs.conversation_id`
-  // holds the INTERNAL id (`loaded.conversationDbId`), never the Chatwoot one the tests name. It
-  // read the tenant's newest handoff row unscoped before, so a turn whose row had not landed yet
-  // silently returned the PREVIOUS test's row: 8801 writes `taken_over`, 8802 asserts
-  // `ownership_lost`, and whichever write won the race decided the result. That is the ~1-in-4 CI
-  // failure this file kept producing, on a machine slower than a dev laptop.
-  // One read, for the assertion that a conversation has NO handoff row.
+  // NOTE: Both of these lose the ownership recheck and return the same "taken-over", but must NOT
+  // share the flow-log detail: a human assignee is a real handoff, while a conversation that merely
+  // left `pending` with nobody assigned is Chatwoot auto-escalating (usually a slow webhook ack).
+  // Reporting both as `taken_over` sends an investigation to the wrong half of the system.
+
+  // One read, for the assertion that a conversation has NO handoff row. Scoped by the DB id
+  // (`execution_logs.conversation_id` holds the INTERNAL id, never the Chatwoot one the tests name):
+  // unscoped, a row that has not landed yet reads as the PREVIOUS test's row.
   async function handoffRowNow(convId: number) {
     const conversation = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: convId },
@@ -1917,24 +1892,20 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const conversation = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: convId },
     });
-    // Scoped since #123; the wait is the other half. `findFirstOrThrow` on a row that has not landed
-    // yet does not answer wrong, it THROWS, so what the scoping converted was a silent wrong answer
-    // into a spurious failure. Poll for the row this conversation owes (#258).
-    for (let i = 0; i < 30; i++) {
-      const row = await flowLogRow(suDb, {
-        where: { tenantId, stage: "handoff", conversationId: conversation.id },
-        orderBy: { id: "desc" },
-      });
-      if (row) return row.detail;
-      await new Promise((r) => setTimeout(r, 100));
-    }
+    // Scoped to the conversation; `flowLogRow` settles the fire-and-forget writes first, so one read
+    // answers whether the row exists.
+    const row = await flowLogRow(suDb, {
+      where: { tenantId, stage: "handoff", conversationId: conversation.id },
+      orderBy: { id: "desc" },
+    });
+    if (row) return row.detail;
     throw new Error(`no handoff flow line for conv ${convId}`);
   }
 
-  // NOTE: the guard for the reader above, not for the product. Before it was scoped, this returned
-  // the newest handoff row of ANY conversation in the tenant, so the two tests below could pass by
-  // reading each other's row. A conversation that never ran a turn has no handoff row at all, so a
-  // scoped reader has nothing to return; an unscoped one hands back a neighbour's and looks fine.
+  // NOTE: the guard for the reader above, not for the product. An unscoped reader would return the
+  // newest handoff row of ANY conversation in the tenant, so the two tests below could pass by
+  // reading each other's row. A conversation that never ran a turn has no handoff row, so a scoped
+  // reader has nothing to return; an unscoped one hands back a neighbour's and looks fine.
   test("handoffDetail refuses to answer with another conversation's row", async () => {
     await seedConversation(8803, "User", 5);
     await runAgentTurn({
@@ -1956,9 +1927,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // written fire-and-forget, so without this wait the null below can mean "nothing has landed
     // yet" and the test passes having proved nothing.
     expect(await handoffDetail(8803)).toBeDefined();
-    // Then one read, awaited. 8804 never ran a turn, so no write of its own is in flight and there
-    // is nothing to poll for: the waiting reader would spend its whole 3s to agree, and would spend
-    // it AFTER this test returned, because the assertion it was handed to was never awaited (#258).
+    // NOTE: Then one read, awaited. 8804 never ran a turn, so no write of its own is in flight and
+    // there is nothing to poll for: the polling reader would spend its whole 3s to agree.
     expect(await handoffRowNow(8804)).toBeNull();
   });
 
@@ -2081,8 +2051,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // The deferred resolve is observable in the flow log (handoff stage, outcome "resolved").
     // emitFlowEvent is fire-and-forget, so poll briefly.
     let resolvedLogged = false;
-    for (let i = 0; i < 30 && !resolvedLogged; i++) {
+    await until("the resolved handoff line", async () => {
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "handoff",
@@ -2094,11 +2065,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         (r) =>
           (r.detail as Record<string, unknown> | null)?.outcome === "resolved",
       );
-      if (!resolvedLogged) await new Promise((r) => setTimeout(r, 100));
-    }
+      return resolvedLogged || null;
+    });
     expect(resolvedLogged).toBe(true);
 
-    // Issue #188: the agent calling resolve_conversation is the ONE closing the Resolution funnel
+    // The agent calling resolve_conversation is the ONE closing the Resolution funnel
     // counts, and it is only distinguishable from the five that are not because the origin is
     // recorded here. The row is read after the flow event above, so the write has had its turn.
     const resolvedRow = await suDb.conversation.findFirstOrThrow({
@@ -2106,13 +2077,382 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       select: { resolvedBy: true, resolvedByAt: true },
     });
     expect(resolvedRow.resolvedBy).toBe("agent");
-    // And the floor is the recheck's version, not the row's at write time — which by now is the
+    // NOTE: And the floor is the recheck's version, not the row's at write time, which by now is the
     // one `mirrorOnToggle` wrote. Getting this wrong dates the stamp to the wrong episode, and a
     // delayed webhook for this very close would then be judged to predate it.
     expect(resolvedRow.resolvedByAt).toBe(OBSERVED_AT);
   });
 
-  // Review round 14. The deferred resolve fires AFTER delivery, and delivery on this path is not
+  // An instruction to label on close is skipped about half of the time, and a CSAT survey keyed on
+  // the label then reaches none of those conversations. The label is written by the close itself,
+  // and BEFORE the toggle, because Chatwoot reads the survey rules when the status changes.
+  describe("resolve labels (issue #919)", () => {
+    const withResolveLabels = async (
+      labels: string[],
+      fn: () => Promise<void>,
+    ) => {
+      const agent = await suDb.agent.findFirstOrThrow({
+        where: { tenantId },
+        select: { id: true },
+      });
+      await suDb.agent.update({
+        where: { id: agent.id },
+        data: {
+          settings: {
+            split: { enabled: false },
+            resolveConversation: { assignLabels: labels },
+          },
+        },
+      });
+      try {
+        await fn();
+      } finally {
+        await suDb.agent.update({
+          where: { id: agent.id },
+          data: { settings: { split: { enabled: false } } },
+        });
+      }
+    };
+
+    test("the configured label lands after the reply and before the close, keeping what was there", async () => {
+      await seedConversation(91901, null);
+      const FINAL = "Fechado! Obrigado pelo contato.";
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia", "vip"],
+        current: ["vip"],
+      });
+      await withResolveLabels(["resolvido-pela-ia"], async () => {
+        const outcome = await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91901 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+            makeClient: cw.make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(outcome).toBe("posted");
+      });
+      expect(calls).toEqual([
+        ["sendMessage", 91901, FINAL],
+        ["setConversationLabels", 91901, "vip,resolvido-pela-ia"],
+        ["toggleStatus", 91901, "resolved"],
+      ]);
+    });
+
+    test("a turn taken over before delivery neither closes nor labels", async () => {
+      await seedConversation(91903, "User");
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+      });
+      await withResolveLabels(["resolvido-pela-ia"], async () => {
+        const outcome = await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91903 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(
+                "Resolvido!",
+              ) as unknown as BaseChatModel,
+            makeClient: cw.make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(outcome).toBe("taken-over");
+      });
+      expect(calls).toEqual([]);
+      expect(cw.labels()).toEqual([]);
+    });
+
+    // A person taking the conversation while the close reads its labels owns it from then on: the
+    // agent neither labels nor closes it.
+    test("a human takeover while the resolve labels are read neither labels nor closes", async () => {
+      await seedConversation(91907, null);
+      const FINAL = "Fechado!";
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+      });
+      const make = async () => {
+        const client = (await cw.make()) as unknown as Record<string, unknown>;
+        return {
+          ...client,
+          listLabels: async () => {
+            if (calls.some((c) => c[0] === "sendMessage")) {
+              await suDb.conversation.updateMany({
+                where: { tenantId, chatwootConversationId: 91907 },
+                data: { assigneeType: "User", assigneeId: 42 },
+              });
+            }
+            return ["resolvido-pela-ia"];
+          },
+        } as unknown as ChatwootClient;
+      };
+      await withResolveLabels(["resolvido-pela-ia"], async () => {
+        await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91907 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+            makeClient: make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+      });
+      expect(calls).toEqual([["sendMessage", 91907, FINAL]]);
+    });
+
+    // An operator's close during delivery is theirs: the toggle is a no-op and no label claims it.
+    test("a conversation closed by someone else during delivery gets no resolve label", async () => {
+      await seedConversation(91906, null);
+      const FINAL = "Fechado!";
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+        conversations: {
+          91906: {
+            id: 91906,
+            status: "resolved",
+            meta: { assignee_type: null, assignee: null },
+            last_activity_at: 1_700_400_000,
+            updated_at: 1_700_400_001,
+          },
+        },
+      });
+      await withResolveLabels(["resolvido-pela-ia"], async () => {
+        await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91906 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+            makeClient: cw.make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+      });
+      // NOTE: the reply is delivered and the close is attempted (a no-op on a resolved one), but no
+      // label claims the close.
+      expect(calls).toEqual([
+        ["sendMessage", 91906, FINAL],
+        ["toggleStatus", 91906, "resolved"],
+      ]);
+    });
+
+    // The label write is a wait after the last fence the reply path asked: an operator switching the
+    // agent off inside it withdraws the label AND the close, never restores what a /reset cleared.
+    test("an agent switched off while the resolve labels are read neither labels nor closes", async () => {
+      await seedConversation(91905, null);
+      const FINAL = "Fechado!";
+      const calls: Array<[string, number, string]> = [];
+      const agent = await suDb.agent.findFirstOrThrow({
+        where: { tenantId },
+        select: { id: true },
+      });
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+      });
+      const make = async () => {
+        const client = (await cw.make()) as unknown as Record<string, unknown>;
+        return {
+          ...client,
+          // The close's own label read: the reply is out by then, and the turn's earlier reads are not.
+          listLabels: async () => {
+            if (calls.some((c) => c[0] === "sendMessage")) {
+              await suDb.agent.update({
+                where: { id: agent.id },
+                data: { enabled: false },
+              });
+            }
+            return ["resolvido-pela-ia"];
+          },
+        } as unknown as ChatwootClient;
+      };
+      await withResolveLabels(["resolvido-pela-ia"], async () => {
+        try {
+          await runAgentTurn({
+            tenantId,
+            instanceId,
+            agentBotId: 9,
+            event: incoming({ conversationId: 91905 }),
+            base: appDb,
+            deps: {
+              makeModel: () =>
+                new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+              makeClient: make,
+              checkpointer: new MemorySaver(),
+            },
+          });
+        } finally {
+          await suDb.agent.update({
+            where: { id: agent.id },
+            data: { enabled: true },
+          });
+        }
+      });
+      expect(calls).toEqual([["sendMessage", 91905, FINAL]]);
+    });
+
+    // The customer came back to the chat to say they will wait for the case: the chat closes, and
+    // the survey keyed on the label does not reach someone whose request is still open.
+    test("a contact waiting on a case gets the close without the label", async () => {
+      await seedConversation(91904, null);
+      const FINAL = "Certo, o time retorna pelo e-mail.";
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+        conversations: {
+          91904: {
+            id: 91904,
+            inbox_id: 1,
+            status: "pending",
+            meta: { assignee_type: null, assignee: null },
+            custom_attributes: { case_conversation_id: 91990 },
+          },
+          91990: { id: 91990, inbox_id: 9, status: "open" },
+        },
+      });
+      const agent = await suDb.agent.findFirstOrThrow({
+        where: { tenantId },
+        select: { id: true },
+      });
+      await suDb.agent.update({
+        where: { id: agent.id },
+        data: {
+          settings: {
+            split: { enabled: false },
+            resolveConversation: { assignLabels: ["resolvido-pela-ia"] },
+            crossInboxCase: { targetInboxId: 9 },
+          },
+        },
+      });
+      try {
+        const outcome = await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91904 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+            makeClient: cw.make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(outcome).toBe("posted");
+      } finally {
+        await suDb.agent.update({
+          where: { id: agent.id },
+          data: { settings: { split: { enabled: false } } },
+        });
+      }
+      expect(calls).toEqual([
+        ["sendMessage", 91904, FINAL],
+        ["toggleStatus", 91904, "resolved"],
+      ]);
+    });
+
+    // A case that could not be read holds the label, and the close still went through: the line is
+    // the record of it, not a failure, so it does not reach the alert.
+    test("a case that could not be read holds the label on an info line", async () => {
+      await seedConversation(91916, null);
+      const FINAL = "Certo, o time retorna pelo e-mail.";
+      const calls: Array<[string, number, string]> = [];
+      const cw = makeLabelledResolveClient(calls, {
+        catalog: ["resolvido-pela-ia"],
+        conversations: {
+          91916: {
+            id: 91916,
+            inbox_id: 1,
+            status: "pending",
+            meta: { assignee_type: null, assignee: null },
+            custom_attributes: { case_conversation_id: 91996 },
+          },
+        },
+      });
+      const agent = await suDb.agent.findFirstOrThrow({
+        where: { tenantId },
+        select: { id: true },
+      });
+      await suDb.agent.update({
+        where: { id: agent.id },
+        data: {
+          settings: {
+            split: { enabled: false },
+            resolveConversation: { assignLabels: ["resolvido-pela-ia"] },
+            crossInboxCase: { targetInboxId: 9 },
+          },
+        },
+      });
+      try {
+        const outcome = await runAgentTurn({
+          tenantId,
+          instanceId,
+          agentBotId: 9,
+          event: incoming({ conversationId: 91916 }),
+          base: appDb,
+          deps: {
+            makeModel: () =>
+              new ResolveThenReplyModel(FINAL) as unknown as BaseChatModel,
+            makeClient: cw.make,
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(outcome).toBe("posted");
+      } finally {
+        await suDb.agent.update({
+          where: { id: agent.id },
+          data: { settings: { split: { enabled: false } } },
+        });
+      }
+      expect(calls).toEqual([
+        ["sendMessage", 91916, FINAL],
+        ["toggleStatus", 91916, "resolved"],
+      ]);
+      let held: Array<{ level: string; status: string | null }> = [];
+      await until("the held label line", async () => {
+        const rows = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
+          where: {
+            tenantId,
+            stage: "tool",
+            threadId: `${tenantId}:${instanceId}:91916`,
+          },
+          select: { level: true, status: true, detail: true },
+        });
+        held = rows.filter(
+          (r) =>
+            (r.detail as Record<string, unknown> | null)?.phase ===
+            "resolve_labels",
+        );
+        return held.length > 0 || null;
+      });
+      expect(held).toEqual(
+        [{ level: "info", status: "error" }].map((h) =>
+          expect.objectContaining(h),
+        ),
+      );
+    });
+  });
+
+  // NOTE: The deferred resolve fires AFTER delivery, and delivery on this path is not
   // quick: the output guardrail is a model round-trip, TTS synthesises audio, and split delivery is
   // typing-paced on purpose. The ownership recheck's snapshot can therefore be seconds old by the
   // time the toggle runs, and an operator closing in that window makes it a silent no-op that the
@@ -2157,28 +2497,22 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(row.resolvedBy).toBeNull();
   });
 
-  // ── A DECISÃO DE SILÊNCIO NÃO É O FIM DO TURNO, E O MARCADOR DELA AFIRMA UM (issue #726) ──
-  //
-  // Achado da rodada 2 de review, e a premissa que ele derrubou: "a última linha de `skip_reply` do
-  // turno responde pelo turno". Desde a #639 um `skip_reply` SOZINHO não encerra o turno (encerrar e
-  // manter calado são garantias diferentes), então o lote seguinte ainda roda — e quando ele é uma
-  // transferência com linha de fechamento, o turno entrega uma mensagem DEPOIS da única decisão que
-  // deixou carimbo. Ler só os carimbos de `skip_reply` responde "não entregou" sobre uma resposta
-  // que está na tela.
-  //
-  // Então o carimbo da chamada continua sendo o que ele é — a melhor resposta NAQUELE instante, que
-  // é tudo que o balão ao vivo pode ter — e o turno escreve um fato próprio quando acaba, sobre o
-  // que de fato saiu. A trilha prefere o fato do turno.
-  // A LINHA DA FERRAMENTA SAI DENTRO DO TURNO, com a fila de callbacks ocupada (issue #836). Um
-  // handler sem `awaitHandlers` vai para a fila de segundo plano do LangChain, única no processo e de
-  // concorrência 1: sob carga, o `handleToolEnd` rodava depois de o turno voltar, a linha ainda nem
-  // tinha sido agendada quando o leitor esperou as escritas, e o carimbo `turnDelivered` era lido
-  // tarde. Aqui a fila é ocupada de propósito antes do turno, que é a carga reproduzida sem acaso.
+  // NOTE: A DECISÃO DE SILÊNCIO NÃO É O FIM DO TURNO. Um `skip_reply` SOZINHO não encerra o turno,
+  // então o lote seguinte ainda roda, e uma transferência com linha de fechamento entrega DEPOIS da
+  // decisão. O carimbo da chamada é a melhor resposta NAQUELE instante (tudo que o balão ao vivo pode
+  // ter); o turno escreve um fato próprio quando acaba, sobre o que de fato saiu, e a trilha o prefere.
+
+  // NOTE: A LINHA DA FERRAMENTA SAI DENTRO DO TURNO. Um handler sem `awaitHandlers` vai para a fila
+  // de segundo plano do LangChain, única no processo e de concorrência 1, e sob carga a linha sairia
+  // depois de o turno voltar, com o carimbo `turnDelivered` lido tarde. A fila é ocupada de propósito
+  // antes do turno, que é a carga reproduzida sem acaso.
   test("com a fila de callbacks ocupada, a linha da ferramenta já existe quando o turno volta, carimbada no fim da ferramenta", async () => {
     await seedConversation(9836, null);
     const CLOSING = "Já chamo uma pessoa do time.";
     const calls: Array<[string, number, string]> = [];
-    const hold = consumeCallback(() => Bun.sleep(300), false);
+    // Held until the line has been read below, so it is read with the queue still busy.
+    const busy = Promise.withResolvers<void>();
+    const hold = consumeCallback(() => busy.promise, false);
     try {
       const outcome = await runAgentTurn({
         tenantId,
@@ -2199,6 +2533,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       });
       // Lido com a fila AINDA ocupada: o que estiver lá só existe se foi escrito dentro do turno.
       const decisao = await flowLogRow(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           conversationId: conv.id,
@@ -2212,6 +2547,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         (decisao?.detail as Record<string, unknown> | null)?.turnDelivered,
       ).toBe(false);
     } finally {
+      busy.resolve();
       await hold;
       await awaitAllCallbacks();
     }
@@ -2264,9 +2600,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       promptTokens: 3300,
       cachedReadTokens: 1024,
       cacheCreationTokens: 0,
+      cacheCreation1hTokens: 0,
       completionTokens: 100,
       byNode: { agent: 2 },
-      // Issue #863: each call at gpt-4o-mini's published rates, per million: $0.15 input, $0.075
+      // NOTE: Each call at gpt-4o-mini's published rates, per million: $0.15 input, $0.075
       // cached, $0.60 output. The cached part is charged at the cache rate and only the rest in full.
       costUsd: expect.closeTo(
         spends.reduce((sum, s) => sum + usd4oMini(s), 0),
@@ -2283,6 +2620,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         promptTokens: s.input,
         cachedReadTokens: s.cached,
         cacheCreationTokens: 0,
+        cacheCreation1hTokens: 0,
         completionTokens: s.output,
         byNode: { agent: 1 },
         costUsd: expect.closeTo(usd4oMini(s), 12),
@@ -2295,6 +2633,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     // The line's turn is the turn the activity trail and the Langfuse trace name: the same id the
     // ExecutionLog carries for each of the two turns.
     const logged = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id },
       select: { turnId: true },
     });
@@ -2325,6 +2664,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         where: { tenantId, chatwootConversationId: chatwootConvId },
       });
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, conversationId: conv.id, stage: "generate" },
         select: { detail: true, turnId: true },
       });
@@ -2421,7 +2761,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       creates.slice(quiet).map(([, id]) => id),
     );
 
-    // A turn that ran the model and has no id to name still closes on its line (review round 2): the
+    // NOTE: A turn that ran the model and has no id to name still closes on its line: the
     // model was billed, so the screen has spend to place. An empty reply leaves a note, answered here
     // without an id, so nothing is recorded.
     await seedConversation(98554, null);
@@ -2451,20 +2791,34 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     await seedConversation(9726, null);
     const CLOSING = "Já chamo uma pessoa do time.";
     const calls: Array<[string, number, string]> = [];
-    const outcome = await runAgentTurn({
-      tenantId,
-      instanceId,
-      agentBotId: 9,
-      event: incoming({ conversationId: 9726 }),
-      base: appDb,
-      deps: {
-        makeModel: () =>
-          new SkipThenHandoffModel(CLOSING) as unknown as BaseChatModel,
-        makeClient: makeResolveClient(calls),
-        checkpointer: new MemorySaver(),
-      },
+    const published: Record<string, unknown>[] = [];
+    setPublisher((_topic, data) => {
+      published.push(JSON.parse(String(data)) as Record<string, unknown>);
     });
+    let outcome: Awaited<ReturnType<typeof runAgentTurn>>;
+    try {
+      outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9726 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new SkipThenHandoffModel(CLOSING) as unknown as BaseChatModel,
+          makeClient: makeResolveClient(calls),
+          checkpointer: new MemorySaver(),
+        },
+      });
+    } finally {
+      setPublisher(() => undefined);
+    }
     expect(outcome).toBe("posted");
+    // O balão ao vivo lê o MESMO leitor que a linha da ferramenta: quando `skip_reply` começou, nada
+    // tinha saído, e o evento diz isso em vez de calar sobre a entrega.
+    expect(
+      published.filter((e) => e.tool === "skip_reply").map((e) => e.delivered),
+    ).toEqual([false]);
     // (0) validade do fixture: a linha de fechamento saiu mesmo, DEPOIS da decisão de silêncio.
     expect(calls).toEqual([
       ["toggleStatus", 9726, "open"],
@@ -2474,13 +2828,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const conv = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: 9726 },
     });
-    // O carimbo da chamada, que é provisório por construção: quando `skip_reply` rodou, a
-    // transferência ainda não tinha acontecido.
-    // A linha do `skip_reply`, pelo nome: o turno grava duas linhas `tool` (a do `handoff_to_human`
-    // vem depois e não carrega carimbo), e a ordem em que elas chegam à tabela não é a das chamadas,
-    // porque cada escrita é disparada sem espera. Ler "a primeira linha tool" era ler qualquer uma
-    // das duas (issue #836).
+    // O carimbo da chamada é provisório por construção: quando `skip_reply` rodou, a
+    // transferência ainda não tinha acontecido. A linha é buscada pelo nome: o turno grava duas
+    // linhas `tool`, e a ordem em que chegam à tabela não é a das chamadas (cada escrita é disparada
+    // sem espera), então "a primeira linha tool" seria qualquer uma das duas.
     const decisao = await flowLogRow(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         conversationId: conv.id,
@@ -2504,16 +2857,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const marcador = trail.find((e) => e.name === "skip_reply");
     expect(marcador?.turnDelivered).toBe(true);
 
-    // A FRASE QUE O DESENHO APOIA E QUE NINGUÉM TINHA EXECUTADO: a trilha lê uma JANELA (as 60 linhas
-    // mais novas de `tool`/`generate`), e o fato do turno só governa o marcador se os dois couberem
-    // nela. O argumento é que o fato é escrito no FIM do turno, então ele é mais novo que a linha da
-    // decisão — e, numa leitura do mais novo para o mais velho, nada que seja mais novo que uma linha
-    // dentro da janela fica de fora dela. O argumento inteiro se apoia nessa ordem, e `emitFlowEvent`
-    // não espera a escrita, então ela é uma afirmação sobre o que acontece, não sobre o que o código
-    // diz. Medida aqui, num turno de verdade.
-    // Procurada, nunca tomada por ordem: um turno escreve várias linhas `generate`, e "a última" é
-    // aquela em que a etapa por acaso terminou.
+    // A trilha lê uma JANELA (as 60 linhas mais novas de `tool`/`generate`), e o fato do turno
+    // só governa o marcador se couber nela junto com a linha da decisão. Isso depende de o fato ser
+    // gravado DEPOIS dela, e `emitFlowEvent` não espera a escrita, então a ordem é verificada aqui,
+    // num turno de verdade. A linha é procurada, nunca tomada por ordem: um turno escreve várias
+    // linhas `generate`, e "a última" é aquela em que a etapa por acaso terminou.
     const geradas = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "generate" },
       select: { id: true, detail: true },
     });
@@ -2525,6 +2875,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
     expect(doFato).toHaveLength(1);
     const linhaDaDecisao = await flowLogRow(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "tool" },
       select: { id: true, detail: true },
     });
@@ -2578,8 +2929,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   // correção que neutralize os dois apaga um fato verdadeiro para consertar um falso.
   test("silêncio decidido e nada depois: o fato do turno diz que nada saiu", async () => {
     await seedConversation(9727, null);
-    // O nosso lado já falou aqui: numa conversa que ninguém respondeu, o silêncio passa a abri-la
-    // para uma pessoa (issue #659), e esse efeito não é o assunto deste teste.
+    // NOTE: O nosso lado já falou aqui: numa conversa que ninguém respondeu, o silêncio passa a
+    // abri-la para uma pessoa, e esse efeito não é o assunto deste teste.
     await suDb.conversation.updateMany({
       where: { tenantId, chatwootConversationId: 9727 },
       data: { lastRepliedMessageId: 1 },
@@ -2615,6 +2966,629 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
+  // NOTE: `stillWanted({ strict: true })` is asked inside the `ingest:` section twice: before the
+  // durable claim, and again after it, because the claim WAITS (on an append's lease and on the row
+  // lock /reset takes) and a reset can retire the run and clear the thread during that wait. The
+  // proof is the thread's STATE: only a claim that skipped the re-ask writes the marker back.
+  test("a run retired while the durable claim waits writes nothing", async () => {
+    const convId = 9741;
+    const contactInboxId = 7741;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: convId,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${convId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const threadId = `${tenantId}:${instanceId}:${convId}`;
+    const loaded = await runScopedOn(
+      appDb,
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      (db) =>
+        loadAgentConfig(db, {
+          tenantId,
+          instanceId,
+          conversationId: convId,
+          agentId: agent.id,
+          threadId,
+        }),
+    );
+    if (!loaded) throw new Error("the agent did not load");
+    expect(loaded.contactInboxId).toBe(contactInboxId);
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    const append = await claimIngestWrite(owner, appDb);
+    expect(append.state).not.toBe("busy");
+    let wanted = true;
+    let strictAsks = 0;
+    let releasing: Promise<void> | null = null;
+    const sent: Array<[number, string]> = [];
+    const outcome = await runLoadedTurn({
+      loaded,
+      authContext: null,
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      agentBotId: 9,
+      threadId,
+      text: "oi",
+      readMessageIds: [],
+      base: appDb,
+      claimReply: null,
+      // The ask right before the claim still answers yes, and /reset lands on that same instant.
+      // The append finishes shortly after, so the claim is granted into a thread that was cleared.
+      stillWanted: async ({ strict }) => {
+        if (!strict) return wanted;
+        strictAsks += 1;
+        if (strictAsks > 1) return wanted;
+        wanted = false;
+        releasing = Bun.sleep(20).then(() =>
+          releaseIngestWrite(owner, appDb, append),
+        );
+        return true;
+      },
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Claro!"] }),
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    await releasing;
+    const row = await suDb.agentThread.findUnique({
+      where: {
+        tenantId_chatwootInstanceId_contactInboxId: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          contactInboxId,
+        },
+      },
+    });
+    expect(row?.lastConversationId ?? null).toBeNull();
+    expect(outcome).toBe("stale");
+    expect(sent).toEqual([]);
+    // And the claim really was waited out, so the ask that refused is the one AFTER the wait.
+    expect(strictAsks).toBeGreaterThan(1);
+  });
+
+  // NOTE: the strict ask before the claim is made once the turn holds the `ingest:` section, so a
+  // reset that lands while the turn waits for the section is seen before the claim, and the retired
+  // run never waits out an append's lease. The section and an append are both held here: the turn
+  // must stand down while the append still holds the claim, after the section opened to it.
+  test("a run retired while it waits for the section stands down before the claim", async () => {
+    const convId = 9747;
+    const contactInboxId = 7747;
+    await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: convId,
+        contactInboxId,
+        status: "pending",
+        threadId: `${tenantId}:${instanceId}:${convId}`,
+        lastEventAt: new Date(),
+      },
+    });
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const threadId = `${tenantId}:${instanceId}:${convId}`;
+    const loaded = await runScopedOn(
+      appDb,
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      (db) =>
+        loadAgentConfig(db, {
+          tenantId,
+          instanceId,
+          conversationId: convId,
+          agentId: agent.id,
+          threadId,
+        }),
+    );
+    if (!loaded) throw new Error("the agent did not load");
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+    const append = await claimIngestWrite(owner, appDb);
+    expect(append.state).not.toBe("busy");
+    const section = `ingest:${graphThreadId}`;
+    const ours = {};
+    let open = () => {};
+    const held = withKeyedQueue(
+      section,
+      () => new Promise<void>((resolve) => (open = resolve)),
+      ours,
+    );
+    let wanted = true;
+    let sectionOpened = false;
+    const strictAsks: boolean[] = [];
+    let settled = false;
+    const sent: Array<[number, string]> = [];
+    const run = runLoadedTurn({
+      loaded,
+      authContext: null,
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      agentBotId: 9,
+      threadId,
+      text: "oi",
+      readMessageIds: [],
+      base: appDb,
+      claimReply: null,
+      stillWanted: async ({ strict }) => {
+        if (strict) strictAsks.push(sectionOpened);
+        return wanted;
+      },
+      deps: {
+        makeModel: () => new FakeListChatModel({ responses: ["Claro!"] }),
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    }).finally(() => {
+      settled = true;
+    });
+    try {
+      // Queued behind the section (it takes our joinable tail away), or asking before it.
+      await until(
+        "the turn to reach the section",
+        () => strictAsks.length > 0 || keyedQueueTail(section) !== ours,
+      );
+      wanted = false;
+      sectionOpened = true;
+      open();
+      await held;
+      await until("the retired turn to stand down", () => settled);
+      expect(await run).toBe("stale");
+      expect(strictAsks).toEqual([true]);
+      expect(sent).toEqual([]);
+    } finally {
+      open();
+      await releaseIngestWrite(owner, appDb, append);
+      await run.catch(() => {});
+    }
+  });
+
+  // NOTE: two turns that wake from the thread wait together both find it free, and only the acquiring
+  // statement tells them apart: the loser gives its hold back and waits again. The wait is released by
+  // hand so both wake at once; the winner's model is held, so a loser that ran on would be seen
+  // starting its own model beside it.
+  test("two turns that wake from the thread wait together do not run side by side", async () => {
+    const contactInboxId = 7761;
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const turnFor = async (convId: number) => {
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: convId,
+          contactInboxId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:${convId}`,
+          lastEventAt: new Date(),
+        },
+      });
+      const threadId = `${tenantId}:${instanceId}:${convId}`;
+      const loaded = await runScopedOn(
+        appDb,
+        { tenantId, userId: null, role: "TENANT_ADMIN" },
+        (db) =>
+          loadAgentConfig(db, {
+            tenantId,
+            instanceId,
+            conversationId: convId,
+            agentId: agent.id,
+            threadId,
+          }),
+      );
+      if (!loaded) throw new Error("the agent did not load");
+      return { convId, threadId, loaded };
+    };
+    const turns = [await turnFor(9761), await turnFor(9762)];
+    let wake = () => {};
+    const woken = new Promise<void>((resolve) => (wake = resolve));
+    let waits = 0;
+    const realWait = threadClaim.waitForTurnToClear;
+    const wait = spyOn(threadClaim, "waitForTurnToClear").mockImplementation(
+      async (...args) => {
+        waits += 1;
+        if (waits <= turns.length) {
+          await woken;
+          return true;
+        }
+        return realWait(...args);
+      },
+    );
+    const started: number[] = [];
+    let releaseFirst = () => {};
+    const firstHeld = new Promise<void>((resolve) => (releaseFirst = resolve));
+    const modelFor = (convId: number) => {
+      const model = {
+        async invoke() {
+          started.push(convId);
+          if (started.length === 1) await firstHeld;
+          return new AIMessage(`RESP-${convId}`);
+        },
+        bindTools: () => model,
+      };
+      return model as unknown as BaseChatModel;
+    };
+    const sent: Array<[number, string]> = [];
+    const checkpointer = new MemorySaver();
+    try {
+      const runs = turns.map(({ convId, threadId, loaded }) =>
+        runLoadedTurn({
+          loaded,
+          authContext: null,
+          tenantId,
+          instanceId,
+          conversationId: convId,
+          agentBotId: 9,
+          threadId,
+          text: "oi",
+          readMessageIds: [],
+          base: appDb,
+          claimReply: null,
+          stillWanted: null,
+          waitForThreadTurn: true,
+          deps: {
+            makeModel: () => modelFor(convId),
+            makeClient: makeStubClient(sent),
+            checkpointer,
+          },
+        }),
+      );
+      await until("both turns to wait for the thread", () => waits >= 2);
+      wake();
+      // Both halves: the winner's turn-limit check runs between the queue and the model, so the loser
+      // can be back in the wait before the winner's model starts.
+      await until(
+        "the winner in its model and the loser waiting again, or both models running",
+        () => started.length >= 2 || (started.length === 1 && waits >= 3),
+      );
+      expect(started).toHaveLength(1);
+      releaseFirst();
+      expect(await Promise.all(runs)).toEqual(["posted", "posted"]);
+      expect(sent.map(([, text]) => text).sort()).toEqual([
+        "RESP-9761",
+        "RESP-9762",
+      ]);
+    } finally {
+      wake();
+      releaseFirst();
+      wait.mockRestore();
+    }
+  });
+
+  // The signal reaches the model call and the tool boundary through the graph's construction, and
+  // never the invoke: an invoke aborted between a checkpointed tool call and its result leaves the
+  // thread with a call nothing answers, and it rejects while the tool is still running.
+  test("the job's signal is handed to the graph, never to its invoke", async () => {
+    const convId = 9743;
+    await seedConversation(convId, null);
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const threadId = `${tenantId}:${instanceId}:${convId}`;
+    const loaded = await runScopedOn(
+      appDb,
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      (db) =>
+        loadAgentConfig(db, {
+          tenantId,
+          instanceId,
+          conversationId: convId,
+          agentId: agent.id,
+          threadId,
+        }),
+    );
+    if (!loaded) throw new Error("the agent did not load");
+    const real = graphModule.buildAgentGraph;
+    const built: Array<AbortSignal | undefined> = [];
+    const invoked: Array<Record<string, unknown> | undefined> = [];
+    const spy = spyOn(graphModule, "buildAgentGraph").mockImplementation(
+      (p) => {
+        built.push(p.signal);
+        const graph = real(p);
+        const invoke = graph.invoke.bind(graph);
+        graph.invoke = ((input: never, options?: Record<string, unknown>) => {
+          invoked.push(options);
+          return invoke(input, options as never);
+        }) as typeof graph.invoke;
+        return graph;
+      },
+    );
+    const controller = new AbortController();
+    const sent: Array<[number, string]> = [];
+    try {
+      await runLoadedTurn({
+        loaded,
+        authContext: null,
+        tenantId,
+        instanceId,
+        conversationId: convId,
+        agentBotId: 9,
+        threadId,
+        text: "oi",
+        readMessageIds: [],
+        base: appDb,
+        claimReply: null,
+        stillWanted: null,
+        signal: controller.signal,
+        deps: {
+          makeModel: () => new FakeListChatModel({ responses: ["Claro!"] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(sent).toEqual([[convId, "Claro!"]]);
+    expect(built).toHaveLength(1);
+    expect(built[0]).toBe(controller.signal);
+    expect(invoked.length).toBeGreaterThan(0);
+    expect(invoked.filter((o) => o && "signal" in o)).toEqual([]);
+  });
+
+  test("the turn's fallback lines name their own model and raise one alarm", async () => {
+    await seedConversation(9744, null);
+    const sent: Array<[number, string]> = [];
+    const deps = await graphDepsOf(() =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9744 }),
+        base: appDb,
+        deps: {
+          makeModel: () => new FakeListChatModel({ responses: ["Claro!"] }),
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      }),
+    );
+    expect(deps).toHaveLength(1);
+    expectFallbackLines(deps[0] ?? {});
+  });
+
+  // The exit through a failed invoke settles the turn's tool logger too (tests/utils/tool-logger-settled.ts).
+  test("a turn whose model call fails still settles its tool logger", async () => {
+    await seedConversation(9745, null);
+    const sent: Array<[number, string]> = [];
+    const settled = await settlesDuring(() =>
+      runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9745 }),
+        base: appDb,
+        deps: {
+          makeModel: () => throwingModel as unknown as BaseChatModel,
+          makeClient: makeStubClient(sent),
+          checkpointer: new MemorySaver(),
+        },
+      }),
+    );
+    expect(sent).toEqual([]);
+    expect(settled).toBeGreaterThan(0);
+  });
+
+  // A turn the tool boundary refused ends on an empty assistant message, the same one a silent turn
+  // ends on, and the fence is not one-way: asked again after the invoke it may answer yes. So the
+  // refusal is read off the result, and the turn stands down instead of reading as silence.
+  test("a fence that flips back to yes does not turn a refused turn into a silent one", async () => {
+    const convId = 9742;
+    await seedConversation(convId, null);
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const threadId = `${tenantId}:${instanceId}:${convId}`;
+    const loaded = await runScopedOn(
+      appDb,
+      { tenantId, userId: null, role: "TENANT_ADMIN" },
+      (db) =>
+        loadAgentConfig(db, {
+          tenantId,
+          instanceId,
+          conversationId: convId,
+          agentId: agent.id,
+          threadId,
+        }),
+    );
+    if (!loaded) throw new Error("the agent did not load");
+    let generated = false;
+    let refusedOnce = false;
+    const callsATool = {
+      invoke: async () => new AIMessage(""),
+      bindTools: () => ({
+        invoke: async () => {
+          generated = true;
+          return new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "skip_reply",
+                args: { reason: "nada a dizer" },
+                id: "call_flip",
+              },
+            ],
+          });
+        },
+      }),
+    };
+    const sent: Array<[number, string]> = [];
+    const outcome = await runLoadedTurn({
+      loaded,
+      authContext: null,
+      tenantId,
+      instanceId,
+      conversationId: convId,
+      agentBotId: 9,
+      threadId,
+      text: "oi",
+      readMessageIds: [],
+      base: appDb,
+      claimReply: null,
+      // No exactly once, on the first ask after the model produced its call, which is the tool
+      // boundary's; yes to everything before and after it.
+      stillWanted: async () => {
+        if (generated && !refusedOnce) {
+          refusedOnce = true;
+          return false;
+        }
+        return true;
+      },
+      deps: {
+        makeModel: () => callsATool as unknown as BaseChatModel,
+        makeClient: makeStubClient(sent),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(refusedOnce).toBe(true);
+    expect(outcome).toBe("stale");
+    expect(sent).toEqual([]);
+  });
+
+  // A TERCEIRA PORTA: o aviso de ferramenta lenta é uma mensagem que chegou ao cliente sem ser a
+  // resposta do turno nem um anexo. Um turno que avisou "só um momento" e depois decidiu calar falou
+  // com o cliente, e o fato do turno tem que contar isso.
+  test("silêncio decidido depois do aviso de ferramenta lenta: o fato do turno conta o aviso", async () => {
+    await seedConversation(9733, null);
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: 9733 },
+      data: { lastRepliedMessageId: 1 },
+    });
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId, name: "Atendente" },
+      select: { id: true },
+    });
+    const ACK = "Só um momento!";
+    const tool = await suDb.toolDefinition.create({
+      data: {
+        tenantId,
+        name: "consulta_lenta",
+        label: "Consulta lenta",
+        method: "GET",
+        urlTemplate: outboundUrl("/v1/slow"),
+        allowedHosts: [new URL(outboundUrl()).hostname],
+        ackEnabled: true,
+        ackMessage: ACK,
+      },
+    });
+    const selection = await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId: agent.id,
+        source: "HTTP",
+        toolDefinitionId: tool.id,
+        enabledTools: [],
+        knowledgeBaseIds: [],
+      },
+    });
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () =>
+      new Response('{"ok":true}', {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof globalThis.fetch;
+    let n = 0;
+    const ackThenSilence = {
+      invoke: async () => new AIMessage(""),
+      bindTools: () => ({
+        invoke: async () => {
+          n++;
+          if (n === 1) {
+            return new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "consulta_lenta",
+                  args: { __wait_message: ACK },
+                  id: "call_slow",
+                },
+              ],
+            });
+          }
+          if (n === 2) {
+            return new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "skip_reply",
+                  args: { reason: "acknowledged" },
+                  id: "call_skip",
+                },
+              ],
+            });
+          }
+          return new AIMessage("");
+        },
+      }),
+    };
+    const sent: string[] = [];
+    const client = {
+      sendMessage: async (_conversationId: number, content: string) => {
+        sent.push(content);
+        return {};
+      },
+      toggleTyping: async () => ({}),
+    } as unknown as ChatwootClient;
+    try {
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 9733 }),
+        base: appDb,
+        deps: {
+          makeModel: () => ackThenSilence as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+        },
+      });
+    } finally {
+      globalThis.fetch = realFetch;
+      await suDb.agentToolSelection.delete({ where: { id: selection.id } });
+      await suDb.toolDefinition.delete({ where: { id: tool.id } });
+    }
+    // (0) validade do fixture: o aviso saiu, e nada mais.
+    expect(sent).toEqual([ACK]);
+    const conv = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: 9733 },
+    });
+    const trail = (
+      await getConversationDetail(
+        { tenantId, userId: null, role: "TENANT_ADMIN" },
+        conv.id,
+        appDb,
+      )
+    ).trail;
+    expect(trail.find((e) => e.name === "skip_reply")?.turnDelivered).toBe(
+      true,
+    );
+  });
+
   // O fato do turno é uma LINHA A MAIS numa tabela de escrita quente, então ele só é escrito no turno
   // em que alguém pergunta. Um turno que respondeu normalmente não tem marcador de silêncio nenhum
   // para rotular, e não paga por isso.
@@ -2638,6 +3612,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       where: { tenantId, chatwootConversationId: 9728 },
     });
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: conv.id, stage: "generate" },
       select: { detail: true },
     });
@@ -2665,15 +3640,15 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       deps: {
         makeModel: () =>
           new HandoffThenReplyModel(FINAL, CLOSING) as unknown as BaseChatModel,
-        // Deliberately do NOT mirror toggleStatus: this is the production lag that allowed the final
-        // reply through after the tool had already sent customerMessage.
+        // NOTE: Deliberately do NOT mirror toggleStatus: the production lag in which the final reply
+        // could go out after the closing line.
         makeClient: makeResolveClient(calls),
         checkpointer: new MemorySaver(),
       },
     });
     expect(outcome).toBe("posted");
-    // One balloon, the closing line, and the model's own final text discarded — that is #158. The
-    // transfer lands FIRST now: the runtime cannot deliver until the tool call returns, and Chatwoot
+    // NOTE: One balloon, the closing line, and the model's own final text discarded as a duplicate.
+    // The transfer lands FIRST: the runtime cannot deliver until the tool call returns, and Chatwoot
     // never shows a status change to the customer, so what they read is unchanged.
     expect(calls).toEqual([
       ["toggleStatus", 996, "open"],
@@ -2681,14 +3656,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // Composing the closing line is not the same event as the transfer happening. sendPrivateNote and
-  // toggleStatus are NOT best-effort inside the tool, so either can throw after the model already
-  // wrote a line promising a human. The conversation then stays `pending` — still the bot's, never
-  // queued to anyone — and the model gets the tool error plus one more step.
-  //
-  // Recording the line instead of sending it (#160) is what keeps the promise from going out at all:
-  // the customer reads the recovery reply and nothing else, where before they read both and the
-  // second contradicted the first.
+  // NOTE: Composing the closing line is not the transfer happening. sendPrivateNote and toggleStatus
+  // are NOT best-effort inside the tool, so either can throw after the model wrote a line promising
+  // a human; the conversation stays `pending` (still the bot's) and the model gets the tool error
+  // plus one more step. The tool records the line instead of sending it, so the customer reads the
+  // recovery reply and not a promise it contradicts.
   test("a handoff whose transfer throws delivers the recovery reply and NOT the promise", async () => {
     await seedConversation(997, null);
     const CLOSING = "Um humano já te atende.";
@@ -2738,11 +3710,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(row?.status).toBe("pending");
   });
 
-  // The shape three review findings arrived in: something between the transfer and the delivery
-  // fails, and the sentence the transfer promised is lost for good, because the conversation now
-  // reads `open` and every retry path stops at its own ownership gate. Here the supersede re-fetch
-  // throws, which ends the turn — and the line is out before it, which is the whole point of
-  // delivering it where nothing downstream can reach it.
+  // NOTE: Something between the transfer and the delivery fails, and the sentence the transfer
+  // promised would be lost for good: the conversation reads `open` and every retry path stops at its
+  // own ownership gate. Here the supersede re-fetch throws and ends the turn, and the line is out
+  // before it, delivered where nothing downstream can reach it.
   test("a failure after the transfer cannot take the closing line back", async () => {
     await seedConversation(9703, null);
     const calls: Array<[string, number, string]> = [];
@@ -2781,10 +3752,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // The last of the four failures, and the only one that happens INSIDE the graph: the tool completes
-  // the transfer and the model's next step throws. The exception ends the turn, and the sentence the
-  // customer was promised has nobody left to deliver it — no retry can, because the conversation
-  // reads `open` from the moment the tool set it.
+  // NOTE: The failure that happens INSIDE the graph: the tool completes the transfer and the model's
+  // next step throws. The exception ends the turn, and no retry can deliver the promised sentence,
+  // because the conversation reads `open` from the moment the tool set it.
   test("a throw after the transfer still delivers the promised line", async () => {
     await seedConversation(9704, null);
     const calls: Array<[string, number, string]> = [];
@@ -2822,17 +3792,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // THIS TEST USED TO ASSERT THE OPPOSITE, and the reason it changed is issue #662. An empty
-  // `customerMessage` was what a model that FORGOT the argument left behind, so the model's own final
-  // text was the only thing the customer would get and it had to go out. The argument is required
-  // now, so an empty one is the model SAYING this case receives no reply, and the tool answers it
-  // with "No message will be sent to the customer, as you indicated", a sentence the product has to
-  // keep. Measured once in 18 live turns of deliberate silence (`gpt-5.2`, three runs): the model
-  // declared the silence and then wrote `Encaminhado para a equipe responsável.`, which reached the
-  // customer on a credit-bureau notice.
-  //
-  // The predicate still has two conditions, for the transfer that THREW: nothing was recorded, the
-  // conversation is still ours, and the recovery text the model writes is the customer's only reply.
+  // NOTE: `customerMessage` is required, so an empty one is the model SAYING this case receives no
+  // reply, and the tool tells it "No message will be sent to the customer, as you indicated", a
+  // sentence the product has to keep even when the model then writes a closing line anyway. The
+  // recovery text only goes out for the transfer that THREW: nothing was recorded, the conversation
+  // is still ours, and that text is the customer's only reply.
   test("a handoff that declared silence sends nothing, not even the model's own next line", async () => {
     const contactInboxId = 7702;
     const graphThreadId = contactInboxThreadId(
@@ -2890,7 +3854,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
     expect(outcome).toBe("empty");
 
-    // AND THE WORDS ARE OUT OF THE THREAD (review round 3). The text was checkpointed by the invoke
+    // AND THE WORDS ARE OUT OF THE THREAD. The text was checkpointed by the invoke
     // that produced it, the thread is shared per contact-inbox, and a later turn reading it would
     // believe the customer was answered. The transfer itself stays: the tool call and its result are
     // the record of what actually happened.
@@ -2953,11 +3917,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(outcome).toBe("empty");
   });
 
-  // A photo the model queued earlier in the same turn is not a second copy of the closing line, and
-  // the tool already told the model it was on its way. The closing line goes out first because it
-  // leaves before the gates the photo still has to pass — the same order the tool produced before
-  // #160. "Image before the text that talks about it" is a rule about the model's own reply, and a
-  // handed-off turn has none.
+  // NOTE: A photo the model queued earlier in the same turn is not a second copy of the closing
+  // line, and the tool already told the model it was on its way. The closing line goes out first
+  // because it leaves before the gates the photo still has to pass. "Image before the text that talks
+  // about it" is a rule about the model's own reply, and a handed-off turn has none.
   test("a handoff still delivers an image queued earlier in the same turn", async () => {
     await allowImageHost();
     await seedConversation(998, null);
@@ -2988,12 +3951,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // AND THE QUEUE FALLS WITH THE DECLARED SILENCE, which is the one case where the rule above flips
-  // (review round 2 of the #662 PR). A photo is not a second copy of a closing line, so a transfer
-  // that spoke still delivers it; a transfer that declared "no reply at all" cannot mean "no text,
-  // plus the photo you queued two hops ago". The caption is the sharper half: it rides into the
-  // output guardrail with the reply, and a trip writes the safe reply BACK into the reply that was
-  // just blanked, which would put the declared silence on the wire as a moderation replacement.
+  // NOTE: AND THE QUEUE FALLS WITH THE DECLARED SILENCE, the one case where the rule above flips: a
+  // transfer that declared "no reply at all" cannot mean "no text, plus the photo you queued two
+  // hops ago". The caption is the sharper half: it rides into the output guardrail with the reply,
+  // and a trip writes the safe reply BACK into the blanked reply, putting the declared silence on
+  // the wire as a moderation replacement.
   test("a handoff that declared silence drops the image queued earlier in the same turn", async () => {
     await allowImageHost();
     await seedConversation(9981, null);
@@ -3020,25 +3982,15 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(calls).toEqual([["toggleStatus", 9981, "open"]]);
   });
 
-  // The deferred resolve falls with the TRANSFER, and with nothing else. The hardest case for that
-  // rule is a closing line that fails to reach the customer: the conversation is a human's either
-  // way, so resolving it would close an open request out from under them, and a customer who heard
-  // nothing is the last one whose thread should be marked done.
-  //
-  // The failure is a warn and not a failed turn (#160): the transfer succeeded, so stamping
-  // lastError and announcing "a human has to take over" would point an operator at a thread that
-  // already has one. Same rule the queued image follows below.
-  // ISSUE #671, and the three below are one scenario with its boundary. The pair the contract of
-  // #662 made expressable is the worst outcome it can produce: the customer gets nothing BY THE
-  // MODEL'S OWN DECLARATION, and the conversation leaves the queue that declaration handed it to, so
-  // nobody is looking either. Worse than the silence by omission #662 removed, which at least left
-  // the conversation open.
-  //
-  // The rule is old ("a conversation the human queue now owns is not ours to close", #159) and the
-  // reactive runtime keeps it by dropping the DEFERRED intent. What was missing is a test that says
-  // the forbidden pair is this pair: the one red case a mutation of that line produced was about a
-  // closing line that FAILS to send, and narrowing the condition from `completed` to
-  // `handoffAnsweredTheTurn` (which a declared silence makes false) survived the whole suite.
+  // NOTE: The deferred resolve falls with the TRANSFER, and with nothing else. Even when the closing
+  // line fails to reach the customer, the conversation is a human's, so resolving it would close an
+  // open request out from under them. That failure is a warn, not a failed turn: the transfer
+  // succeeded, and "a human has to take over" would point at a thread that already has one.
+
+  // NOTE: This and the two below are one scenario with its boundary. A silent transfer plus a resolve
+  // is the worst pair: the customer gets nothing BY THE MODEL'S OWN DECLARATION, and the conversation
+  // leaves the queue that declaration handed it to. The runtime drops the DEFERRED intent on
+  // `completed`; narrowing that to `handoffAnsweredTheTurn` (false on a declared silence) must fail.
   test("a resolve asked in the same turn as a silent transfer does not close the conversation", async () => {
     await seedConversation(6711, null);
     const calls: Array<[string, number, string]> = [];
@@ -3265,9 +4217,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       },
     });
     expect(outcome).toBe("posted");
-    // The only toggleStatus is the handoff's `open`. A "resolved" here would be the deferred intent
-    // closing a conversation the human queue had just been handed. And the model's own final text
-    // is NOT a fallback: it is the duplicate #158 is about, so a failed closing line means silence,
+    // NOTE: The only toggleStatus is the handoff's `open`. A "resolved" here would be the deferred
+    // intent closing a conversation the human queue had just been handed. And the model's own final
+    // text is NOT a fallback: it would be a duplicate, so a failed closing line means silence,
     // not a second attempt with different words.
     expect(calls).toEqual([
       ["toggleStatus", 9977, "open"],
@@ -3275,13 +4227,325 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // The bound, pinned so it is a decision and not a surprise. The closing line left before this gate
-  // and is therefore untouched by it; everything the turn still holds when it arrives here does stop,
-  // photo included. Once the mirror reads "not ours" our own transfer and a human who accepted the
-  // conversation in the same window are indistinguishable — it records no reason for a status change
-  // — so the gate keeps failing closed for the one that matters, and the turn reports the takeover
-  // it saw. Identical to what shipped before #160, when the tool sent the line and the gate stopped
-  // the rest.
+  // The newer message's gate exit, which finds the conversation `open` and dispenses the span up to
+  // it, lands while this turn is between the transfer and its closing line. A transfer gets no later
+  // turn to speak for it, so the line must go out with the claim lost; a plain reply must not, and
+  // neither may the line when another turn holds the claim, since that turn speaks for the burst.
+  for (const [handsOff, lostTo, conv] of [
+    [true, "gate-exit", 9814],
+    [true, "gate-exit-per-message", 9817],
+    [false, "gate-exit", 9815],
+    [true, "another-turn", 9816],
+    [true, "another-turn-then-gate-exit", 9818],
+  ] as const) {
+    const byAnotherTurn = lostTo.startsWith("another-turn");
+    const label = !handsOff
+      ? "a newer message's gate exit under the turn still stops a plain reply"
+      : byAnotherTurn
+        ? `another turn's claim under the turn still stops the transfer's closing line${lostTo === "another-turn" ? "" : ", with a gate exit's dispensal over it"}`
+        : `a newer message's gate exit under the turn still lets the transfer's closing line out (${lostTo === "gate-exit" ? "scalar mark" : "per-message rows"})`;
+    test(label, async () => {
+      await seedConversation(conv, null);
+      const { id: convDbId } = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: conv },
+        select: { id: true },
+      });
+      // NOTE: Above a floor the gate exit's range answers as `dispensed`; with none, the moved mark
+      // answers first, as `handled`.
+      if (lostTo === "gate-exit-per-message") {
+        await suDb.conversation.update({
+          where: { id: convDbId },
+          data: { replyClaimFloorMessageId: 0 },
+        });
+      }
+      const sent: string[] = [];
+      const client = {
+        sendMessage: async (_c: number, t: string) => {
+          sent.push(t);
+          return {};
+        },
+        toggleStatus: async () => ({}),
+        sendPrivateNote: async () => ({}),
+      } as unknown as ChatwootClient;
+      const newerMessageGateExit = async () => {
+        if (byAnotherTurn) {
+          await claimReplyBurst({
+            tenantId,
+            conversationDbId: convDbId,
+            toMessageId: 2,
+            maxHandledAllowed: null,
+            messageIds: [1, 2],
+            initiatedBy: "automatic",
+            base: appDb,
+          });
+        }
+        if (lostTo !== "another-turn") {
+          await advanceHandledWatermark({
+            tenantId,
+            conversationDbId: convDbId,
+            toMessageId: 3,
+            dispensed: { kind: "range", afterMessageId: null },
+            base: appDb,
+          });
+        }
+      };
+      class RacedModel {
+        async invoke() {
+          return new AIMessage("Vou verificar.");
+        }
+        bindTools(_t: unknown) {
+          let n = 0;
+          return {
+            async invoke() {
+              n++;
+              if (handsOff && n === 1)
+                return new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    {
+                      name: "handoff_to_human",
+                      args: {
+                        customerMessage:
+                          "Procure atendimento de emergência ou ligue 192.",
+                        reason: "Sintoma de emergência",
+                      },
+                      id: "h1",
+                    },
+                  ],
+                });
+              await newerMessageGateExit();
+              return new AIMessage(handsOff ? "" : "Vou verificar.");
+            },
+          };
+        }
+      }
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: conv }),
+        base: appDb,
+        deps: {
+          makeModel: () => new RacedModel() as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(sent).toEqual(
+        handsOff && !byAnotherTurn
+          ? ["Procure atendimento de emergência ou ligue 192."]
+          : [],
+      );
+    });
+  }
+
+  for (const [label, handoffArgs] of [
+    ["with no message", { customerMessage: "", reason: "Not applicable" }],
+    [
+      "with the goodbye as its message",
+      {
+        customerMessage: "Tudo bem, obrigada por avisar!",
+        reason: "Paciente recusou; encerrar sem transferir.",
+      },
+    ],
+  ] as const) {
+    test(`a handoff ${label} in the same step as resolve_conversation is not run, and the close and the reply stand`, async () => {
+      const conv = label === "with no message" ? 9983 : 9984;
+      await seedConversation(conv, null);
+      const calls: Array<[string, number, string]> = [];
+      const client = {
+        sendMessage: async (c: number, t: string) => {
+          calls.push(["sendMessage", c, t]);
+          return {};
+        },
+        toggleStatus: async (c: number, status: string) => {
+          calls.push(["toggleStatus", c, status]);
+          return {};
+        },
+        sendPrivateNote: async (c: number, t: string) => {
+          calls.push(["sendPrivateNote", c, t]);
+          return {};
+        },
+      } as unknown as ChatwootClient;
+      const seen: string[] = [];
+      class PhantomHandoffModel {
+        async invoke() {
+          return new AIMessage("Tudo bem, obrigada por avisar!");
+        }
+        bindTools(_t: unknown) {
+          let n = 0;
+          return {
+            async invoke(msgs: Array<{ content: unknown }>) {
+              n++;
+              if (n === 1)
+                return new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    { name: "handoff_to_human", args: handoffArgs, id: "h1" },
+                    { name: "resolve_conversation", args: {}, id: "r1" },
+                  ],
+                });
+              for (const m of msgs) seen.push(String(m.content));
+              return new AIMessage("Tudo bem, obrigada por avisar!");
+            },
+          };
+        }
+      }
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: conv }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new PhantomHandoffModel() as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(outcome).toBe("posted");
+      expect(calls).toEqual([
+        ["sendMessage", conv, "Tudo bem, obrigada por avisar!"],
+        ["toggleStatus", conv, "resolved"],
+      ]);
+      expect(seen).toContain(CONTRADICTED_HANDOFF_RESULT);
+      // The trail says the handoff was set aside, and its handoff stage reads as a close.
+      const rows = await until("the ignored-handoff line", async () => {
+        const r = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
+          where: { tenantId, threadId: `${tenantId}:${instanceId}:${conv}` },
+          select: { stage: true, detail: true },
+        });
+        return r.some(
+          (x) =>
+            (x.detail as Record<string, unknown> | null)?.handoffIgnored ===
+            "resolve_in_same_step",
+        ) && r.some((x) => x.stage === "handoff")
+          ? r
+          : null;
+      });
+      const handoffOutcomes = rows
+        .filter((x) => x.stage === "handoff")
+        .map((x) => (x.detail as Record<string, unknown> | null)?.outcome);
+      expect(handoffOutcomes).toEqual(["resolved"]);
+    });
+  }
+
+  test("a lone handoff whose message is only a placeholder sends the customer nothing", async () => {
+    await seedConversation(9986, null);
+    const calls: Array<[string, number, string]> = [];
+    const client = {
+      sendMessage: async (c: number, t: string) => {
+        calls.push(["sendMessage", c, t]);
+        return {};
+      },
+      toggleStatus: async (c: number, status: string) => {
+        calls.push(["toggleStatus", c, status]);
+        return {};
+      },
+      sendPrivateNote: async (c: number, t: string) => {
+        calls.push(["sendPrivateNote", c, t]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    class PlaceholderModel {
+      async invoke() {
+        return new AIMessage("");
+      }
+      bindTools(_t: unknown) {
+        let n = 0;
+        return {
+          async invoke() {
+            n++;
+            if (n === 1)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  {
+                    name: "handoff_to_human",
+                    args: {
+                      customerMessage: "EMPTY",
+                      reason: "cliente pediu atendente",
+                    },
+                    id: "h1",
+                  },
+                ],
+              });
+            return new AIMessage("");
+          },
+        };
+      }
+    }
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9986 }),
+      base: appDb,
+      deps: {
+        makeModel: () => new PlaceholderModel() as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(calls).toEqual([
+      ["sendPrivateNote", 9986, "cliente pediu atendente"],
+      ["toggleStatus", 9986, "open"],
+    ]);
+  });
+
+  test("a repeated handoff-and-close batch still stops as a stall instead of spending the tool budget", async () => {
+    await seedConversation(9985, null);
+    const client = {
+      sendMessage: async () => ({}),
+      toggleStatus: async () => ({}),
+      sendPrivateNote: async () => ({}),
+    } as unknown as ChatwootClient;
+    let bound = 0;
+    class RepeatingModel {
+      async invoke() {
+        return new AIMessage("Tudo bem!");
+      }
+      bindTools(_t: unknown) {
+        return {
+          async invoke() {
+            bound++;
+            return new AIMessage({
+              content: "",
+              tool_calls: [
+                {
+                  name: "handoff_to_human",
+                  args: { customerMessage: "" },
+                  id: "h1",
+                },
+                { name: "resolve_conversation", args: {}, id: "r1" },
+              ],
+            });
+          },
+        };
+      }
+    }
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 9985 }),
+      base: appDb,
+      deps: {
+        makeModel: () => new RepeatingModel() as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(bound).toBe(2);
+  });
+
+  // NOTE: The bound, pinned so it is a decision and not a surprise. The closing line left before
+  // this gate and is untouched by it; everything the turn still holds here stops, photo included.
+  // Once the mirror reads "not ours", our own transfer and a human who accepted the conversation in
+  // the same window are indistinguishable (it records no reason for a status change), so the gate
+  // fails closed and the turn reports the takeover it saw.
   test("the takeover gate still stops everything the closing line did not carry", async () => {
     await allowImageHost();
     await seedConversation(9988, null);
@@ -3355,42 +4619,97 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         imageDeps,
       },
     });
-    // `posted-partial`, not plain `posted` (issue #429): the handoff line answered, so this is not a
-    // failed turn — but the customer was promised a photo that never arrived, and the word that
+    // NOTE: `posted-partial`, not plain `posted`: the handoff line answered, so this is not a
+    // failed turn, but the customer was promised a photo that never arrived, and the word that
     // clears the operator's badge is reserved for a delivery that arrived whole. Same two bits as
     // the resolve decision, which this branch already refused for the same reason.
     expect(outcome).toBe("posted-partial");
   });
 
-  test("taken over mid-turn discards the resolve intent", async () => {
-    await seedConversation(911, "User");
-    const calls: Array<[string, number, string]> = [];
-    const outcome = await runAgentTurn({
-      tenantId,
-      instanceId,
-      agentBotId: 9,
-      event: incoming({ conversationId: 911 }),
-      base: appDb,
-      deps: {
-        makeModel: () =>
-          new ResolveThenReplyModel("Resolvido!") as unknown as BaseChatModel,
-        makeClient: makeResolveClient(calls),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(outcome).toBe("taken-over");
-    // A human owns the conversation: no reply AND no resolve may reach Chatwoot.
-    expect(calls).toEqual([]);
-  });
+  // A tool that failed on every call it made is the turn's outcome, and the turn says so once it is
+  // done; a tool that failed and then worked says nothing past its `info` lines.
+  test.each([
+    ["fails on every call", 91921, [false, false], ["warn"]],
+    ["fails, then works", 91922, [false, true], []],
+  ] as const)(
+    "a tool that %s settles at the end of the turn",
+    async (_label, conversationId, works, expected) => {
+      await seedConversation(conversationId, null);
+      const calls: Array<[string, number, string]> = [];
+      let reacts = 0;
+      const client = {
+        ...(await makeResolveClient(calls)()),
+        getLatestIncomingMessage: async () => {
+          if (!works[reacts++]) throw new Error("chatwoot unreachable");
+          return { id: 1, isReaction: false };
+        },
+        addMessageReaction: async () => ({}),
+      } as unknown as ChatwootClient;
+      const model = {
+        invoke: async () => new AIMessage("Certo!"),
+        bindTools() {
+          let n = 0;
+          return {
+            invoke: async () =>
+              ++n <= works.length
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "react_to_message",
+                        args: { emoji: "👍" },
+                        id: `call_react_${n}`,
+                      },
+                    ],
+                  })
+                : new AIMessage("Certo!"),
+          };
+        },
+      };
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(outcome).toBe("posted");
+      expect(reacts).toBe(works.length);
+      const lines = async () =>
+        (
+          await flowLogRows(suDb, {
+            orderBy: { id: "asc" },
+            where: {
+              tenantId,
+              stage: "tool",
+              threadId: `${tenantId}:${instanceId}:${conversationId}`,
+            },
+            select: { level: true, detail: true },
+          })
+        ).filter(
+          (r) =>
+            (r.detail as Record<string, unknown> | null)?.tool ===
+            "react_to_message",
+        );
+      const rows = await until("every reaction's line", async () => {
+        const landed = await lines();
+        return landed.length >= works.length + expected.length ? landed : null;
+      });
+      expect(
+        rows.filter((r) => r.level !== "info").map((r) => r.level),
+      ).toEqual([...expected]);
+      expect(rows.filter((r) => r.level === "info")).toHaveLength(works.length);
+    },
+  );
 
-  // ISSUE #773, AND IT REPLACES AN ASSERTION THIS FILE USED TO MAKE. The test here was
-  // "resolve with an empty final reply still resolves after the turn", and what it was built to prove
-  // is the ORDER — the close comes after the reply, never instead of it. The shape it happened to use
-  // was a completion that merely came back EMPTY, so it also asserted that an unexplained silence may
-  // close, which is the defect. The order is proved by the tests above with a real reply; what the
-  // empty shape decides is a different question, and the pair below answers it.
-  //
-  // Measured on 115 replayed conversations: 6 turns produced nothing, 3 correctly and 3 like this.
+  // NOTE: An unexplained silence must not close the conversation. The ORDER (the close comes after
+  // the reply, never instead of it) is proved by the tests above with a real reply; what an EMPTY
+  // completion decides is a different question, and this pair answers it.
   test("an empty completion NOBODY chose does not close the conversation", async () => {
     await seedConversation(912, null);
     const calls: Array<[string, number, string]> = [];
@@ -3407,11 +4726,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // The turn still produced nothing — that part is true and unchanged. What must NOT happen is the
-    // conversation closing as handled: nothing reached the customer and nothing in the turn chose
-    // that, so the deferred intent is discarded like a takeover or a blocked output discards it.
-    // Nobody on our side had spoken here either, so since issue #659 it goes to a person: `open`,
-    // with a note, and never `resolved`.
+    // NOTE: The turn still produced nothing. What must NOT happen is the conversation closing as
+    // handled: nothing reached the customer and nothing in the turn chose that, so the deferred intent
+    // is discarded like a takeover or a blocked output discards it. Nobody on our side had spoken here
+    // either, so it goes to a person: `open`, with a note, and never `resolved`.
     expect(outcome).toBe("empty");
     expect(
       calls.map(([op, id, arg]) => [op, id, op === "toggleStatus" ? arg : ""]),
@@ -3422,9 +4740,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
 
     // ...and the operator is told, because a turn that ends with nothing and no explanation is
     // exactly the one nobody can find afterwards. Fire-and-forget, so poll briefly.
-    let warned: Record<string, unknown> | null = null;
-    for (let i = 0; i < 30 && !warned; i++) {
+    const warned = await until("the silence warning", async () => {
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "generate",
@@ -3433,20 +4751,20 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
         select: { detail: true },
       });
-      warned =
+      return (
         rows
           .map((r) => r.detail as Record<string, unknown> | null)
-          .find((d) => d?.silenceUnexplained === true) ?? null;
-      if (!warned) await new Promise((r) => setTimeout(r, 100));
-    }
+          .find((d) => d?.silenceUnexplained === true) ?? null
+      );
+    });
     expect(warned).not.toBeNull();
     // The line says WHICH exit this was: a resolve intent existed and was thrown away.
     expect(warned?.resolveDiscarded).toBe(true);
   });
 
-  // The control, and the half that must keep working: the model DECLARED the silence with the tool
-  // built for it. Three of the six empty turns in the report are this, and they are correct — the
-  // customer wrote "Amoooo." and there is nothing to answer.
+  // NOTE: The control, and the half that must keep working: the model DECLARED the silence with the
+  // tool built for it, which is correct when the customer wrote "Amoooo." and there is nothing to
+  // answer.
   test("a silence the model CHOSE still closes the conversation", async () => {
     await seedConversation(9773, null);
     const calls: Array<[string, number, string]> = [];
@@ -3466,8 +4784,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(calls).toEqual([["toggleStatus", 9773, "resolved"]]);
 
     // And no warning: there is nothing unexplained about this turn.
-    await new Promise((r) => setTimeout(r, 300));
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "generate",
@@ -3485,12 +4803,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toBe(false);
   });
 
-  // REVIEW ROUND 1 OF THIS PR, and the case it caught is the one a name almost hid. A transfer that
-  // SUCCEEDED and declared silence (`customerMessage: ""`, issue #662) leaves `handoffAnsweredTheTurn`
-  // false, because that predicate asks whether the transfer supplies this turn's customer-facing
-  // TEXT. Read through it, this turn looks like nobody chose the silence — and it would page an
-  // operator about a conversation that is correctly sitting in a person's queue. The question here is
-  // only whether somebody is looking.
+  // NOTE: A transfer that SUCCEEDED and declared silence (`customerMessage: ""`) leaves
+  // `handoffAnsweredTheTurn` false, because that predicate asks whether the transfer supplies this
+  // turn's customer-facing TEXT. Read through it, nobody chose the silence, and an operator would be
+  // paged about a conversation correctly sitting in a person's queue. The question here is only
+  // whether somebody is looking.
   test("a transfer that declared silence explains it, with no skip_reply", async () => {
     await seedConversation(9776, null);
     const calls: Array<[string, number, string]> = [];
@@ -3531,8 +4848,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
 
     // And nobody is paged, because nothing here is unexplained.
-    await new Promise((r) => setTimeout(r, 300));
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "generate",
@@ -3550,12 +4867,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toBe(false);
   });
 
-  // THE SECOND EXIT, and the one the original report did not have. With no deferred resolve there is
-  // nothing to discard, so the conversation simply stays `pending` with no owner, which in the report
-  // is where the label the same turn wrote goes on saying the customer is being dealt with. Nothing
-  // at all marked this turn before the line below: it ended indistinguishable from a turn that never
-  // ran. What the model called first is incidental — any tool followed by an empty completion is this
-  // shape — and `set_labels` is here because it is the one the measurement caught.
+  // NOTE: THE SECOND EXIT. With no deferred resolve there is nothing to discard, so without the line
+  // below the conversation would sit `pending` with no owner, while a label the same turn wrote says
+  // the customer is being dealt with, indistinguishable from a turn that never ran. Any tool followed
+  // by an empty completion is this shape; `set_labels` is just a realistic one.
   test("an empty completion with no resolve intent is still reported", async () => {
     await seedConversation(9774, null);
     const calls: Array<[string, number, string]> = [];
@@ -3575,8 +4890,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       },
     });
     expect(outcome).toBe("empty");
-    // Nothing was closed and nothing reached the customer. Nobody on our side had ever spoken here,
-    // so since issue #659 the conversation leaves `pending` for a person, with a note saying why.
+    // NOTE: Nothing was closed and nothing reached the customer. Nobody on our side had ever spoken
+    // here, so the conversation leaves `pending` for a person, with a note saying why.
     expect(
       calls.map(([op, id, arg]) => [op, id, op === "toggleStatus" ? arg : ""]),
     ).toEqual([
@@ -3584,9 +4899,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ["sendPrivateNote", 9774, ""],
     ]);
 
-    let warned: Record<string, unknown> | null = null;
-    for (let i = 0; i < 30 && !warned; i++) {
+    const warned = await until("the silence warning", async () => {
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "generate",
@@ -3595,46 +4910,41 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
         select: { detail: true },
       });
-      warned =
+      return (
         rows
           .map((r) => r.detail as Record<string, unknown> | null)
-          .find((d) => d?.silenceUnexplained === true) ?? null;
-      if (!warned) await new Promise((r) => setTimeout(r, 100));
-    }
+          .find((d) => d?.silenceUnexplained === true) ?? null
+      );
+    });
     expect(warned).not.toBeNull();
     // No intent existed, so nothing was thrown away — and the line says so rather than leaving the
     // operator to guess which of the two exits they are looking at.
     expect(warned?.resolveDiscarded).toBe(false);
   });
 
-  // ISSUE #886. The reply WAS written, in the same assistant message as a tool call, and the turn
-  // then ended on an empty message. The runtime posted the LAST assistant message, so the answer the
-  // model wrote never left, and the turn read as an unexplained silence (#773). Measured on 51 real
-  // `silenceUnexplained` turns read from the checkpoint: 8 were this, every one a complete answer.
-  // The trigger is in the tool's own result: `resolve_conversation` says the close waits for "your
-  // final reply", and a model that already wrote it reads that as done.
+  // The reply can be written in the same assistant message as a tool call, with the turn then
+  // ending on an empty message; posting only the LAST assistant message would drop that answer and
+  // read the turn as an unexplained silence. `resolve_conversation` invites it: its result says the
+  // close waits for "your final reply", and a model that already wrote it reads that as done.
   async function recoveredLine(threadConv: number) {
-    for (let i = 0; i < 30; i++) {
-      const rows = await flowLogRows(suDb, {
-        where: {
-          tenantId,
-          stage: "generate",
-          threadId: `${tenantId}:${instanceId}:${threadConv}`,
-        },
-        select: { detail: true, level: true },
-      });
-      const hit = rows.find(
-        (r) =>
-          (r.detail as Record<string, unknown> | null)?.replyRecovered === true,
-      );
-      if (hit) return hit;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return null;
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: {
+        tenantId,
+        stage: "generate",
+        threadId: `${tenantId}:${instanceId}:${threadConv}`,
+      },
+      select: { detail: true, level: true },
+    });
+    const hit = rows.find(
+      (r) =>
+        (r.detail as Record<string, unknown> | null)?.replyRecovered === true,
+    );
+    return hit ?? null;
   }
   async function unexplainedWarned(threadConv: number) {
-    await new Promise((r) => setTimeout(r, 300));
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "generate",
@@ -3791,8 +5101,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       },
     });
     expect(outcome).toBe("posted");
-    await new Promise((r) => setTimeout(r, 300));
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "generate",
@@ -3831,6 +5141,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(outcome).toBe("taken-over");
     expect(calls.filter(([op]) => op === "sendMessage")).toEqual([]);
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, threadId: `${tenantId}:${instanceId}:98871` },
       select: { stage: true, detail: true },
     });
@@ -3878,46 +5189,40 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(calls.filter(([op]) => op === "sendMessage")).toEqual([]);
   });
 
-  // ISSUE #885. A turn that ends with nothing for the customer, no handoff and no `skip_reply` is
-  // asked once more, in the same round, with a late instruction naming both exits. Measured on 51
-  // real turns: most are correct silences after a thank-you that were never declared, and a few are
-  // customers owed an answer — the retry recovers both, without making anyone answer a thank-you.
+  // A turn that ends with nothing for the customer, no handoff and no `skip_reply` is asked once
+  // more, in the same round, with a late instruction naming both exits. Most such turns are correct
+  // but undeclared silences after a thank-you, a few are customers owed an answer; the retry recovers
+  // both without making anyone answer a thank-you.
   async function silenceRetryLine(threadConv: number) {
-    for (let i = 0; i < 30; i++) {
-      const rows = await flowLogRows(suDb, {
-        where: {
-          tenantId,
-          stage: "generate",
-          threadId: `${tenantId}:${instanceId}:${threadConv}`,
-        },
-        select: { detail: true },
-      });
-      const hit = rows
-        .map((r) => r.detail as Record<string, unknown> | null)
-        .find((d) => d?.silenceRetry !== undefined);
-      if (hit) return hit;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return null;
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: {
+        tenantId,
+        stage: "generate",
+        threadId: `${tenantId}:${instanceId}:${threadConv}`,
+      },
+      select: { detail: true },
+    });
+    const hit = rows
+      .map((r) => r.detail as Record<string, unknown> | null)
+      .find((d) => d?.silenceRetry !== undefined);
+    return hit ?? null;
   }
   async function unexplainedDetail(threadConv: number) {
-    for (let i = 0; i < 30; i++) {
-      const rows = await flowLogRows(suDb, {
-        where: {
-          tenantId,
-          stage: "generate",
-          level: "warn",
-          threadId: `${tenantId}:${instanceId}:${threadConv}`,
-        },
-        select: { detail: true },
-      });
-      const hit = rows
-        .map((r) => r.detail as Record<string, unknown> | null)
-        .find((d) => d?.silenceUnexplained === true);
-      if (hit) return hit;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-    return null;
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: {
+        tenantId,
+        stage: "generate",
+        level: "warn",
+        threadId: `${tenantId}:${instanceId}:${threadConv}`,
+      },
+      select: { detail: true },
+    });
+    const hit = rows
+      .map((r) => r.detail as Record<string, unknown> | null)
+      .find((d) => d?.silenceUnexplained === true);
+    return hit ?? null;
   }
 
   test("an empty answer is asked again once, and the second answer reaches the customer", async () => {
@@ -3946,6 +5251,64 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
     expect(await silenceRetryLine(98851)).toEqual({ silenceRetry: "answered" });
     expect(await unexplainedWarned(98851)).toBe(false);
+  });
+
+  test("a reply whose replayed thinking blocks the provider dropped is logged with the count", async () => {
+    await seedConversation(91684, null);
+    const calls: Array<[string, number, string]> = [];
+    const reply = () =>
+      new AIMessage({
+        content: "Começa às 20h30.",
+        response_metadata: {
+          model_provider: "anthropic",
+          input_transformations: [
+            {
+              type: "thinking_dropped",
+              path: "messages.1.content.0",
+              reason: "prefix_binding_mismatch",
+            },
+            {
+              type: "thinking_dropped",
+              path: "messages.3.content.0",
+              reason: "prefix_binding_mismatch",
+            },
+          ],
+        },
+      });
+    const model = {
+      invoke: async () => reply(),
+      bindTools: () => ({ invoke: async () => reply() }),
+    };
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 91684 }),
+      base: appDb,
+      deps: {
+        makeModel: () => model as unknown as BaseChatModel,
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: {
+        tenantId,
+        stage: "generate",
+        threadId: `${tenantId}:${instanceId}:91684`,
+      },
+      select: { detail: true, status: true },
+    });
+    const dropped = rows
+      .filter(
+        (r) =>
+          (r.detail as Record<string, unknown> | null)?.thinkingDropped !==
+          undefined,
+      )
+      .map((r) => ({ detail: r.detail, status: r.status }));
+    expect(dropped).toEqual([{ detail: { thinkingDropped: 2 }, status: "ok" }]);
   });
 
   test("empty twice: nothing is sent, nothing is closed, and the warn says a retry was made", async () => {
@@ -4137,16 +5500,16 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const tuples = [];
     for await (const t of checkpointer.list({})) tuples.push(t);
     const persisted = JSON.stringify(tuples.map((t) => t.checkpoint));
-    expect(persisted).not.toContain(SILENCE_RETRY_MARK);
-    // And in what the model was sent it is a system message, never a human one.
-    const second = model.seen[1] ?? [];
+    // NOTE: the retry happened: the model was asked twice, the second time carrying the instruction
+    // in a system message and nowhere else.
+    expect(model.seen).toHaveLength(2);
     expect(
-      second.some(
-        (m) =>
-          m.getType() === "human" &&
-          contentToText(m.content).includes(SILENCE_RETRY_MARK),
-      ),
-    ).toBe(false);
+      (model.seen[1] ?? [])
+        .filter((m) => contentToText(m.content).includes(SILENCE_RETRY_MARK))
+        .map((m) => m.getType()),
+    ).toEqual(["system"]);
+    expect(persisted).toContain("Ok!");
+    expect(persisted).not.toContain(SILENCE_RETRY_MARK);
   });
 
   test("an agent that turned it off keeps today's ending", async () => {
@@ -4181,6 +5544,126 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(model.seen).toHaveLength(1);
       const warned = await unexplainedDetail(98855);
       expect(warned?.silenceRetried).toBe(false);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agent.id },
+        data: { settings: { split: { enabled: false } } },
+      });
+    }
+  });
+
+  // The answer written before the last tool call came back hidden (a 5.5 model under `display:
+  // "updates"`), and the model closed with a dash because it believed it had answered.
+  async function hiddenNotesLine(threadConv: number) {
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: {
+        tenantId,
+        stage: "generate",
+        threadId: `${tenantId}:${instanceId}:${threadConv}`,
+      },
+      select: { detail: true },
+    });
+    return (
+      rows
+        .map((r) => r.detail as Record<string, unknown> | null)
+        .find((d) => d?.hiddenNotes !== undefined) ?? null
+    );
+  }
+  const HIDDEN =
+    "O curso tem 5 módulos e 20 aulas, e a matrícula está no link que eu deixei acima.";
+
+  test("a dash after a hidden note is retried, and the customer gets the whole answer", async () => {
+    await seedConversation(17880, null);
+    const calls: Array<[string, number, string]> = [];
+    const model = new ScriptedSilenceModel([
+      {
+        text: "Vou buscar.",
+        calls: [{ name: "set_labels", args: { add: ["quente"] } }],
+      },
+      {
+        text: "",
+        note: HIDDEN,
+        calls: [{ name: "set_labels", args: { add: ["link-enviado"] } }],
+      },
+      { text: "—" },
+      { text: "São 5 módulos. Matrícula: https://exemplo.com/matricula" },
+    ]);
+    const outcome = await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 17880 }),
+      base: appDb,
+      deps: {
+        makeModel: () => model as unknown as BaseChatModel,
+        makeClient: makeResolveClient(calls),
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(outcome).toBe("posted");
+    expect(calls.filter(([op]) => op === "sendMessage")).toEqual([
+      [
+        "sendMessage",
+        17880,
+        "São 5 módulos. Matrícula: https://exemplo.com/matricula",
+      ],
+    ]);
+    expect(await silenceRetryLine(17880)).toEqual({ silenceRetry: "answered" });
+    // The note is conversation content: by default only its size reaches the log.
+    expect(await hiddenNotesLine(17880)).toEqual({
+      hiddenNotes: 1,
+      hiddenNoteChars: HIDDEN.length,
+    });
+  });
+
+  test("with the retry off, a dash is never delivered, and the summary is logged only under logToolValues", async () => {
+    await seedConversation(17881, null);
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId },
+      select: { id: true },
+    });
+    await suDb.agent.update({
+      where: { id: agent.id },
+      data: {
+        settings: {
+          split: { enabled: false },
+          limits: { retrySilence: false },
+          observability: { logToolValues: true },
+        },
+      },
+    });
+    try {
+      const calls: Array<[string, number, string]> = [];
+      const model = new ScriptedSilenceModel([
+        {
+          text: "",
+          note: HIDDEN,
+          calls: [{ name: "set_labels", args: { add: ["link-enviado"] } }],
+        },
+        { text: "—" },
+        { text: "não deveria ser perguntado" },
+      ]);
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 17881 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: makeResolveClient(calls),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      expect(model.seen).toHaveLength(2);
+      expect(calls.filter(([op]) => op === "sendMessage")).toEqual([]);
+      expect(await unexplainedWarned(17881)).toBe(true);
+      expect(await hiddenNotesLine(17881)).toEqual({
+        hiddenNotes: 1,
+        hiddenNoteChars: HIDDEN.length,
+        hiddenNoteSummaries: [HIDDEN],
+      });
     } finally {
       await suDb.agent.update({
         where: { id: agent.id },
@@ -4256,7 +5739,64 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(await silenceRetryLine(98858)).toBeNull();
   });
 
-  // Issue #886 delivers the reply the model wrote beside a tool call: that turn is not a silence.
+  // An image caption is the model's text riding as the message content, which Chatwoot
+  // renders as Liquid like any other, so it goes escaped (the wire shape is pinned in
+  // chatwoot-liquid.test.ts), and so does the reply beside it.
+  test("the caption and the reply reach the customer literally", async () => {
+    await allowImageHost();
+    await seedConversation(98943, null);
+    const sent: Array<[string, string | undefined]> = [];
+    const client = {
+      sendMessage: async (_c: number, content: string) => {
+        sent.push(["message", content]);
+        return {};
+      },
+      toggleStatus: async () => ({}),
+      toggleTyping: async () => ({}),
+      sendFileAttachment: async (
+        _c: number,
+        _b: ArrayBuffer,
+        _f: string,
+        _m: string,
+        o: { caption?: string } = {},
+      ) => {
+        sent.push(["attachment", o.caption]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const model = new ScriptedSilenceModel([
+      {
+        text: "",
+        calls: [
+          {
+            name: "send_image",
+            args: { url: IMG_URL, caption: "Foto {{contact.email}}" },
+          },
+        ],
+      },
+      { text: "Veja {{foo}}" },
+    ]);
+    await runAgentTurn({
+      tenantId,
+      instanceId,
+      agentBotId: 9,
+      event: incoming({ conversationId: 98943 }),
+      base: appDb,
+      deps: {
+        makeModel: () => model as unknown as BaseChatModel,
+        makeClient: async () => client,
+        checkpointer: new MemorySaver(),
+        imageDeps,
+      },
+    });
+    expect(sent).toContainEqual([
+      "attachment",
+      "Foto {{ '{{' }}contact.email}}",
+    ]);
+    expect(sent).toContainEqual(["message", "Veja {{ '{{' }}foo}}"]);
+  });
+
+  // NOTE: The reply the model wrote beside a tool call is delivered, so that turn is not a silence.
   test("a recovered reply is not retried", async () => {
     await seedConversation(98857, null);
     const calls: Array<[string, number, string]> = [];
@@ -4287,9 +5827,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(await silenceRetryLine(98857)).toBeNull();
   });
 
-  // Something else already answers the turn: the picture the model queued. The text it wrote beside
-  // the call is not brought back on top of it, which keeps the recovery to the one shape measured
-  // (nothing at all reached the customer).
+  // NOTE: Something else already answers the turn: the picture the model queued. The text it wrote
+  // beside the call is not brought back on top of it; the recovery is only for a turn where nothing
+  // at all reached the customer.
   test("an earlier text is not recovered when an attachment answers the turn", async () => {
     await allowImageHost();
     await seedConversation(98866, null);
@@ -4411,9 +5951,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(await recoveredLine(98869)).toBeNull();
   });
 
-  // ISSUE #717. A person taking the conversation over WHILE the model runs: the gates before the
-  // invoke (#711) have already answered, and the recheck after it only holds the send. Between them
-  // the tools ran over the person. The mirror flip happens inside the model call, which is the
+  // A person taking the conversation over WHILE the model runs: the gates before the
+  // invoke have already answered, and the recheck after it only holds the send. Between them
+  // the tools would run over the person. The mirror flip happens inside the model call, which is the
   // window, and the next hop's calls are what the fence has to stop.
   function ownershipClient(calls: Array<[string, number, string]>) {
     let labels: string[] = [];
@@ -4509,8 +6049,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(outcome).toBe("taken-over");
     // Neither the label nor anything else reached the conversation the person now holds.
     expect(calls).toEqual([]);
-    // And the trail says the gate closed, from the read that refused (review round 2).
+    // And the trail says the gate closed, from the read that refused.
     const closedLines = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "handoff",
@@ -4563,10 +6104,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // The turn's OWN transfer changes the owner too, and the calls after it in the same answer are the
-  // turn's intent: a label written after the handoff is not a write over somebody.
-  // Review round 2: the calls of one batch run concurrently, so the label's own ask inside its queue
-  // can read the `open` the handoff beside it just wrote. Still the turn's own transfer.
+  // NOTE: The turn's OWN transfer changes the owner too, and the calls after it in the same answer are the
+  // turn's intent: a label written after the handoff is not a write over somebody. The calls of one
+  // batch run concurrently, so the label's own ask inside its queue can read the `open` the handoff
+  // beside it just wrote: still the turn's own transfer.
   test("issue #717: a handoff and a label in the same batch both run", async () => {
     await seedConversation(9720, null);
     const calls: Array<[string, number, string]> = [];
@@ -4616,6 +6157,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const base = ownershipClient(calls);
     const inner = await base();
     const mirrored = Promise.withResolvers<void>();
+    let labelWritten = false;
     let armed = false;
     const client = {
       ...inner,
@@ -4630,14 +6172,25 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           data: { status },
         });
         mirrored.resolve();
-        // The response comes back well after the webhook landed.
-        await new Promise((r) => setTimeout(r, 300));
+        // The response comes back only after the label has passed its ownership fence and reached
+        // Chatwoot. A fence that stood the label down never gets there, and this call then gives up,
+        // which leaves the label missing from `calls` below.
+        await until(
+          "the label written past its ownership fence",
+          () => labelWritten,
+        );
         return {};
       },
       // Armed inside the model call: the turn reads the labels while it prepares, too.
       getConversationLabels: async (c: number) => {
         if (armed) await mirrored.promise;
         return inner.getConversationLabels(c);
+      },
+      setConversationLabels: async (...args: unknown[]) => {
+        labelWritten = true;
+        return (
+          inner.setConversationLabels as (...a: unknown[]) => Promise<unknown>
+        )(...args);
       },
     } as unknown as ChatwootClient;
     const m = scriptedToolModel([
@@ -4725,7 +6278,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(calls).toEqual([]);
   });
 
-  // Review round 3: a second transfer that throws must not erase the first one, which landed.
+  // NOTE: A second transfer that throws must not erase the first one, which landed.
   test("issue #717: a failed second transfer does not undo the first one's exemption", async () => {
     await seedConversation(9723, null);
     const calls: Array<[string, number, string]> = [];
@@ -4951,7 +6504,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
   });
 
-  // Issue #787: a URL or an e-mail address never goes into the speech. It is handed over verbatim in
+  // A URL or an e-mail address never goes into the speech. It is handed over verbatim in
   // one text message right after the voice note, or the whole reply goes as text when all that is
   // left to say is the introduction of the item.
   function recordingAudioClient(
@@ -5033,7 +6586,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(r.outcome).toBe("posted");
       expect(r.log.map((m) => m.kind)).toEqual(["audio", "text"]);
       expect(r.log[1]?.text).toBe(url);
-      // #792: the voice note also carries the whole reply, which is what goes as text if the channel
+      // NOTE: The voice note also carries the whole reply, which is what goes as text if the channel
       // refuses the audio; the speech alone reads "em a qualquer momento".
       expect(r.log[0]?.reply).toBe(reply);
       for (const said of [...r.spoken, ...r.normalized, r.log[0]?.text ?? ""]) {
@@ -5073,7 +6626,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
   });
 
-  // Issue #856: a reply built to be read goes as text, whole, even when the customer would get audio.
+  // A reply built to be read goes as text, whole, even when the customer would get audio.
   const PRICE_TABLE = `Os valores de 2 lugares ficam assim:
 
 - **Cadeira**: meia R$ 300,00, total R$ 600,00
@@ -5087,6 +6640,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       where: { tenantId, chatwootConversationId: conv },
     });
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId: c.id, stage: "tts" },
     });
     return rows.map(({ level, status, detail }) => ({ level, status, detail }));
@@ -5173,7 +6727,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // Issue #859: the model is TOLD when its reply will be spoken, and may choose text for it. What it
+  // The model is TOLD when its reply will be spoken, and may choose text for it. What it
   // is told is a property of the request, so every test here reads the request the model received.
   const NOTICE_ON = { spokenNotice: true };
 
@@ -5262,7 +6816,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const c = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: conv },
     });
-    return flowLogRows(suDb, { where: { tenantId, conversationId: c.id } });
+    return flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: { tenantId, conversationId: c.id },
+    });
   }
 
   test("an agent without the new keys reads the same prompt and tools on an audio turn (#859)", async () => {
@@ -5578,7 +7135,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // Codex review of #879: once the reply goes as text, the rounds after the change must not read an
+  // NOTE: Once the reply goes as text, the rounds after the change must not read an
   // instruction that says it is a voice note (no lists, no formatting), which is exactly what the
   // model chose text to write.
   test("after the model chooses text, the next round is no longer told voice (#859)", async () => {
@@ -5734,7 +7291,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // Review round 1 of #788: the written follow-up is a second write, and a /reset or a disabled agent
+  // NOTE: The written follow-up is a second write, and a /reset or a disabled agent
   // landing while the voice note was being sent has to stop it like it stops any other write.
   test("an agent disabled during the voice note does not send the written follow-up (#787)", async () => {
     await withTtsMirror(async () => {
@@ -5777,13 +7334,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
   });
 
-  // #160, and the finding waived on #159: the closing line is a reply like any other, so a customer
-  // being answered in audio has to HEAR it. Today the tool writes it as text, so the one turn where
-  // the agent says the least is also the one where it drops the modality the customer asked for.
-  //
-  // The order is the visible cost of a single delivery owner: the transfer lands first and the line
-  // follows, because the runtime cannot deliver until the tool call returns. Chatwoot never shows a
-  // status change to the customer, so what they perceive is unchanged.
+  // NOTE: The closing line is a reply like any other, so a customer being answered in audio has to
+  // HEAR it. The order is the visible cost of a single delivery owner: the transfer lands first and
+  // the line follows, because the runtime cannot deliver until the tool call returns. Chatwoot never
+  // shows a status change to the customer, so what they perceive is unchanged.
   test("a handoff's closing line is spoken when the reply modality is audio", async () => {
     await withTtsMirror(async () => {
       await seedConversation(915, null);
@@ -5855,9 +7409,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       },
     });
     expect(outcome).toBe("posted");
-    // The line delivered is the second attempt's own, and the first attempt's promise never goes
-    // out. Since issue #662 the retry has to carry a line (or declare silence), so this is the
-    // shape a real retry takes.
+    // NOTE: The line delivered is the second attempt's own, and the first attempt's promise never
+    // goes out. A retry has to carry a line (or declare silence), so this is the shape a real retry
+    // takes.
     expect(calls).toEqual([
       ["toggleStatus", 961, "open"],
       ["sendMessage", 961, "Pronto, te transferi."],
@@ -5996,7 +7550,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
   });
 
-  // Issue #65 + review: the tool queues and the RUNTIME delivers, after the same gates the reply
+  // NOTE: The tool queues and the RUNTIME delivers, after the same gates the reply
   // passes. The customer sees the picture, then the sentence about it.
   test("a queued image is delivered before the reply, in the same turn", async () => {
     await allowImageHost();
@@ -6100,22 +7654,20 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         select: { id: true, status: true, number: true },
       });
       expect(row).toMatchObject({ status: "READY", number: 1 });
-      // And the bytes really went to the injected directory. Asserting this is not ceremony: the
-      // first version of this test passed a dir the runtime did not plumb through, so the PDF was
-      // written to the configured one and nothing said so.
+      // NOTE: And the bytes really went to the injected directory: a dir the runtime did not plumb
+      // through would leave the PDF in the configured one with nothing saying so.
       expect(
         await Bun.file(
           `${dir}/${storageKey(tenantId, row?.id ?? 0n)}`,
         ).exists(),
       ).toBe(true);
-      // And the trail names the tool the operator granted, not a constant: an operator filtering for
-      // it has to find the line it produced.
-      // Scoped AND polled. This reader had neither, and the missing wait is the one that already
-      // cost a CI run on an unrelated PR: `emitFlowEvent` is fire-and-forget, so the `send_orcamento`
-      // line had simply not landed when the assertion read the table (#258).
+      // And the trail names the tool the operator granted, not a constant: an operator
+      // filtering for it has to find the line it produced. Scoped AND polled: `emitFlowEvent` is
+      // fire-and-forget, so the `send_orcamento` line may not have landed on the first read.
       let named = false;
-      for (let i = 0; i < 30 && !named; i++) {
+      await until("the send_orcamento line", async () => {
         const flow = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
           where: {
             tenantId,
             stage: "tool",
@@ -6129,8 +7681,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
             (d) =>
               d.includes("send_orcamento") && d.includes('"outcome":"sent"'),
           );
-        if (!named) await new Promise((r) => setTimeout(r, 100));
-      }
+        return named || null;
+      });
       expect(named).toBe(true);
     } finally {
       await suDb.$executeRawUnsafe(
@@ -6216,8 +7768,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // Polled, because emitFlowEvent is fire-and-forget: asserting on the first read passes or
       // fails on timing, which is a test that reports the wrong thing.
       let skipLogged = false;
-      for (let i = 0; i < 30 && !skipLogged; i++) {
+      await until("the skipped revocation line", async () => {
         const flow = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
           where: {
             tenantId,
             stage: "tool",
@@ -6230,8 +7783,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
             JSON.stringify(f.detail).includes("revoked_before_delivery") &&
             f.status === "skipped",
         );
-        if (!skipLogged) await new Promise((r) => setTimeout(r, 100));
-      }
+        return skipLogged || null;
+      });
       expect(skipLogged).toBe(true);
     } finally {
       await suDb.$executeRawUnsafe(
@@ -6309,9 +7862,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           documentsStorageDir: dir,
         },
       });
-      // Nothing was sent and nothing failed: an empty turn, not a broken one. Nobody on our side had
-      // spoken here either, so since issue #659 this early exit also hands the conversation to a
-      // person, like every other way the turn ends empty.
+      // NOTE: Nothing was sent and nothing failed: an empty turn, not a broken one. Nobody on our
+      // side had spoken here either, so this early exit also hands the conversation to a person, like
+      // every other way the turn ends empty.
       expect(outcome).toBe("empty");
       expect(calls).toEqual([["toggleStatus", 946, "open"]]);
       // …and no deferred resolve closed a conversation the customer never heard back on.
@@ -6490,7 +8043,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           documentsStorageDir: dir,
         },
       });
-      // `posted-partial` (issue #429), and the same reasoning the flow line below states: a lookup
+      // NOTE: `posted-partial`, by the same reasoning the flow line below states: a lookup
       // that could not be made is not the operator withdrawing the file. The customer holds the text
       // and not the document they were promised, so the turn does not get the word that clears the
       // badge — the badge is the second place they can find out why the file never arrived.
@@ -6501,8 +8054,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // why the file never arrived tell them somebody meant it.
       let flow: { detail: unknown; status: string | null }[] = [];
       let unknown: typeof flow = [];
-      for (let i = 0; i < 30 && unknown.length === 0; i++) {
+      await until("the revocation_unknown line", async () => {
         flow = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
           where: {
             tenantId,
             stage: "tool",
@@ -6513,8 +8067,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         unknown = flow.filter((f) =>
           JSON.stringify(f.detail).includes("revocation_unknown"),
         );
-        if (unknown.length === 0) await new Promise((r) => setTimeout(r, 100));
-      }
+        return unknown.length > 0 || null;
+      });
       expect(unknown.length).toBeGreaterThan(0);
       expect(unknown.every((f) => f.status === "error")).toBe(true);
       expect(
@@ -6543,6 +8097,26 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       "verde.png": 15,
       "vermelha.png": 0,
     };
+    // The three files share a name and bytes, so the caption is what tells them apart.
+    const captions: string[] = [];
+    const makeClient = async () => {
+      const client = (await makeImageClient(calls)()) as unknown as {
+        sendFileAttachment: (...a: unknown[]) => Promise<unknown>;
+      };
+      return {
+        ...client,
+        sendFileAttachment: (
+          conversationId: number,
+          bytes: ArrayBuffer,
+          fileName: string,
+          _mime: string,
+          opts: { caption?: string } = {},
+        ) => {
+          captions.push(opts.caption ?? "");
+          return client.sendFileAttachment(conversationId, bytes, fileName);
+        },
+      } as unknown as ChatwootClient;
+    };
     const outcome = await runAgentTurn({
       tenantId,
       instanceId,
@@ -6559,7 +8133,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
               caption: "Vermelha",
             },
           ]) as unknown as BaseChatModel,
-        makeClient: makeImageClient(calls),
+        makeClient,
         checkpointer: new MemorySaver(),
         imageDeps: {
           ...imageDeps,
@@ -6581,44 +8155,16 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ["sendFileAttachment", 936, "imagem.png"],
       ["sendMessage", 936, "Essas são as três."],
     ]);
-  });
-
-  // An image IS an answer, so a turn whose only output is a picture must not report "empty" — the
-  // callers clear the surfaced turn error on "posted", and a conversation that was just answered
-  // would otherwise keep showing the previous failure.
-  test("an image with no final text still counts as an answered turn", async () => {
-    await allowImageHost();
-    await seedConversation(932, null);
-    const calls: Array<[string, number, string]> = [];
-    const outcome = await runAgentTurn({
-      tenantId,
-      instanceId,
-      agentBotId: 9,
-      event: incoming({ conversationId: 932 }),
-      base: appDb,
-      deps: {
-        makeModel: () =>
-          new SendImageOnlyModel(
-            IMG_URL,
-            "Camiseta azul",
-          ) as unknown as BaseChatModel,
-        makeClient: makeImageClient(calls),
-        checkpointer: new MemorySaver(),
-        imageDeps,
-      },
-    });
-    expect(outcome).toBe("posted");
-    expect(calls).toEqual([["sendFileAttachment", 932, "imagem.png"]]);
+    expect(captions).toEqual(["Azul", "Verde", "Vermelha"]);
   });
 
   // The other half of that rule: when the attachments were the whole turn and NONE of them got
   // through, nothing reached the customer. Reporting "empty" would let the deferred resolve close an
   // unanswered conversation, and the callers only record a turn error when the turn throws.
   //
-  // NOTE: the assertion matches the GENERAL wording, not "no image was delivered". The queue is
-  // shared with the document tools now, and a turn whose only artefact was a quote fails through
-  // exactly this branch — a message naming images would send the operator to the image allowlist to
-  // debug a PDF read off our own disk.
+  // NOTE: the assertion matches the GENERAL wording, not "no image was delivered": the queue is
+  // shared with the document tools, and a message naming images would send the operator to the image
+  // allowlist to debug a PDF read off our own disk.
   test("an image-only turn whose delivery fails does not resolve, and fails loudly", async () => {
     await allowImageHost();
     await seedConversation(933, null);
@@ -6643,10 +8189,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect((await mirroredStatus(933)) === "resolved").toBe(false);
   });
 
-  // THE CONTROL FOR ISSUE #773'S RULE, and the mutation battery is what asked for it: a turn with no
-  // text is not automatically a turn nobody answered. The picture WENT OUT, so the customer heard
-  // something, and the close is legitimate even though the model never called `skip_reply` — the
-  // decision it did not take is about SILENCE, and this turn was not silent.
+  // NOTE: THE CONTROL FOR THE UNEXPLAINED-SILENCE RULE: a turn with no text is not automatically a
+  // turn nobody answered. The picture WENT OUT, so the close is legitimate even though the model
+  // never called `skip_reply`: that decision is about SILENCE, and this turn was not silent.
   test("an image-only turn still closes: something reached the customer", async () => {
     await allowImageHost();
     await seedConversation(9775, null);
@@ -6673,8 +8218,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
 
     // And nothing is reported: there is nothing unexplained about a turn that delivered.
-    await new Promise((r) => setTimeout(r, 300));
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: {
         tenantId,
         stage: "generate",
@@ -6692,7 +8237,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toBe(false);
   });
 
-  // The finding this defers for: a turn a human took over mid-flight must not have already put an
+  // NOTE: Why delivery is deferred to the runtime: a turn a human took over mid-flight must not have already put an
   // image in front of the customer. Nothing at all reaches Chatwoot.
   test("a turn taken over mid-flight delivers no image", async () => {
     await allowImageHost();
@@ -6762,7 +8307,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   test("issue #49: a newer incoming message mid-turn supersedes the direct reply", async () => {
     await seedConversation(970, null);
     const sent: Array<[number, string]> = [];
-    // NOTE: The shouldPost re-fetch sees a newer incoming message (id 2) than the trigger (id 1).
+    // The shouldPost re-fetch sees a newer incoming message (id 2) than the trigger (id 1).
     const client = {
       getMessages: async () => ({
         payload: [
@@ -6794,7 +8339,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(outcome).toBe("superseded");
     expect(sent).toEqual([]);
-    // NOTE: Superseded leaves the watermark for the newer message's own turn.
+    // Superseded leaves the watermark for the newer message's own turn.
     const conv = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: 970 },
       select: { lastHandledMessageId: true },
@@ -6802,14 +8347,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(conv.lastHandledMessageId).toBeNull();
   });
 
-  // AND THE NEWER MESSAGE SOMEBODY ELSE ALREADY ANSWERED IS NOT A SUPERSESSION (issue #698). The
-  // test above is the case the gate exists for: message 2 is still open, so the reply to 1 is
-  // obsolete and its own turn is coming. This is the other one, and it is the shape #690 measured on
-  // this exact path: two deliveries serialized (#658), the NEWER one takes the thread first and
-  // answers, and the older message's turn — the only actor in the system that ever loaded it — comes
-  // second. #690 made the claim grant it. Judged by arithmetic here, the gate then swallows the
-  // reply anyway: message 2 is above message 1, so the turn defers, hands nothing back and leaves
-  // the customer with no answer to what they wrote.
+  // NOTE: AND THE NEWER MESSAGE SOMEBODY ELSE ALREADY ANSWERED IS NOT A SUPERSESSION. Above, message
+  // 2 is still open, so the reply to 1 is obsolete and its own turn is coming. Here two serialized
+  // deliveries let the NEWER one take the thread first and answer, and the older message's turn (the
+  // only actor that ever loaded it) comes second. Judged by arithmetic (2 is above 1) the gate would
+  // defer and leave the customer with no answer to what they wrote.
   test("issue #698: a newer message somebody else answered does not supersede this reply", async () => {
     await seedConversation(9698, null);
     const { id } = await suDb.conversation.findFirstOrThrow({
@@ -6872,12 +8414,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(sent.length).toBe(1);
   });
 
-  // AND A PERSON WHO ANSWERED CLOSES THIS TURN TOO, not only the messages after it (PR #701, review
-  // round 1). The fence that stops an orphan from being re-offered removes the human-answered ids
-  // from the selection — including the one this turn is holding — so a gate that only asks "is
-  // anything NEWER still open?" reads that emptiness as "nothing came after me, go ahead" and posts
-  // over the person who already replied. The older gate was accidentally covered here: the newer
-  // inbound message was above the trigger and suppressed the post by arithmetic.
+  // NOTE: AND A PERSON WHO ANSWERED CLOSES THIS TURN TOO, not only the messages after it. The fence
+  // that stops an orphan from being re-offered removes the human-answered ids from the selection,
+  // including the one this turn holds, so a gate asking only "is anything NEWER still open?" reads
+  // that emptiness as "go ahead" and posts over the person who already replied.
   test("issue #698: a human reply closes the turn's own trigger, not just what came after it", async () => {
     await seedConversation(9699, null);
     const { id } = await suDb.conversation.findFirstOrThrow({
@@ -6922,20 +8462,17 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     // Nothing is said on top of the person who answered.
     expect(sent).toEqual([]);
-    // E a PALAVRA diz qual das duas recusas foi (issue #703). `superseded` afirma que o flush da
+    // NOTE: E a PALAVRA diz qual das duas recusas foi. `superseded` afirma que o flush da
     // mensagem nova está armado e por isso deixa a marca e o ledger onde estão; aqui ninguém vem
     // atrás, e a rajada é fechada como consumida.
     expect(outcome).toBe("answered-elsewhere");
   });
 
-  // E QUANDO AS DUAS VALEM AO MESMO TEMPO, QUEM VEM ATRÁS MANDA (issue #703, bateria de mutação, m6).
-  // Uma atendente responde e o cliente escreve de novo, na mesma janela: o portão vê uma resposta de
-  // terceiro fechando este gatilho E uma mensagem do cliente ainda aberta acima dele. As duas recusas
-  // são verdadeiras e as contabilidades são opostas, então a ordem da pergunta é a decisão, não um
-  // detalhe de escrita. `superseded` é a resposta certa: a mensagem nova arma um flush que vai decidir
-  // a rajada INTEIRA de novo, e fechá-la aqui como consumida tomaria essa decisão duas vezes, a
-  // primeira sem ter lido a mensagem que chegou. Com a ordem invertida a marca andaria por cima de uma
-  // mensagem que ninguém leu, que é o defeito que o `superseded` existe para não cometer.
+  // NOTE: E QUANDO AS DUAS VALEM AO MESMO TEMPO, QUEM VEM ATRÁS MANDA. Uma atendente responde e o
+  // cliente escreve de novo na mesma janela: as duas recusas são verdadeiras e as contabilidades
+  // opostas, então a ordem da pergunta é a decisão. `superseded` é o certo: a mensagem nova arma um
+  // flush que decide a rajada INTEIRA de novo; fechá-la aqui como consumida andaria a marca por cima
+  // de uma mensagem que ninguém leu.
   test("issue #703: a newer message and a human reply at once defer to the newer message", async () => {
     await seedConversation(9712, null);
     const { id } = await suDb.conversation.findFirstOrThrow({
@@ -6999,10 +8536,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toBeNull();
   });
 
-  // E A OUTRA ROTA POR ONDE UMA PESSOA RESPONDE, no caminho direto também (bateria de mutação da
-  // rodada 10, m31). A resposta digitada no aparelho pareado chega sem remetente nenhum, então a
+  // NOTE: E A OUTRA ROTA POR ONDE UMA PESSOA RESPONDE, no caminho direto também. A resposta digitada no aparelho pareado chega sem remetente nenhum, então a
   // cláusula acima não a vê, e este portão é o único que decide aqui: sem a rota do aparelho ele
-  // responde por cima da atendente. Vale só onde o provedor reserva os ids do envio — no `zapi` a
+  // responde por cima da atendente. Vale só onde o provedor reserva os ids do envio: no `zapi` a
   // mesma forma pode ser o eco da nossa própria resposta, e o control abaixo é o que prova a
   // diferença em vez de a afirmar.
   test("issue #698: a reply from the paired phone closes the direct turn, and only on a reserving provider", async () => {
@@ -7075,7 +8611,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     }
   });
 
-  // QUEM CLASSIFICA A SAÍDA É QUEM A PRODUZ, no caminho direto também (PR #701, review round 7). O
+  // NOTE: QUEM CLASSIFICA A SAÍDA É QUEM A PRODUZ, no caminho direto também. O
   // `agentBotId` é a ROTA que trouxe a entrega; quem envia é `loaded.agentBotToken`, da persona que o
   // inbox serve no momento do load. Religado o inbox entre uma coisa e outra, o aviso que ESTA
   // persona acabou de postar seria saída de terceiro, e o portão engoliria a resposta dela mesma.
@@ -7222,15 +8758,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ]);
   });
 
-  // THE END OF THE HUMAN STRETCH GETS WRITTEN DOWN, and until this it never was (issue #457). The
-  // agent's own transfer turn and every message the person sent stay in the thread; the return
-  // leaves no trace at all, so an operator prompt like "após transferir, não responda mais" goes on
-  // applying to a condition that ended. Measured live: one model went silent (`outcome=empty`, the
-  // reported symptom) and another sent the silence to the customer as text.
-  //
-  // The note has to land BEFORE the customer's message, which is why it is written here and not
-  // when ownership changed: the model reads the thread in order, and a hand-back announced after
-  // the question it is meant to unblock announces nothing.
+  // NOTE: THE END OF THE HUMAN STRETCH GETS WRITTEN DOWN. The transfer turn and the person's messages
+  // stay in the thread, so without a note an operator prompt like "após transferir, não responda
+  // mais" keeps applying to a condition that ended (the model goes silent, or sends the silence as
+  // text). The note lands BEFORE the customer's message, written here rather than when ownership
+  // changed: the model reads in order, and a hand-back after the question unblocks nothing.
   test("issue #457: the turn after a hand-back writes the note, before the customer's message", async () => {
     // ON A CONTACT-INBOX THREAD, which is the shape this situation has: the message that OPENS the
     // human stretch is folded in by continuous ingestion, and that path is keyed by contact inbox.
@@ -7331,10 +8863,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     ).toBe(1);
   });
 
-  // DEFERRED WHILE AN OLDER INVOKE IS READING, the same rule the divider follows: that invoke saves
-  // the channel it LOADED, so a note appended beside it is erased — and an erased note is the bug
-  // back, silently. Deferring costs nothing because the decision is derived: the next turn asks the
-  // same question of the same thread.
+  // NOTE: NEVER APPENDED BESIDE AN OLDER INVOKE, the same rule the divider follows: that invoke saves
+  // the channel it LOADED, so a note appended beside it is silently erased. The turn waits it out,
+  // and the decision is derived, so asking it after the wait costs nothing.
   test("issue #457: the note reaches the model after this turn waits the other invoke out", async () => {
     const contactInboxId = 7459;
     await suDb.conversation.create({
@@ -7363,9 +8894,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       },
       THREAD_STATE_NODE,
     );
-    // Another invoke is already reading this channel, so this turn waits it out (issue #658) rather
-    // than appending beside it. What #457 is about survives the wait unchanged: the customer is
-    // waiting on a transfer with no ending, and the note has to reach the model of THIS turn.
+    // Another invoke is already reading this channel, so this turn waits it out rather than
+    // appending beside it. The note still has to reach the model of THIS turn: the customer is
+    // waiting on a transfer with no ending.
     const owner = {
       tenantId,
       instanceId,
@@ -7394,13 +8925,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer,
       },
     });
-    const waiting = Symbol("still waiting");
-    expect(
-      await Promise.race([
-        turn,
-        new Promise<typeof waiting>((r) => setTimeout(() => r(waiting), 300)),
-      ]),
-    ).toBe(waiting);
+    expect(await waitsForTheThread(turn, threadId)).toBe(true);
     await clearTurnOwning(owner, appDb, otherInvoke);
     await turn;
 
@@ -7418,10 +8943,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(channel.filter(([, t]) => t === HUMAN_HANDBACK_NOTE)).toHaveLength(
       1,
     );
-    // AND IT IS A DURABLE APPEND, which is what the wait makes safe: `updateState` writes the note
-    // in a checkpoint of its own, before the customer's message exists. Deferring to the invoke's
-    // own input was the answer while an older invoke could erase that checkpoint; with nobody left
-    // to erase it, the note survives even a turn that dies before its invoke.
+    // AND IT IS A DURABLE APPEND, which the wait makes safe: `updateState` writes the note in a
+    // checkpoint of its own, before the customer's message exists. With no older invoke left to erase
+    // it, the note survives even a turn that dies before its invoke.
     const withNote: string[][] = [];
     for await (const cp of checkpointer.list({
       configurable: { thread_id: threadId },
@@ -7436,11 +8960,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(withNote.at(-1)?.some((t) => t.includes("oi"))).toBe(false);
   });
 
-  // TWO TURNS, ONE NOTE (issue #457, review round 10). The turn can be beaten to the append by the
-  // very invoke it waited out: that one finishes, writes the note, and this turn would then write a
-  // second copy. Waiting narrows the window but does not close it — the other invoke's release and
-  // its last write are not one step — so the question is re-asked of the thread as it is immediately
-  // before the invoke, and a note already there is a note not written again.
+  // NOTE: TWO TURNS, ONE NOTE. The invoke this turn waited out can write the note first. Waiting
+  // narrows the window but does not close it (the other invoke's release and its last write are not
+  // one step), so the question is re-asked of the thread immediately before the invoke, and a note
+  // already there is not written again.
   test("issue #457: a note appended by the invoke we waited out is not written twice", async () => {
     const contactInboxId = 7462;
     await suDb.conversation.create({
@@ -7522,9 +9045,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         checkpointer,
       },
     });
-    // Released only after the turn has begun waiting, so the decision below really runs on the far
-    // side of the occupancy.
-    setTimeout(() => void clearTurnOwning(owner, appDb, otherInvoke), 150);
+    // Released only once the turn is seen waiting, so the decision below really runs on the far side
+    // of the occupancy.
+    expect(await waitsForTheThread(turn, owner.graphThreadId)).toBe(true);
+    await clearTurnOwning(owner, appDb, otherInvoke);
     await turn;
     expect(injected).toBe(true);
     const channel = await threadOf(checkpointer, threadId);
@@ -7533,9 +9057,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // THE CONVERSATION-KEYED FALLBACK THREAD is a path the runtime supports, and a successful handoff
-  // is written there by the turn's own invoke like anywhere else — so leaving it out would leave
-  // this issue unfixed on it.
+  // NOTE: THE CONVERSATION-KEYED FALLBACK THREAD is a path the runtime supports, and a successful
+  // handoff is written there by the turn's own invoke like anywhere else, so it needs the note too.
   test("issue #457: a conversation-keyed thread gets the note too", async () => {
     await seedConversation(985, null);
     const checkpointer = new MemorySaver();
@@ -7576,12 +9099,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(channel.some(([, text]) => text === HUMAN_HANDBACK_NOTE)).toBe(true);
   });
 
-  // A TAKEOVER INSIDE THE WINDOW (issue #457, review round 7), on the reactive turn this time. The
-  // receiver's gate proved bot ownership before this turn was queued, and the note is written after
-  // the toolset is built, after the ingestion drain, and after a claim that WAITS. A person taking
-  // the conversation over in there leaves the gate's answer stale, and the note would announce that
-  // a human attendance ended while the human is in it — which the post-generation recheck can
-  // suppress the SEND for and never unwrite.
+  // NOTE: A TAKEOVER INSIDE THE WINDOW, on the reactive turn. The receiver's gate proved bot
+  // ownership before this turn was queued, and the note is written after the toolset, the ingestion
+  // drain, and a claim that WAITS. A takeover in there makes the gate stale, and the note would
+  // announce a human attendance ended while the human is in it; the post-generation recheck can
+  // suppress the SEND but never unwrite the note.
   test("issue #457: a takeover after the gate stops the note", async () => {
     const contactInboxId = 7461;
     await suDb.conversation.create({
@@ -7702,19 +9224,12 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     );
   });
 
-  // ONE CLAIM FOR EVERY POSTING PATH (issue #452). This direct turn and a manual re-engage of the
-  // same message are two paths to one reply, and the only thing that stops them both sending is
-  // that they claim the same column. While the claim was per caller — this one on the watermark,
-  // the button on a column of its own — an operator clicking during a delivery got the customer two
-  // answers.
-  //
-  // Ordered rather than raced, and stopped at the ONE instant where the claim is the only thing that
-  // can answer: the direct turn runs to completion inside the click's burst selection, and then its
-  // watermark write is undone. That is a real state — the claim is written before the send and the
-  // watermark only after the turn returns, so every reply passes through it. Letting the watermark
-  // stand instead makes this pass with the claim GONE, because the click's handled ceiling refuses
-  // it on the mark alone. (The other order proves nothing either: the click advances the watermark
-  // on its way out, and the direct turn's own ceiling would stop it whatever the claim did.)
+  // NOTE: ONE CLAIM FOR EVERY POSTING PATH. This direct turn and a manual re-engage of the same
+  // message are two paths to one reply, and only claiming the same column stops both sending. Ordered
+  // rather than raced: the direct turn completes inside the click's burst selection and its watermark
+  // write is then undone, a real state (the claim precedes the send, the watermark follows the turn).
+  // A standing watermark would let this pass with the claim GONE, since the click's handled ceiling
+  // refuses on the mark alone; the reverse order proves nothing for the same reason.
   test("issue #452: a direct turn completing inside an operator's click leaves one reply", async () => {
     await seedConversation(978, null);
     const inbox = await suDb.inbox.findFirstOrThrow({
@@ -7736,8 +9251,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     const client = {
       getMessages: async () => {
         fetches += 1;
-        // The click's burst selection (its pre-fetch was #1). Guarded before the call, not by its
-        // result: the direct turn reads the thread through this same stub.
+        // NOTE: The click's burst selection (its pre-fetch was the first fetch). Guarded before the
+        // call, not by its result: the direct turn reads the thread through this same stub.
         if (fetches === 2 && !running) {
           running = true;
           const before = (
@@ -7826,7 +9341,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     });
     expect(outcome).toBe("superseded");
     expect(sent).toEqual([]);
-    // NOTE: The CAS must also never move the watermark BACKWARDS (5 → 1), which would let the
+    // The CAS must also never move the watermark BACKWARDS (5 → 1), which would let the
     // messages in between be handled a second time.
     const conv = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: 971 },
@@ -7838,7 +9353,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
   test("issue #49: a newer attachment-only message (voice note) also supersedes the direct reply", async () => {
     await seedConversation(973, null);
     const sent: Array<[number, string]> = [];
-    // NOTE: The newer message carries no text at all — only an audio attachment.
+    // The newer message carries no text at all — only an audio attachment.
     const client = {
       getMessages: async () => ({
         payload: [
@@ -7878,16 +9393,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
     expect(sent).toEqual([]);
   });
 
-  // ── issue #315: what a refusal below the invoke leaves in the thread ──
-  //
-  // The invoke checkpoints as it runs, so by the time any of these gates answers, the customer's
-  // message and the assistant's reply are both in the history. The send is suppressed and the reply
-  // stays — and on `superseded` the next flush is guaranteed to read it, because that outcome exists
-  // precisely so the re-armed flush answers the whole burst. It then has the abandoned sentence in
-  // its context and can write "as I said" about something nobody was shown.
-  //
-  // What each of these asserts is the CHANNEL, not the outcome: the outcome was already right before
-  // the rollback existed, which is why the defect was invisible.
+  // NOTE: What a refusal below the invoke leaves in the thread. The invoke checkpoints as it runs, so
+  // when any of these gates answers the reply is already in the history; left there, the next turn
+  // (on `superseded`, the re-armed flush, guaranteed) can write "as I said" about something nobody
+  // was shown. Each test asserts the CHANNEL, not the outcome, which is right with or without the
+  // rollback.
   describe("a refused reactive turn leaves the thread as the customer saw it", () => {
     // The customer's own message SURVIVES, and that is the half that separates this from the
     // proactive rollback: `superseded` hands the burst to the next flush, so removing it would lose
@@ -7930,6 +9440,91 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(await threadChannel(checkpointer, 93151)).toEqual([
         ["human", "oi"],
       ]);
+      // A reply that only said something lost nothing the next turn cannot say again, so the
+      // operator is not told about it.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93151 },
+      });
+      const generated = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          conversationId: conv.id,
+          stage: "generate",
+        },
+        select: { detail: true },
+      });
+      expect(JSON.stringify(generated)).not.toContain(
+        "superseded_after_action",
+      );
+    });
+
+    // The silence tool is the one call that does nothing, so a turn that called it and then wrote a
+    // reply owes the customer nothing the next turn cannot say: no note.
+    test("a silence call before the reply is not an act", async () => {
+      await seedConversation(93155, null);
+      const checkpointer = new MemorySaver();
+      const sent: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () => ({
+          payload: [
+            { id: 1, content: "oi", message_type: 0, private: false },
+            { id: 2, content: "deixa", message_type: 0, private: false },
+          ],
+        }),
+        sendMessage: async (c: number, content: string) => {
+          sent.push([c, content]);
+          return {};
+        },
+      } as unknown as ChatwootClient;
+      let n = 0;
+      const model = {
+        invoke: async () => new AIMessage("Certo."),
+        bindTools: () => ({
+          invoke: async () => {
+            n++;
+            return n === 1
+              ? new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    {
+                      name: "skip_reply",
+                      args: { reason: "acknowledged" },
+                      id: "call_s",
+                    },
+                  ],
+                })
+              : new AIMessage("Certo.");
+          },
+        }),
+      };
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 93155 }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer,
+        },
+      });
+      expect(outcome).toBe("superseded");
+      const channel = await threadChannel(checkpointer, 93155);
+      // NOTE: positive control: the call and its result stayed, so the rollback ran on this turn.
+      expect(channel.map(([type]) => type)).toEqual(["human", "ai", "tool"]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93155 },
+      });
+      const generated = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: { tenantId, conversationId: conv.id, stage: "generate" },
+        select: { detail: true },
+      });
+      expect(JSON.stringify(generated)).not.toContain(
+        "superseded_after_action",
+      );
     });
 
     test("taken-over: a human owning the conversation leaves no reply behind either", async () => {
@@ -7953,6 +9548,66 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(await threadChannel(checkpointer, 93152)).toEqual([
         ["human", "oi"],
       ]);
+    });
+
+    // NOTE: The same refusal on a contact-inbox thread, the production shape: the graph thread and the
+    // conversation's in-flight key differ, and the durable claim on the graph thread is held until the
+    // `finally` releases it. An awaited rollback reads that claim as another invoke and keeps the reply.
+    // The person takes over inside the model's call, past the gate that runs before it.
+    test("taken-over on a contact-inbox thread: the reply leaves that thread too", async () => {
+      const contactInboxId = 7471;
+      await suDb.conversation.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          chatwootConversationId: 93159,
+          contactInboxId,
+          status: "pending",
+          threadId: `${tenantId}:${instanceId}:93159`,
+          lastEventAt: new Date(),
+        },
+      });
+      class TakenOverWhileWriting extends BaseChatModel {
+        _llmType() {
+          return "fake-taken-over-while-writing";
+        }
+        async _generate(): Promise<ChatResult> {
+          await suDb.conversation.updateMany({
+            where: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              chatwootConversationId: 93159,
+            },
+            data: { status: "open", assigneeType: "User", assigneeId: 3 },
+          });
+          return {
+            generations: [{ text: REPLY, message: new AIMessage(REPLY) }],
+          };
+        }
+      }
+      const checkpointer = new MemorySaver();
+      const sent: Array<[number, string]> = [];
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 93159, contactInboxId }),
+        base: appDb,
+        deps: {
+          makeModel: () => new TakenOverWhileWriting({}),
+          makeClient: makeStubClient(sent),
+          checkpointer,
+        },
+      });
+      expect(outcome).toBe("taken-over");
+      expect(sent).toEqual([]);
+      const channel = await threadOf(
+        checkpointer,
+        contactInboxThreadId(tenantId, instanceId, contactInboxId),
+      );
+      // NOTE: positive control: the customer's message is there, so the read found the thread.
+      expect(channel).toContainEqual(["human", "oi"]);
+      expect(channel.filter(([type]) => type === "ai")).toEqual([]);
     });
 
     // The row the PROACTIVE rollback answers the other way, and the reason the reactive plan is not
@@ -8006,6 +9661,297 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       const channel = await threadChannel(checkpointer, 93153);
       expect(channel.map(([type]) => type)).toEqual(["human", "ai", "tool"]);
       expect(JSON.stringify(channel)).not.toContain("Vou te transferir");
+      // A completed transfer told the customer itself and leaves the conversation with a person, so
+      // no turn of ours comes next to need the note, and the operator has nothing to learn.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93153 },
+      });
+      const generated = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          conversationId: conv.id,
+          stage: "generate",
+        },
+        select: { detail: true },
+      });
+      expect(JSON.stringify(generated)).not.toContain(
+        "superseded_after_action",
+      );
+    });
+
+    test("a booking whose confirmation was superseded leaves the note where the confirmation stood", async () => {
+      await seedConversation(93160, null);
+      const checkpointer = new MemorySaver();
+      const sent: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () => ({
+          payload: [
+            { id: 1, content: "oi", message_type: 0, private: false },
+            { id: 2, content: "deixa", message_type: 0, private: false },
+          ],
+        }),
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return {};
+        },
+        assignToAgent: async () => ({}),
+        toggleStatus: async () => ({}),
+        unassignConversation: async () => ({}),
+        getConversation: async () => ({
+          id: 93160,
+          status: "pending",
+          meta: { assignee_type: null, assignee: null },
+        }),
+      } as unknown as ChatwootClient;
+      // The call names a tool the agent does not have, so the graph answers it with an error result.
+      // The rollback judges an act by the call and never by its outcome, so this is the booking.
+      let n = 0;
+      const booksThenConfirms = {
+        invoke: async () => new AIMessage("Agendado para terça às 10h."),
+        bindTools: () => ({
+          invoke: async () => {
+            n++;
+            return n === 1
+              ? new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    { name: "calendar_create_event", args: {}, id: "call_cal" },
+                  ],
+                })
+              : new AIMessage("Agendado para terça às 10h.");
+          },
+        }),
+      };
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 93160 }),
+        base: appDb,
+        deps: {
+          makeModel: () => booksThenConfirms as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer,
+        },
+      });
+      expect(outcome).toBe("superseded");
+      expect(sent).toEqual([]);
+      const channel = await threadChannel(checkpointer, 93160);
+      // And in its place, a note that the act was never reported. Without it the next
+      // turn reads a finished act and assumes it was confirmed.
+      expect(channel).toEqual([
+        ["human", "oi"],
+        ["ai", ""],
+        ["tool", expect.any(String)],
+        ["human", UNDELIVERED_REPLY_NOTE],
+      ]);
+      // Stored WITH an id, so a compaction or a second rollback before the next turn can name it.
+      const stored = (
+        (
+          await buildThreadStateGraph(checkpointer).getState({
+            configurable: { thread_id: `${tenantId}:${instanceId}:93160` },
+          })
+        ).values as { messages: BaseMessage[] }
+      ).messages.at(-1);
+      expect(typeof stored?.id).toBe("string");
+      // The flow log records it at `info`: the next turn tells the customer, so no alert is owed.
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93160 },
+      });
+      const lines = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          conversationId: conv.id,
+          stage: "generate",
+        },
+        select: { level: true, detail: true },
+      });
+      expect(
+        lines.map((r) => ({ level: r.level, detail: r.detail })),
+      ).toContainEqual({
+        level: "info",
+        detail: expect.objectContaining({
+          reason: "superseded_after_action",
+          tools: ["calendar_create_event"],
+        }),
+      });
+      expect(
+        JSON.stringify(lines.filter((r) => r.level === "warn")),
+      ).not.toContain("superseded_after_action");
+
+      // The superseding flush reads the act, then the note, then the newer message, in that order,
+      // and leaves a single note behind once it has answered.
+      const seen: string[][] = [];
+      const recording = {
+        invoke: async () =>
+          new AIMessage("Sua visita está marcada para terça às 10h."),
+        bindTools: () => ({
+          invoke: async (messages: BaseMessage[]) => {
+            seen.push(
+              messages.map((m) =>
+                typeof m.content === "string" ? m.content : "",
+              ),
+            );
+            return new AIMessage("Sua visita está marcada para terça às 10h.");
+          },
+        }),
+      };
+      const next = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({
+          conversationId: 93160,
+          message: {
+            id: 2,
+            content: "deixa",
+            messageType: "incoming",
+            private: false,
+          },
+        }),
+        base: appDb,
+        deps: {
+          makeModel: () => recording as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer,
+        },
+      });
+      expect(next).toBe("posted");
+      const read = seen[0] ?? [];
+      const noteAt = read.indexOf(UNDELIVERED_REPLY_NOTE);
+      expect(noteAt).toBeGreaterThan(-1);
+      expect(read.findIndex((t) => t.includes("deixa"))).toBeGreaterThan(
+        noteAt,
+      );
+      const after = await threadChannel(checkpointer, 93160);
+      expect(
+        after.filter(([, text]) => text === UNDELIVERED_REPLY_NOTE),
+      ).toHaveLength(1);
+    });
+
+    // The same act on a turn nobody superseded: the closing line is the customer's to read, so it
+    // stays, and nothing tells the operator about a reply that was not lost.
+    test("a turn that acted and was not superseded gets no note and no warn", async () => {
+      await seedConversation(93157, null);
+      const checkpointer = new MemorySaver();
+      const sent: Array<[number, string]> = [];
+      const client = {
+        getMessages: async () => ({
+          payload: [{ id: 1, content: "oi", message_type: 0, private: false }],
+        }),
+        sendMessage: async (conversationId: number, content: string) => {
+          sent.push([conversationId, content]);
+          return {};
+        },
+        assignToAgent: async () => ({}),
+        toggleStatus: async () => ({}),
+        unassignConversation: async () => ({}),
+        getConversation: async () => ({
+          id: 93157,
+          status: "pending",
+          meta: { assignee_type: null, assignee: null },
+        }),
+      } as unknown as ChatwootClient;
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 93157 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            new HandoffThenReplyModel(
+              "Vou te transferir.",
+              "cliente quer atendente",
+            ) as unknown as BaseChatModel,
+          makeClient: async () => client,
+          checkpointer,
+        },
+      });
+      expect(outcome).toBe("posted");
+      const channel = await threadChannel(checkpointer, 93157);
+      expect(channel.map(([, text]) => text)).not.toContain(
+        UNDELIVERED_REPLY_NOTE,
+      );
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93157 },
+      });
+      const generated = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          conversationId: conv.id,
+          stage: "generate",
+        },
+        select: { detail: true },
+      });
+      expect(JSON.stringify(generated)).not.toContain(
+        "superseded_after_action",
+      );
+    });
+
+    // A takeover after an act is refused too, and the act stays, but no turn of ours comes next: the
+    // person who took the conversation reads the act in Chatwoot. The call here names a tool the agent
+    // does not have, which the graph answers with an error result; the rollback reads it as an act
+    // all the same, since it judges by name and never by outcome.
+    test("a takeover after an act takes the reply back with no note", async () => {
+      await seedConversation(93156, null);
+      const checkpointer = new MemorySaver();
+      const sent: Array<[number, string]> = [];
+      let n = 0;
+      const actsThenLosesTheConversation = {
+        invoke: async () => new AIMessage("Agendado."),
+        bindTools: () => ({
+          invoke: async () => {
+            n++;
+            if (n === 1)
+              return new AIMessage({
+                content: "",
+                tool_calls: [
+                  { name: "calendar_create_event", args: {}, id: "call_cal" },
+                ],
+              });
+            await suDb.conversation.updateMany({
+              where: {
+                tenantId,
+                chatwootInstanceId: instanceId,
+                chatwootConversationId: 93156,
+              },
+              data: { status: "open", assigneeType: "User", assigneeId: 3 },
+            });
+            return new AIMessage("Agendado.");
+          },
+        }),
+      };
+      const outcome = await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({ conversationId: 93156 }),
+        base: appDb,
+        deps: {
+          makeModel: () =>
+            actsThenLosesTheConversation as unknown as BaseChatModel,
+          makeClient: makeStubClient(sent),
+          checkpointer,
+        },
+      });
+      expect(outcome).toBe("taken-over");
+      const channel = await threadChannel(checkpointer, 93156);
+      expect(channel.map(([type]) => type)).toEqual(["human", "ai", "tool"]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 93156 },
+      });
+      const generated = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: { tenantId, conversationId: conv.id, stage: "generate" },
+        select: { detail: true },
+      });
+      expect(JSON.stringify(generated)).not.toContain(
+        "superseded_after_action",
+      );
     });
 
     // The control the three above cannot give: a turn that was NOT refused keeps its reply, so the
@@ -8349,6 +10295,712 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(attachments).toEqual([]);
     });
 
+    // Factual grounding (docs/factual-grounding.md): the graph reviews the answer that would end the
+    // turn, and the inbox delivers what the action decided. The calculator stands in for a source.
+    describe("factual grounding", () => {
+      const DRAFT = "Deu 3.";
+      const REVISED = "Deu 2.";
+      const CLEAN_GROUNDING = JSON.stringify({
+        violated: false,
+        claims: [],
+        rationale: "",
+      });
+      const flagged = JSON.stringify({
+        violated: true,
+        claims: [{ claim: "deu 3", type: "contradiction", evidence: "2" }],
+        rationale: "r",
+      });
+      // The rewrite is asked of the model without tools, so it arrives through the raw `invoke`.
+      const calcThenAnswer = (rewrite = REVISED) => {
+        let answers = 0;
+        return {
+          async invoke() {
+            return new AIMessage(rewrite);
+          },
+          bindTools() {
+            return {
+              async invoke(msgs: BaseMessage[]) {
+                const sinceHuman = msgs.slice(
+                  msgs.findLastIndex((m) => m.getType() === "human") + 1,
+                );
+                if (!sinceHuman.some((m) => m.getType() === "tool"))
+                  return new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "calculator",
+                        args: { expression: "1+1" },
+                        id: `c${Math.random()}`,
+                      },
+                    ],
+                  });
+                answers += 1;
+                return new AIMessage(answers === 1 ? DRAFT : REVISED);
+              },
+            };
+          },
+        } as unknown as BaseChatModel;
+      };
+      const grounded = (action: string, extra: Record<string, unknown> = {}) =>
+        setGuardrails({
+          enabled: true,
+          provider: "openai",
+          model: GUARD_MODEL,
+          credentialRef: gVaultRef,
+          input: { enabled: false },
+          output: {
+            enabled: false,
+            templateMessage: "TEMPLATE-OUT",
+            handoffMessage: "HANDOFF-OUT",
+          },
+          factualGrounding: {
+            enabled: true,
+            sourceTools: ["calculator"],
+            action,
+            ...extra,
+          },
+        });
+      const turn = async (convId: number, rewrite = REVISED) => {
+        await seedConv(convId);
+        const sent: Array<[number, string]> = [];
+        const notes: Array<[number, string]> = [];
+        const outcome = await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: branchingWith(flagged, calcThenAnswer(rewrite)),
+            makeClient: guardStub(sent, notes),
+            checkpointer: new MemorySaver(),
+          },
+        });
+        return { outcome, sent, notes };
+      };
+
+      beforeAll(async () => {
+        await suDb.agentToolSelection.create({
+          data: {
+            tenantId: gTenantId,
+            agentId: gAgentId,
+            source: "NATIVE",
+            enabledTools: ["calculator", "handoff_to_human"],
+            knowledgeBaseIds: [],
+          },
+        });
+      });
+      // The calculator grant would change what every later test of this agent is offered.
+      afterAll(async () => {
+        await suDb.agentToolSelection.deleteMany({
+          where: { tenantId: gTenantId, agentId: gAgentId, source: "NATIVE" },
+        });
+      });
+
+      test("revise delivers the agent's second answer and posts no note", async () => {
+        await grounded("revise", { reviseWithTools: false });
+        const { outcome, sent, notes } = await turn(1762);
+        expect(outcome).toBe("posted");
+        expect(sent).toEqual([[1762, REVISED]]);
+        expect(notes).toEqual([]);
+      });
+
+      test("a revise whose rewrite is empty sends the Output template, never the refused draft", async () => {
+        await grounded("revise", { reviseWithTools: false });
+        const { sent } = await turn(1765, "");
+        expect(sent).toEqual([[1765, "TEMPLATE-OUT"]]);
+      });
+
+      // The rewrite that consults the source: the draft answers from memory, the rewrite calls
+      // the calculator, and the second review decides what the customer reads.
+      describe("a rewrite that consults the source", () => {
+        const calls: string[] = [];
+        const memoryThenSource = {
+          async invoke() {
+            return new AIMessage("sem ferramentas");
+          },
+          bindTools(tools: Array<{ name: string }>) {
+            return {
+              async invoke(msgs: BaseMessage[]) {
+                const sinceHuman = msgs.slice(
+                  msgs.findLastIndex((m) => m.getType() === "human") + 1,
+                );
+                const revising = sinceHuman.some((m) =>
+                  String(m.content).startsWith(REVISE_NOTE_MARK),
+                );
+                if (!revising) return new AIMessage(DRAFT);
+                if (sinceHuman.some((m) => m.getType() === "tool"))
+                  return new AIMessage(REVISED);
+                calls.push(tools.map((t) => t.name).join(","));
+                return new AIMessage({
+                  content: "",
+                  tool_calls: [
+                    {
+                      name: "calculator",
+                      args: { expression: "1+1" },
+                      id: `c${Math.random()}`,
+                    },
+                  ],
+                });
+              },
+            };
+          },
+        } as unknown as BaseChatModel;
+        const verdicts = (...seq: string[]) => {
+          let i = 0;
+          return (cfg: ResolvedModelConfig): BaseChatModel =>
+            cfg.model === GUARD_MODEL
+              ? guardrailModel(async () => ({
+                  content: seq[Math.min(i++, seq.length - 1)] as string,
+                }))
+              : memoryThenSource;
+        };
+        const sourceTurn = async (convId: number, ...seq: string[]) => {
+          await seedConv(convId);
+          const sent: Array<[number, string]> = [];
+          const notes: Array<[number, string]> = [];
+          calls.length = 0;
+          await runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+            base: appDb,
+            deps: {
+              makeModel: verdicts(...seq),
+              makeClient: guardStub(sent, notes),
+              checkpointer: new MemorySaver(),
+            },
+          });
+          return { sent, notes };
+        };
+
+        test("the rewrite calls the source, and the reply it writes from the result is delivered", async () => {
+          await grounded("revise");
+          const { sent, notes } = await sourceTurn(
+            1781,
+            flagged,
+            CLEAN_GROUNDING,
+          );
+          expect(calls).toEqual(["calculator"]);
+          expect(sent).toEqual([[1781, REVISED]]);
+          expect(notes).toEqual([]);
+        });
+
+        test("a rewrite the second review still flags sends the Output template", async () => {
+          await grounded("revise");
+          const { sent } = await sourceTurn(1782, flagged, flagged);
+          expect(sent).toEqual([[1782, "TEMPLATE-OUT"]]);
+        });
+      });
+
+      test("template replaces the reply with the Output template and leaves a note", async () => {
+        await grounded("template");
+        const { sent, notes } = await turn(1763);
+        expect(sent).toEqual([[1763, "TEMPLATE-OUT"]]);
+        expect(notes[0]?.[1]).toContain("factual_grounding");
+      });
+
+      // The bug it catches: a reply stating an in-scope fact with no tool consulted went out unreviewed,
+      // since only a turn a source answered was reviewed.
+      describe("a reply that consulted nothing", () => {
+        const FACT = "O Camarote Aurora dá acesso ao setor Coral.";
+        const ASK = "Para qual evento é o seu pedido?";
+        const answersDirectly = (text: string) =>
+          ({
+            async invoke() {
+              return new AIMessage(text);
+            },
+            bindTools() {
+              return { invoke: async () => new AIMessage(text) };
+            },
+          }) as unknown as BaseChatModel;
+        const unsourcedTurn = async (
+          convId: number,
+          text: string,
+          verdict: string,
+        ) => {
+          await seedConv(convId);
+          const sent: Array<[number, string]> = [];
+          const notes: Array<[number, string]> = [];
+          const reviewerSystem: string[] = [];
+          await runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+            base: appDb,
+            deps: {
+              makeModel: (cfg: ResolvedModelConfig) =>
+                cfg.model === GUARD_MODEL
+                  ? guardrailModel(async (msgs) => {
+                      reviewerSystem.push(
+                        String((msgs as BaseMessage[])[0]?.content),
+                      );
+                      return { content: verdict };
+                    })
+                  : answersDirectly(text),
+              makeClient: guardStub(sent, notes),
+              checkpointer: new MemorySaver(),
+            },
+          });
+          return { sent, reviewerSystem };
+        };
+
+        test("a fact stated with no source is reviewed as unsourced and caught", async () => {
+          await grounded("template");
+          const { sent, reviewerSystem } = await unsourcedTurn(
+            1771,
+            FACT,
+            flagged,
+          );
+          expect([
+            sent,
+            reviewerSystem.length,
+            reviewerSystem[0]?.includes(GROUNDING_NO_SOURCE_PROMPT),
+          ]).toEqual([[[1771, "TEMPLATE-OUT"]], 1, true]);
+        });
+
+        test("a question to the customer with no source is reviewed and, clean, goes out as written", async () => {
+          await grounded("template");
+          const { sent, reviewerSystem } = await unsourcedTurn(
+            1772,
+            ASK,
+            CLEAN_GROUNDING,
+          );
+          expect([sent, reviewerSystem.length]).toEqual([[[1772, ASK]], 1]);
+        });
+      });
+
+      test("after a completed hand-over the final text is dropped, so it is not reviewed", async () => {
+        await grounded("template");
+        await seedConv(1767);
+        const sent: Array<[number, string]> = [];
+        const toggles: Array<[number, string]> = [];
+        let n = 0;
+        let reviews = 0;
+        const handsOver = {
+          async invoke() {
+            return new AIMessage(DRAFT);
+          },
+          bindTools() {
+            return {
+              async invoke() {
+                n++;
+                if (n === 1)
+                  return new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "calculator",
+                        args: { expression: "1+1" },
+                        id: "g1",
+                      },
+                    ],
+                  });
+                if (n === 2)
+                  return new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "handoff_to_human",
+                        args: { customerMessage: "ATENDENTE-JA-VEM" },
+                        id: "g2",
+                      },
+                    ],
+                  });
+                return new AIMessage(DRAFT);
+              },
+            };
+          },
+        } as unknown as BaseChatModel;
+        await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: 1767, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    reviews++;
+                    return { content: flagged };
+                  })
+                : handsOver,
+            makeClient: guardStub(sent, [], toggles),
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(sent).toEqual([[1767, "ATENDENTE-JA-VEM"]]);
+        expect(reviews).toBe(0);
+      });
+
+      // The case that cost most in production: the second answer, under the customer's pressure,
+      // repeats a source the first turn read, without asking the tool again, and gets it wrong.
+      const fromMemory = async (convId: number, second: string) => {
+        await grounded("template");
+        await seedConv(convId);
+        const sent: Array<[number, string]> = [];
+        const asked: string[] = [];
+        const agent = {
+          async invoke() {
+            return new AIMessage("");
+          },
+          bindTools() {
+            return {
+              async invoke(msgs: BaseMessage[]) {
+                const human = msgs.findLast((m) => m.getType() === "human");
+                if (!contentToText(human?.content ?? "").includes("1+1"))
+                  return new AIMessage(second);
+                const sinceHuman = msgs.slice(
+                  msgs.indexOf(human as BaseMessage),
+                );
+                if (!sinceHuman.some((m) => m.getType() === "tool"))
+                  return new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "calculator",
+                        args: { expression: "1+1" },
+                        id: `m${convId}`,
+                      },
+                    ],
+                  });
+                return new AIMessage("Deu 2.");
+              },
+            };
+          },
+        } as unknown as BaseChatModel;
+        const checkpointer = new MemorySaver();
+        const run = (id: number, content: string) =>
+          runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({
+              conversationId: convId,
+              inboxId: G_INBOX,
+              message: { id, content, messageType: "incoming", private: false },
+            }),
+            base: appDb,
+            deps: {
+              makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+                cfg.model === GUARD_MODEL
+                  ? guardrailModel(async (msgs) => {
+                      const text = contentToText(
+                        (msgs.at(-1)?.content ?? "") as never,
+                      );
+                      asked.push(text);
+                      const reply = text.slice(text.indexOf("<reply>"));
+                      return {
+                        content: reply.includes("3")
+                          ? flagged
+                          : CLEAN_GROUNDING,
+                      };
+                    })
+                  : agent,
+              makeClient: guardStub(sent, []),
+              checkpointer,
+            },
+          });
+        await run(convId * 10 + 1, "quanto é 1+1?");
+        await run(convId * 10 + 2, "tem certeza? achei que dava 3");
+        return { sent, asked };
+      };
+
+      test("an answer from memory that contradicts an earlier turn's source is caught", async () => {
+        const { sent, asked } = await fromMemory(1768, "Isso, deu 3.");
+        expect(sent).toEqual([
+          [1768, "Deu 2."],
+          [1768, "TEMPLATE-OUT"],
+        ]);
+        expect(asked).toHaveLength(2);
+        expect(asked[1]).toContain('turn="earlier" turns_back="1"');
+      });
+
+      test("an answer from memory that agrees with the earlier source goes out as written", async () => {
+        const { sent, asked } = await fromMemory(1769, "Confirmo, deu 2.");
+        expect(sent).toEqual([
+          [1769, "Deu 2."],
+          [1769, "Confirmo, deu 2."],
+        ]);
+        expect(asked[1]).toContain('turn="earlier" turns_back="1"');
+      });
+
+      test("a silent hand-over keeps its silence, and the draft beside it is not reviewed", async () => {
+        await grounded("template");
+        await seedConv(1766);
+        const sent: Array<[number, string]> = [];
+        const toggles: Array<[number, string]> = [];
+        let n = 0;
+        let reviews = 0;
+        const handsOver = {
+          async invoke() {
+            return new AIMessage("");
+          },
+          bindTools() {
+            return {
+              async invoke() {
+                n++;
+                if (n === 1)
+                  return new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "calculator",
+                        args: { expression: "1+1" },
+                        id: "g1",
+                      },
+                    ],
+                  });
+                if (n === 2)
+                  return new AIMessage({
+                    content: DRAFT,
+                    tool_calls: [
+                      {
+                        name: "handoff_to_human",
+                        args: { customerMessage: "" },
+                        id: "g2",
+                      },
+                    ],
+                  });
+                return new AIMessage("");
+              },
+            };
+          },
+        } as unknown as BaseChatModel;
+        await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: 1766, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => {
+                    reviews++;
+                    return { content: flagged };
+                  })
+                : handsOver,
+            makeClient: guardStub(sent, [], toggles),
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(toggles.length).toBeGreaterThan(0);
+        expect(sent).toEqual([]);
+        expect(reviews).toBe(0);
+      });
+
+      test("observe sends the reply as written", async () => {
+        await grounded("observe");
+        const { sent, notes } = await turn(1764);
+        expect(sent).toEqual([[1764, DRAFT]]);
+        expect(notes).toEqual([]);
+      });
+    });
+
+    // The input check reads the conversation's thread as context: the second message is
+    // judged after the first one and the agent's reply to it, and is the only text judged.
+    test("the input check reads the earlier turns of the conversation as context", async () => {
+      await setGuardrails({
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        credentialRef: gVaultRef,
+        input: {
+          enabled: true,
+          action: "template",
+          templateMessage: "TEMPLATE-IN",
+          checks: {
+            toxicity: false,
+            unsafeContent: true,
+            competitorMentions: false,
+          },
+          contextMessages: 4,
+        },
+        output: { enabled: false },
+      });
+      await seedConv(9483);
+      const judged: string[][] = [];
+      const checkpointer = new MemorySaver();
+      const run = (id: number, content: string) =>
+        runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({
+            conversationId: 9483,
+            inboxId: G_INBOX,
+            message: { id, content, messageType: "incoming", private: false },
+          }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async (msgs) => {
+                    judged.push(msgs.map((m) => String(m.content)));
+                    return {
+                      content: JSON.stringify({
+                        violated: false,
+                        categories: [],
+                        rationale: "",
+                        suggestedReply: null,
+                      }),
+                    };
+                  })
+                : new FakeListChatModel({ responses: [REPLY] }),
+            makeClient: guardStub([], []),
+            checkpointer,
+          },
+        });
+      expect(await run(94831, "C1 quero ingresso")).toBe("posted");
+      expect(judged[0]).toHaveLength(2);
+      expect(await run(94832, "C2 sim o vip como")).toBe("posted");
+      const second = judged[1] ?? [];
+      expect(second).toHaveLength(3);
+      expect(second[1]).toMatch(/customer: C1 quero ingresso/);
+      expect(second[1]).toContain(`assistant: ${REPLY}`);
+      expect(second[2]).toBe("C2 sim o vip como");
+    });
+
+    test("a new conversation of the same contact starts with no context from the one before", async () => {
+      await setGuardrails({
+        enabled: true,
+        provider: "openai",
+        model: GUARD_MODEL,
+        credentialRef: gVaultRef,
+        input: {
+          enabled: true,
+          action: "template",
+          templateMessage: "TEMPLATE-IN",
+          checks: {
+            toxicity: false,
+            unsafeContent: true,
+            competitorMentions: false,
+          },
+          contextMessages: 4,
+        },
+        output: { enabled: false },
+      });
+      const contact = await suDb.contact.create({
+        data: {
+          tenantId: gTenantId,
+          chatwootInstanceId: gInstanceId,
+          chatwootContactId: 89484,
+          name: "C",
+        },
+        select: { id: true },
+      });
+      for (const convId of [9484, 9485])
+        await suDb.conversation.create({
+          data: {
+            tenantId: gTenantId,
+            chatwootInstanceId: gInstanceId,
+            chatwootConversationId: convId,
+            contactInboxId: 9484,
+            contactId: contact.id,
+            status: "pending",
+            threadId: `${gTenantId}:${gInstanceId}:${convId}`,
+            lastEventAt: new Date(),
+          },
+        });
+      const judged: string[][] = [];
+      const checkpointer = new MemorySaver();
+      const run = (conversationId: number, id: number, content: string) =>
+        runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({
+            conversationId,
+            inboxId: G_INBOX,
+            contactInboxId: 9484,
+            message: { id, content, messageType: "incoming", private: false },
+          }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async (msgs) => {
+                    judged.push(msgs.map((m) => String(m.content)));
+                    return {
+                      content: JSON.stringify({
+                        violated: false,
+                        categories: [],
+                        rationale: "",
+                        suggestedReply: null,
+                      }),
+                    };
+                  })
+                : new FakeListChatModel({ responses: [REPLY] }),
+            makeClient: guardStub([], []),
+            checkpointer,
+          },
+        });
+      expect(await run(9484, 94841, "C1 da conversa antiga")).toBe("posted");
+      expect(await run(9485, 94851, "C2 da conversa nova")).toBe("posted");
+      expect(judged[1]?.join("\n")).not.toMatch(/conversa antiga/);
+      expect(await run(9485, 94852, "C3 da conversa nova")).toBe("posted");
+      expect(judged[2]?.[1]).toMatch(/customer: C2 da conversa nova/);
+      expect(judged[2]?.[1]).not.toMatch(/conversa antiga/);
+    });
+
+    // The reply the output check sends instead of the model's keeps the escape only when a model wrote
+    // it: the operator's template keeps Chatwoot's Liquid, a generated reply is escaped.
+    for (const [convId, action, expected] of [
+      [9481, "template", "Olá {{contact.name}}"],
+      [9482, "generated", "Gerada {{ '{{' }}foo}}"],
+    ] as const) {
+      test(`output '${action}': the replacement goes out as ${action === "template" ? "the operator wrote it" : "escaped model text"}`, async () => {
+        await setGuardrails({
+          enabled: true,
+          provider: "openai",
+          model: GUARD_MODEL,
+          credentialRef: gVaultRef,
+          input: { enabled: false },
+          output: {
+            enabled: true,
+            action,
+            checks: {
+              toxicity: true,
+              unsafeContent: false,
+              competitorMentions: false,
+              promptAdherence: false,
+            },
+            templateMessage: "Olá {{contact.name}}",
+          },
+        });
+        await seedConv(convId);
+        const sent: Array<[number, string]> = [];
+        const verdict = JSON.stringify({
+          violated: true,
+          categories: ["toxicity"],
+          rationale: "x",
+          suggestedReply: "Gerada {{foo}}",
+        });
+        await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => ({ content: verdict }))
+                : (new FakeListChatModel({
+                    responses: ["resposta {{contact.email}}"],
+                  }) as unknown as BaseChatModel),
+            makeClient: guardStub(sent, [], [], []),
+            checkpointer: new MemorySaver(),
+          },
+        });
+        expect(sent).toEqual([[convId, expected]]);
+      });
+    }
+
     // The recovered text is what the guardrail screened, and the customer got the safe reply
     // instead, so nothing on the log says a recovered reply was delivered.
     test("a recovered reply the output guardrail replaced is not logged as recovered", async () => {
@@ -8400,8 +11052,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       });
       expect(outcome).toBe("posted");
       expect(sent).toEqual([[9471, "GEN-OUT-REPLY"]]);
-      await new Promise((r) => setTimeout(r, 300));
+      // Every line the turn scheduled has landed, so a missing one was never written.
+      await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId: gTenantId,
           stage: "generate",
@@ -8551,8 +11205,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([]);
     });
 
-    // Issue #315, the fourth refusal. A suppressed reply is the one case where keeping the text has
-    // an argument — the operator gets a private note either way, so the record is not lost. It still
+    // NOTE: A suppressed reply is the one case where keeping the text has an argument (the operator
+    // gets a private note either way, so the record is not lost). It still
     // comes out: the note is where the record belongs, and the thread is where the model READS. Left
     // in, the sentence a judge just refused to let out travels in every prompt of this attendance,
     // and the next turn treats it as something the customer was told.
@@ -8610,16 +11264,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ).toEqual([["human", "oi"]]);
     });
 
-    // On the INPUT direction there is no assistant reply to rewrite — the analyzed text is the
-    // CUSTOMER's own message — so `generated` has nothing to repair and the model composes from an
-    // empty desk: no agent prompt, no knowledge base, no account data (`runGuardrail` passes
-    // systemPrompt and customerMessage as undefined for input). Measured live, 32 runs per case:
-    // against gpt-5.4-mini it wrote in the CUSTOMER's voice 18/32 (the bot posting the customer's
-    // own complaint back at them) and named an operator-banned competitor 14/32. Worse on
-    // gpt-4o-mini, where the customer's message could DICTATE the reply: one instructing the
-    // reviewer to state a price and a partnership produced exactly that, verbatim, 16/16.
-    // So the replacement is dropped and the configured template goes out, exactly as
-    // answer_relevance already does for the same reason (issues #95, #99).
+    // NOTE: On the INPUT direction the analyzed text is the CUSTOMER's own message, so `generated`
+    // has nothing to repair and the model composes from an empty desk (`runGuardrail` passes no
+    // system prompt or customer message for input): it writes in the customer's voice, names banned
+    // competitors, and can be dictated to by the message itself. So the replacement is dropped and
+    // the configured template goes out, as answer_relevance does for the same reason.
     test("input 'generated' → sends the template, never a composed reply", async () => {
       await setGuardrails({
         enabled: true,
@@ -8704,7 +11353,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         rationale: "abuse",
         suggestedReply: "GEN-IN-REPLY",
       });
-      // NOTE: A newer customer message (id 2) landed while the guardrail was screening id 1.
+      // A newer customer message (id 2) landed while the guardrail was screening id 1.
       const client = {
         getMessages: async () => ({
           payload: [
@@ -8842,10 +11491,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(notes[0]?.[1]).toContain("— template.");
     });
 
-    // #160: the handoff's closing line is customer-facing text the MODEL wrote, so the output policy
-    // owns it exactly like any other reply. Today the tool posts it from inside the tool call, before
-    // the turn has a reply to moderate, so the most rule-bound message is the only unscreened one.
-    // The promise guard on the delivery unit, which only shows itself when a judge is configured:
+    // NOTE: The promise guard on the delivery unit, which only shows itself when a judge is configured:
     // `customerMessage` starts as null, so on a turn with no transfer the screening would be asked
     // about NOTHING — and a `violated` verdict on nothing composes a replacement, which the unit
     // then delivers. The customer reads an unprompted template on a turn that promised them
@@ -8907,6 +11553,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ).toBe(1);
     });
 
+    // NOTE: The handoff's closing line is customer-facing text the MODEL wrote, so the output policy
+    // owns it exactly like any other reply.
     test("a handoff's closing line is screened by the output guardrail", async () => {
       await setGuardrails({
         enabled: true,
@@ -8955,8 +11603,8 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         },
       });
       expect(outcome).toBe("posted");
-      // The customer reads the screened line, once. The model's own final text is still discarded
-      // (that is #158) and the raw closing line never reaches Chatwoot.
+      // NOTE: The customer reads the screened line, once. The model's own final text is still
+      // discarded as a duplicate, and the raw closing line never reaches Chatwoot.
       expect(sent).toEqual([[956, "GEN-HANDOFF-LINE"]]);
       // The transfer is not hostage to the moderation: it happened either way.
       expect(toggles).toEqual([[956, "open"]]);
@@ -9133,11 +11781,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(toggles).toEqual([]);
     });
 
-    // The SHIPPED DEFAULT is the broken case: provider "openai" with an empty model is what the
+    // NOTE: The SHIPPED DEFAULT is the broken case: provider "openai" with an empty model is what the
     // editor persists when the operator enables guardrails and never opens the provider select (the
     // per-provider default is applied only on that select's change), while the model field shows a
-    // model name it never saved. Measured on the dependency we ship: `new ChatOpenAI({ model: "" })`
-    // puts `model: ""` on the wire verbatim, so the provider refuses the call and `analyzeGuardrail`
+    // model name it never saved. The shipped `new ChatOpenAI({ model: "" })` puts `model: ""` on the
+    // wire verbatim, so the provider refuses the call and `analyzeGuardrail`
     // fails open. What the operator sees is a guardrail that is on and never trips.
     test("an enabled guardrail with no model configured still screens the reply", async () => {
       await setGuardrails({
@@ -9195,12 +11843,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([[951, "TEMPLATE-NO-MODEL"]]);
     });
 
-    // Fail-open stays fail-open: a guardrail that cannot run must never cost the customer the reply.
-    // But it also must not be indistinguishable from a guardrail that ran and approved, or an
-    // Which shape the call takes is decided from the guardrail's PROVIDER, and this is the only
-    // place that decision becomes an actual request. Asserting it on the table alone would leave
-    // the wiring untested, which is how a provider ends up correctly classified and still asked the
-    // wrong way — the classification is one call away from the runtime, and nothing else reads it.
+    // NOTE: Which shape the call takes is decided from the guardrail's PROVIDER, and this is the only
+    // place that decision becomes an actual request. Asserting it on the table alone would leave the
+    // wiring untested: a provider correctly classified and still asked the wrong way.
     describe("the provider decides how the verdict is asked for", () => {
       const shapes = [
         // Constrained, in the dialect this endpoint speaks.
@@ -9287,8 +11932,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       }
     });
 
-    // operator whose credential expired reads "no violations" forever. Same argument that put
-    // `retriedEmptyResponse` in the trail on #63.
+    // NOTE: Fail-open stays fail-open: a guardrail that cannot run must never cost the customer the
+    // reply. But it also must not be indistinguishable from a guardrail that ran and approved, or an
+    // operator whose credential expired reads "no violations" forever.
     test("a guardrail that cannot run is reported on the screen that enabled it", async () => {
       await setGuardrails({
         enabled: true,
@@ -9333,11 +11979,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       // The customer still gets answered: moderation failing is not the customer's problem.
       expect(sent).toEqual([[952, REPLY]]);
 
-      // ...and the console says so where the feature was turned on. The chain under test is the
-      // whole one: the vendor refuses the call, the turn records a guardrail failure, the health
-      // read counts it, and the editor's configuration-warning panel raises a line for it. Ending
-      // at the log row instead would assert a proxy: that row already existed and the operator
-      // still had no way to learn the screen was dead from the screen that switched it on.
+      // ...and the console says so where the feature was turned on. The chain under test is
+      // the whole one: the vendor refuses the call, the turn records a guardrail failure, the health
+      // read counts it, and the editor's configuration-warning panel raises a line for it. Ending at
+      // the log row would assert a proxy: the operator learns nothing from a row alone.
       // emitFlowEvent is fire-and-forget, so poll briefly.
       const ctx: TenantContext = {
         tenantId: gTenantId,
@@ -9346,10 +11991,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       };
       const since = new Date(Date.now() - 3_600_000);
       let health = { failures: 0, lastAt: null as string | null };
-      for (let i = 0; i < 30 && health.failures === 0; i++) {
+      await until("the guardrail failure count", async () => {
         health = await readGuardrailHealth(ctx, gAgentId, since, appDb);
-        if (health.failures === 0) await new Promise((r) => setTimeout(r, 100));
-      }
+        return health.failures > 0 || null;
+      });
       expect(health.failures).toBeGreaterThan(0);
       expect(
         computeConfigIssues({
@@ -9670,11 +12315,10 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(sent).toEqual([[963, REPLY]]);
     });
 
-    // The reason answer_relevance gets its own model call. Measured live against gpt-5.4-mini, with
-    // both checks in one call: a reply naming nobody was flagged competitor_mention in 11 of 16 runs
-    // because the CUSTOMER had named a competitor, and in 0 of 16 with the message absent. The
-    // reviewer below is that behaviour made deterministic: it flags whenever the competitor's name
-    // appears in the material it was handed, which is what a real one does often enough to matter.
+    // NOTE: The reason answer_relevance gets its own model call: with both checks in one call, a
+    // real reviewer often flags competitor_mention on a clean reply because the CUSTOMER named a
+    // competitor. The reviewer below makes that deterministic: it flags whenever the competitor's
+    // name appears in the material it was handed.
     test("a competitor named by the customer no longer replaces a clean reply", async () => {
       await setGuardrails({
         enabled: true,
@@ -9751,13 +12395,11 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       ).toEqual([]);
     });
 
-    // The other half of the split. Taking the policies off the relevance call is what stops the
-    // customer's words from tripping them, and it also takes away the rules a replacement would have
-    // to obey. Handing them back as writing guidance was tried and measured: 5 of 10 replacements
-    // still named a competitor the operator had banned, in the same breath as being told never to.
-    // Worse, a relevance violation has NOTHING to rewrite, so the model invents the answer: 3 of
-    // those 10 stated a commercial fact it could not know. So this half never proposes a
-    // replacement, and the configured template goes out instead.
+    // NOTE: The other half of the split. Taking the policies off the relevance call also takes away
+    // the rules a replacement would have to obey, and handing them back as writing guidance does not
+    // hold (replacements still name banned competitors). A relevance violation also has NOTHING to
+    // rewrite, so a model would invent the answer. So this half never proposes a replacement, and
+    // the configured template goes out instead.
     test("a relevance trip sends the template, never a replacement it invented", async () => {
       await setGuardrails({
         enabled: true,
@@ -9820,7 +12462,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(outcome).toBe("posted");
       expect(sent).toEqual([[965, "TEMPLATE-RELEVANCE"]]);
     });
-    // ISSUE #704: the `handoff` action. The refused text does not go out, the conversation goes to
+    // NOTE: The `handoff` action. The refused text does not go out, the conversation goes to
     // the team through the agent's own handoff target, and the customer reads the hand-over line
     // (or nothing, when the operator left it empty). The note is what the person taking over reads.
     describe("the 'handoff' action", () => {
@@ -9866,11 +12508,13 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         dir: "input" | "output",
         extra: { [k: string]: JsonValue },
         handoff: { [k: string]: JsonValue } = { mode: "route" },
+        more: { [k: string]: JsonValue } = {},
       ) =>
         suDb.agent.update({
           where: { id: gAgentId },
           data: {
             settings: {
+              ...more,
               split: { enabled: false },
               handoff,
               guardrails: {
@@ -9942,10 +12586,254 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         expect(note).toContain(REPLY);
       });
 
+      // The transfer flips the conversation to `open`, and the newer message's gate exit that this
+      // causes dispenses the burst before the hand-over line is sent: the line still goes out.
+      for (const dir of ["input", "output"] as const) {
+        test(`the ${dir} hand-over line goes out when a gate exit dispensed the burst under the transfer`, async () => {
+          await configure(dir, {
+            action: "handoff",
+            handoffMessage: "ENCAMINHADO",
+          });
+          const convId = dir === "input" ? 7814 : 7815;
+          const { id: convDbId } = await seedConv(convId);
+          const log = newLog();
+          const base = await handoffStub(log)();
+          const client = {
+            ...base,
+            toggleStatus: async (
+              c: number,
+              status: "open" | "pending" | "resolved",
+            ) => {
+              await advanceHandledWatermark({
+                tenantId: gTenantId,
+                conversationDbId: convDbId,
+                toMessageId: 2,
+                dispensed: { kind: "range", afterMessageId: null },
+                base: appDb,
+              });
+              return base.toggleStatus(c, status);
+            },
+          } as unknown as ChatwootClient;
+          await runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+            base: appDb,
+            deps: {
+              makeModel: branchingModel(TRIP),
+              makeClient: async () => client,
+              checkpointer: new MemorySaver(),
+            },
+          });
+          expect(log.toggles).toEqual([[convId, "open"]]);
+          expect(log.sent).toEqual([[convId, "ENCAMINHADO"]]);
+        });
+      }
+
+      // A tool that writes to the customer from inside its call (the case opening) is screened by
+      // the turn's own output gate, which the runtime hands to the toolset as `screenCustomerText`.
+      // The model below asks it mid-invoke, where the tool does, and then answers normally.
+      const screenedMidTurn = async (
+        convId: number,
+        verdictJson: string,
+        log: ReturnType<typeof newLog>,
+        client: () => Promise<ChatwootClient> = handoffStub(log),
+        next: AIMessage[] = [],
+      ) => {
+        const build = spyOn(nativeTools, "buildNativeTools");
+        let verdict: string | undefined;
+        const asksMidTurn = {
+          invoke: async () => new AIMessage(""),
+          bindTools: () => ({
+            invoke: async () => {
+              if (verdict === undefined) {
+                const screen = build.mock.calls.at(-1)?.[0].screenCustomerText;
+                verdict = screen
+                  ? await screen("Abrimos seu caso.")
+                  : "not handed down";
+              }
+              return next.shift() ?? new AIMessage(REPLY);
+            },
+          }),
+        };
+        try {
+          await seedConv(convId);
+          // The turn's own reply trips the gate too, and a transfer that fails there makes the turn
+          // throw; the verdict the tool got is what is under test.
+          const outcome = await runAgentTurn({
+            tenantId: gTenantId,
+            instanceId: gInstanceId,
+            agentBotId: G_BOT,
+            event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+            base: appDb,
+            deps: {
+              makeModel: branchingWith(
+                verdictJson,
+                asksMidTurn as unknown as BaseChatModel,
+              ),
+              makeClient: client,
+              checkpointer: new MemorySaver(),
+            },
+          }).catch((err: unknown) => err);
+          return { verdict, outcome };
+        } finally {
+          build.mockRestore();
+        }
+      };
+      const PASS = JSON.stringify({
+        violated: false,
+        categories: [],
+        rationale: "",
+      });
+
+      test("a tool's text the gate passes is sent", async () => {
+        await configure("output", {
+          action: "handoff",
+          handoffMessage: "ENCAMINHADO",
+        });
+        const log = newLog();
+        const { verdict } = await screenedMidTurn(7351, PASS, log);
+        expect(verdict).toBe("send");
+        expect(log.toggles).toEqual([]);
+      });
+
+      test("a tool's text the gate refuses without a transfer is dropped", async () => {
+        await configure("output", { action: "template" });
+        const log = newLog();
+        const { verdict } = await screenedMidTurn(7352, TRIP, log);
+        expect(verdict).toBe("drop");
+        expect(log.toggles).toEqual([]);
+      });
+
+      test("a tool's text the gate sends to the team transfers the turn, which closes on the policy's line", async () => {
+        await configure(
+          "output",
+          { action: "handoff", handoffMessage: "ENCAMINHADO" },
+          { mode: "pinned", targetTeamId: TEAM },
+        );
+        const log = newLog();
+        const { verdict } = await screenedMidTurn(7353, TRIP, log);
+        expect(verdict).toBe("handed");
+        expect(log.toggles).toEqual([[7353, "open"]]);
+        expect(log.assigns).toEqual([`team:7353:${TEAM}`]);
+        // The model's own reply after the transfer is not what the customer reads.
+        expect(log.sent).toEqual([[7353, "ENCAMINHADO"]]);
+      });
+
+      test("a tool's text handed over with an empty line leaves the customer unwritten", async () => {
+        await configure("output", { action: "handoff", handoffMessage: "" });
+        const log = newLog();
+        const { verdict } = await screenedMidTurn(7354, TRIP, log);
+        expect(verdict).toBe("handed");
+        expect(log.toggles).toEqual([[7354, "open"]]);
+        expect(log.sent).toEqual([]);
+      });
+
+      // A transfer that did not land is not a dropped line: the tool must not open the case (nor
+      // close the origin) as if a person had been asked for.
+      test("a tool's text whose transfer fails reads as failed, not dropped", async () => {
+        await configure("output", {
+          action: "handoff",
+          handoffMessage: "ENCAMINHADO",
+        });
+        const log = newLog();
+        const failing = async () =>
+          ({
+            ...(await handoffStub(log)()),
+            toggleStatus: async () => {
+              throw new Error("chatwoot 500");
+            },
+          }) as unknown as ChatwootClient;
+        const { verdict, outcome } = await screenedMidTurn(
+          7355,
+          TRIP,
+          log,
+          failing,
+        );
+        expect(verdict).toBe("failed");
+        expect(outcome).toBeInstanceOf(GuardrailHandoffFailedError);
+      });
+
+      // A failed transfer ends the turn in a throw, after the closing block: it is retried or lost,
+      // so the turn-errors message, which only a turn that returned posts, says nothing.
+      test("a failed transfer posts no turn-errors message", async () => {
+        await configure(
+          "output",
+          { action: "handoff", handoffMessage: "ENCAMINHADO" },
+          { mode: "route" },
+          { conversationNotes: { errors: "note" } },
+        );
+        const log = newLog();
+        const failing = async () =>
+          ({
+            ...(await handoffStub(log)()),
+            getMessages: async () => ({ payload: [] }),
+            toggleStatus: async () => {
+              throw new Error("chatwoot 500");
+            },
+          }) as unknown as ChatwootClient;
+        const { outcome } = await screenedMidTurn(7391, TRIP, log, failing);
+        expect(outcome).toBeInstanceOf(GuardrailHandoffFailedError);
+        expect(
+          [...log.sent, ...log.notes].filter(([, t]) =>
+            t.startsWith("Erros neste turno"),
+          ),
+        ).toEqual([]);
+      });
+
+      // The transfer is the turn's own: its status webhook, mirrored at once here, is not a person
+      // taking over, so the turn's next tool call still runs.
+      test("after a tool's text is handed over, the turn's next tool call still runs", async () => {
+        await configure("output", {
+          action: "handoff",
+          handoffMessage: "ENCAMINHADO",
+        });
+        const log = newLog();
+        const labelled: string[][] = [];
+        const mirrored = async () =>
+          ({
+            ...(await handoffStub(log)()),
+            toggleStatus: async (c: number, status: string) => {
+              log.toggles.push([c, status]);
+              await suDb.conversation.updateMany({
+                where: {
+                  tenantId: gTenantId,
+                  chatwootInstanceId: gInstanceId,
+                  chatwootConversationId: c,
+                },
+                data: { status },
+              });
+              return {};
+            },
+            getConversationLabels: async () => [],
+            setConversationLabels: async (_c: number, next: string[]) => {
+              labelled.push(next);
+              return {};
+            },
+          }) as unknown as ChatwootClient;
+        const { verdict } = await screenedMidTurn(7356, TRIP, log, mirrored, [
+          new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                name: "set_labels",
+                args: { add: ["caso-aberto"] },
+                id: "call_case_label",
+              },
+            ],
+          }),
+        ]);
+        expect(verdict).toBe("handed");
+        expect(log.toggles).toEqual([[7356, "open"]]);
+        expect(labelled).toEqual([["caso-aberto"]]);
+      });
+
       test("an empty hand-over line hands over without writing to the customer", async () => {
         await configure("output", { action: "handoff", handoffMessage: "" });
         await seedConv(7042);
         const log = newLog();
+        const saver = new MemorySaver();
         const outcome = await runAgentTurn({
           tenantId: gTenantId,
           instanceId: gInstanceId,
@@ -9955,7 +12843,7 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
           deps: {
             makeModel: branchingModel(TRIP),
             makeClient: handoffStub(log),
-            checkpointer: new MemorySaver(),
+            checkpointer: saver,
           },
         });
         // Settled, like a suppression: the operator's policy answered this message, and recovery
@@ -9963,9 +12851,18 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         expect(outcome).toBe("blocked");
         expect(log.sent).toEqual([]);
         expect(log.toggles).toEqual([[7042, "open"]]);
+        // The refused reply leaves the thread: the transfer landed, but the customer read none of it.
+        expect(
+          (
+            await threadChannel(saver, 7042, {
+              tenantId: gTenantId,
+              instanceId: gInstanceId,
+            })
+          ).filter(([type]) => type === "ai"),
+        ).toEqual([]);
         // `route` mode: Chatwoot's own routing, nothing assigned from here.
         expect(log.assigns).toEqual([]);
-        // The skip hand-over (#659) must not add a second note on top of this one.
+        // NOTE: The skip hand-over must not add a second note on top of this one.
         expect(log.notes).toHaveLength(1);
         // Nothing was sent, so nothing claims the burst as answered: the reply claim is permanent,
         // and a re-engage after the conversation comes back must still be able to answer it.
@@ -10354,11 +13251,555 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
         expect(log.notes).toEqual([]);
       });
     });
+
+    // The operator's endpoint (docs/guardrails-external.md): asked after the built-in output screening, on the reply
+    // that would go out, and its answer applied the way a trip is.
+    describe("external check", () => {
+      const EXT_URL = "https://check.example.com/hook";
+      type Asked = { body: Record<string, unknown>; headers: Headers };
+
+      // An endpoint that answers by script and records what it was asked. `answer` sees the request
+      // body, so it can echo the candidate id the way a real endpoint has to.
+      const endpoint = (
+        asked: Asked[],
+        answer: (body: Record<string, unknown>) => Response | Promise<Response>,
+      ) => ({
+        assertSafe: async (u: string) => new URL(u),
+        fetchImpl: (async (_u: string, init: RequestInit) => {
+          const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+          asked.push({ body, headers: new Headers(init.headers) });
+          return answer(body);
+        }) as unknown as typeof fetch,
+      });
+      const json = (v: unknown, status = 200) =>
+        new Response(JSON.stringify(v), { status });
+
+      const withExternal = async (
+        output: { [k: string]: JsonValue },
+        extra: { [k: string]: JsonValue } = {},
+      ) => {
+        const secret = await suDb.vaultEntry.create({
+          data: {
+            tenantId: gTenantId,
+            name: `ext-secret-${Math.random()}`,
+            secret: encryptJson("s3gr3d0"),
+          },
+          select: { id: true },
+        });
+        await setGuardrails({
+          enabled: true,
+          provider: "openai",
+          model: GUARD_MODEL,
+          credentialRef: gVaultRef,
+          input: { enabled: false },
+          output: {
+            enabled: true,
+            checks: {
+              toxicity: true,
+              unsafeContent: false,
+              competitorMentions: false,
+              promptAdherence: false,
+            },
+            templateMessage: "TEMPLATE-OUT",
+            handoffMessage: "HANDOFF-OUT",
+            ...output,
+          },
+          external: { url: EXT_URL, credentialRef: `vault:${secret.id}` },
+          ...extra,
+        });
+      };
+      const clean = JSON.stringify({ violated: false, categories: [] });
+
+      const turn = (
+        convId: number,
+        sent: Array<[number, string]>,
+        notes: Array<[number, string]>,
+        toggles: Array<[number, string]>,
+        externalCheck: ReturnType<typeof endpoint>,
+      ) =>
+        runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: convId, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: branchingModel(clean),
+            makeClient: guardStub(sent, notes, toggles),
+            checkpointer: new MemorySaver(),
+            externalCheck,
+          },
+        });
+
+      // The bug it catches: a request the endpoint cannot tie to the turn or verify, or that judges
+      // something other than the reply about to go out.
+      test("allow: the reply goes out, and the request is signed and names the turn", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14101);
+        const [sent, notes, toggles, asked] = [[], [], [], []] as [
+          Array<[number, string]>,
+          Array<[number, string]>,
+          Array<[number, string]>,
+          Asked[],
+        ];
+        const outcome = await turn(
+          14101,
+          sent,
+          notes,
+          toggles,
+          endpoint(asked, (b) =>
+            json({ decision: "allow", candidateId: b.candidateId }),
+          ),
+        );
+        expect(outcome).toBe("posted");
+        expect(sent).toEqual([[14101, REPLY]]);
+        expect(notes).toEqual([]);
+        expect(asked).toHaveLength(1);
+        const { body, headers } = asked[0] as Asked;
+        expect(body).toMatchObject({
+          type: "guardrail.output",
+          tenantId: String(gTenantId),
+          agentId: String(gAgentId),
+          chatwootConversationId: 14101,
+          customerMessage: "oi",
+          candidate: { text: REPLY, model: "primary" },
+          toolCalls: [],
+        });
+        expect(typeof body.turnId).toBe("string");
+        expect(typeof body.conversationId).toBe("string");
+        const ts = Number(headers.get("x-fazerai-timestamp"));
+        expect(
+          verifyOutboundSignature(
+            "s3gr3d0",
+            ts,
+            JSON.stringify(body),
+            headers.get("x-fazerai-signature") ?? "",
+          ),
+        ).toBe(true);
+      });
+
+      // The bug it catches: the endpoint's text sent raw (Liquid runs on it) or not at all.
+      test("replace: the endpoint's text goes out instead, escaped like a model's", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14102);
+        const sent: Array<[number, string]> = [];
+        const notes: Array<[number, string]> = [];
+        const outcome = await turn(
+          14102,
+          sent,
+          notes,
+          [],
+          endpoint([], (b) =>
+            json({
+              decision: "replace",
+              candidateId: b.candidateId,
+              text: "Atendemos {{x}}",
+            }),
+          ),
+        );
+        expect(outcome).toBe("posted");
+        expect(sent).toEqual([[14102, "Atendemos {{ '{{' }}x}}"]]);
+        expect(notes[0]?.[1]).toContain("Verificação externa (output)");
+      });
+
+      // The bug it catches: a block that delivers the reply, or fires an action the operator did not
+      // configure, or leaves no note saying why.
+      for (const [convId, action, expectSent, expectToggle] of [
+        [14103, "template", [[14103, "TEMPLATE-OUT"]], []],
+        [14104, "silent", [], []],
+        [14105, "handoff", [[14105, "HANDOFF-OUT"]], [[14105, "open"]]],
+        [14106, "generated", [[14106, "TEMPLATE-OUT"]], []],
+      ] as const) {
+        test(`block with ${action}: the output action fires and the note carries the reason`, async () => {
+          await withExternal({ action });
+          await seedConv(convId);
+          const sent: Array<[number, string]> = [];
+          const notes: Array<[number, string]> = [];
+          const toggles: Array<[number, string]> = [];
+          await turn(
+            convId,
+            sent,
+            notes,
+            toggles,
+            endpoint([], (b) =>
+              json({
+                decision: "block",
+                candidateId: b.candidateId,
+                reason: "MOTIVO-X",
+              }),
+            ),
+          );
+          expect(sent).toEqual(
+            expectSent as unknown as Array<[number, string]>,
+          );
+          expect(toggles).toEqual(
+            expectToggle as unknown as Array<[number, string]>,
+          );
+          expect(notes.some(([, n]) => n.includes("MOTIVO-X"))).toBe(true);
+        });
+      }
+
+      // The bug it catches: a failed check treated as a block, or ignoring onFailure.
+      test("a non-2xx passes under pass and holds under hold", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14107);
+        const sentPass: Array<[number, string]> = [];
+        await turn(
+          14107,
+          sentPass,
+          [],
+          [],
+          endpoint([], () => json({ decision: "block" }, 500)),
+        );
+        expect(sentPass).toEqual([[14107, REPLY]]);
+
+        await withExternal({ action: "template" }, { onFailure: "hold" });
+        await seedConv(14108);
+        const sentHold: Array<[number, string]> = [];
+        const notes: Array<[number, string]> = [];
+        const toggles: Array<[number, string]> = [];
+        await turn(
+          14108,
+          sentHold,
+          notes,
+          toggles,
+          endpoint([], () => json({ decision: "allow" }, 503)),
+        );
+        expect(sentHold).toEqual([[14108, "HANDOFF-OUT"]]);
+        expect(toggles).toEqual([[14108, "open"]]);
+        expect(notes[0]?.[1]).toContain("respondeu com erro HTTP (503)");
+      });
+
+      // The bug it catches: an answer for another candidate (a replayed or misrouted one) obeyed.
+      test("an answer that does not echo the candidate id follows onFailure", async () => {
+        await withExternal({ action: "template" }, { onFailure: "hold" });
+        await seedConv(14109);
+        const sent: Array<[number, string]> = [];
+        await turn(
+          14109,
+          sent,
+          [],
+          [],
+          endpoint([], () => json({ decision: "allow", candidateId: "other" })),
+        );
+        expect(sent).toEqual([[14109, "HANDOFF-OUT"]]);
+      });
+
+      // The bug it catches: a reply delivered after a person took the conversation over while the
+      // endpoint was thinking.
+      test("a person who takes the conversation over during the wait wins", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14110);
+        const sent: Array<[number, string]> = [];
+        const outcome = await turn(
+          14110,
+          sent,
+          [],
+          [],
+          endpoint([], async (b) => {
+            await suDb.conversation.updateMany({
+              where: { tenantId: gTenantId, chatwootConversationId: 14110 },
+              data: { assigneeType: "User", assigneeId: 77, status: "open" },
+            });
+            return json({ decision: "allow", candidateId: b.candidateId });
+          }),
+        );
+        expect(outcome).toBe("taken-over");
+        expect(sent).toEqual([]);
+      });
+
+      // The bug it catches: the closing line the model writes when it hands over reaching the customer
+      // with no question asked.
+      test("a hand-over's closing line is asked about, and a block replaces it", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14114);
+        const sent: Array<[number, string]> = [];
+        const toggles: Array<[number, string]> = [];
+        const asked: Asked[] = [];
+        class HandsOver {
+          bindTools(_t: unknown) {
+            let n = 0;
+            return {
+              async invoke() {
+                n++;
+                return n === 1
+                  ? new AIMessage({
+                      content: "",
+                      tool_calls: [
+                        {
+                          name: "handoff_to_human",
+                          args: { customerMessage: "DESPEDIDA-1514" },
+                          id: "h1",
+                        },
+                      ],
+                    })
+                  : new AIMessage("");
+              },
+            };
+          }
+          async invoke() {
+            return new AIMessage("");
+          }
+        }
+        await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: 14114, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: branchingWith(
+              clean,
+              new HandsOver() as unknown as BaseChatModel,
+            ),
+            makeClient: guardStub(sent, [], toggles),
+            checkpointer: new MemorySaver(),
+            externalCheck: endpoint(asked, (b) =>
+              json({ decision: "block", candidateId: b.candidateId }),
+            ),
+          },
+        });
+        expect(
+          asked.map((x) => (x.body.candidate as { text: string }).text),
+        ).toEqual(["DESPEDIDA-1514"]);
+        expect(sent).toEqual([[14114, "TEMPLATE-OUT"]]);
+        expect(toggles).toEqual([[14114, "open"]]);
+      });
+
+      // The bug it catches: a reply that is only a file (an image with its caption) going out with no
+      // question asked, past a block.
+      test("a reply that is only an image is asked about too, and a block keeps it", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14113);
+        const sent: Array<[number, string]> = [];
+        const attachments: Array<[number, string]> = [];
+        const asked: Asked[] = [];
+        await runAgentTurn({
+          tenantId: gTenantId,
+          instanceId: gInstanceId,
+          agentBotId: G_BOT,
+          event: incoming({ conversationId: 14113, inboxId: G_INBOX }),
+          base: appDb,
+          deps: {
+            makeModel: (cfg: ResolvedModelConfig): BaseChatModel =>
+              cfg.model === GUARD_MODEL
+                ? guardrailModel(async () => ({ content: clean }))
+                : (new SendImageThenReplyModel(
+                    "",
+                    IMG_URL,
+                    "LEGENDA-1514",
+                  ) as unknown as BaseChatModel),
+            makeClient: guardStub(sent, [], [], attachments),
+            checkpointer: new MemorySaver(),
+            imageDeps,
+            externalCheck: endpoint(asked, (b) =>
+              json({ decision: "block", candidateId: b.candidateId }),
+            ),
+          },
+        });
+        expect(asked).toHaveLength(1);
+        expect(asked[0]?.body.candidate).toMatchObject({
+          text: "",
+          attachments: [{ kind: "image", caption: "LEGENDA-1514" }],
+        });
+        expect(attachments).toEqual([]);
+        expect(sent).toEqual([[14113, "TEMPLATE-OUT"]]);
+      });
+
+      // The bug it catches: a reply the fallback wrote reported to the endpoint as the primary's.
+      test("a reply the fallback model wrote says so in the request", async () => {
+        await withExternal({ action: "template" });
+        await seedConv(14112);
+        const asked: Asked[] = [];
+        const real = prepare.buildModelAndGraph;
+        const build = spyOn(prepare, "buildModelAndGraph").mockImplementation(
+          async (loaded, tools, deps) => {
+            // The graph switched models before answering: the callback the runtime hands it fires.
+            deps?.onModelFallback?.({
+              provider: "openai",
+              model: "fallback-model",
+              reason: "primary_error",
+              failure: "server",
+            } as never);
+            return real(loaded, tools, deps);
+          },
+        );
+        try {
+          await turn(
+            14112,
+            [],
+            [],
+            [],
+            endpoint(asked, (b) =>
+              json({ decision: "allow", candidateId: b.candidateId }),
+            ),
+          );
+        } finally {
+          build.mockRestore();
+        }
+        expect(asked[0]?.body.candidate).toEqual({
+          text: REPLY,
+          attachments: [],
+          model: "fallback",
+        });
+      });
+
+      // The bug it catches: an agent with no endpoint calling out, or changing what it delivers.
+      test("with no endpoint configured, nothing is asked", async () => {
+        await setGuardrails({
+          enabled: true,
+          provider: "openai",
+          model: GUARD_MODEL,
+          credentialRef: gVaultRef,
+          input: { enabled: false },
+          output: { enabled: true, checks: { toxicity: true } },
+        });
+        await seedConv(14111);
+        const sent: Array<[number, string]> = [];
+        const asked: Asked[] = [];
+        await turn(
+          14111,
+          sent,
+          [],
+          [],
+          endpoint(asked, () => json({ decision: "block" })),
+        );
+        expect(asked).toEqual([]);
+        expect(sent).toEqual([[14111, REPLY]]);
+      });
+    });
   });
-  // ISSUE #749. A metade REATIVA do mesmo eixo: aqui a entrega do webhook traz a mensagem, então o
-  // instante existe antes do prompt ser composto e vai direto ao `loadAgentConfig`. O caso que dói
-  // é a entrega que chega tarde — a fila do Chatwoot parada, o webhook reprocessado, a mensagem que
-  // ficou dias sem ninguém — e o agente responde como se tivesse acabado de acontecer.
+  // A document waiting on the team's approval is a standing fact of the conversation: every turn is
+  // told about it, not only the turn whose tool result said so, because that result scrolls out of
+  // the history window and a fresh episode never had it.
+  describe("a document waiting on approval (docs/documents.md, Approval)", () => {
+    async function pendingTurn(
+      conv: number,
+      model: ScriptedCaptureModel,
+      opts: { messageId?: number; checkpointer?: MemorySaver } = {},
+    ) {
+      const log: Array<{ kind: string; text: string; reply?: string }> = [];
+      await runAgentTurn({
+        tenantId,
+        instanceId,
+        agentBotId: 9,
+        event: incoming({
+          conversationId: conv,
+          message: {
+            id: opts.messageId ?? 1,
+            content: "vocês abrem sábado?",
+            messageType: "incoming",
+            private: false,
+          },
+        }),
+        base: appDb,
+        deps: {
+          makeModel: () => model as unknown as BaseChatModel,
+          makeClient: recordingAudioClient(log),
+          checkpointer: opts.checkpointer ?? new MemorySaver(),
+        },
+      });
+    }
+
+    async function requestOn(
+      conv: number,
+      title: string,
+      status: string,
+      expiresAt = new Date(Date.now() + 86_400_000),
+    ) {
+      const c = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: conv },
+        select: { id: true, threadId: true },
+      });
+      await suDb.documentApprovalRequest.create({
+        data: {
+          tenantId,
+          title,
+          threadId: c.threadId,
+          chatwootInstanceId: instanceId,
+          conversationId: c.id,
+          idempotencyKey: `pending-${conv}-${title}-${status}`,
+          status,
+          snapshot: {},
+          expiresAt,
+        },
+      });
+    }
+
+    test("every turn of the conversation names the pending document and promises no time", async () => {
+      await seedConversation(1138_01, null);
+      await requestOn(1138_01, "Orçamento", "PENDING");
+      const checkpointer = new MemorySaver();
+      const first = new ScriptedCaptureModel([{ reply: "Abrimos sim." }]);
+      await pendingTurn(1138_01, first, { checkpointer });
+      const second = new ScriptedCaptureModel([{ reply: "Até as 12h." }]);
+      await pendingTurn(1138_01, second, { checkpointer, messageId: 2 });
+      for (const model of [first, second]) {
+        const system = systemOf(model.seen[0] ?? []);
+        expect(system).toContain("aguardando a aprovação da equipe");
+        expect(system).toContain("Orçamento");
+        expect(system).toContain('nada de prazo, data, "hoje", "em breve"');
+        expect(system).toContain("não diga que já foi enviado");
+        expect(system).not.toMatch(/\d{1,2}h|\d{4}-\d{2}-\d{2}|24 horas/);
+      }
+    });
+
+    test("a request of another conversation, or one no longer pending, adds no line", async () => {
+      await seedConversation(1138_02, null);
+      await seedConversation(1138_03, null);
+      await requestOn(1138_03, "Proposta", "PENDING");
+      await seedConversation(1138_04, null);
+      await requestOn(1138_04, "Orçamento", "APPROVED");
+      await requestOn(1138_04, "Recibo", "REJECTED");
+      await requestOn(1138_04, "Contrato", "EXPIRED");
+      await requestOn(
+        1138_04,
+        "Vencido",
+        "PENDING",
+        new Date(Date.now() - 60_000),
+      );
+      for (const conv of [1138_02, 1138_04]) {
+        const model = new ScriptedCaptureModel([{ reply: "Abrimos sim." }]);
+        await pendingTurn(conv, model);
+        expect(systemOf(model.seen[0] ?? [])).not.toContain(
+          "aguardando a aprovação da equipe",
+        );
+      }
+    });
+
+    test("two pending documents are named once each", async () => {
+      await seedConversation(1138_05, null);
+      await requestOn(1138_05, "Orçamento", "PENDING");
+      await requestOn(1138_05, "Proposta", "PENDING");
+      await suDb.documentApprovalRequest.create({
+        data: {
+          tenantId,
+          title: "Orçamento",
+          threadId: `${tenantId}:${instanceId}:${1138_05}`,
+          chatwootInstanceId: instanceId,
+          conversationId: (
+            await suDb.conversation.findFirstOrThrow({
+              where: { tenantId, chatwootConversationId: 1138_05 },
+            })
+          ).id,
+          idempotencyKey: "segundo-orcamento",
+          snapshot: {},
+          expiresAt: new Date(Date.now() + 86_400_000),
+        },
+      });
+      const model = new ScriptedCaptureModel([{ reply: "Abrimos sim." }]);
+      await pendingTurn(1138_05, model);
+      const system = systemOf(model.seen[0] ?? []);
+      expect(system.split("aguardando a aprovação da equipe")).toHaveLength(2);
+      expect(system.split("Orçamento")).toHaveLength(2);
+      expect(system).toContain("Proposta");
+    });
+  });
+
+  // NOTE: A metade REATIVA da idade da mensagem: a entrega do webhook traz a mensagem, então o
+  // instante existe antes do prompt ser composto e vai direto ao `loadAgentConfig`. O caso que dói é
+  // a entrega que chega tarde (a fila do Chatwoot parada, o webhook reprocessado, a mensagem que
+  // ficou dias sem ninguém), e o agente responderia como se tivesse acabado de acontecer.
   describe("a idade da mensagem no caminho direto (issue #749)", () => {
     const COM_IDADE = "Você é prestativa. Idade: {{idade_ultima_mensagem}}.";
     let promptOriginal = "";
@@ -10412,9 +13853,9 @@ describe.skipIf(!dbUp)("runAgentTurn", () => {
       expect(capture.systemPrompts.join("\n")).toContain("Idade: há 3 dias");
     });
 
-    // A ENTREGA QUE NÃO DIZ QUANDO: o evento sem `createdAt` resolve vazio em vez de "agora mesmo",
+    // NOTE: A ENTREGA QUE NÃO DIZ QUANDO: o evento sem `createdAt` resolve vazio em vez de "agora mesmo",
     // pela mesma razão do caminho do religamento. Um `now` de consolo aqui seria pior do que a
-    // ausência, porque ele é exatamente a leitura errada que a issue existe para tirar.
+    // ausência, porque ele é exatamente a leitura errada que a variável existe para evitar.
     test("sem instante no evento, a variável some", async () => {
       await seedConversation(9750, null);
       const capture = new PromptCapturingModel(REPLY);

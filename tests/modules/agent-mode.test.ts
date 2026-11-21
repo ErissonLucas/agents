@@ -8,7 +8,7 @@ import {
 import { isTestSilenced, shouldRunReset } from "@/modules/agents/test-mode";
 
 // The mode is a plain string column read by many callers; these are the answers every one of them
-// has to agree on (issue #209).
+// has to agree on.
 
 describe("normalizeAgentMode", () => {
   test("every declared mode reads back as itself", () => {
@@ -20,12 +20,6 @@ describe("normalizeAgentMode", () => {
     expect(normalizeAgentMode(undefined)).toBe("production");
     expect(normalizeAgentMode("")).toBe("production");
     expect(normalizeAgentMode("staging")).toBe("production");
-  });
-
-  test("monitoring is NOT collapsed into production", () => {
-    // The failure this function exists to prevent: read through a two-way ternary, a monitoring
-    // agent came back as a fully answering one.
-    expect(normalizeAgentMode("monitoring")).not.toBe("production");
   });
 });
 

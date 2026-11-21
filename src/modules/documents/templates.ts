@@ -6,9 +6,13 @@ import {
   AppError,
   type ErrorTranslationKey,
   NotFoundError,
+  phrase,
+  quotingReason,
+  type TranslatedParam,
 } from "@/lib/errors";
+import { isUniqueViolation, violatedConstraintOf } from "@/lib/pg-error";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
-import { unstorableProblem } from "@/lib/text";
+import { unstorablePhrase } from "@/lib/text";
 import { markUndisclosed, undisclosedMoved } from "@/modules/audit/projection";
 import { auditMutation, projectionMoved } from "@/modules/audit/service";
 import {
@@ -23,21 +27,30 @@ import {
   type DocumentBlock,
   type DocumentField,
   type DocumentStyle,
+  newTemplateStyle,
   parseDocumentStyle,
 } from "./blocks";
 import { type CompanyLogo, readCompanyLogo } from "./company";
 import { documentDraws } from "./draws";
 import { formatDate, formatDocumentNumber } from "./format";
 import { calendarDay } from "./issue";
-import { unprintableProblem } from "./printable";
+import {
+  lockNumbering,
+  nextNumberFor,
+  nextNumberPhrase,
+  nextNumberProblem,
+  usedNumberProblem,
+} from "./numbering";
+import { unprintablePhrase } from "./printable";
 import { renderDocumentPdf } from "./render";
 import { sampleValues } from "./sample";
-import { documentToolName, slugifyTemplateName, slugProblem } from "./slug";
+import { documentToolName, slugifyTemplateName, slugPhrase } from "./slug";
 import {
   type AuthoredHalves,
   authoredStyleProblem,
   type DocumentValues,
   invalidDocumentTemplate,
+  invalidDocumentValues,
   parseAuthoredTemplate,
   parseDocumentValues,
   parseTemplateContent,
@@ -60,24 +73,17 @@ export {
   slugProblem,
 } from "./slug";
 
-// Names are UNIQUE per tenant, enforced through the slug they derive to, and the uniqueness is not
-// bookkeeping: the name is what the model reads to pick between document tools. Two templates called
-// "Orçamento" produce two tools with the same description and nothing to choose between them, so the
-// agent picks one at random and sends the customer the wrong document. Numbering the second one
-// (`send_orcamento_2`) would hide exactly that, which is why the write refuses instead.
-//
-// The refusal is written in terms of the NAME, because that is what the operator typed. Naming the
-// slug tells them about an identifier they never chose and cannot edit.
-// Both halves of the answer: the English text (the log line, the MCP client's answer, and the
-// fallback) and the key the HTTP layer localises. They are built together because they have to say
-// the same thing — a key without its pre-interpolated message is what turns a careful refusal into
-// "A document template with this identifier already exists" on the way out.
+// Names are UNIQUE per tenant, through the slug they derive to: the name is what the model reads to
+// pick between document tools, so a duplicate is refused rather than numbered, in terms of the NAME
+// the operator typed. The English text and the i18n key are built together so they say the same thing.
 interface Refusal {
   message: string;
   // Typed, not `string`: this struct is the ONLY thing `refuse` passes to `AppError`, so an
   // unregistered key would reach the wire through here without any throw site spelling it.
   key: ErrorTranslationKey;
   params: Record<string, string>;
+  // The reason the sentence quotes, as a phrase, when it quotes one: rendered in the caller's language.
+  reason?: TranslatedParam;
   // Which of the two inputs the operator has to go and change. This module already decided it before
   // the wire could carry it: `conflictTarget` reads which index fired, and `slugRefusal` re-points a
   // derived-slug problem at the NAME because that is the only field the caller ever saw. Required so
@@ -118,19 +124,17 @@ async function existingClash(
   return { byName: byName ?? undefined, bySlug: bySlug ?? undefined };
 }
 
-// The one way a Refusal becomes a thrown error. It exists because the field was the FOURTH thing a
-// throw site had to remember to carry, and the round that added it found a hand-written copy of
-// `slugRefusal`'s explicit branch on the patch path (same message, same key, no field), which had
-// made the wire contract depend on the HTTP method. One converter, and the producer is the only
-// place that decides.
+// The one way a Refusal becomes a thrown error, so message, key and field travel together and the
+// wire contract never depends on the HTTP method. The producer is the only place that decides.
 function refuse(refusal: Refusal, statusCode: number): never {
-  throw new AppError(
+  const error = new AppError(
     refusal.message,
     statusCode,
     refusal.key,
     refusal.params,
     refusal.field,
   );
+  throw refusal.reason ? quotingReason(error, refusal.reason) : error;
 }
 
 // `nameTaken`'s same-name branch, lifted out so it can be produced without a slug to interpolate.
@@ -168,9 +172,8 @@ function nameTaken(
   // that would otherwise read as a false refusal, so its message names both templates.
   if (existingName === name) return nameAlreadyUsed(name);
   return {
-    // NOTE: the SENTENCE stays the tool-name explanation in both cases, because the tool name is what is
-    // actually in the way and #208 chose that wording for an authoring client on purpose. Only the
-    // input it is attached to depends on who chose the slug.
+    // NOTE: the SENTENCE stays the tool-name explanation in both cases, because the tool name is what
+    // is actually in the way. Only the input it is attached to depends on who chose the slug.
     message: `"${name}" collides with the template "${existingName}": both produce the tool name ${tool}`,
     key: "errors.documentTemplateNameCollides",
     params: { name, existing: existingName, tool },
@@ -182,12 +185,10 @@ function nameTaken(
 // case and the MCP/import case. Answering it two different ways is how a rename ends up as a 500 for
 // something the operator can fix by typing another name, so the mapping lives here.
 // Which INDEX fired is the difference between "that name is taken" and "that identifier is taken",
-// and Prisma reports it in `meta.target`. Read leniently, because it is a driver detail: an unknown
-// shape falls back to the slug message, which is the one that was correct before the name constraint
-// existed.
+// and `violatedConstraintOf` names it (the index name carries the column). An unknown shape falls
+// back to the slug message, which is the one that was correct before the name constraint existed.
 function conflictTarget(e: unknown): "name" | "slug" {
-  const target = (e as { meta?: { target?: unknown } } | null)?.meta?.target;
-  const text = Array.isArray(target) ? target.join(",") : String(target ?? "");
+  const text = violatedConstraintOf(e) ?? "";
   return /(^|[^a-z])name/.test(text) ? "name" : "slug";
 }
 
@@ -199,7 +200,7 @@ function writeConflict(
   slugExplicit: boolean,
 ): (e: unknown) => never {
   return (e: unknown) => {
-    if (e instanceof Error && (e as { code?: string }).code === "P2002") {
+    if (isUniqueViolation(e)) {
       if (name !== undefined && conflictTarget(e) === "name") {
         throw new AppError(
           `you already have a document template called "${name}"`,
@@ -237,16 +238,17 @@ function writeConflict(
 // derived case is re-pointed at the name, and the built-in collision is the one that has to be,
 // because "Image" is a perfectly good template name whose only fault is where it normalises to.
 function slugRefusal(
-  problem: string,
+  problem: TranslatedParam,
   name: string | undefined,
   explicit: boolean,
   slug: string,
 ): Refusal {
   if (explicit || name === undefined) {
     return {
-      message: `slug: ${problem}.`,
+      message: `slug: ${problem.message}.`,
       key: "errors.invalidDocumentSlug",
-      params: { reason: problem },
+      params: { reason: problem.message },
+      reason: problem,
       field: "slug",
     };
   }
@@ -276,6 +278,8 @@ export async function documentTemplateWriteProblem(
     slug?: string;
     description?: unknown;
     numberPrefix?: unknown;
+    approvalTtlHours?: unknown;
+    nextNumber?: unknown;
   },
   base: PrismaClient = basePrisma,
   opts: { deriveSlugFromName: boolean; excludeId?: bigint } = {
@@ -284,9 +288,19 @@ export async function documentTemplateWriteProblem(
 ): Promise<string | null> {
   const { deriveSlugFromName, excludeId } = opts;
   const metadata = templateMetadataProblem(input);
-  if (metadata) return metadata;
+  if (metadata) return metadata.message;
+  if (input.nextNumber !== undefined) {
+    const problem = await nextNumberWriteProblem(
+      ctx,
+      base,
+      input.nextNumber,
+      input.numberPrefix,
+      excludeId,
+    );
+    if (problem) return problem;
+  }
   const name =
-    // not-caller-input: wrapped by invalidDocumentTemplate, which names the rule that broke
+    // biome-ignore lint/plugin/require-parse-input: not caller input, wrapped by invalidDocumentTemplate, which names the rule that broke
     input.name !== undefined ? templateNameSchema.parse(input.name) : undefined;
   // Only CREATE derives a slug from the name; a rename keeps the slug it already has, because the
   // slug is a tool name an agent may already be granted. Deriving here on an update would refuse a
@@ -298,7 +312,7 @@ export async function documentTemplateWriteProblem(
       ? slugifyTemplateName(name)
       : undefined);
   if (slug !== undefined) {
-    const problem = slugProblem(slug);
+    const problem = slugPhrase(slug);
     if (problem) {
       return slugRefusal(problem, name, input.slug !== undefined, slug).message;
     }
@@ -309,9 +323,8 @@ export async function documentTemplateWriteProblem(
   // (a patch that touches only the description, say).
   if (slug === undefined && name === undefined) return null;
   if (slug !== undefined) {
-    // Only when the slug MOVES, which is what the apply does: a template whose `send_<slug>` already
-    // collides was legal before this rule, and a full-state client sends the unchanged slug on every
-    // patch — a preview refusing what the apply performs is the divergence #490 is about, backwards.
+    // Only when the slug MOVES, as in the apply: an existing collision predates this rule and a
+    // full-state client sends the unchanged slug on every patch, so the preview must not refuse it.
     const storedSlug =
       opts.excludeId === undefined
         ? null
@@ -353,7 +366,13 @@ export interface DocumentTemplateDto {
   style: DocumentStyle;
   numberPrefix: string | null;
   lastNumber: number;
+  // The number the next document issued from this template will print, before the prefix: one above
+  // the larger of this template's counter and the highest number the tenant already issued under its
+  // prefix (numbering.ts).
+  nextNumber: number;
   enabled: boolean;
+  requiresApproval: boolean;
+  approvalTtlHours: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -369,31 +388,19 @@ const SELECT = {
   numberPrefix: true,
   lastNumber: true,
   enabled: true,
+  requiresApproval: true,
+  approvalTtlHours: true,
   createdAt: true,
   updatedAt: true,
 } as const;
 
 type Row = Prisma.DocumentTemplateGetPayload<{ select: typeof SELECT }>;
 
-// What the audit row carries.
-//
-// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
-// else is listed in `UNDISCLOSED` below and compared without being carried. A column in neither
-// half changes without the row noticing, and `projectionMoved` then suppresses the write entirely.
-//
-// A template is a mould rather than an issued document, so what is in it is `{{token}}` prose the
-// operator wrote — but it is also the largest field here, and the trail is append-only and readable
-// by every tenant admin. The structure (`{id, type}` per block, `{key, type}` per field) answers
-// what a reader asks: a block appeared, one was removed, the order moved, a field changed type. The
-// comparison over blocks+fields+style is what makes an edit INSIDE a block visible at all —
-// replacing the text of an existing block moves nothing in the structure, and that is the commonest
-// edit a template gets.
-//
-// `lastNumber` is in NEITHER half, deliberately: it is the issuer's counter, advanced by issuing a
-// document and not by editing the template, so folding it in would file every issuance as a change
-// the next save reported.
-//
-// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+// What the audit row carries: identity, policy and shape PROJECTED (blocks and fields as structure
+// only), the rest in `UNDISCLOSED`, compared without being carried, so an edit inside a block still
+// registers. `lastNumber` is projected: issuing moves it without an audit row (issuing is not
+// editing), but an operator setting the next number is an edit. The fence over this model's columns
+// is `tests/modules/audit-config-families.test.ts`.
 function auditProjection(r: Row) {
   const blocks = Array.isArray(r.blocks) ? r.blocks : [];
   const fields = Array.isArray(r.fields) ? r.fields : [];
@@ -402,7 +409,10 @@ function auditProjection(r: Row) {
     slug: r.slug,
     description: r.description,
     numberPrefix: r.numberPrefix,
+    lastNumber: r.lastNumber,
     enabled: r.enabled,
+    requiresApproval: r.requiresApproval,
+    approvalTtlHours: r.approvalTtlHours,
     blocks: blocks.map((b) => {
       const o = (b ?? {}) as Record<string, unknown>;
       return { id: o.id ?? null, type: o.type ?? null };
@@ -428,7 +438,7 @@ const UNDISCLOSED = ["blocks", "fields", "style"] as const;
 // by an older version of this file may not satisfy today's schema. Falling back to an empty document
 // rather than throwing keeps the console listable: a template that cannot be parsed has to be
 // visible to be fixed.
-function toDto(row: Row): DocumentTemplateDto {
+function toDto(row: Row, nextNumber?: number): DocumentTemplateDto {
   const parsed = parseTemplateContent(row.blocks, row.fields, row.style);
   return {
     id: String(row.id),
@@ -441,7 +451,10 @@ function toDto(row: Row): DocumentTemplateDto {
     style: parseDocumentStyle(row.style),
     numberPrefix: row.numberPrefix,
     lastNumber: row.lastNumber,
+    nextNumber: nextNumber ?? row.lastNumber + 1,
     enabled: row.enabled,
+    requiresApproval: row.requiresApproval,
+    approvalTtlHours: row.approvalTtlHours,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
@@ -462,7 +475,12 @@ export interface DocumentTemplateInput {
   fields?: unknown;
   style?: unknown;
   numberPrefix?: string | null;
+  // Where the numbering continues from: the number the next document prints. Refused at or below a
+  // number the tenant already issued under the template's prefix (numbering.ts).
+  nextNumber?: number;
   enabled?: boolean;
+  requiresApproval?: boolean;
+  approvalTtlHours?: number;
 }
 
 export const templateNameSchema = z.string().trim().min(1).max(120);
@@ -471,8 +489,7 @@ export const templateNameSchema = z.string().trim().min(1).max(120);
 // run's preview, its diff, the title rendered into the previewed PDF. The schema trims, so a padded
 // name is accepted and kept in a shorter form than it arrived — and a caller shown the raw one was
 // told the apply would keep something it will not. It lives beside the schema because that is the
-// only thing that decides it; two rounds of review found two different surfaces reporting the
-// unnormalized value, and both had copied the check without the transform.
+// only thing that decides it, so callers never copy the check without the transform.
 export function normalizeTemplateName(value: string): string {
   return templateNameSchema.safeParse(value).success ? value.trim() : value;
 }
@@ -497,23 +514,36 @@ export function templateMetadataProblem(input: {
   name?: unknown;
   description?: unknown;
   numberPrefix?: unknown;
-}): string | null {
+  approvalTtlHours?: unknown;
+}): TranslatedParam | null {
+  if (input.approvalTtlHours !== undefined) {
+    const problem = approvalTtlProblem(input.approvalTtlHours);
+    if (problem) return problem;
+  }
   if (
     input.name !== undefined &&
     !templateNameSchema.safeParse(input.name).success
   ) {
-    return "name: must be between 1 and 120 characters.";
+    return phrase(
+      "errors.documentNameLength",
+      "name: must be between 1 and 120 characters.",
+      { min: 1, max: 120 },
+    );
   }
   // The name is DRAWN: it resolves {{doc_title}}, which every bundled starter prints in its header.
   if (typeof input.name === "string") {
-    const problem = unprintableProblem(input.name, "name");
+    const problem = unprintablePhrase(input.name, "name");
     if (problem) return problem;
   }
   if (
     input.description !== undefined &&
     !templateDescriptionSchema.safeParse(input.description ?? null).success
   ) {
-    return "description: must be at most 2000 characters.";
+    return phrase(
+      "errors.documentDescriptionLength",
+      "description: must be at most 2000 characters.",
+      { max: 2000 },
+    );
   }
   // NOT `unprintableProblem`, and the difference is the point: the description is read by the MODEL
   // and drawn by nobody, so an emoji in it is fine and refusing one would be a rule with no reason
@@ -521,58 +551,162 @@ export function templateMetadataProblem(input: {
   // value reached `document_templates.description`, and Postgres answered with a 500 for REST and
   // MCP, or by aborting the whole transaction an agent import runs in.
   if (typeof input.description === "string") {
-    const problem = unstorableProblem(input.description, "description");
+    const problem = unstorablePhrase(input.description, "description");
     if (problem) return problem;
   }
   if (
     input.numberPrefix !== undefined &&
     !templateNumberPrefixSchema.safeParse(input.numberPrefix ?? null).success
   ) {
-    return "numberPrefix: must be at most 20 characters.";
+    return phrase(
+      "errors.documentNumberPrefixLength",
+      "numberPrefix: must be at most 20 characters.",
+      { max: 20 },
+    );
   }
   // The prefix is DRAWN: it is the front of every document number on the page. A length check alone
   // let a character the fonts cannot encode through, and the renderer then prints a different one —
   // on every document that template ever issues.
   if (typeof input.numberPrefix === "string") {
-    const problem = unprintableProblem(input.numberPrefix, "numberPrefix");
+    const problem = unprintablePhrase(input.numberPrefix, "numberPrefix");
     if (problem) return problem;
   }
   return null;
 }
 
+// How long an approval request waits for a person, in whole hours (docs/documents.md, Approval).
+export const APPROVAL_TTL_HOURS = { min: 1, max: 168, default: 24 } as const;
+
+export function approvalTtlProblem(value: unknown): TranslatedParam | null {
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < APPROVAL_TTL_HOURS.min ||
+    value > APPROVAL_TTL_HOURS.max
+  ) {
+    return phrase(
+      "errors.documentApprovalTtlRange",
+      `approvalTtlHours: must be a whole number of hours from ${APPROVAL_TTL_HOURS.min} to ${APPROVAL_TTL_HOURS.max}.`,
+      { min: APPROVAL_TTL_HOURS.min, max: APPROVAL_TTL_HOURS.max },
+    );
+  }
+  return null;
+}
+
+function parseApprovalTtl(value: unknown): number {
+  const problem = approvalTtlProblem(value);
+  if (problem) {
+    throw quotingReason(
+      new AppError(problem.message, 400, "errors.invalidDocumentApprovalTtl", {
+        reason: problem.message,
+      }),
+      problem,
+    );
+  }
+  return value as number;
+}
+
 function parseNumberPrefix(value: unknown): string | null {
   const problem = templateMetadataProblem({ numberPrefix: value });
   if (problem) {
-    throw new AppError(problem, 400, "errors.invalidDocumentNumberPrefix", {
-      reason: problem,
-    });
+    throw quotingReason(
+      new AppError(problem.message, 400, "errors.invalidDocumentNumberPrefix", {
+        reason: problem.message,
+      }),
+      problem,
+    );
   }
-  // not-caller-input: wrapped by invalidDocumentTemplate, which names the rule that broke
+  // biome-ignore lint/plugin/require-parse-input: not caller input, wrapped by invalidDocumentTemplate, which names the rule that broke
   return templateNumberPrefixSchema.parse(value ?? null);
+}
+
+// The dry run's answer for a next number, read without the lock the apply takes: the apply asks again
+// under it, so a document issued in between is still refused there.
+async function nextNumberWriteProblem(
+  ctx: TenantContext,
+  base: PrismaClient,
+  next: unknown,
+  patchPrefix: unknown,
+  templateId: bigint | undefined,
+): Promise<string | null> {
+  const problem = nextNumberProblem(next);
+  if (problem) return problem;
+  if (ctx.tenantId === null) return null;
+  const tenantId = ctx.tenantId;
+  return runScopedOn(base, ctx, async (db) => {
+    const prefix =
+      patchPrefix !== undefined
+        ? ((patchPrefix as string | null) ?? null)
+        : templateId === undefined
+          ? null
+          : ((
+              await db.documentTemplate.findUnique({
+                where: { id: templateId },
+                select: { numberPrefix: true },
+              })
+            )?.numberPrefix ?? null);
+    return (
+      (await usedNumberProblem(db, tenantId, prefix, next as number))
+        ?.message ?? null
+    );
+  });
+}
+
+function parseNextNumber(value: unknown): number {
+  const problem = nextNumberPhrase(value);
+  if (problem) {
+    throw quotingReason(
+      new AppError(problem.message, 400, "errors.invalidDocumentNextNumber", {
+        reason: problem.message,
+      }),
+      problem,
+    );
+  }
+  return value as number;
+}
+
+// The counter that makes `next` the next number, after checking under the sequence lock that no
+// document of the tenant already printed it or anything above it under `prefix`.
+async function counterForNextNumber(
+  db: ScopedDb,
+  tenantId: bigint,
+  prefix: string | null,
+  next: number,
+): Promise<number> {
+  await lockNumbering(db, tenantId);
+  const refusal = await usedNumberProblem(db, tenantId, prefix, next);
+  if (refusal) throw refusal;
+  return next - 1;
 }
 
 function parseTemplateDescription(value: unknown): string | null {
   const problem = templateMetadataProblem({ description: value });
   if (problem) {
-    throw new AppError(
+    throw quotingReason(
+      new AppError(
+        problem.message,
+        400,
+        "errors.invalidDocumentTemplateDescription",
+        { reason: problem.message },
+      ),
       problem,
-      400,
-      "errors.invalidDocumentTemplateDescription",
-      { reason: problem },
     );
   }
-  // not-caller-input: wrapped by invalidDocumentTemplate, which names the rule that broke
+  // biome-ignore lint/plugin/require-parse-input: not caller input, wrapped by invalidDocumentTemplate, which names the rule that broke
   return templateDescriptionSchema.parse(value ?? null);
 }
 
 function parseTemplateName(value: unknown): string {
   const problem = templateMetadataProblem({ name: value });
   if (problem) {
-    throw new AppError(problem, 400, "errors.invalidDocumentTemplateName", {
-      reason: problem,
-    });
+    throw quotingReason(
+      new AppError(problem.message, 400, "errors.invalidDocumentTemplateName", {
+        reason: problem.message,
+      }),
+      problem,
+    );
   }
-  // not-caller-input: wrapped by invalidDocumentTemplate, which names the rule that broke
+  // biome-ignore lint/plugin/require-parse-input: not caller input, wrapped by invalidDocumentTemplate, which names the rule that broke
   return templateNameSchema.parse(value);
 }
 
@@ -597,7 +731,7 @@ function validated(input: {
     input.authored,
   );
   if (!parsed.ok) {
-    throw invalidDocumentTemplate(parsed.reason);
+    throw invalidDocumentTemplate(parsed.phrase);
   }
   return parsed.content;
 }
@@ -606,10 +740,38 @@ export async function listDocumentTemplates(
   ctx: TenantContext,
   base: PrismaClient = basePrisma,
 ): Promise<DocumentTemplateDto[]> {
-  const rows = await runScopedOn(base, ctx, (db) =>
-    db.documentTemplate.findMany({ orderBy: { name: "asc" }, select: SELECT }),
+  return runScopedOn(base, ctx, async (db) => {
+    const rows = await db.documentTemplate.findMany({
+      orderBy: { name: "asc" },
+      select: SELECT,
+    });
+    if (rows.length === 0 || ctx.tenantId === null) {
+      return rows.map((r) => toDto(r));
+    }
+    const tenantId = ctx.tenantId;
+    // One read per template: a tenant has a handful, and the answer depends on each one's counter.
+    return Promise.all(
+      rows.map(async (r) =>
+        toDto(
+          r,
+          await nextNumberFor(db, tenantId, r.numberPrefix, r.lastNumber),
+        ),
+      ),
+    );
+  });
+}
+
+// The DTO with its next number read in the same transaction, for the paths that return one template.
+async function dtoOf(
+  db: ScopedDb,
+  row: Row & { tenantId?: bigint },
+  tenantId: bigint | null,
+) {
+  if (tenantId === null) return toDto(row);
+  return toDto(
+    row,
+    await nextNumberFor(db, tenantId, row.numberPrefix, row.lastNumber),
   );
-  return rows.map(toDto);
 }
 
 export async function getDocumentTemplate(
@@ -617,16 +779,48 @@ export async function getDocumentTemplate(
   id: bigint,
   base: PrismaClient = basePrisma,
 ): Promise<DocumentTemplateDto> {
-  const row = await runScopedOn(base, ctx, (db) =>
-    db.documentTemplate.findUnique({ where: { id }, select: SELECT }),
-  );
-  if (!row) {
-    throw new NotFoundError(
-      "document template not found",
-      "errors.documentTemplateNotFound",
-    );
-  }
-  return toDto(row);
+  return runScopedOn(base, ctx, async (db) => {
+    const row = await db.documentTemplate.findUnique({
+      where: { id },
+      select: SELECT,
+    });
+    if (!row) {
+      throw new NotFoundError(
+        "document template not found",
+        "errors.documentTemplateNotFound",
+      );
+    }
+    return dtoOf(db, row, ctx.tenantId);
+  });
+}
+
+// Where this template's numbering would continue under `prefix` (its own when undefined): what an
+// editor moving the prefix, and a dry run that moves it, show before the save. The counter stays with
+// the template across a prefix change, so it is the larger of that counter and the highest number the
+// tenant issued under the destination prefix, plus one.
+export async function nextNumberUnderPrefix(
+  ctx: TenantContext,
+  id: bigint,
+  prefix: string | null | undefined,
+  base: PrismaClient = basePrisma,
+): Promise<number> {
+  if (ctx.tenantId === null) throw new AppError("tenant required", 400);
+  const tenantId = ctx.tenantId;
+  return runScopedOn(base, ctx, async (db) => {
+    const row = await db.documentTemplate.findUnique({
+      where: { id },
+      select: { lastNumber: true, numberPrefix: true },
+    });
+    if (!row) {
+      throw new NotFoundError(
+        "document template not found",
+        "errors.documentTemplateNotFound",
+      );
+    }
+    const target =
+      prefix === undefined ? row.numberPrefix : parseNumberPrefix(prefix);
+    return nextNumberFor(db, tenantId, target, row.lastNumber);
+  });
 }
 
 // The stored row as it IS, not as this version reads it. The preview needs this: `toDto` drops a
@@ -677,10 +871,8 @@ export async function createDocumentTemplate(
   base: PrismaClient = basePrisma,
 ): Promise<DocumentTemplateDto> {
   const name = parseTemplateName(input.name);
-  // Derived only when the slug is genuinely ABSENT. An explicit "" is a malformed identifier the
-  // caller wrote, and a truthiness fallback silently replaced it with one derived from the name —
-  // while the dry run, which uses `?? `, refused exactly that input. A preview that says no to what
-  // the apply says yes to is the same contract break as the reverse.
+  // Derived only when the slug is genuinely ABSENT: an explicit "" is a malformed identifier
+  // the caller wrote, refused here as the dry run (`??`) refuses it.
   const derived = input.slug === undefined;
   if (input.blockText !== undefined) {
     // Accepted by the shared body schema because the PATCH needs it, and meaningless here: there is
@@ -688,13 +880,16 @@ export async function createDocumentTemplate(
     // than ignored — a 200 that discarded what was asked for is the failure this whole field exists
     // to prevent.
     throw invalidDocumentTemplate(
-      "blockText: only an update can replace text by block id; when creating, write the text inside blocks.",
+      phrase(
+        "errors.documentBlockTextOnCreate",
+        "blockText: only an update can replace text by block id; when creating, write the text inside blocks.",
+      ),
     );
   }
   const content = validated({
     blocks: input.blocks ?? [],
     fields: input.fields ?? [],
-    style: input.style,
+    style: newTemplateStyle(input.style),
   });
   const style = content.style;
   if (ctx.tenantId === null) throw new AppError("tenant required", 400);
@@ -708,9 +903,17 @@ export async function createDocumentTemplate(
     style: style as unknown as Prisma.InputJsonValue,
     numberPrefix: parseNumberPrefix(input.numberPrefix ?? null),
     enabled: input.enabled ?? true,
+    requiresApproval: input.requiresApproval ?? false,
+    approvalTtlHours: parseApprovalTtl(
+      input.approvalTtlHours ?? APPROVAL_TTL_HOURS.default,
+    ),
   };
+  const nextNumber =
+    input.nextNumber === undefined
+      ? undefined
+      : parseNextNumber(input.nextNumber);
   const slug = derived ? slugifyTemplateName(name) : (input.slug as string);
-  const problem = slugProblem(slug);
+  const problem = slugPhrase(slug);
   if (problem) {
     const refusal = slugRefusal(problem, name, !derived, slug);
     refuse(refusal, 400);
@@ -725,24 +928,39 @@ export async function createDocumentTemplate(
     const refusal = nameTaken(holder.name, name, slug, !derived);
     refuse(refusal, 409);
   }
-  const row = await runScopedOn(base, ctx, async (db) => {
+  return runScopedOn(base, ctx, async (db) => {
     // The other half of the namespace, asked INSIDE this transaction and behind the same lock the
     // tool services take: the slug becomes `send_<slug>`, and an HTTP or code tool may hold that
     // name. The assembly builds documents FIRST, so the tool is the one that would be dropped —
     // silently, with a flow-log line as the only trace. No unique index spans the three tables, so
     // the lock is what keeps two writers from each seeing the name free (namespace.ts).
     await assertToolNameFreeForSlug(db, slug, name, !derived);
+    const lastNumber =
+      nextNumber === undefined
+        ? undefined
+        : await counterForNextNumber(
+            db,
+            tenantId,
+            data.numberPrefix,
+            nextNumber,
+          );
     const created = await db.documentTemplate
-      .create({ data: { ...data, slug }, select: SELECT })
+      .create({
+        data: {
+          ...data,
+          slug,
+          ...(lastNumber === undefined ? {} : { lastNumber }),
+        },
+        select: SELECT,
+      })
       .catch(writeConflict(slug, name, !derived));
     await auditMutation(db, ctx, {
       action: "document_template.create",
       target: `document_template:${created.id}`,
       after: auditProjection(created),
     });
-    return created;
+    return dtoOf(db, created, tenantId);
   });
-  return toDto(row);
 }
 
 export async function updateDocumentTemplate(
@@ -751,21 +969,9 @@ export async function updateDocumentTemplate(
   patch: Partial<DocumentTemplateInput>,
   base: PrismaClient = basePrisma,
 ): Promise<DocumentTemplateDto> {
-  // Read, validate and write under ONE lock on the template row.
-  //
-  // A patch that touches any of blocks/fields/style is validated against the OTHER two as they stand
-  // — that is the rule below — and then writes all of them back. Two clients patching different
-  // parts therefore each merge into the snapshot they read, and the later write silently replaces
-  // the earlier one: a text edit acknowledged with a 200 and then overwritten by a style edit
-  // carrying the pre-edit blocks. The lock is what makes the second request read the first's result
-  // instead of a snapshot from before it.
-  //
-  // NO LOCAL FAILURE MEASURED: a test issuing both patches under Promise.all could not reach the
-  // interleaving on this stack — the two transactions serialised, and the test passed with the lock
-  // removed, three runs out of three. It was deleted rather than kept as a proof of nothing. The
-  // interleaving that this guards is between API REPLICAS, which is the deployed topology and which
-  // no single-process test reaches; the same guard on the settings blob (patchBlock) IS covered,
-  // because a test there does fail without it.
+  // NOTE: Read, validate and write under ONE lock on the template row: a patch writes blocks, fields
+  // and style back together, so two clients patching different parts would otherwise overwrite each
+  // other. The race is between API replicas, which no single-process test reaches.
   return runScopedOn(base, ctx, async (db) => {
     // The namespace lock before the row lock, for the ordering reason `updateToolDefinition` in
     // modules/tool-definitions/service.ts spells out: a slug change asks the tool namespace
@@ -783,7 +989,7 @@ export async function updateDocumentTemplate(
       );
     }
     const current = toDto(found);
-    const row = await patched(current, found, patch, db, id);
+    const row = await patched(current, found, patch, db, id, ctx.tenantId);
     const beforeProj = auditProjection(found);
     const afterProj = auditProjection(row);
     const undisclosed = undisclosedMoved(found, row, UNDISCLOSED);
@@ -795,7 +1001,7 @@ export async function updateDocumentTemplate(
         after: undisclosed ? markUndisclosed(afterProj) : afterProj,
       });
     }
-    return toDto(row);
+    return dtoOf(db, row, ctx.tenantId);
   });
 }
 
@@ -814,7 +1020,11 @@ function applyBlockText(
   for (const id of Object.keys(text)) {
     if (byId.get(id)?.type !== "text") {
       throw invalidDocumentTemplate(
-        `blockText: "${id}" is not a text block of this template.`,
+        phrase(
+          "errors.documentBlockTextNotText",
+          `blockText: "${id}" is not a text block of this template.`,
+          { id },
+        ),
       );
     }
   }
@@ -829,15 +1039,9 @@ function applyBlockText(
   });
 }
 
-// What this patch would make the template's content BE, validated exactly once.
-//
-// Shared by the apply and by the preview that promises what the apply will do, because they were
-// answering the same question from different sources and disagreeing: the preview read the parsed
-// DTO, where a block a NEWER build wrote has already been dropped, so a style-only dry run rendered
-// happily and the apply then refused the very same patch as unreadable. A dry run that approves a
-// write which cannot be performed is worse than no dry run.
-//
-// `stored` is null when there is nothing saved yet — a create, or a preview of one.
+// What this patch would make the template's content BE, validated exactly once, shared by the apply
+// and its preview so a dry run never approves a write that cannot be performed (a parsed DTO would
+// already have dropped a block a newer build wrote). `stored` is null for a create or its preview.
 export function patchedContent(
   stored: {
     blocks?: unknown;
@@ -874,7 +1078,7 @@ export function patchedContent(
   // blockText patch. Checked here, on the values as they arrived, which is the only place that knows
   // they came from a caller at all.
   for (const [id, text] of Object.entries(patch.blockText ?? {})) {
-    const problem = unprintableProblem(text, `blockText."${id}"`);
+    const problem = unprintablePhrase(text, `blockText."${id}"`);
     if (problem) throw invalidDocumentTemplate(problem);
   }
   const rawFields = (patch.fields ?? stored?.fields ?? []) as unknown[];
@@ -917,15 +1121,9 @@ export function patchedContent(
       authored,
     });
   } catch (e) {
-    // A stored block this version cannot read at all (an unknown TYPE, not just an unknown
-    // property) fails the shared parse, and there is no safe way to save around it: writing what
-    // parsed would drop it. Refusing keeps it, and says why — the generic "invalid discriminator"
-    // reads like the operator's own edit is at fault when they only changed a word.
-    //
-    // Conditioned on the STORED content actually being unreadable: without that test, any failure
-    // on a wording-only or style-only patch — including one caused by what the caller just sent —
-    // was reported as a newer version's doing, pointing them at the wrong remedy while the dry run
-    // answered correctly.
+    // A stored block of an unknown TYPE fails the parse, and saving what parsed would drop it,
+    // so the patch is refused with its own reason. Only when the STORED content is unreadable, so a
+    // failure caused by the caller's own input is not blamed on a newer version.
     const storedUnreadable =
       stored !== null &&
       !parseTemplateContent(
@@ -939,12 +1137,15 @@ export function patchedContent(
       !authored.blocks &&
       !authored.fields
     ) {
-      throw new AppError(
+      const unreadable = new AppError(
         `this template contains content a newer version wrote and this one cannot read, so saving from here would drop it (${e.message}) — edit it from the client that wrote it, or send blocks explicitly to replace them.`,
         409,
         "errors.documentTemplateUnreadable",
         { reason: e.message },
       );
+      // The stored content's reason, in the caller's language like the sentence around it.
+      const reason = e.translatedParams?.reason;
+      throw reason ? quotingReason(unreadable, reason) : unreadable;
     }
     throw e;
   }
@@ -959,25 +1160,20 @@ async function patched(
   patch: Partial<DocumentTemplateInput>,
   db: ScopedDb,
   id: bigint,
+  tenantId: bigint | null,
 ): Promise<Row> {
   const data: Prisma.DocumentTemplateUpdateInput = {};
   if (patch.name !== undefined) data.name = parseTemplateName(patch.name);
   if (patch.slug !== undefined) {
-    const problem = slugProblem(patch.slug);
+    const problem = slugPhrase(patch.slug);
     if (problem) {
       // NOTE: a patch always writes the slug EXPLICITLY, so this is the producer's explicit branch. Calling
       // it rather than restating it is what keeps POST and PATCH answering the same refusal.
       refuse(slugRefusal(problem, undefined, true, patch.slug), 400);
     }
-    // The tool-name half of the namespace, asked on the way in and inside this transaction: a
-    // rename onto a slug whose `send_<slug>` a tool already holds is the same collision a create is
-    // refused for, and the update reached the row through a different door.
-    // The tool-name half of the namespace, asked on the way in and inside this transaction: a
-    // rename onto a slug whose `send_<slug>` a tool already holds is the same collision a create is
-    // refused for, and the update reached the row through a different door.
-    // Only when the slug MOVES: rows that already collide were legal before this rule and nothing
-    // migrates them, and a PATCH carries the unchanged slug — refusing it would lock an operator
-    // out of editing the template (the tool services carry the same note).
+    // NOTE: The tool-name half of the namespace: a rename onto a slug whose `send_<slug>` a tool
+    // already holds is the collision a create is refused for. Only when the slug MOVES, since a PATCH
+    // carries the unchanged slug and existing collisions must stay editable.
     if (patch.slug !== current.slug) {
       await assertToolNameFreeForSlug(db, patch.slug, undefined, true);
     }
@@ -989,7 +1185,24 @@ async function patched(
   if (patch.numberPrefix !== undefined) {
     data.numberPrefix = parseNumberPrefix(patch.numberPrefix);
   }
+  if (patch.nextNumber !== undefined) {
+    const next = parseNextNumber(patch.nextNumber);
+    if (tenantId === null) throw new AppError("tenant required", 400);
+    // Checked against the prefix the template will HAVE: a patch moving the prefix and setting the
+    // number together starts the number in the new sequence.
+    const prefix =
+      data.numberPrefix !== undefined
+        ? (data.numberPrefix as string | null)
+        : stored.numberPrefix;
+    data.lastNumber = await counterForNextNumber(db, tenantId, prefix, next);
+  }
   if (patch.enabled !== undefined) data.enabled = patch.enabled;
+  if (patch.requiresApproval !== undefined) {
+    data.requiresApproval = patch.requiresApproval;
+  }
+  if (patch.approvalTtlHours !== undefined) {
+    data.approvalTtlHours = parseApprovalTtl(patch.approvalTtlHours);
+  }
   // NOTE: blocks, fields and style are validated TOGETHER even when only one was sent, because the
   // rules are about the relationship between them — a block pointing at a field, a token in a block
   // or in the footer naming one. Validating only the patched part would accept a template whose
@@ -1016,14 +1229,11 @@ async function patched(
       data.fields = rawFields as unknown as Prisma.InputJsonValue;
     }
     if (patch.style !== undefined) {
-      // Written back over the raw stored style, taking ONLY the properties the patch addressed.
-      //
-      // Spreading the whole parsed style looks equivalent and is not: the parse fills every property
-      // it could not read with a default, so a `font` a newer build wrote was replaced by "sans" on
-      // any style save — an operator changing a colour silently downgrading a setting they cannot
-      // even see. Storage is tolerant on the way out precisely so that value survives; writing the
-      // parsed view back is how that guarantee is lost, and it is the same mistake `toDto` made for
-      // whole blocks.
+      // Written back over the raw stored style, taking ONLY the properties the patch
+      // addressed. Spreading the whole parsed style is not equivalent: the parse fills every
+      // property it could not read with a default, so a `font` a newer build wrote would become
+      // "sans" on any style save, downgrading a setting the operator cannot even see. Storage is
+      // tolerant on the way out so that value survives; writing the parsed view back would lose it.
       const written = Object.keys(patch.style as Record<string, unknown>);
       data.style = {
         ...rawStyle,
@@ -1163,15 +1373,9 @@ export async function readRenderContext(
     readCompanySettings(db, tenantId),
   );
   const logo = await readCompanyLogo(company);
-  // A logo the settings NAME and the disk does not have is a cross-format replacement landing
-  // between these two reads: the upload commits the new key and deletes the file the old one named,
-  // which is exactly the file this read is reaching for. Answering null there freezes a document
-  // without a letterhead forever, even though both the profile before and the profile after had
-  // one — and the document is immutable, so nothing ever fixes it.
-  //
-  // Re-read once instead of holding the company lock across a render: the lock is taken by every
-  // profile save, and an issuance is not something a save should have to wait behind. One retry is
-  // enough because the replacement has already committed by the time the file is gone.
+  // NOTE: A logo the settings NAME but the disk lacks is a cross-format replacement landing between
+  // the two reads, and null would freeze an immutable document without its letterhead. Re-read once
+  // (the replacement has committed by then) rather than hold the company lock across a render.
   if (!logo && company.logoKey) {
     const latest = await runScopedOn(base, ctx, (db) =>
       readCompanySettings(db, tenantId),
@@ -1188,20 +1392,17 @@ export async function readRenderContext(
 // prints a blank where the customer expects a name, a string where a number belongs throws inside
 // react-pdf, and a line-item array past the ceiling lays out on the API process at whatever length
 // the caller sent. Omitting them is the other path, and it stays free — sample values are ours.
-function callerValues(
+export function callerValues(
   fields: DocumentField[],
   raw: unknown,
   now: Date,
   // The document's own calendar day, so a generated sample date matches the date printed on it.
   day: string,
+  locale: DocumentStyle["locale"],
 ): DocumentValues {
-  if (raw === undefined) return sampleValues(fields, now, day);
+  if (raw === undefined) return sampleValues(fields, now, day, locale);
   const parsed = parseDocumentValues(fields, raw);
-  if (!parsed.ok) {
-    throw new AppError(parsed.reason, 400, "errors.invalidDocumentValues", {
-      reason: parsed.reason,
-    });
-  }
+  if (!parsed.ok) throw invalidDocumentValues(parsed);
   return parsed.values;
 }
 
@@ -1235,7 +1436,12 @@ export async function previewDocumentTemplate(
   const { content } = patchedContent(saved, {
     ...(input.blocks !== undefined ? { blocks: input.blocks } : {}),
     ...(input.fields !== undefined ? { fields: input.fields } : {}),
-    ...(input.style !== undefined ? { style: input.style } : {}),
+    // NOTE: an unsaved template previews as the create would write it, footer default included.
+    ...(saved === null
+      ? { style: newTemplateStyle(input.style) }
+      : input.style !== undefined
+        ? { style: input.style }
+        : {}),
     ...(input.blockText ? { blockText: input.blockText } : {}),
   });
   const style = content.style;
@@ -1243,35 +1449,25 @@ export async function previewDocumentTemplate(
   // Computed ONCE and used for both the document's date and any generated sample date, so the two
   // cannot land on different sides of a day boundary.
   const previewDay = calendarDay(now, DEFAULT_TIMEZONE);
-  const values = callerValues(content.fields, input.values, now, previewDay);
+  const values = callerValues(
+    content.fields,
+    input.values,
+    now,
+    previewDay,
+    style.locale,
+  );
   const { company, logo } = await readRenderContext(ctx, base);
   const prefix =
     input.numberPrefix !== undefined ? input.numberPrefix : saved?.numberPrefix;
   const meta = {
     // A believable number, not a real one: the preview must not consume the template's counter.
     number: formatDocumentNumber(42, prefix ?? null),
-    // The same day calculation an issuance freezes, so the preview and the document it previews
-    // cannot disagree on a date the customer reads. A template has no agent of its own — it can be
-    // granted to several — so this is the fleet default zone, which is also what the REST issue path
-    // falls back to.
-    //
-    // NOT COVERED BY A TEST, deliberately and measured: a rendered PDF exposes neither greppable
-    // text (react-pdf subsets its fonts, so the content stream carries glyph ids) nor a
-    // deterministic byte stream (two renders of identical input differ), so nothing here can observe
-    // the date that came out. The equivalent decision on the ISSUE path is covered, and this line
-    // calls the same helper — that is the whole of the assurance, and it is written down rather
-    // than implied.
+    // NOTE: The same day calculation an issuance freezes, in the fleet default zone (a template has
+    // no agent of its own, and the REST issue path falls back to the same). A rendered PDF exposes no
+    // readable date, so only the issue path's use of this helper is tested.
     date: formatDate(previewDay, style.locale),
-    // NORMALIZED, like the write does, and `normalizeTemplateName`'s own comment lists this exact
-    // surface among the ones it serves.
-    //
-    // NO OBSERVABLE DIFFERENCE MEASURED, and that is written here so nobody restores the raw value
-    // believing they are removing dead weight, nor cites this line as a bug that was fixed. A review
-    // round reported it as the preview drawing padding the write would trim; measured against the
-    // renderer, "  Orcamento  " and "Orcamento" produce a byte-identical page — as a header title,
-    // where layout collapses the run, and inside body text as `[{{doc_title}}]`, where the value has
-    // already been through `sanitizeDocumentValue`. There is no `/Title` in the output at all. What
-    // remains is consistency with the sibling surfaces, which is worth one call and no more.
+    // NOTE: NORMALIZED like the write, for consistency with the sibling surfaces only: the renderer
+    // already draws padded and trimmed names identically.
     title:
       (input.name !== undefined
         ? normalizeTemplateName(input.name)

@@ -26,6 +26,7 @@ const PROVIDERS: { id: Provider; label: string }[] = [
   { id: "deepseek", label: "DeepSeek" },
   { id: "openrouter", label: "OpenRouter" },
   { id: "openai-compatible", label: "OpenAI-compatible" },
+  { id: "typesafe", label: "TypeSafe (Jev)" },
 ];
 
 type RateKey = "input" | "cachedInput" | "cacheWrite" | "output";
@@ -57,10 +58,10 @@ function rate(text: string): number | undefined {
   return trimmed === "" ? undefined : Number(trimmed);
 }
 
-// THE TENANT'S OWN PRICES (issue #865). The price table is public list prices; a tenant that pays
-// something else (a negotiated discount, Azure or Bedrock, its own server) writes what it pays here,
-// and every call on that provider and model is priced with it from the next call on. The rows
-// already in the ledger keep the price they were written with.
+// The tenant's own prices. The price table is public list prices; a tenant that pays something else
+// (a negotiated discount, Azure or Bedrock, its own server) writes what it pays here, and every call
+// on that provider and model is priced with it from the next call on. The rows already in the
+// ledger keep the price they were written with.
 export function PriceOverridesCard({
   value,
   onSaved,
@@ -157,10 +158,10 @@ export function PriceOverridesCard({
   return (
     <Card className="flex flex-col gap-4" data-testid="price-overrides">
       <div>
-        <h2 className="font-medium text-text-primary">
+        <h2 className="text-text-primary font-medium">
           {t("priceOverrides.title", "Model prices")}
         </h2>
-        <p className="mt-0.5 text-sm text-text-muted">
+        <p className="text-text-muted mt-0.5 text-sm">
           {t(
             "priceOverrides.description",
             "The cost the console shows comes from public list prices. If this account pays something else for a model (a negotiated discount, Azure or Bedrock, its own server), write what it pays here, in USD per million tokens. An empty cache rate is charged at the input rate. It applies from the next call; calls already made keep their price.",
@@ -168,7 +169,7 @@ export function PriceOverridesCard({
         </p>
       </div>
       {rows.length === 0 && (
-        <p className="text-sm text-text-muted">
+        <p className="text-text-muted text-sm">
           {t(
             "priceOverrides.empty",
             "No prices of this account's own: every call is priced from the list.",
@@ -178,7 +179,7 @@ export function PriceOverridesCard({
       {rows.map((r, i) => (
         <div
           key={r.key}
-          className="flex flex-col gap-2 rounded-lg border border-border p-3"
+          className="border-border flex flex-col gap-2 rounded-lg border p-3"
           data-testid="price-override-row"
         >
           <div className="flex flex-wrap items-end gap-2">

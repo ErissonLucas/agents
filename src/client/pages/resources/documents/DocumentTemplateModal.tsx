@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
@@ -7,6 +7,7 @@ import {
   Modal,
   ModalCancelButton,
   type ModalController,
+  NumberInput,
   Select,
   SwitchField,
   Textarea,
@@ -15,6 +16,8 @@ import {
 } from "@/client/components";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
+import type { DocumentFieldType } from "@/modules/documents/blocks";
+import { BASE_FONT_SIZE_RANGE } from "@/modules/documents/blocks";
 import {
   documentToolName,
   slugifyTemplateName,
@@ -45,6 +48,26 @@ export interface TemplateModalPayload {
 const FONTS = ["sans", "serif", "mono"] as const;
 const MARGINS = ["narrow", "normal", "wide"] as const;
 const PAGE_SIZES = ["A4", "LETTER"] as const;
+// The validities offered in the console, in hours; the API takes any whole number from 1 to 168, and
+// a stored value outside this list is offered too, so opening the modal never rewrites it.
+const APPROVAL_TTL_PRESETS = [1, 4, 12, 24, 48, 72, 168] as const;
+
+// Where an operator connects the AI assistant that builds a template: blocks and fields are authored
+// over MCP, and this screen only edits wording. Opened in a new tab so the editor keeps its edits.
+const MCP_SETTINGS_PATH = "/settings/mcp";
+
+function McpSettingsLink({ children }: { children: React.ReactNode }) {
+  return (
+    <a
+      href={MCP_SETTINGS_PATH}
+      target="_blank"
+      rel="noreferrer"
+      className="text-accent underline-offset-2 hover:underline"
+    >
+      {children}
+    </a>
+  );
+}
 
 export function DocumentTemplateModal({
   modal,
@@ -60,7 +83,20 @@ export function DocumentTemplateModal({
   const [slug, setSlug] = useState("");
   const [description, setDescription] = useState("");
   const [numberPrefix, setNumberPrefix] = useState("");
+  // Where numbering continues, as the operator types it. A string so a cleared field is not 0.
+  const [nextNumber, setNextNumber] = useState("");
+  // Whether the operator typed it. Untouched, the field follows the prefix being typed (the server
+  // recomputes it for the destination prefix on save) and nothing about it is sent.
+  const [nextTouched, setNextTouched] = useState(false);
+  // Where numbering would continue under the prefix as typed, read from the server once it differs
+  // from the stored one; null while it matches or the answer has not come back.
+  const [prefixNext, setPrefixNext] = useState<number | null>(null);
+  // That read failed; bumping `prefixRetry` asks again.
+  const [prefixFailed, setPrefixFailed] = useState(false);
+  const [prefixRetry, setPrefixRetry] = useState(0);
   const [enabled, setEnabled] = useState(true);
+  const [requiresApproval, setRequiresApproval] = useState(false);
+  const [approvalTtlHours, setApprovalTtlHours] = useState(24);
   const [style, setStyle] = useState<Style | null>(null);
   const [texts, setTexts] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
@@ -92,7 +128,12 @@ export function DocumentTemplateModal({
     setSlug(tpl.slug);
     setDescription(tpl.description ?? "");
     setNumberPrefix(tpl.numberPrefix ?? "");
+    setNextNumber(String(tpl.nextNumber));
+    setNextTouched(false);
+    setPrefixNext(null);
     setEnabled(tpl.enabled);
+    setRequiresApproval(tpl.requiresApproval);
+    setApprovalTtlHours(tpl.approvalTtlHours);
     setStyle({ ...tpl.style });
     setTexts(initialTexts);
     baselineRef.current = JSON.stringify({
@@ -100,7 +141,10 @@ export function DocumentTemplateModal({
       slug: tpl.slug,
       description: tpl.description ?? "",
       numberPrefix: tpl.numberPrefix ?? "",
+      nextNumber: String(tpl.nextNumber),
       enabled: tpl.enabled,
+      requiresApproval: tpl.requiresApproval,
+      approvalTtlHours: tpl.approvalTtlHours,
       style: { ...tpl.style },
       texts: initialTexts,
     });
@@ -114,7 +158,10 @@ export function DocumentTemplateModal({
       slug,
       description,
       numberPrefix,
+      nextNumber,
       enabled,
+      requiresApproval,
+      approvalTtlHours,
       style,
       texts,
     }) !== baselineRef.current;
@@ -144,18 +191,10 @@ export function DocumentTemplateModal({
     );
   }, [template, texts]);
 
-  // What this modal would WRITE: the fields whose value here differs from the row it was opened on.
-  //
-  // The modal holds a snapshot from when the list was loaded, so sending every field back makes a
-  // wording-only edit overwrite a name, prefix or style an API or MCP client set in the meantime —
-  // the same multi-transport overwrite `blockText` exists to avoid for the blocks. The server's row
-  // lock serialises the writes; it cannot know that a field this request restated was never edited
-  // here.
-  //
-  // The PREVIEW is built from this too, and that is the point of it being one value: a preview
-  // assembled from the modal's whole state shows the stale style beside the new wording, while the
-  // save that follows keeps the concurrent style — the preview describing a document the apply will
-  // not produce, which is the one thing it must never do.
+  // What this modal would WRITE: only the fields that differ from the row it opened on, so a
+  // wording edit cannot overwrite a name, prefix or style an API or MCP client set meanwhile (the
+  // row lock cannot tell a restated field from an edited one). The PREVIEW is built from this same
+  // value, so it never shows a document the save would not produce.
   const changes = useMemo(() => {
     if (!template || !style) return null;
     const patch: Record<string, unknown> = {};
@@ -167,7 +206,26 @@ export function DocumentTemplateModal({
     if (numberPrefix !== (template.numberPrefix ?? "")) {
       patch.numberPrefix = numberPrefix || null;
     }
+    // Sent only when the operator moved it: the template's next number also moves on its own as
+    // documents are issued, and restating the one this modal opened on would be refused once one was.
+    // Typed back to what it opened on, with the prefix unchanged, it is an untouched number again:
+    // restating it would be refused once a document went out meanwhile, or undo another client's move.
+    if (
+      nextTouched &&
+      !(
+        nextNumber === String(template.nextNumber) &&
+        numberPrefix === (template.numberPrefix ?? "")
+      )
+    ) {
+      patch.nextNumber = Number(nextNumber);
+    }
     if (enabled !== template.enabled) patch.enabled = enabled;
+    if (requiresApproval !== template.requiresApproval) {
+      patch.requiresApproval = requiresApproval;
+    }
+    if (approvalTtlHours !== template.approvalTtlHours) {
+      patch.approvalTtlHours = approvalTtlHours;
+    }
     if (Object.keys(blockText).length > 0) patch.blockText = blockText;
     const changedStyle = Object.fromEntries(
       Object.entries(style as unknown as Record<string, unknown>).filter(
@@ -184,9 +242,21 @@ export function DocumentTemplateModal({
     slug,
     description,
     numberPrefix,
+    nextNumber,
+    nextTouched,
     enabled,
+    requiresApproval,
+    approvalTtlHours,
     blockText,
   ]);
+
+  const ttlOptions = useMemo(
+    () =>
+      [...new Set<number>([...APPROVAL_TTL_PRESETS, approvalTtlHours])].sort(
+        (a, b) => a - b,
+      ),
+    [approvalTtlHours],
+  );
 
   const draft = useMemo(() => {
     if (!template || !changes) return null;
@@ -245,9 +315,8 @@ export function DocumentTemplateModal({
       modal.close();
       onSaved();
     } catch {
-      // Eden rejects on a transport failure rather than answering `{ error }`, and only the second
-      // was handled — so an offline save closed nothing, said nothing, and left an unhandled
-      // rejection behind.
+      // NOTE: Eden rejects on a transport failure rather than answering `{ error }`, so an
+      // offline save lands here.
       if (session === sessionRef.current) {
         showToast(
           t("documents.saveError", "Could not save this template."),
@@ -259,6 +328,46 @@ export function DocumentTemplateModal({
     }
   }
 
+  // A prefix being typed moves where an untouched number continues; asked of the server, which alone
+  // knows what the tenant issued under it, after the typing settles. Answers for an older prefix or
+  // another open are dropped.
+  const templateId = template?.id ?? null;
+  const storedPrefix = template?.numberPrefix ?? "";
+  const prefixReads = useRef(0);
+  useEffect(() => {
+    const read = ++prefixReads.current;
+    setPrefixNext(null);
+    setPrefixFailed(false);
+    if (!templateId || nextTouched || numberPrefix === storedPrefix) return;
+    // Read by the effect only to ask again: a retry is a new request for the same prefix.
+    void prefixRetry;
+    const timer = setTimeout(async () => {
+      const { data } = await api.api.v1["document-templates"]({
+        id: templateId,
+      })
+        ["next-number"].get({ query: { prefix: numberPrefix } })
+        .catch(() => ({ data: null }));
+      if (read !== prefixReads.current) return;
+      if (data) setPrefixNext(data.nextNumber);
+      else setPrefixFailed(true);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [templateId, storedPrefix, numberPrefix, nextTouched, prefixRetry]);
+  // Between a prefix change and its answer the stored number belongs to the OLD prefix, so nothing
+  // is shown rather than a number the save would not print.
+  const nextPending =
+    !nextTouched &&
+    numberPrefix !== storedPrefix &&
+    prefixNext === null &&
+    !prefixFailed;
+  // Unread for the new prefix: nothing is shown either, and the save still computes it.
+  const nextUnread =
+    !nextTouched && numberPrefix !== storedPrefix && prefixFailed;
+  const shownNext = nextTouched
+    ? nextNumber
+    : nextPending || nextUnread
+      ? ""
+      : String(prefixNext ?? template?.nextNumber ?? "");
   // Answered here because the answer is a keystroke away, not because the write stopped checking:
   // this is the SAME `slugProblem` the write runs, imported rather than restated.
   //
@@ -266,8 +375,45 @@ export function DocumentTemplateModal({
   // be told something, and the modal keeps its payload after closing (Radix needs it for the exit
   // animation), so this never flashes a refusal at a form nobody has opened.
   const slugIssue = template ? slugProblem(slug) : null;
+  // The shape only, and only once the operator moved it; whether a number was already used is the
+  // server's to say, on save.
+  const nextNumberIssue =
+    template && nextTouched && !/^[1-9][0-9]{0,9}$/.test(nextNumber)
+      ? t("documents.nextNumberInvalid", "Enter a whole number from 1.")
+      : null;
+  // The tool name the current template name would derive, offered when it differs from the one the
+  // tool has; never applied by itself.
+  const derivedSlug = slugifyTemplateName(name);
+  const renameSuggestion =
+    template && derivedSlug !== slug && !slugProblem(derivedSlug)
+      ? derivedSlug
+      : null;
 
   const textBlocks = blocks.filter((b) => b.type === "text");
+  const fields = template?.fields ?? [];
+
+  // The stored values are identifiers; the operator reads these.
+  const fontLabel: Record<(typeof FONTS)[number], string> = {
+    sans: t("documents.style.fontSans", "Sans serif"),
+    serif: t("documents.style.fontSerif", "Serif"),
+    mono: t("documents.style.fontMono", "Monospaced"),
+  };
+  const marginLabel: Record<(typeof MARGINS)[number], string> = {
+    narrow: t("documents.style.marginNarrow", "Narrow"),
+    normal: t("documents.style.marginNormal", "Normal"),
+    wide: t("documents.style.marginWide", "Wide"),
+  };
+  const pageSizeLabel: Record<(typeof PAGE_SIZES)[number], string> = {
+    A4: "A4",
+    LETTER: t("documents.style.pageLetter", "Letter"),
+  };
+  const fieldTypeLabel: Record<DocumentFieldType, string> = {
+    text: t("documents.fieldType.text", "text"),
+    number: t("documents.fieldType.number", "number"),
+    date: t("documents.fieldType.date", "date"),
+    currency: t("documents.fieldType.currency", "amount"),
+    lineItems: t("documents.fieldType.lineItems", "item list"),
+  };
 
   return (
     <Modal
@@ -276,7 +422,7 @@ export function DocumentTemplateModal({
       unsavedChanges={isDirty}
       // While the save is in flight the modal stays put: closing it there is what creates the stale
       // callback in the first place, and the request cannot be taken back (docs/modals.md).
-      onCloseRequest={saving ? () => undefined : undefined}
+      busy={saving}
       title={t("documents.editTitle", "Edit document template")}
       footer={
         <div className="flex justify-end gap-2">
@@ -286,7 +432,12 @@ export function DocumentTemplateModal({
           <ModalCancelButton disabled={saving} />
           {/* Disabled on a refusal the FIELD is already explaining, in red, one line above the
               button. Sending it anyway would spend a round trip to be told what is on screen. */}
-          <Button onClick={save} loading={saving} disabled={Boolean(slugIssue)}>
+          <Button
+            onClick={save}
+            loading={saving}
+            disabled={Boolean(slugIssue || nextNumberIssue)}
+            holdOnRange
+          >
             {t("common.save", "Save")}
           </Button>
         </div>
@@ -304,15 +455,10 @@ export function DocumentTemplateModal({
           <FormField label={t("documents.name", "Name")}>
             <Input
               value={name}
-              // The name is the source of the slug, and it stays the source: every keystroke here
-              // re-derives it, so a rename renames the agent's tool instead of leaving a template
-              // called "Contrato" behind a tool called send_orcamento. A slug the operator typed by
-              // hand is overwritten by the next edit to the name, deliberately — a slug that
-              // survived it would be a second name to keep in sync by hand.
-              onChange={(e) => {
-                setName(e.target.value);
-                setSlug(slugifyTemplateName(e.target.value));
-              }}
+              // A rename keeps the agent's tool name, as an MCP or API rename does: a prompt that
+              // mentions send_orcamento keeps working, and the model still reads the new name in the
+              // tool's description. Renaming the tool is a separate, explicit act (below).
+              onChange={(e) => setName(e.target.value)}
             />
           </FormField>
           <FormField label={t("documents.description", "Description")}>
@@ -331,21 +477,95 @@ export function DocumentTemplateModal({
                 onChange={(e) => setNumberPrefix(e.target.value)}
               />
             </FormField>
-            {/* The tool name the model will be offered, and the operator's to change. It was
-                read-only, which made the rename trap unfixable from the screen that caused it: the
-                field kept showing the tool derived from the ORIGINAL name with nothing saying why.
-                The refusal shows HERE rather than in a toast, because the only thing that answers
-                it is this input. */}
-            <FormField
-              label={t("documents.toolName", "Agent tool")}
-              hint={t("documents.toolNameHint", "The agent calls it {{tool}}", {
-                tool: documentToolName(slug),
-              })}
-              error={slugIssue}
-            >
-              <Input value={slug} onChange={(e) => setSlug(e.target.value)} />
-            </FormField>
+            {/* The tool name the model will be offered, and the operator's to change, so a rename
+                can be fixed from this screen. The refusal shows HERE rather than in a toast,
+                because the only thing that answers it is this input. */}
+            <div className="flex flex-col gap-1">
+              <FormField
+                label={t("documents.toolName", "Agent tool")}
+                hint={t(
+                  "documents.toolNameHint",
+                  "The agent calls it {{tool}}",
+                  {
+                    tool: documentToolName(slug),
+                  },
+                )}
+                error={slugIssue}
+              >
+                <Input value={slug} onChange={(e) => setSlug(e.target.value)} />
+              </FormField>
+              {template && slug !== template.slug && !slugIssue ? (
+                <p className="text-warning text-xs">
+                  {t(
+                    "documents.toolRenamedWarning",
+                    "Prompts that mention {{old}} stop working once you save.",
+                    { old: documentToolName(template.slug) },
+                  )}
+                </p>
+              ) : renameSuggestion ? (
+                <p className="text-text-muted text-xs">
+                  {t(
+                    "documents.toolNameKept",
+                    "Renaming the template keeps this tool name, so prompts that mention it keep working.",
+                  )}{" "}
+                  <button
+                    type="button"
+                    className="text-accent underline-offset-2 hover:underline"
+                    onClick={() => setSlug(renameSuggestion)}
+                  >
+                    {t("documents.toolRenameTo", "Use {{tool}}", {
+                      tool: documentToolName(renameSuggestion),
+                    })}
+                  </button>
+                </p>
+              ) : null}
+            </div>
           </div>
+          <FormField
+            label={t("documents.nextNumber", "Next number")}
+            hint={
+              nextNumberIssue || nextUnread
+                ? undefined
+                : nextPending
+                  ? t(
+                      "documents.nextNumberPending",
+                      "Reading where the new prefix continues…",
+                    )
+                  : t(
+                      "documents.nextNumberHint",
+                      "The next document prints {{number}}. It cannot go back to a number already issued under this prefix; a new prefix starts a new sequence.",
+                      {
+                        number: `${numberPrefix}${shownNext.padStart(4, "0")}`,
+                      },
+                    )
+            }
+            error={nextNumberIssue}
+          >
+            <Input
+              inputMode="numeric"
+              className="sm:max-w-48"
+              value={shownNext}
+              onChange={(e) => {
+                setNextTouched(true);
+                setNextNumber(e.target.value.trim());
+              }}
+            />
+          </FormField>
+          {nextUnread && (
+            <p className="text-text-muted -mt-2 text-xs">
+              {t(
+                "documents.nextNumberUnread",
+                "Could not read where the new prefix continues; saving still computes it.",
+              )}{" "}
+              <button
+                type="button"
+                className="text-accent underline-offset-2 hover:underline"
+                onClick={() => setPrefixRetry((n) => n + 1)}
+              >
+                {t("common.retry", "Retry")}
+              </button>
+            </p>
+          )}
 
           {style && (
             <div className="grid gap-3 sm:grid-cols-2">
@@ -361,16 +581,14 @@ export function DocumentTemplateModal({
                 >
                   {FONTS.map((f) => (
                     <option key={f} value={f}>
-                      {f}
+                      {fontLabel[f]}
                     </option>
                   ))}
                 </Select>
               </FormField>
               <FormField label={t("documents.style.size", "Base font size")}>
-                <Input
-                  type="number"
-                  min={8}
-                  max={14}
+                <NumberInput
+                  range={BASE_FONT_SIZE_RANGE}
                   value={style.baseFontSize}
                   onChange={(e) =>
                     setStyle({ ...style, baseFontSize: Number(e.target.value) })
@@ -389,7 +607,7 @@ export function DocumentTemplateModal({
                     onChange={(e) =>
                       setStyle({ ...style, accentColor: e.target.value })
                     }
-                    className="h-9 w-12 rounded border border-border bg-bg-secondary"
+                    className="border-border bg-bg-secondary h-9 w-12 rounded border"
                   />
                   <Input
                     value={style.accentColor}
@@ -411,7 +629,7 @@ export function DocumentTemplateModal({
                 >
                   {MARGINS.map((m) => (
                     <option key={m} value={m}>
-                      {m}
+                      {marginLabel[m]}
                     </option>
                   ))}
                 </Select>
@@ -428,7 +646,7 @@ export function DocumentTemplateModal({
                 >
                   {PAGE_SIZES.map((p) => (
                     <option key={p} value={p}>
-                      {p}
+                      {pageSizeLabel[p]}
                     </option>
                   ))}
                 </Select>
@@ -455,25 +673,100 @@ export function DocumentTemplateModal({
           />
 
           <div className="flex flex-col gap-2">
-            <p className="font-medium text-sm text-text-primary">
+            <SwitchField
+              label={t(
+                "documents.requiresApproval",
+                "A person approves each document before the customer gets it",
+              )}
+              checked={requiresApproval}
+              onCheckedChange={setRequiresApproval}
+            />
+            {requiresApproval && (
+              <FormField
+                label={t("documents.approvalTtl", "The request waits for")}
+                hint={t(
+                  "documents.approvalTtlHint",
+                  "If nobody decides by then, the request expires and nothing is sent.",
+                )}
+              >
+                <Select
+                  value={String(approvalTtlHours)}
+                  onChange={(e) => setApprovalTtlHours(Number(e.target.value))}
+                >
+                  {ttlOptions.map((h) => (
+                    <option key={h} value={h}>
+                      {h % 24 === 0
+                        ? t("documents.approvalTtlDays", "{{count}} days", {
+                            count: h / 24,
+                          })
+                        : t("documents.approvalTtlHours", "{{count}} hours", {
+                            count: h,
+                          })}
+                    </option>
+                  ))}
+                </Select>
+              </FormField>
+            )}
+          </div>
+
+          <div className="flex flex-col gap-2">
+            <p className="text-text-primary text-sm font-medium">
               {t("documents.textBlocks", "Text")}
             </p>
-            <p className="text-text-muted text-xs">
-              {t(
-                "documents.textBlocksHint",
-                "Only the wording is editable here. Adding, removing or reordering blocks is done through the API or MCP.",
-              )}
-            </p>
+            {/* One pointer to the MCP settings at a time: the empty-state box below carries it for
+                a template with no fields, this line for every other. */}
+            {fields.length > 0 && (
+              <p className="text-text-muted text-xs">
+                {t(
+                  "documents.textBlocksBuildHint",
+                  "Only the wording is editable here. To add, remove or reorder blocks and fields, ask your AI assistant connected over MCP.",
+                )}{" "}
+                <McpSettingsLink>
+                  {t("documents.mcpHowToConnect", "How to connect")}
+                </McpSettingsLink>
+              </p>
+            )}
+            {fields.length === 0 && (
+              // The blank starter lands here with nothing to edit, so the screen says how a template
+              // gets its content instead of showing an empty list.
+              <div className="border-accent/40 bg-accent-soft flex flex-col gap-1 rounded-lg border p-3">
+                <p className="text-text-primary text-sm font-medium">
+                  {t(
+                    "documents.buildWithAiTitle",
+                    "Build this template with AI",
+                  )}
+                </p>
+                <p className="text-text-secondary text-xs">
+                  {t(
+                    "documents.buildWithAiBody",
+                    'Ask your AI assistant connected over MCP (Claude, Codex, Cursor) to add what the agent fills in and the text around it, for example: "set up a quote with the client\'s name, a list of services and a validity date". The preview here updates when you reopen the template.',
+                  )}
+                </p>
+                <p className="text-xs">
+                  <McpSettingsLink>
+                    {t(
+                      "documents.buildWithAiLink",
+                      "Connect an AI assistant in Settings > MCP",
+                    )}
+                  </McpSettingsLink>
+                </p>
+              </div>
+            )}
             {textBlocks.length === 0 ? (
-              <p className="text-sm text-text-muted">
+              <p className="text-text-muted text-sm">
                 {t(
                   "documents.noTextBlocks",
                   "This template has no text block.",
                 )}
               </p>
             ) : (
-              textBlocks.map((b) => (
-                <FormField key={b.id} label={b.id}>
+              textBlocks.map((b, i) => (
+                <FormField
+                  key={b.id}
+                  label={t("documents.textBlockLabel", "Text {{n}}", {
+                    n: i + 1,
+                  })}
+                >
                   <Textarea
                     rows={4}
                     value={texts[b.id] ?? ""}
@@ -487,32 +780,39 @@ export function DocumentTemplateModal({
           </div>
 
           <div className="flex flex-col gap-1">
-            <p className="font-medium text-sm text-text-primary">
+            <p className="text-text-primary text-sm font-medium">
               {t("documents.fields", "Fields the agent fills")}
             </p>
-            <div className="flex flex-wrap gap-1.5">
-              {(template?.fields ?? []).map((f) => (
-                <span
-                  key={f.name}
-                  className="rounded border border-border bg-bg-secondary px-2 py-0.5 font-mono text-text-secondary text-xs"
-                >
-                  {`${f.name}: ${f.type}${f.required ? " *" : ""}`}
-                </span>
-              ))}
-            </div>
+            {fields.length === 0 ? (
+              <p className="text-text-muted text-sm">
+                {t("documents.noFields", "No fields yet.")}
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-1.5">
+                {fields.map((f) => (
+                  <span
+                    key={f.name}
+                    className="border-border bg-bg-secondary text-text-secondary rounded border px-2 py-0.5 text-xs"
+                  >
+                    {f.label}
+                    <span className="text-text-muted">
+                      {` · ${fieldTypeLabel[f.type as DocumentFieldType] ?? f.type}`}
+                    </span>
+                    {f.required && (
+                      <span className="text-text-muted">
+                        {` · ${t("documents.fieldRequiredShort", "required")}`}
+                      </span>
+                    )}
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
-        {/* `self-start` is what makes the sticky actually stick. A grid item stretches to the
-            row height by default, so `sticky` has nothing to travel within and the preview scrolls
-            away as soon as the form below it is longer than the viewport — which is exactly when it
-            is being used.
-
-            And `h-`, not `max-h-`, for the other half of the same fact: `self-start` also removes
-            the stretch that WAS giving this column a height, so a ceiling leaves the box sitting at
-            `min-h-96` and the iframe's `h-full` resolving against nothing. The document then
-            rendered into 384px of a modal twice that tall. A definite height is what both `sticky`
-            and the iframe need. */}
+        {/* `self-start` makes the sticky stick: a stretched grid item leaves `sticky` nothing to
+            travel within. `h-`, not `max-h-`: without the stretch the column needs a definite
+            height, or the iframe's `h-full` resolves against nothing and sits at `min-h-96`. */}
         <DocumentPreview
           state={preview}
           className="min-h-96 lg:sticky lg:top-0 lg:h-[70vh] lg:self-start"

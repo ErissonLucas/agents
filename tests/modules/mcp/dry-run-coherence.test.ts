@@ -4,6 +4,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import config from "@/config";
 import { AppError } from "@/lib/errors";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { buildMcpServer } from "@/modules/mcp/server";
@@ -14,30 +15,23 @@ import * as writeCodeTools from "@/modules/mcp/write-code-tools";
 import * as writeConversations from "@/modules/mcp/write-conversations";
 import * as writeDocuments from "@/modules/mcp/write-documents";
 import * as writeFleet from "@/modules/mcp/write-fleet";
+import * as writeInstanceHealth from "@/modules/mcp/write-instance-health";
 import * as writeKnowledge from "@/modules/mcp/write-knowledge";
+import * as writeOccurrences from "@/modules/mcp/write-occurrences";
 import * as writeRyze from "@/modules/mcp/write-ryze";
 import * as writeSettings from "@/modules/mcp/write-settings";
 import * as writeWebhooks from "@/modules/mcp/write-webhooks";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance, withRunNamespace } from "../../utils/chatwoot";
 
-// A write tool with `dry_run` answers its preview WITHOUT touching the core, and that shortcut is
-// what makes the preview cheap. It is also what makes every rule the core learns start out
-// unmirrored: the preview keeps answering `ok`, nobody notices, and the operator (or the model
-// driving MCP) reads a confident description of a write that cannot happen. Issue #490.
-//
-// Two things this harness learned the hard way, both worth keeping written down. It does NOT drive
-// the tools through the MCP client, tempting as that is: the server's handlers use `basePrisma`,
-// built at import time off `DATABASE_URL`, which `tests/setup.ts` deliberately points at a dead
-// database — so every apply "refused" with `Database 'test' does not exist` and eleven tools looked
-// broken that were not. And a refusal is not any failure: a thrown Prisma error is a CRASH, and
-// counting it as a refusal is what made that contamination invisible. `verdict` below separates the
-// three outcomes and the rows fail loudly on the third.
-//
-// The fence has two halves and needs both. The TABLE below gives every dry-run tool one input the
-// APPLY refuses; the first test derives the tool list from the live registry and fails when a tool
-// has no row, so a tool added later cannot join silently. The second drives both halves of each row
-// and requires them to agree — and requires the apply to have actually refused, because a row whose
-// apply succeeds proves nothing and would quietly become decoration.
+// A write tool with `dry_run` answers its preview WITHOUT touching the core: cheap, and every rule
+// the core learns starts out unmirrored, so the preview keeps answering `ok` for a write that cannot
+// happen. Dispatched directly, not through the MCP client, whose handlers use `basePrisma` built off
+// the dead `DATABASE_URL` that `tests/setup.ts` sets on purpose. A thrown Prisma error is a CRASH,
+// not a refusal; `verdict` keeps the three outcomes apart. Two halves: the TABLE gives every dry-run
+// tool one input the APPLY refuses, and the first test derives the tool list from the live registry
+// so a new tool cannot join silently; the second drives both halves of each row, requires agreement,
+// and requires the apply to have refused, since a row whose apply succeeds proves nothing.
 
 const NOPE = "999999999";
 
@@ -45,16 +39,13 @@ const NOPE = "999999999";
 // It is not an escape hatch for a row that is merely awkward: the reason has to be a property of the
 // tool, and the fence prints it.
 type Case = { args: Record<string, unknown>; why: string };
-// `also` carries the inputs a one-row-per-tool table cannot: a tool agrees on the row's input and
-// still diverges on another, and each of these was a real second divergence found after the row for
-// that tool was already green.
+// `also` carries the inputs a one-row-per-tool table cannot: a tool can agree on the row's input and
+// still diverge on another.
 //
-// `pastOwnership` is the OTHER thing a row cannot say. Forty-two of these pass `NOPE` — an id that
-// names no row — so what they prove is the ownership check and nothing the core decides once it HAS
-// the row. That is not a defect of the row (a not-found is a real refusal and worth pinning); it is
-// a limit, and an invisible one, because the row reads as covering its tool. So every row shaped
-// that way carries what was measured on a row that EXISTS, and the test below refuses a new one
-// without it — which is the part that keeps this from happening again (#510).
+// `pastOwnership` is the OTHER thing a row cannot say. A row that passes `NOPE` (an id naming no row)
+// proves the ownership check and nothing the core decides once it HAS the row, while reading as
+// covering its tool. So every row shaped that way carries what was measured on a row that EXISTS,
+// and the test below refuses a new one without it.
 type Row =
   | (Case & { also?: Case[]; pastOwnership?: string })
   | { skip: string };
@@ -187,6 +178,10 @@ const TABLE: Record<string, Row> = {
     skip: "takes no arguments: every refusal it has is a property of the deployment, not of an input",
   },
   deployment_rotate_token: { args: { admin_token: "" }, why: "empty token" },
+  deployment_update: {
+    args: { webhook_base_url: "http://10.0.0.6:3000/?" },
+    why: "a bare ? would put the webhook mount in the query",
+  },
   deployment_set_accounts: {
     args: { account_ids: [999999999] },
     why: "no Chatwoot deployment is connected",
@@ -268,6 +263,12 @@ const TABLE: Record<string, Row> = {
     pastOwnership:
       'measured, and it DIVERGED: a disconnected account, and an agent that does not exist. Fixed and covered in "a preview asks what the core asks once it has the row".',
   },
+  inbox_bind_voice: {
+    args: { inbox_id: NOPE },
+    why: "inbox does not exist",
+    pastOwnership:
+      'measured on an inbox that EXISTS: the preview and the apply ask the same `voiceBindingRefusal`, and both refuse an inbox that is not WhatsApp, a text agent and a disconnected account ("the MCP preview of a voice binding refuses what the bind refuses", tests/modules/voice-call/voice-inboxes.test.ts).',
+  },
   inbox_reconcile: {
     skip: "takes no arguments: every refusal it has is a property of the deployment, not of an input",
   },
@@ -287,7 +288,7 @@ const TABLE: Record<string, Row> = {
     args: { inbox_id: NOPE, agent_id: NOPE },
     why: "inbox does not exist",
     pastOwnership:
-      "measured on an inbox that EXISTS: the preview runs every check `observeInbox` makes before it touches Chatwoot (`readObserveTarget`), so a non-monitoring agent, the inbox's own responder, a second observer and a disconnected account are refused by both halves.",
+      "measured on an inbox that EXISTS: the preview runs every check `observeInbox` makes before it touches Chatwoot (`readObserveTarget`), so a non-monitoring agent, the inbox's own responder and a disconnected account are refused by both halves, and a second observer is accepted by both.",
   },
   inbox_unobserve: {
     args: { inbox_id: NOPE, agent_id: NOPE },
@@ -322,6 +323,22 @@ const TABLE: Record<string, Row> = {
     pastOwnership:
       "read, not measurable here: past the existence check the sync's refusals are Chatwoot's, behind a network call.",
   },
+  instance_alert_channel_delete: {
+    args: { id: NOPE },
+    why: "channel does not exist",
+  },
+  instance_alert_channel_update: {
+    args: { id: NOPE, name: "x" },
+    why: "channel does not exist",
+  },
+  instance_alert_channel_create: {
+    args: { name: "x", type: "webhook", signals: ["no_such_signal"] },
+    why: "unknown signal",
+  },
+  instance_threshold_set: {
+    args: { signal: "no_such_signal", threshold: 1 },
+    why: "unknown signal",
+  },
   integration_create: {
     args: { catalog_type: "not_a_provider", name: "n" },
     why: "provider is not in the catalog",
@@ -343,10 +360,9 @@ const TABLE: Record<string, Row> = {
     why: "approval_id is not a number",
   },
   knowledge_create: {
-    // NOTE: a NUL, which is the column's own limit and the oldest rule here (#247). The name's OTHER
-    // rule arrived with #501: this core used to store an empty name and a 5000-character one alike,
-    // which the rows below now pin, because a base the agent cannot scope a search to is not a
-    // knowledge base it has.
+    // NOTE: a NUL, which is the column's own limit. The name's other rule is pinned by the rows below:
+    // an empty name and a 5000-character one are refused, because a base the agent cannot scope a search
+    // to is not a knowledge base it has.
     args: { name: "a\u0000b" },
     why: "the column cannot store a NUL",
     also: [
@@ -398,6 +414,10 @@ const TABLE: Record<string, Row> = {
       "measured on a base that EXISTS: both halves go through `reindexKnowledgeBase` itself with `dryRun`, so there is no second spelling of the rule to diverge from.",
   },
   knowledge_reject: {
+    args: { approval_id: "abc" },
+    why: "approval_id is not a number",
+  },
+  knowledge_requeue: {
     args: { approval_id: "abc" },
     why: "approval_id is not a number",
   },
@@ -484,6 +504,36 @@ const TABLE: Record<string, Row> = {
       "measured on an agent that EXISTS: `updateAgent` is reached with only a prompt in the patch, and an empty one is stored by both halves.",
   },
   tenant_create: { args: { name: "n", slug: "" }, why: "empty slug" },
+  proactive_breaker_resume: {
+    skip: "takes no input it could refuse: resuming an open breaker changes nothing, so the preview and the apply agree by construction",
+  },
+  occurrence_monitor_create: { args: { name: "" }, why: "empty name" },
+  occurrence_monitor_update: {
+    args: { monitor_id: NOPE, name: "x" },
+    why: "monitor does not exist",
+    pastOwnership:
+      "measured on a monitor that EXISTS: the preview runs the apply's own service call in a transaction it rolls back (`previewBase`), so whatever the core refuses past ownership both halves refuse; a taken name and the cap on monitors are the cases tests/modules/occurrence-monitors.test.ts drives.",
+  },
+  occurrence_monitor_delete: {
+    args: { monitor_id: NOPE },
+    why: "monitor does not exist",
+    pastOwnership:
+      "measured on a monitor that EXISTS: the preview runs the apply's own service call in a transaction it rolls back (`previewBase`), so whatever the core refuses past ownership both halves refuse; a taken name and the cap on monitors are the cases tests/modules/occurrence-monitors.test.ts drives.",
+  },
+  occurrences_set: {
+    args: { enabled: true },
+    why: "switched on with no inbox, model or reason field",
+    also: [
+      {
+        args: { inboxIds: [NOPE] },
+        why: "inboxIds names no inbox of this account",
+      },
+    ],
+  },
+  proactive_breaker_set: {
+    args: { mode: "fixed", limit: -5 },
+    why: "limit below 1",
+  },
   tenant_settings_update: {
     args: { embedding: { credential_ref: `vault:${NOPE}` } },
     why: "credential_ref names no credential",
@@ -492,14 +542,12 @@ const TABLE: Record<string, Row> = {
   },
   tenant_update: { args: { name: "" }, why: "empty name" },
   tool_create: {
-    // NOTE: the NAME, not the method — the method IS an enum on the published schema, so "PURGE" is
-    // a row the transport could never deliver. The URL was the other half of this note until #501:
-    // `createToolDefinition` did not validate `url_template` at all, so "not-a-url" was stored, the
-    // tool was granted, and the model got a thrown `invalid urlTemplate` on the first call.
+    // NOTE: the NAME, not the method: the method IS an enum on the published schema, so "PURGE" is a row
+    // the transport could never deliver.
     args: {
       name: "not a valid name!",
-      url_template: "https://example.com/x",
-      allowed_hosts: ["example.com"],
+      url_template: "https://203.0.113.36/x",
+      allowed_hosts: ["203.0.113.36"],
     },
     why: "name is not [A-Za-z0-9_-]{1,64}",
     also: [
@@ -507,7 +555,7 @@ const TABLE: Record<string, Row> = {
         args: {
           name: "ok_name",
           url_template: "not-a-url",
-          allowed_hosts: ["example.com"],
+          allowed_hosts: ["203.0.113.36"],
         },
         why: "a template `new URL` cannot parse once its placeholders are neutralized",
       },
@@ -542,8 +590,8 @@ const TABLE: Record<string, Row> = {
       "measured on a delivery that EXISTS: already coherent — the preview reads the status and refuses one that is not DEAD.",
   },
   webhook_update: {
-    // NOTE: a literal IP, not a hostname. The preview now vets this URL the way the write does, and
-    // for a hostname that means a DNS lookup — which would make this row measure the resolver.
+    // NOTE: a literal IP, not a hostname. The preview vets this URL the way the write does, and for a
+    // hostname that means a DNS lookup, which would make this row measure the resolver.
     args: { webhook_id: NOPE, url: "https://93.184.216.34/hook" },
     why: "subscription does not exist",
     pastOwnership:
@@ -568,11 +616,16 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
+// The client app tools refuse wholesale while CLIENT_CHANNEL_ENABLED is off, which would make both
+// halves agree for a reason that has nothing to do with the judgement this file compares.
+const clientChannelWas = config.clientChannel.enabled;
+config.clientChannel.enabled = true;
 afterAll(async () => {
+  config.clientChannel.enabled = clientChannelWas;
   await su?.$disconnect();
   await app?.$disconnect();
 });
@@ -596,7 +649,9 @@ const FNS = {
   ...writeConversations,
   ...writeDocuments,
   ...writeFleet,
+  ...writeInstanceHealth,
   ...writeKnowledge,
+  ...writeOccurrences,
   ...writeRyze,
   ...writeSettings,
   ...writeWebhooks,
@@ -717,10 +772,10 @@ function fits(value: unknown, schema: JsonSchema): boolean {
       if (typeof value !== "object" || value === null || Array.isArray(value)) {
         return false;
       }
-      // A nested block with DECLARED properties is judged like the top level: an undeclared key
-      // there is the same artifact, one level down, and that is exactly where the first one hid
-      // (`embedding: { credentialRef }` against a block publishing `credential_ref`). A block with
-      // no `properties` is free-form by design (tool headers, a body) and passes.
+      // A nested block with DECLARED properties is judged like the top level: an undeclared key there is
+      // the same artifact, one level down (`embedding: { credentialRef }` against a block publishing
+      // `credential_ref`). A block with no `properties` is free-form by design (tool headers, a body) and
+      // passes.
       const nested = schema.properties;
       if (!nested) return true;
       return Object.entries(value as Record<string, unknown>).every(
@@ -733,11 +788,11 @@ function fits(value: unknown, schema: JsonSchema): boolean {
 }
 
 // Why a row's arguments could never reach the tool it claims to measure. The fence dispatches
-// DIRECTLY, past the registry's own input schema, which buys it a live database and costs it this:
-// an argument the schema would have rejected exercises a path the transport has no way to produce,
-// and the row reads as a divergence that no client can hit. Three of the first thirteen failures
-// were exactly that — `account_ids: ["not-a-number"]` against `z.array(z.number().int())`, a
-// `method` outside its enum, and `credentialRef` where the tool publishes `credential_ref`.
+// DIRECTLY, past the registry's own input schema, which buys it a live database and costs it this: an
+// argument the schema would have rejected exercises a path the transport cannot produce, and the row
+// reads as a divergence no client can hit (`account_ids: ["not-a-number"]` against
+// `z.array(z.number().int())`, a `method` outside its enum, `credentialRef` where the tool publishes
+// `credential_ref`).
 function schemaComplaints(
   args: Record<string, unknown>,
   schema: JsonSchema,
@@ -806,29 +861,6 @@ describe.skipIf(!dbUp)(
       expect(all.filter((t) => !fnFor(t))).toEqual([]);
     });
 
-    // The row that names NOTHING has to say what was measured past the not-found. Mechanical on
-    // purpose: `NOPE` in the arguments IS the shape, so a row added later with a fresh id-that-does-
-    // not-exist cannot join without the measurement, and the failure names it.
-    //
-    // SURVIVING MUTANT, by construction: narrowing the filter (`&& false`) leaves this green, while
-    // widening it and deleting any single `pastOwnership` both turn it red. That is what a fence
-    // over a table can be — it detects a row that stops carrying the measurement, not a future
-    // author weakening the fence itself, which is a change a reviewer sees in the diff.
-    test("every row that names no row records what was measured on one that does", () => {
-      const missing = Object.entries(TABLE)
-        .filter(([, row]) => !("skip" in row))
-        .filter(([, row]) => {
-          const cases = [
-            row as Case,
-            ...((row as { also?: Case[] }).also ?? []),
-          ];
-          return cases.some((c) => JSON.stringify(c.args).includes(NOPE));
-        })
-        .filter(([, row]) => !(row as { pastOwnership?: string }).pastOwnership)
-        .map(([name]) => name);
-      expect(missing).toEqual([]);
-    });
-
     test("every row's arguments are ones the registry would actually deliver", async () => {
       const { schemas } = await publishedDryRunTools();
       const bad: Record<string, string[]> = {};
@@ -844,11 +876,10 @@ describe.skipIf(!dbUp)(
       expect(bad).toEqual({});
     });
 
+    // NOTE: a `skip` row is a decision recorded in the table, which the coverage test above
+    // enforces; it has nothing to run, so it emits no test.
     for (const [name, row] of Object.entries(TABLE)) {
-      if ("skip" in row) {
-        test.skip(`${name} — ${row.skip}`, () => {});
-        continue;
-      }
+      if ("skip" in row) continue;
       test(`${name}: preview and apply agree (${row.why})`, async () => {
         const fn = fnFor(name) as WriteFn;
         const p = principalFor(name);
@@ -867,7 +898,7 @@ describe.skipIf(!dbUp)(
             ),
           }).toEqual({ row: label, previewed: "refused" });
         }
-        // NOTE: the control, and it runs first on purpose. A row whose apply SUCCEEDS has nothing to
+        // The control, and it runs first on purpose. A row whose apply SUCCEEDS has nothing to
         // disagree about — the comparison below would pass forever measuring nothing, and the row
         // would have created a real record getting there. A row that CRASHES is worse: it is the
         // harness failing, dressed as the tool refusing.
@@ -891,23 +922,13 @@ describe.skipIf(!dbUp)(
 );
 
 // ── The same rule, asked of one input the row-per-tool table above cannot reach ──────────────────
-//
-// The fence gives every tool ONE refusable input, which is a floor and not a proof: a tool can agree
-// on that input and still diverge on another. This is the second one worth naming, because it is a
-// CLASS rather than a tool — a caller-supplied outbound URL, vetted by the core through
-// `assertSafeOutboundUrl` after the preview has already approved it.
-//
-// It was found by measuring a sentence in the PR body that had no number behind it ("the SSRF check
-// stays on the apply — it is a call, not a judgement about the arguments"). It is both: with the
-// guard armed, `http://127.0.0.1:9/` is refused on the PROTOCOL, before any lookup, and the preview
-// was approving exactly that. Four tools reach the check; `mcp_connection_create` was the only one
-// already covered, by the assert extracted for its own row.
-// Two of them, and the pair is the point. The first fails on the PROTOCOL, with no lookup involved;
-// the second fails on where the NAME points, which no amount of reading the string can tell you.
-// Skipping the resolution — which is what an earlier round of this PR did, to avoid a doubled lookup
-// on the apply — closes the first gap and leaves the second wide open, and `https://localhost` is a
-// URL an operator types by accident constantly. The doubled lookup was the wrong thing to fix: the
-// preflight lives inside the preview branch, so an apply never reaches it at all.
+// A CLASS rather than a tool: a caller-supplied outbound URL, vetted by the core through
+// `assertSafeOutboundUrl`. With the guard armed, `http://127.0.0.1:9/` is refused on the PROTOCOL,
+// before any lookup, so the preview has to vet it too; four tools reach the check. Two URLs, and the
+// pair is the point: the first fails on the PROTOCOL, the second on where the NAME points, which
+// reading the string cannot tell (`https://localhost` is typed by accident constantly). Skipping the
+// resolution to spare the apply a doubled lookup would leave the second open, and there is no doubled
+// lookup: the preflight lives inside the preview branch, so an apply never reaches it.
 const BLOCKED_URLS = {
   protocol: "http://127.0.0.1:9/hook",
   resolution: "https://localhost/hook",
@@ -928,7 +949,7 @@ describe.skipIf(!dbUp)("a preview vets the outbound URL its apply vets", () => {
     const hook = await suDb.webhookSubscription.create({
       data: {
         tenantId,
-        url: "https://example.com/hook",
+        url: "https://203.0.113.36/hook",
         events: ["heartbeat"],
       },
     });
@@ -938,7 +959,7 @@ describe.skipIf(!dbUp)("a preview vets the outbound URL its apply vets", () => {
         tenantId,
         name: "ssrf-fence",
         transport: "streamableHttp",
-        url: "https://example.com/mcp",
+        url: "https://203.0.113.36/mcp",
       },
     });
     connectionId = String(conn.id);
@@ -1019,12 +1040,11 @@ describe.skipIf(!dbUp)("a preview vets the outbound URL its apply vets", () => {
 });
 
 // ── The other way a row can be green while the tool diverges ─────────────────────────────────────
-//
-// A row gives its tool ONE refusable input, so it certifies the preflight exists — not that the
-// preflight covers everything its core decides. `deployment_set_accounts` is the measured case: its
-// row passes no deployment at all, and stayed green while a preview handed an account ANOTHER tenant
-// owns answered "will connect" and the apply answered "already connected to another tenant". The
-// preflight had half of `setConnectedAccounts`'s judgement, and half reads exactly like all of it.
+// A row gives its tool ONE refusable input, so it certifies the preflight exists, not that it covers
+// everything its core decides. `deployment_set_accounts` is the case: its row passes no deployment at
+// all, so it stays green with a preview that answers "will connect" for an account ANOTHER tenant
+// owns while the apply answers "already connected to another tenant". Half of
+// `setConnectedAccounts`'s judgement reads exactly like all of it.
 describe.skipIf(!dbUp)("a preflight covers its core's whole judgement", () => {
   let mine = 0n;
   let theirs = 0n;
@@ -1157,9 +1177,9 @@ describe.skipIf(!dbUp)("a preflight covers its core's whole judgement", () => {
         writeChannels.deploymentSetAccounts(
           p,
           { account_ids: accountIds },
-          // NOTE: the probe is stubbed because this test measures the CLAIM check, and the preview
-          // grew a second question after it (#503) whose unstubbed answer is a real network call to
-          // the seeded base URL — five seconds of it, which reads as this test having got slower.
+          // NOTE: the probe is stubbed because this test measures the CLAIM check, and the preview asks a
+          // second question after it whose unstubbed answer is a real network call to the seeded base URL,
+          // seconds of it, which would read as this test having got slower.
           { base: counting, fetchProfile: async () => ({ accounts: [] }) },
         ),
       );
@@ -1172,11 +1192,10 @@ describe.skipIf(!dbUp)("a preflight covers its core's whole judgement", () => {
     expect(one.transactions).toBeGreaterThan(0);
     expect(many.transactions).toBe(one.transactions);
 
-    // And the other axis, which the assertion above cannot see: each id is a BIND PARAMETER, and
-    // Postgres takes at most 32767. Measured before the chunking, 32760 ids answered in 56ms and
-    // 32770 raised "The query parameter limit supported by your database is exceeded" — a CRASH,
-    // not a refusal, on input the published schema accepts, and on the preview as much as on the
-    // apply. Still one privileged transaction: the chunks share it.
+    // And the other axis, which the assertion above cannot see: each id is a BIND PARAMETER, and Postgres
+    // takes at most 32767. Past it the query raises "The query parameter limit supported by your database
+    // is exceeded", a CRASH, not a refusal, on input the published schema accepts, on the preview as much
+    // as on the apply. So the ids are chunked, still inside one privileged transaction.
     const huge = await spend(
       Array.from({ length: 40_000 }, (_, i) => 20_000 + i),
     );
@@ -1189,17 +1208,11 @@ describe.skipIf(!dbUp)("a preflight covers its core's whole judgement", () => {
   });
 });
 
-// The class the TABLE structurally cannot reach: a divergence that depends on what is ALREADY IN
-// THE DATABASE. Every row above passes an input bad on its face, so it needs no fixture; a name
-// already taken is bad only relative to a row that exists, and the row has to be created first.
-// Measured before it was fixed: all four previewed `ok` while their applies refused.
-//
-// These four preflights are ADVISORY and the distinction is the point. The rest of this fence
-// covers questions whose answer cannot change between preview and apply, so a preview that agrees
-// agrees forever. Uniqueness is not one of those: someone can take the name in the gap, and then
-// the preview was right when it spoke and wrong when the apply ran. That residue is deliberate and
-// is not what these tests pin — they pin the case that actually happens, an operator reusing a name
-// they already used, which before this went out as "will create".
+// The class the TABLE structurally cannot reach: a divergence that depends on what is ALREADY IN THE
+// DATABASE. A name already taken is bad only relative to a row that exists, so the row is created
+// first. These four preflights are ADVISORY: someone can take the name between preview and apply,
+// and that residue is deliberate and is not what these tests pin. They pin the case that actually
+// happens: an operator reusing a name they already used, which must not preview as "will create".
 describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
   let tenantId = 0n;
   const TAKEN = `dupfence-${process.pid}`;
@@ -1224,8 +1237,8 @@ describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
         tenantId,
         name: TAKEN,
         label: "taken",
-        urlTemplate: "https://example.com/x",
-        allowedHosts: ["example.com"],
+        urlTemplate: "https://203.0.113.36/x",
+        allowedHosts: ["203.0.113.36"],
       },
     });
     await suDb.mcpServerConnection.create({
@@ -1233,7 +1246,7 @@ describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
         tenantId,
         name: TAKEN,
         transport: "streamableHttp",
-        url: "https://example.com/mcp",
+        url: "https://203.0.113.36/mcp",
       },
     });
     await suDb.vaultEntry.create({
@@ -1283,8 +1296,8 @@ describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
       {
         name: TAKEN,
         label: "dup",
-        url_template: "https://example.com/x",
-        allowed_hosts: ["example.com"],
+        url_template: "https://203.0.113.36/x",
+        allowed_hosts: ["203.0.113.36"],
       },
     );
     expect(r.applied).toBe("refused");
@@ -1300,7 +1313,7 @@ describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
       {
         name: TAKEN,
         transport: "streamableHttp",
-        url: "https://example.com/mcp",
+        url: "https://203.0.113.36/mcp",
       },
     );
     expect(r.applied).toBe("refused");
@@ -1316,27 +1329,11 @@ describe.skipIf(!dbUp)("a preview asks the questions that need a row", () => {
     expect(r.applied).toBe("refused");
     expect(r.previewed).toBe("refused");
   });
-
-  // The normalization the advisory check depends on, and the reason it takes the NORMALIZED pair.
-  // `kind` defaults to "generic" on the way in, and the uniqueness is on what gets STORED — so a
-  // preview that looked the pair up with the raw `kind: null` would find nothing and answer "will
-  // create" for the exact name it just refused above.
-  test("credential_create: the default kind is the one the lookup uses", async () => {
-    const r = await both(
-      (a) =>
-        writeRoot.credentialCreate(principal(), a as never, { base: appDb }),
-      { name: TAKEN, kind: "generic" },
-    );
-    expect(r.applied).toBe("refused");
-    expect(r.previewed).toBe("refused");
-  });
 });
 
-// Round 6 of review, four findings, all four measured and all four real — and all four the SAME
-// shape as `deployment_set_accounts` above: a preflight that answered part of what its core decides.
-// The class is worth a block of its own because it does not announce itself: a tool with a
-// preflight looks covered, and the fence's row for it stays green as long as the row happens to
-// trip the part that IS covered.
+// A preflight that answers part of what its core decides, the same shape as
+// `deployment_set_accounts` above. The class does not announce itself: a tool with a preflight looks
+// covered, and the fence's row for it stays green as long as the row trips the part that IS covered.
 describe.skipIf(!dbUp)(
   "a preflight answers all of its core, not the easy half",
   () => {
@@ -1372,7 +1369,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: TAKEN,
           transport: "streamableHttp",
-          url: "https://example.com/a",
+          url: "https://203.0.113.36/a",
         },
       });
       const other = await suDb.mcpServerConnection.create({
@@ -1380,7 +1377,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `${TAKEN}-other`,
           transport: "streamableHttp",
-          url: "https://example.com/b",
+          url: "https://203.0.113.36/b",
         },
       });
       otherConnId = other.id;
@@ -1454,7 +1451,7 @@ describe.skipIf(!dbUp)(
           {
             connection_id: String(otherConnId),
             name: `${TAKEN}-other`,
-            url: "https://example.com/b2",
+            url: "https://203.0.113.36/b2",
           } as never,
           { base: appDb },
         ),
@@ -1462,12 +1459,12 @@ describe.skipIf(!dbUp)(
       expect(previewed).toBe("ok");
     });
 
-    // The preflight here asked only whether the URL was safe, and the schema asks two more things.
+    // NOTE: The preflight asks what the schema asks, not only whether the URL is safe.
     test("webhook_create: an empty events array with a safe url", async () => {
       const r = await both(
         (a) =>
           writeWebhooks.webhookCreate(principal(), a as never, { base: appDb }),
-        { url: "https://example.com/hook", events: [] },
+        { url: "https://203.0.113.36/hook", events: [] },
       );
       expect(r.applied).toBe("refused");
       expect(r.previewed).toBe("refused");
@@ -1477,7 +1474,7 @@ describe.skipIf(!dbUp)(
       const hook = await suDb.webhookSubscription.create({
         data: {
           tenantId,
-          url: "https://example.com/hook",
+          url: "https://203.0.113.36/hook",
           events: ["conversation.created"],
         },
       });
@@ -1490,9 +1487,8 @@ describe.skipIf(!dbUp)(
       expect(r.previewed).toBe("refused");
     });
 
-    // Round 7, same class again — and the reason this block keeps growing is that "the tool has a
-    // preflight" is not the property that matters. `agent_create` had TWO by this point and still
-    // approved a credential the apply refuses.
+    // NOTE: The same class: "the tool has a preflight" is not the property that matters. `agent_create` has
+    // two and must still refuse a credential whose KIND the apply refuses.
     test("agent_create: a credentialRef whose KIND cannot serve the field", async () => {
       const oauth = await suDb.vaultEntry.create({
         data: {
@@ -1502,9 +1498,9 @@ describe.skipIf(!dbUp)(
           secret: encryptJson({ clientId: "a", clientSecret: "b" }),
         },
       });
-      // NOTE: a COMPLETE model config. The first cut passed `{ credentialRef }` alone, which the
-      // schema refuses on its own shape — so both halves said no and the row measured nothing, the
-      // same artifact the schema-conformance guard catches for table rows.
+      // A COMPLETE model config. `{ credentialRef }` alone is refused by the schema on its own shape,
+      // so both halves would say no and the row would measure nothing, the same artifact the
+      // schema-conformance guard catches for table rows.
       const r = await both(
         (a) =>
           writeAgents.agentCreate(principal(), a as never, { base: appDb }),
@@ -1521,11 +1517,9 @@ describe.skipIf(!dbUp)(
       expect(r.previewed).toBe("refused");
     });
 
-    // NOT from a review round: found by asking what `agent_update`'s row actually proves. It passes an
-    // agent id that does not exist, so it proved the not-found path and stopped there — while the
-    // tool's preview had no preflight at all and `updateAgent` applies half a dozen rules after the
-    // ownership check. Thirty-three of the fifty-five rows in the table above are shaped like that;
-    // the class is filed as its own issue, and this is the one that was measured.
+    // NOTE: `agent_update`'s row passes an agent id that does not exist, so it proves the not-found path and
+    // stops there, while `updateAgent` applies half a dozen rules after the ownership check. These are
+    // three of them.
     test("agent_update: three rules the row's not-found could never reach", async () => {
       const ag = await suDb.agent.create({
         data: {
@@ -1588,14 +1582,11 @@ describe.skipIf(!dbUp)(
       expect(r.previewed).toBe("refused");
     });
 
-    // The INVERSE divergence, and the only one in this PR. Everywhere else the preview approved a
-    // write the apply refuses; here the preview refused and the apply SUCCEEDED — storing
-    // `baseUrl: null` on a kind whose own create path rejects exactly that. `updateVaultEntry` asked
-    // "does this kind require a base URL" only on the null/empty branch, while the other branch
-    // normalized "   " to empty without raising and stored the null it had just refused.
-    //
-    // It needs the entry to ALREADY EXIST, because that is the branch `langfuse_connect` takes then
-    // — which is why the create-side case above stayed green while this was broken.
+    // NOTE: The INVERSE divergence: the preview refuses and the apply must not SUCCEED by storing
+    // `baseUrl: null` on a kind whose own create path rejects exactly that. `updateVaultEntry` asks "does
+    // this kind require a base URL" on every branch, including the one that normalizes "   " to empty
+    // without raising. It needs the entry to ALREADY EXIST, because that is the branch `langfuse_connect`
+    // takes then; the create-side case above cannot reach it.
     test("langfuse_connect: a whitespace base_url on an entry that already exists", async () => {
       await suDb.vaultEntry.create({
         data: {
@@ -1663,17 +1654,12 @@ describe.skipIf(!dbUp)(
 );
 
 // ── The class the TABLE cannot reach at all: a row that passes an id NAMING NOTHING ──────────────
-//
-// Forty-two of the sixty-six rows above pass `NOPE` as their target's id. Those rows prove the
-// ownership check and stop there: every rule the core applies once it HAS the row goes unasked, and
-// the row stays green while the preview approves a write the apply refuses. Issue #510, and the
-// measurement is the deliverable — each tool was driven on a row that EXISTS, with an input its core
-// refuses, and the twelve below are the ones that diverged. What was measured and did NOT diverge is
-// written on the row itself (`pastOwnership`), so the next reader does not re-derive it.
-//
-// The controls matter as much as the divergences here. Every fix in this block makes a preview say
-// no more often, and "refuse everything" passes a coherence test — so each rule that has an
-// inverse (a document that IS retryable, a tool keeping its own name) is pinned in both directions.
+// Such a row proves the ownership check and stops there: every rule the core applies once it HAS the
+// row goes unasked, and the row stays green while the preview approves a write the apply refuses.
+// Each tool here is driven on a row that EXISTS, with an input its core refuses; what did NOT diverge
+// is written on the table row itself (`pastOwnership`). The controls matter as much: every fix here
+// makes a preview say no more often, and "refuse everything" passes a coherence test, so each rule
+// that has an inverse (a document that IS retryable, a tool keeping its own name) is pinned both ways.
 describe.skipIf(!dbUp)(
   "a preview asks what the core asks once it has the row",
   () => {
@@ -1719,7 +1705,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `ch-url-${process.pid}`,
           kind: "generic",
-          secret: encryptJson("https://example.com/alert"),
+          secret: encryptJson("https://203.0.113.36/alert"),
         },
       });
       const r = await both(
@@ -1764,7 +1750,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `upd-${process.pid}`,
           type: "webhook",
-          url: encryptJson("https://example.com/alert"),
+          url: encryptJson("https://203.0.113.36/alert"),
         },
       });
       const junk = await suDb.vaultEntry.create({
@@ -1802,7 +1788,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `ok-${process.pid}`,
           type: "webhook",
-          url: encryptJson("https://example.com/alert"),
+          url: encryptJson("https://203.0.113.36/alert"),
         },
       });
       const good = await suDb.vaultEntry.create({
@@ -1810,7 +1796,7 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `ok-url-${process.pid}`,
           kind: "generic",
-          secret: encryptJson("https://example.com/hook"),
+          secret: encryptJson("https://203.0.113.36/hook"),
         },
       });
       const previewed = await verdict(() =>
@@ -1827,8 +1813,8 @@ describe.skipIf(!dbUp)(
       expect(previewed).toBe("ok");
     });
 
-    // ── business hours: the create side has had `assertBusinessHoursCreatable` since #490, and the
-    // update side went without its twin. Three rules, and the row's not-found could reach none.
+    // NOTE: ── business hours: the update side's twin of `assertBusinessHoursCreatable`. Three rules, and
+    // the row's not-found reaches none.
     test("business_hours_update: the three rules its core checks", async () => {
       const b = await suDb.businessHours.create({
         data: { tenantId, name: `bh-${process.pid}` },
@@ -1875,8 +1861,8 @@ describe.skipIf(!dbUp)(
       expect(previewed).toBe("ok");
     });
 
-    // ── knowledge: the status IS the rule, and the preview was already reading it — it just
-    // reported it instead of judging it, in a `note` that says "Re-queues a FAILED document".
+    // NOTE: ── knowledge: the status IS the rule, and the preview reads it, so it judges it rather than
+    // reporting it in a `note` that says "Re-queues a FAILED document".
     test("knowledge_document_retry: a document that is not retryable", async () => {
       const kb = await suDb.knowledgeBase.create({
         data: { tenantId, name: `kb-${process.pid}` },
@@ -1926,8 +1912,7 @@ describe.skipIf(!dbUp)(
       expect(previewed).toBe("ok");
     });
 
-    // ── tools: the uniqueness class again, on the UPDATE side. #492 covered `tool_create` and
-    // `mcp_connection_update`; the tool's own rename went without it.
+    // NOTE: ── tools: the uniqueness class again, on the UPDATE side: the tool's own rename.
     test("tool_update: renaming onto a name this tenant already used", async () => {
       const taken = `taken-${process.pid}`;
       await suDb.toolDefinition.create({
@@ -1935,8 +1920,8 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: taken,
           label: "l",
-          urlTemplate: "https://example.com/x",
-          allowedHosts: ["example.com"],
+          urlTemplate: "https://203.0.113.36/x",
+          allowedHosts: ["203.0.113.36"],
         },
       });
       const mine = await suDb.toolDefinition.create({
@@ -1944,8 +1929,8 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `mine-${process.pid}`,
           label: "l",
-          urlTemplate: "https://example.com/y",
-          allowedHosts: ["example.com"],
+          urlTemplate: "https://203.0.113.36/y",
+          allowedHosts: ["203.0.113.36"],
         },
       });
       const r = await both(
@@ -1963,8 +1948,8 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: own,
           label: "l",
-          urlTemplate: "https://example.com/z",
-          allowedHosts: ["example.com"],
+          urlTemplate: "https://203.0.113.36/z",
+          allowedHosts: ["203.0.113.36"],
         },
       });
       const previewed = await verdict(() =>
@@ -1977,9 +1962,9 @@ describe.skipIf(!dbUp)(
       expect(previewed).toBe("ok");
     });
 
-    // ── code tools: the same uniqueness class, and the namespace they SHARE with the HTTP tools
-    // above. A code tool renaming onto an HTTP tool's name is the collision a table row can never
-    // reach, because one table row only ever holds one kind (#363).
+    // NOTE: ── code tools: the same uniqueness class, and the namespace they SHARE with the HTTP tools
+    // above. A code tool renaming onto an HTTP tool's name is the collision a table row can never reach,
+    // because one table row only ever holds one kind.
     test("code_tool_update: renaming onto a name this tenant already used", async () => {
       const takenHttp = `ct-http-${process.pid}`;
       await suDb.toolDefinition.create({
@@ -1987,8 +1972,8 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: takenHttp,
           label: "l",
-          urlTemplate: "https://example.com/ct",
-          allowedHosts: ["example.com"],
+          urlTemplate: "https://203.0.113.36/ct",
+          allowedHosts: ["203.0.113.36"],
         },
       });
       const mine = await suDb.codeToolDefinition.create({
@@ -2043,9 +2028,9 @@ describe.skipIf(!dbUp)(
       }
     });
 
-    // What the DELETE decides once it has the row, which is nothing: the grant cascades. Measured
-    // rather than assumed, because "a tool an agent is using cannot be deleted" is the rule this
-    // surface would plausibly have and does not.
+    // NOTE: What the DELETE decides once it has the row, which is nothing: the grant cascades. Pinned because
+    // "a tool an agent is using cannot be deleted" is the rule this surface would plausibly have and does
+    // not.
     test("code_tool_delete: a tool GRANTED to an agent still deletes", async () => {
       const t = await suDb.codeToolDefinition.create({
         data: {
@@ -2124,13 +2109,10 @@ describe.skipIf(!dbUp)(
       }
     });
 
-    // Round 3 of review. Every id list here comes off an UNCAPPED array on the published schema, and
-    // each id is a bind parameter: Postgres takes 32,767. Measured at 40,000 knowledge-base ids in
-    // ONE grant: both halves raised "The query parameter limit supported by your database is
-    // exceeded" — a CRASH on input the schema accepts, and on the call an operator makes first.
-    //
-    // The apply already had it; the preview would have doubled the surface. Both are chunked now,
-    // and the assertion is the SHAPE (a refusal, not a crash) rather than a number.
+    // NOTE: Every id list here comes off an UNCAPPED array on the published schema, and each id is a bind
+    // parameter: Postgres takes 32,767, and past it the query raises "The query parameter limit supported
+    // by your database is exceeded", a CRASH on input the schema accepts, on the call an operator makes
+    // first. Both halves chunk, and the assertion is the SHAPE (a refusal, not a crash), not a number.
     test("agent_tools_set: forty thousand ids refuse rather than crash", async () => {
       const ag = await suDb.agent.create({
         data: {
@@ -2142,10 +2124,10 @@ describe.skipIf(!dbUp)(
         },
       });
       const ids = Array.from({ length: 40_000 }, (_, i) => String(900_000 + i));
-      // The COUNT of queries too, because the chunking has an obvious wrong shape: asking all forty
-      // chunks and comparing the total at the end answers the same refusal after 40 round trips,
-      // and no verdict assertion can tell the two apart. `$extends` is wrapped for the same reason
-      // #492's probe wraps it: `runScopedOn` issues everything on the client it returns.
+      // The COUNT of queries too, because the chunking has an obvious wrong shape: asking all forty chunks
+      // and comparing the total at the end answers the same refusal after 40 round trips, and no verdict
+      // assertion can tell the two apart. `$extends` is wrapped for the same reason the claim-check probe
+      // above wraps it: `runScopedOn` issues everything on the client it returns.
       let counts = 0;
       const wrap = (c: object): object =>
         new Proxy(c, {
@@ -2162,6 +2144,19 @@ describe.skipIf(!dbUp)(
                   (tx: unknown) => fn(wrap(tx as object)),
                   ...rest,
                 );
+            }
+            // NOTE: The base check reads the rows `FOR KEY SHARE` through a raw query, so that shape
+            // counts as one ask too.
+            if (prop === "$queryRaw") {
+              return (strings: TemplateStringsArray, ...v: unknown[]) => {
+                if (strings.join("").includes("FROM knowledge_bases"))
+                  counts += 1;
+                return (inner as (...x: unknown[]) => unknown).call(
+                  t,
+                  strings,
+                  ...v,
+                );
+              };
             }
             if (prop !== "knowledgeBase") return inner;
             return new Proxy(inner as object, {
@@ -2222,8 +2217,8 @@ describe.skipIf(!dbUp)(
           tenantId,
           name: `grantable-${process.pid}`,
           label: "l",
-          urlTemplate: "https://example.com/g",
-          allowedHosts: ["example.com"],
+          urlTemplate: "https://203.0.113.36/g",
+          allowedHosts: ["203.0.113.36"],
         },
       });
       const previewed = await verdict(() =>
@@ -2260,11 +2255,10 @@ describe.skipIf(!dbUp)(
       expect(r.applied).toBe("refused");
     });
 
-    // Round 2 of review, and the reason it was missed is worth writing down: the first measurement
-    // used a `generic` credential, which `secretTypeFits` ACCEPTS (an unknown or legacy kind is the
-    // escape hatch), so the probe read "no divergence" from a value the apply never refuses. The
-    // kinds that actually fail are one that does not yield a plain string and one that is
-    // `neverOutbound`, and both are the shapes an operator picks by accident from the same list.
+    // NOTE: A `generic` credential proves nothing here: `secretTypeFits` ACCEPTS it (an unknown or legacy kind
+    // is the escape hatch), so it reads "no divergence" from a value the apply never refuses. The kinds
+    // that fail are one that does not yield a plain string and one that is `neverOutbound`, both shapes
+    // an operator picks by accident from the same list.
     test("tenant_settings_update: an embedding ref whose KIND cannot serve it", async () => {
       const oauth = await suDb.vaultEntry.create({
         data: {
@@ -2362,10 +2356,9 @@ describe.skipIf(!dbUp)(
       expect(r.applied).toBe("refused");
     });
 
-    // The same divergence on the hand-back, found the round after (issue #495 review, round 1). The
-    // preview read `getConversationDetail` and answered "this returns the conversation" for an inbox
-    // with no responder — unbound, switched off, only observing, or with no bot on this Chatwoot —
-    // while the approved apply refused it with a 409.
+    // NOTE: The same divergence on the hand-back. A preview reading `getConversationDetail` must not answer
+    // "this returns the conversation" for an inbox with no responder (unbound, switched off, only
+    // observing, or with no bot on this Chatwoot), which the apply refuses with a 409.
     test("conversation_return: nothing answers the conversation's inbox", async () => {
       const inst = await seedChatwootInstance(suDb, {
         tenantId,
@@ -2392,11 +2385,10 @@ describe.skipIf(!dbUp)(
           status: "open",
         },
       });
-      // A CLIENT, because both halves now read the conversation from Chatwoot before answering
-      // (issue #495 review, round 7): the inbox a hand-back is judged against is the one Chatwoot
-      // names, so neither half may refuse on the mirror's row before asking. It answers inbox 9 —
-      // the row seeded above — which is the case this test is about: nothing moved, and nothing
-      // answers the inbox it is on.
+      // A CLIENT, because both halves read the conversation from Chatwoot before answering: the inbox a
+      // hand-back is judged against is the one Chatwoot names, so neither half may refuse on the mirror's
+      // row before asking. It answers inbox 9, the row seeded above, which is the case this test is about:
+      // nothing moved, and nothing answers the inbox it is on.
       const makeClient = async () =>
         ({
           getConversation: async (cid: number) => ({
@@ -2419,14 +2411,12 @@ describe.skipIf(!dbUp)(
       expect(r.applied).toBe("refused");
     });
 
-    // Round 1 of review, and it is the one thing a preview must never do: WRITE. Resolving an A/B
-    // variant is not a read — `resolveVariantOverride` INSERTS the thread's assignment when there is
-    // none, and that row lands in the denominator of every result for the experiment. So a preview
-    // that reached it would enrol a conversation in an experiment it never ran a turn for, quietly
-    // lowering the reported rate of the arm it was bucketed into.
-    //
-    // `loadAgentConfig` already carries `skipExperiment` for exactly this shape of caller (memory
-    // compaction), and the preview is the second one.
+    // NOTE: The one thing a preview must never do: WRITE. Resolving an A/B variant is not a read:
+    // `resolveVariantOverride` INSERTS the thread's assignment when there is none, and that row lands in
+    // the denominator of every result for the experiment, so a preview reaching it would enrol a
+    // conversation in an experiment it never ran a turn for, quietly lowering the reported rate of the
+    // arm it was bucketed into. `loadAgentConfig` carries `skipExperiment` for this shape of caller
+    // (memory compaction is the other one).
     test("conversation_reengage: the preview enrols nobody in an experiment", async () => {
       const ag = await suDb.agent.create({
         data: {

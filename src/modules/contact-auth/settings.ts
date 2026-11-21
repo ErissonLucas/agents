@@ -1,8 +1,9 @@
 import { clipText } from "@/lib/text";
+import { CONTACT_AUTH_RANGES } from "@/modules/agents/number-ranges";
 import { TEMPLATE_MESSAGE_MAX } from "@/modules/agents/text-caps";
 import {
-  parseToolPrecondition,
-  type ToolPrecondition,
+  type AttributePrecondition,
+  parseAttributePrecondition,
 } from "@/modules/agents/tool-preconditions";
 
 // Per-agent contact authorization gate, read from the free-form `agent.settings.contactAuth` bag
@@ -14,30 +15,44 @@ import {
 // the verdict, so revoking there takes effect on the customer's next message. Off by default; every
 // other field clamps rather than throws, so a malformed write can never break the webhook.
 
-// How long a positive verdict counts for (issue #189). `perMessage` is the gate as it shipped: the
-// endpoint owns the answer, and asking it every time is what lets a revocation there land on the
-// contact's very next message. `once` trades that immediacy for the call: the first `authorized:
-// true` is stored per contact and reused until it expires. Two operators asked for it — an endpoint
-// that is expensive or rate-limited (a burst of five WhatsApp messages is five identical lookups),
-// and a gate that is an UNLOCK, where the customer sends a code once and should stay served
-// afterwards without the endpoint having to remember them.
+// How long a positive verdict counts for. `perMessage` asks the endpoint every time, so a revocation
+// there lands on the contact's very next message. `once` stores the first `authorized: true` per
+// contact and reuses it until it expires, for an expensive or rate-limited endpoint and for an UNLOCK
+// gate where the customer sends a code once and should stay served.
 export type ContactAuthMode = "perMessage" | "once";
 
-// A verdict the runtime reaches from data it already holds, instead of asking an endpoint (issue
-// #646). For the rules whose answer is in our own tables (a pilot list of numbers, a mirrored
-// attribute), an operator-hosted service is pure cost: TLS, a vault credential, a timeout budget on
-// the webhook path, and an availability dependency, because a fail-closed gate whose endpoint is down
-// stops answering customers.
-//
-// TYPED, for the reason tool-preconditions.ts gives: the gate decides whether the turn happens at
-// all, and it is fail-closed, so every way a rule could fail to answer would be a refused customer.
-// A closed set of conditions always terminates and always answers. The attribute condition IS the
-// precondition's, parsed by the same function, so an operator who learned one surface learned both.
-export type ContactAuthRule =
+// A verdict the runtime reaches from data it already holds, instead of asking an endpoint (a pilot
+// list of numbers, a mirrored attribute), sparing the TLS, credential, timeout budget and availability
+// dependency of a fail-closed endpoint. TYPED, as in tool-preconditions.ts: the gate is fail-closed,
+// so every way a rule could fail to answer would refuse a customer, and a closed set of conditions
+// always answers. The attribute condition IS the precondition's, parsed by the same function.
+export type ContactAuthCondition =
   // The contact's mirrored phone (compared by digits, so `+55 (11) 9...` and `5511 9...` are one
   // number) or its operator identifier is on the list.
   | { kind: "allowlist"; phones: string[]; identifiers: string[] }
-  | ToolPrecondition;
+  | AttributePrecondition
+  // The conversation is a WhatsApp group or a one-to-one chat (the fork's `group_type`).
+  | { kind: "conversation_type"; type: ContactAuthConversationType }
+  // The conversation carries this label, stored lowercased as Chatwoot stores label titles.
+  | { kind: "label"; label: string };
+
+// What a match means. `serve` (the default, stored as no key) serves only what matches; `exclude` serves everything EXCEPT what matches, for an agent that answers a whole inbox but must stay out of a known few (the staff writing to a reception number). It belongs to the rule and not beside it: every write replaces the rule whole, so a new list can never inherit an inversion meant for the old.
+export type ContactAuthRuleEffect = "serve" | "exclude";
+
+// One level only: a combination holds plain conditions, never another combination, so every rule
+// the API accepts is a rule the editor can show and save back unchanged. `effect` sits on the rule,
+// never on a condition inside a combination.
+export type ContactAuthRule = (
+  | ContactAuthCondition
+  | { kind: "all"; conditions: ContactAuthCondition[] }
+  | { kind: "any"; conditions: ContactAuthCondition[] }
+) & { effect?: "exclude" };
+
+export type ContactAuthConversationType = "group" | "individual";
+
+export const CONTACT_AUTH_RULE_CONDITIONS_MAX = 10;
+// Chatwoot keeps a label title in a varchar(255).
+export const CONTACT_AUTH_LABEL_MAX = 255;
 
 // A list the operator types into a text box, and every entry is compared on every message: bounded
 // so a paste of a whole CRM cannot turn a settings bag into a table. Past a few hundred numbers the
@@ -96,7 +111,7 @@ function entries(
 // than none, because the operator would read the gate as a list while the runtime reads it as open.
 // A malformed rule reads as ABSENT, and an enabled gate with neither a rule nor a url is the
 // fail-closed `not_configured` it always was, never an open door.
-export function parseContactAuthRule(raw: unknown): ContactAuthRule | null {
+function parseCondition(raw: unknown): ContactAuthCondition | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const r = raw as Record<string, unknown>;
   if (r.kind === "allowlist") {
@@ -107,12 +122,77 @@ export function parseContactAuthRule(raw: unknown): ContactAuthRule | null {
     // leave the rule out and let `not_configured` refuse), and as a rule it is almost always a save
     // made before the list was typed, so it is refused rather than honoured.
     if (phones.length + identifiers.length === 0) return null;
-    if (phones.length + identifiers.length > CONTACT_AUTH_ALLOWLIST_MAX) {
-      return null;
-    }
     return { kind: "allowlist", phones, identifiers };
   }
-  return parseToolPrecondition(raw);
+  if (r.kind === "conversation_type") {
+    return r.type === "group" || r.type === "individual"
+      ? { kind: "conversation_type", type: r.type }
+      : null;
+  }
+  if (r.kind === "label") {
+    const label = str(r.label);
+    return label &&
+      label.length <= CONTACT_AUTH_LABEL_MAX &&
+      !/[\r\n]/.test(label)
+      ? { kind: "label", label: label.toLowerCase() }
+      : null;
+  }
+  return parseAttributePrecondition(raw);
+}
+
+function listEntries(c: ContactAuthCondition): number {
+  return c.kind === "allowlist" ? c.phones.length + c.identifiers.length : 0;
+}
+
+// Strict both ways: a value that is neither reads the whole rule as absent, since guessing would either turn an exclusion list into the only people served or a pilot list into the only people refused.
+function parseEffect(v: unknown): ContactAuthRuleEffect | null {
+  if (v === undefined || v === null || v === "serve") return "serve";
+  return v === "exclude" ? "exclude" : null;
+}
+
+export function parseContactAuthRule(raw: unknown): ContactAuthRule | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const r = raw as Record<string, unknown>;
+  const effect = parseEffect(r.effect);
+  if (!effect) return null;
+  let rule: ContactAuthRule | null;
+  if (r.kind === "all" || r.kind === "any") {
+    const list = r.conditions;
+    if (
+      !Array.isArray(list) ||
+      list.length === 0 ||
+      list.length > CONTACT_AUTH_RULE_CONDITIONS_MAX
+    ) {
+      return null;
+    }
+    const conditions: ContactAuthCondition[] = [];
+    for (const item of list) {
+      const c = parseCondition(item);
+      if (!c || (item as Record<string, unknown>).effect !== undefined) {
+        return null;
+      }
+      conditions.push(c);
+    }
+    rule =
+      r.kind === "all"
+        ? { kind: "all", conditions }
+        : { kind: "any", conditions };
+  } else {
+    rule = parseCondition(raw);
+  }
+  if (!rule) return null;
+  // The list cap is on the RULE: two lists of 500 inside a combination are the table the cap exists
+  // to keep out of a settings bag.
+  const listed =
+    rule.kind === "all" || rule.kind === "any"
+      ? rule.conditions.reduce((n, c) => n + listEntries(c), 0)
+      : listEntries(rule);
+  if (listed > CONTACT_AUTH_ALLOWLIST_MAX) return null;
+  return effect === "exclude" ? { ...rule, effect } : rule;
+}
+
+export function contactAuthRuleExcludes(rule: ContactAuthRule): boolean {
+  return rule.effect === "exclude";
 }
 
 // The write boundary's question: is there a rule that the reader would drop? Absent and null are not
@@ -125,11 +205,16 @@ export function invalidContactAuthRule(raw: unknown): boolean {
 
 export interface ContactAuthConfig {
   enabled: boolean;
-  // The local rule, when the verdict comes from data we already hold (issue #646). EITHER this or
-  // `url`: with a rule set the endpoint is never called, so a rule and a url together mean the rule.
-  // A rule is always evaluated per message and never stores a grant: a stored verdict exists to
-  // spare somebody's endpoint, and a rule reads our own rows.
+  // The local rule, when the verdict comes from data we already hold. A rule is always evaluated per
+  // message and never stores a grant: a stored verdict exists to spare somebody's endpoint, and a rule
+  // reads our own rows. With a rule set the endpoint is asked only under `askEndpointAfterRule`.
   rule: ContactAuthRule | null;
+  // The two-stage gate: the rule decides first, and what it allows is handed to the endpoint for the
+  // final verdict. A flag and not "a rule and a url together": the url stays stored when an operator
+  // switches to a rule, and the editor tells them it is not used, so reading the pair as two stages
+  // would call an endpoint they turned away from. Strict, like `enabled`: anything but `true` keeps
+  // the rule alone.
+  askEndpointAfterRule: boolean;
   // The authorization endpoint: a fixed origin, no placeholders (the identity travels in the body).
   // https in production; http only where the SSRF guard allows private targets, the same rule HTTP
   // tools follow. null = not configured, which an enabled gate treats as an error (fail-closed).
@@ -168,14 +253,21 @@ export interface ContactAuthConfig {
   // assigns the team ONLY when the conversation's instance matches. The editor already refuses to
   // pin while the agent spans several accounts, and this covers the drift it cannot see: an agent
   // MOVED to another account keeps the number it was given in the old one, and there the editor
-  // sees a single account and has nothing to warn about. null ⇒ legacy value stored before this
-  // field existed (applied under the older, weaker check).
+  // sees a single account and has nothing to warn about. null ⇒ a legacy value with no recorded
+  // instance (applied under the weaker check).
   handoffTeamInstanceId: number | null;
+  // Whether a DENIAL writes the private note. Off is for a gate used as a scope filter, where a refusal
+  // is the ordinary case and one note per excluded conversation is noise. Only the denial: an endpoint
+  // that failed and a contact with nothing to ask about are things the operator has to fix, and the
+  // note is where they learn it. Strict the other way from `enabled`: anything but `false` writes it,
+  // so a malformed write can only bring a note back, never silence one.
+  operatorNoteEnabled: boolean;
 }
 
 export const CONTACT_AUTH_DEFAULTS: ContactAuthConfig = {
   enabled: false,
   rule: null,
+  askEndpointAfterRule: false,
   url: null,
   credentialRef: null,
   timeoutMs: 5000,
@@ -187,17 +279,33 @@ export const CONTACT_AUTH_DEFAULTS: ContactAuthConfig = {
   grantTtlSeconds: 86_400,
   handoffTeamId: null,
   handoffTeamInstanceId: null,
+  operatorNoteEnabled: true,
 };
 
-export const CONTACT_AUTH_TIMEOUT_MIN_MS = 1000;
-export const CONTACT_AUTH_TIMEOUT_MAX_MS = 10_000;
-export const CONTACT_AUTH_NOTICE_COOLDOWN_MAX_SECONDS = 3600;
+// Where the two stages sit. The rule stage runs first among the pre-turn gates, since it costs nothing
+// and a conversation the agent does not serve should not get an away message or a redirect first.
+// The endpoint stage stays last, since a conversation an earlier gate silenced costs no call. The
+// endpoint stage exists when there is no rule (that is where an enabled gate with neither is the
+// fail-closed `not_configured`) and when the operator asked for it after the rule.
+export function contactAuthHasRuleStage(cfg: ContactAuthConfig): boolean {
+  return cfg.rule !== null;
+}
+export function contactAuthHasEndpointStage(cfg: ContactAuthConfig): boolean {
+  return cfg.rule === null || cfg.askEndpointAfterRule;
+}
+
+export const CONTACT_AUTH_TIMEOUT_MIN_MS = CONTACT_AUTH_RANGES.timeoutMs.min;
+export const CONTACT_AUTH_TIMEOUT_MAX_MS = CONTACT_AUTH_RANGES.timeoutMs.max;
+export const CONTACT_AUTH_NOTICE_COOLDOWN_MAX_SECONDS =
+  CONTACT_AUTH_RANGES.noticeCooldownSeconds.max;
 // A grant shorter than a minute is a grant that expires inside the burst it exists to collapse, and
 // one longer than a month outlives most of the facts an endpoint decides on. "Never reuse" is the
 // MODE, not a TTL of zero: two ways to say the same thing, and the second one says it in the more
 // confusing place.
-export const CONTACT_AUTH_GRANT_TTL_MIN_SECONDS = 60;
-export const CONTACT_AUTH_GRANT_TTL_MAX_SECONDS = 30 * 24 * 3600;
+export const CONTACT_AUTH_GRANT_TTL_MIN_SECONDS =
+  CONTACT_AUTH_RANGES.grantTtlSeconds.min;
+export const CONTACT_AUTH_GRANT_TTL_MAX_SECONDS =
+  CONTACT_AUTH_RANGES.grantTtlSeconds.max;
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.trim() ? v.trim() : null;
@@ -247,6 +355,7 @@ export function readContactAuthConfig(settings: unknown): ContactAuthConfig {
     // off, never start refusing customers nobody asked it to.
     enabled: b.enabled === true,
     rule: parseContactAuthRule(b.rule),
+    askEndpointAfterRule: b.askEndpointAfterRule === true,
     url: readContactAuthUrl(b.url),
     credentialRef: str(b.credentialRef),
     timeoutMs: clampInt(
@@ -276,5 +385,6 @@ export function readContactAuthConfig(settings: unknown): ContactAuthConfig {
     ),
     handoffTeamId: posInt(b.handoffTeamId),
     handoffTeamInstanceId: posInt(b.handoffTeamInstanceId),
+    operatorNoteEnabled: b.operatorNoteEnabled !== false,
   };
 }

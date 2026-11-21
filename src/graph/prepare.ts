@@ -1,12 +1,26 @@
 import type { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
+import type { BaseMessage } from "@langchain/core/messages";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import config from "@/config";
-import type { ModelOverride } from "@/graph/model-override";
+import {
+  type ModelOverride,
+  resolveModelOverride,
+} from "@/graph/model-override";
+import {
+  caseHoldOn,
+  type ResolveCaseHold,
+  resolveCaseHoldFor,
+} from "@/graph/resolve-labels";
+import {
+  choiceCheckOverridden,
+  readChoiceCheckConfig,
+} from "@/graph/tools/choice-check-settings";
+import { type ChoiceCheck, choiceCheck } from "@/graph/tools/customer-choice";
 import { modelVisibleLabels } from "@/graph/tools/label-view";
 import type { LabelWriteReporter } from "@/graph/tools/label-writes";
 import {
@@ -16,6 +30,7 @@ import {
   unmatchedPreconditionEvent,
 } from "@/graph/tools/precondition";
 import { parseDbId } from "@/lib/db-id";
+import type { PermitClass } from "@/lib/semaphore";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { isMonitoring } from "@/modules/agents/mode";
@@ -24,11 +39,15 @@ import {
   readReplyGateConfig,
   replyGateControlLabels,
 } from "@/modules/agents/reply-gate";
+import { readResolveLabels } from "@/modules/agents/resolve-labels";
 import {
   readAllowedLabels,
+  readLabelRemoval,
   readOutsideAllowedLabels,
   readProtectedLabels,
   readToolGuidance,
+  readWritableAttributes,
+  type WritableAttribute,
 } from "@/modules/agents/tool-guidance";
 import {
   readToolPreconditions,
@@ -41,19 +60,32 @@ import {
 import { appointmentSideEffects } from "@/modules/appointments/side-effect";
 import { parseSchedule, type Schedule } from "@/modules/business-hours/hours";
 import { readSchedule } from "@/modules/business-hours/service";
+import type {
+  AttributeRefusal,
+  AttributeRefusalReporter,
+} from "@/modules/chatwoot/attribute-rules";
 import {
   ATTRIBUTE_SCOPES,
   attributeBagsFrom,
   buildAttributeContextSection,
+  buildContactFieldsSection,
   isAttributeContextEmpty,
   readAttributeContextConfig,
 } from "@/modules/chatwoot/attributes";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import {
+  type ContactFieldsConfig,
+  contactFieldValuesFrom,
+  readContactFieldsConfig,
+} from "@/modules/chatwoot/contact-fields";
+import { mirroredContactIdentifier } from "@/modules/chatwoot/contact-identifier";
+import {
   type KanbanContext,
   loadKanbanContext,
 } from "@/modules/chatwoot/kanban";
+import { literalForChatwoot, markValue } from "@/modules/chatwoot/liquid";
 import {
+  attributesForModel,
   type ChatwootVocab,
   loadChatwootVocab,
 } from "@/modules/chatwoot/vocab";
@@ -61,8 +93,15 @@ import {
   type ContactAuthConfig,
   readContactAuthConfig,
 } from "@/modules/contact-auth/settings";
+import {
+  type ConversationNoteFormat,
+  readConversationNotesConfig,
+} from "@/modules/conversation-notes/settings";
 import type { ObservedConversation } from "@/modules/conversations/record-resolution";
-import type { CustomerTextVerdict } from "@/modules/cross-inbox-case/service";
+import type {
+  CaseInbox,
+  CustomerTextVerdict,
+} from "@/modules/cross-inbox-case/service";
 import {
   type CrossInboxCaseConfig,
   destinationIdentity,
@@ -73,12 +112,21 @@ import { resolveVariantOverride } from "@/modules/experiments/service";
 import {
   emitFlowEvent,
   type FlowContext,
+  type FlowEvent,
   withFlowStage,
 } from "@/modules/flowlog/service";
 import { readObservabilityConfig } from "@/modules/flowlog/settings";
+import type { DatedContextMessage } from "@/modules/guardrails/context";
 import {
+  type GroundingReference,
+  loadGroundingReference,
+} from "@/modules/guardrails/grounding-reference";
+import {
+  type GroundingReviewerModel,
   type GuardrailsConfig,
+  guardrailCredentialRef,
   readGuardrailsConfig,
+  resolveGroundingReviewer,
 } from "@/modules/guardrails/settings";
 import {
   type HandoffConfig,
@@ -101,7 +149,14 @@ import {
 } from "@/modules/integrations/toolpacks";
 import { type JevConfig, readJevConfig } from "@/modules/jev/service";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
+import { attendanceStartedAt } from "@/modules/memory/attendance-start";
 import { readMemoryConfig } from "@/modules/memory/settings";
+import type { OtherInboxesReport } from "@/modules/other-inboxes/context";
+import {
+  type OtherInboxesConfig,
+  readOtherInboxesConfig,
+} from "@/modules/other-inboxes/settings";
+import { readKnowledgeConfig } from "@/modules/rag/review-settings";
 import { ryzeLabelPromptSection } from "@/modules/ryze/label-shared";
 import { ryzeLabelTurnContext } from "@/modules/ryze/labels";
 import {
@@ -120,6 +175,7 @@ import { resolveNormalizeModel } from "@/modules/tts/normalize-model";
 import { readTtsConfig, type TtsConfig } from "@/modules/tts/settings";
 import { resolveInjectableCredential } from "@/modules/vault/injectable";
 import { tryResolveApiKeyEntry } from "@/modules/vault/service";
+import { LAST_MESSAGE_RULE } from "./anthropic-progress-notes";
 import { chatwootThreadId, getCheckpointer } from "./checkpointer";
 import {
   type FallbackConfig,
@@ -130,10 +186,13 @@ import {
 import {
   buildAgentGraph,
   type FallbackModel,
+  type RevisionPlan,
   type SilenceRetryInfo,
 } from "./graph";
-import { PRIMARY_MAX_RETRIES, PRIMARY_TIMEOUT_MS } from "./model-fallback";
+import { DEFAULT_MODEL_CONFIG } from "./model-config";
+import { fallbackDeadlineMs, PRIMARY_MAX_RETRIES } from "./model-fallback";
 import type {
+  FallbackFailedInfo,
   ModelLabels,
   ModelRetryInfo,
   PermitWaitInfo,
@@ -141,6 +200,7 @@ import type {
 import {
   createChatModel,
   type ModelConfig,
+  modelConfigSchema,
   parseModelConfig,
   type ResolvedModelConfig,
 } from "./models";
@@ -160,6 +220,7 @@ import { type AuditedSection, buildPromptAudit } from "./prompt-audit";
 import { readSkipReplyConfig, type SkipReplyConfig } from "./skip-handover";
 import { DEFAULT_TIMEZONE, zonedWallClockToInstant } from "./time";
 import {
+  type AgentToolSelections,
   buildHttpTools,
   type LoadedCodeToolDef,
   type LoadedHttpToolDef,
@@ -182,7 +243,12 @@ import {
   dropDuplicateToolNames,
   droppedToolNamesEvent,
 } from "./tools/unique-names";
-import { UsageCapture, type UsagePersist, type UsageSource } from "./usage";
+import {
+  UsageCapture,
+  type UsageNode,
+  type UsagePersist,
+  type UsageSource,
+} from "./usage";
 
 // Shared agent-invocation plumbing used by BOTH entry points: runAgentTurn (incoming customer
 // message) and runAgentNudge (inbound domain event). Loading is a short scoped read (DB only);
@@ -213,14 +279,14 @@ export interface AgentConfig {
   // The DB Inbox.id this conversation belongs to (null in the playground / no mirror row). Feeds
   // the per-inbox usage attribution on LlmUsage.
   inboxDbId: bigint | null;
-  // NOTE: the inbox's Chatwoot channel class ("Channel::Api", "Channel::Instagram", …; null when unknown
-  // or in the playground). Decides the TTS reply container (pickTtsFormat) — Meta's Instagram
+  // The inbox's Chatwoot channel class ("Channel::Api", "Channel::Instagram", …; null when unknown
+  // or in the playground). Decides the TTS reply container (pickTtsFormat): Meta's Instagram
   // messaging refuses WhatsApp's Ogg/Opus.
   channelType: string | null;
-  // NOTE: the inbox's WhatsApp provider (baileys | zapi | whatsapp_cloud | …; null off WhatsApp or on
-  // an inbox that has not synced). It is what says whether an attendant's reply typed on the paired
-  // phone can be told apart from an unmatched echo of our own — see `providerReservesEchoIds` and
-  // `foreignReplyBoundary`. Selected from the row this query already reads (PR #701, review round 8).
+  // The inbox's WhatsApp provider (baileys | zapi | whatsapp_cloud | …; null off WhatsApp or on an
+  // inbox that has not synced). It says whether an attendant's reply typed on the paired phone can be
+  // told apart from an unmatched echo of our own: see `providerReservesEchoIds` and
+  // `foreignReplyBoundary`. Selected from the inbox row the conversation query already reads.
   whatsappProvider: string | null;
   contactDbId: bigint | null;
   // The native Chatwoot ContactInbox id (one contact on one channel) for this conversation. Keys the
@@ -242,10 +308,20 @@ export interface AgentConfig {
   guardrails: GuardrailsConfig;
   guardrailsApiKey: string;
   guardrailsCredentialBaseUrl: string | null;
+  // The external check's signing secret: null when none is configured (unsigned) or when the
+  // configured entry did not resolve, which `guardrailsExternalSecretMissing` says.
+  guardrailsExternalSecret: string | null;
+  guardrailsExternalSecretMissing: boolean;
+  // The factual-grounding reviewer, resolved as an override of the guardrails chat model
+  // (`resolveGroundingReviewer`), key included; null while the check is off.
+  groundingReviewer: GroundingReviewerModel | null;
+  // The reference bases' READY documents, read for this turn; null while the check is off or none is
+  // picked.
+  groundingReference: GroundingReference | null;
   transferWithSummary: boolean;
   nativeToolsAllow?: string[];
   httpToolDefs: LoadedHttpToolDef[];
-  // Operator-authored code tools granted to this agent (issue #363).
+  // Operator-authored code tools granted to this agent.
   codeToolDefs: LoadedCodeToolDef[];
   mcpSelections: McpSelection[];
   integrationSelections: IntegrationSelection[];
@@ -264,8 +340,9 @@ export interface AgentConfig {
   //
   // Its shape is the two siblings' and its DEFAULT is the opposite: everything absent means no
   // fallback at all, never "the agent's own model" (see graph/fallback-settings). An unresolvable
-  // ref leaves the key empty, and `buildModelAndGraph` then builds NO fallback — the turn fails the
-  // way it does today rather than sending the agent's key to a vendor that never issued it.
+  // ref leaves the key empty, and `buildModelAndGraph` then builds NO fallback: the turn fails as it
+  // would with no fallback configured, rather than sending the agent's key to a vendor that never
+  // issued it.
   modelFallback: FallbackConfig;
   modelFallbackApiKey: string;
   modelFallbackCredentialBaseUrl: string | null;
@@ -274,24 +351,20 @@ export interface AgentConfig {
   splitConfig: SplitConfig;
   signatureConfig: SignatureConfig;
   // The same placeholder values the system prompt was rendered with, carried so the OPERATOR's own
-  // texts can use them too (issue #599: the signature). Built once per turn and reused rather than
-  // rebuilt, so `{{nome_agente}}` in a signature and in the prompt can never disagree.
+  // texts (the signature) can use them too. Built once per turn and reused rather than rebuilt, so
+  // `{{nome_agente}}` in a signature and in the prompt can never disagree.
   promptVars: Record<string, string>;
-  // The options those vars were rendered WITH, carried beside them because a variable is only half
-  // the answer: `{{horario_atendimento}}` and every time variable need the schedule and the instant
-  // to resolve, and a caller handed only the map renders them literally. The signature is the second
-  // consumer of this pair (issue #599); the system prompt is the first, and it reads them from the
-  // same place, so the two cannot disagree about what a placeholder means.
-  // `now` is REQUIRED here while the render option is optional: every caller that produces an
-  // AgentConfig pins one instant for both renderings, and the re-render below needs the same one.
+  // The options those vars were rendered WITH: `{{horario_atendimento}}` and every time variable need
+  // the schedule and the instant to resolve, and a caller handed only the map renders them literally.
+  // The system prompt and the signature both read them from here, so they cannot disagree about what
+  // a placeholder means. `now` is REQUIRED here while the render option is optional: every caller
+  // that produces an AgentConfig pins one instant for both renderings, and the re-render needs it.
   promptOpts: PromptRenderOpts & { now: Date };
-  // THE INPUTS THE PROMPT WAS RENDERED FROM, carried so a caller that learns the age of the message
-  // only AFTER the config is loaded can re-render it in ONE pass instead of interpolating over the
-  // finished string (issue #749). The debounce flush and the manual re-engage are both in that
-  // position: they load the config and only then fetch the burst from Chatwoot. A second pass over
-  // the rendered prompt would also resolve placeholders that came from DATA — a mirrored attribute
-  // value spelling `{{nome_contato}}` — which is exactly what appending the sections to the FINISHED
-  // prompt exists to prevent. Re-rendering from the template cannot do that.
+  // THE INPUTS THE PROMPT WAS RENDERED FROM, so a caller that learns the message's age only AFTER
+  // loading the config (the debounce flush, the manual re-engage) re-renders in ONE pass. A second
+  // pass over the finished prompt would also resolve placeholders that came from DATA (a mirrored
+  // attribute spelling `{{nome_contato}}`), which appending the sections to the FINISHED prompt
+  // exists to prevent. See docs/graph.md, System prompt composition.
   promptTemplate: string;
   promptSections: string[];
   auditedSections: AuditedSection[];
@@ -313,6 +386,18 @@ export interface AgentConfig {
   skipReplyConfig?: SkipReplyConfig;
   // Where `open_case_in_inbox` opens the case (operator-set; no inbox = the tool is not built).
   crossInboxCaseConfig: CrossInboxCaseConfig;
+  // Which of the contact's conversations in other inboxes a turn may read
+  // (src/modules/other-inboxes/context.ts appends them after the load, outside its transaction).
+  otherInboxesConfig: OtherInboxesConfig;
+  // The Chatwoot inbox id of this conversation, null on the playground.
+  chatwootInboxId: number | null;
+  // What `withOtherInboxesContext` read, for the turn's flow line. Absent when it did not run.
+  otherInboxesReport?: OtherInboxesReport | null;
+  // When the coalesced burst behind this turn started (its oldest message), stamped on the turn's
+  // input next to the newest. Absent on a turn of one message.
+  burstStartedAt?: Date | null;
+  // The contact fields in the prompt and the ones update_contact may write (none = no tool).
+  contactFieldsConfig: ContactFieldsConfig;
   // The origin contact as Chatwoot knows it; what `open_case_in_inbox` settles the identity on.
   chatwootContactId: number | null;
   // Per-agent kanban guidance (operator funnel note), surfaced in the kanban_move_card description.
@@ -320,17 +405,26 @@ export interface AgentConfig {
   // Operator-authored guidance for tools whose only config is the note (set_custom_attribute,
   // set_labels, …), keyed by native tool name; merged into the tool descriptions at buildToolset.
   toolGuidance: Partial<Record<NativeToolName, string>>;
-  // Labels set_labels may neither add nor remove (issue #568 review; #695 dropped "and never
-  // sees" — a protected label is shown and refused by name). See readProtectedLabels for why an
-  // operator control label is not the classifier's to touch.
+  // Labels set_labels may neither add nor remove; the model still sees them, and a call naming one
+  // is refused by name. See readProtectedLabels for why an operator control label is not the
+  // classifier's to touch.
   protectedLabels: string[];
-  // The labels set_labels may ADD and what a title outside them meets (issue #638). Empty ⇒ any
-  // title, the behaviour before the list existed. See readAllowedLabels.
+  // The labels resolve_conversation writes before it closes. See readResolveLabels.
+  resolveLabels: string[];
+  // Where a contact waiting on a case holds those labels off, read before any path narrows the
+  // case tool's config. See graph/resolve-labels.ts resolveCaseHoldFor.
+  resolveCaseHold: ResolveCaseHold | null;
+  // The labels set_labels may ADD and what a title outside them meets. Empty ⇒ any title. See
+  // readAllowedLabels.
   allowedLabels: string[];
   outsideAllowedLabels: "refuse" | "accept";
-  // Operator-declared preconditions, keyed by TOOL NAME (issue #101). Native or custom: the seam
+  // Which labels set_labels may remove: `allowed` limits it to the list above. See readLabelRemoval.
+  labelRemoval: "any" | "allowed";
+  // The attributes set_custom_attribute may write. Empty ⇒ any key. See readWritableAttributes.
+  writableAttributes: WritableAttribute[];
+  // Operator-declared preconditions, keyed by TOOL NAME. Native or custom: the seam
   // that applies them is the one place every source's tools meet, so one map covers all six.
-  toolPreconditions: Record<string, ToolPrecondition>;
+  toolPreconditions: Record<string, ToolPrecondition[]>;
   // Conversation/contact context exposed to custom HTTP tools as {{placeholders}} (contact_name,
   // contact_email, …). conversation_id is merged in at buildToolset time (it lives on ctx). Never
   // holds a secret.
@@ -344,20 +438,37 @@ export interface AgentConfig {
   // Ceiling on the history tokens sent to the model (agent.settings.limits.maxHistoryTokens).
   // null = no ceiling, send the whole thread.
   maxHistoryTokens: number | null;
-  // Retry an unexplained silence once (agent.settings.limits.retrySilence, issue #885).
+  // Retry an unexplained silence once (agent.settings.limits.retrySilence).
   retrySilence: boolean;
+  // Delivered turns per conversation per rolling hour; 0 = no limit
+  // (agent.settings.limits.maxTurnsPerHour).
+  maxTurnsPerHour: number;
+  // Proactive messages delivered per conversation per rolling 24 hours; 0 = no limit
+  // (agent.settings.limits.maxProactivePerDay).
+  maxProactivePerDay: number;
   // Whether a closed attendance gets folded into the contact's memory instead of staying raw on
   // the thread (agent.settings.memory.compaction). Read here so the turn that CROSSES an
   // attendance boundary can arm the compaction job without a second query.
   memoryCompaction: boolean;
   // Whether each person's message reaches the model behind the date it was sent
-  // (agent.settings.memory.historyDates, issue #755). Rendered in `timezone` above.
+  // (agent.settings.memory.historyDates). Rendered in `timezone` above.
   historyDates: boolean;
   // The summariser's own model, as an override of the agent's, plus the credential it names. Same
   // three-field shape as the speech rewrite above; resolved through graph/model-override.ts.
   memoryCompactionOverride: ModelOverride;
   memoryCompactionApiKey: string;
   memoryCompactionCredentialBaseUrl: string | null;
+  // The knowledge suggestion reviewer's own model (agent.settings.knowledge.suggestionReview), with
+  // the credential it names. Same shape and resolver as the summariser's above.
+  suggestionReviewOverride: ModelOverride;
+  suggestionReviewApiKey: string;
+  suggestionReviewCredentialBaseUrl: string | null;
+  // The customer_choice judge's own model (agent.settings.choiceCheck), with the credential it names.
+  // Same shape and resolver as the reviewer's above, but an override that cannot run REFUSES the
+  // guarded call instead of letting it through.
+  choiceCheckOverride: ModelOverride;
+  choiceCheckApiKey: string;
+  choiceCheckCredentialBaseUrl: string | null;
   // Whether this agent's tool lines log the VALUES the model sent instead of their shape
   // (agent.settings.observability.logToolValues; off by default — see src/modules/flowlog/shape.ts).
   logToolValues: boolean;
@@ -367,6 +478,16 @@ export interface AgentConfig {
   // expires on its own — see src/modules/flowlog/settings.ts). Read HERE, with the rest of the
   // agent's settings, so the emit path never pays a settings read per log line.
   fullDetail: boolean;
+  // How many days this agent keeps each turn's full detail (every tool result whole, the audited
+  // prompt whole) beside the cut log lines, or null when it keeps none
+  // (agent.settings.observability.fullDetailRetentionDays). Read here for the same reason.
+  fullDetailRetentionDays: number | null;
+  // Whether a turn that called a tool leaves a private note naming them in the Chatwoot conversation
+  // (agent.settings.conversationNotes.toolsUsed; "off" by default — src/modules/conversation-notes).
+  toolsUsedNote: ConversationNoteFormat;
+  // Where a turn that hit an error and still ended says so in the conversation
+  // (agent.settings.conversationNotes.errors; "off" by default).
+  turnErrors: ConversationNoteFormat;
 }
 
 export interface LoadAgentArgs {
@@ -375,7 +496,7 @@ export interface LoadAgentArgs {
   conversationId: number;
   agentId: bigint;
   threadId: string;
-  // WHEN THE CUSTOMER'S MESSAGE ARRIVED (issue #749), from the instant the caller already holds: the
+  // WHEN THE CUSTOMER'S MESSAGE ARRIVED, from the instant the caller already holds: the
   // webhook payload's own timestamp, the newest message of a debounced burst, or the row the
   // re-engage read back from Chatwoot. Absent on the paths with no triggering message (memory
   // compaction, the observer, the playground), and the age variables then render empty.
@@ -446,6 +567,15 @@ export async function loadAgentConfig(
     // fixed prompt of its own — would be inventing participants for an experiment it takes no part
     // in, lowering its reported rates with nothing in the numbers to say why.
     skipExperiment?: boolean;
+    // The caller never builds the chat model: a monitoring agent that decides through a
+    // classification API (docs/decisions.md) needs the rest of the config (tools, fences, limits)
+    // and nothing of the model. A bag no schema accepts then loads as an unconfigured one, and a key
+    // that does not resolve as no key, where every other caller treats both as an agent that cannot
+    // run. `mc` keeps whatever parsed, for the lines that name it.
+    chatModelUnused?: boolean;
+    // The grants to load instead of the saved ones: the editor's unsaved set, for the call-floor
+    // estimate of what saving it would send.
+    toolSelections?: AgentToolSelections;
   } = {},
 ): Promise<AgentConfig | null> {
   const agent = await db.agent.findUnique({
@@ -463,11 +593,11 @@ export async function loadAgentConfig(
     },
   });
   if (!agent) return null;
-  // The `enabled` toggle gates production auto-replies; the playground tests config regardless.
+  // NOTE: The `enabled` toggle gates production auto-replies; the playground tests config regardless.
   if (!agent.enabled && !opts.ignoreDisabled) return null;
-  // A monitoring agent never answers, and this is the seam that guarantees it (issue #209): every
-  // caller that posts to the customer — the reactive turn, the guardrail's replacement, the nudges,
-  // the slow-tool ack — loads its config here first, so refusing here is refusing them all. The
+  // NOTE: A monitoring agent never answers, and this is the seam that guarantees it: every caller
+  // that posts to the customer (the reactive turn, the guardrail's replacement, the nudges, the
+  // slow-tool ack) loads its config here first, so refusing here is refusing them all. The
   // playground still loads it (`ignoreDisabled`, an operator talking to the agent in a fenced
   // thread), and so does a caller that says it never speaks (`ignoreMode`).
   if (isMonitoring(agent.mode) && !opts.ignoreDisabled && !opts.ignoreMode) {
@@ -479,13 +609,18 @@ export async function loadAgentConfig(
   const ov = opts.overrides;
   const effModelConfig = ov?.modelConfig ?? agent.modelConfig;
   const effSettings = (ov?.settings ?? agent.settings) as typeof agent.settings;
-  const mc = parseModelConfig(effModelConfig);
+  const parsedModel = modelConfigSchema.safeParse(effModelConfig);
+  // The default stands in only as a name for the lines; it has no key, so nothing can call it.
+  const mc: ModelConfig =
+    opts.chatModelUnused && !parsedModel.success
+      ? { ...DEFAULT_MODEL_CONFIG }
+      : parseModelConfig(effModelConfig);
   let apiKey = "";
   let credentialBaseUrl: string | null = null;
-  if (mc.credentialRef) {
+  if (mc.credentialRef && !opts.chatModelUnused) {
     const entry = await tryResolveApiKeyEntry(db, mc.credentialRef);
     if (entry.state !== "ok") {
-      // A credentialRef that no longer resolves (deleted / still-pending / a NAME passed where a
+      // NOTE: A credentialRef that no longer resolves (deleted / still-pending / a NAME passed where a
       // vault:<id> ref is required) otherwise makes the agent go silent with no trace — the turn just
       // returns null. Log it so the silent no-reply is diagnosable.
       //
@@ -512,8 +647,10 @@ export async function loadAgentConfig(
   const guardrails = readGuardrailsConfig(effSettings);
   let guardrailsApiKey = "";
   let guardrailsCredentialBaseUrl: string | null = null;
-  if (guardrails.enabled && guardrails.credentialRef) {
-    const gEntry = await tryResolveApiKeyEntry(db, guardrails.credentialRef);
+  // The chat model's key, or the decisions provider's, whichever the screening uses.
+  const guardrailsRef = guardrailCredentialRef(guardrails);
+  if (guardrails.enabled && guardrailsRef) {
+    const gEntry = await tryResolveApiKeyEntry(db, guardrailsRef);
     if (gEntry.state === "ok") {
       guardrailsApiKey = gEntry.secret;
       guardrailsCredentialBaseUrl = gEntry.baseUrl;
@@ -523,10 +660,50 @@ export async function loadAgentConfig(
           ? "agent %s: guardrails credentialRef %s resolves to a %s credential, which cannot be used as an API key — guardrails analysis is skipped"
           : "agent %s: guardrails credentialRef %s did not resolve — guardrails analysis is skipped",
         String(args.agentId),
-        guardrails.credentialRef,
+        guardrailsRef,
         gEntry.state === "unusable" ? gEntry.kind : "",
       );
     }
+  }
+  let groundingReviewer: GroundingReviewerModel | null = null;
+  let groundingReference: GroundingReference | null = null;
+  if (guardrails.enabled && guardrails.factualGrounding.enabled) {
+    const refIds = guardrails.factualGrounding.referenceKnowledgeBaseIds;
+    if (refIds.length > 0)
+      groundingReference = await loadGroundingReference(db, refIds);
+    // The two keys it may run on: its own credential's and the guardrails chat model's, the one it
+    // inherits from (which is the screening's key unless the screening runs on the decisions engine).
+    const resolve = async (ref: string | null) => {
+      if (!ref) return { key: "", baseUrl: null };
+      if (ref === guardrailsRef && guardrailsApiKey)
+        return { key: guardrailsApiKey, baseUrl: guardrailsCredentialBaseUrl };
+      const e = await tryResolveApiKeyEntry(db, ref);
+      return e.state === "ok"
+        ? { key: e.secret, baseUrl: e.baseUrl }
+        : { key: "", baseUrl: null };
+    };
+    const own = await resolve(guardrails.factualGrounding.credentialRef);
+    const parent = await resolve(guardrails.credentialRef);
+    groundingReviewer = resolveGroundingReviewer(guardrails, {
+      ownKey: own.key,
+      ownBaseUrl: own.baseUrl,
+      parentKey: parent.key,
+      parentBaseUrl: parent.baseUrl,
+    });
+  }
+  let guardrailsExternalSecret: string | null = null;
+  let guardrailsExternalSecretMissing = false;
+  if (
+    guardrails.enabled &&
+    guardrails.external.url &&
+    guardrails.external.credentialRef
+  ) {
+    const sEntry = await tryResolveApiKeyEntry(
+      db,
+      guardrails.external.credentialRef,
+    );
+    if (sEntry.state === "ok") guardrailsExternalSecret = sEntry.secret;
+    else guardrailsExternalSecretMissing = true;
   }
   // Speech normalizer's own credential, when it runs on a separate model. Same fail-open shape as
   // guardrails: an unresolvable ref leaves the key empty, and buildSpeechNormalizer then SKIPS the
@@ -586,7 +763,12 @@ export async function loadAgentConfig(
   const memoryCfg = memoryRead.compaction;
   let memoryCompactionApiKey = "";
   let memoryCompactionCredentialBaseUrl: string | null = null;
-  if (memoryCfg.enabled && memoryCfg.credentialRef) {
+  // NOTE: the summaries of the contact's other inboxes run on the same override, so its credential is
+  // needed whenever either summariser is on.
+  if (
+    (memoryCfg.enabled || readOtherInboxesConfig(effSettings).enabled) &&
+    memoryCfg.credentialRef
+  ) {
     const mEntry = await tryResolveApiKeyEntry(db, memoryCfg.credentialRef);
     if (mEntry.state === "ok") {
       memoryCompactionApiKey = mEntry.secret;
@@ -594,26 +776,60 @@ export async function loadAgentConfig(
     } else {
       logger.warn(
         mEntry.state === "unusable"
-          ? "agent %s: memory compaction credentialRef %s resolves to a %s credential, which cannot be used as an API key, so the attendance summary is not written"
-          : "agent %s: memory compaction credentialRef %s did not resolve, so the attendance summary is not written",
+          ? "agent %s: memory compaction credentialRef %s resolves to a %s credential, which cannot be used as an API key, so no summary is written on it"
+          : "agent %s: memory compaction credentialRef %s did not resolve, so no summary is written on it",
         String(args.agentId),
         memoryCfg.credentialRef,
         mEntry.state === "unusable" ? mEntry.kind : "",
       );
     }
   }
+  // The suggestion reviewer's own credential: an unresolvable ref leaves the key empty, and the
+  // review then queues the proposal unreviewed instead of borrowing the agent's key.
+  const reviewCfg = readKnowledgeConfig(effSettings).suggestionReview;
+  let suggestionReviewApiKey = "";
+  let suggestionReviewCredentialBaseUrl: string | null = null;
+  if (reviewCfg.credentialRef) {
+    const rEntry = await tryResolveApiKeyEntry(db, reviewCfg.credentialRef);
+    if (rEntry.state === "ok") {
+      suggestionReviewApiKey = rEntry.secret;
+      suggestionReviewCredentialBaseUrl = rEntry.baseUrl;
+    } else {
+      logger.warn(
+        "agent %s: suggestion review credentialRef %s did not resolve to an API key, so suggestions reach the queue unreviewed",
+        String(args.agentId),
+        reviewCfg.credentialRef,
+      );
+    }
+  }
+  // The choice judge's own credential: an unresolvable ref leaves the key empty, and every guarded
+  // call is then refused rather than judged on the agent's key.
+  const choiceCheckCfg = readChoiceCheckConfig(effSettings);
+  let choiceCheckApiKey = "";
+  let choiceCheckCredentialBaseUrl: string | null = null;
+  if (choiceCheckCfg.credentialRef) {
+    const cEntry = await tryResolveApiKeyEntry(
+      db,
+      choiceCheckCfg.credentialRef,
+    );
+    if (cEntry.state === "ok") {
+      choiceCheckApiKey = cEntry.secret;
+      choiceCheckCredentialBaseUrl = cEntry.baseUrl;
+    } else {
+      logger.warn(
+        "agent %s: choice check credentialRef %s did not resolve to an API key, so every choice-guarded call is refused",
+        String(args.agentId),
+        choiceCheckCfg.credentialRef,
+      );
+    }
+  }
   const attributeContext = readAttributeContextConfig(effSettings);
-  // One read for both observability knobs, and one instant for the debug mode's expiry: reading it
-  // twice would let the window close between the two answers.
-  // From the SAVED bag, not the draft, and it is the one block here that is read that way.
-  //
-  // The overrides exist so the playground can run an unsaved agent, and every other block in them
-  // changes how the agent BEHAVES — the prompt, the model, the tools, the guardrails. This one does
-  // not: it changes what the platform STORES about the run. A draft that widened it would record
-  // the customer's tool values, or full-size rows, from a switch the operator has not committed and
-  // could close the tab on, while the console's own warning says "Save to apply" and the agent's
-  // stored settings say the mode is off. Recording policy follows the saved settings, so the two
-  // can never disagree (#58).
+  const contactFieldsConfig = readContactFieldsConfig(effSettings);
+  // One read for both observability knobs, and one instant for the debug mode's expiry (two
+  // reads would let the window close between the answers). Read from the SAVED bag, the only block
+  // here that ignores the draft: every other override changes how the agent BEHAVES, this one what
+  // the platform STORES about the run. A draft that widened it would record tool values or full-size
+  // rows from a switch the operator has not saved, while the console says "Save to apply".
   const obs = readObservabilityConfig(agent.settings);
   const wantsAttributeContext = !isAttributeContextEmpty(attributeContext);
   const conv = await db.conversation.findUnique({
@@ -640,6 +856,8 @@ export async function loadAgentConfig(
           name: true,
           email: true,
           phone: true,
+          attributes: true,
+          additionalAttributes: contactFieldsConfig.context.length > 0,
           voiceReply: true,
           customAttributes: wantsAttributeContext,
         },
@@ -666,11 +884,11 @@ export async function loadAgentConfig(
     },
     select: { chatwootAgentBotId: true, accessToken: true },
   });
-  // The agent's Availability, in one scoped read when configured. It feeds the clock (get_current_time
-  // tool + {{hora_atual}} var) through its timezone, and the schedule variables ({{esta_aberto}},
-  // {{proximo_atendimento}}, {{horario_atendimento}}) through the grid and its exceptions. Until this
-  // read carried more than the timezone, the agent described its own hours from the operator's prose
-  // and drifted from the gate the moment either changed. `null` = no Availability = always on.
+  // The agent's Availability, in one scoped read when configured. It feeds the clock
+  // (get_current_time tool + {{hora_atual}} var) through its timezone, and the schedule variables
+  // ({{esta_aberto}}, {{proximo_atendimento}}, {{horario_atendimento}}) through the grid and its
+  // exceptions, so the hours the agent describes are the ones the gate enforces, not the operator's
+  // prose. `null` = no Availability = always on.
   let timezone = DEFAULT_TIMEZONE;
   let schedule: Schedule | null = null;
   // A draft id is console input, so it goes through parseDbId (digits AND range: a value past 2^63-1
@@ -695,7 +913,7 @@ export async function loadAgentConfig(
   }
   // Company name for the {{nome_empresa}} prompt variable (the tenant's own row under RLS).
   const tenant = await db.tenant.findFirst({ select: { name: true } });
-  // NOTE: A subject template only fits an email destination, and one left over from an earlier
+  // A subject template only fits an email destination, and one left over from an earlier
   // destination would still offer the model a summary. The mirror knows the channel; an inbox it does
   // not know keeps the template, and the service writes the subject on an email destination only.
   const crossInboxCaseConfig = readCrossInboxCaseConfig(effSettings);
@@ -706,7 +924,7 @@ export async function loadAgentConfig(
     const destination = await db.inbox.findFirst({
       where: {
         chatwootInboxId: crossInboxCaseConfig.targetInboxId,
-        // The tool is built only where the destination's instance is this conversation's.
+        // NOTE: The tool is built only where the destination's instance is this conversation's.
         chatwootInstanceId: args.instanceId,
       },
       select: { channelType: true },
@@ -715,7 +933,7 @@ export async function loadAgentConfig(
       crossInboxCaseConfig.subjectTemplate = null;
   }
   const langfuseCfg = await resolveLangfuseConfig(db, args.tenantId);
-  const sel = await loadToolSelections(db, agent.id);
+  const sel = opts.toolSelections ?? (await loadToolSelections(db, agent.id));
   // A/B: an active experiment for this agent may override the system prompt for this thread.
   const promptOverride = opts.skipExperiment
     ? null
@@ -741,6 +959,9 @@ export async function loadAgentConfig(
     {
       grounded,
     },
+  );
+  const contactIdentifier = mirroredContactIdentifier(
+    conv?.contact?.attributes,
   );
   const promptVars = buildPromptVars({
     contactName: pickPromptVar(
@@ -776,7 +997,7 @@ export async function loadAgentConfig(
   });
   // Playground time simulation: a valid wall-clock override replaces the real now for every time
   // variable, interpreted in the agent's timezone; anything malformed falls back to the real now.
-  // NOTE: one instant for BOTH renderings, and never `undefined`. `interpolatePromptVars` falls
+  // One instant for BOTH renderings, and never `undefined`. `interpolatePromptVars` falls
   // back to its own `new Date()` per call, and the audited prompt is built further down, after the
   // appointment read: an exact-time variable would otherwise cross a minute (or a date) boundary
   // and the logged prompt would report an hour the model never saw.
@@ -785,14 +1006,14 @@ export async function loadAgentConfig(
     new Date();
   const promptOpts = {
     timezone,
-    // The instant the age is measured FROM (issue #749). `"now"` is the caller saying the message is
+    // NOTE: The instant the age is measured FROM. `"now"` is the caller saying the message is
     // the one being written at this instant — the playground — and it resolves to the SAME instant
     // every other time variable uses, simulation included. Handing `new Date()` instead would read
     // "há 5 horas" for a message the operator just typed, the moment they simulate an earlier hour.
     messageAt:
       args.lastIncomingAt === "now" ? promptNow : (args.lastIncomingAt ?? null),
     now: promptNow,
-    // Passed on every real path, so a schedule variable is answered rather than left literal. The
+    // NOTE: Passed on every real path, so a schedule variable is answered rather than left literal. The
     // playground's time simulation reaches it through `now` above: an operator testing "what does
     // it say at 22:00" sees the agent report itself closed, exactly as the gate would.
     availability: { schedule },
@@ -802,7 +1023,7 @@ export async function loadAgentConfig(
     promptVars,
     promptOpts,
   );
-  // NOTE: The current values of the attribute keys the operator selected, rendered as an XML block
+  // The current values of the attribute keys the operator selected, rendered as an XML block
   // APPENDED to the FINISHED prompt — never interpolated, so a stored value containing
   // `{{nome_contato}}` stays literal. Values come from the mirror (webhook-fed), so this costs one
   // already-loaded row and no Chatwoot call. Absent selection / no conversation ⇒ no block.
@@ -820,7 +1041,15 @@ export async function loadAgentConfig(
             sel.nativeToolsAllow.includes("set_custom_attribute"),
         )
       : null;
-  // NOTE: The LIVE appointments booked in THIS conversation, re-read from the reminder scheduler
+  // The current values of the contact fields the operator selected, from the same mirrored row,
+  // appended like the attribute block and for the same reasons.
+  const contactFieldsSection = conv
+    ? buildContactFieldsSection(
+        contactFieldValuesFrom(conv.contact ?? {}),
+        contactFieldsConfig,
+      )
+    : null;
+  // The LIVE appointments booked in THIS conversation, re-read from the reminder scheduler
   // rows on EVERY turn — including after the last reminder fired (job DONE, start still ahead), the
   // exact turn where the customer replies to it. loadAgentConfig is shared by the reactive turn, the
   // nudge and the debounce flush, so the identity reaches all of them. Playground passes
@@ -846,9 +1075,9 @@ export async function loadAgentConfig(
           chatwootThreadId(args.tenantId, args.instanceId, args.conversationId),
         ),
         canOperate,
-        // The SAME instant and zone the prompt variables render, for the reason promptOpts states
-        // above: two renderings of one turn's clock that disagree is the defect, not the cure. The
-        // playground's time simulation therefore reaches this block too (issue #685).
+        // NOTE: The SAME instant and zone the prompt variables render, for the reason promptOpts
+        // states above: two renderings of one turn's clock must not disagree. The playground's time
+        // simulation therefore reaches this block too.
         promptOpts.now,
         timezone,
       );
@@ -881,6 +1110,7 @@ export async function loadAgentConfig(
     : null;
   const promptSections = [
     attributeSection,
+    contactFieldsSection,
     appointmentSection,
     labelSection,
   ].filter((s): s is string => s !== null);
@@ -896,6 +1126,13 @@ export async function loadAgentConfig(
         attributeContext[scope].map((k) => `${scope}:${k}`),
       ),
       text: attributeSection,
+    });
+  }
+  if (contactFieldsSection) {
+    auditedSections.push({
+      label: "contato",
+      keys: contactFieldsConfig.context.map((f) => `contact_field:${f}`),
+      text: contactFieldsSection,
     });
   }
   if (appointmentSection) {
@@ -935,6 +1172,10 @@ export async function loadAgentConfig(
     guardrails,
     guardrailsApiKey,
     guardrailsCredentialBaseUrl,
+    guardrailsExternalSecret,
+    guardrailsExternalSecretMissing,
+    groundingReviewer,
+    groundingReference,
     transferWithSummary: agent.transferWithSummary,
     nativeToolsAllow: sel.nativeToolsAllow,
     httpToolDefs: sel.httpToolDefs,
@@ -961,6 +1202,9 @@ export async function loadAgentConfig(
     jevConfig: readJevConfig(effSettings),
     skipReplyConfig: readSkipReplyConfig(effSettings),
     crossInboxCaseConfig,
+    otherInboxesConfig: readOtherInboxesConfig(effSettings),
+    chatwootInboxId: conv?.inbox?.chatwootInboxId ?? null,
+    contactFieldsConfig,
     chatwootContactId: conv?.contact?.chatwootContactId ?? null,
     kanbanConfig: readKanbanConfig(effSettings),
     toolGuidance: readToolGuidance(effSettings),
@@ -973,8 +1217,12 @@ export async function loadAgentConfig(
         ...replyGateControlLabels(readReplyGateConfig(effSettings)),
       ]),
     ],
+    resolveLabels: readResolveLabels(effSettings),
+    resolveCaseHold: resolveCaseHoldFor(crossInboxCaseConfig),
     allowedLabels: readAllowedLabels(effSettings),
     outsideAllowedLabels: readOutsideAllowedLabels(effSettings),
+    labelRemoval: readLabelRemoval(effSettings),
+    writableAttributes: readWritableAttributes(effSettings),
     toolPreconditions: readToolPreconditions(effSettings),
     httpToolContext: {
       ...(conv?.contact?.chatwootContactId != null
@@ -983,6 +1231,7 @@ export async function loadAgentConfig(
       ...(conv?.contact?.name ? { contact_name: conv.contact.name } : {}),
       ...(conv?.contact?.email ? { contact_email: conv.contact.email } : {}),
       ...(conv?.contact?.phone ? { contact_phone: conv.contact.phone } : {}),
+      ...(contactIdentifier ? { contact_identifier: contactIdentifier } : {}),
       ...(conv?.inbox?.chatwootInboxId != null
         ? { inbox_id: String(conv.inbox.chatwootInboxId) }
         : {}),
@@ -995,6 +1244,8 @@ export async function loadAgentConfig(
     maxToolCalls: limits.maxToolCalls,
     maxHistoryTokens: limits.maxHistoryTokens,
     retrySilence: limits.retrySilence,
+    maxTurnsPerHour: limits.maxTurnsPerHour,
+    maxProactivePerDay: limits.maxProactivePerDay,
     memoryCompaction: memoryCfg.enabled,
     historyDates: memoryRead.historyDates.enabled,
     memoryCompactionOverride: {
@@ -1005,19 +1256,25 @@ export async function loadAgentConfig(
     },
     memoryCompactionApiKey,
     memoryCompactionCredentialBaseUrl,
+    suggestionReviewOverride: reviewCfg,
+    suggestionReviewApiKey,
+    suggestionReviewCredentialBaseUrl,
+    choiceCheckOverride: choiceCheckCfg,
+    choiceCheckApiKey,
+    choiceCheckCredentialBaseUrl,
     logToolValues: obs.logToolValues,
     fullDetail: obs.fullDetail,
+    fullDetailRetentionDays: obs.fullDetailRetentionDays,
+    toolsUsedNote: readConversationNotesConfig(effSettings).toolsUsed,
+    turnErrors: readConversationNotesConfig(effSettings).errors,
   };
 }
 
-// A IDADE DA MENSAGEM, quando ela só é conhecida DEPOIS do load (issue #749). O fluxo do debounce e o
-// religamento manual carregam a config e só então buscam a rajada no Chatwoot, então o instante que a
-// cerca precisa não existe ainda na hora de compor. Isto recompõe o prompt a partir das MESMAS
-// entradas, com uma a mais: uma passada só, sobre o template do operador, nunca sobre o texto já
-// renderizado — é o que preserva a garantia de que um valor vindo de dado não forja placeholder.
-//
-// Sem instante, ou com um que não muda nada, devolve a config intocada: quem não sabe a idade não
-// paga nem uma interpolação, e nada no objeto muda de identidade à toa.
+// A IDADE DA MENSAGEM, quando ela só é conhecida DEPOIS do load: o fluxo do debounce e o religamento
+// manual carregam a config e só então buscam a rajada no Chatwoot. Recompõe o prompt a partir das
+// MESMAS entradas numa passada só, sobre o template do operador e nunca sobre o texto já renderizado,
+// o que preserva a garantia de que um valor vindo de dado não forja placeholder. Sem instante, ou com
+// um que não muda nada, devolve a config intocada, sem interpolar e sem trocar a identidade do objeto.
 export function withMessageAge(
   cfg: AgentConfig,
   at: Date | null | undefined,
@@ -1048,22 +1305,35 @@ export function withMessageAge(
 
 export interface ToolsetCtx {
   tenantId: bigint;
+  // Called once per send a tool made straight to the customer (the slow-tool ack, a file a toolpack
+  // delivers). The reactive turn learns it from turnState; a nudge, which has none, from this.
+  onCustomerSend?: () => void;
   instanceId: bigint;
   base: PrismaClient;
+  // The saver the turn's graph runs on, when the caller injected one. Absent ⇒ the global one.
+  checkpointer?: BaseCheckpointSaver;
   client: ChatwootClient;
   conversationId: number;
   threadId: string;
+  // A WhatsApp call's turn: it answers by voice, so no slow-tool acknowledgement is posted to the
+  // chat (the call fills the pause with its own sound). Unlike a muted client, the conversation's
+  // reference and an appointment's reminders stay, since the call is answering this customer.
+  onCall?: boolean;
+  // The HTTP tools' deadline on this turn, when it is not the instance's (HTTP_TOOL_TIMEOUT_MS).
+  httpToolTimeoutMs?: number;
   // The turn's OUTPUT guardrail, for customer-facing text a tool sends itself. Absent ⇒ nothing
   // screens it on this path. See ToolCtx.screenCustomerText.
   screenCustomerText?: (text: string) => Promise<CustomerTextVerdict>;
-  // The caller's send fence, for the one customer-facing write a tool makes on its own: the
-  // slow-tool ack, whose send is a wait the graph's own ask at the tool boundary sits before
-  // (issue #209 review, round 10). Asked after that send, before the typing indicator and before
-  // the tool runs; absent, both proceed.
+  // The conversation for the `customer_choice` judge, when the graph state is not it: the observer's
+  // graph reads one rendered prompt, which would read as a single customer message.
+  choiceTranscript?: () => DatedContextMessage[];
   // The caller's whole-turn deadline, when it has one (the observer's tick). Reaches the Chatwoot
   // client as `expiresOn` and the HTTP tools as the same signal, so a handler that outlives the
   // budget cannot still write. Absent on a reactive turn, which has no deadline.
   expiresOn?: AbortSignal;
+  // The caller's send fence, for the one customer-facing write a tool makes on its own: the
+  // slow-tool ack, whose send is a wait after the graph's own ask at the tool boundary. Asked after
+  // that send, before the typing indicator and before the tool runs; absent, both proceed.
   stillWanted?: () => Promise<boolean>;
   // Called by a handler that refused WITHOUT writing, with that tool's own name (effect-free.ts).
   // Threaded to every source that has such an exit, so the caller counting committed effects hears
@@ -1072,18 +1342,22 @@ export interface ToolsetCtx {
   // Called by `set_labels` with what a write moved, for a caller whose own flow line is the record of
   // the turn (the observation tick). See graph/tools/label-writes.ts.
   onLabelsWritten?: LabelWriteReporter;
+  // A follow-up turn (ToolCtx.proactive).
+  proactive?: boolean;
   // The conversation's status as this turn observed it, before any close of ours. Feeds the
   // IMMEDIATE resolve_conversation path (nudge turns, which carry no turnState): a close that had
   // already happened when the turn started is not the agent's. See record-resolution.ts rule 2.
   observed?: ObservedConversation;
-  // THE CONVERSATION'S LABELS, WHEN THE CALLER ALREADY READ THEM. `set_labels` diffs the model's
-  // list against what the model was SHOWN, so the set in the prompt and the set the tool compares
-  // against have to be one value: two reads a few hundred milliseconds apart let a label the prompt
-  // advertised be absent from the baseline, and the model repeating it to keep it then reads as an
-  // ADDITION, putting back exactly what somebody just removed. The observer builds its own prompt
-  // block and so has read them already; handing them over is what keeps the two from drifting
-  // (review r8). Absent ⇒ this module reads them itself, which is what the reactive turn does.
+  // THE CONVERSATION'S LABELS, WHEN THE CALLER ALREADY READ THEM. The observer builds its own prompt
+  // block from them, and handing them over keeps the labels in that block and the `shownLabels` the
+  // tool grounds on one value rather than two reads apart. Absent ⇒ this module reads them itself,
+  // which is what the reactive turn does.
   conversationLabels?: string[];
+  // The same read, dated, for a caller whose writes follow it at once: `set_labels` then applies
+  // its delta to it instead of reading again (`ToolCtx.conversationLabelsRead`).
+  conversationLabelsRead?: { labels: string[]; at: number };
+  // Whether each conversation write goes out alone (`ToolCtx.writesAlone`).
+  writesAlone?: () => boolean;
   // Chatwoot id of the message that triggered this turn, exposed to HTTP tools as {{message_id}}.
   // Direct path: the incoming message's id. Debounce flush: the burst's last incoming message id
   // (the watermark), since the coalesced turn answers up to that message. 0/absent ⇒ not exposed.
@@ -1092,16 +1366,16 @@ export interface ToolsetCtx {
   // can be exercised without the network; production leaves it absent and every builder falls back
   // to the global fetch. Named apart from `imageDeps.fetchImpl`, which is the inbound image fetch.
   outboundFetch?: typeof fetch;
-  // Mutable per-turn state shared between runLoadedTurn and the native tools (deferred resolve).
-  // Only runLoadedTurn passes it; nudge/playground omit it on purpose (structural mirror of
-  // TurnState in tools/native.ts — this module deliberately does not import that file).
   // Injectable for tests: the download + SSRF assertion send_image performs before queueing
-  // (defaults are the real ones). The assertion resolves DNS, so a hermetic test has to stub it —
+  // (defaults are the real ones). The assertion resolves DNS, so a hermetic test has to stub it,
   // same convention as ToolpackCtx.assertSafe.
   imageDeps?: ImageFetchDeps;
   // Injectable for tests: where a document tool writes and reads its rendered PDF (default: the
   // configured documents directory).
   documentsStorageDir?: string;
+  // Mutable per-turn state shared between runLoadedTurn and the native tools (deferred resolve).
+  // Only runLoadedTurn passes it; nudge/playground omit it on purpose (structural mirror of
+  // TurnState in tools/native.ts, since this module deliberately does not import that file).
   turnState?: {
     resolveRequested: boolean;
     // Mirror of TurnState.pendingAttachments: send_image and the document tools queue here and the
@@ -1125,14 +1399,45 @@ export interface ToolsetCtx {
   // Structural mirror of HandoffTurnState in tools/native.ts, for the same reason as turnState.
   // Two fields, not one: the line the model wants delivered, and whether the transfer completed.
   handoffState?: { customerMessage: string | null; completed: boolean };
-  // Where `reply_as_text` records the model's choice (issue #859), passed by the callers that deliver
+  // Where `reply_as_text` records the model's choice, passed by the callers that deliver
   // a reply that can be spoken: the reactive turn and the playground. Absent, the tool is not built,
   // which is every path that never synthesizes (nudge, observation).
   replyChoice?: ReplyChoice;
   // What the reply of THIS turn would be once the customer's stored preference is `voiceReply`, for
-  // `set_voice_preference` to tell the model how the reply it is writing will go out (issue #859).
+  // `set_voice_preference` to tell the model how the reply it is writing will go out.
   replyIsAudioWith?: (voiceReply: boolean | null) => boolean;
 }
+
+// The flow line a tool's side effect reports. A failure is an `error` line (warn unless the tool asks
+// for info); `status: "ok"` is the record of one that went through, never an error.
+export function sideEffectFlowEvent(
+  e: Parameters<SideEffectErrorReporter>[0],
+): FlowEvent {
+  return {
+    stage: "tool",
+    level: e.status === "ok" ? "info" : (e.level ?? "warn"),
+    status: e.status ?? "error",
+    // NOTE: Spread first — the canonical tool/phase discriminators must win over any
+    // caller-supplied detail keys (the Logs page and alerting key on detail.phase).
+    detail: { ...(e.detail ?? {}), tool: e.tool, phase: e.phase },
+    ...(e.status === "ok"
+      ? {}
+      : {
+          errorMessage: e.err instanceof Error ? e.err.message : String(e.err),
+        }),
+  };
+}
+
+// The native tools that read this conversation's kanban card from the turn's snapshot (`ctx.kanban`):
+// the two card tools, and the two whose `task` scope is one use among several (buildToolset).
+const KANBAN_CARD_TOOLS: readonly string[] = [
+  "kanban_move_card",
+  "update_kanban_task",
+];
+const KANBAN_CARD_SCOPE_TOOLS: readonly string[] = [
+  "set_custom_attribute",
+  "set_labels",
+];
 
 export interface ToolBuildDeps {
   buildNativeTools: (
@@ -1158,6 +1463,7 @@ export interface ToolBuildDeps {
         spokeOutsideTheReply?: boolean;
       };
       handoffState?: { customerMessage: string | null; completed: boolean };
+      proactive?: boolean;
       transferWithSummary?: boolean;
       skipReplyHandoff?: boolean;
       handoff?: HandoffConfig;
@@ -1179,17 +1485,26 @@ export interface ToolBuildDeps {
         task?: string[];
       };
       protectedLabels?: string[];
+      resolveLabels?: string[];
+      resolveCaseHold?: CaseInbox | null;
       allowedLabels?: string[];
       outsideAllowedLabels?: "refuse" | "accept";
+      labelRemoval?: "any" | "allowed";
+      writableAttributes?: WritableAttribute[];
+      onAttributeRefused?: AttributeRefusalReporter;
+      vocabUnavailable?: boolean;
       expiresOn?: AbortSignal;
       stillWanted?: () => Promise<boolean>;
       kanban?: KanbanContext;
       sendImage?: SendImageConfig;
+      contactFields?: ContactFieldsConfig;
       crossInboxCase?: {
         config: CrossInboxCaseConfig;
         contactId: number | null;
         sign?: (text: string) => string;
         renderSubject?: (summary: string | null) => string | null;
+        interpolate?: (template: string) => string;
+        attendanceStartedAt?: () => Promise<Date | null>;
       };
       screenCustomerText?: (text: string) => Promise<CustomerTextVerdict>;
       fetchImpl?: typeof fetch;
@@ -1202,12 +1517,26 @@ export interface ToolBuildDeps {
     allowed?: Iterable<string>,
   ) => StructuredToolInterface[];
   mcp?: McpLoadDeps;
-  // The playground simulates conversation tools rather than running them; a document tool belongs to
-  // that set, because it needs a turn to attach to. See DocumentToolDeps.simulate.
-  simulateDocuments?: boolean;
+  // What a channel with no conversation does with document tools, which need a turn to attach the
+  // file to: the playground simulates them (see DocumentToolDeps.simulate), the client channel does
+  // not offer them. Absent means they run.
+  documents?: "simulated" | "omitted";
   // Flow telemetry context for THIS turn. When present, an MCP discovery failure is surfaced as a
   // flowlog warn (visible in the Logs page; paged on inbox traffic) instead of only a stdout log.
   flow?: FlowContext;
+  // The `customer_choice` judge's model factory and ledger writer, injectable like the turn's own.
+  makeModel?: (cfg: ResolvedModelConfig) => BaseChatModel;
+  persistUsage?: UsagePersist;
+  // The scheduler job's signal, for a tool that makes its own model call (the `customer_choice`
+  // judge): a job past its deadline starts no call, as the turn's own model does not.
+  signal?: AbortSignal;
+  // The permit class of that call, the turn's own (BuildAgentGraphParams.modelPriority).
+  modelPriority?: PermitClass;
+  // Swaps tools of the assembled list before the precondition wrapper goes on (the playground's
+  // canned results), so a stand-in is refused by the same rules as the tool it replaces.
+  replaceTools?: (
+    tools: StructuredToolInterface[],
+  ) => StructuredToolInterface[];
 }
 
 // Native Chatwoot tools + allowlisted custom HTTP tools + allowlisted MCP tools. buildNativeTools
@@ -1226,30 +1555,21 @@ export async function buildToolset(
   const resolveBusinessHours = (id: string): Promise<Schedule | null> =>
     readSchedule(sysCtx(ctx.tenantId), id, ctx.base);
   const flow = deps.flow;
-  // NOTE: A side effect that fails INSIDE a tool that still returns success is invisible in the
+  const spokeToCustomer = (): void => {
+    if (ctx.turnState) ctx.turnState.spokeOutsideTheReply = true;
+    ctx.onCustomerSend?.();
+  };
+  // A side effect that fails INSIDE a tool that still returns success is invisible in the
   // tool's own flowlog line (the tool legitimately succeeded for the model). This binding lets toolpacks and
   // native tools surface those failures as their OWN `tool`-stage warn line (same shape as the MCP
   // onDiscoverError below): visible in the Logs page, and inbox traffic pages minLevel:warn alert
   // channels. detail.tool names the trail card; detail.phase discriminates the side effect.
   const onSideEffectError = flow
-    ? (e: {
-        tool: string;
-        phase: string;
-        detail?: Record<string, unknown>;
-        err: unknown;
-      }) =>
-        emitFlowEvent(flow, {
-          stage: "tool",
-          level: "warn",
-          status: "error",
-          // NOTE: Spread first — the canonical tool/phase discriminators must win over any
-          // caller-supplied detail keys (the Logs page and alerting key on detail.phase).
-          detail: { ...(e.detail ?? {}), tool: e.tool, phase: e.phase },
-          errorMessage: e.err instanceof Error ? e.err.message : String(e.err),
-        })
+    ? (e: Parameters<SideEffectErrorReporter>[0]) =>
+        emitFlowEvent(flow, sideEffectFlowEvent(e))
     : undefined;
-  // The two closures a tool calls to say a booking now stands, or no longer does — the Calendar
-  // toolpack and any HTTP tool whose definition declares an appointment (issue #352). The POLICY
+  // The two closures a tool calls to say a booking now stands, or no longer does: the Calendar
+  // toolpack and any HTTP tool whose definition declares an appointment. The POLICY
   // (offsets/confirmation, or none at all) comes from the caller; this only binds the MECHANISM to
   // the tenant and THIS conversation's thread. Wired on any real conversation, regardless of the
   // per-integration reminder toggle: the RECORD is not about sending a reminder.
@@ -1263,18 +1583,16 @@ export async function buildToolset(
         threadId: apptThreadId,
         base: ctx.base,
         report: onSideEffectError,
-        // A MUTED CLIENT DOES NOT REACH A JOB THAT RUNS LATER. The transport can refuse what this
-        // turn sends; a reminder is armed now and delivered on its own tick, resolving the inbox's
-        // RESPONDER and building a client of its own — so an observation could put a message in
-        // front of the customer through a door the mute never sees (round 16). The booking itself
-        // is still recorded: the record is not the reminder, and an observer that books has as much
-        // right to be remembered as one that labels.
+        // NOTE: A MUTED CLIENT DOES NOT REACH A JOB THAT RUNS LATER. A reminder is armed now and
+        // delivered on its own tick through the inbox's RESPONDER and a client of its own, so an
+        // observation could reach the customer through a door the mute never sees. The booking
+        // itself is still recorded: the record is not the reminder.
         armReminders: !ctx.client.muted,
       })
     : undefined;
   const appointmentBookedFn = apptSideEffects?.booked;
   const cancelAppointmentFn = apptSideEffects?.cancel;
-  // `{{conversation_ref}}` (issue #818): the handle an HTTP tool gives the operator's own system so
+  // `{{conversation_ref}}`: the handle an HTTP tool gives the operator's own system so
   // it can send an event back to THIS conversation later. Bound to the same thread key the
   // appointment closures use. NOT on a muted turn, for the reason the reminders above give: the
   // event is delivered later, through the inbox's responder and a client of its own, so handing the
@@ -1289,29 +1607,22 @@ export async function buildToolset(
             base: ctx.base,
           })
       : undefined;
-  // Slow-tool ack emitter: posts the per-tool "I'll look into that…" message (with a typing
-  // indicator) before the tool runs. Wired ONLY on a real conversation (conversationId > 0) — the
-  // playground builds its toolset with conversationId 0 and a dummy client, so acks never fire
-  // there. Best-effort: any failure is swallowed so it can never block the actual tool call.
-  //
-  // Answers whether the tool may still RUN. The ack's send is a wait of its own, after the graph's
-  // ask at the tool boundary, and a run called off inside it — the operator's flip to monitoring
-  // (issue #209 review, round 10) — must show no typing indicator and make no request after it.
-  // Only an explicit `false` stops the tool; a fence that could not answer is not a withdrawal.
-  //
-  // NOT WIRED ON A MUTED TURN: the ack is a message in front of the customer, which the muted
-  // transport refuses by design — an observation would log a failed ack before every slow tool and
-  // tell the operator an integration is broken. Same field the toolset reads to hide the tools a
-  // muted turn cannot complete.
+  // Slow-tool ack: posts the per-tool "I'll look into that…" message (with a typing indicator)
+  // before the tool runs; a failure is swallowed so it never blocks the tool. Only on a real
+  // conversation (the playground uses conversationId 0 and a dummy client), and not on a muted turn,
+  // whose transport refuses it: an observation would log a failed ack before every slow tool. It
+  // answers whether the tool may still RUN: the send is a wait after the graph's ask at the tool
+  // boundary, so a run called off inside it (the operator's flip to monitoring) shows no typing and
+  // makes no request after it. Only an explicit `false` stops the tool; an unanswered fence does not.
   const emitAck =
-    ctx.conversationId > 0 && !ctx.client.muted
+    ctx.conversationId > 0 && !ctx.client.muted && !ctx.onCall
       ? async (message: string): Promise<boolean> => {
           try {
             await ctx.client.sendMessage(ctx.conversationId, message);
             // NOTE: recorded the instant it lands, and before the withdrawal check below: the
             // message is on the customer's phone either way, and the operator's timeline must not
-            // call that turn silent (issue #726).
-            if (ctx.turnState) ctx.turnState.spokeOutsideTheReply = true;
+            // call that turn silent.
+            spokeToCustomer();
             if (ctx.stillWanted && !(await ctx.stillWanted())) {
               logger.info(
                 "tool ack: the run was called off after the acknowledgement (conv=%s); the tool will not run",
@@ -1330,12 +1641,25 @@ export async function buildToolset(
           return true;
         }
       : undefined;
+  // The conversation variables an HTTP tool's {{context}} placeholders read and a code tool's
+  // `context` argument and an MCP connection's headers carry: one object, so the three cannot disagree
+  // about a name.
+  const turnContext = {
+    ...(ctx.conversationId > 0
+      ? { conversation_id: String(ctx.conversationId) }
+      : {}),
+    ...(ctx.messageId && ctx.messageId > 0
+      ? { message_id: String(ctx.messageId) }
+      : {}),
+    ...cfg.httpToolContext,
+  };
   const mcpTools = await loadMcpToolsForAgent(ctx.tenantId, cfg.mcpSelections, {
-    // Default google_oauth refresh (overridable by tests via deps.mcp). Resolves the entry id from
+    context: turnContext,
+    // NOTE: Default google_oauth refresh (overridable by tests via deps.mcp). Resolves the entry id from
     // the `vault:<id>` ref and returns a fresh access token, refreshing via Google when stale.
     refreshCredential: (tenantId, ref) =>
       resolveInjectableCredential(ctx.base, tenantId, ref),
-    // A connection that fails discovery degrades the toolset silently (fail-open). When a flow ctx is
+    // NOTE: A connection that fails discovery degrades the toolset silently (fail-open). When a flow ctx is
     // present, also surface it as a flowlog `tool` warn → visible in the Logs page and (inbox traffic
     // only) paged to alert channels. Best-effort: the emit is fire-and-forget and never throws.
     onDiscoverError: flow
@@ -1357,18 +1681,18 @@ export async function buildToolset(
   const toolpackTools = buildToolpackTools(cfg.integrationSelections, {
     tenantId: ctx.tenantId,
     expiresOn: ctx.expiresOn,
-    // Wrapped onto the pack's fetch at the build seam, next to the deadline and for the same reason:
+    // NOTE: Wrapped onto the pack's fetch at the build seam, next to the deadline and for the same reason:
     // four packs with four request helpers is four places to forget.
     stillWanted: ctx.stillWanted,
     onNoEffect: ctx.onNoEffect,
     ...(ctx.outboundFetch ? { fetchImpl: ctx.outboundFetch } : {}),
     base: ctx.base,
     threadId: ctx.threadId,
-    // The current customer, so a toolpack can isolate per-contact data (e.g. Calendar appointments).
+    // NOTE: The current customer, so a toolpack can isolate per-contact data (e.g. Calendar appointments).
     // null on the playground (no mirrored contact) → such tools fail closed.
     contactDbId: cfg.contactDbId,
     resolveCredential,
-    // Read at call time, like every other resolver here: a turn that sends no email pays no query.
+    // NOTE: Read at call time, like every other resolver here: a turn that sends no email pays no query.
     resolveContactEmail: async () => {
       const id = cfg.contactDbId;
       if (id == null) return null;
@@ -1378,15 +1702,31 @@ export async function buildToolset(
       const email = row?.email?.trim();
       return email ? email : null;
     },
+    // NOTE: Live from Chatwoot, for the Calendar invite: the mirror misses an email an agent typed in
+    // Chatwoot (no contact_updated reaches a bot). Read only when a create invites, so a turn that
+    // books nothing pays no call. Only a real conversation has a client that reaches Chatwoot.
+    ...(ctx.conversationId > 0
+      ? {
+          readContactEmail: async () => {
+            const id = cfg.chatwootContactId;
+            return id == null ? null : ctx.client.getContactEmail(id);
+          },
+        }
+      : {}),
     resolveBusinessHours,
     appointmentBooked: appointmentBookedFn,
     cancelAppointment: cancelAppointmentFn,
     onSideEffectError,
-    // Only a real conversation gets the live handle (mirrors the emitAck gate); the playground
+    ...(ctx.client.muted ? { muted: true } : {}),
+    // NOTE: Only a real conversation gets the live handle (mirrors the emitAck gate); the playground
     // builds with conversationId 0 + a stub client, so customer-delivery tools degrade.
     ...(ctx.conversationId > 0
       ? {
-          chatwoot: { client: ctx.client, conversationId: ctx.conversationId },
+          chatwoot: {
+            client: ctx.client,
+            conversationId: ctx.conversationId,
+            onSent: spokeToCustomer,
+          },
         }
       : {}),
   });
@@ -1430,6 +1770,7 @@ export async function buildToolset(
     !cfg.nativeToolsAllow ||
     cfg.nativeToolsAllow.some((n) => vocabTools.includes(n));
   let vocab: ChatwootVocab | undefined;
+  let vocabUnavailable = false;
   if (needsVocab && ctx.conversationId > 0) {
     try {
       vocab = await loadChatwootVocab(
@@ -1437,6 +1778,7 @@ export async function buildToolset(
         `${ctx.tenantId}:${ctx.instanceId}`,
       );
     } catch (e) {
+      vocabUnavailable = true;
       logger.warn(
         "chatwoot vocab fetch failed (tenant=%s): %s",
         String(ctx.tenantId),
@@ -1444,11 +1786,20 @@ export async function buildToolset(
       );
     }
   }
-  // Resolve this conversation's kanban card (board + current step + steps) ONLY when the funnel tool
-  // is granted (it is the costlier 2-3 call resolve), so the common case stays cheap. Grounds
-  // kanban_move_card (step by name) + enables set_custom_attribute's task scope. Best-effort.
+  // Resolve this conversation's kanban card (board + current step + steps) ONLY when a tool that reads
+  // it is granted: kanban_move_card and update_kanban_task always. set_custom_attribute and set_labels
+  // use the `task` scope only sometimes, so they resolve it only when the account defines card
+  // attributes or the operator listed a task key for set_custom_attribute; otherwise every attribute
+  // or label agent, the decisions observer included, would pay the read on accounts with no funnel.
+  // The cost is one conversation GET per turn (the board's steps are cached). Best-effort.
+  const allow = cfg.nativeToolsAllow;
   const grantsKanban =
-    !cfg.nativeToolsAllow || cfg.nativeToolsAllow.includes("kanban_move_card");
+    !allow ||
+    allow.some((n) => KANBAN_CARD_TOOLS.includes(n)) ||
+    (allow.some((n) => KANBAN_CARD_SCOPE_TOOLS.includes(n)) &&
+      attributesForModel(vocab, "task_attribute").length > 0) ||
+    (allow.includes("set_custom_attribute") &&
+      (cfg.writableAttributes ?? []).some((a) => a.scope === "task"));
   let kanban: KanbanContext | undefined;
   if (grantsKanban && ctx.conversationId > 0) {
     try {
@@ -1466,24 +1817,13 @@ export async function buildToolset(
       );
     }
   }
-  // WHAT THE LABELS ARE RIGHT NOW, read fresh, and since #695 this is GROUNDING rather than
-  // authority: the tool names a delta, so a removal comes from the model naming the label in
-  // `remove` and not from it being missing here. What this read buys is that the model knows which
-  // values exist on the scope, so it asks for the canonical one instead of inventing a synonym.
-  // Read HERE, once, and handed to the tool as `shownLabels`, so the block in the description and
-  // the argument's own sentence are the same value and cannot describe different turns.
-  //
-  // A scope that fails to read is simply ABSENT, never `[]`: an empty list says "this conversation
-  // has no labels", which under the old contract a model would honour by removing everything, and
-  // which even now invites a redundant `add`, while absent says "we do not
-  // know" and makes the call additive. This is best-effort like the vocab above, and the failure
-  // mode of getting it wrong is deleting a customer's classification, so it fails to the safe side.
-  //
-  // The conversation's set is one GET, spent only when the tool is granted and only on a real
-  // conversation. The card's comes free with the kanban snapshot. The CONTACT's is deliberately not
-  // read: it would be a scoped DB lookup plus a second GET on every turn, for a scope whose labels
-  // are durable traits (`vip`, `inadimplente`) that a turn rarely needs to retract — so contact
-  // scope stays additive, by the same "absent means we do not know" rule, and the description says so.
+  // THE LABELS RIGHT NOW, read once and handed to the tool as `shownLabels`: GROUNDING, not
+  // authority. The tool names a delta, so a removal comes from `remove`, never from a label missing
+  // here; the read lets the model ask for the canonical value instead of inventing a synonym. A
+  // scope that fails to read is ABSENT, never `[]`, which would say "no labels" and invite a
+  // redundant `add`. The conversation's set is one GET, only when the tool is granted on a real
+  // conversation; the card's comes with the kanban snapshot. The CONTACT's is not read (a DB lookup
+  // plus a GET every turn, for durable traits a turn rarely retracts), so that scope stays additive.
   const grantsLabels =
     !cfg.nativeToolsAllow || cfg.nativeToolsAllow.includes("set_labels");
   const shownLabels: {
@@ -1491,16 +1831,9 @@ export async function buildToolset(
     contact?: string[];
     task?: string[];
   } = {};
-  // A GUARDED LABEL IS NOT SHOWN, which is the whole of its protection on this side: the diff at
-  // write time refuses the same set, so what the model sees and what the tool accepts are stated
-  // once each and no longer have to agree by subtraction. Applied at the SEAM rather than at each
-  // reader, so every scope answers the question with the same function.
-  //
-  // THE GUARD IS NO LONGER SUBTRACTED HERE (issue #695). Under the replace contract a guarded label
-  // had to be hidden, because a label the model was shown and left out was deleted; under the delta
-  // contract nothing is removed unless named, so a guarded label can be shown and still refused.
-  // Showing it is the point: hiding it is what made a fenced agent invent a name for the canonical
-  // value it was not allowed to see.
+  // A guarded label is SHOWN and refused at write time: nothing is removed unless named, and
+  // hiding it would make a fenced agent invent a name for the canonical value. Applied at the SEAM,
+  // so every scope answers with the same function (graph/tools/label-view.ts).
   const shownProjection = (labels: string[]): string[] =>
     modelVisibleLabels(labels);
   if (grantsLabels && ctx.conversationId > 0) {
@@ -1523,7 +1856,7 @@ export async function buildToolset(
   const toolInstructions: Partial<Record<NativeToolName, string>> = {
     ...cfg.toolGuidance,
   };
-  // handoff/kanban guidance lives in their own grouped config; let it win over the flat map for those
+  // NOTE: handoff/kanban guidance lives in their own grouped config; let it win over the flat map for those
   // two tools (the editor writes them there, not into settings.toolGuidance).
   if (cfg.handoffConfig.instructions) {
     toolInstructions.handoff_to_human = cfg.handoffConfig.instructions;
@@ -1539,6 +1872,7 @@ export async function buildToolset(
       conversationId: ctx.conversationId,
       turnState: ctx.turnState,
       handoffState: ctx.handoffState,
+      ...(ctx.proactive ? { proactive: true } : {}),
       transferWithSummary: cfg.transferWithSummary,
       skipReplyHandoff: cfg.skipReplyConfig?.handoff !== false,
       handoff: effectiveHandoff,
@@ -1552,18 +1886,50 @@ export async function buildToolset(
       replyIsAudioWith: ctx.replyIsAudioWith,
       timezone: cfg.timezone,
       vocab,
+      ...(vocabUnavailable ? { vocabUnavailable } : {}),
       shownLabels,
+      ...(ctx.conversationLabelsRead
+        ? { conversationLabelsRead: ctx.conversationLabelsRead }
+        : {}),
+      ...(ctx.writesAlone ? { writesAlone: ctx.writesAlone } : {}),
       protectedLabels: cfg.protectedLabels,
+      resolveLabels: cfg.resolveLabels,
+      resolveCaseHold: caseHoldOn(
+        cfg.resolveCaseHold,
+        ctx.instanceId,
+        cfg.chatwootContactId,
+      ),
       allowedLabels: cfg.allowedLabels,
       outsideAllowedLabels: cfg.outsideAllowedLabels,
-      // The same fence the ack above asks, handed on to set_labels: its write waits for a queue
+      labelRemoval: cfg.labelRemoval,
+      writableAttributes: cfg.writableAttributes,
+      // NOTE: A refused attribute write is its own `tool` line at info: the model is told and asks
+      // again, and the operator sees which rule held the value back. The rule, never the value.
+      ...(flow
+        ? {
+            onAttributeRefused: (r: AttributeRefusal) =>
+              emitFlowEvent(flow, {
+                stage: "tool",
+                level: "info",
+                status: "skipped",
+                detail: {
+                  tool: "set_custom_attribute",
+                  phase: "attribute_refused",
+                  scope: r.scope,
+                  rule: r.rule,
+                  ...(r.key ? { key: r.key } : {}),
+                },
+              }),
+          }
+        : {}),
+      // NOTE: The same fence the ack above asks, handed on to set_labels: its write waits for a queue
       // that `/reset` also uses, and that wait is after the graph's ask at the tool boundary.
       stillWanted: ctx.stillWanted,
       onNoEffect: ctx.onNoEffect,
-      // A caller with its own record of the turn (the observation tick) keeps it. Every other turn
-      // gets the write as its own `tool` line, so `outsideAllowed` under `accept` is counted on a
-      // responder and a follow-up turn too, as the setting promises (review round 2 of #638). Counts
-      // and operator titles only: see graph/tools/label-writes.ts.
+      // NOTE: A caller with its own record of the turn (the observation tick) keeps it. Every other
+      // turn gets the write as its own `tool` line, so `outsideAllowed` under `accept` is counted on
+      // a responder and a follow-up turn too, as the setting promises. Counts and operator titles
+      // only: see graph/tools/label-writes.ts.
       onLabelsWritten:
         ctx.onLabelsWritten ??
         (flow
@@ -1577,7 +1943,8 @@ export async function buildToolset(
           : undefined),
       kanban,
       sendImage: cfg.sendImageConfig,
-      // The inbox id is account-scoped: on a conversation of another account it names a different
+      contactFields: cfg.contactFieldsConfig,
+      // NOTE: The inbox id is account-scoped: on a conversation of another account it names a different
       // inbox or none, so the tool is not built there (same drift the pinned handoff covers above).
       // The playground (conversationId 0, instance 0) belongs to no account and only simulates the
       // tool, so it keeps it: an operator testing the escalation is what the playground is for.
@@ -1588,6 +1955,28 @@ export async function buildToolset(
           ? {
               config: cfg.crossInboxCaseConfig,
               contactId: cfg.chatwootContactId,
+              // NOTE: Read only when the files block asks for the attendance scope, and only on a real
+              // conversation of a known contact-inbox, which is what keys the memory thread.
+              ...(ctx.conversationId > 0 &&
+              cfg.contactInboxId != null &&
+              cfg.crossInboxCaseConfig.carryAttachments.mode === "attendance"
+                ? {
+                    attendanceStartedAt: async () =>
+                      attendanceStartedAt(
+                        {
+                          // NOTE: The saver the running graph writes to, so the boundary reads the same thread.
+                          checkpointer:
+                            ctx.checkpointer ?? (await getCheckpointer()),
+                          base: ctx.base,
+                        },
+                        {
+                          tenantId: ctx.tenantId,
+                          instanceId: ctx.instanceId,
+                          contactInboxId: cfg.contactInboxId as number,
+                        },
+                      ),
+                  }
+                : {}),
               renderSubject: (summary: string | null) =>
                 renderCaseSubject(
                   cfg.crossInboxCaseConfig.subjectTemplate,
@@ -1595,19 +1984,29 @@ export async function buildToolset(
                   (t) =>
                     interpolatePromptVars(t, cfg.promptVars, cfg.promptOpts),
                 ),
-              // The opening reaches the customer, so it carries the agent's signature like every reply
-              // (docs/signature.md); one message, one chunk.
+              // NOTE: The operator's opening and note templates take the same context variables, fenced
+              // as values: a contact's name is theirs, not the operator's, and must not run as Liquid.
+              interpolate: (t: string) =>
+                interpolatePromptVars(t, cfg.promptVars, {
+                  ...cfg.promptOpts,
+                  wrap: markValue,
+                }),
+              // NOTE: The opening reaches the customer, so it carries the agent's signature like every reply
+              // (docs/signature.md); one message, one chunk. The model's text is escaped for Chatwoot's
+              // Liquid and the signature is not.
               sign: (text: string) => {
                 const sig = signatureFor(
                   cfg.signatureConfig,
                   cfg.promptVars,
                   cfg.promptOpts,
                 );
-                if (!sig) return text;
-                const [out = text] = attachSignature(
+                if (!sig) return literalForChatwoot(text);
+                const [out = literalForChatwoot(text)] = attachSignature(
                   [text],
                   sig,
                   cfg.signatureConfig,
+                  undefined,
+                  literalForChatwoot,
                 );
                 return out;
               },
@@ -1625,18 +2024,7 @@ export async function buildToolset(
   // the ones it did are already first in the list and win by order. See unique-names.ts for why the
   // reservation cannot be left to ordering alone.
   const builtNativeNames = new Set(nativeTools.map((t) => t.name));
-  // The conversation variables an HTTP tool's {{context}} placeholders read and a code tool's
-  // `context` argument carries: one object, so the two kinds cannot disagree about a name.
-  const turnContext = {
-    ...(ctx.conversationId > 0
-      ? { conversation_id: String(ctx.conversationId) }
-      : {}),
-    ...(ctx.messageId && ctx.messageId > 0
-      ? { message_id: String(ctx.messageId) }
-      : {}),
-    ...cfg.httpToolContext,
-  };
-  // `reply_as_text` (issue #859), on every turn of an agent that turned it on, text and audio alike.
+  // `reply_as_text`, on every turn of an agent that turned it on, text and audio alike.
   // Only a caller that delivers a reply which can be spoken hands over the holder (the reactive turn
   // and the playground), so the observer and the nudge, which never synthesize, are not offered it.
   // Placed with the natives so a tenant tool that happens to share the name is the one dropped: the
@@ -1655,16 +2043,16 @@ export async function buildToolset(
     [
       ...nativeTools,
       ...replyAsText,
-      // A DOCUMENT IS AN ATTACHMENT TO THE CUSTOMER, so a muted turn is not offered one: without a
-      // turnState to queue into it refuses every call anyway, and with one it would deliver through
-      // the very send this client exists to refuse. Same reading `buildNativeTools` and the
-      // toolpacks make (issue #568, review round 23).
-      ...(ctx.client.muted
+      // NOTE: A DOCUMENT IS AN ATTACHMENT TO THE CUSTOMER, so a muted turn is not offered one:
+      // without a turnState to queue into it refuses every call anyway, and with one it would
+      // deliver through the very send this client exists to refuse. Same reading
+      // `buildNativeTools` and the toolpacks make.
+      ...(ctx.client.muted || deps.documents === "omitted"
         ? []
         : buildDocumentTools(cfg.documentSelections, {
             tenantId: ctx.tenantId,
             turnState: ctx.turnState,
-            // The document is bound to the conversation by its THREAD key, never by the conversation id
+            // NOTE: The document is bound to the conversation by its THREAD key, never by the conversation id
             // alone: that id only identifies a conversation within one Chatwoot account, and a tenant can
             // have several. Absent off a real conversation, and the document is then issued unbound.
             threadId: apptThreadId ?? undefined,
@@ -1672,31 +2060,34 @@ export async function buildToolset(
             conversationDbId: cfg.conversationDbId,
             base: ctx.base,
             storageDir: ctx.documentsStorageDir,
-            // The same zone the agent tells the time in, so a document's date and a message saying "hoje"
+            // NOTE: The same zone the agent tells the time in, so a document's date and a message saying "hoje"
             // cannot disagree by a day.
             timezone: cfg.timezone,
-            simulate: deps.simulateDocuments,
+            simulate: deps.documents === "simulated",
           })),
       ...buildHttpTools(cfg.httpToolDefs, {
         resolveCredential,
         emitAck,
+        ...(ctx.httpToolTimeoutMs !== undefined
+          ? { timeoutMs: ctx.httpToolTimeoutMs }
+          : {}),
         expiresOn: ctx.expiresOn,
-        // The same fence the native tools and the precondition wrapper ask, at the same point: past
+        // NOTE: The same fence the native tools and the precondition wrapper ask, at the same point: past
         // every wait, immediately before the request leaves for somebody else's system.
         stillWanted: ctx.stillWanted,
         onNoEffect: ctx.onNoEffect,
         ...(ctx.outboundFetch ? { fetchImpl: ctx.outboundFetch } : {}),
-        // HTTP tools are https-only unless allowHttp. In dev (where SSRF_ALLOW_PRIVATE_TARGETS is on by
+        // NOTE: HTTP tools are https-only unless allowHttp. In dev (where SSRF_ALLOW_PRIVATE_TARGETS is on by
         // default) operators legitimately point tools at local http services (see .env.example); prod
         // keeps the flag false → https-only. Ties the two so a local HTTP tool works without extra config.
         allowHttp: config.ssrf.allowPrivateTargets,
         context: turnContext,
-        // The zone an offset-less start from a declared response is read in. Same value the documents
+        // NOTE: The zone an offset-less start from a declared response is read in. Same value the documents
         // tool gets, and for the same reason: two readers of the operator's own wall clock must not
         // disagree by three hours.
         timezone: cfg.timezone,
-        // The same two closures the toolpacks get, for a tool whose DEFINITION declares that its
-        // response describes an appointment (issue #352). Wired identically: undefined on the
+        // NOTE: The same two closures the toolpacks get, for a tool whose DEFINITION declares that
+        // its response describes an appointment. Wired identically: undefined on the
         // playground, where nothing is recorded, and the declaration then simply does nothing.
         appointmentBooked: appointmentBookedFn,
         cancelAppointment: cancelAppointmentFn,
@@ -1706,7 +2097,7 @@ export async function buildToolset(
       ...buildCodeTools(cfg.codeToolDefs, {
         timezone: cfg.timezone,
         context: turnContext,
-        // The two attribute bags, read when the tool is CALLED, through the same loader a
+        // NOTE: The two attribute bags, read when the tool is CALLED, through the same loader a
         // precondition uses (tool-preconditions.ts is the one vocabulary for both). Off a real
         // conversation the ids are null and the bags come back empty.
         loadState: preconditionStateLoader({
@@ -1715,6 +2106,7 @@ export async function buildToolset(
           conversationDbId: cfg.conversationDbId ?? null,
           contactDbId: cfg.contactDbId ?? null,
         }),
+        onSideEffectError,
       }),
       ...mcpTools,
       ...toolpackTools,
@@ -1725,6 +2117,7 @@ export async function buildToolset(
           knowledgeBaseIds: cfg.ragConfig?.knowledgeBaseIds ?? [],
           knowledgeBases: cfg.ragConfig?.knowledgeBases,
           threadId: ctx.threadId,
+          agentId: cfg.agentId,
           maxDistance: cfg.ragConfig?.maxDistance,
         },
         cfg.ragConfig?.tools,
@@ -1732,12 +2125,12 @@ export async function buildToolset(
     ],
     NATIVE_TOOL_NAMES.filter((n) => !builtNativeNames.has(n)),
   );
-  // NOTE: The precondition seam, and the reason the whole feature is six lines: every source's tools have
+  // The precondition seam, and the reason the whole feature is six lines: every source's tools have
   // already been merged into ONE name-unique list above, so a map keyed by name reaches native,
   // document, HTTP, MCP, toolpack and RAG at once. An agent with no preconditions gets the same
   // array back, untouched.
   const guarded = applyToolPreconditions(
-    tools,
+    deps.replaceTools ? deps.replaceTools(tools) : tools,
     cfg.toolPreconditions,
     preconditionStateLoader({
       base: ctx.base,
@@ -1749,7 +2142,7 @@ export async function buildToolset(
       ? (info) => emitFlowEvent(flow, preconditionFlowEvent(info))
       : undefined,
     (unmatched) => {
-      // A rule that matches no assembled tool guards nothing and reads on screen exactly like one
+      // NOTE: A rule that matches no assembled tool guards nothing and reads on screen exactly like one
       // that does. Reported at assembly because this is the first and only point where the whole
       // toolset is known.
       if (flow) emitFlowEvent(flow, unmatchedPreconditionEvent(unmatched));
@@ -1759,23 +2152,22 @@ export async function buildToolset(
         unmatched.join(", "),
       );
     },
-    // The same fence every handler that waits before writing asks: this wrapper puts a state read
-    // between the graph's ask and the call, so a tool whose first act is a write would otherwise
-    // lose the cover that ask gives it (issue #568, review round 24).
+    // NOTE: The same fence every handler that waits before writing asks: this wrapper puts a state
+    // read between the graph's ask and the call, so a tool whose first act is a write would
+    // otherwise lose the cover that ask gives it.
     ctx.stillWanted,
     ctx.onNoEffect,
+    customerChoiceCheck(cfg, ctx, deps),
   );
   if (dropped.length > 0) {
-    // The operator is the only one who can fix this, and the symptom they would otherwise see is a
-    // tool that quietly does nothing — or, on a provider that rejects a duplicated function name,
-    // an agent that stops replying at all. So it goes where they look at the turn (#389), not only
-    // to the process log, which on a managed deploy they may have no way to read at all.
+    // NOTE: The operator is the only one who can fix this, and the symptom they would otherwise see
+    // is a tool that quietly does nothing (or, on a provider that rejects a duplicated function
+    // name, an agent that stops replying). So it goes where they look at the turn, not only to the
+    // process log, which on a managed deploy they may have no way to read at all.
     if (flow) emitFlowEvent(flow, droppedToolNamesEvent(dropped));
-    // NOTE: what to rename is NOT said here any more. It was "rename the later one", which is an
-    // action that exists for an MCP connection (the slug comes from its display name) and does not
-    // exist for the commonest case: two instances of one toolpack expose identical names, because
-    // the names come from the pack. Naming the tool that lost is the part that is true for every
-    // source.
+    // NOTE: the line names the tool that lost and not what to rename: renaming exists for an MCP
+    // connection (the slug comes from its display name) but not for the commonest case, two
+    // instances of one toolpack exposing identical names that come from the pack.
     logger.warn(
       "agent %s: %d tool(s) dropped for a duplicate name (%s)",
       String(cfg.agentId),
@@ -1783,11 +2175,10 @@ export async function buildToolset(
       [...new Set(dropped)].join(", "),
     );
   }
-  // LAST, so it is the outermost wrapper: the schema parse that refuses a call happens in the
+  // NOTE: LAST, so it is the outermost wrapper: the schema parse that refuses a call happens in the
   // innermost tool, and this has to be the frame the exception passes through on its way out. One
-  // wrap here covers every caller of this builder (turn, nudge, observation, playground), which is
-  // the point: the four of them instantiate their own ToolFlowLogger, and that logger cannot see a
-  // refusal from any of them (issue #667).
+  // wrap here covers every caller of this builder (turn, nudge, observation, playground), whose own
+  // ToolFlowLogger cannot see such a refusal.
   return logSchemaRefusals(guarded, flow, cfg.logToolValues);
 }
 
@@ -1796,11 +2187,11 @@ export interface CallbacksArgs {
   threadId: string;
   base?: PrismaClient;
   persistUsage?: UsagePersist;
-  node?: string;
+  node?: UsageNode;
   // The model to LABEL the usage row with. Defaults to the agent's own model, which is right for the
   // turn itself; a secondary call on a separately-configured model (the speech normalizer) must pass
   // the model it actually billed, or the row attributes that spend to the wrong model. The provider
-  // travels with it, because the price of a model is its provider's (issue #863).
+  // travels with it, because the price of a model is its provider's.
   billedModel?: { provider: string; model: string };
   // The conversation to ATTRIBUTE the usage row and the trace to. Defaults to the one the config was
   // loaded for, which is right for a turn; memory compaction is the exception, because a claimed job
@@ -1812,6 +2203,8 @@ export interface CallbacksArgs {
   updateRoot?: boolean;
   // Usage segmentation: "inbox" (real traffic, default) | "playground" (operator test turns).
   source?: UsageSource;
+  // A client-channel turn for an anonymous visitor's session, marked on its usage rows.
+  anonymous?: boolean;
   // Per-turn id → the Langfuse trace id (correlates a trace with the ExecutionLog turn). Omitted
   // lets Langfuse generate its own id.
   turnId?: string;
@@ -1819,11 +2212,10 @@ export interface CallbacksArgs {
   tools?: StructuredToolInterface[];
 }
 
-// `??` was wrong here, and the case it got wrong is the one the override exists for: compaction
-// passes an explicit null when the segment it summarized belongs to a conversation whose mirrored row
-// is gone (an owed backlog, a conversation deleted since). Coalescing that back to the config's own
-// conversation charges the generation to an unrelated attendance — louder than the bug the override
-// was added to fix. Omitted and explicitly-null are different answers, so they are read differently.
+// Omitted and explicitly-null are different answers, so this does not use `??`: compaction passes an
+// explicit null when the segment it summarized belongs to a conversation whose mirrored row is gone
+// (an owed backlog, a conversation deleted since), and coalescing that back to the config's own
+// conversation would charge the generation to an unrelated attendance.
 function resolveUsageConversation(
   cfg: AgentConfig,
   args: CallbacksArgs,
@@ -1848,6 +2240,7 @@ export function buildCallbacks(
     model: (args.billedModel ?? cfg.mc).model,
     node: args.node ?? "agent",
     source: args.source,
+    anonymous: args.anonymous,
     persist: args.persistUsage,
     base: args.base,
   });
@@ -1865,6 +2258,122 @@ export function buildCallbacks(
     updateRoot: args.updateRoot,
   });
   return langfuse ? [usage, langfuse] : [usage];
+}
+
+// The `customer_choice` judge runs on the agent's OWN model and key, so the condition needs no
+// configuration of its own, and is billed under its own ledger node inside the turn that called the
+// tool. Pinned like the speech rewrite: temperature 0 and no reasoning effort, since the answer is a
+// YES or a NO the customer is waiting on.
+export function customerChoiceCheck(
+  cfg: AgentConfig,
+  ctx: ToolsetCtx,
+  deps: ToolBuildDeps,
+): ChoiceCheck {
+  // The agent's model and key unless `settings.choiceCheck` names another, resolved like every
+  // secondary call's override. Unlike the suggestion reviewer, an override that cannot run refuses the
+  // call (null below): falling back to the agent's model would send its key where the operator moved
+  // the check away from, and letting the call through would drop the guard.
+  const mc = (): ResolvedModelConfig | null => {
+    const o = cfg.choiceCheckOverride ?? {};
+    if (!choiceCheckOverridden(o)) {
+      return {
+        provider: cfg.mc.provider,
+        model: cfg.mc.model,
+        apiKey: cfg.apiKey,
+        baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
+        temperature: 0,
+      };
+    }
+    const r = resolveModelOverride(
+      o,
+      {
+        provider: cfg.mc.provider,
+        model: cfg.mc.model,
+        baseURL: cfg.credentialBaseUrl ?? cfg.mc.baseURL,
+      },
+      { ownCredentialBaseURL: cfg.choiceCheckCredentialBaseUrl },
+    );
+    if (!r.runnable) {
+      logger.warn(
+        { agentId: String(cfg.agentId), reason: r.reason },
+        "customer choice: the judge's own model cannot run, so a guarded call is refused",
+      );
+      return null;
+    }
+    if (r.credential === "own" && !cfg.choiceCheckApiKey) {
+      logger.warn(
+        { agentId: String(cfg.agentId) },
+        "customer choice: the judge's own credential did not resolve, so a guarded call is refused",
+      );
+      return null;
+    }
+    return {
+      provider: r.provider as ModelConfig["provider"],
+      model: r.model,
+      apiKey:
+        r.credential === "own"
+          ? cfg.choiceCheckApiKey
+          : r.credential === "agent"
+            ? cfg.apiKey
+            : "",
+      baseURL: r.baseURL ?? undefined,
+      temperature: 0,
+    };
+  };
+  let resolvedMc: ResolvedModelConfig | null | undefined;
+  const judgeMc = (): ResolvedModelConfig | null => {
+    if (resolvedMc === undefined) resolvedMc = mc();
+    return resolvedMc;
+  };
+  let built: BaseChatModel | null | undefined;
+  return choiceCheck({
+    // NOTE: the clock and zone the agent's own prompt rendered, so the playground's simulated hour
+    // reaches the judge too and "tomorrow" means the same day to both.
+    clock: () => ({
+      now: cfg.promptOpts.now,
+      timezone: cfg.promptOpts.timezone ?? cfg.timezone,
+    }),
+    transcript: ctx.choiceTranscript,
+    priority: deps.modelPriority,
+    reference: () => cfg.systemPrompt,
+    signal: () => {
+      const turn = [ctx.expiresOn, deps.signal].filter(
+        (s): s is AbortSignal => s !== undefined,
+      );
+      return turn.length > 1 ? AbortSignal.any(turn) : turn[0];
+    },
+    model: () => {
+      if (built !== undefined) return built;
+      try {
+        const resolved = judgeMc();
+        // NOTE: no key is not a reason to refuse here: an `openai-compatible` endpoint may run keyless,
+        // and the factory is what knows which configurations are runnable.
+        built = resolved ? (deps.makeModel ?? createChatModel)(resolved) : null;
+      } catch (err) {
+        logger.warn(
+          { err, agentId: String(cfg.agentId) },
+          "customer choice: the agent's model is not runnable, so a guarded call is refused",
+        );
+        built = null;
+      }
+      return built;
+    },
+    callbacks: () =>
+      deps.flow
+        ? buildCallbacks(cfg, {
+            tenantId: ctx.tenantId,
+            threadId: ctx.threadId,
+            base: ctx.base,
+            persistUsage: deps.persistUsage,
+            node: "choice_check",
+            billedModel: judgeMc() ?? undefined,
+            turnId: deps.flow.turnId,
+            source: deps.flow.source,
+            anonymous: deps.flow.anonymous,
+            updateRoot: false,
+          })
+        : [],
+  });
 }
 
 export interface SpeechNormalizerArgs {
@@ -1914,12 +2423,12 @@ export function buildSpeechNormalizer(
     }
     return undefined;
   };
-  // Every configuration the resolver refuses: an unsupported provider name, a switched provider with
+  // NOTE: Every configuration the resolver refuses: an unsupported provider name, a switched provider with
   // no key of its own (running it on the AGENT's key would transmit one vendor's secret to another),
   // and an openai-compatible endpoint that is missing. REST and MCP write the settings bag directly,
   // so the editor's warning is not the guard here.
   if (!resolved.runnable) return skip(resolved.reason ?? "not_runnable");
-  // Its own credential was configured and did not resolve. Falling back to the AGENT's key would be a
+  // NOTE: Its own credential was configured and did not resolve. Falling back to the AGENT's key would be a
   // silent substitution on a provider that may not even accept it.
   if (own && !cfg.ttsNormalizeApiKey) return skip("credential_not_found");
   const makeModel = args.makeModel ?? createChatModel;
@@ -1931,7 +2440,7 @@ export function buildSpeechNormalizer(
   const mc: ResolvedModelConfig = {
     provider: resolved.provider as ModelConfig["provider"],
     model: resolved.model,
-    // WHOSE key travels, decided by the resolver rather than here: the agent's is reachable only
+    // NOTE: WHOSE key travels, decided by the resolver rather than here: the agent's is reachable only
     // while the provider is unchanged, and `none` is an openai-compatible endpoint that authenticates
     // by its URL, where sending the agent's key would be the leak this whole rule exists to prevent.
     apiKey:
@@ -1941,7 +2450,7 @@ export function buildSpeechNormalizer(
           ? cfg.apiKey
           : "",
     baseURL: resolved.baseURL ?? undefined,
-    // Pinned, and the agent's reasoningEffort deliberately NOT carried: this pass rewrites an answer
+    // NOTE: Pinned, and the agent's reasoningEffort deliberately NOT carried: this pass rewrites an answer
     // that already exists, and the effort the operator chose is about how the agent THINKS.
     // Reasoning here would only add latency to an audio reply the customer is waiting on.
     temperature: 0,
@@ -1964,7 +2473,7 @@ export function buildSpeechNormalizer(
         ...args.callbacks,
         node: "tts_normalize",
         billedModel: mc,
-        // The turn's trace already exists under this turnId; this call is a generation INSIDE it.
+        // NOTE: The turn's trace already exists under this turnId; this call is a generation INSIDE it.
         updateRoot: false,
       })
     : undefined;
@@ -1982,7 +2491,7 @@ export function buildSpeechNormalizer(
           outChars: out.length,
           rewritten: out !== text,
         }),
-        // Best-effort: synthesizeReply catches and synthesizes the raw text, so this is an advisory.
+        // NOTE: Best-effort: synthesizeReply catches and synthesizes the raw text, so this is an advisory.
         errorLevel: "warn",
       },
       () => llmNormalizeForSpeech(model, text, callbacks),
@@ -1995,9 +2504,11 @@ export interface GraphBuildDeps {
   // Fired when the hard tool-call limit forces a no-tools answer (runtime emits a flow warn).
   onToolLimit?: (info: { maxToolCalls: number; toolCalls: number }) => void;
   onModelRetry?: (info: ModelRetryInfo) => void;
-  // A model call that waited past the capacity threshold for a permit (issue #812).
+  // A model call that waited past the capacity threshold for a permit.
   onModelPermitWait?: (info: PermitWaitInfo) => void;
-  // The scheduler job's signal (issue #811); see BuildAgentGraphParams.signal.
+  // See BuildAgentGraphParams.modelPriority.
+  modelPriority?: PermitClass;
+  // The scheduler job's signal; see BuildAgentGraphParams.signal.
   signal?: AbortSignal;
   // Fired when the configured second provider took the turn, so the runtime can put it on the trail.
   // A fallback that answers is a SUCCESSFUL turn, so nothing else on the turn would say it happened
@@ -2006,30 +2517,20 @@ export interface GraphBuildDeps {
     provider: string;
     model: string;
     reason: string;
+    failure: string;
   }) => void;
-  // Fired when a fallback was configured and could not be built, which is the state that looks
-  // exactly like having none. Separate from `onModelFallback` on purpose: one says the safety net
-  // caught the turn, the other says there is no net, and folding them would let the second read as
-  // the first.
   // Fired when the fallback ALSO failed, which is the turn's real ending. Its own line, because the
   // `generate` stage is labelled with the primary by construction.
-  onModelFallbackFailed?: (info: {
-    provider: string;
-    model: string;
-    reason: string;
-  }) => void;
+  onModelFallbackFailed?: (info: FallbackFailedInfo) => void;
   // The caller's own "is this run still wanted", carried down to the graph's TOOL BOUNDARY, which is
-  // the one seam inside the invoke (issue #449). The reactive turn and the nudge both pass one; the
-  // playground passes none and the tool node is then exactly what it was. No `strict`: the graph
-  // states why.
+  // the one seam inside the invoke. The reactive turn and the nudge both pass one; the playground
+  // passes none and the tool node then runs unfenced. No `strict`: the graph states why.
   stillWanted?: () => Promise<boolean>;
-  // WHICH FALLBACK could not be built, carried and NOT optional, for the reason the other three
-  // fallback events carry it: the line is written by handlers whose only other labels are the
-  // PRIMARY's, so a `reason` on its own gets published under the name of the model that is working.
-  // Measured on all three consumers before this: the webhook and the nudge stamped the primary's
-  // provider and model onto a warning about the fallback, and the playground stamped neither, so a
-  // filter by model showed it under the wrong one or not at all. Only reached after
-  // `hasModelFallback` said yes, so the configured labels always exist.
+  // Fired when a fallback was configured and could not be built, the state that looks exactly like
+  // having none; separate from `onModelFallback`, which says the net caught the turn. WHICH fallback
+  // is carried and NOT optional: the line is written by handlers whose only other labels are the
+  // PRIMARY's, so a bare `reason` would be published under the model that is working. Only reached
+  // after `hasModelFallback` said yes, so the configured labels always exist.
   onModelFallbackUnavailable?: (info: ModelLabels & { reason: string }) => void;
   // Fired when a turn dropped history to fit maxHistoryTokens (runtime records it in the trail).
   onHistoryTrim?: (info: {
@@ -2037,30 +2538,47 @@ export interface GraphBuildDeps {
     dropped: number;
     tokens: number;
   }) => void;
+  // See BuildAgentGraphParams.clientToolNames.
+  clientToolNames?: ReadonlySet<string>;
+  // Fired when a round took tool calls no result ever answered out of the thread. See
+  // BuildAgentGraphParams.onDanglingToolCalls.
+  onDanglingToolCalls?: (info: { calls: number }) => void;
+  // See BuildAgentGraphParams.onUnansweredInputs.
+  onUnansweredInputs?: (info: {
+    directives: number;
+    duplicates: number;
+  }) => void;
+  // See BuildAgentGraphParams.onContradictedHandoff.
+  onContradictedHandoff?: (info: { calls: number }) => void;
   // Forwarded to the graph: this caller's turn has no reply channel, so the tool budget's wrap-up
-  // must not tell the model to answer a customer (issue #629). The observation tick passes it.
+  // must not tell the model to answer a customer. The observation tick passes it.
   noReplyChannel?: boolean;
-  // The spoken-reply notice, asked every round (issue #859). See BuildAgentGraphParams.spokenNotice.
+  // See BuildAgentGraphParams.noEffectCount.
+  noEffectCount?: () => number;
+  // The spoken-reply notice, asked every round. See BuildAgentGraphParams.spokenNotice.
   spokenNotice?: () => string | null;
-  // The retry of an unexplained silence (issue #885). See BuildAgentGraphParams.retrySilence. Only
+  // See BuildAgentGraphParams.standingNotices.
+  standingNotices?: string[];
+  // The retry of an unexplained silence. See BuildAgentGraphParams.retrySilence. Only
   // the reactive turn passes it; the agent's own switch is read by the caller, which also knows what
   // the turn already delivered.
   retrySilence?: () => boolean;
   onSilenceRetry?: (info: SilenceRetryInfo) => void;
   // The held reply's retry (Jev outputCheck.onBreak "retry"). See BuildAgentGraphParams.checkReply.
   checkReply?: (text: string, toolsCalled: string[]) => Promise<string | null>;
+  // See BuildAgentGraphParams.reviewReply. The reactive turn and the playground pass it.
+  reviewReply?: (turn: BaseMessage[], reply: string) => Promise<string | null>;
+  revisionPlan?: () => RevisionPlan | null;
+  onReplyRevised?: (text: string) => void;
+  recoversReply?: () => boolean;
 }
 
-// The second provider, built or deliberately absent. Every way this returns undefined is a way an
-// install behaves exactly as it does today, which is the property that makes the whole feature safe
-// to ship on: the fallback can only ever ADD an attempt that would not have happened.
-//
-// The three refusals are the three ways a configuration can be wrong, and none of them is silent:
-//   * nothing named        — the ordinary state, and the only one with no line (there is nothing to
-//                            report about a feature the operator did not ask for);
-//   * named but unrunnable — `resolveModelOverride` refused the destination (unknown provider, a key
-//                            that belongs to another vendor, an endpoint that would be dropped);
-//   * named with a credential that did not resolve — the ref is stale or was deleted.
+// The second provider, built or deliberately absent. Every undefined leaves the install behaving as
+// one with no fallback configured, so the fallback can only ever ADD an attempt. The three cases:
+//   * nothing named: the ordinary state, and the only one with no line (the operator did not ask);
+//   * named but unrunnable: `resolveModelOverride` refused the destination (unknown provider, a key
+//     that belongs to another vendor, an endpoint that would be dropped);
+//   * named with a credential that did not resolve: the ref is stale or was deleted.
 export function buildFallbackModel(
   cfg: AgentConfig,
   makeModel: (mc: ResolvedModelConfig) => BaseChatModel,
@@ -2107,7 +2625,7 @@ export function buildFallbackModel(
           ? cfg.apiKey
           : "",
     baseURL: resolved.baseURL ?? undefined,
-    // The agent's temperature and reasoningEffort DO carry, unlike the two sibling overrides: those
+    // NOTE: The agent's temperature and reasoningEffort DO carry, unlike the two sibling overrides: those
     // rewrite or summarise something that already exists, while this answers the customer in the
     // agent's place. A fallback that answers in a different register than the primary is a worse
     // fallback, and the operator tuned those values for the answer, not for the vendor.
@@ -2116,9 +2634,9 @@ export function buildFallbackModel(
       ? { reasoningEffort: cfg.mc.reasoningEffort }
       : {}),
     maxRetries: PRIMARY_MAX_RETRIES,
-    timeoutMs: PRIMARY_TIMEOUT_MS,
+    timeoutMs: fallbackDeadlineMs(cfg.modelFallback),
   };
-  // `createChatModel` REFUSES some configurations synchronously (openai-compatible with no effective
+  // NOTE: `createChatModel` REFUSES some configurations synchronously (openai-compatible with no effective
   // base URL throws a 400). Uncaught here that would cost the turn the fallback exists to save, and
   // it would cost it on EVERY turn, not just the ones the primary failed.
   try {
@@ -2126,7 +2644,7 @@ export function buildFallbackModel(
       model: makeModel(mc),
       provider: mc.provider,
       modelId: mc.model,
-      deadlineMs: PRIMARY_TIMEOUT_MS,
+      deadlineMs: fallbackDeadlineMs(cfg.modelFallback),
     };
   } catch (err) {
     logger.warn(
@@ -2150,17 +2668,20 @@ export async function buildModelAndGraph(
   const makeModel = deps.makeModel ?? createChatModel;
   const effectiveBaseUrl = cfg.credentialBaseUrl ?? cfg.mc.baseURL;
   const fallback = buildFallbackModel(cfg, makeModel, deps);
-  // Two bounds, and exactly one of them applies. With a fallback behind it, the primary gets one
-  // attempt with the SDK's 45 s ceiling (see ./model-fallback). With none, it keeps LangChain's six
-  // retries, and the whole call, retries included, runs under `config.agent.modelCallTimeoutMs`
-  // instead (issue #809): a per-attempt ceiling alone does not bound it, because the SDK retries a
-  // timeout (measured, 2s per attempt and still waiting at 90s), and the Google adapter drops it.
+  // Two bounds, and exactly one of them applies. With a fallback behind it, the primary gets
+  // one attempt under the fallback's ceiling (`fallbackDeadlineMs`, 45 s by default). With none, it keeps LangChain's
+  // six retries, and the whole call, retries included, runs under `config.agent.modelCallTimeoutMs`:
+  // a per-attempt ceiling alone does not bound it, because the SDK retries a timeout and the Google
+  // adapter drops it.
   const model = makeModel({
     ...cfg.mc,
     apiKey: cfg.apiKey,
     baseURL: effectiveBaseUrl,
     ...(fallback
-      ? { maxRetries: PRIMARY_MAX_RETRIES, timeoutMs: PRIMARY_TIMEOUT_MS }
+      ? {
+          maxRetries: PRIMARY_MAX_RETRIES,
+          timeoutMs: fallbackDeadlineMs(cfg.modelFallback),
+        }
       : {}),
   });
   const checkpointer = deps.checkpointer ?? (await getCheckpointer());
@@ -2168,9 +2689,15 @@ export async function buildModelAndGraph(
   // namespaced tool names) so the agent understands what an `mcp__<server>__<tool>` call operates on.
   // Built from the assembled toolset metadata here so turn / nudge / playground all get it uniformly.
   const mcpContext = buildMcpContextSection(tools);
-  const systemPrompt = mcpContext
-    ? `${cfg.systemPrompt}\n\n${mcpContext}`
-    : cfg.systemPrompt;
+  // An Anthropic model is told where its reply has to be written (./anthropic-progress-notes). Last,
+  // and the same on every turn, so the cached prefix and the thinking bound to it hold.
+  const systemPrompt = [
+    cfg.systemPrompt,
+    mcpContext,
+    cfg.mc.provider === "anthropic" ? LAST_MESSAGE_RULE : null,
+  ]
+    .filter((s): s is string => Boolean(s))
+    .join("\n\n");
   return buildAgentGraph({
     model,
     systemPrompt,
@@ -2182,20 +2709,31 @@ export async function buildModelAndGraph(
     onToolLimit: deps.onToolLimit,
     onModelRetry: deps.onModelRetry,
     onModelPermitWait: deps.onModelPermitWait,
+    modelPriority: deps.modelPriority,
     signal: deps.signal,
     onModelFallback: deps.onModelFallback,
     onModelFallbackFailed: deps.onModelFallbackFailed,
     maxHistoryTokens: cfg.maxHistoryTokens,
     historyDates: cfg.historyDates ? { timezone: cfg.timezone } : null,
     onHistoryTrim: deps.onHistoryTrim,
+    onDanglingToolCalls: deps.onDanglingToolCalls,
+    onUnansweredInputs: deps.onUnansweredInputs,
+    onContradictedHandoff: deps.onContradictedHandoff,
     noReplyChannel: deps.noReplyChannel,
+    noEffectCount: deps.noEffectCount,
     spokenNotice: deps.spokenNotice,
+    standingNotices: deps.standingNotices,
     stillWanted: deps.stillWanted,
     retrySilence: deps.retrySilence,
     onSilenceRetry: deps.onSilenceRetry,
     checkReply: deps.checkReply,
+    reviewReply: deps.reviewReply,
+    revisionPlan: deps.revisionPlan,
+    onReplyRevised: deps.onReplyRevised,
+    recoversReply: deps.recoversReply,
+    clientToolNames: deps.clientToolNames,
     primaryDeadlineMs: fallback
-      ? PRIMARY_TIMEOUT_MS
+      ? fallbackDeadlineMs(cfg.modelFallback)
       : config.agent.modelCallTimeoutMs,
   });
 }

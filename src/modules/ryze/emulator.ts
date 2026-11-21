@@ -15,6 +15,7 @@ import {
   reportReplyGateHeld,
 } from "@/modules/agents/reply-gate";
 import { CHATWOOT_AUTH_HEADER } from "@/modules/chatwoot/constants";
+import { asRendered } from "@/modules/chatwoot/liquid";
 import {
   RyzeApiError,
   type RyzeClient,
@@ -688,7 +689,10 @@ export class RyzeEmulator {
     if (!conv) return NOT_FOUND();
     const sender = await this.senderFor(gw, token);
     const isPrivate = b.private === true;
-    const content = typeof b.content === "string" ? b.content : null;
+    // The agent's text arrives escaped for Chatwoot's Liquid renderer, and nothing renders it
+    // here: it goes to WhatsApp, and into the record, as the customer would have read it.
+    const content =
+      typeof b.content === "string" ? asRendered(b.content) : null;
     const messageType =
       b.message_type === "incoming" ? 0 : b.message_type === "activity" ? 2 : 1;
     const goesOut = !isPrivate && messageType === 1 && !!content;
@@ -777,7 +781,9 @@ export class RyzeEmulator {
     const transcribed = form.get(
       `attachments_metadata[${file.name}][transcribed_text]`,
     );
-    const caption = form.get("content");
+    const rawCaption = form.get("content");
+    const caption =
+      typeof rawCaption === "string" ? asRendered(rawCaption) : rawCaption;
     const attrsRaw = form.get("content_attributes");
     let contentAttributes: Record<string, unknown> = {};
     try {

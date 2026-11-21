@@ -4,18 +4,17 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { createAlertChannel } from "@/modules/flowlog/channels";
 import { processOutboundBatch } from "@/modules/webhooks/outbound/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { until } from "@/tests/utils/poll";
 
-// ── A DEAD DELIVERY HAS TO SAY SO WHERE THE OPERATOR READS (issue #325) ──
+// ── A DEAD DELIVERY HAS TO SAY SO WHERE THE OPERATOR READS ──
 // Integration, real DB, real RLS: the claim runs cross-tenant under asSuperAdmin and the outcome
 // under the tenant scope, exactly as the worker does in production. Only the network and the SSRF
 // guard are injectable, and the SSRF test uses the REAL guard because the URL it refuses is the
-// second road to DEAD — the one that needs no retries at all.
-//
-// The effect asserted is the row an operator can see (`ExecutionLog`) and the alert it feeds
-// (`AlertDelivery`), never the worker's own return value: the tick summary already counted these
-// deaths before this issue, and counting is exactly what did not reach anybody.
+// second road to DEAD, the one that needs no retries at all. The effect asserted is the row an operator can see (`ExecutionLog`) and the alert it feeds
+// (`AlertDelivery`), never the worker's own return value: the tick summary counts these deaths, and
+// a count reaches nobody.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -33,8 +32,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -75,38 +74,34 @@ async function seedDelivery(
   return row.id;
 }
 
-// The emit is fire-and-forget, so the row lands after the worker returned. Poll for the expected
-// count instead of sleeping a fixed amount: a fixed sleep is either flaky or slow, and this says
-// which of the two it is when it fails.
-async function webhookRows(expected: number, waitMs = POLL_DEADLINE_MS) {
-  const deadline = Date.now() + waitMs;
-  for (;;) {
-    // flowlog-scope: tenant-wide — the subject is HOW MANY lines the tick wrote, so scoping the
-    // read to a turn would answer a different question and pass while a second row existed. The
-    // tenant is this file's own and `clearRows` empties it before each case — through `clearFlowLog`,
-    // which settles the scheduled writes first, or the emptying would not include the line the
-    // previous case had scheduled and not yet written (issue #375).
-    const rows = await flowLogRows(suDb, {
+// The emit is fire-and-forget, so the row lands after the worker returned. The read settles the
+// scheduled writes first, so it answers "nothing was written" in one read, and a count that has to be
+// reached is waited for instead of slept for.
+async function webhookRows(expected: number) {
+  const read = () =>
+    flowLogRows(suDb, {
+      // flowlog-scope: tenant-wide. The subject is HOW MANY lines the tick wrote, so a turn-scoped
+      // read would pass with a second row present. The tenant is this file's own, and `clearRows`
+      // empties it through `clearFlowLog`, which settles scheduled writes first (or the previous
+      // case's line lands late).
       where: { tenantId, stage: "webhook" },
       orderBy: { id: "asc" },
     });
-    if (rows.length >= expected) return rows;
-    if (Date.now() > deadline) return rows;
-    await Bun.sleep(50);
-  }
+  if (expected === 0) return read();
+  return until(`${expected} webhook line(s)`, async () => {
+    const rows = await read();
+    return rows.length >= expected ? rows : null;
+  });
 }
 
-async function alertRows(expected: number, waitMs = POLL_DEADLINE_MS) {
-  const deadline = Date.now() + waitMs;
-  for (;;) {
+async function alertRows(expected: number) {
+  return until(`${expected} alert deliveries`, async () => {
     const rows = await suDb.alertDelivery.findMany({
       where: { tenantId },
       orderBy: { id: "asc" },
     });
-    if (rows.length >= expected) return rows;
-    if (Date.now() > deadline) return rows;
-    await Bun.sleep(50);
-  }
+    return rows.length >= expected ? rows : null;
+  });
 }
 
 async function clearRows() {
@@ -126,7 +121,7 @@ describe.skipIf(!dbUp)("a dead outbound delivery reaches the operator", () => {
       await suDb.webhookSubscription.create({
         data: {
           tenantId,
-          url: "https://example.com/receiver",
+          url: "https://203.0.113.35/receiver",
           events: ["conversion"],
           enabled: true,
         },
@@ -137,7 +132,7 @@ describe.skipIf(!dbUp)("a dead outbound delivery reaches the operator", () => {
         data: {
           tenantId,
           // Refused by the real SSRF guard (plain http), so it dies without a single attempt.
-          url: "http://example.com/insecure",
+          url: "http://203.0.113.35/insecure",
           events: ["conversion"],
           enabled: true,
         },
@@ -301,7 +296,7 @@ describe.skipIf(!dbUp)("a dead outbound delivery reaches the operator", () => {
       {
         name: `subscribable-${process.pid}`,
         type: "webhook",
-        url: "https://example.com/alerts",
+        url: "https://203.0.113.35/alerts",
         minLevel: "error",
         stages: ["webhook"],
       },
@@ -321,7 +316,7 @@ describe.skipIf(!dbUp)("a dead outbound delivery reaches the operator", () => {
       assertSafe: passthroughSafe,
     });
     expect(summary.delivered).toBe(1);
-    expect(await webhookRows(0, 700)).toHaveLength(0);
+    expect(await webhookRows(0)).toHaveLength(0);
   });
 
   test("negative control: a retried delivery writes no line — the budget is not spent yet", async () => {
@@ -335,6 +330,6 @@ describe.skipIf(!dbUp)("a dead outbound delivery reaches the operator", () => {
     });
     expect(summary.retried).toBe(1);
     expect(summary.dead).toBe(0);
-    expect(await webhookRows(0, 700)).toHaveLength(0);
+    expect(await webhookRows(0)).toHaveLength(0);
   });
 });

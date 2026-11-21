@@ -2,9 +2,31 @@
 // to be importable by the frontend (its sibling `document-support` already is); this file is where
 // the decoders live, and it must never be pulled into that graph — libheif is 8.4 MB of WASM.
 
+import { fileURLToPath } from "node:url";
+import { inflateSync } from "node:zlib";
+import jpeg from "jpeg-js";
+import { PNG } from "pngjs";
 import type { MediaConverterId } from "../media-conversion";
-import { type HeicFrame, withHeicFrames } from "./heic";
-import { rasterToJpeg } from "./raster";
+import {
+  isJpeg,
+  isPng,
+  readImageDimensions,
+  readJpegOrientation,
+} from "./dimensions";
+import {
+  decodeGridFitted,
+  type HeicFrame,
+  libheifChildEnv,
+  withHeicFrames,
+} from "./heic";
+import { decodeJpegFitted } from "./jpeg-stream";
+import {
+  encodeJpeg,
+  fitRgba,
+  orientRgba,
+  type Rgba,
+  rasterToJpeg,
+} from "./raster";
 
 // Thrown for every refusal a conversion can make, so the caller has one thing to catch and one
 // message to put on the operator's line. A conversion that fails is NOT the same as an extraction
@@ -17,19 +39,23 @@ export class MediaConversionError extends Error {
   }
 }
 
-// THE DECLARED TYPE LIED, which is a different fact from "this file cannot be converted" and earns
-// the opposite answer. Measured against the live API on 2026-09-18: a PNG announced as `image/heic`
-// comes back 200 with the value read off it — the vendors sniff the bytes, they do not trust the
-// data URI's label. And Chatwoot serves whatever content type the uploader's server declared, so a
-// mislabelled attachment is a real population, not a hypothetical.
-//
-// So when the bytes are not of the type the plan was made for, the original goes to the provider
-// untouched and the vendor answers for itself. Skipping there would take an attachment that WAS
-// being read before this feature existed and stop reading it (issue #697, holdout scenario s8).
+// The declared type lied, which earns the opposite answer from "cannot be converted": the vendors
+// sniff the bytes rather than trust the data URI's label, and Chatwoot serves whatever type the
+// uploader declared. So bytes not of the planned type go to the provider untouched; skipping would
+// stop reading an attachment that was readable.
 export class MediaSourceMismatchError extends MediaConversionError {
   constructor(message: string) {
     super(message);
     this.name = "MediaSourceMismatchError";
+  }
+}
+
+// Over the pixel cap: a legitimate picture, too large to decode here. Its own type because the
+// customer can fix it (a screenshot, a photo at normal resolution) and a broken file cannot.
+export class MediaTooLargeError extends MediaConversionError {
+  constructor(message: string) {
+    super(message);
+    this.name = "MediaTooLargeError";
   }
 }
 
@@ -38,10 +64,16 @@ export class MediaSourceMismatchError extends MediaConversionError {
 // PIXELS and not on the file, because HEIC's whole point is that the file is small — the 25 MB
 // download ceiling in the Chatwoot client admits a 100 MP image at phone compression.
 //
-// It is also the only time bound there is. The decode is CPU inside WASM and nothing can interrupt
-// it once entered, so an `AbortSignal` here would be decoration; bounding the pixels is what bounds
-// the milliseconds (~450ms at 12 MP, measured).
+// It also bounds the time. The decode is CPU inside WASM and nothing inside its process can interrupt
+// it once entered, so an `AbortSignal` here would be decoration: bounding the pixels is what bounds
+// the milliseconds, and `CONVERSION_TIMEOUT_MS` is the backstop that kills the process.
 export const MAX_SOURCE_PIXELS = 50_000_000;
+
+// Over the cap, a GRID image is still read: it is decoded tile by tile into the output, so memory is
+// bounded by one tile plus the output, not by the image. What this second cap bounds is TIME, since
+// every tile is still decoded: 200 MP is the largest mode phones shoot, and ~150 MP took ~4s here.
+// A tile is decoded whole, so a tile over `MAX_SOURCE_PIXELS` is refused like an image would be.
+export const MAX_TILED_SOURCE_PIXELS = 200_000_000;
 
 // Overridable, and for the same reason `extractWithRetry` lets a battery move the clock: what these
 // bound is MEMORY, and a test that cannot lower the cap can only exercise it by allocating the 200 MB
@@ -49,10 +81,24 @@ export const MAX_SOURCE_PIXELS = 50_000_000;
 // handles being released. Production passes neither.
 export type ConvertOptions = {
   readonly maxSourcePixels?: number;
+  readonly maxTiledSourcePixels?: number;
   // Stands in for `./heic`'s frame opener, so the battery can drive the refusal paths without a
   // fixture for each and can watch the decoder being released.
   readonly withFrames?: typeof withHeicFrames;
+  // Stands in for jpeg-js's whole-image decode, so the battery can tell which decoder a file took:
+  // the two give the same bytes, and only memory, which a test cannot watch cheaply, tells them apart.
+  readonly decodeWholeJpeg?: WholeJpegDecode;
 };
+
+export type WholeJpegDecode = (
+  data: Uint8Array,
+  opts: {
+    useTArray: true;
+    formatAsRGBA: true;
+    maxResolutionInMP: number;
+    maxMemoryUsageInMB: number;
+  },
+) => Rgba;
 
 // The long edge every vision provider downscales to on its standard tier anyway (OpenAI and
 // Anthropic both 1568 px), so handing over more is paying to ship bytes the vendor discards. It is
@@ -64,10 +110,11 @@ const MAX_OUTPUT_EDGE = 1568;
 // heavy compression (docs: "heavy JPEG compression can make text difficult to read").
 const JPEG_QUALITY = 82;
 
-// ONE CONVERSION AT A TIME, process-wide. A message may carry eight attachments and the webhook
-// extracts them in PARALLEL (the `Promise.all` in `handleVisualAttachments`), so without this gate
-// eight HEICs hold eight RGBA buffers at once: 384 MB for eight 12 MP photos, on a VPS that also
-// runs Postgres and Redis. Serialising costs about half a second per extra photo, which is invisible
+// ONE CONVERSION PROCESS AT A TIME, process-wide. A message may carry eight attachments and the
+// webhook extracts them in PARALLEL (the `Promise.all` in `handleVisualAttachments`), so without this
+// gate eight HEICs hold eight RGBA buffers and eight libheif heaps at once: 384 MB of RGBA alone for
+// eight 12 MP photos, on a VPS that also runs Postgres and Redis. Serialising costs one conversion
+// per extra photo, which the event loop does not pay (the work runs in the child), and which sits
 // next to the provider round trip each one is waiting for anyway.
 let gate: Promise<unknown> = Promise.resolve();
 
@@ -125,19 +172,11 @@ type HeicHeader =
 
 function heicHeader(bytes: ArrayBuffer): HeicHeader {
   if (bytes.byteLength < 12) return { kind: "too-short" };
-  // THE BOX BEFORE THE BRAND. `ftyp` at offset 4 is what makes offset 8 the major brand rather than
-  // four bytes that happen to spell one: a JPEG whose first marker is a comment can carry "heic" at
-  // offset 8 and decode perfectly as a JPEG. Reading the brand alone would call that file a broken
-  // HEIC and SKIP it, which is the exact regression the brand check exists to prevent — the
-  // attachment was readable and stops being read (PR #707 review round 7; holdout s8 is the same
-  // failure arrived at from the other side).
+  // NOTE: the box before the brand: a JPEG whose first marker is a comment can carry "heic" at
+  // offset 8, and reading the brand alone would call it a broken HEIC and skip a readable file.
   if (ascii(bytes, 4) !== "ftyp") return { kind: "not-ftyp" };
-  // …and offset 8 is only the brand when the header ENDED there. `ftyp` states its size the same
-  // three ways every other BMFF box does, and with `size == 1` the real size occupies the next 64
-  // bits, so the brand sits at 16 and offset 8 holds the high half of a length. Reading it anyway
-  // reported `carries brand "   "` for a file libheif decodes without complaint, which sends the
-  // original HEIC to a provider that refuses it — the attachment stops being read, which is the one
-  // outcome this PR exists to prevent (review round 13).
+  // With `size == 1` the real size occupies the next 64 bits, so the brand sits at 16 and
+  // offset 8 holds the high half of a length.
   const header = new DataView(bytes).getUint32(0) === 1 ? 16 : 8;
   if (bytes.byteLength < header + 4) return { kind: "too-short" };
   return { kind: "brand", brand: ascii(bytes, header) };
@@ -155,22 +194,11 @@ function ascii(bytes: ArrayBuffer, offset: number): string {
     .trim();
 }
 
-// THE SIZE THE FILE SAYS IT STORES, read out of the file rather than asked of the decoder, and the
-// reason is that the two can disagree. A HEIC may carry a `clap` (clean aperture) crop, and libheif's
-// `get_width`/`get_height` then report the CROPPED size while the decode still materialises the whole
-// stored image — so a 1x1 crop over a 100 Mpx picture walks past a cap applied to the reported size
-// (PR #707 review round 11).
-//
-// Neither mechanism the review suggested is available here, and both were measured on this build
-// (libheif-js 1.23.2): `heif_image_handle_get_ispe_width` answers 0 even for a plain file whose
-// dimensions it should report, and `heif_context_set_maximum_image_size_limit` refuses nothing, at
-// read time or at decode time, at any value. What is left is the file itself, where `ispe` is
-// mandatory and says exactly this.
-//
-// The walk is deliberately shallow: `meta` → `iprp` → `ipco`, collecting every `ispe`, and the cap
-// uses the LARGEST, because `ipco` holds the properties of every item and a cap is only wrong if it
-// underestimates. Anything unparseable returns 0 and the cap falls back to the decoder's numbers,
-// which is the behaviour this had before.
+// The size the file says it stores, read from the file rather than the decoder: with a `clap` crop,
+// libheif reports the CROPPED size while decoding the whole stored image, so a 1x1 crop over 100 Mpx
+// would pass a cap. On libheif-js 1.23.2 `get_ispe_width` answers 0 and the maximum-size limit refuses
+// nothing, so this reads `ispe` (mandatory) via `meta` > `iprp` > `ipco` and takes the LARGEST. An
+// unparseable file returns 0, and the cap falls back to the decoder's numbers.
 const ISPE_CAP_DEPTH: ReadonlyArray<[string, number]> = [
   ["meta", 12], // FullBox: 4 more bytes of version/flags before the children
   ["iprp", 8],
@@ -185,11 +213,8 @@ export function storedPixels(bytes: ArrayBuffer): number {
     while (i + 8 <= end) {
       const declared = v.getUint32(i);
       const type = ascii(bytes, i + 4);
-      // THE THREE WAYS A BMFF BOX STATES ITS SIZE, and the two unusual ones are not decoration: a
-      // walker that stops at the first `size == 1` reads nothing past it, returns "no ispe found",
-      // and hands the cap back to the cropped dimensions it was written to distrust. Reproduced with
-      // a 16-byte extended-size `free` box spliced after `ftyp` — libheif reads that file fine
-      // (PR #707 review round 12).
+      // The three ways a BMFF box states its size; stopping at `size == 1` would find no ispe
+      // and hand the cap back to the cropped dimensions.
       //   0  the box runs to the end of the file
       //   1  the real size is the 64-bit value after the type
       //   n  the size, header included
@@ -202,7 +227,7 @@ export function storedPixels(bytes: ArrayBuffer): number {
         // box of at least 4 GiB, which no buffer that reached here can contain, so it is out of
         // range for the same reason the length guard below is. Spelling it this way also keeps the
         // tree's one bounded `BigInt` parse the only cast of its kind
-        // (tests/lib/caller-id-spelling.test.ts sweeps for the spelling, not for the intent).
+        // (biome-plugins/no-bigint-cast.grit matches the spelling, not the intent).
         if (v.getUint32(i + 8) !== 0) return;
         size = v.getUint32(i + 12);
         header = 16;
@@ -239,25 +264,12 @@ async function heicToJpeg(
       `declared as heic but ${headerReason(header)}`,
     );
   const open = opts.withFrames ?? withHeicFrames;
-  return await open(bytes, async (frames: readonly HeicFrame[]) => {
-    // THE PRIMARY IMAGE, which is not the same as the first one. A HEIC may hold several top-level
-    // images, and the file says which of them it is OF: the `pitm` box. libheif hands them back in
-    // storage order, and the two disagree — measured on a two-image collection whose `pitm` points
-    // at the second, where the first item is a different picture entirely.
-    //
-    // The animation rule the vendors state ("Animations are unsupported, and only the first frame is
-    // used" — Anthropic) does not transfer, and that was the mistake here: a GIF's frames are one
-    // picture over time, with no frame designated, while a HEIC collection is several pictures with
-    // one designated. Taking the first would send a picture the sender did not send, and the
-    // extraction would come back successful and about the wrong image (PR #707 review round 6).
-    //
-    // FALLING BACK TO THE FIRST when nothing is designated, and the honest note is that no file this
-    // parser accepts reaches it: measured by renaming the `pitm` box to `free` (which the standard
-    // says to ignore, so the box stops existing for a reader), libheif refuses the whole file with
-    // `No 'pitm' box` and returns ZERO images. So the branch is not for the pitm-less file it looks
-    // like it is for; it is for a library that hands back images without designating one, which this
-    // version never does. It stays because without it that case throws "heic carries no image
-    // frame" — a message about a file that plainly has frames — and because a test can kill it.
+  const cap = opts.maxSourcePixels ?? MAX_SOURCE_PIXELS;
+  const whole = await open(bytes, async (frames: readonly HeicFrame[]) => {
+    // The PRIMARY image (`pitm`), not the first: libheif returns a collection in storage
+    // order, and unlike a GIF's frames these are separate pictures with one designated. The fallback
+    // to the first is unreachable with this libheif (a file without `pitm` yields zero images); it
+    // keeps "carries no image frame" from being thrown about a file that has frames.
     const frame = frames.find((f) => f.primary) ?? frames[0];
     if (frame === undefined)
       throw new MediaConversionError("heic carries no image frame");
@@ -265,7 +277,6 @@ async function heicToJpeg(
     // The larger of what the decoder reports and what the file says it stores, because a crop makes
     // the first smaller than the work the decode actually does.
     const stored = storedPixels(bytes);
-    const cap = opts.maxSourcePixels ?? MAX_SOURCE_PIXELS;
     // FAIL CLOSED when the file will not say. `ispe` is mandatory in HEIF and every file libheif
     // accepts carries one, so finding none means the container is malformed or beyond this walker —
     // and falling back to the decoder's numbers there is precisely the hole, because the attacker
@@ -274,24 +285,208 @@ async function heicToJpeg(
       throw new MediaConversionError(
         "heic does not declare the size it stores, so the pixel cap cannot be applied",
       );
-    // BOTH NUMBERS COME FROM `ispe`, and the work a decode costs comes from the HEVC bitstream, so a
-    // file that declares 1x1 and codes 2000x2000 would walk past any cap. libheif closes that one
-    // itself: it compares the coded dimensions against the signalled ones and refuses BEFORE
-    // decoding. Measured on 1.23.2, steady state — the same image at 2000, 4000 and 6000 px square,
-    // made to declare 1x1, costs 2-3 ms and zero wasm-heap growth against 111/91/197 ms and
-    // +27/+130/+216 MB decoded honestly. The lie buys less work than the truth. Pinned by a test,
-    // because it is the dependency's property and not ours (review round 14).
+    // Both numbers come from `ispe`, while decode cost comes from the HEVC bitstream. libheif
+    // refuses coded dimensions that disagree with the signalled ones BEFORE decoding; that is the
+    // dependency's property, pinned by a test.
     const pixels = Math.max(width * height, stored);
-    if (pixels > cap)
-      throw new MediaConversionError(
-        `heic is ${width}x${height} and stores ${pixels} px, over the ${cap} px cap`,
-      );
+    const tooLarge = new MediaTooLargeError(
+      `heic is ${width}x${height} and stores ${pixels} px, over the ${cap} px cap`,
+    );
+    if (pixels > cap) return { tooLarge, pixels };
     const raw = await frame.decode();
     return rasterToJpeg(raw, {
       maxEdge: MAX_OUTPUT_EDGE,
       quality: JPEG_QUALITY,
     });
   });
+  if (whole instanceof ArrayBuffer) return whole;
+  // Decided inside, decoded outside: the whole-image decoder is released before the grid decode opens
+  // its own context, so the two never hold the file at once.
+  if (whole.pixels > (opts.maxTiledSourcePixels ?? MAX_TILED_SOURCE_PIXELS))
+    throw whole.tooLarge;
+  const grid = await decodeGridFitted(bytes, {
+    maxEdge: MAX_OUTPUT_EDGE,
+    maxTilePixels: cap,
+  });
+  if (grid.kind !== "decoded") throw whole.tooLarge;
+  return encodeJpeg(grid.image, JPEG_QUALITY);
+}
+
+// THE FIT CONVERTERS: a type the provider reads, at a size it refuses (../media-conversion,
+// IMAGE_LIMITS). Same tail as the HEIC path, fitted to MAX_OUTPUT_EDGE, and the same pixel cap,
+// applied to the size the HEADER declares before a byte is decoded: a JPEG that claims 60000x60000
+// is refused here instead of asking jpeg-js for 14 GB.
+function headerPixels(bytes: ArrayBuffer, mime: string, cap: number): number {
+  const d = readImageDimensions(bytes);
+  if (d === null)
+    throw new MediaConversionError(
+      `${mime} does not declare its size, so the pixel cap cannot be applied`,
+    );
+  if (d.width * d.height > cap)
+    throw new MediaTooLargeError(
+      `${mime.slice(6)} is ${d.width}x${d.height}, over the ${cap} px cap`,
+    );
+  return d.width * d.height;
+}
+
+// jpeg-js counts every buffer against `maxMemoryUsageInMB` BEFORE allocating it, so that budget is
+// the guard, sized from the pixels the header declared. A 4:4:4 color JPEG needs ~12 B/px of it
+// (measured: 3000x3000 refused at 100 MB, decoded at 103), so 24 covers a four-component (CMYK) one
+// with room to spare; plus the file itself and slack for the tables.
+// Anything a crafted file adds on top (a second frame, after the scan or before it, or 255
+// components) is refused at the allocation that would cross it. The 2 GB fixed ceiling did not do
+// that: it let a small file claim gigabytes the pixel cap had never admitted.
+const JPEG_BYTES_PER_PIXEL = 24;
+const JPEG_SLACK_BYTES = 16 * 1024 * 1024;
+
+function jpegMemoryBudgetMB(bytes: ArrayBuffer, pixels: number): number {
+  return Math.ceil(
+    (pixels * JPEG_BYTES_PER_PIXEL + bytes.byteLength + JPEG_SLACK_BYTES) /
+      (1024 * 1024),
+  );
+}
+
+async function jpegFit(
+  bytes: ArrayBuffer,
+  opts: ConvertOptions,
+): Promise<ArrayBuffer> {
+  if (!isJpeg(bytes))
+    throw new MediaSourceMismatchError("declared as jpeg but is not one");
+  const cap = opts.maxSourcePixels ?? MAX_SOURCE_PIXELS;
+  const pixels = headerPixels(bytes, "image/jpeg", cap);
+  const data = new Uint8Array(bytes);
+  // A photo over the edge is decoded a band at a time straight into its fitted size (jpeg-stream.ts:
+  // the same bytes jpeg-js would give, at a fraction of the memory). What that decoder does not
+  // cover, and anything already within the edge, goes through jpeg-js, which enforces its own
+  // ceilings too: resolution from the cap, memory from the header (above).
+  // Opaque by construction, so there is nothing to flatten: fit, then turn upright, then encode.
+  // The turn runs on the fitted raster so its copy is of 1568 px and not of the original.
+  const fitted =
+    decodeJpegFitted(data, { maxEdge: MAX_OUTPUT_EDGE, maxPixels: cap }) ??
+    fitRgba(
+      (opts.decodeWholeJpeg ?? jpeg.decode)(data, {
+        useTArray: true,
+        formatAsRGBA: true,
+        maxResolutionInMP: Math.ceil(cap / 1_000_000),
+        maxMemoryUsageInMB: jpegMemoryBudgetMB(bytes, pixels),
+      }),
+      MAX_OUTPUT_EDGE,
+    );
+  return encodeJpeg(
+    orientRgba(fitted, readJpegOrientation(bytes)),
+    JPEG_QUALITY,
+  );
+}
+
+const PNG_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+// The bit depths the spec allows per color type. The inflate bound is computed from the depth, so a
+// forged one (255) would raise it by 30x past what any real image of that size needs.
+const PNG_DEPTHS: Record<number, readonly number[]> = {
+  0: [1, 2, 4, 8, 16],
+  2: [8, 16],
+  3: [1, 2, 4, 8],
+  4: [8, 16],
+  6: [8, 16],
+};
+// Adam7: x start, y start, x step, y step of each of the seven passes.
+const ADAM7 = [
+  [0, 0, 8, 8],
+  [4, 0, 8, 8],
+  [0, 4, 4, 8],
+  [2, 0, 4, 4],
+  [0, 2, 2, 4],
+  [1, 0, 2, 2],
+  [0, 1, 1, 2],
+] as const;
+
+// pngjs keeps one Buffer per scanline until the end of the decode, so the row count costs memory of
+// its own that the pixel cap does not see (a 1x50,000,000 image is under the cap). A side this long
+// is no photo or screenshot anyone sends.
+const PNG_MAX_ROWS = 100_000;
+
+// The pixel cap holds only if pngjs decodes the size headerPixels read, and pngjs trusts neither
+// side of that: it takes the LAST IHDR it meets, and inflates an interlaced image with no output
+// limit, so a few KB of IDAT can expand to gigabytes before it notices the excess. So the chunk
+// list is walked first (one IHDR: only the first chunk may be one), and the IDAT stream is inflated
+// against the exact length that IHDR implies; only a file that fits is handed to pngjs.
+function checkPngStructure(bytes: ArrayBuffer): void {
+  const v = new DataView(bytes);
+  const idat: Uint8Array[] = [];
+  let ihdr: number | null = null;
+  let palettes = 0;
+  let i = 8;
+  while (i + 12 <= bytes.byteLength) {
+    const length = v.getUint32(i);
+    const type = String.fromCharCode(...new Uint8Array(bytes, i + 4, 4));
+    const data = i + 8;
+    if (data + length + 4 > bytes.byteLength) break;
+    if (type === "IHDR") {
+      if (i !== 8 || length !== 13)
+        throw new MediaConversionError("png has a misplaced or repeated IHDR");
+      ihdr = data;
+    } else if (type === "PLTE") {
+      // pngjs appends every entry of every PLTE to one array, with no 256-entry limit.
+      if (palettes++ > 0 || length > 768 || length % 3 !== 0)
+        throw new MediaConversionError("png has a repeated or oversized PLTE");
+    } else if (type === "IDAT") {
+      idat.push(new Uint8Array(bytes, data, length));
+    } else if (type === "IEND") {
+      break;
+    }
+    i = data + length + 4;
+  }
+  if (ihdr === null) throw new MediaConversionError("png has no IHDR");
+  const width = v.getUint32(ihdr);
+  const height = v.getUint32(ihdr + 4);
+  const depth = v.getUint8(ihdr + 8);
+  const colorType = v.getUint8(ihdr + 9);
+  const channels = PNG_CHANNELS[colorType];
+  const interlaced = v.getUint8(ihdr + 12) === 1;
+  if (channels === undefined)
+    throw new MediaConversionError("png declares an unknown color type");
+  if (height > PNG_MAX_ROWS)
+    throw new MediaConversionError(
+      `png is ${height} rows tall, over the ${PNG_MAX_ROWS} the decoder is held to`,
+    );
+  if (!PNG_DEPTHS[colorType]?.includes(depth))
+    throw new MediaConversionError(
+      "png declares a bit depth its color type does not allow",
+    );
+  const rowBytes = (w: number) => 1 + Math.ceil((w * channels * depth) / 8);
+  let expected = 0;
+  if (!interlaced) expected = height * rowBytes(width);
+  else
+    for (const [xs, ys, dx, dy] of ADAM7) {
+      const w = width > xs ? Math.ceil((width - xs) / dx) : 0;
+      const h = height > ys ? Math.ceil((height - ys) / dy) : 0;
+      if (w > 0 && h > 0) expected += h * rowBytes(w);
+    }
+  try {
+    inflateSync(Buffer.concat(idat), {
+      maxOutputLength: Math.max(1, expected),
+    });
+  } catch {
+    throw new MediaConversionError(
+      "png pixel data does not inflate within its declared size",
+    );
+  }
+}
+
+async function pngFit(
+  bytes: ArrayBuffer,
+  opts: ConvertOptions,
+): Promise<ArrayBuffer> {
+  if (!isPng(bytes))
+    throw new MediaSourceMismatchError("declared as png but is not one");
+  headerPixels(bytes, "image/png", opts.maxSourcePixels ?? MAX_SOURCE_PIXELS);
+  checkPngStructure(bytes);
+  // pngjs hands back 8-bit RGBA whatever the source (palette, 16-bit, interlaced), and a PNG may be
+  // transparent, so this one takes the full tail: flatten, fit, encode.
+  const png = PNG.sync.read(Buffer.from(bytes));
+  return rasterToJpeg(
+    { data: png.data, width: png.width, height: png.height },
+    { maxEdge: MAX_OUTPUT_EDGE, quality: JPEG_QUALITY },
+  );
 }
 
 // A `Record` over the id union and not a lookup that can miss: adding an entry to MEDIA_CONVERTERS
@@ -302,6 +497,8 @@ const IMPLS: Record<
   (bytes: ArrayBuffer, opts: ConvertOptions) => Promise<ArrayBuffer>
 > = {
   "heic-to-jpeg": heicToJpeg,
+  "jpeg-fit": jpegFit,
+  "png-fit": pngFit,
 };
 
 // ONE ERROR TYPE OUT, whatever went wrong inside. libheif answers with its own classes, and so does
@@ -309,13 +506,15 @@ const IMPLS: Record<
 // the module's single-catch contract would hold for the refusals it writes itself and leak for
 // everything underneath. The original is kept as `cause`, and its message is carried through because
 // it is the only thing that says WHICH file failed.
-export async function runMediaConverter(
+// Runs on the CALLING thread: this is what the conversion process (./child.ts) runs, and what a
+// battery that stands in for a decoder calls, since a function cannot cross into a process.
+export async function convertInline(
   id: MediaConverterId,
   bytes: ArrayBuffer,
   opts: ConvertOptions = {},
 ): Promise<ArrayBuffer> {
   try {
-    return await serialized(() => IMPLS[id](bytes, opts));
+    return await IMPLS[id](bytes, opts);
   } catch (err) {
     if (err instanceof MediaConversionError) throw err;
     const wrapped = new MediaConversionError(
@@ -324,4 +523,193 @@ export async function runMediaConverter(
     wrapped.cause = err;
     throw wrapped;
   }
+}
+
+// The backstop for a child that never answers. A 12 MP photo converts in about a second and the
+// 200 MP tiled ceiling in a few, so this is far past any conversion the caps admit, on a loaded host
+// too; what it bounds is a wedged decoder holding the attachment, and the gate behind it, forever.
+export const CONVERSION_TIMEOUT_MS = 60_000;
+
+const CHILD_SCRIPT = fileURLToPath(new URL("./child.ts", import.meta.url));
+
+// What crosses into the child: the limits, never the stand-ins, which are functions.
+export type ConversionLimits = Pick<
+  ConvertOptions,
+  "maxSourcePixels" | "maxTiledSourcePixels"
+>;
+
+export type RunOptions = ConversionLimits & {
+  readonly timeoutMs?: number;
+  // A battery points this at a child that crashes or never answers.
+  readonly childScript?: string;
+  // A battery counts the children through this.
+  readonly spawn?: typeof Bun.spawn;
+};
+
+export type ConversionFailure = {
+  kind: "too-large" | "mismatch" | "conversion";
+  message: string;
+  cause?: { name: string; message: string };
+};
+
+// The child's answer on stdout: this marker, one JSON line, then the JPEG's bytes when it succeeded.
+// The marker because libheif's runtime prints its own errors to stdout ahead of the answer.
+export const REPLY_MARKER = "\n<<fazer-ai-media-conversion>>\n";
+export type ConversionHeader =
+  | { ok: true; length: number }
+  | ({ ok: false } & ConversionFailure);
+
+// The refusal as data, because an Error's class does not survive a process boundary: the caller
+// tells a mismatch (send the original) from a too-large (tell the customer) from a failure by it.
+export function describeConversionFailure(err: unknown): ConversionFailure {
+  const kind =
+    err instanceof MediaTooLargeError
+      ? "too-large"
+      : err instanceof MediaSourceMismatchError
+        ? "mismatch"
+        : "conversion";
+  const message = err instanceof Error ? err.message : String(err);
+  const cause =
+    err instanceof Error && err.cause instanceof Error
+      ? { name: err.cause.name, message: err.cause.message }
+      : undefined;
+  return cause ? { kind, message, cause } : { kind, message };
+}
+
+function conversionError(failure: ConversionFailure): MediaConversionError {
+  const err =
+    failure.kind === "too-large"
+      ? new MediaTooLargeError(failure.message)
+      : failure.kind === "mismatch"
+        ? new MediaSourceMismatchError(failure.message)
+        : new MediaConversionError(failure.message);
+  if (failure.cause) {
+    const cause = new Error(failure.cause.message);
+    cause.name = failure.cause.name;
+    err.cause = cause;
+  }
+  return err;
+}
+
+// THE CONVERSION RUNS IN A CHILD PROCESS, one per conversion. Every step is synchronous CPU (the
+// libheif decode, jpeg-js, pngjs, the fit, the encode) and holds the thread it runs on for a second
+// or more for a phone photo: on the event loop that expires every wall-clock timer in the process,
+// the Chatwoot ack's among them. A process and not a Worker because a Worker cannot be stopped
+// inside WASM: `terminate()` on a thread spinning in WASM leaves it spinning, so the time budget
+// would release the gate with the decoder still holding its heap and a core. A fresh process per
+// conversion also gives every heap back when it exits.
+export function runMediaConverter(
+  id: MediaConverterId,
+  bytes: ArrayBuffer,
+  opts: RunOptions = {},
+): Promise<ArrayBuffer> {
+  return serialized(() => inChild(id, bytes, opts));
+}
+
+async function inChild(
+  id: MediaConverterId,
+  bytes: ArrayBuffer,
+  opts: RunOptions,
+): Promise<ArrayBuffer> {
+  const {
+    timeoutMs = CONVERSION_TIMEOUT_MS,
+    childScript = CHILD_SCRIPT,
+    spawn = Bun.spawn,
+    ...limits
+  } = opts;
+  const fail = (message: string) =>
+    new MediaConversionError(`${id} failed: ${message}`);
+  let child: ReturnType<typeof Bun.spawn>;
+  try {
+    child = spawn({
+      // NOTE: --no-env-file, because Bun loads the `.env` of the working directory into a child
+      // whatever `env` it was given, and that file holds the app's secrets.
+      cmd: [
+        process.execPath,
+        "--no-env-file",
+        childScript,
+        id,
+        JSON.stringify(limits),
+      ],
+      stdin: new Uint8Array(bytes),
+      stdout: "pipe",
+      stderr: "pipe",
+      env: libheifChildEnv(),
+    });
+  } catch (err) {
+    throw fail(
+      `the conversion process did not start (${err instanceof Error ? err.message : String(err)})`,
+    );
+  }
+  let timedOut = false;
+  const killer = setTimeout(() => {
+    timedOut = true;
+    child.kill("SIGKILL");
+  }, timeoutMs);
+  try {
+    const [out, err, code] = await Promise.all([
+      new Response(child.stdout as ReadableStream).arrayBuffer(),
+      new Response(child.stderr as ReadableStream).text(),
+      child.exited,
+    ]);
+    if (timedOut)
+      throw fail(`the conversion did not finish within ${timeoutMs} ms`);
+    const reply = readReply(out);
+    if (reply === null)
+      throw fail(
+        `the conversion process exited (${code}) without answering${lastError(err)}`,
+      );
+    if (!reply.header.ok) throw conversionError(reply.header);
+    return reply.body;
+  } finally {
+    clearTimeout(killer);
+  }
+}
+
+// The line of the child's stderr that says what went wrong: Bun's own `error:` line for an uncaught
+// throw, else the last line written.
+function lastError(stderr: string): string {
+  const lines = stderr
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const line = lines.find((l) => l.startsWith("error:")) ?? lines.at(-1);
+  return line ? `: ${line}` : "";
+}
+
+function readReply(
+  out: ArrayBuffer,
+): { header: ConversionHeader; body: ArrayBuffer } | null {
+  const bytes = new Uint8Array(out);
+  const marker = new TextEncoder().encode(REPLY_MARKER);
+  const at = indexOf(bytes, marker);
+  if (at < 0) return null;
+  const start = at + marker.byteLength;
+  const newline = bytes.indexOf(0x0a, start);
+  if (newline < 0) return null;
+  let header: ConversionHeader;
+  try {
+    header = JSON.parse(
+      new TextDecoder().decode(bytes.subarray(start, newline)),
+    );
+  } catch {
+    return null;
+  }
+  const body = out.slice(newline + 1);
+  if (header.ok && body.byteLength !== header.length) return null;
+  return { header, body };
+}
+
+function indexOf(haystack: Uint8Array, needle: Uint8Array): number {
+  const first = needle[0] as number;
+  for (
+    let i = haystack.indexOf(first);
+    i >= 0 && i <= haystack.byteLength - needle.byteLength;
+    i = haystack.indexOf(first, i + 1)
+  ) {
+    let j = 1;
+    while (j < needle.byteLength && haystack[i + j] === needle[j]) j++;
+    if (j === needle.byteLength) return i;
+  }
+  return -1;
 }

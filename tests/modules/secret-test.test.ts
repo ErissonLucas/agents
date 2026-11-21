@@ -141,6 +141,24 @@ describe("runSecretTest", () => {
     ]);
   });
 
+  test("an asaas key whose prefix names its environment is probed there only", async () => {
+    for (const [value, host, status] of [
+      ["$aact_prod_000refused", "api.asaas.com", 401],
+      ["$aact_prod_000valid", "api.asaas.com", 200],
+      ["$aact_hmlg_000refused", "api-sandbox.asaas.com", 401],
+      ["$aact_hmlg_000valid", "api-sandbox.asaas.com", 200],
+    ] as const) {
+      const { calls, fetchImpl } = fakeFetch({ [host]: status });
+      const r = await runSecretTest(
+        { kind: "asaas", value },
+        { fetchImpl, assertSafe: passAssert },
+      );
+      expect(r.testable && r.ok).toBe(status === 200);
+      expect(calls.map((c) => new URL(c.url).host)).toEqual([host]);
+      expect(calls[0]?.headers.access_token).toBe(value);
+    }
+  });
+
   test("treats ElevenLabs missing_permissions (valid key, no scope) as a pass", async () => {
     const { calls, fetchImpl } = fakeFetch(
       { "api.elevenlabs.io": 401 },
@@ -223,5 +241,61 @@ describe("runSecretTest", () => {
       { fetchImpl, assertSafe: passAssert },
     );
     expect(r).toEqual({ testable: true, ok: false, code: "unreachable" });
+  });
+  // TypeSafe (the Jev classifier of the decisions engine): the models list is authenticated and runs
+  // no classification, so the probe costs nothing (docs.typesafe.ai, `client.models.list()`).
+  test("probes typesafe's models list with a bearer header", async () => {
+    const { calls, fetchImpl } = fakeFetch();
+    const r = await runSecretTest(
+      { kind: "typesafe", value: "ts-secret" },
+      { fetchImpl, assertSafe: passAssert },
+    );
+    expect(r).toEqual({ testable: true, ok: true });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe("https://api.typesafe.ai/v1/models");
+    expect(calls[0]?.headers.authorization).toBe("Bearer ts-secret");
+  });
+
+  test("maps a wrong typesafe key (401) to unauthorized", async () => {
+    const { fetchImpl } = fakeFetch({ "api.typesafe.ai": 401 });
+    const r = await runSecretTest(
+      { kind: "typesafe", value: "wrong" },
+      { fetchImpl, assertSafe: passAssert },
+    );
+    expect(r).toEqual({
+      testable: true,
+      ok: false,
+      code: "unauthorized",
+      status: 401,
+    });
+  });
+
+  // The decisions engine sends the classification to the entry's base URL when it has one, so the
+  // probe asks the same server: testing the public API for a key meant for a proxy proves nothing.
+  test("probes typesafe on the entry's base URL when it has one", async () => {
+    const { calls, fetchImpl } = fakeFetch();
+    const r = await runSecretTest(
+      {
+        kind: "typesafe",
+        value: "ts-secret",
+        baseURL: "https://ts-proxy.example.com/v1/",
+      },
+      { fetchImpl, assertSafe: passAssert },
+    );
+    expect(r).toEqual({ testable: true, ok: true });
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://ts-proxy.example.com/v1/models",
+    ]);
+  });
+
+  test("a fixed-host kind ignores a base URL handed to the probe", async () => {
+    const { calls, fetchImpl } = fakeFetch();
+    await runSecretTest(
+      { kind: "openai", value: "x", baseURL: "https://elsewhere.example.com" },
+      { fetchImpl, assertSafe: passAssert },
+    );
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://api.openai.com/v1/models",
+    ]);
   });
 });

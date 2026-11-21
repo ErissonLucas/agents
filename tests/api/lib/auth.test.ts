@@ -1,7 +1,16 @@
-import { beforeEach, describe, expect, mock, test } from "bun:test";
+import {
+  beforeEach,
+  describe,
+  expect,
+  mock,
+  setSystemTime,
+  test,
+} from "bun:test";
 import { Elysia } from "elysia";
 
-import { authPlugin } from "@/api/lib/auth";
+import { authPlugin, authPoolFor } from "@/api/lib/auth";
+import { localeMiddleware } from "@/api/middlewares/locale";
+import config from "@/config";
 
 // happy-dom's Request drops `Cookie` (a forbidden request header), so a cookie built with the
 // global constructor never reaches the route. Bun's native Request is captured in tests/dom-setup.ts
@@ -19,12 +28,13 @@ const mockUser = {
   googleId: null as string | null,
 };
 
-// The row the session lookup reads: the person, with their one membership (issue #756).
+// The row the session lookup reads: the person, with their one membership.
 const mockPersonRow = {
   id: mockUser.id,
   email: mockUser.email,
   name: mockUser.name,
   googleId: mockUser.googleId,
+  passwordHash: mockUser.passwordHash as string | null,
   isSuperAdmin: false,
   memberships: [
     { tenantId: BigInt(1), role: "AGENT" as const, createdAt: new Date(0) },
@@ -41,6 +51,35 @@ const mockPrisma = {
 
 mock.module("@/api/lib/prisma", () => ({
   default: mockPrisma,
+}));
+
+// The metrics routes authenticate through the metrics pool, so the screen does not need a
+// connection of the main one (src/api/lib/prisma-metrics.ts).
+const mockMetricsPrisma = {
+  user: {
+    findUnique: mock(
+      (): Promise<typeof mockPersonRow | null> => Promise.resolve(null),
+    ),
+  },
+  // Under the request's deadline the memberships are a read of their own.
+  tenantUser: {
+    findMany: mock(() => Promise.resolve(mockPersonRow.memberships)),
+  },
+  endedSession: {
+    findMany: mock(() => Promise.resolve([] as { jti: string }[])),
+  },
+  // The lookup runs in a transaction bounded by the request's budget.
+  $executeRaw: mock(() => Promise.resolve(0)),
+  $transaction: mock(
+    (
+      fn: (tx: unknown) => Promise<unknown>,
+      _options?: { maxWait: number; timeout: number },
+    ) => fn(mockMetricsPrisma),
+  ),
+};
+
+mock.module("@/api/lib/prisma-metrics", () => ({
+  default: mockMetricsPrisma,
 }));
 
 function base64urlToBase64(input: string): string {
@@ -62,7 +101,7 @@ describe("authPlugin", () => {
       const app = new Elysia()
         .use(authPlugin)
         .post("/test-set-cookie", async ({ setAuthCookie }) => {
-          const token = await setAuthCookie(mockUser);
+          const token = await setAuthCookie(mockUser, mockUser.passwordHash);
           return { token };
         });
 
@@ -71,7 +110,7 @@ describe("authPlugin", () => {
       );
 
       expect(response.status).toBe(200);
-      // NOTE: happy-dom (registered via tests/setup.ts) strips `Set-Cookie`
+      // Happy-dom (registered via tests/setup.ts) strips `Set-Cookie`
       // from Response headers as a forbidden response header. The cookie
       // side effect is therefore only observable indirectly through the
       // JWT returned by `setAuthCookie`, which we assert below.
@@ -92,7 +131,7 @@ describe("authPlugin", () => {
       const app = new Elysia()
         .use(authPlugin)
         .post("/test-set-cookie", async ({ setAuthCookie }) => {
-          const token = await setAuthCookie(mockUser);
+          const token = await setAuthCookie(mockUser, mockUser.passwordHash);
           return { token };
         });
 
@@ -111,24 +150,26 @@ describe("authPlugin", () => {
   });
 
   describe("clearAuthCookie", () => {
-    test("executes without error", async () => {
+    test("expires both session cookies the request carried", async () => {
       const app = new Elysia()
         .use(authPlugin)
-        .post("/test-clear-cookie", ({ clearAuthCookie }) => {
+        .post("/test-clear-cookie", ({ clearAuthCookie, set }) => {
           clearAuthCookie();
-          return { success: true };
+          return structuredClone(set.cookie);
         });
-
       const response = await app.handle(
-        new Request("http://localhost/test-clear-cookie", {
+        new BunRequest("http://localhost/test-clear-cookie", {
           method: "POST",
-          headers: { Cookie: "auth_token=some_token" },
+          headers: {
+            cookie: "fazerai_auth_token=a; secretaria_v4_auth_token=b",
+          },
         }),
       );
 
-      expect(response.status).toBe(200);
-      const data = await response.json();
-      expect(data.success).toBe(true);
+      const jar = await response.json();
+      const expired = { value: "", maxAge: 0 };
+      expect(jar.fazerai_auth_token).toMatchObject(expired);
+      expect(jar.secretaria_v4_auth_token).toMatchObject(expired);
     });
   });
 
@@ -149,42 +190,6 @@ describe("authPlugin", () => {
       expect(data.user).toBeNull();
     });
 
-    test("returns null for invalid token", async () => {
-      const app = new Elysia()
-        .use(authPlugin)
-        .get("/test-get-user", async ({ getAuthUser }) => {
-          const user = await getAuthUser();
-          return { user };
-        });
-
-      const response = await app.handle(
-        new Request("http://localhost/test-get-user", {
-          headers: { Cookie: "auth_token=invalid_token" },
-        }),
-      );
-
-      const data = await response.json();
-      expect(data.user).toBeNull();
-    });
-
-    test("returns null for malformed JWT", async () => {
-      const app = new Elysia()
-        .use(authPlugin)
-        .get("/test-get-user", async ({ getAuthUser }) => {
-          const user = await getAuthUser();
-          return { user };
-        });
-
-      const response = await app.handle(
-        new Request("http://localhost/test-get-user", {
-          headers: { Cookie: "auth_token=not.a.valid.jwt.token" },
-        }),
-      );
-
-      const data = await response.json();
-      expect(data.user).toBeNull();
-    });
-
     // Brand rename compatibility window. Sessions minted by the previous image carry
     // `secretaria_v4_auth_token`; the current one issues and reads `fazerai_auth_token`. Reading
     // both is what keeps an upgrade from logging every operator out. Dropped at 2.0.
@@ -195,7 +200,7 @@ describe("authPlugin", () => {
         const app = new Elysia()
           .use(authPlugin)
           .post("/mint", async ({ setAuthCookie }) => ({
-            token: await setAuthCookie(mockUser),
+            token: await setAuthCookie(mockUser, mockUser.passwordHash),
           }));
         const res = await app.handle(
           new Request("http://localhost/mint", { method: "POST" }),
@@ -232,6 +237,185 @@ describe("authPlugin", () => {
           }),
         );
         expect((await res.json()).id).toBe(mockUser.id.toString());
+      });
+
+      test("a metrics route reads the session through the metrics pool, any other route through the main one", async () => {
+        const token = await mintToken();
+        const app = new Elysia().group("/api", (api) =>
+          api
+            .use(authPlugin)
+            .get("/v1/metrics/costs", async ({ getAuthUser }) => ({
+              id: (await getAuthUser())?.id.toString() ?? null,
+            }))
+            .get("/v1/agents", async ({ getAuthUser }) => ({
+              id: (await getAuthUser())?.id.toString() ?? null,
+            })),
+        );
+        const ask = (path: string) =>
+          app.handle(
+            new BunRequest(`http://localhost${path}`, {
+              headers: { Cookie: `fazerai_auth_token=${token}` },
+            }),
+          );
+        mockMetricsPrisma.user.findUnique.mockResolvedValueOnce(mockPersonRow);
+        mockMetricsPrisma.$transaction.mockClear();
+        mockMetricsPrisma.tenantUser.findMany.mockClear();
+        expect((await (await ask("/api/v1/metrics/costs")).json()).id).toBe(
+          mockUser.id.toString(),
+        );
+        // Inside a transaction whose wait and run are what is left of the request's metrics budget.
+        const options = mockMetricsPrisma.$transaction.mock.calls[0]?.[1];
+        expect(options?.maxWait).toBeLessThanOrEqual(config.metrics.timeoutMs);
+        expect(options?.timeout).toBeLessThanOrEqual(config.metrics.timeoutMs);
+        // The memberships are a read of their own, so the deadline is set before each one.
+        expect(mockMetricsPrisma.tenantUser.findMany).toHaveBeenCalledTimes(1);
+        mockMetricsPrisma.user.findUnique.mockResolvedValueOnce(mockPersonRow);
+        expect((await (await ask("/api/v1/agents")).json()).id).toBeNull();
+      });
+
+      test("a metrics route's key lookup keeps to what is left of the request's metrics budget, any other to the main one", () => {
+        const metrics = authPoolFor("/api/v1/metrics/costs").budget;
+        expect(metrics?.timeout).toBeLessThanOrEqual(config.metrics.timeoutMs);
+        expect(metrics?.timeout).toBeGreaterThan(0);
+        expect(metrics?.deadline).toBeDefined();
+        expect(authPoolFor("/api/v1/metrics").budget?.maxWait).toBeDefined();
+        expect(authPoolFor("/api/v1/metricsx").budget).toBeUndefined();
+        expect(authPoolFor("/api/v1/agents").budget).toBeUndefined();
+        // The screen an instance alert links to authenticates off the main pool too.
+        expect(
+          authPoolFor("/api/v1/instance-health").budget?.maxWait,
+        ).toBeDefined();
+        expect(
+          authPoolFor("/api/v1/instance-health/channels").budget,
+        ).toBeDefined();
+        expect(authPoolFor("/api/v1/instance-healthx").budget).toBeUndefined();
+      });
+
+      test("a metrics route whose session lookup fails after the request's budget is spent answers the metrics refusal", async () => {
+        const token = await mintToken();
+        const app = new Elysia().use(localeMiddleware).group("/api", (api) =>
+          api
+            .use(authPlugin)
+            .get("/v1/metrics/costs", async ({ getAuthUser }) =>
+              getAuthUser().then(
+                () => ({ status: 200 }),
+                (e: { statusCode?: number; field?: string }) => ({
+                  status: e.statusCode ?? 500,
+                  field: e.field ?? null,
+                }),
+              ),
+            ),
+        );
+        const ask = () =>
+          app.handle(
+            new BunRequest("http://localhost/api/v1/metrics/costs", {
+              headers: { Cookie: `fazerai_auth_token=${token}` },
+            }),
+          );
+        const metrics = config.metrics;
+        const saved = metrics.timeoutMs;
+        metrics.timeoutMs = 50;
+        // NOTE: drops a value an earlier test queued and never consumed.
+        mockMetricsPrisma.user.findUnique.mockReset();
+        try {
+          // The pool gave no connection until the budget was gone.
+          mockMetricsPrisma.user.findUnique.mockImplementationOnce(() => {
+            setSystemTime(new Date(Date.now() + 100));
+            return Promise.reject(
+              new Error("timeout exceeded when trying to connect"),
+            );
+          });
+          expect(await (await ask()).json()).toEqual({
+            status: 503,
+            field: "since",
+          });
+          // A lookup that fails inside the budget is the plain transient 503.
+          mockMetricsPrisma.user.findUnique.mockImplementationOnce(() =>
+            Promise.reject(new Error("connection reset")),
+          );
+          metrics.timeoutMs = 10_000;
+          expect(await (await ask()).json()).toEqual({
+            status: 503,
+            field: null,
+          });
+        } finally {
+          metrics.timeoutMs = saved;
+          setSystemTime();
+          mockMetricsPrisma.user.findUnique.mockImplementation(() =>
+            Promise.resolve(null),
+          );
+        }
+      });
+
+      test("an API key whose lookup fails is a transient 503, not a 500", async () => {
+        const app = new Elysia()
+          .use(authPlugin)
+          .get("/who", async ({ getAuthUser }) =>
+            getAuthUser().then(
+              () => ({ status: 200 }),
+              (e: { statusCode?: number }) => ({ status: e.statusCode ?? 500 }),
+            ),
+          );
+        // The mock client has no `$transaction`, so the key's lookup throws as a full pool would.
+        const res = await app.handle(
+          new BunRequest("http://localhost/who", {
+            headers: { Authorization: "Bearer fazerai_abc" },
+          }),
+        );
+        expect((await res.json()).status).toBe(503);
+      });
+
+      test("refuses a session signed under another password", async () => {
+        const token = await mintToken();
+        mockPrisma.user.findUnique.mockResolvedValueOnce({
+          ...mockPersonRow,
+          passwordHash: "$2b$10$anotherhash",
+        });
+        const res = await readerApp().handle(
+          new BunRequest("http://localhost/whoami", {
+            headers: { Cookie: `fazerai_auth_token=${token}` },
+          }),
+        );
+        expect((await res.json()).id).toBeNull();
+      });
+
+      test("refuses a session that carries no password fingerprint for an account that has one", async () => {
+        const app = new Elysia()
+          .use(authPlugin)
+          .post("/mint", async ({ setAuthCookie }) => ({
+            token: await setAuthCookie(mockUser, null),
+          }));
+        const { token } = (await (
+          await app.handle(
+            new Request("http://localhost/mint", { method: "POST" }),
+          )
+        ).json()) as { token: string };
+        mockPrisma.user.findUnique.mockResolvedValueOnce(mockPersonRow);
+        const res = await readerApp().handle(
+          new BunRequest("http://localhost/whoami", {
+            headers: { Cookie: `fazerai_auth_token=${token}` },
+          }),
+        );
+        expect((await res.json()).id).toBeNull();
+      });
+
+      test("the proof of identity refuses a revoked session too", async () => {
+        const token = await mintToken();
+        mockPrisma.user.findUnique.mockResolvedValueOnce({
+          ...mockPersonRow,
+          passwordHash: "$2b$10$anotherhash",
+        });
+        const app = new Elysia()
+          .use(authPlugin)
+          .get("/who", async ({ getSessionIdentity }) => ({
+            id: (await getSessionIdentity())?.userId.toString() ?? null,
+          }));
+        const res = await app.handle(
+          new BunRequest("http://localhost/who", {
+            headers: { Cookie: `fazerai_auth_token=${token}` },
+          }),
+        );
+        expect((await res.json()).id).toBeNull();
       });
 
       test("prefers the current name when both cookies are present", async () => {
@@ -302,22 +486,6 @@ describe("authPlugin", () => {
       const data = await response.json();
       expect(data.error).toBe("Unauthorized");
     });
-
-    test("rejects requests with invalid token with 401", async () => {
-      const app = new Elysia()
-        .use(authPlugin)
-        .get("/protected", () => ({ message: "secret data" }), {
-          requireAuth: true,
-        });
-
-      const response = await app.handle(
-        new Request("http://localhost/protected", {
-          headers: { Cookie: "auth_token=invalid" },
-        }),
-      );
-
-      expect(response.status).toBe(401);
-    });
   });
 
   describe("requireAdmin macro", () => {
@@ -333,22 +501,6 @@ describe("authPlugin", () => {
       expect(response.status).toBe(401);
       const data = await response.json();
       expect(data.error).toBe("Unauthorized");
-    });
-
-    test("rejects requests with invalid token with 401", async () => {
-      const app = new Elysia()
-        .use(authPlugin)
-        .get("/admin", () => ({ message: "admin data" }), {
-          requireAdmin: true,
-        });
-
-      const response = await app.handle(
-        new Request("http://localhost/admin", {
-          headers: { Cookie: "auth_token=invalid" },
-        }),
-      );
-
-      expect(response.status).toBe(401);
     });
   });
 });

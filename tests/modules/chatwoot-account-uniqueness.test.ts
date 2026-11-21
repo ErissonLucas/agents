@@ -8,7 +8,12 @@ import {
   normalizeChatwootBaseUrl,
   setConnectedAccounts,
 } from "@/modules/chatwoot/management";
-import { seedChatwootInstance, withRunNamespace } from "../utils/chatwoot";
+import { dbProbeFailed } from "@/tests/db-gate";
+import {
+  fakeInstallation,
+  seedChatwootInstance,
+  withRunNamespace,
+} from "../utils/chatwoot";
 
 // A Chatwoot ACCOUNT (server + accountId) is globally unique to one tenant, even though a server can
 // back many tenants. Needs a real Postgres for the unique index + the superuser cross-tenant guard.
@@ -28,14 +33,14 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
-// NOTE: loopback on the discard port, NOT a hostname. The best-effort provisioning call inside
+// Loopback on the discard port, NOT a hostname. The best-effort provisioning call inside
 // setConnectedAccounts reaches out with this base URL; a real hostname made the test depend on DNS
 // (it "passed" only because the name failed to resolve), and a public IP literal has nowhere to
 // fail fast, so the connect hung until the 5s test timeout. Loopback is refused by the SSRF guard
@@ -43,6 +48,7 @@ const suDb = su as PrismaClient;
 const SHARED = "https://127.0.0.1:9";
 // Probe stub: the accounts the (shared) server's admin token can reach.
 const deps = {
+  fetchAccount: fakeInstallation("shared").fetchAccount,
   fetchProfile: async () => ({
     accounts: [
       { id: 5, name: "Acc 5" },
@@ -149,6 +155,7 @@ describe.skipIf(!dbUp)("Chatwoot account uniqueness (shared server)", () => {
       ctx(tenantC),
       [1, 5],
       {
+        fetchAccount: fakeInstallation("other").fetchAccount,
         fetchProfile: async () => ({
           accounts: [
             { id: 1, name: "C1" },

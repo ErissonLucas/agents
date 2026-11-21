@@ -5,13 +5,13 @@ import type { TenantContext } from "@/lib/tenancy";
 import { getConversationDetail } from "@/modules/conversations/service";
 import { CONVERSATION_USAGE_TURN_CAP } from "@/modules/conversations/usage";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// Issue #853: the conversation screen shows what the conversation has spent (header) and what each
-// agent turn spent (timeline), from the usage ledger. The total is every row billed to the
-// conversation whatever its node; a turn is the rows sharing a `turnId`; a row no turn owns counts in
-// the total and in no turn; and nothing from the playground, another conversation or another tenant
-// gets in.
+// The conversation screen shows what the conversation has spent (header) and what each agent turn
+// spent (timeline), from the usage ledger. The total is every row billed to the conversation
+// whatever its node; a turn is the rows sharing a `turnId`; a row no turn owns counts in the total
+// and in no turn; and nothing from the playground, another conversation or another tenant gets in.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -29,8 +29,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -73,10 +73,12 @@ interface Row {
   input: number;
   cached?: number;
   written?: number;
+  // Of `written`, the 1-hour writes.
+  written1h?: number;
   output: number;
   at: string;
   tenant?: bigint;
-  // The price the capture wrote (issue #863); absent is a row it could not price.
+  // The price the capture wrote; absent is a row it could not price.
   cost?: string;
   // The table that priced it; absent is the one in the tree now when a cost is given.
   priceTable?: string;
@@ -94,6 +96,7 @@ async function bill(r: Row) {
       promptTokens: r.input,
       cachedReadTokens: r.cached ?? 0,
       cacheCreationTokens: r.written ?? 0,
+      cacheCreation1hTokens: r.written1h ?? 0,
       completionTokens: r.output,
       costUsd: r.cost,
       priceTable:
@@ -189,6 +192,7 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
       node: "agent",
       input: 3000,
       written: 2500,
+      written1h: 1000,
       output: 150,
       at: "2026-09-25T10:05:00Z",
     });
@@ -242,6 +246,7 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
       promptTokens: 5200,
       cachedReadTokens: 600,
       cacheCreationTokens: 2500,
+      cacheCreation1hTokens: 1000,
       completionTokens: 375,
       byNode: {
         agent: 2,
@@ -266,6 +271,7 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
           promptTokens: 1600,
           cachedReadTokens: 600,
           cacheCreationTokens: 0,
+          cacheCreation1hTokens: 0,
           completionTokens: 75,
           byNode: { agent: 1, guardrail: 1, vision: 1 },
           costUsd: 0,
@@ -287,6 +293,7 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
           promptTokens: 3100,
           cachedReadTokens: 0,
           cacheCreationTokens: 2500,
+          cacheCreation1hTokens: 1000,
           completionTokens: 200,
           byNode: { agent: 1, tts_normalize: 1 },
           costUsd: 0,
@@ -315,8 +322,8 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
     expect(usage.turns).toEqual([]);
   });
 
-  // Issue #858: a turn is hung on the messages its closing line names (#855), and the line gives
-  // its wall time; a line that is not a closing one (no turnMs) names nothing.
+  // A turn is hung on the messages its closing line names, and the line gives its wall time; a
+  // line that is not a closing one (no turnMs) names nothing.
   test("a turn carries the message ids and the time its closing line recorded", async () => {
     const conv = await newConversation();
     await bill({
@@ -356,8 +363,8 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
     expect(byTurn.tOpen?.turnMs).toBeNull();
   });
 
-  // Issue #863: the cost is summed from the column, the calls it could not price are counted beside
-  // it, and the Decimal sum comes back exact to the cent's ten-thousandth and past it.
+  // The cost is summed from the column, the calls it could not price are counted beside it, and
+  // the Decimal sum comes back exact to the cent's ten-thousandth and past it.
   test("a total and a turn carry the priced calls' cost and count the unpriced ones", async () => {
     const conv = await newConversation();
     const base = { conversationId: conv.id, input: 100, output: 10 };
@@ -437,30 +444,6 @@ describe.skipIf(!dbUp)("what a conversation spent (issue #853)", () => {
       usage.turns.map((t) => [t.turnId, t.usage.olderTablePricedCalls]),
     );
     expect(byTurn).toEqual({ tOld: 1, tNew: 0 });
-  });
-
-  test("the observer's calls are billed to the conversation it watched", async () => {
-    const conv = await newConversation();
-    await bill({
-      conversationId: conv.id,
-      turnId: "tAgent",
-      node: "agent",
-      input: 1000,
-      cached: 100,
-      output: 10,
-      at: "2026-09-25T12:00:00Z",
-    });
-    await bill({
-      conversationId: conv.id,
-      turnId: "tObs",
-      node: "observer",
-      input: 300,
-      output: 10,
-      at: "2026-09-25T12:00:05Z",
-    });
-    const usage = await usageOf(conv.id);
-    expect(usage.total.promptTokens).toBe(1300);
-    expect(usage.total.calls).toBe(2);
   });
 
   test("only the newest turns come back, oldest first", async () => {

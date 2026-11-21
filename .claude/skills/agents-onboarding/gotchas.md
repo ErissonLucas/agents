@@ -36,7 +36,13 @@ Sem setar o Instance Domain (`coolify.<seu-dominio>`) o painel fica só em `http
 
 ### Coolify não conecta no próprio servidor (localhost Unreachable) = chave grudada
 
-O Coolify alcança o servidor `localhost` por SSH do container `coolify` pro host (`root@host.docker.internal`), com uma chave que o instalador adiciona às **chaves autorizadas do root** via `cat >>`. Se a última linha do arquivo não terminava em newline (uma chave **colada pelo painel da VPS** chega sem `\n` final), a chave do Coolify **gruda** no fim da linha anterior e deixa de ser entrada válida → servidor `localhost` **Unreachable** → **todo deploy falha** (sem erro de SSH claro; a UI só mostra inacessível). Determinístico: repete a cada install nessa condição. **Não edite as chaves autorizadas na mão** (SSH→PowerShell mangla o quoting). Fix idempotente, logo após o Coolify subir e **antes** de deployar:
+O Coolify alcança o servidor `localhost` por SSH do container `coolify` pro host (`root@host.docker.internal`), com uma chave que o instalador adiciona às **chaves autorizadas do root** via `cat >>`. Se a última linha do arquivo não terminava em newline, a chave do Coolify **gruda** no fim da linha anterior e deixa de ser entrada válida → servidor `localhost` **Unreachable** → **todo deploy falha** (sem erro de SSH claro; a UI só mostra inacessível). Determinístico: repete a cada install nessa condição.
+
+**Causa na Hostinger: é como ela grava a chave, no painel e na API.** O hPanel e o `vps_ssh-keys_add-virtual-machine` escrevem `"\n" + chave` e **nunca** põem `\n` no fim: se o arquivo já terminava em newline, sobra uma linha em branco antes da chave nova; se não terminava, a chave fica na própria linha. Nos dois casos o arquivo termina **sem** newline, então a próxima chave acrescentada com `>>` (a do Coolify) gruda. `vps_ssh-keys_list-virtual-machine` passa a mostrar as duas como uma entrada só. Por isso a `01-vps-dns-ssh.md` manda rodar `sshkey.py normalize-keys` logo no 1º SSH, antes de qualquer instalador; o `heal-localhost` abaixo é a correção para quando já grudou (instância existente, ou normalização que não rodou).
+
+**Apagar também tem armadilha.** Remover pelo hPanel a chave que tem outra grudada apaga **as duas** e deixa uma linha em branco; remover pela API (`vps_ssh-keys_remove-virtual-machine`) com o texto exato da linha grudada responde 200 e **não remove nada**. Sem nada grudado, apagar (painel ou API) devolve o arquivo idêntico ao de antes. Não tente limpar por aí: conserte com o `heal-localhost`.
+
+**Não edite as chaves autorizadas na mão** (SSH→PowerShell mangla o quoting). Fix idempotente, logo após o Coolify subir e **antes** de deployar (ele normaliza o arquivo como o `normalize-keys` faz, e vai além: desgruda, deduplica e garante a chave do Coolify; os dois são idempotentes e podem rodar em qualquer ordem):
 ```sh
 python3 scripts/coolify.py heal-localhost --ssh root@<VPS_IP>   # normaliza as chaves + verifica container->host
 ```
@@ -97,9 +103,16 @@ Não há heredoc (`<<'EOF'` é só POSIX) nem `<` de stdin no PowerShell, por is
 
 A edição **Pro** do fazer.ai agents (`edition: "pro"`, marcador) usa imagem privada no Harbor (projeto `agents`), liberada **só pra membros da comunidade** (`isCommunityGrant`). Uma licença Chatwoot Pro **avulsa** NÃO desbloqueia o fazer.ai agents. A robot do Harbor é **per-user** (cobre a união dos projetos a que o usuário tem acesso): se Chatwoot e o fazer.ai agents são ambos Pro, é **um único** `docker login`: não logue duas vezes. `free` = imagem pública, **sem** `docker login`.
 
-### Chatwoot OSS não faz `docker login` (mas inclui Baileys)
+### Chatwoot OSS não faz `docker login` (e já traz o WhatsApp nativo)
 
-`chatwootTier: "community"` (OSS) usa a imagem pública `ghcr.io/fazer-ai/chatwoot` (nosso fork), **sem** `docker login` no Harbor. O `baileys-api` **roda também no OSS** (imagem pública `ghcr.io/fazer-ai/baileys-api`, parte do fork — **não** remova). Só o `pro` faz `docker login` no Harbor + imagem privada `chatwoot-pro` (o que o Pro adiciona é o **Kanban**, não o Baileys). **Não** rode `docker login` nem provisione credencial do Harbor no caminho OSS (não há licença, e o pull público não precisa dela).
+`chatwootTier: "community"` (OSS) usa a imagem pública `ghcr.io/fazer-ai/chatwoot` (nosso fork), **sem** `docker login` no Harbor. O WhatsApp (nativo) vem nas **duas** edições: a imagem roda o conector dentro do container do `sidekiq`, ligado por padrão, sem serviço extra. Só o `pro` faz `docker login` no Harbor + imagem privada `chatwoot-pro` (o que o Pro adiciona é o **Kanban**). **Não** rode `docker login` nem provisione credencial do Harbor no caminho OSS (não há licença, e o pull público não precisa dela).
+
+### Stack nova não leva `baileys-api`; stack existente com conector separado precisa de uma variável antes de atualizar
+
+Os templates de Chatwoot não sobem mais o `baileys-api`: Baileys e Z-API aparecem como legado no Chatwoot, e o canal recomendado é o WhatsApp (nativo), que roda dentro do `sidekiq`. Duas consequências que não aparecem como erro:
+
+- O conector cria um banco próprio (`<POSTGRES_DB>_whatsapp_connector`) no mesmo PostgreSQL no primeiro start. Um usuário de PostgreSQL sem permissão de criar banco deixa o conector tentando de novo para sempre, com o Sidekiq de pé e a caixa nativa sem parear. O usuário que a imagem do postgres cria tem a permissão; um banco gerenciado de fora talvez não.
+- Em brownfield, um `baileys-api` que já roda **fica** (as caixas dele dependem dele). Já um conector rodando como **serviço separado** (`ghcr.io/fazer-ai/whatsapp-connector`) exige `WHATSAPP_CONNECTOR_EMBEDDED=false` no `chatwoot` e no `sidekiq` **antes** de atualizar o Chatwoot para uma imagem que embute o conector (`v4.18.0-fazer-ai.124` em diante). Sem ela sobe um segundo conector, com um banco sem os pareamentos, disputando as mesmas sessões.
 
 ## Langfuse
 

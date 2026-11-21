@@ -8,14 +8,15 @@ import {
   ChatwootApiError,
   type ChatwootClient,
 } from "@/modules/chatwoot/client";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { fakeInstallation } from "@/tests/utils/chatwoot";
 import { mockFindUnique, setupPrismaMock } from "@/tests/utils/prisma-mock";
 
-// The channel family's trail, driven through the Channels page's own doors (issue #395).
+// The channel family's trail, driven through the Channels page's own doors.
 //
-// `tests/modules/audit-channel-family.test.ts` proves the SERVICES record. This file answers the half
-// it cannot see: whether the eleven mutating routes of `chatwoot-admin.controller.ts` reach those
-// services with a principal at all. None of them contained the string `audit`, and three of them have
-// no MCP twin, so before this the console was the ONLY door those three had and it recorded nothing.
+// `tests/modules/audit-channel-family.test.ts` proves the SERVICES record. This file proves the half
+// it cannot see: that the eleven mutating routes of `chatwoot-admin.controller.ts` reach those
+// services with a principal, including the three with no MCP twin, whose only door is the console.
 
 const BunRequest = (globalThis as unknown as { BunRequest: typeof Request })
   .BunRequest;
@@ -36,8 +37,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -46,7 +47,7 @@ setupPrismaMock();
 const ADMIN_TOKEN = "cw-console-token-9394";
 // The two destructive routes ask for the acting user's password again (step-up), verified against
 // the stored hash, so the session alone does not open them.
-const PASSWORD = "senha-do-operador-9394";
+const PASSWORD = "operator-password";
 const PASSWORD_HASH = await Bun.password.hash(PASSWORD);
 // The pid in the PATH, the way `withRunNamespace` does it for the seeded fixtures: the server key is
 // derived from this URL and `chatwoot_instances (server_key, account_id)` is unique GLOBALLY, so two
@@ -59,6 +60,8 @@ const fetchProfile = async () => ({
     { id: 2, name: "Conta B" },
   ],
 });
+
+const installation = fakeInstallation("channels-audit-actor");
 
 // What Chatwoot answers `listInboxes` with, flipped by the journey below. It starts empty because
 // the two syncs `PUT /deployment/accounts` performs happen before any inbox exists upstream, and a
@@ -73,6 +76,7 @@ const makeClient = async () =>
       throw new ChatwootApiError(404, "GET /inboxes/94");
     },
     listInboxes: async () => remoteInboxes,
+    inboxAgentBotId: async () => null,
     setInboxAgentBot: async () => ({}),
     listAgentBots: async () => [],
     createAgentBot: async () => ({
@@ -103,7 +107,12 @@ mock.module("@/modules/chatwoot/management", () => ({
     real.disconnectChatwootDeployment(ctx, app),
   ),
   setConnectedAccounts: mock((ctx: TenantContext, ids: number[]) =>
-    real.setConnectedAccounts(ctx, ids, { fetchProfile, makeClient }, app),
+    real.setConnectedAccounts(
+      ctx,
+      ids,
+      { fetchProfile, fetchAccount: installation.fetchAccount, makeClient },
+      app,
+    ),
   ),
   softDisconnectChatwootInstance: mock((ctx: TenantContext, id: bigint) =>
     real.softDisconnectChatwootInstance(ctx, id, app),
@@ -199,6 +208,7 @@ describe.skipIf(!dbUp)("the Channels page names who wrote", () => {
       email: "admin@example.com",
       role: "SUPER_ADMIN",
       tenantId: tenantId.toString(),
+      pwd: (await import("@/api/lib/auth")).passwordFingerprint(PASSWORD_HASH),
     })
       .setProtectedHeader({ alg: "HS256" })
       .setExpirationTime("1h")
@@ -360,6 +370,7 @@ describe.skipIf(!dbUp)("the Channels page names who wrote", () => {
       "inbox.bind",
       "inbox.reconnect",
       "inbox.remove",
+      "instance.disconnect",
       "instance.remove",
       "deployment.disconnect",
     ]);

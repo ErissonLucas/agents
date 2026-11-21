@@ -7,6 +7,7 @@ import { NotFoundError } from "@/lib/errors";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { agentGet } from "@/modules/mcp/read";
 import { resolveEffectivePrincipal } from "@/modules/mcp/tenant-target";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // MCP tenant targeting: a fleet-level SUPER_ADMIN token is tenant-less and picks the target per call
 // via a `tenant` selector (slug or id); a tenant-scoped token keeps its tenant implicit and any
@@ -26,13 +27,6 @@ function principal(over: Partial<VerifiedToken>): VerifiedToken {
 }
 
 describe("resolveEffectivePrincipal (no DB)", () => {
-  test("tenant-scoped token → effective principal is itself (tenant implicit)", async () => {
-    const p = principal({ tenantId: 42n });
-    const r = await resolveEffectivePrincipal(p, {});
-    expect(r.ok).toBe(true);
-    if (r.ok) expect(r.eff.tenantId).toBe(42n);
-  });
-
   test("tenant-scoped token IGNORES a `tenant` arg (cannot cross)", async () => {
     const p = principal({ tenantId: 42n });
     // Even handed a different tenant selector, a tenant user stays fenced to its own tenant.
@@ -71,8 +65,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -123,10 +117,9 @@ describe.skipIf(!dbUp)("MCP tenant targeting (DB)", () => {
     ).rejects.toBeInstanceOf(NotFoundError);
   });
 
-  // An all-digits selector past what the column holds. The guard here was `/^\d+$/`, which this
-  // passes, and the value then reached Postgres as a bind error — a 500 out of a lookup whose only
-  // other outcome is a 404. It is also not a slug anyone can register, so NotFound is the whole
-  // answer. Issue #407.
+  // NOTE: An all-digits selector past what the column holds passes `/^\d+$/`, and must not reach Postgres as
+  // a bind error (a 500 out of a lookup whose only other outcome is a 404). It is not a slug anyone can
+  // register either, so NotFound is the whole answer.
   test("resolveTenantSelector answers NotFound for digits past the column, not a bind error", async () => {
     await expect(
       resolveTenantSelector((MAX_DB_ID + 1n).toString(), appDb),

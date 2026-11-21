@@ -1,19 +1,18 @@
+import type { UsageSource } from "@/graph/usage";
 // Closed vocabulary for the execution-flow log, kept dependency-free so the schema layer and the
 // read/controller layers can validate without importing the emit machinery.
 
-// One stage per step the operator can be asked to explain. Most are pipeline steps a turn runs
-// through; `route` and `command` sit BEFORE the turn (#318, #317) and `webhook` is not a turn at all
-// (#325), which is why the vocabulary is the operator's question and not the pipeline's shape.
-// Stored as a validated String on ExecutionLog (never a Prisma enum — adding a stage must not
-// require a migration).
+// One stage per step the operator can be asked to explain. `route` and `command` sit BEFORE the
+// turn and `webhook` is not a turn at all, which is why the vocabulary follows the operator's
+// question and not the pipeline. Stored as a validated String on ExecutionLog, never a Prisma enum,
+// so adding a stage needs no migration.
 export const FLOW_STAGES = [
   // The step BEFORE any of the others: the delivery is matched to the agent that answers this
-  // inbox. It writes only when there is none — an inbox nobody bound consumes the message and
-  // answers nothing, and until issue #318 the only trace was a process log line.
+  // inbox. It writes only when there is none, since an inbox nobody bound consumes the message and
+  // answers nothing.
   "route",
-  // A control command (`/teste`, `/reset`) the delivery did NOT run. Also before the turn, and for
-  // the same reason as `route`: past the gate the command is gone and every later line describes a
-  // plain message, so the console had nothing to show for it (issue #317).
+  // A control command (`/teste`, `/reset`) the delivery did NOT run. Also before the turn: past the
+  // gate the command reads as a plain message, so no later line would show it.
   "command",
   "stt", // inbound voice-note transcription
   "vision", // inbound image/document extraction
@@ -21,54 +20,94 @@ export const FLOW_STAGES = [
   "delivery", // an inbound delivery a process death interrupted: lost, or answered late
   "debounce", // inbound burst coalesced before a turn (one line per flush)
   "contact_auth", // external contact-authorization gate (allowed/denied/error before the turn)
-  // The per-tenant token ceiling refusing a turn, or warning that it is about to (issue #146).
-  // Before the turn like `contact_auth`, and for the same reason it is worth a line: past this gate
-  // nothing runs, so without one the operator sees an agent that stopped answering and no cause.
+  // The per-tenant token ceiling refusing a turn, or warning that it is about to. Before the turn
+  // like `contact_auth`, and for the same reason it is worth a line: past this gate nothing runs,
+  // so without one the operator sees an agent that stopped answering and no cause.
   "spend_ceiling",
+  // The per-conversation turn limit handing a conversation to a person: the agent answered so often
+  // in the last hour that the other side is most likely automated. Before the turn, like the ceiling.
+  "turn_limit",
+  // The per-conversation proactive limit refusing a follow-up, reminder or integration event: the
+  // conversation already received that many proactive messages in the last 24 hours. Only the first
+  // refusal of a day is `error`; the conversation stays with the agent.
+  "proactive_limit",
+  // The account-wide proactive breaker refusing a proactive send: the account delivered its limit of
+  // proactive messages in 24 hours and stays paused until an admin resumes. The trip is `error`.
+  "proactive_breaker",
   "generate", // the LLM turn (graph.invoke)
   "guardrail", // input/output moderation trip (a guardrails check fired)
   "jev", // Jev fast decisions around a turn: the reading before the model, the rule check after it
   "tool", // a tool call the agent made during the turn (name + status + duration)
   "normalize", // the reply rewritten for speech before synthesis (its own model call)
   "tts", // audio-reply synthesis
-  // The detector's verdict on a synthesized audio (issue #779): passed, regenerated, rejected (the
-  // reply went as text), or sent corrupted in shadow mode. Its own stage so an alert channel can
-  // subscribe to broken audio without subscribing to every synthesis.
+  // The detector's verdict on a synthesized audio: passed, regenerated, rejected (the reply went as
+  // text), or sent corrupted in shadow mode. Its own stage so an alert channel can subscribe to
+  // broken audio without subscribing to every synthesis.
   "tts_check",
   "split", // humanized balloon delivery
-  // The CHANNEL refused a reply after Chatwoot accepted it (issue #587): the failure arrives later, on
-  // a `message_updated` carrying `external_error`. One line per report, naming the code and what was
+  // The CHANNEL refused a reply after Chatwoot accepted it: the failure arrives later, on a
+  // `message_updated` carrying `external_error`. One line per report, naming the code and what was
   // done about it (resent as text, or nothing), never the channel's sentence or the reply.
   "channel_error",
+  // A message the customer read that was posted with the agent's own Agent Bot token by something
+  // other than the agent (an external automation). The agent did not see it, so its next reply can
+  // answer as if it was never said. One line per message; the alert is one per agent per window.
+  "foreign_send",
+  // A proactive send outside the WhatsApp 24h window that became a private note because its occasion
+  // had no usable template. One line per note; the alert is one per agent per day.
+  "service_window",
   "handoff", // an ownership gate closed: a takeover, or the conversation left the bot
   "memory", // a closed attendance folded into the contact's memory (compaction)
-  // A watching agent's verdict on a conversation it does not answer: what it is about, written as
-  // labels by the OBSERVE job (issue #477). One line per tick, whether or not anything changed,
-  // because "the observer ran and agreed with the label already there" is the answer an operator
-  // asks for when a label looks stale.
+  // A watching agent's verdict on a conversation it does not answer, written as labels by the
+  // OBSERVE job. One line per tick, whether or not anything changed, because "the observer ran and
+  // agreed with the label already there" is the answer an operator asks for when a label looks
+  // stale.
   "observe",
-  // NOT a turn step, and the only stage here that is not: an outbound webhook delivery the bus gave
-  // up on. It happens on a worker tick long after whatever produced the event, so it hangs off no
-  // conversation and no contact. It is in this vocabulary because the vocabulary is what an alert
-  // channel subscribes to and what the Logs page filters by, and a dropped event that reaches
-  // neither is a loss nobody is told about (issue #325).
+  // NOT a turn step: an outbound webhook delivery the bus gave up on, on a worker tick long after
+  // whatever produced the event, so it hangs off no conversation and no contact. It is here because
+  // this vocabulary is what an alert channel subscribes to and what the Logs page filters by.
   "webhook",
-  // NOT a turn step either, and the widest of the three: a unit of work that reached a TERMINAL
-  // failure state — a scheduled job past its budget, an alert the bus gave up on, an inbound event
-  // that will never be processed, a document that will never be indexed. One stage rather than one
-  // per bus because it is one question ("what did the system give up on?"), which is what an
-  // operator subscribes a channel to; `detail.unit` says which bus inside it (issue #356).
+  // NOT a turn step either: a unit of work that reached a TERMINAL failure state (a scheduled job
+  // past its budget, an alert the bus gave up on, an inbound event or a document that will never be
+  // processed). One stage for every bus because it is one question ("what did the system give up
+  // on?"); `detail.unit` says which bus.
   "dead_letter",
-  // NOT a turn step either: a reply that WAITED for capacity past the operator's threshold (issue
-  // #812), either a due debounce flush with no free slot in its lane or a model call with no free
-  // permit in the process-wide semaphore. `detail.waitedOn` says which. Its own stage so a channel can
-  // subscribe to saturation without subscribing to every generate warning.
+  // NOT a turn step either: a reply that WAITED for capacity past the operator's threshold, either
+  // a due debounce flush with no free slot in its lane or a model call with no free permit in the
+  // process-wide semaphore. `detail.waitedOn` says which. Its own stage so a channel can subscribe
+  // to saturation without subscribing to every generate warning.
   "capacity",
 ] as const;
 export type FlowStage = (typeof FLOW_STAGES)[number];
 
 export function isFlowStage(s: string): s is FlowStage {
   return (FLOW_STAGES as readonly string[]).includes(s);
+}
+
+// A `guardrail` line whose trip was only recorded (the `observe` action), as a selector: an alert
+// channel's stage list and the Logs stage filter name it to pick those lines apart from the trips that
+// acted. Not a stage of its own: the line is written as `guardrail`, where every trip is.
+export const GUARDRAIL_OBSERVED = "guardrail_observed";
+
+// What an alert channel's stage list and the Logs stage filter may name: every stage, plus the
+// observed guardrail trips. In a channel's list `guardrail` means the trips that ACTED, so a channel
+// that pages on guardrail trips today keeps paging on exactly those; the Logs filter for `guardrail`
+// still lists every line stored at that stage, observed ones included.
+export const SELECTABLE_STAGES = [...FLOW_STAGES, GUARDRAIL_OBSERVED] as const;
+export type SelectableStage = (typeof SELECTABLE_STAGES)[number];
+
+export function isSelectableStage(s: string): s is SelectableStage {
+  return (SELECTABLE_STAGES as readonly string[]).includes(s);
+}
+
+// The selector a line answers to: its stage, except an observed guardrail trip.
+export function selectorOf(
+  stage: string,
+  detail: Record<string, unknown> | null | undefined,
+): string {
+  return stage === "guardrail" && detail?.action === "observe"
+    ? GUARDRAIL_OBSERVED
+    : stage;
 }
 
 // The buses that can reach a terminal failure. Closed, because the `dead_letter` line is only
@@ -89,6 +128,10 @@ export const DEAD_UNITS = [
   "inbound_delivery",
   // A knowledge document whose indexing failed; the row stays FAILED and no retry is coming.
   "knowledge_document",
+  // A live thread the checkpoint retention pass failed to prune alone, in two passes in a row
+  // (../../graph/checkpoint-retention.ts). Not lost: the thread keeps every row and the next pass
+  // tries again, so `warn`; but no pass prunes it until the cause goes away.
+  "checkpoint_retention",
 ] as const;
 export type DeadUnit = (typeof DEAD_UNITS)[number];
 
@@ -101,7 +144,11 @@ export function isFlowLevel(s: string): s is FlowLevel {
 
 export type FlowStatus = "ok" | "error" | "skipped";
 
-// The two worlds an alert has to tell apart, and the split is real-vs-test, never turn-vs-not:
-// inbox = production, including the system work that serves it (a `webhook` line has no turn and
-// still pages); playground = operator test turns, which never alert.
-export type FlowSource = "inbox" | "playground";
+// Which traffic a line is about. An alert splits it real-vs-test, never turn-vs-not: inbox and
+// client are production (a `webhook` line has no turn and still pages); playground is operator test
+// turns, which never alert. See `pagesAlerts`.
+export type FlowSource = UsageSource;
+
+export function pagesAlerts(source: FlowSource): boolean {
+  return source !== "playground";
+}

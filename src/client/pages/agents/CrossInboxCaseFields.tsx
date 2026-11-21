@@ -1,15 +1,32 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { FormField, Input, Select, SwitchField } from "@/client/components";
+import {
+  FormField,
+  Input,
+  NumberInput,
+  Select,
+  SwitchField,
+  Textarea,
+} from "@/client/components";
 import { api } from "@/client/lib/api";
+import { CARRY_ATTACHMENTS_RANGES } from "@/modules/agents/number-ranges";
+import {
+  CARRY_ATTACHMENTS_MAX_FILES,
+  CARRY_FILE_TYPES,
+  type CarryFileType,
+  type CarryMode,
+  readCarryAttachments,
+} from "@/modules/cross-inbox-case/carry-attachments-settings";
 import {
   CROSS_INBOX_CASE_ATTRIBUTE_KEY_RE,
+  CROSS_INBOX_CASE_NOTE_TEMPLATE_MAX,
+  CROSS_INBOX_CASE_OPENING_TEMPLATE_MAX,
   destinationIdentity,
   normalizeCaseLabels,
 } from "@/modules/cross-inbox-case/settings";
 import { type InboxLabelOption, LabelPicker } from "./LabelPicker";
 
-// NOTE: Mirrors agent.settings.crossInboxCase (modules/cross-inbox-case/settings). The inbox is kept
+// Mirrors agent.settings.crossInboxCase (modules/cross-inbox-case/settings). The inbox is kept
 // with the instance it was picked from, because an inbox id only means something inside one Chatwoot
 // account.
 export interface CrossInboxCaseState {
@@ -21,6 +38,12 @@ export interface CrossInboxCaseState {
   mergeContacts: boolean;
   resolveOrigin: boolean;
   subjectTemplate: string;
+  openingTemplate: string;
+  noteTemplate: string;
+  // agent.settings.crossInboxCase.carryAttachments, as the reader normalizes it.
+  carryMode: CarryMode;
+  carryFileTypes: CarryFileType[];
+  carryMaxFiles: number;
 }
 
 export function readCrossInboxCaseState(raw: unknown): CrossInboxCaseState {
@@ -40,6 +63,21 @@ export function readCrossInboxCaseState(raw: unknown): CrossInboxCaseState {
     resolveOrigin: o.resolveOrigin === true,
     subjectTemplate:
       typeof o.subjectTemplate === "string" ? o.subjectTemplate : "",
+    openingTemplate:
+      typeof o.openingTemplate === "string" ? o.openingTemplate : "",
+    noteTemplate: typeof o.noteTemplate === "string" ? o.noteTemplate : "",
+    ...carryState(o.carryAttachments),
+  };
+}
+
+function carryState(
+  raw: unknown,
+): Pick<CrossInboxCaseState, "carryMode" | "carryFileTypes" | "carryMaxFiles"> {
+  const c = readCarryAttachments(raw);
+  return {
+    carryMode: c.mode,
+    carryFileTypes: c.fileTypes,
+    carryMaxFiles: c.maxFiles,
   };
 }
 
@@ -66,6 +104,13 @@ export function serializeCrossInboxCase(
     mergeContacts: s.mergeContacts,
     resolveOrigin: s.resolveOrigin,
     subjectTemplate: s.subjectTemplate.trim() || null,
+    openingTemplate: s.openingTemplate.trim() || null,
+    noteTemplate: s.noteTemplate.trim() || null,
+    carryAttachments: readCarryAttachments({
+      mode: s.carryMode,
+      fileTypes: s.carryFileTypes,
+      maxFiles: s.carryMaxFiles,
+    }),
   };
 }
 
@@ -99,6 +144,22 @@ export function withDestination(
     targetInboxId !== "" &&
     (channelType === undefined || destinationIdentity(channelType) === "email");
   return keep ? next : { ...next, subjectTemplate: "" };
+}
+
+function fileTypeLabel(
+  t: (key: string, fallback: string) => string,
+  type: CarryFileType,
+): string {
+  switch (type) {
+    case "image":
+      return t("editor.crossInboxCase.carryImage", "Images");
+    case "file":
+      return t("editor.crossInboxCase.carryFile", "Documents");
+    case "audio":
+      return t("editor.crossInboxCase.carryAudio", "Audio");
+    case "video":
+      return t("editor.crossInboxCase.carryVideo", "Video");
+  }
 }
 
 const optionValue = (instanceId: string, inboxId: string | number) =>
@@ -240,6 +301,121 @@ export function CrossInboxCaseFields({
             placeholder="Solicitação de {{nome_contato}}: {{resumo}}"
           />
         </FormField>
+      )}
+      <FormField
+        label={t("editor.crossInboxCase.opening", "Opening message")}
+        description={t(
+          "editor.crossInboxCase.openingHint",
+          "First message the customer gets in the case. Takes the prompt's variables, numero_caso and mensagem, the agent's part (without it, the text is fixed). Not signed. Empty: the agent writes it.",
+        )}
+      >
+        <Textarea
+          value={value.openingTemplate}
+          onChange={(e) =>
+            onChange({ ...value, openingTemplate: e.target.value })
+          }
+          rows={5}
+          maxLength={CROSS_INBOX_CASE_OPENING_TEMPLATE_MAX}
+          placeholder={
+            "Olá, {{primeiro_nome}}!\n\nSua solicitação nº {{numero_caso}} foi recebida.\n\n{{mensagem}}"
+          }
+        />
+      </FormField>
+      <FormField
+        label={t("editor.crossInboxCase.note", "Note on the case")}
+        description={t(
+          "editor.crossInboxCase.noteHint",
+          "The team's private note on the case, in markdown. Takes assunto, motivo, link_origem and the prompt's variables. Empty: the subject as title, a link to the origin and the reason.",
+        )}
+      >
+        <Textarea
+          value={value.noteTemplate}
+          onChange={(e) => onChange({ ...value, noteTemplate: e.target.value })}
+          rows={4}
+          maxLength={CROSS_INBOX_CASE_NOTE_TEMPLATE_MAX}
+          placeholder={
+            "### {{assunto}}\n[Conversa de origem]({{link_origem}})\n\n{{motivo}}"
+          }
+        />
+      </FormField>
+      <FormField
+        label={t("editor.crossInboxCase.carry", "Customer files on the case")}
+        description={t(
+          "editor.crossInboxCase.carryHint",
+          "Copies the files the customer sent into the case, as one private note after the case note, so the team does not have to ask again. This copies identity documents and receipts into the other inbox.",
+        )}
+      >
+        <Select
+          value={value.carryMode}
+          aria-label={t(
+            "editor.crossInboxCase.carry",
+            "Customer files on the case",
+          )}
+          onChange={(e) =>
+            onChange({ ...value, carryMode: e.target.value as CarryMode })
+          }
+        >
+          <option value="off">
+            {t("editor.crossInboxCase.carryOff", "Do not copy")}
+          </option>
+          <option value="attendance">
+            {t(
+              "editor.crossInboxCase.carryAttendance",
+              "Files of the current attendance",
+            )}
+          </option>
+          <option value="conversation">
+            {t(
+              "editor.crossInboxCase.carryConversation",
+              "Every file of the conversation",
+            )}
+          </option>
+        </Select>
+      </FormField>
+      {value.carryMode !== "off" && (
+        <div className="flex flex-col gap-2">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            {CARRY_FILE_TYPES.map((type) => (
+              <label
+                key={type}
+                className="text-text-secondary flex items-center gap-1.5 text-xs"
+              >
+                <input
+                  type="checkbox"
+                  checked={value.carryFileTypes.includes(type)}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                      ? [...value.carryFileTypes, type]
+                      : value.carryFileTypes.filter((x) => x !== type);
+                    // NOTE: the last type cannot be unticked: an empty list reads as the default
+                    if (next.length > 0)
+                      onChange({ ...value, carryFileTypes: next });
+                  }}
+                />
+                {fileTypeLabel(t, type)}
+              </label>
+            ))}
+          </div>
+          <FormField
+            label={t("editor.crossInboxCase.carryMax", "Most files per case")}
+            description={t(
+              "editor.crossInboxCase.carryMaxHint",
+              "The newest ones win; the note says how many were left out. From 1 to {{max}}.",
+              { max: CARRY_ATTACHMENTS_MAX_FILES },
+            )}
+          >
+            <NumberInput
+              range={CARRY_ATTACHMENTS_RANGES.maxFiles}
+              value={String(value.carryMaxFiles)}
+              onChange={(e) =>
+                onChange({
+                  ...value,
+                  carryMaxFiles: Number(e.target.value) || 1,
+                })
+              }
+            />
+          </FormField>
+        </div>
       )}
       <div className="flex flex-col gap-1.5">
         <SwitchField

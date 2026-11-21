@@ -1,186 +1,178 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { parseIntSetting } from "@/config";
+import { modelSemaphorePolicy } from "@/graph/model-limit";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 
-// Every numeric environment variable goes through one validated parser, and this file is what keeps
-// that true as variables are added.
-//
-// The shape being replaced was `RAW ? Number(RAW) : fallback`, which converts and asks nothing.
-// `Number("15s")` is NaN and `Number("1e309")` is Infinity, and both reach whatever consumes them.
-// On the five that feed `setInterval` (the webhook, scheduler, debounce, compaction and alert
-// workers) that is not a slow tick, it is a HOT one: measured in Bun, twenty ticks at a NaN delay
-// took 23.6ms and twenty at Infinity took 22.8ms, about 1.15ms each, against the 15_000ms the
-// operator wrote. `COMPACTION_WORKER_INTERVAL_MS=15s` is a plausible typo, the compaction worker is
-// on by default, and its tick claims jobs against the database. The rest fail quietly instead:
-// `FLOWLOG_RETENTION_DAYS` and `HEARTBEAT_INTERVAL_MS` reach `Date` arithmetic, where the same
-// values give an Invalid Date, so the daily sweep stops deleting and the heartbeat never comes due.
-//
-// Checked on the SOURCE, not by driving config with a hostile environment. `bun test` shares one
-// module registry across files in a worker, so `@/config` is evaluated once with whatever the
-// environment held at that moment, and a later dynamic import returns the cached module. The parser
-// itself is a pure exported function and IS driven with hostile input, in
-// tests/api/middlewares/credentialRateLimit.test.ts, which covers blanks, `Infinity`, `1e309`,
-// fractions, zero, negatives, garbage and the upper bound. What that cannot show is whether
-// config.ts routes through it, which is what this file is for.
-//
-// NOTE: comment lines are dropped before scanning. The NOTEs in config.ts quote the shape being
-// replaced, so scanning the raw text reported `Number("x")` and `Number(RAW)` out of prose and would
-// have tied this test to how the file explains itself. Only whole comment lines are dropped, which
-// is where every mention in that file lives; a `Number(` written after code on the same line is
-// still read as code, and that is the safe direction to be wrong in.
-const isComment = (line: string): boolean => /^\s*(\/\/|\/\*|\*)/.test(line);
-
-const CODE = readFileSync("src/config.ts", "utf8")
-  .split("\n")
-  .filter((line) => !isComment(line))
-  .join("\n");
+// Every numeric environment variable goes through one validated parser. An unchecked `Number(RAW)`
+// turns "15s" into NaN and "1e309" into Infinity: a `setInterval` worker then ticks about every
+// millisecond against the database, and `Date` arithmetic gets an Invalid Date (the retention sweep
+// stops, the heartbeat never comes due). `@/config` is evaluated once per import specifier, so each
+// environment below loads a fresh copy of the module under its own query string.
+const CONFIG_MODULE = Bun.resolveSync("@/config", import.meta.dir);
 const ENV_EXAMPLE = readFileSync(".env.example", "utf8");
 
-// Every `Number(x)` call, by argument. The parser converts its own input, so `raw` is the one
-// argument allowed to appear; anything else is an environment variable being converted without being
-// checked. `Number.isInteger` and `Number.isSafeInteger` do not match, which is deliberate: they are
-// the check, not the conversion.
-const numberCallArguments = (code: string): string[] => {
-  const found = new Set<string>();
-  for (const match of code.matchAll(/\bNumber\(([^)]*)\)/g)) {
-    const argument = (match[1] ?? "").trim();
-    if (argument) found.add(argument);
-  }
-  return [...found].sort();
-};
+// The numeric defaults .env.example documents, which is where the operator reads them.
+const DOCUMENTED = new Map(
+  [...ENV_EXAMPLE.matchAll(/^([A-Z][A-Z0-9_]*)=([0-9]+)\s*$/gm)].map(
+    (match) => [match[1] as string, Number(match[2])],
+  ),
+);
 
-// Each `parseIntSetting(...)` call, split into its top-level arguments.
-//
-// NOTE: walked rather than matched. A regex reaching for "the last argument" cannot tell the closing
-// paren of the call from one inside it, and cannot tell an argument comma from a comma inside a
-// consequence sentence, which several of these have. The first attempt at the zero test below did
-// exactly that and reported AGENT_PROMPT_MAX_CHARS, whose fallback happens to be the last number on
-// its own line. Tracking depth and quotes is a dozen lines and cannot be wrong in that way.
-interface Call {
-  variable: string;
-  reportedAs: string;
-  fallback: string;
-  minimum: string | undefined;
+let loads = 0;
+async function loadConfig(
+  env: Record<string, string | undefined>,
+): Promise<Record<string, unknown>> {
+  const saved = Object.fromEntries(
+    Object.keys(env).map((key) => [key, process.env[key]]),
+  );
+  try {
+    for (const [key, value] of Object.entries(env)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    loads += 1;
+    return (await import(`${CONFIG_MODULE}?load=${loads}`)).default;
+  } finally {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
 }
 
-const parserCalls = (code: string): Call[] => {
-  const calls: Call[] = [];
-  const CALL = "parseIntSetting(";
-  for (
-    let at = code.indexOf(CALL);
-    at !== -1;
-    at = code.indexOf(CALL, at + 1)
-  ) {
-    let depth = 1;
-    let quote: string | undefined;
-    const args: string[] = [];
-    let current = "";
-    let i = at + CALL.length;
-    for (; i < code.length && depth > 0; i++) {
-      const ch = code[i] as string;
-      if (quote) {
-        if (ch === "\\") {
-          current += ch + (code[i + 1] ?? "");
-          i++;
-          continue;
-        }
-        if (ch === quote) quote = undefined;
-        current += ch;
-        continue;
-      }
-      if (ch === '"' || ch === "'" || ch === "`") {
-        quote = ch;
-        current += ch;
-        continue;
-      }
-      if (ch === "(") depth++;
-      if (ch === ")") {
-        depth--;
-        if (depth === 0) break;
-      }
-      if (ch === "," && depth === 1) {
-        args.push(current.trim());
-        current = "";
-        continue;
-      }
-      current += ch;
-    }
-    if (current.trim()) args.push(current.trim());
-    calls.push({
-      variable: args[0] ?? "",
-      reportedAs: (args[1] ?? "").replaceAll('"', ""),
-      fallback: (args[2] ?? "").replaceAll("_", ""),
-      minimum: args[5],
-    });
+async function refusalOf(
+  env: Record<string, string | undefined>,
+): Promise<string | null> {
+  try {
+    await loadConfig(env);
+    return null;
+  } catch (e) {
+    return (e as Error).message;
   }
-  return calls;
-};
+}
 
-const CALLS = parserCalls(CODE);
+// Every primitive in the loaded config, by path, so a variable's effect is found by what it changes.
+function leaves(value: unknown, at = ""): Map<string, unknown> {
+  const out = new Map<string, unknown>();
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    for (const [key, inner] of Object.entries(value)) {
+      for (const [path, leaf] of leaves(inner, at ? `${at}.${key}` : key)) {
+        out.set(path, leaf);
+      }
+    }
+  } else {
+    out.set(at, Array.isArray(value) ? JSON.stringify(value) : value);
+  }
+  return out;
+}
+
+// Every documented number, unset, so the baseline is the code's own defaults and not this machine's
+// `.env`.
+const UNSET = Object.fromEntries(
+  [...DOCUMENTED.keys()].map((key) => [key, undefined]),
+);
+
+interface Setting {
+  variable: string;
+  documented: number;
+  // The config paths this variable moves, and what each holds with the variable unset.
+  defaults: Map<string, unknown>;
+}
+
+// A documented variable is a config setting when setting it moves a value in the loaded config; one
+// that moves nothing (`POSTGRES_PORT`) is read by something else.
+async function numericSettings(): Promise<Setting[]> {
+  const baseline = leaves(await loadConfig(UNSET));
+  const settings: Setting[] = [];
+  for (const [variable, documented] of DOCUMENTED) {
+    const probe = String(documented > 1 ? documented - 1 : documented + 1);
+    const moved = leaves(await loadConfig({ ...UNSET, [variable]: probe }));
+    const defaults = new Map<string, unknown>();
+    for (const [path, value] of moved) {
+      if (value !== baseline.get(path)) defaults.set(path, baseline.get(path));
+    }
+    if (defaults.size > 0) settings.push({ variable, documented, defaults });
+  }
+  return settings;
+}
+
+const SETTINGS = await numericSettings();
 
 describe("numeric environment parsing", () => {
-  // The guard against the next one. A variable added with the old shape shows up here by name, which
-  // is the failure mode this whole change is about: the shape was not wrong once, it was copied into
-  // thirteen places over time and would have been copied into the fourteenth.
-  test("nothing is converted to a number without being checked", () => {
-    expect(numberCallArguments(CODE)).toEqual(["raw"]);
-  });
-
-  // The mechanical error a thirteen-site change invites: the value of one variable reported under
-  // another's name. The operator then gets an error naming a variable they never set, which is worse
-  // than no message at all, and no type checker can see it because both sides are just strings.
-  test("every parsed variable is reported under its own name", () => {
-    const mismatched = CALLS.filter(
-      (call) => call.variable !== call.reportedAs,
-    ).map((call) => `${call.variable} reported as ${call.reportedAs}`);
-    expect(mismatched).toEqual([]);
-  });
-
-  // The other mechanical error, and the one a reviewer reading a thirteen-site diff is least likely
-  // to catch: a fallback mistyped, so the app runs on a number nobody chose and nothing says so.
-  // Checked against `.env.example` rather than against a list here, because that file is where an
-  // operator reads the default, so the same test also fails when the documentation drifts from the
-  // code, and when a parsed variable is not documented at all. Both sides are literals in different
-  // files, which no type checker can relate.
-  test("every default is the one .env.example documents", () => {
-    const documented = new Map(
-      [...ENV_EXAMPLE.matchAll(/^([A-Z][A-Z0-9_]*)=([0-9]+)\s*$/gm)].map(
-        (match) => [match[1] as string, match[2] as string],
-      ),
+  // NOTE: the probe is looking at something: a discovery that finds no setting would pass every test
+  // below.
+  test("the documented numeric settings are found in the loaded config", () => {
+    expect(SETTINGS.length).toBeGreaterThanOrEqual(25);
+    expect(SETTINGS.map((s) => s.variable)).toContain(
+      "OBSERVE_WORKER_INTERVAL_MS",
     );
-    const disagreements = CALLS.filter(
-      (call) => documented.get(call.variable) !== call.fallback,
-    ).map(
-      (call) =>
-        `${call.variable}: config.ts says ${call.fallback}, .env.example says ${documented.get(call.variable) ?? "nothing"}`,
+  });
+
+  // NOTE: a variable converted with the unchecked `Number(RAW)` shape loads "15s" as NaN instead of
+  // refusing it, and one reported under another's name gives the operator an error naming a variable
+  // they never set.
+  test("garbage is refused at load, naming the variable that carried it", async () => {
+    const wrong: string[] = [];
+    for (const { variable } of SETTINGS) {
+      const refusal = await refusalOf({ ...UNSET, [variable]: "15s" });
+      if (!refusal?.startsWith(`${variable} must be`)) {
+        wrong.push(`${variable}: ${refusal ?? "loaded"}`);
+      }
+    }
+    expect(wrong).toEqual([]);
+  });
+
+  // NOTE: a mistyped fallback runs the app on a number nobody chose. Checked against `.env.example`,
+  // because that is where the operator reads the default, so this also fails when the documentation
+  // drifts from the code.
+  test("every default is the one .env.example documents", () => {
+    const disagreements = SETTINGS.flatMap(
+      ({ variable, documented, defaults }) =>
+        [...defaults]
+          .filter(([, value]) => value !== documented)
+          .map(
+            ([path, value]) =>
+              `${variable}: config.${path} defaults to ${String(value)}, .env.example says ${documented}`,
+          ),
     );
     expect(disagreements).toEqual([]);
   });
 
-  // Zero is admitted at exactly one call site, and this names it. The distinction the parser draws is
-  // whether the CONSUMER treats zero as a value or as an absence, which is narrower than "the old
-  // code let it through": it let zero through on nine of the thirteen, and on eight of those it was
-  // the pathology (a 1ms tick, a heartbeat due at `now`, a port nothing can route to). Widening the
-  // exception is therefore a decision, and it fails here until someone makes it deliberately.
-  test("zero is a value at one setting, and this is which", () => {
-    const admitZero = CALLS.filter((call) => call.minimum === "0").map(
-      (call) => call.variable,
-    );
-    expect(admitZero).toEqual(["ALERT_COALESCE_WINDOW_MS"]);
+  // NOTE: zero is admitted only where the CONSUMER treats it as a value rather than an absence; elsewhere it
+  // is a 1ms tick, a heartbeat due at `now`, or a port nothing can route to. Widening the exception
+  // fails here until someone makes it deliberately.
+  test("zero is a value at one setting, and this is which", async () => {
+    const admitZero: string[] = [];
+    for (const { variable } of SETTINGS) {
+      if ((await refusalOf({ ...UNSET, [variable]: "0" })) === null) {
+        admitZero.push(variable);
+      }
+    }
+    // DB_LOCK_TIMEOUT_MS: Postgres reads lock_timeout 0 as no limit, which is the documented "off".
+    expect(admitZero.sort()).toEqual([
+      "ALERT_COALESCE_WINDOW_MS",
+      "DB_LOCK_TIMEOUT_MS",
+    ]);
   });
 
-  // Every variable is checked, so the scan above must be finding calls at all. Without this, deleting
-  // the parser and every call site would leave both tests above green.
-  test("the parser is actually used", () => {
-    expect(CALLS.length).toBeGreaterThanOrEqual(13);
-    expect(new Set(CALLS.map((call) => call.variable)).size).toBe(CALLS.length);
+  // The dashboard's warm-up pass is gone: its two variables are read by nothing, so an instance that
+  // still sets them, whatever to, boots as one that does not.
+  test("the retired warm-up variables are not read", async () => {
+    const env = {
+      ...UNSET,
+      DASHBOARD_WARM_INTERVAL_MS: "not a number",
+      DASHBOARD_WARM_IDLE_DAYS: "-3",
+    };
+    expect(await refusalOf(env)).toBeNull();
+    expect(leaves(await loadConfig(env))).toEqual(
+      leaves(await loadConfig(UNSET)),
+    );
   });
 });
 
-// Why the timer bound is 2_147_483_647 rather than a number someone picked. Above it the delay is not
-// stretched, it is SET TO 1, so a variable that reads as "tick every 25 days" is a worker spinning
-// against the database. Proven rather than asserted, because the bound is the entire reason a timer
-// variable is refused above it.
+// Why a timer variable is refused above 2_147_483_647: past it the runtime SETS the delay to 1, so
+// "tick every 25 days" is a worker spinning against the database.
 describe("the timer bound is the runtime's, not a policy", () => {
   test("a delay above it is not honoured, it collapses to about a millisecond", async () => {
     const firedImmediately = await new Promise<boolean>((resolve) => {
@@ -190,20 +182,50 @@ describe("the timer bound is the runtime's, not a policy", () => {
         clearTimeout(guard);
         resolve(true);
       }, 2_147_483_648);
-      // Resolves false instead of hanging, so a runtime that ever starts honouring long delays fails
-      // this test in two seconds rather than blocking the suite.
+      // Resolves false instead of hanging, so a runtime that starts honouring long delays fails
+      // this test at the suite's poll deadline rather than blocking it. A passing run never waits it.
       const guard = setTimeout(() => {
         clearInterval(interval);
         resolve(false);
-      }, 2_000);
+      }, POLL_DEADLINE_MS);
     });
     expect(firedImmediately).toBe(true);
   });
 });
 
+// An agent's burst window may be shorter than the observe drain's interval, so the
+// interval is a safety net with a floor of its own, and the operator reads both numbers where the
+// variable is set.
+describe("the observe drain's interval", () => {
+  test("has a default and a minimum of its own", async () => {
+    const intervalOf = async (raw: string | undefined) =>
+      (
+        (await loadConfig({ OBSERVE_WORKER_INTERVAL_MS: raw }))
+          .observeWorker as {
+          intervalMs: number;
+        }
+      ).intervalMs;
+    expect(await intervalOf(undefined)).toBe(2_500);
+    expect(await intervalOf("100")).toBe(100);
+  });
+
+  test(".env.example states the default and the minimum next to the variable", () => {
+    const at = ENV_EXAMPLE.indexOf("OBSERVE_WORKER_INTERVAL_MS=");
+    expect(at).toBeGreaterThan(-1);
+    const note = ENV_EXAMPLE.slice(Math.max(0, at - 700), at);
+    expect(note).toContain("default 2500, minimum 100");
+  });
+
+  test("a value below the minimum is refused by name at boot", async () => {
+    expect(await refusalOf({ OBSERVE_WORKER_INTERVAL_MS: "99" })).toMatch(
+      /^OBSERVE_WORKER_INTERVAL_MS must be a whole number between 100/,
+    );
+  });
+});
+
 // The parser's own handling of the minimum, driven directly. Everything else about it (blanks,
 // `Infinity`, `1e309`, fractions, negatives, garbage, the upper bound) is covered in
-// tests/api/middlewares/credentialRateLimit.test.ts, where it arrived.
+// tests/api/middlewares/credentialRateLimit.test.ts.
 describe("the minimum", () => {
   test("zero is refused by default and admitted when a setting asks for it", () => {
     expect(() =>
@@ -243,25 +265,26 @@ describe("the minimum", () => {
   });
 });
 
-// The storage-directory fallback chain, read off config.ts rather than driven with an environment.
-// Same reason as above: `@/config` is evaluated once per worker, so a test that set the variables
-// would be asserting whatever the environment held when the first file in the worker imported it.
+// The storage-directory fallback chain.
 describe("documentsStorageDir fallback chain", () => {
-  const source = readFileSync("src/config.ts", "utf8");
-
-  // The ORDER is the whole point, and getting it backwards loses files rather than erroring. Coolify
-  // freezes a compose `environment:` value when the installation is created, so an existing install
-  // keeps QUOTES_STORAGE_DIR forever and never learns the new name. With the fallback, that install
-  // keeps writing inside its volume; without it, it falls through to a default that lives in the
-  // container and every PDF disappears on the next redeploy, silently.
-  test("prefers the new name, then the frozen old one, then the default", () => {
-    expect(source).toContain(
-      'DOCUMENTS_STORAGE_DIR || QUOTES_STORAGE_DIR || "./data/documents"',
-    );
+  // NOTE: the ORDER matters: Coolify freezes a compose `environment:` value at install time, so an existing
+  // install keeps QUOTES_STORAGE_DIR forever. Without that fallback it lands on the in-container
+  // default and every PDF disappears on the next redeploy, silently.
+  test("prefers the new name, then the frozen old one, then the default", async () => {
+    const dirFor = async (documents?: string, quotes?: string) =>
+      (
+        await loadConfig({
+          DOCUMENTS_STORAGE_DIR: documents,
+          QUOTES_STORAGE_DIR: quotes,
+        })
+      ).documentsStorageDir;
+    expect(await dirFor("/new", "/old")).toBe("/new");
+    expect(await dirFor(undefined, "/old")).toBe("/old");
+    expect(await dirFor(undefined, undefined)).toBe("./data/documents");
   });
 
-  // A variable the composes do not declare lands on that in-container default, which is the same
-  // silent loss from the other direction — this time for a NEW installation.
+  // NOTE: a variable the composes do not declare lands on that in-container default, which is the same
+  // silent loss from the other direction, for a NEW installation.
   test("every deploy compose declares the storage directory", () => {
     for (const file of [
       "docker-compose.prod.yml",
@@ -270,8 +293,420 @@ describe("documentsStorageDir fallback chain", () => {
     ]) {
       const compose = readFileSync(file, "utf8");
       expect(compose).toContain("DOCUMENTS_STORAGE_DIR=/app/storage/documents");
-      // The old name stays declared too, for installations created before the rename.
+      // NOTE: the old name stays declared too, for installations created before the rename.
       expect(compose).toContain("QUOTES_STORAGE_DIR=");
+    }
+  });
+});
+
+// A setting the deploy composes do not forward cannot be tuned there: the stack's variable never
+// reaches the container, which keeps the default in silence.
+describe("Chatwoot receiver settings in the deploy composes", () => {
+  test("every deploy compose forwards both, with the documented defaults", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      expect(compose).toMatch(
+        /CHATWOOT_DELIVERY_CONCURRENCY=\$\{CHATWOOT_DELIVERY_CONCURRENCY:-15\}/,
+      );
+      expect(compose).toMatch(
+        /CHATWOOT_ACK_POOL_MAX=\$\{CHATWOOT_ACK_POOL_MAX:-4\}/,
+      );
+    }
+  });
+});
+
+describe("checkpoint reconciler settings in the deploy composes", () => {
+  test("every deploy compose forwards the three, empty taking the app default", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      for (const name of [
+        "CHECKPOINT_RECONCILE_FIRST_DELAY_MS",
+        "CHECKPOINT_RECONCILE_INTERVAL_MS",
+        "CHECKPOINT_RECONCILE_GRACE_MS",
+      ]) {
+        expect(compose).toContain(`- ${name}=\${${name}:-}`);
+      }
+    }
+  });
+});
+
+describe("checkpoint retention settings in the deploy composes", () => {
+  test("every deploy compose forwards the three, empty taking the app default", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      for (const name of [
+        "CHECKPOINT_RETENTION_FIRST_DELAY_MS",
+        "CHECKPOINT_RETENTION_INTERVAL_MS",
+        "CHECKPOINT_RETENTION_GRACE_MS",
+      ]) {
+        expect(compose).toContain(`- ${name}=\${${name}:-}`);
+      }
+    }
+  });
+});
+
+// Each pool has its own size and every budget its own knob; the checkpointer keeps following
+// DB_POOL_MAX until it is set, which is what an upgrade without new variables must open.
+describe("database pools and budgets", () => {
+  test("the checkpointer pool follows DB_POOL_MAX until set, and is its own when set", async () => {
+    const follows = await loadConfig({
+      DB_POOL_MAX: "7",
+      LANGGRAPH_POOL_MAX: undefined,
+    });
+    expect(follows.dbPoolMax).toBe(7);
+    expect(follows.langgraphPoolMax).toBe(7);
+    const own = await loadConfig({ DB_POOL_MAX: "7", LANGGRAPH_POOL_MAX: "2" });
+    expect(own.dbPoolMax).toBe(7);
+    expect(own.langgraphPoolMax).toBe(2);
+  });
+
+  test("a value that is not a whole number in range refuses by name, and a lock timeout of 0 is off", async () => {
+    for (const [env, raw] of [
+      ["METRICS_POOL_MAX", "0"],
+      ["BACKGROUND_POOL_MAX", "2.5"],
+      ["LANGGRAPH_POOL_MAX", "abc"],
+      ["METRICS_TIMEOUT_MS", "15s"],
+      ["DB_TX_TIMEOUT_MS", "-1"],
+      ["DB_TX_MAX_WAIT_MS", "1e309"],
+      ["DB_LOCK_TIMEOUT_MS", "1.5"],
+    ] as const) {
+      const refusal = await refusalOf({ [env]: raw });
+      expect(refusal).toContain(`${env} must be`);
+      expect(refusal).toContain(`"${raw}"`);
+    }
+    const off = await loadConfig({ DB_LOCK_TIMEOUT_MS: "0" });
+    expect(off.dbLockTimeoutMs).toBe(0);
+  });
+
+  // NOTE: an operator sizing this pool reads the refusal to learn what runs on it. A turn's flow-log
+  // lines are written on the pool of the work that emits them, so naming the flow log here sends the
+  // operator to size the wrong pool for it.
+  test("the BACKGROUND_POOL_MAX refusal names flow-log retention, not the flow log", async () => {
+    const refusal = await refusalOf({ BACKGROUND_POOL_MAX: "0" });
+    expect(refusal).toContain("flow-log retention");
+    expect(refusal).not.toContain("the flow log");
+  });
+
+  test("every deploy compose forwards the pool sizes, budgets and turn capacities, empty for the app default", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      for (const v of [
+        "DB_POOL_MAX",
+        "LANGGRAPH_POOL_MAX",
+        "BACKGROUND_POOL_MAX",
+        "METRICS_POOL_MAX",
+        "METRICS_TIMEOUT_MS",
+        "DB_TX_MAX_WAIT_MS",
+        "DB_TX_TIMEOUT_MS",
+        "DB_LOCK_TIMEOUT_MS",
+        "AGENT_MODEL_CONCURRENCY",
+        "DEBOUNCE_TURN_SLOTS",
+        "AGENT_MODEL_BACKGROUND_SHARE_PERCENT",
+        "AGENT_MODEL_BACKGROUND_MAX_WAIT_MS",
+      ]) {
+        expect(compose).toContain(`${v}=\${${v}:-}`);
+      }
+    }
+  });
+});
+
+describe("client channel settings in the deploy composes", () => {
+  test("every deploy compose forwards the switch, the limits and the suspended turn's deadline", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      expect(compose).toContain(
+        `CLIENT_CHANNEL_ENABLED=\${CLIENT_CHANNEL_ENABLED:-false}`,
+      );
+      for (const v of [
+        "CLIENT_CHANNEL_SDK_USER_PER_MIN",
+        "CLIENT_CHANNEL_SDK_APP_PER_MIN",
+        "CLIENT_TURN_SUSPEND_TIMEOUT_MS",
+      ]) {
+        expect(compose).toContain(`${v}=\${${v}:-}`);
+      }
+    }
+  });
+});
+
+// Without these the image runs with no mail provider whatever the stack's variables say, and a
+// dashboard's viewers never receive a sign-in code.
+describe("mail settings in the deploy composes", () => {
+  test("every deploy compose forwards them, empty for the app default", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      for (const v of [
+        "MAIL_PROVIDER",
+        "MAIL_FROM",
+        "MAIL_REPLY_TO",
+        "RESEND_API_KEY",
+        "SMTP_HOST",
+        "SMTP_PORT",
+        "SMTP_SECURE",
+        "SMTP_USER",
+        "SMTP_PASSWORD",
+      ]) {
+        expect(compose).toContain(`${v}=\${${v}:-}`);
+      }
+    }
+  });
+});
+
+// A turn slot is held for the whole turn and a model permit only for the model call inside it, so the
+// two are sized apart. Unset, the lane follows the permits at a multiple, so an upgrade
+// without the new variable still moves both with AGENT_MODEL_CONCURRENCY.
+describe("debounce turn slots", () => {
+  async function slotsOf(env: Record<string, string | undefined>) {
+    const saved = Object.fromEntries(
+      Object.keys(env).map((key) => [key, process.env[key]]),
+    );
+    try {
+      for (const [key, value] of Object.entries(env)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+      loads += 1;
+      const mod = await import(`${CONFIG_MODULE}?load=${loads}`);
+      return {
+        slots: mod.debounceTurnSlots(mod.default) as number,
+        permits: mod.default.agent.modelConcurrency as number,
+      };
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  }
+
+  test("unset, the lane holds twice the permits, and the permits are what they were", async () => {
+    expect(
+      await slotsOf({
+        AGENT_MODEL_CONCURRENCY: "20",
+        DEBOUNCE_TURN_SLOTS: undefined,
+      }),
+    ).toEqual({ slots: 40, permits: 20 });
+    expect(
+      await slotsOf({
+        AGENT_MODEL_CONCURRENCY: "7",
+        DEBOUNCE_TURN_SLOTS: undefined,
+      }),
+    ).toEqual({ slots: 14, permits: 7 });
+  });
+
+  test("set, it wins over the derived default and does not move the permits", async () => {
+    expect(
+      await slotsOf({
+        AGENT_MODEL_CONCURRENCY: "10",
+        DEBOUNCE_TURN_SLOTS: "15",
+      }),
+    ).toEqual({ slots: 15, permits: 10 });
+  });
+
+  // NOTE: the derived default is capped where every count is, so the largest permit count the base
+  // accepted still boots, with no fewer slots than permits.
+  test("the largest permit count still boots, with as many slots as permits", async () => {
+    expect(
+      await slotsOf({
+        AGENT_MODEL_CONCURRENCY: "1000000",
+        DEBOUNCE_TURN_SLOTS: undefined,
+      }),
+    ).toEqual({ slots: 1_000_000, permits: 1_000_000 });
+  });
+
+  test("a value that is not a whole number in range refuses by name", async () => {
+    for (const raw of ["0", "-3", "abc", "2.5", "1000001"]) {
+      const refusal = await refusalOf({ DEBOUNCE_TURN_SLOTS: raw });
+      expect(refusal).toContain("DEBOUNCE_TURN_SLOTS must be");
+      expect(refusal).toContain(`"${raw}"`);
+    }
+  });
+});
+
+// Under contention the model semaphore serves replies first; the background keeps a share of the
+// permits held at once and an aging bound, both process knobs.
+describe("the model semaphore's background share and aging bound", () => {
+  async function policyOf(env: Record<string, string | undefined>) {
+    const cfg = (await loadConfig(env)) as unknown as Parameters<
+      typeof modelSemaphorePolicy
+    >[0];
+    return modelSemaphorePolicy(cfg);
+  }
+
+  test("the share is a count of permits, rounded down, and the bound is the setting", async () => {
+    expect(
+      await policyOf({
+        AGENT_MODEL_CONCURRENCY: "40",
+        AGENT_MODEL_BACKGROUND_SHARE_PERCENT: undefined,
+        AGENT_MODEL_BACKGROUND_MAX_WAIT_MS: undefined,
+      }),
+    ).toEqual({ backgroundMin: 4, agingMs: 60_000 });
+    expect(
+      await policyOf({
+        AGENT_MODEL_CONCURRENCY: "7",
+        AGENT_MODEL_BACKGROUND_SHARE_PERCENT: "25",
+        AGENT_MODEL_BACKGROUND_MAX_WAIT_MS: "5000",
+      }),
+    ).toEqual({ backgroundMin: 1, agingMs: 5_000 });
+    expect(
+      await policyOf({
+        AGENT_MODEL_CONCURRENCY: "1",
+        AGENT_MODEL_BACKGROUND_SHARE_PERCENT: undefined,
+      }),
+    ).toMatchObject({ backgroundMin: 0 });
+  });
+
+  test("a value that is not a whole number in range refuses by name", async () => {
+    for (const [env, raw] of [
+      ["AGENT_MODEL_BACKGROUND_SHARE_PERCENT", "abc"],
+      ["AGENT_MODEL_BACKGROUND_SHARE_PERCENT", "-1"],
+      ["AGENT_MODEL_BACKGROUND_SHARE_PERCENT", "101"],
+      ["AGENT_MODEL_BACKGROUND_MAX_WAIT_MS", "abc"],
+      ["AGENT_MODEL_BACKGROUND_MAX_WAIT_MS", "-1"],
+    ] as const) {
+      const refusal = await refusalOf({ [env]: raw });
+      expect(refusal).toContain(`${env} must be`);
+      expect(refusal).toContain(`"${raw}"`);
+    }
+  });
+});
+
+describe("the mail provider", () => {
+  const NONE = {
+    MAIL_PROVIDER: undefined,
+    RESEND_API_KEY: undefined,
+    SMTP_HOST: undefined,
+    MAIL_FROM: undefined,
+  };
+  const mailOf = async (env: Record<string, string | undefined>) =>
+    (await loadConfig({ ...NONE, ...env })).mail as {
+      provider: string;
+      enabled: boolean;
+    };
+
+  test("with nothing set, the suite gets the in-memory outbox", async () => {
+    expect((await mailOf({})).provider).toBe("memory");
+  });
+
+  test("the credentials decide when MAIL_PROVIDER is unset, and both at once are refused", async () => {
+    expect(
+      (await mailOf({ RESEND_API_KEY: "re_x", MAIL_FROM: "a@b.co" })).provider,
+    ).toBe("resend");
+    expect(
+      (await mailOf({ SMTP_HOST: "smtp.local", MAIL_FROM: "a@b.co" })).provider,
+    ).toBe("smtp");
+    expect(
+      await refusalOf({
+        ...NONE,
+        RESEND_API_KEY: "re_x",
+        SMTP_HOST: "smtp.local",
+        MAIL_FROM: "a@b.co",
+      }),
+    ).toContain("Both RESEND_API_KEY and SMTP_HOST are set");
+  });
+
+  test("a sending provider needs a sender, and none turns mail off", async () => {
+    expect(await refusalOf({ ...NONE, SMTP_HOST: "smtp.local" })).toContain(
+      "MAIL_FROM must be set",
+    );
+    expect(await mailOf({ MAIL_PROVIDER: "none" })).toMatchObject({
+      provider: "none",
+      enabled: false,
+    });
+  });
+
+  test("the console transport is refused in production, and the outbox outside the suite", async () => {
+    expect(
+      await refusalOf({
+        ...NONE,
+        NODE_ENV: "production",
+        JWT_SECRET: "a-real-secret",
+        ENCRYPTION_KEY: "a-real-key",
+        MAIL_PROVIDER: "console",
+      }),
+    ).toContain("MAIL_PROVIDER=console");
+    expect(
+      await refusalOf({
+        ...NONE,
+        NODE_ENV: "development",
+        MAIL_PROVIDER: "memory",
+      }),
+    ).toContain("only available to the test suite");
+  });
+});
+
+describe("database screen settings in the deploy composes", () => {
+  test("every deploy compose forwards the retention and preloads pg_stat_statements", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      const compose = readFileSync(file, "utf8");
+      expect(compose).toContain(
+        `- DB_STATS_RETENTION_DAYS=\${DB_STATS_RETENTION_DAYS:-}`,
+      );
+      expect(compose).toContain("shared_preload_libraries=pg_stat_statements");
+    }
+  });
+});
+
+describe("LANGFUSE_SAMPLE_RATE", () => {
+  const rateOf = async (raw: string | undefined) =>
+    (
+      (await loadConfig({ ...UNSET, LANGFUSE_SAMPLE_RATE: raw })).langfuse as {
+        sampleRate: number;
+      }
+    ).sampleRate;
+
+  test("unset traces every turn, and a share from 0 to 1 is read as written", async () => {
+    expect(await rateOf(undefined)).toBe(1);
+    expect(await rateOf("")).toBe(1);
+    expect(await rateOf("0.05")).toBe(0.05);
+    expect(await rateOf("0")).toBe(0);
+    expect(await rateOf("1")).toBe(1);
+  });
+
+  test("anything else refuses to boot, naming the variable", async () => {
+    for (const raw of ["abc", "1.5", "-0.2", "5%", "Infinity"]) {
+      expect(
+        await refusalOf({ ...UNSET, LANGFUSE_SAMPLE_RATE: raw }),
+      ).toStartWith("LANGFUSE_SAMPLE_RATE must be a number between 0 and 1");
+    }
+  });
+
+  test("every deploy compose forwards it, empty taking the app default", () => {
+    for (const file of [
+      "docker-compose.prod.yml",
+      "docker-compose.coolify.yml",
+      "docker-compose.portainer.yml",
+    ]) {
+      expect(readFileSync(file, "utf8")).toMatch(
+        /- LANGFUSE_SAMPLE_RATE=\$\{LANGFUSE_SAMPLE_RATE:-\}\n/,
+      );
     }
   });
 });

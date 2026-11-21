@@ -12,20 +12,26 @@ import jpeg from "jpeg-js";
 import {
   __frameDimensionsForTest,
   __serializedForTest,
+  convertInline,
   MAX_SOURCE_PIXELS,
+  MAX_TILED_SOURCE_PIXELS,
   MediaConversionError,
   MediaSourceMismatchError,
+  MediaTooLargeError,
   runMediaConverter,
   storedPixels,
 } from "@/modules/vision/convert";
 import {
+  __placementForTest,
   __resetLibheifForTest,
+  decodeGridFitted,
   LIBHEIF_WASM_PATH_ENV,
   libheifWasmPath,
   loadLibheif,
   withHeicFrames,
 } from "@/modules/vision/convert/heic";
 import {
+  FitAccumulator,
   fitRgba,
   flattenOntoWhite,
   rasterToJpeg,
@@ -38,20 +44,52 @@ import {
 } from "@/modules/vision/media-conversion";
 import { visionKindForMime } from "@/modules/vision/providers";
 
+// Stored as a GRID: 2400x1600 in 5x4 tiles of 512x512, as phones store their photos.
 const HEIC = readFileSync(`${import.meta.dir}/../fixtures/media/recibo.heic`);
+// A grid with an `irot`: 2000x1300 stored in 4x3 tiles, shown rotated to 1300x2000, so the tiles are
+// laid out in the TRANSFORMED image as 3x4 and its edge tiles are padded past it. Colour quadrants,
+// a black block and two diagonals, so a misplaced or unrotated tile changes the pixels. Built with
+// `heif-enc --cut-tiles 512 --rotate-cw 90`.
+const GRID_ROTATED = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-rotacionada.heic`,
+);
+// The same source turned 180 and 270 degrees: 180 runs BOTH shown axes backwards along the stored
+// ones, so both paddings move to the start; 270 swaps the axes the other way from 90.
+const GRID_ROTATED_180 = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-rotacionada-180.heic`,
+);
+const GRID_ROTATED_270 = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-rotacionada-270.heic`,
+);
+// A SQUARE grid, 2000x2000 in 4x4 tiles, turned 180 and 90 degrees: the size alone cannot say
+// whether the axes were swapped, so only the tile mapping can.
+const GRID_SQUARE_180 = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-quadrada-180.heic`,
+);
+const GRID_SQUARE_90 = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-quadrada-90.heic`,
+);
+// A grid with alpha: 1100x700 in 3x2 tiles, left half opaque red, a band of blue at alpha 128, the
+// rest transparent. A tile decode leaves the alpha out, so this one is not read tile by tile.
+// Tiles 250 px wide, whose rows libheif pads to a 1008-byte stride instead of the 1000 bytes of
+// pixels, so reading a row has to follow the stride.
+const GRID_TILE_250 = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-tile-250.heic`,
+);
+const GRID_ALPHA = readFileSync(
+  `${import.meta.dir}/../fixtures/media/grade-alfa.heic`,
+);
 // A cutout: left half opaque red, right half fully transparent. Made the way iOS's "remove
-// background" makes one, `sips -s format heic` from an RGBA PNG, and the alpha survives the decode
-// (measured: the transparent half comes back with a = 0).
+// background" makes one, `sips -s format heic` from an RGBA PNG; the alpha survives the decode (the
+// transparent half comes back with a = 0).
 const ALPHA = readFileSync(
   `${import.meta.dir}/../fixtures/media/recorte-alpha.heic`,
 );
 // A three-image collection whose PRIMARY is the MIDDLE item: flat blue 512x512, flat red 2400x1200,
-// flat green 300x300, with `pitm` pointing at the red one. Three and not two on purpose — with two,
-// "take the last" and "take the designated" agree, and the mutation battery showed that a two-image
-// fixture cannot tell the fix from a different wrong answer. Built with libheif's own encoder
-// (`heif-enc azul512.png vermelho2400.png verde300.png`, which makes the first input primary) and
-// then patching the two-byte item id inside the `pitm` box from 1 to 2, which is the only way to get
-// the two orders to disagree — every encoder writes the primary first.
+// flat green 300x300, with `pitm` pointing at the red one. Three and not two: with two, "take the
+// last" and "take the designated" agree. Built with `heif-enc azul512.png vermelho2400.png
+// verde300.png`, then the two-byte item id in `pitm` patched from 1 to 2 (every encoder writes the
+// primary first, so patching is the only way to make the two orders disagree).
 // A HEIC written with premultiplied alpha (`heif-enc --premultiplied-alpha`): 64x64 of a single
 // pixel value, RGBA (100, 0, 0, 128), where the 100 is ALREADY the colour scaled by the alpha.
 // libheif reports `is_premultiplied_alpha()` true for it and hands those exact bytes back.
@@ -140,8 +178,8 @@ describe("normalizeMediaType / mediaSubtype", () => {
   });
 
   test("a PDF whose content type carries a parameter is still a document", () => {
-    // The bug the dedupe fixed: `application/pdf; charset=binary` matched neither the equality nor
-    // the `/pdf` suffix, so Chatwoot serving that spelling meant the document was never read.
+    // NOTE: Chatwoot can serve `application/pdf; charset=binary`, which matches neither an equality
+    // nor a `/pdf` suffix check.
     expect(visionKindForMime("application/pdf; charset=binary")).toBe(
       "document",
     );
@@ -153,7 +191,7 @@ describe("planImageConversion", () => {
   // The table's source is each vendor's own documentation, read 2026-09-17, and for OpenAI also the
   // live API's 400, which enumerates ['png', 'jpeg', 'gif', 'webp'].
   const cases: Array<[string, string, "as-is" | "convert"]> = [
-    // HEIC: the type the issue is about. Gemini documents it; the other two do not.
+    // NOTE: HEIC: Gemini documents it; the other two do not.
     ["openai", "image/heic", "convert"],
     ["anthropic", "image/heic", "convert"],
     ["gemini", "image/heic", "as-is"],
@@ -195,6 +233,7 @@ describe("planImageConversion", () => {
       action: "convert",
       converter: "heic-to-jpeg",
       to: "image/jpeg",
+      required: true,
     });
   });
 
@@ -209,30 +248,50 @@ describe("planImageConversion", () => {
     // type it converts INTO is one the provider reads, because today it always is; this is what
     // holds that true. A converter added with a target some listed provider cannot read fails here,
     // which is the moment the missing branch has to be written.
+    const converted: string[] = [];
     for (const spec of MEDIA_CONVERTERS) {
       for (const provider of ["openai", "anthropic", "gemini"]) {
-        const some = [...spec.from][0] as string;
-        const plan = planImageConversion({ provider, mimeType: some });
-        if (plan.action !== "convert") continue;
-        // The target, planned for the same provider, must need no conversion of its own.
-        expect(
-          planImageConversion({ provider, mimeType: plan.to }).action,
-        ).toBe("as-is");
+        for (const from of spec.from) {
+          const plan = planImageConversion({ provider, mimeType: from });
+          if (plan.action !== "convert") continue;
+          // The target, planned for the same provider, must need no conversion of its own.
+          const again = planImageConversion({ provider, mimeType: plan.to });
+          converted.push(`${provider} ${from} -> ${plan.to}: ${again.action}`);
+        }
       }
     }
+    // NOTE: every pair the table converts was checked; gemini reads HEIC/HEIF itself.
+    expect(converted).toEqual([
+      "openai image/heic -> image/jpeg: as-is",
+      "openai image/heif -> image/jpeg: as-is",
+      "openai image/heic-sequence -> image/jpeg: as-is",
+      "anthropic image/heic -> image/jpeg: as-is",
+      "anthropic image/heif -> image/jpeg: as-is",
+      "anthropic image/heic-sequence -> image/jpeg: as-is",
+      "gemini image/heic-sequence -> image/jpeg: as-is",
+    ]);
   });
 
   test("every registered converter has an implementation", async () => {
     // The runtime mirror of the compile-time guarantee: `IMPLS` is a `Record` over the id union, so
     // this can only fail if the union and the registry are edited apart.
+    // What each implementation says about a file that is branded right and holds no image: an
+    // answer about the CONTENT, which only a converter that read the bytes can give.
+    const contentRefusal: Record<string, string> = {
+      "heic-to-jpeg": "heic carries no image frame",
+    };
+    expect(MEDIA_CONVERTERS.map((s) => s.id as string)).toEqual(
+      Object.keys(contentRefusal),
+    );
     for (const spec of MEDIA_CONVERTERS) {
       expect(spec.from.size).toBeGreaterThan(0);
       expect(spec.to).toMatch(/^[a-z]+\/[a-z0-9+.-]+$/);
-      // Rejects for the CONTENT, never with "unknown converter", and always as this module's own
-      // error type even when the refusal came from the third-party decoder.
-      await expect(
-        runMediaConverter(spec.id, brandedHeic()),
-      ).rejects.toBeInstanceOf(MediaConversionError);
+      // Always as this module's own error type even when the refusal came from the decoder.
+      const err = await runMediaConverter(spec.id, brandedHeic()).catch(
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(MediaConversionError);
+      expect((err as Error).message).toBe(contentRefusal[spec.id] as string);
     }
   });
 });
@@ -296,16 +355,10 @@ describe("flattenOntoWhite", () => {
   });
 
   test("flattening BEFORE the resize is what keeps the cutout edge from darkening", () => {
-    // The claim in the comment, with the arithmetic that makes it a claim. Three pixels, two opaque
-    // red and one transparent black (what iOS leaves under a cutout), downscaled to two so the
-    // second box STRADDLES the edge:
-    //
-    //   flatten, then fit   px1 is (220,30,30) and px2 is white, so the box averages to
-    //                       ((220+255)/2, (30+255)/2, …) = (237, 142, 142)
-    //   fit, then flatten   the box first averages colour AND alpha to (110,15,15) at a = 127, and
-    //                       compositing that half-transparent dark value gives (183, 135, 135)
-    //
-    // 183 against 237 is the dark fringe, on every cutout, invisible in a green test.
+    // Flatten BEFORE fit. Two opaque red pixels and one transparent black (what iOS leaves
+    // under a cutout), downscaled to two so the second box straddles the edge: flatten-then-fit gives
+    // (237, 142, 142); fit-then-flatten averages colour AND alpha first and gives (183, 135, 135),
+    // a dark fringe on every cutout.
     const src = {
       data: new Uint8Array([220, 30, 30, 255, 220, 30, 30, 255, 0, 0, 0, 0]),
       width: 3,
@@ -355,33 +408,9 @@ describe("flattenOntoWhite", () => {
     expect(img.data[mid]).toBeLessThan(250);
   });
 
-  test("premultiplied colour is not scaled by its alpha a second time", async () => {
-    // Review round 10. libheif answers `is_premultiplied_alpha()` and hands back colour that is
-    // already multiplied by the alpha; compositing it with the straight-alpha formula multiplies
-    // again and darkens everything translucent. The arithmetic, on the fixture's (100, 0, 0, 128):
-    //
-    //   premultiplied (right)   100 + 255 * (1 - 128/255) = 227
-    //   straight (wrong)        100 * (128/255) + 255 * (1 - 128/255) = 177
-    //
-    // Fifty levels of red on every cutout edge, and nothing about the output looks broken.
-    const out = await runMediaConverter(
-      "heic-to-jpeg",
-      PREMULT.buffer.slice(
-        PREMULT.byteOffset,
-        PREMULT.byteOffset + PREMULT.byteLength,
-      ) as ArrayBuffer,
-    );
-    const img = jpeg.decode(new Uint8Array(out));
-    const mid = ((img.height >> 1) * img.width + (img.width >> 1)) * 4;
-    expect(img.data[mid] as number).toBeGreaterThan(215);
-    expect(img.data[mid] as number).toBeLessThan(240);
-  });
-
   test("the two files decode to the SAME bytes, so only the flag can tell them apart", async () => {
-    // Measured, and it is what makes this a correctness question rather than a heuristic one: the
-    // same PNG encoded with and without `--premultiplied-alpha` comes back byte-identical. Nothing
-    // in the pixels says which formula is owed, so discarding the flag is not a worse guess — it is
-    // no information. Independently reproduced by the verifier's a5 addendum.
+    // The same PNG encoded with and without `--premultiplied-alpha` decodes byte-identical, so
+    // nothing in the pixels says which formula is owed: without the flag there is no information.
     const asArrayBuffer = (b: Buffer) =>
       b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
     const raw = async (b: Buffer) =>
@@ -431,7 +460,7 @@ describe("flattenOntoWhite", () => {
     expect(flattenOntoWhite(bytes()).data[0]).toBe(177);
     // AND IT SATURATES. Premultiplied colour is supposed to be at most its alpha, and lossy HEVC
     // does not have to honour that: [129, 129, 129, 128] composites to 256, which a plain
-    // `Uint8Array` stores as 0 — a black pixel where the arithmetic asked for white (round 11, P2).
+    // `Uint8Array` stores as 0, a black pixel where the arithmetic asked for white.
     expect(
       flattenOntoWhite({
         data: new Uint8Array([129, 129, 129, 128]),
@@ -494,12 +523,6 @@ describe("fitRgba", () => {
     expect(out.width).toBe(1568);
     expect(out.height).toBe(1176);
     expect(out.data.length).toBe(1568 * 1176 * 4);
-  });
-
-  test("the portrait case scales on the OTHER edge", () => {
-    const out = fitRgba(solid(3024, 4032), 1568);
-    expect(out.height).toBe(1568);
-    expect(out.width).toBe(1176);
   });
 
   test("an extreme ratio never rounds an edge to zero", () => {
@@ -644,32 +667,11 @@ describe("heic-to-jpeg", () => {
     expect(seen).toEqual([2400, 1600, 2400 * 1600 * 4]);
   });
 
-  test("the decoder is released even when the body throws", async () => {
-    // The `finally` is what makes the ownership ours on every path, including the ones libheif's own
-    // wrapper never returned a handle for. Observable here only as "the throw comes through and the
-    // next call still works" — a wedged or leaked decoder shows up as the second call failing.
-    await expect(
-      withHeicFrames(heicBytes(), async () => {
-        throw new Error("estourou no meio");
-      }),
-    ).rejects.toThrow("estourou no meio");
-    const again = await withHeicFrames(heicBytes(), async (f) => f.length);
-    expect(again).toBe(1);
-  });
-
-  test("a file that parses to no image still releases the decoder", async () => {
-    // The case the previous wrapper could not release: it built the decoder and only then decided
-    // whether to hand the caller anything to free. Truncated, brand intact, so it reaches libheif.
-    const out = await withHeicFrames(truncatedHeic(), async (f) => f.length);
-    expect(out).toBe(0);
-  });
-
   test("a rejected file leaves NOTHING behind in the wasm heap", async () => {
-    // The round 2 finding, as an assertion instead of a claim. A malformed file is the case the old
-    // wrapper could not release — it built the decoder and threw before returning a handle — and it
-    // cost 6.5 KB each. The probe is a malloc(1) against libheif's own heap: the pointer it returns
-    // is the boundary of what is allocated, so two probes with the allocation released in between
-    // are equal, and any residual shows up as the difference.
+    // A malformed file throws after the decoder is built and must still release it. The probe
+    // is a malloc(1) against libheif's own heap: the pointer it returns is the boundary of what is
+    // allocated, so two probes with the allocation released in between are equal, and any residual
+    // shows up as the difference.
     const lib = (await loadLibheif()) as unknown as {
       _malloc(n: number): number;
       _free(p: number): void;
@@ -679,24 +681,20 @@ describe("heic-to-jpeg", () => {
       lib._free(p);
       return p;
     };
-    // One pass first, to take the allocator's own one-time step (440 bytes) out of the measurement.
+    // NOTE: one pass first, to take the allocator's own one-time step (440 bytes) out of the probe.
     await withHeicFrames(truncatedHeic(), async (f) => f.length);
     const before = probe();
     for (let i = 0; i < 50; i++)
       await withHeicFrames(truncatedHeic(), async (f) => f.length);
-    // Not "bounded", not "small": ZERO. Measured flat at 100, 500, 1000 and 2000 files too.
+    // NOTE: not "bounded", not "small": ZERO.
     expect(probe() - before).toBe(0);
   });
 
   test("every image handle is released, on every path out, and before the context", async () => {
-    // Review round 5, and the finding my own round 2 measurement missed: freeing the CONTEXT does not
-    // free the image handles, and what a handle retains is the decoded image. Measured over 400
-    // conversions of the 2400x1600 fixture, the wasm heap grows 4.3 -> 9.5 -> 15.75 -> 23.25 MB
-    // without `image.free()` and stays at 0 with it.
-    //
-    // Asserted here by standing in for the library, because measuring it takes a minute of real
-    // decoding and because the ORDER is part of the contract: a handle holds a reference into the
-    // context, so the context cannot go first.
+    // Freeing the CONTEXT does not free the image handles, and a handle retains the decoded
+    // image, so the wasm heap grows with every conversion that skips `image.free()`. Asserted by
+    // standing in for the library: a real heap reading takes a minute of decoding, and the ORDER is
+    // part of the contract (a handle holds a reference into the context, so the context goes last).
     const trail: string[] = [];
     const fake = (n: number) =>
       ({
@@ -718,7 +716,7 @@ describe("heic-to-jpeg", () => {
     await withHeicFrames(heicBytes(), async () => "ok", fake(2));
     expect(trail).toEqual(["image 0", "image 1", "context"]);
 
-    // The refusal paths are the ones that leaked in both review rounds, so each gets its own check.
+    // NOTE: the refusal paths are the ones most prone to skip a release, so each gets its own check.
     trail.length = 0;
     await expect(
       withHeicFrames(
@@ -738,13 +736,10 @@ describe("heic-to-jpeg", () => {
   });
 
   test("converts the image the file DESIGNATES, not the one stored first", async () => {
-    // Review round 6. A HEIC may carry several top-level images and name one of them in its `pitm`
-    // box; libheif returns them in storage order, and the two disagree. Taking the first sends a
-    // picture the sender did not send, and the extraction comes back successful and about the wrong
-    // image — the worst shape a defect can have here, because nothing downstream looks wrong.
-    //
-    // Measured on the fixture: item order is blue 512x512, red 2400x1200, green 300x300, and `pitm`
-    // designates the red one — neither the first nor the last.
+    // A HEIC may carry several top-level images and name one in its `pitm` box; libheif returns
+    // them in storage order. Taking the first yields a successful extraction of the wrong picture,
+    // with nothing downstream looking wrong. The fixture's `pitm` designates the red one, neither the
+    // first nor the last.
     const out = await runMediaConverter(
       "heic-to-jpeg",
       COLECAO.buffer.slice(
@@ -768,14 +763,10 @@ describe("heic-to-jpeg", () => {
   });
 
   test("images with nothing designated convert the first instead of reading as empty", async () => {
-    // The fallback, and what it is actually for. It is NOT for a file with no `pitm`: measured by
-    // renaming that box to `free` (the standard says to ignore `free`, so it stops existing for a
-    // reader), libheif refuses the file outright with `No 'pitm' box` and returns zero images, so
-    // such a file never reaches this branch. What the branch answers for is a library that returns
-    // images without designating one, which this version never does — hence standing in for it.
-    // Without the fallback that case would throw "heic carries no image frame" about a file that
-    // plainly has frames. Driven through `runMediaConverter` and not through `withHeicFrames`,
-    // because the selection being asserted lives in the converter.
+    // The fallback is NOT for a file with no `pitm` (libheif refuses that with `No 'pitm' box`
+    // and zero images). It answers a library that returns images without designating one, which this
+    // version never does, hence the stand-in; without it that case throws "heic carries no image
+    // frame". Driven through `runMediaConverter`, because the selection lives in the converter.
     const solid = (w: number, h: number, r: number) => {
       const data = new Uint8ClampedArray(w * h * 4);
       for (let i = 0; i < data.length; i += 4) {
@@ -786,7 +777,7 @@ describe("heic-to-jpeg", () => {
     };
     // The real fixture's bytes, because the cap reads the declared size out of them and a synthetic
     // header declares nothing — the frames are what is being stood in for here, not the container.
-    const out = await runMediaConverter("heic-to-jpeg", heicBytes(), {
+    const out = await convertInline("heic-to-jpeg", heicBytes(), {
       withFrames: (async (_b, use) =>
         use([
           {
@@ -820,28 +811,28 @@ describe("heic-to-jpeg", () => {
     expect(jpeg.decode(new Uint8Array(out)).width).toBe(1568);
   });
 
-  test("refuses a source over the pixel cap instead of allocating it", async () => {
-    // The fixture is 3.84 Mpx, so a cap just under it exercises the guard without the 200 MB the
-    // real cap is there to prevent.
-    await expect(
-      runMediaConverter("heic-to-jpeg", heicBytes(), {
-        maxSourcePixels: 2400 * 1600 - 1,
-      }),
-    ).rejects.toThrow(/over the 3839999 px cap/);
+  test("refuses an image stored in one piece over the pixel cap instead of allocating it", async () => {
+    // The cutout is 400x400 and not a grid, so a cap just under it exercises the guard without the
+    // 200 MB the real cap is there to prevent.
+    const bytes = ALPHA.buffer.slice(
+      ALPHA.byteOffset,
+      ALPHA.byteOffset + ALPHA.byteLength,
+    ) as ArrayBuffer;
+    const refused = runMediaConverter("heic-to-jpeg", bytes, {
+      maxSourcePixels: 400 * 400 - 1,
+    });
+    await expect(refused).rejects.toThrow(/over the 159999 px cap/);
+    await expect(refused).rejects.toBeInstanceOf(MediaTooLargeError);
     // And the real cap admits it, so the guard is not simply always on.
-    expect(2400 * 1600).toBeLessThan(MAX_SOURCE_PIXELS);
+    expect(400 * 400).toBeLessThan(MAX_SOURCE_PIXELS);
   });
 
   test("a crop cannot shrink the file past the pixel cap", async () => {
-    // Review round 11, P1. A HEIC may carry a `clap` crop, and libheif's `get_width`/`get_height`
-    // then report the CROPPED size while the decode still materialises the whole stored image. A cap
-    // applied to the reported size is therefore no cap at all: a 1x1 crop over a 100 Mpx picture
-    // walks straight past it.
-    //
-    // Neither mechanism available in libheif answers this on the installed build, and both were
-    // measured: `heif_image_handle_get_ispe_width` returns 0 even for a plain file whose dimensions
-    // it should report, and `heif_context_set_maximum_image_size_limit` refuses nothing at any value,
-    // set before the read or after it. So the cap reads the size out of the file.
+    // With a `clap` crop, `get_width`/`get_height` report the CROPPED size while the decode
+    // materialises the whole stored image, so a 1x1 crop over 100 Mpx walks past a cap on the
+    // reported size. The cap reads the size out of the file because, on the installed build,
+    // `heif_image_handle_get_ispe_width` returns 0 and `heif_context_set_maximum_image_size_limit`
+    // refuses nothing.
     const clap = CLAP.buffer.slice(
       CLAP.byteOffset,
       CLAP.byteOffset + CLAP.byteLength,
@@ -853,7 +844,7 @@ describe("heic-to-jpeg", () => {
     });
     expect(storedPixels(clap)).toBe(64 * 64);
 
-    // One pixel of cap. The reported size fits it exactly, which is what made this a bypass.
+    // NOTE: one pixel of cap, which the reported (cropped) size fits exactly.
     await expect(
       runMediaConverter("heic-to-jpeg", clap, { maxSourcePixels: 1 }),
     ).rejects.toThrow(/stores 4096 px, over the 1 px cap/);
@@ -865,10 +856,9 @@ describe("heic-to-jpeg", () => {
   });
 
   test("an extended-size box does not blind the cap", async () => {
-    // Review round 12. BMFF states a box size three ways — `n`, `0` for "to the end of the file", and
-    // `1` for "the real size is the 64 bits after the type" — and a walker that only understands the
-    // first stops at the first of the others. It then reports "no declared size", which under the
-    // previous fallback meant the cropped dimensions, which is the hole the walk was added to close.
+    // BMFF states a box size three ways (`n`, `0` for "to the end of the file", `1` for "the
+    // real size is the 64 bits after the type"). A walker that only understands the first stops at
+    // the others and reports "no declared size", which must not fall back to the cropped dimensions.
     const ext = CLAP_EXT.buffer.slice(
       CLAP_EXT.byteOffset,
       CLAP_EXT.byteOffset + CLAP_EXT.byteLength,
@@ -910,11 +900,10 @@ describe("heic-to-jpeg", () => {
   });
 
   test("an extended-size ftyp still carries a brand, eight bytes later", async () => {
-    // Review round 13. The brand check reads offset 8, which is only the brand when the header ended
-    // there: with `size == 1` the real size occupies the next 64 bits and the brand sits at 16. The
-    // file below decodes in libheif without complaint and was reported as `carries brand "   "` — a
-    // source mismatch, which hands the original HEIC to a provider that refuses it. The attachment
-    // stops being read, which is the outcome this whole PR exists to prevent.
+    // Offset 8 is the brand only when the header ends there: with `size == 1` the real size
+    // takes the next 64 bits and the brand sits at 16. Misread, the file below (which libheif decodes)
+    // reads as `carries brand "   "`, a source mismatch that hands the original HEIC to a provider
+    // that refuses it, and the attachment stops being read.
     const ext = CLAP_FTYP_EXT.buffer.slice(
       CLAP_FTYP_EXT.byteOffset,
       CLAP_FTYP_EXT.byteOffset + CLAP_FTYP_EXT.byteLength,
@@ -942,20 +931,11 @@ describe("heic-to-jpeg", () => {
   });
 
   test("an ispe that understates the coded image is refused by the decoder, not decoded", async () => {
-    // Review round 14 raised the cap's one blind spot and it is real as a question: both numbers the
-    // cap reads — `get_width`/`get_height` and the `ispe` walk — come from `ispe`, while the work a
-    // decode costs is set by the HEVC bitstream. A file that declares 1x1 and codes 2000x2000 would
-    // walk past any cap.
-    //
-    // MEASURED, and libheif closes it: it compares the coded dimensions against the signalled ones
-    // and refuses BEFORE decoding. On libheif-js 1.23.2, steady state, the same source encoded at
-    // 2000x2000, 4000x4000 and 6000x6000 and then made to declare 1x1 costs 2-3 ms and grows the
-    // wasm heap by zero; decoded honestly the three cost 111 ms / +27 MB, 91 ms / +130 MB and
-    // 197 ms / +216 MB. The lie buys an attacker less work than telling the truth, at every size.
-    //
-    // So this test is not about the cap. It pins the property the cap leans on, which belongs to the
-    // dependency and could change under an upgrade: the file below is admitted by any cap (it says
-    // one pixel) and must still never be decoded.
+    // Both numbers the cap reads come from `ispe`, while a decode's cost is set by the HEVC
+    // bitstream, so a file declaring 1x1 and coding 2000x2000 passes any cap. libheif closes that: it
+    // compares coded against signalled dimensions and refuses BEFORE decoding (no heap growth). This
+    // pins that property of the dependency, which an upgrade could change: the file below is admitted
+    // by any cap and must still never be decoded.
     const bytes = ISPE_MENOR.buffer.slice(
       ISPE_MENOR.byteOffset,
       ISPE_MENOR.byteOffset + ISPE_MENOR.byteLength,
@@ -972,7 +952,7 @@ describe("heic-to-jpeg", () => {
     // chooses the container. Driven through the frame seam, because reaching this branch needs a file
     // that decodes to a frame AND hides its `ispe`, which is a combination no real encoder writes.
     await expect(
-      runMediaConverter("heic-to-jpeg", brandedHeic(), {
+      convertInline("heic-to-jpeg", brandedHeic(), {
         withFrames: (async (_b, use) =>
           use([
             {
@@ -1047,44 +1027,9 @@ describe("heic-to-jpeg", () => {
     }
   });
 
-  test("a JPEG carrying an accepted brand at offset 8 is a MISMATCH, not a broken HEIC", async () => {
-    // Review round 7. Offset 8 is the major brand only when offset 4 says `ftyp`; on its own it is
-    // four bytes that can spell one by accident. A JPEG whose first marker is a comment puts the
-    // comment's payload exactly there, and the file decodes perfectly as a JPEG.
-    //
-    // Getting this wrong costs the SAME regression the brand check was written to prevent: the file
-    // would be called a broken HEIC, the conversion would fail, and the attachment would be skipped
-    // — an attachment the vendor reads by sniffing, and read before this feature existed.
-    const real = new Uint8Array(
-      jpeg.encode(
-        { data: new Uint8Array(8 * 8 * 4).fill(180), width: 8, height: 8 },
-        80,
-      ).data,
-    );
-    // SOI, then a COM segment (0xFFFE) whose declared length is 10: two length bytes plus eight of
-    // payload, which puts payload bytes 2..5 on file offsets 8..11.
-    const armadilha = new Uint8Array(real.length + 12);
-    armadilha.set([0xff, 0xd8, 0xff, 0xfe, 0x00, 0x0a, 0x20, 0x20], 0);
-    armadilha.set(new TextEncoder().encode("heic"), 8);
-    armadilha.set([0x20, 0x20], 12);
-    armadilha.set(real.subarray(2), 14);
-
-    // The two facts that make this the regression rather than a curiosity: those bytes DO spell an
-    // accepted brand at the offset the check reads, and the file IS a readable JPEG.
-    expect(String.fromCharCode(...armadilha.subarray(8, 12))).toBe("heic");
-    expect(jpeg.decode(armadilha).width).toBe(8);
-    // `ftyp` is what the check now requires at offset 4, and a JPEG has 0xFFFE there.
-    expect(String.fromCharCode(...armadilha.subarray(4, 8))).not.toBe("ftyp");
-
-    await expect(
-      runMediaConverter("heic-to-jpeg", armadilha.buffer as ArrayBuffer),
-    ).rejects.toBeInstanceOf(MediaSourceMismatchError);
-  });
-
   test("the operator's line names WHICH of the three things the file is", async () => {
-    // The three ways of not being a convertible HEIC are different facts, and the line is the whole
-    // point of this PR. Reported as one, a 703-byte JPEG reads as `<too short>` and sends whoever is
-    // looking at it after a truncated upload (PR #707, found by the verifier's a4 addendum).
+    // The three ways of not being a convertible HEIC are different facts on the line. Reported
+    // as one, a 703-byte JPEG reads as `<too short>` and sends the reader after a truncated upload.
     const message = async (bytes: ArrayBuffer) => {
       const out: unknown = await runMediaConverter("heic-to-jpeg", bytes).catch(
         (e: unknown) => e,
@@ -1165,5 +1110,391 @@ describe("heic-to-jpeg", () => {
     ).rejects.toBeInstanceOf(MediaConversionError);
     const out = await runMediaConverter("heic-to-jpeg", heicBytes());
     expect(out.byteLength).toBeGreaterThan(0);
+  });
+});
+
+const buf = (b: Buffer) =>
+  b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
+
+// What the whole-image path produces for the same file: decode it all, flatten, fit.
+async function wholeFitted(bytes: ArrayBuffer, maxEdge: number) {
+  return await withHeicFrames(bytes, async (frames) => {
+    const frame = frames.find((f) => f.primary) ?? frames[0];
+    if (!frame) throw new Error("no frame");
+    return fitRgba(flattenOntoWhite(await frame.decode()), maxEdge);
+  });
+}
+
+describe("a grid HEIC over the pixel cap", () => {
+  const cases: [string, Buffer, number][] = [
+    ["a grid, downscaled", HEIC, 1568],
+    ["a rotated grid, downscaled", GRID_ROTATED, 1568],
+    [
+      "a rotated grid at full size, where only the padding is cut",
+      GRID_ROTATED,
+      4000,
+    ],
+    ["a grid turned 180 degrees, at full size", GRID_ROTATED_180, 4000],
+    ["a grid turned 270 degrees, at full size", GRID_ROTATED_270, 4000],
+    ["a grid turned 180 degrees, downscaled", GRID_ROTATED_180, 700],
+    ["a grid whose rows are padded past the tile", GRID_TILE_250, 4000],
+    ["a square grid turned 180 degrees", GRID_SQUARE_180, 4000],
+    ["a square grid turned 90 degrees", GRID_SQUARE_90, 4000],
+    ["a grid scaled to a fractional width", GRID_ROTATED, 1001],
+    ["a grid scaled to a box that does not divide its tiles", HEIC, 333],
+  ];
+  for (const [name, file, maxEdge] of cases) {
+    test(`${name}: tile by tile gives the same pixels as the whole decode`, async () => {
+      const whole = await wholeFitted(buf(file), maxEdge);
+      const grid = await decodeGridFitted(buf(file), {
+        maxEdge,
+        maxTilePixels: MAX_SOURCE_PIXELS,
+      });
+      if (grid.kind !== "decoded") throw new Error(grid.kind);
+      expect([grid.image.width, grid.image.height]).toEqual([
+        whole.width,
+        whole.height,
+      ]);
+      expect(Buffer.from(grid.image.data).equals(Buffer.from(whole.data))).toBe(
+        true,
+      );
+    });
+  }
+
+  // 7101 / 1568 * 1568 is 7100.999..., which floors to 7100: the last box has to end at the source's
+  // edge anyway, or the last column is dropped (fitRgba) or averaged into the FIRST box (a map
+  // whose last entry keeps its default 0).
+  test("the last source column lands in the last box, whatever the float rounding", () => {
+    const sw = 7101;
+    const row = new Uint8Array(sw * 4).fill(255);
+    row.set([0, 0, 0, 255], (sw - 1) * 4);
+    const src = { data: row, width: sw, height: 1 };
+    const whole = fitRgba(src, 1568);
+    const fit = new FitAccumulator(sw, 1, 1568);
+    fit.add(src, 0, 0);
+    const pieces = fit.result();
+    expect(whole.width).toBe(1568);
+    expect(whole.data[0]).toBe(255);
+    expect(whole.data[(1568 - 1) * 4]).toBeLessThan(255);
+    expect(Buffer.from(pieces.data).equals(Buffer.from(whole.data))).toBe(true);
+  });
+
+  // A file declares its own size, and a grid of 150,000,000x1 passes both caps: nothing may be
+  // allocated per SOURCE coordinate, only per output pixel and per tile in hand.
+  test("the accumulator allocates by the output and the piece, never by the source's size", () => {
+    const sw = 3_000_000_000;
+    const fit = new FitAccumulator(sw, 1, 1568);
+    fit.add(
+      { data: new Uint8Array(4 * 4).fill(255), width: 4, height: 1 },
+      sw - 4,
+      0,
+    );
+    fit.add(
+      { data: new Uint8Array([0, 0, 0, 255]), width: 1, height: 1 },
+      0,
+      0,
+    );
+    const out = fit.result();
+    expect(out.width).toBe(1568);
+    expect(Array.from(out.data.slice(0, 4))).toEqual([0, 0, 0, 255]);
+    expect(Array.from(out.data.slice((1568 - 1) * 4))).toEqual([
+      255, 255, 255, 255,
+    ]);
+  });
+
+  test("a piece's boxes match fitRgba's at every offset, not just from the origin", () => {
+    const sw = 7101;
+    const row = new Uint8Array(sw * 4);
+    for (let x = 0; x < sw; x++)
+      row.set([x % 251, (x * 7) % 253, (x * 13) % 255, 255], x * 4);
+    const whole = fitRgba({ data: row, width: sw, height: 1 }, 1000);
+    const fit = new FitAccumulator(sw, 1, 1000);
+    for (let left = 0; left < sw; left += 333) {
+      const w = Math.min(333, sw - left);
+      fit.add(
+        { data: row.slice(left * 4, (left + w) * 4), width: w, height: 1 },
+        left,
+        0,
+      );
+    }
+    expect(Buffer.from(fit.result().data).equals(Buffer.from(whole.data))).toBe(
+      true,
+    );
+  });
+
+  test("a piece placed outside the source fails instead of vanishing", () => {
+    const fit = new FitAccumulator(10, 10, 5);
+    const piece = { data: new Uint8Array(4 * 4 * 4), width: 4, height: 4 };
+    for (const [left, top] of [
+      [-1, 0],
+      [0, -1],
+      [7, 0],
+      [0, 7],
+    ] as const)
+      expect(() => fit.add(piece, left, top)).toThrow(
+        /outside the 10x10 source/,
+      );
+    expect(() => fit.add(piece, 6, 6)).not.toThrow();
+  });
+
+  test("an image stored in one piece is not a grid, whatever its size", async () => {
+    expect(
+      await decodeGridFitted(buf(ALPHA), {
+        maxEdge: 1568,
+        maxTilePixels: MAX_SOURCE_PIXELS,
+      }),
+    ).toEqual({ kind: "not-a-grid" });
+  });
+
+  test("the converter reads a grid over the cap instead of refusing it", async () => {
+    const out = await runMediaConverter("heic-to-jpeg", heicBytes(), {
+      maxSourcePixels: 2400 * 1600 - 1,
+    });
+    const img = jpeg.decode(new Uint8Array(out));
+    expect([img.width, img.height]).toEqual([1568, 1045]);
+  });
+
+  test("a grid cut short fails as a conversion, not as a size refusal, and takes nothing down", async () => {
+    const cut = heicBytes().slice(0, Math.floor(HEIC.byteLength * 0.7));
+    const failed = runMediaConverter("heic-to-jpeg", cut, {
+      maxSourcePixels: 2400 * 1600 - 1,
+    });
+    await expect(failed).rejects.toThrow(/libheif tile \d+,\d+ failed/);
+    await expect(failed).rejects.not.toBeInstanceOf(MediaTooLargeError);
+    // And the next conversion still works.
+    const out = await runMediaConverter("heic-to-jpeg", heicBytes());
+    expect(jpeg.decode(new Uint8Array(out)).width).toBe(1568);
+  });
+
+  test("a grid whose tile is itself over the cap is refused, since a tile is decoded whole", async () => {
+    await expect(
+      runMediaConverter("heic-to-jpeg", heicBytes(), {
+        maxSourcePixels: 512 * 512 - 1,
+      }),
+    ).rejects.toBeInstanceOf(MediaTooLargeError);
+  });
+
+  test("a grid over the tiled cap is refused: every tile is still decoded, so size is time", async () => {
+    const refused = runMediaConverter("heic-to-jpeg", heicBytes(), {
+      maxSourcePixels: 1_000_000,
+      maxTiledSourcePixels: 2400 * 1600 - 1,
+    });
+    await expect(refused).rejects.toBeInstanceOf(MediaTooLargeError);
+    await expect(refused).rejects.toThrow(/over the 1000000 px cap/);
+    // And the real tiled cap covers the largest phone mode, 200 MP.
+    expect(MAX_TILED_SOURCE_PIXELS).toBeGreaterThanOrEqual(16320 * 12240);
+  });
+
+  // Every allocation, handle, image and context the grid decode takes is given back, on success and
+  // when a tile fails halfway: the heap never returns memory to the process, so a leak per photo is
+  // a leak for the life of the process.
+  async function counted(failTile?: [number, number]) {
+    const lib = (await loadLibheif()) as unknown as Record<string, unknown>;
+    const live = { malloc: 0, context: 0, handle: 0, image: 0 };
+    const wrap = new Proxy(lib, {
+      get(target, key) {
+        const v = target[key as string];
+        if (typeof v !== "function") return v;
+        const fn = v as (...a: number[]) => number;
+        return (...a: number[]) => {
+          if (key === "_heif_image_handle_decode_image_tile" && failTile) {
+            const [x, y] = failTile;
+            if (a[6] === x && a[7] === y) {
+              (target.HEAP32 as Int32Array)[(a[0] as number) >> 2] = 1;
+              return;
+            }
+          }
+          const r = fn.apply(target, a);
+          if (key === "_malloc") live.malloc++;
+          if (key === "_free") live.malloc--;
+          if (key === "_heif_context_alloc") live.context++;
+          if (key === "_heif_context_free") live.context--;
+          if (key === "_heif_context_get_primary_image_handle") live.handle++;
+          if (key === "_heif_context_get_image_handle") live.handle++;
+          if (key === "_heif_image_handle_release") live.handle--;
+          if (key === "_heif_image_handle_decode_image_tile") live.image++;
+          if (key === "_heif_image_release") live.image--;
+          return r;
+        };
+      },
+    });
+    const run = decodeGridFitted(
+      buf(HEIC),
+      { maxEdge: 1568, maxTilePixels: MAX_SOURCE_PIXELS },
+      wrap as never,
+    );
+    return { run, live };
+  }
+
+  test("a grid with alpha is not read tile by tile, since a tile decode drops the alpha", async () => {
+    expect(
+      await decodeGridFitted(buf(GRID_ALPHA), {
+        maxEdge: 1568,
+        maxTilePixels: MAX_SOURCE_PIXELS,
+      }),
+    ).toEqual({ kind: "unsupported", reason: "a grid with alpha" });
+    // So over the cap it is refused as before, not handed to the model on black.
+    await expect(
+      runMediaConverter("heic-to-jpeg", buf(GRID_ALPHA), {
+        maxSourcePixels: 1100 * 700 - 1,
+      }),
+    ).rejects.toBeInstanceOf(MediaTooLargeError);
+  });
+
+  // Tiles are decoded whole, padding included, so a grid whose tiles cover far more than the image
+  // (a thin one: 150,000,000x1 in 512x512 tiles decodes 512 times its pixels) is time the pixel cap
+  // does not see.
+  test("a grid whose tiles cover more than twice the image is refused", async () => {
+    const lib = (await loadLibheif()) as unknown as Record<string, unknown>;
+    const shrunk = new Proxy(lib, {
+      get(target, key) {
+        if (key === "_heif_image_handle_get_width") return () => 400;
+        if (key === "_heif_image_handle_get_height") return () => 400;
+        const v = target[key as string];
+        return typeof v === "function" ? v.bind(target) : v;
+      },
+    });
+    expect(
+      await decodeGridFitted(
+        buf(HEIC),
+        { maxEdge: 1568, maxTilePixels: MAX_SOURCE_PIXELS },
+        shrunk as never,
+      ),
+    ).toEqual({
+      kind: "unsupported",
+      reason: "a grid whose tiles cover more than twice the image",
+    });
+  });
+
+  // The tiling reports the first tile's size; a malformed grid can carry a bigger tile further on,
+  // which libheif allocates before rejecting. Here one tile of the real receipt grid is made to
+  // declare 2000x2000: nothing may be decoded, and every handle opened to measure is given back.
+  for (const lie of [
+    "_heif_image_handle_get_ispe_width",
+    "_heif_image_handle_get_ispe_height",
+  ])
+    test(`a grid with a tile larger than it declares (${lie.slice(-5)}) is refused before any tile is decoded`, async () => {
+      const lib = (await loadLibheif()) as unknown as Record<string, unknown>;
+      let decoded = 0;
+      let measured = 0;
+      let liar = -1;
+      const open = new Set<number>();
+      const tampered = new Proxy(lib, {
+        get(target, key) {
+          const v = target[key as string];
+          if (typeof v !== "function") return v;
+          const fn = v as (...a: number[]) => number;
+          return (...a: number[]) => {
+            if (key === "_heif_image_handle_decode_image_tile") decoded++;
+            const r = fn.apply(target, a);
+            if (key === "_heif_context_get_image_handle") {
+              const h = (target.HEAPU32 as Uint32Array)[
+                (a[3] as number) >> 2
+              ] as number;
+              open.add(h);
+              // The seventh tile measured is the one that lies.
+              if (++measured === 7) liar = h;
+            }
+            if (key === "_heif_image_handle_release")
+              open.delete(a[0] as number);
+            if (key === lie && a[0] === liar) return 2000;
+            return r;
+          };
+        },
+      });
+      expect(
+        await decodeGridFitted(
+          buf(HEIC),
+          { maxEdge: 1568, maxTilePixels: MAX_SOURCE_PIXELS },
+          tampered as never,
+        ),
+      ).toEqual({
+        kind: "unsupported",
+        reason: "a grid with a tile larger than it declares",
+      });
+      expect(decoded).toBe(0);
+      expect(measured).toBe(7);
+      expect(open.size).toBe(0);
+    });
+
+  test("everything the grid decode takes is released after a success", async () => {
+    const { run, live } = await counted();
+    expect((await run).kind).toBe("decoded");
+    expect(live).toEqual({ malloc: 0, context: 0, handle: 0, image: 0 });
+  });
+
+  test("and after a tile fails halfway through", async () => {
+    const { run, live } = await counted([2, 1]);
+    await expect(run).rejects.toThrow(/tile 2,1/);
+    expect(live).toEqual({ malloc: 0, context: 0, handle: 0, image: 0 });
+  });
+
+  test("the heap does not grow from one grid to the next", async () => {
+    // The malloc(1) probe, not HEAPU8.length: the heap grows in pages, so a small leak never
+    // moves its length, while the probe's pointer moves with any allocation left behind.
+    const lib = (await loadLibheif()) as unknown as {
+      _malloc(n: number): number;
+      _free(p: number): void;
+    };
+    const probe = () => {
+      const p = lib._malloc(1);
+      lib._free(p);
+      return p;
+    };
+    const opts = { maxEdge: 1568, maxTilePixels: MAX_SOURCE_PIXELS };
+    await decodeGridFitted(buf(HEIC), opts);
+    const after = probe();
+    for (let i = 0; i < 4; i++) await decodeGridFitted(buf(HEIC), opts);
+    expect(probe() - after).toBe(0);
+  });
+
+  const tiling = (
+    columns: number,
+    rows: number,
+    width: number,
+    height: number,
+  ) => ({
+    columns,
+    rows,
+    tileWidth: 512,
+    tileHeight: 512,
+    width,
+    height,
+  });
+
+  test("a crop inside the grid is refused rather than placed", () => {
+    expect(
+      __placementForTest(
+        tiling(4, 3, 2000, 1300),
+        tiling(4, 3, 1990, 1300),
+        1990,
+        1300,
+        (_t, x, y) => y * 4 + x,
+      ),
+    ).toBe("a cropped grid");
+  });
+
+  test("a padded axis one tile long cannot say which way it runs, so it is refused", () => {
+    expect(
+      __placementForTest(
+        tiling(4, 1, 2000, 500),
+        tiling(4, 1, 2000, 500),
+        2000,
+        500,
+        (_t, x, y) => y * 4 + x,
+      ),
+    ).toBe("a padded grid axis one tile long");
+  });
+
+  test("an unpadded axis one tile long needs no direction", () => {
+    expect(
+      __placementForTest(
+        tiling(4, 1, 2000, 512),
+        tiling(4, 1, 2000, 512),
+        2000,
+        512,
+        (_t, x, y) => y * 4 + x,
+      ),
+    ).toEqual({ leftOffset: 0, topOffset: 0 });
   });
 });

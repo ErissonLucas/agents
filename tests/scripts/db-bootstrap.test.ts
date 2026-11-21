@@ -1,4 +1,12 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  test,
+} from "bun:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Client } from "pg";
@@ -6,6 +14,7 @@ import {
   FLEET_ROLE_EXPR,
   FLEET_ROLE_RETAINED_MEMBER_ENV,
 } from "@/lib/tenancy/fleet-role";
+import { dbProbeFailed } from "@/tests/db-gate";
 import {
   assertFleetMembership,
   assertFleetRoleIsUnprivileged,
@@ -14,13 +23,31 @@ import {
   fleetMembershipRepair,
   parseAppRole,
   planRoleProvisioning,
+  provisionDatabase,
+  provisionFleetRole,
 } from "../../scripts/db-bootstrap";
+import {
+  holdRoleCatalogLock,
+  ROLE_CATALOG_HOOK_MS,
+  withRoleCatalogLock,
+} from "../utils/role-catalog-lock";
+import { SubprocessTracker } from "../utils/subprocess-tracker";
 
-// The bug this file exists for only exists on a database whose ADMINISTRATIVE role is not a real
+// The failures this file covers exist only on a database whose ADMINISTRATIVE role is not a real
 // superuser, which is every managed Postgres (RDS, Coolify, EasyPanel) and no local docker one. So
 // the fixture builds that shape for real: a CREATEROLE/NOSUPERUSER admin owning its own database,
-// and the actual `scripts/db-bootstrap.ts` run against it as a subprocess, exactly as the image
-// CMD runs it. Nothing here mocks Postgres — the privilege checks under test are the server's.
+// and the actual `scripts/db-bootstrap.ts` run against it as a subprocess, exactly as the image CMD
+// runs it. Nothing here mocks Postgres: the privilege checks under test are the server's.
+// "passes", or the refusal's message: a table of these pins both sides of a guard.
+function outcomeOf(run: () => void): string {
+  try {
+    run();
+    return "passes";
+  } catch (e) {
+    return (e as Error).message;
+  }
+}
+
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
 let su: Client | undefined;
@@ -30,8 +57,8 @@ if (suUrl) {
     await su.connect();
     await su.query("SELECT 1");
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -52,8 +79,8 @@ const SU_PARENT = `fazerai_bs_su_parent_${process.pid}`;
 const TEAM_ROLE = `fazerai_bs_team_${process.pid}`;
 const SIDE_ROLE = `fazerai_bs_side_${process.pid}`;
 const HEIR_ROLE = `fazerai_bs_heir_${process.pid}`;
-// The heir that reaches privilege WITHOUT inheriting it: the case every one of these checks
-// answered "safe" until round 16 measured it.
+// The heir that reaches privilege WITHOUT inheriting it (a SET-only membership): a check that asks
+// about inheritance alone answers "safe" for it.
 const SETHEIR_ROLE = `fazerai_bs_setheir_${process.pid}`;
 const SETHEIR_PARENT = `fazerai_bs_setheir_parent_${process.pid}`;
 // Elevated WITHOUT defeating RLS, which is the whole point of the arm it serves.
@@ -82,16 +109,12 @@ function urlFor(user: string, password: string, database: string): string {
 }
 
 // The fleet role is CLUSTER-wide and this file boots a dozen installations against a handful of
-// probe databases, so it accumulates members across tests — several granted by the SUPERUSER, which
-// a CREATEROLE administrator cannot revoke even with CASCADE, and which bootstrap then correctly
-// refuses to boot past. Production does not accumulate that way: one installation, one runtime role,
-// rotations cleared by the same administrator that made them.
-//
-// So every boot starts from the state a real one starts from. It takes the DATABASE and the
-// ADMINISTRATOR of the boot it is about to run, because both vary here — a helper that assumed the
-// default probe database cleared the wrong role and a helper that assumed the default administrator
-// revoked the ADMIN OPTION out from under the boot. Tests that are ABOUT a leftover pass
-// `keepStrays` and create it themselves.
+// probe databases, so it accumulates members across tests, some granted by the SUPERUSER, which a
+// CREATEROLE administrator cannot revoke even with CASCADE and which bootstrap correctly refuses to
+// boot past. Production does not accumulate that way, so every boot starts from the state a real
+// one starts from. It takes the DATABASE and the ADMINISTRATOR of the boot about to run, because
+// both vary here: assuming the defaults clears the wrong role or revokes the ADMIN OPTION out from
+// under the boot. Tests that are ABOUT a leftover pass `keepStrays` and create it themselves.
 async function clearFleetMembers(migrationUrl: string, appRole: string) {
   const admin = new URL(migrationUrl).username;
   const c = new Client({ connectionString: migrationUrl });
@@ -152,6 +175,10 @@ async function clearFleetMembers(migrationUrl: string, appRole: string) {
   }
 }
 
+// Every bootstrap a test started, so the suite holding the role catalog lock for them can stop one a
+// timed-out test left running before it lets the lock go.
+const bootstraps = new SubprocessTracker();
+
 async function runBootstrap(
   appPassword = APP_PW,
   appRole = APP_ROLE,
@@ -167,12 +194,14 @@ async function runBootstrap(
   if (!keepStrays) {
     await clearFleetMembers(env.MIGRATION_DATABASE_URL as string, appRole);
   }
-  const proc = Bun.spawn(["bun", "scripts/db-bootstrap.ts"], {
-    cwd: REPO_ROOT,
-    env,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  const proc = bootstraps.track(
+    Bun.spawn(["bun", "scripts/db-bootstrap.ts"], {
+      cwd: REPO_ROOT,
+      env,
+      stdout: "pipe",
+      stderr: "pipe",
+    }),
+  );
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
@@ -209,30 +238,18 @@ async function onProbe<T>(
   }
 }
 
-// The decision the whole change turns on, as a table: which statement each catalog state earns.
-// It is separated from the database because what makes it right is a privilege rule, not a
-// connection — and because the e2e below can only reach three of these five rows.
-// A rotation's outgoing role is DECLARED, and a declaration that cannot REACH the process declares
-// nothing. None of the deploy composes uses `env_file`: each lists its environment explicitly, so a
-// variable they do not name never arrives, and `docs/deploy.md` would be telling operators to set
-// something with no effect. Measured by reading them — all three whitelist, none inherits.
-// THE THRESHOLD IS DERIVED FROM THE TIMEOUT, AND BOTH ARE SIZED FOR A BUSY MACHINE.
-//
-// The two tests below tell a healthy boot from a broken one BY HOW LONG IT WAITED: a transfer that
-// takes the lock queues behind the reader and dies at `lock_timeout`, and one that filters correctly
-// never queues at all. The signal is the gap between those, so the only thing that can break the
-// measurement is machine noise wide enough to cross it.
-//
-// It was 2000ms of timeout against a 1000ms threshold, on a healthy path measured at 60ms. That is a
-// 16x margin, and `bun test --parallel` spends it: at 24 workers the healthy boot took 1478ms, all of
-// it subprocess startup and none of it lock waiting, and the test failed for the machine it ran on.
-//
-// Widening the timeout costs nothing on a passing run, because the healthy path never waits on the
-// lock; only a genuinely broken transfer reaches the deadline, and only then is the extra time paid.
-// The threshold stays at half the timeout, and is now written as that rather than said to be.
+// THE THRESHOLD IS DERIVED FROM THE TIMEOUT, AND BOTH ARE SIZED FOR A BUSY MACHINE. The lock tests
+// below tell a healthy boot from a broken one BY HOW LONG IT WAITED: a transfer that takes the lock
+// queues behind the reader and dies at `lock_timeout`, one that filters correctly never queues. A
+// tight timeout fails under `bun test --parallel`, where subprocess startup alone can pass a second;
+// a wide one costs nothing on a passing run, since only a broken transfer reaches the deadline. The
+// threshold is half the timeout.
 const LOCK_TIMEOUT_MS = 10_000;
 const HEALTHY_BOOT_CEILING_MS = LOCK_TIMEOUT_MS / 2;
 
+// A rotation's outgoing role is DECLARED, and a declaration that cannot REACH the process declares
+// nothing. Each deploy compose lists the agents service's environment explicitly, so a variable it
+// does not name never arrives, and `docs/deploy.md` would tell operators to set something inert.
 describe("the retention declaration reaches a deployed container", () => {
   const COMPOSES = [
     "docker-compose.prod.yml",
@@ -240,43 +257,48 @@ describe("the retention declaration reaches a deployed container", () => {
     "docker-compose.portainer.yml",
   ];
 
-  test("every deploy compose passes it through", () => {
+  // The `agents` service's own environment, parsed: a mention in a comment or in another service
+  // reaches no container.
+  const agentsEnvironment = (file: string): string[] => {
+    const doc = Bun.YAML.parse(readFileSync(file, "utf8")) as {
+      services?: Record<
+        string,
+        { environment?: string[] | Record<string, unknown> }
+      >;
+    };
+    const env = doc.services?.agents?.environment ?? [];
+    return Array.isArray(env)
+      ? env.map((entry) => String(entry).split("=")[0] ?? "")
+      : Object.keys(env);
+  };
+
+  test("every deploy compose passes it through to the agents service", () => {
     for (const file of COMPOSES) {
       expect([
         file,
-        readFileSync(file, "utf8").includes(
-          `${FLEET_ROLE_RETAINED_MEMBER_ENV}=`,
-        ),
+        agentsEnvironment(file).includes(FLEET_ROLE_RETAINED_MEMBER_ENV),
       ]).toEqual([file, true]);
     }
   });
 
-  // The positive control for the premise above: if a compose ever grew an `env_file`, the whitelist
-  // would stop being the whole story and this fence would be asking the wrong question.
-  test("none of them inherits an env file instead", () => {
-    for (const file of COMPOSES) {
-      expect([file, readFileSync(file, "utf8").includes("env_file")]).toEqual([
-        file,
-        false,
-      ]);
-    }
-  });
-
-  // Where an operator looks the name up. `CLAUDE.md` makes this the rule for every new variable.
-  //
-  // Anchored on the DECLARATION, not on the name appearing somewhere: the note above it explains
-  // the variable in prose, so a substring check stayed green with the declaration line renamed —
-  // measured, as a mutation that survived.
+  // NOTE: Where an operator looks the name up; `CLAUDE.md` makes this the rule for every new
+  // variable. Anchored on the DECLARATION, not on the name appearing somewhere, and commented out,
+  // the way the file offers a setting nobody has to set.
   test(".env.example declares it, commented out", () => {
-    const declared = readFileSync(".env.example", "utf8")
-      .split("\n")
-      .filter((line) =>
-        new RegExp(`^#?\\s*${FLEET_ROLE_RETAINED_MEMBER_ENV}=`).test(line),
-      );
+    const lines = readFileSync(".env.example", "utf8").split("\n");
+    const declared = lines.filter((line) =>
+      new RegExp(`^#?\\s*${FLEET_ROLE_RETAINED_MEMBER_ENV}=`).test(line),
+    );
     expect(declared).toHaveLength(1);
+    expect(declared[0]).toMatch(
+      new RegExp(`^#\\s*${FLEET_ROLE_RETAINED_MEMBER_ENV}=\\s*$`),
+    );
   });
 });
 
+// The decision bootstrap turns on, as a table: which statement each catalog state earns. It is
+// separate from the database because what makes it right is a privilege rule, not a connection,
+// and because the e2e below can only reach three of these five rows.
 describe("planRoleProvisioning", () => {
   const cases: [
     string,
@@ -381,12 +403,11 @@ describe("planRoleProvisioning", () => {
     });
   }
 
-  // NOTE: the module used to call main() at import time, so importing it to test the decision
-  // above would have run a real bootstrap against whatever the environment pointed at. Asserting
-  // that from inside this file is not possible — the import at the top has already happened, and a
-  // main() that ran and succeeded would look exactly like one that never ran. So this spawns a
-  // fresh process whose environment would make a real bootstrap fail loudly, and watches nothing
-  // happen.
+  // NOTE: Importing the module must not run main(), or testing the decision above would run a real
+  // bootstrap against whatever the environment points at. That cannot be asserted from inside this
+  // file (the import at the top already happened, and a main() that succeeded looks like one that
+  // never ran), so this spawns a fresh process whose environment would make a real bootstrap fail
+  // loudly, and watches nothing happen.
   test("importing the script does not run the bootstrap", async () => {
     const proc = Bun.spawn(
       [
@@ -417,19 +438,23 @@ describe("planRoleProvisioning", () => {
     expect(stderr).not.toContain("ECONNREFUSED");
   });
 
-  // NOTE: the role name is interpolated into DDL as a double-quoted identifier, so this regex is
-  // the only thing between a role name and the quotes. It is defense in depth rather than a
-  // boundary against external input — DATABASE_URL is operator-supplied — but an unquoted-identifier
-  // check that accepts a quote is not defense at all, so it gets a table of its own.
-  // NOTE: the question the plan table cannot ask, because it is about the role AFTER provisioning.
-  // It is a post-condition on a string the catalog produces, so it tests as one.
-  // NOTE: the question the plan table cannot ask, because it is about the role AFTER provisioning.
+  // NOTE: The question the plan table cannot ask, because it is about the role AFTER provisioning.
   // It is a post-condition on two strings the catalog produces, so it tests as one.
   describe("assertRuntimeRoleIsUnprivileged", () => {
     test("a role reaching nothing privileged passes", () => {
-      expect(() =>
-        assertRuntimeRoleIsUnprivileged("app_role", null, null),
-      ).not.toThrow();
+      expect([
+        outcomeOf(() =>
+          assertRuntimeRoleIsUnprivileged("app_role", null, null),
+        ),
+        outcomeOf(() =>
+          assertRuntimeRoleIsUnprivileged("app_role", "rds_superuser", null),
+        ),
+      ]).toEqual([
+        "passes",
+        expect.stringContaining(
+          'runtime role "app_role" reaches a privileged role through a membership (rds_superuser)',
+        ),
+      ]);
     });
 
     test("a direct membership is reported and revoked by the same name", () => {
@@ -443,10 +468,9 @@ describe("planRoleProvisioning", () => {
       expect(boom).toThrow(/REVOKE rds_superuser FROM "app_role"/);
     });
 
-    // NOTE: the case the two arguments exist for. `runtime -> team -> privileged` reaches
-    // `privileged`, and revoking THAT from the runtime role is a statement Postgres accepts as a
-    // no-op while changing nothing (measured) — the operator would run it, see success, restart,
-    // and fail identically. The instruction has to name `team`.
+    // NOTE: The case the two arguments exist for. `runtime -> team -> privileged` reaches
+    // `privileged`, and revoking THAT from the runtime role is a statement Postgres accepts as a no-op:
+    // the operator would run it, see success, restart, and fail identically. It has to name `team`.
     test("a transitive one is reported by its endpoint and revoked by its edge", () => {
       const boom = () =>
         assertRuntimeRoleIsUnprivileged("app_role", "privileged", "team");
@@ -475,22 +499,33 @@ describe("planRoleProvisioning", () => {
     });
   });
 
-  // NOTE: the sibling post-condition, and it refuses in BOTH directions because the two failures
-  // are opposite and only one is loud. Without the membership the cross-tenant path cannot switch
-  // role and every fleet read answers zero rows; WITH it inherited, the fleet policy applies to the
-  // runtime role passively and every tenant becomes readable on an ordinary request. Neither shows
-  // up in a role ATTRIBUTE, which is why `assertRuntimeRoleIsUnprivileged` above cannot see it.
-  // NOTE: the third post-condition, and the one that is about what the fleet role IS rather than who
-  // reaches it. This script only CREATES the role when it is absent, so on the branch that finds an
-  // existing one — a database dropped and recreated leaves it behind — nothing had asked whether it
-  // is the harmless NOLOGIN role this design describes.
+  // NOTE: The post-condition about what the fleet role IS rather than who reaches it. This script
+  // only CREATES the role when it is absent, so on the branch that finds an existing one (a database
+  // dropped and recreated leaves it behind) nothing else asks whether it is the harmless NOLOGIN role
+  // this design describes.
   describe("assertFleetRoleIsUnprivileged", () => {
     const ok = { reaches: null };
 
     test("the role this design creates passes", () => {
-      expect(() =>
-        assertFleetRoleIsUnprivileged("fleet_role", ok),
-      ).not.toThrow();
+      const states = [
+        ok,
+        ...FLEET_ROLE_FORBIDDEN_ATTRIBUTES.map(([field]) => ({
+          ...ok,
+          [field]: true,
+        })),
+      ];
+      expect(
+        states.map((st) =>
+          outcomeOf(() => assertFleetRoleIsUnprivileged("fleet_role", st)),
+        ),
+      ).toEqual([
+        "passes",
+        ...FLEET_ROLE_FORBIDDEN_ATTRIBUTES.map(([, word]) =>
+          expect.stringContaining(
+            `"fleet_role" already exists and is privileged (${word})`,
+          ),
+        ),
+      ]);
     });
 
     // Each attribute on its own, because a check written as one boolean would pass five of these —
@@ -533,23 +568,43 @@ describe("planRoleProvisioning", () => {
     });
   });
 
+  // NOTE: The sibling post-condition, and it refuses in BOTH directions because the two failures
+  // are opposite and only one is loud. Without the membership the cross-tenant path cannot switch
+  // role and every fleet read answers zero rows; WITH it inherited, the fleet policy applies to the
+  // runtime role passively and every tenant becomes readable on an ordinary request. Neither shows
+  // up in a role ATTRIBUTE, which is why `assertRuntimeRoleIsUnprivileged` above cannot see it.
   describe("assertFleetMembership", () => {
     const repair = fleetMembershipRepair("app_role", "fleet_role", 170000);
 
     test("able to SET ROLE and not inheriting is the only state that passes", () => {
-      expect(() =>
-        assertFleetMembership(
-          "app_role",
-          "fleet_role",
-          { can_set_role: true, usage: false },
-          repair,
+      const states = [
+        { can_set_role: true, usage: false },
+        { can_set_role: true, usage: true },
+        { can_set_role: false, usage: true },
+        { can_set_role: false, usage: false },
+      ];
+      expect(
+        states.map((st) =>
+          outcomeOf(() =>
+            assertFleetMembership("app_role", "fleet_role", st, repair),
+          ),
         ),
-      ).not.toThrow();
+      ).toEqual([
+        "passes",
+        expect.stringContaining(
+          'runtime role "app_role" INHERITS "fleet_role"',
+        ),
+        expect.stringContaining(
+          'runtime role "app_role" INHERITS "fleet_role"',
+        ),
+        expect.stringContaining(
+          'runtime role "app_role" cannot SET ROLE to "fleet_role"',
+        ),
+      ]);
     });
 
-    // Both refuse. The first version of this made the missing capability a WARNING, on the claim
-    // that only fleet administration breaks — counting the call sites says otherwise, and the
-    // message now names them, so a change back to warning has to argue with the text.
+    // NOTE: Both refuse. A missing capability breaks more than fleet administration (the message names
+    // the call sites), so a change back to a warning has to argue with the text.
     test("inheriting THROWS, and the repair keeps SET ROLE possible", () => {
       const boom = () =>
         assertFleetMembership(
@@ -567,9 +622,9 @@ describe("planRoleProvisioning", () => {
       expect(boom).not.toThrow(/REVOKE/);
     });
 
-    // NOTE: the state below is what a grant with `SET FALSE` produces, and it is NOT "not a member".
-    // `pg_has_role(…, 'MEMBER')` answers true there while `SET ROLE` is denied (measured on 17.10),
-    // so asking the membership instead of the capability is how a broken install reads as healthy.
+    // NOTE: The state below is what a grant with `SET FALSE` produces, and it is NOT "not a member".
+    // `pg_has_role(…, 'MEMBER')` answers true there while `SET ROLE` is denied, so asking the
+    // membership instead of the capability is how a broken install reads as healthy.
     test("no SET capability is refused too, and names what stops working", () => {
       const boom = () =>
         assertFleetMembership(
@@ -579,9 +634,8 @@ describe("planRoleProvisioning", () => {
           repair,
         );
       expect(boom).toThrow(/cannot SET ROLE/);
-      // The call sites that make this fatal rather than cosmetic. The first version of this check
-      // WARNED, on the claim that only fleet administration breaks; counting them says otherwise —
-      // an API key cannot be verified before its tenant is known, so that lookup is one of these.
+      // NOTE: The call sites that make this fatal rather than cosmetic: an API key cannot be verified
+      // before its tenant is known, so that lookup is one of these.
       expect(boom).toThrow(/API key/);
       expect(boom).toThrow(/Chatwoot route/);
       expect(boom).toThrow(/scheduler/);
@@ -629,123 +683,186 @@ describe("planRoleProvisioning", () => {
     });
   });
 
-  // NOTE: this reads the script's own source, which is not how anything else here is tested, and
-  // the reason is that the failure it guards cannot be reached from this suite: the only servers
-  // available run PostgreSQL 17, and the statement in question is one an older server refuses to
-  // PARSE. A review round caught `pg_auth_members.inherit_option` — 16-only, added on a boot path
-  // that runs everywhere — after it had already shipped into the branch, and nothing red would
-  // have said so. So the rule is asserted where it can be: every 16-only spelling in this file
-  // lives inside the version gate, and the portable spelling is used everywhere else.
-  // NOTE: the twin of the test below, and it exists because a mutation survived: deleting the pre-16
-  // branch of the administrative grant broke nothing in this suite, and could not — every server
-  // available here is 17. The consequence is not small, though. On PostgreSQL 15 with a
-  // non-superuser owner, skipping it leaves every future DATA migration failing with
-  // `permission denied to set role`, which is the contract docs/deploy.md states for that role.
-  //
-  // So the rule is asserted where it can be: the fleet role is granted to CURRENT_USER on BOTH
-  // sides of the version gate, in the version-appropriate spelling.
-  test("the administrative grant exists on both sides of the version gate", async () => {
-    const source = await Bun.file(
-      fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
-    ).text();
-    // The needle is written with an escaped dollar rather than as a plain string, so the linter does
-    // not read a literal `${` as a template someone forgot to interpolate.
-    const needle = `\${fleet} TO CURRENT_USER`;
-    const grants = source
-      .split("\n")
-      .map((l) => l.trim())
-      // Scoped to the FLEET role: the runtime role is granted to CURRENT_USER further down for an
-      // unrelated reason (the langgraph schema's AUTHORIZATION), and counting it would make this
-      // assert a number instead of a rule.
-      .filter((l) => !l.startsWith("//") && l.includes(needle));
-    // One per branch, and no more: a third would mean a path nobody accounted for.
-    expect(grants.length).toBe(2);
-    expect(
-      grants.filter((l) => l.includes("WITH INHERIT FALSE, SET TRUE")),
-    ).toHaveLength(1);
-    // The pre-16 one takes no options at all — 15 refuses to parse them.
-    const legacy = grants.find((l) => !l.includes("WITH "));
-    expect(legacy).toBeDefined();
-    expect(legacy).not.toContain("INHERIT");
-    expect(legacy).not.toContain("SET TRUE");
-
-    // And each sits on its own side of the gate: the optioned one inside a `>= 160000` branch, the
-    // bare one in the `else` that closes it.
-    const optionedAt = source.indexOf(`${needle} WITH INHERIT FALSE, SET TRUE`);
-    const gate = source.lastIndexOf(
-      "if (serverVersionNum >= 160000) {",
-      optionedAt,
-    );
-    const elseAt = source.indexOf("} else {", optionedAt);
-    const bareAt = source.indexOf(`${needle}\``, elseAt);
-    expect(gate).toBeGreaterThan(-1);
-    expect(optionedAt).toBeGreaterThan(gate);
-    expect(elseAt).toBeGreaterThan(optionedAt);
-    expect(bareAt).toBeGreaterThan(elseAt);
-  });
-
-  test("16-only syntax stays behind the version gate", async () => {
-    const source = await Bun.file(
-      fileURLToPath(new URL("../../scripts/db-bootstrap.ts", import.meta.url)),
-    ).text();
-    // Every gate, not "the" gate. The file had one when this was written; the count was the proxy,
-    // never the rule, and a second gate arriving is not the thing to make red. What the rule says is
-    // that a 16-only spelling sits inside SOME `>= 160000` branch, so the ranges are collected.
-    const gates: Array<[number, number]> = [];
-    const gateRe = /if\s*\([^)]*>=\s*160000\)\s*\{/g;
-    for (const m of source.matchAll(gateRe)) {
-      const start = m.index as number;
-      // The branch ends at the first `}` back at the opening line's indentation.
-      const indent = source.slice(source.lastIndexOf("\n", start) + 1, start);
-      const close = source.indexOf(`\n${indent}}`, start);
-      gates.push([start, close === -1 ? source.length : close]);
+  // NOTE: Every server available here is 17, so the pre-16 branches run only against a client that
+  // reports an older `server_version_num`. That client answers each catalog read with the healthy
+  // state and records the statements, which is the effect being asserted: what is sent on each side.
+  describe("on both sides of the version gate", () => {
+    const FLEET = "fazerai_fleet_gate_probe";
+    function recordingClient(serverVersionNum: number) {
+      const sent: string[] = [];
+      const answer = (sql: string): Record<string, unknown>[] => {
+        if (/ AS role$/.test(sql)) return [{ role: FLEET }];
+        if (sql.includes("AS server_version_num"))
+          return [
+            {
+              app_exists: true,
+              app_superuser: false,
+              app_bypassrls: false,
+              app_createdb: false,
+              app_createrole: false,
+              admin_superuser: false,
+              server_version_num: serverVersionNum,
+            },
+          ];
+        if (sql.includes("AS revokable"))
+          return [{ reaches: null, revokable: null }];
+        if (sql.includes("r.rolsuper, r.rolbypassrls"))
+          return [
+            {
+              rolsuper: false,
+              rolbypassrls: false,
+              rolcanlogin: false,
+              rolcreatedb: false,
+              rolcreaterole: false,
+              rolreplication: false,
+              reaches: null,
+            },
+          ];
+        if (sql.includes("AS present")) return [{ present: true }];
+        if (sql.includes("quote_ident($1::text) AS q"))
+          return [{ q: `"${FLEET}"` }];
+        if (sql.includes("AS can_set_role"))
+          return [{ can_set_role: true, usage: false }];
+        // NOTE: absent on the first read and present once created, so the reconciliation runs too.
+        if (sql.includes("AS owner"))
+          return sent.some((s) => s.startsWith("CREATE SCHEMA"))
+            ? [{ owner: "app_role" }]
+            : [];
+        if (sql.includes("AS schema_ok"))
+          return [{ schema_ok: true, tables_ok: true, foreign_owners: null }];
+        return [];
+      };
+      const client = {
+        query: async (text: string) => {
+          const sql = text.replace(/\s+/g, " ").trim();
+          sent.push(sql);
+          return { rows: answer(sql) };
+        },
+      };
+      return { client: client as unknown as Client, sent };
     }
-    expect(gates.length).toBeGreaterThan(0);
 
-    // Spellings PostgreSQL 15 cannot parse or resolve, as they appear in a statement.
-    const sixteenOnly = [
+    // NOTE: on PostgreSQL 15 with a non-superuser owner, a missing pre-16 grant leaves every future
+    // DATA migration failing with `permission denied to set role` (docs/deploy.md), so the
+    // administrator gets the fleet role on BOTH sides, in each side's spelling.
+    test("the administrative grant is sent on each side, in that side's spelling", async () => {
+      const grants: Record<number, string[]> = {};
+      for (const version of [170000, 160000, 150000]) {
+        const { client, sent } = recordingClient(version);
+        await provisionFleetRole(client, "app_role", '"app_role"', version);
+        grants[version] = sent.filter((s) =>
+          s.startsWith(`GRANT "${FLEET}" TO CURRENT_USER`),
+        );
+      }
+      expect(grants).toEqual({
+        170000: [
+          `GRANT "${FLEET}" TO CURRENT_USER WITH INHERIT FALSE, SET TRUE`,
+        ],
+        160000: [
+          `GRANT "${FLEET}" TO CURRENT_USER WITH INHERIT FALSE, SET TRUE`,
+        ],
+        150000: [`GRANT "${FLEET}" TO CURRENT_USER`],
+      });
+    });
+
+    test("and the runtime role's membership too", async () => {
+      const membership = (version: number) => {
+        const { client, sent } = recordingClient(version);
+        return provisionFleetRole(
+          client,
+          "app_role",
+          '"app_role"',
+          version,
+        ).then(() =>
+          sent.filter(
+            (s) =>
+              s.startsWith(`GRANT "${FLEET}" TO "app_role"`) ||
+              s.startsWith('ALTER ROLE "app_role"'),
+          ),
+        );
+      };
+      expect(await membership(170000)).toEqual([
+        `GRANT "${FLEET}" TO "app_role" WITH INHERIT FALSE, SET TRUE`,
+      ]);
+      expect(await membership(150000)).toEqual([
+        'ALTER ROLE "app_role" NOINHERIT',
+        `GRANT "${FLEET}" TO "app_role"`,
+      ]);
+    });
+
+    // PostgreSQL 15 refuses to PARSE these, on a boot path that runs everywhere, which is a crash loop
+    // rather than a wrong answer. The whole bootstrap is driven, not only the fleet role.
+    const SIXTEEN_ONLY = [
       "WITH SET",
       "WITH INHERIT",
+      ", SET TRUE",
+      "INHERIT TRUE",
       "inherit_option",
       "set_option",
-      // The privilege TYPE, added in 16 alongside the grant option it reports. Older servers reject
-      // it outright — `unrecognized privilege type` — which on a boot path is a crash loop, not a
-      // wrong answer, and is why it belongs in this list rather than in a comment.
       "'SET')",
     ];
-    const offenders = source
-      .split("\n")
-      .map((line, i) => ({ line, at: i }))
-      .filter(({ line }) => {
-        const code = line.trim();
-        if (code.startsWith("//") || code.startsWith("*")) return false;
-        return sixteenOnly.some((t) => code.includes(t));
-      })
-      .filter(({ at }) => {
-        const offset = source.split("\n").slice(0, at).join("\n").length;
-        return !gates.some(([lo, hi]) => offset >= lo && offset <= hi);
-      })
-      .map(({ line }) => line.trim());
+    const sixteenOnlyIn = (sent: string[]) =>
+      sent.filter((s) => SIXTEEN_ONLY.some((t) => s.includes(t)));
 
-    expect(offenders).toEqual([]);
+    test("nothing 16-only is sent to a PostgreSQL 15 server", async () => {
+      const { client, sent } = recordingClient(150000);
+      await provisionDatabase(client, "app_role", "pw");
+      // NOTE: positive control: the run reached the fleet role and the checkpointer schema, so an
+      // empty list below is about what was sent, not about a run that stopped early.
+      expect(sent.some((s) => s.includes("TO CURRENT_USER"))).toBe(true);
+      expect(
+        sent.some((s) =>
+          s.startsWith("GRANT USAGE, CREATE ON SCHEMA langgraph"),
+        ),
+      ).toBe(true);
+      expect(sixteenOnlyIn(sent)).toEqual([]);
+    });
+
+    test("while a 16 server gets every one of them", async () => {
+      const { client, sent } = recordingClient(160000);
+      await provisionDatabase(client, "app_role", "pw");
+      const found = sixteenOnlyIn(sent);
+      expect(found.length).toBeGreaterThanOrEqual(4);
+      expect(found.some((s) => s.includes("'SET')"))).toBe(true);
+      expect(found).toContain(
+        'GRANT "app_role" TO CURRENT_USER WITH SET TRUE, INHERIT TRUE',
+      );
+    });
   });
 
+  // NOTE: The role name is interpolated into DDL as a double-quoted identifier, so this regex is
+  // the only thing between a role name and the quotes. It is defense in depth rather than a
+  // boundary against external input (DATABASE_URL is operator-supplied), but an unquoted-identifier
+  // check that accepts a quote is not defense at all, so it gets a table of its own.
   describe("parseAppRole", () => {
-    const cases: [string, string, "ok" | "rejects"][] = [
-      ["a plain name", "postgres://app_role:pw@h:5432/db", "ok"],
-      ["a hyphenated name", "postgres://app-role:pw@h:5432/db", "ok"],
-      ["digits", "postgres://app9:pw@h:5432/db", "ok"],
+    type Parsed = { role: string; password: string };
+    const cases: [string, string, Parsed | "rejects"][] = [
+      [
+        "a plain name",
+        "postgres://app_role:p%40ss%3Aw@h:5432/db",
+        { role: "app_role", password: "p@ss:w" },
+      ],
+      [
+        "a hyphenated name",
+        "postgres://app-role:pw@h:5432/db",
+        { role: "app-role", password: "pw" },
+      ],
+      [
+        "digits",
+        "postgres://app9:pw@h:5432/db",
+        { role: "app9", password: "pw" },
+      ],
       ["an embedded double quote", "postgres://ap%22p:pw@h:5432/db", "rejects"],
       ["a semicolon", "postgres://app%3Bdrop:pw@h:5432/db", "rejects"],
       ["a space", "postgres://ap%20p:pw@h:5432/db", "rejects"],
       ["an empty role", "postgres://:pw@h:5432/db", "rejects"],
     ];
     for (const [name, url, expected] of cases) {
-      test(`${expected === "ok" ? "accepts" : "rejects"} ${name}`, () => {
-        if (expected === "ok") {
-          expect(parseAppRole(url).role).toMatch(/^[A-Za-z0-9_-]+$/);
-        } else {
+      test(`${expected === "rejects" ? "rejects" : "accepts"} ${name}`, () => {
+        if (expected === "rejects") {
           expect(() => parseAppRole(url)).toThrow("unsafe app role name");
+        } else {
+          expect(parseAppRole(url)).toEqual(expected);
         }
       });
     }
@@ -764,95 +881,107 @@ describe("planRoleProvisioning", () => {
 describe.skipIf(!dbUp)(
   "db-bootstrap against a non-superuser admin role",
   () => {
+    let releaseCatalog: (() => Promise<void>) | undefined;
     // NOTE: these run in order and share state on purpose — they walk one install's lifecycle
     // (first boot, later boot, a rotated password, a privileged role, a role we did not create, a
     // schema we do not own), which is the shape the failures actually come in. Running one alone
     // with `-t` skips the boot that created the role and fails on a missing role, not on the
     // behaviour under test.
+    // The role catalog lock is held per test, so it covers the subprocess, whose own role DDL we do
+    // not control, without making every other suite that writes roles wait for this whole one
+    // (tests/utils/role-catalog-lock.ts). Each hook that takes it has a timeout above the wait.
+    beforeEach(async () => {
+      releaseCatalog = await holdRoleCatalogLock(suUrl as string);
+    }, ROLE_CATALOG_HOOK_MS);
+    afterEach(async () => {
+      // NOTE: a test that timed out leaves its bootstrap running, and its role DDL is what the lock is
+      // held for, so it is stopped, and seen gone, first.
+      await bootstraps.stopAll();
+      await releaseCatalog?.();
+      releaseCatalog = undefined;
+    });
+
     beforeAll(async () => {
       const db = su as Client;
-      // NOTE: roles and databases are CLUSTER-WIDE catalogs that Postgres does not serialize for
-      // concurrent DDL. tests/lib/db-guard.test.ts takes this same advisory lock id for the same
-      // reason; a SESSION-level lock is what covers the subprocess, whose own role DDL we do not
-      // control. Both suites therefore take their turn instead of racing to `tuple concurrently
-      // updated`.
-      await db.query("SELECT pg_advisory_lock(729104553)");
-      await db.query(`DROP DATABASE IF EXISTS ${SOLO_DB}`);
-      await db.query(`DROP DATABASE IF EXISTS ${NOINH_DB}`);
-      await db.query(`DROP DATABASE IF EXISTS ${PROBE_DB}`);
-      await db.query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${FOREIGN_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${UNREACHABLE_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ROT_A_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ROT_B_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SOLO_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SPLIT_OWNER}`);
-      await db.query(`DROP ROLE IF EXISTS ${NOINH_ADMIN}`);
-      await db.query(`DROP ROLE IF EXISTS ${NOINH_APP}`);
-      await db.query(`DROP ROLE IF EXISTS ${HEIR_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SETONLY_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${PRIV_PARENT}`);
-      await db.query(`DROP ROLE IF EXISTS ${SU_PARENT}`);
-      await db.query(`DROP ROLE IF EXISTS ${TEAM_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SIDE_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${PRIV_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
-      // NOTE: the shape of an RDS master user / a Coolify-provisioned owner: it can create roles and owns
-      // the database, and `rolsuper` is false.
-      await db.query(
-        `CREATE ROLE ${ADMIN_ROLE} LOGIN PASSWORD '${ADMIN_PW}' CREATEROLE NOSUPERUSER NOBYPASSRLS`,
-      );
-      await db.query(`CREATE DATABASE ${PROBE_DB} OWNER ${ADMIN_ROLE}`);
-      // NOTE: pgvector is installed here by the SUPERUSER on purpose. `CREATE EXTENSION` is a separate
-      // privilege question with a separate answer (on RDS the master user may install it; a
-      // non-superuser on a plain server may not), and it is not what this file measures. Leaving it
-      // out would fail the script one statement earlier, on something this change does not touch.
-      const admin = new URL(suUrl as string);
-      await onProbe(urlFor(admin.username, admin.password, PROBE_DB), (c) =>
-        c.query("CREATE EXTENSION IF NOT EXISTS vector"),
-      );
-    });
+      await withRoleCatalogLock(suUrl as string, async () => {
+        await db.query(`DROP DATABASE IF EXISTS ${SOLO_DB}`);
+        await db.query(`DROP DATABASE IF EXISTS ${NOINH_DB}`);
+        await db.query(`DROP DATABASE IF EXISTS ${PROBE_DB}`);
+        await db.query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${FOREIGN_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${UNREACHABLE_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ROT_A_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ROT_B_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SOLO_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SPLIT_OWNER}`);
+        await db.query(`DROP ROLE IF EXISTS ${NOINH_ADMIN}`);
+        await db.query(`DROP ROLE IF EXISTS ${NOINH_APP}`);
+        await db.query(`DROP ROLE IF EXISTS ${HEIR_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SETONLY_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${PRIV_PARENT}`);
+        await db.query(`DROP ROLE IF EXISTS ${SU_PARENT}`);
+        await db.query(`DROP ROLE IF EXISTS ${TEAM_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SIDE_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${PRIV_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
+        // NOTE: the shape of an RDS master user / a Coolify-provisioned owner: it can create roles and owns
+        // the database, and `rolsuper` is false.
+        await db.query(
+          `CREATE ROLE ${ADMIN_ROLE} LOGIN PASSWORD '${ADMIN_PW}' CREATEROLE NOSUPERUSER NOBYPASSRLS`,
+        );
+        await db.query(`CREATE DATABASE ${PROBE_DB} OWNER ${ADMIN_ROLE}`);
+        // Pgvector is installed here by the SUPERUSER on purpose. `CREATE EXTENSION` is a separate
+        // privilege question with a separate answer (on RDS the master user may install it; a
+        // non-superuser on a plain server may not), and not what this file measures. Leaving it out would
+        // fail the script one statement earlier, on something unrelated.
+        const admin = new URL(suUrl as string);
+        await onProbe(urlFor(admin.username, admin.password, PROBE_DB), (c) =>
+          c.query("CREATE EXTENSION IF NOT EXISTS vector"),
+        );
+      });
+    }, ROLE_CATALOG_HOOK_MS);
 
     afterAll(async () => {
       const db = su as Client;
-      await db.query(`DROP DATABASE IF EXISTS ${SOLO_DB}`);
-      await db.query(`DROP DATABASE IF EXISTS ${NOINH_DB}`);
-      await db.query(`DROP DATABASE IF EXISTS ${PROBE_DB}`);
-      // The fleet roles those databases provisioned, whose NAMES carry them. Dropped before the
-      // administrators are, because the membership each administrator granted onward is a
-      // dependency of that administrator: without this the DROP ROLE below fails with
-      // `privileges for membership of role … in role …` and the cluster keeps one role per run.
-      for (const { rolname } of (
-        await db.query<{ rolname: string }>(
-          "SELECT rolname FROM pg_roles WHERE rolname LIKE $1",
-          [`fazerai_fleet_%${process.pid}%`],
-        )
-      ).rows) {
-        await db.query(`DROP OWNED BY "${rolname}" CASCADE`);
-        await db.query(`DROP ROLE IF EXISTS "${rolname}"`);
-      }
-      await db.query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${FOREIGN_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${UNREACHABLE_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ROT_A_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ROT_B_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SOLO_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SPLIT_OWNER}`);
-      await db.query(`DROP ROLE IF EXISTS ${NOINH_ADMIN}`);
-      await db.query(`DROP ROLE IF EXISTS ${NOINH_APP}`);
-      await db.query(`DROP ROLE IF EXISTS ${HEIR_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SETONLY_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${PRIV_PARENT}`);
-      await db.query(`DROP ROLE IF EXISTS ${SU_PARENT}`);
-      await db.query(`DROP ROLE IF EXISTS ${TEAM_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${SIDE_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${PRIV_ROLE}`);
-      await db.query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
-      await db.query("SELECT pg_advisory_unlock(729104553)");
+      await withRoleCatalogLock(suUrl as string, async () => {
+        await db.query(`DROP DATABASE IF EXISTS ${SOLO_DB}`);
+        await db.query(`DROP DATABASE IF EXISTS ${NOINH_DB}`);
+        await db.query(`DROP DATABASE IF EXISTS ${PROBE_DB}`);
+        // The fleet roles those databases provisioned, whose NAMES carry them. Dropped before the
+        // administrators are, because the membership each administrator granted onward is a
+        // dependency of that administrator: without this the DROP ROLE below fails with
+        // `privileges for membership of role … in role …` and the cluster keeps one role per run.
+        for (const { rolname } of (
+          await db.query<{ rolname: string }>(
+            "SELECT rolname FROM pg_roles WHERE rolname LIKE $1",
+            [`fazerai_fleet_%${process.pid}%`],
+          )
+        ).rows) {
+          await db.query(`DROP OWNED BY "${rolname}" CASCADE`);
+          await db.query(`DROP ROLE IF EXISTS "${rolname}"`);
+        }
+        await db.query(`DROP ROLE IF EXISTS ${APP_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${FOREIGN_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${UNREACHABLE_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ROT_A_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ROT_B_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SOLO_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SPLIT_OWNER}`);
+        await db.query(`DROP ROLE IF EXISTS ${NOINH_ADMIN}`);
+        await db.query(`DROP ROLE IF EXISTS ${NOINH_APP}`);
+        await db.query(`DROP ROLE IF EXISTS ${HEIR_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SETONLY_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${PRIV_PARENT}`);
+        await db.query(`DROP ROLE IF EXISTS ${SU_PARENT}`);
+        await db.query(`DROP ROLE IF EXISTS ${TEAM_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${SIDE_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${PRIV_ROLE}`);
+        await db.query(`DROP ROLE IF EXISTS ${ADMIN_ROLE}`);
+      });
       await db.end();
-    });
+    }, ROLE_CATALOG_HOOK_MS);
 
     test("the first boot provisions the runtime role and the langgraph schema", async () => {
       const { exitCode, stdout, stderr } = await runBootstrap();
@@ -1022,11 +1151,10 @@ describe.skipIf(!dbUp)(
       );
     });
 
-    // NOTE: roles are cluster-wide while databases are not, so a database dropped and recreated under
-    // the same name derives the SAME fleet role — and every membership the previous installation
-    // granted survives it. Measured before this reconcile existed: the old installation's runtime
-    // role read all 30 rows of the new installation's data through the new policies, with nothing
-    // but a SET ROLE. Adding to the membership set is therefore not enough; it has to be reconciled.
+    // NOTE: Roles are cluster-wide while databases are not, so a database dropped and recreated under
+    // the same name derives the SAME fleet role, and every membership the previous installation granted
+    // survives it: the old runtime role reads the new installation's data through the new policies with
+    // nothing but a SET ROLE. Adding to the membership set is not enough; it has to be reconciled.
     test("a membership this database did not grant is revoked and named", async () => {
       const db = su as Client;
       const fleet = await probeFleetRole();
@@ -1092,11 +1220,10 @@ describe.skipIf(!dbUp)(
       await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
     });
 
-    // NOTE: the reconcile's one exemption, and it is DECLARED rather than inferred. The first
-    // version spared any member holding an open session here, reading that as a rotation's outgoing
-    // role. Measured false: drop a database and recreate it under the same name, and the stale
-    // installation's pool reconnects to that name, so its role presents an open session too — same
-    // catalog row, opposite meaning. `pg_stat_activity` holds nothing that separates them.
+    // NOTE: The reconcile's one exemption, and it is DECLARED rather than inferred. An open session does
+    // not mark a rotation's outgoing role: drop a database and recreate it under the same name, and the
+    // stale installation's pool reconnects to that name, so its role presents an open session too (same
+    // catalog row, opposite meaning). `pg_stat_activity` holds nothing that separates them.
     test("a serving member is kept only where it was declared", async () => {
       const db = su as Client;
       const fleet = await probeFleetRole();
@@ -1127,8 +1254,8 @@ describe.skipIf(!dbUp)(
       });
       await serving.connect();
       try {
-        // First arm: serving, and nothing declared it. This is the previous installation, and it
-        // goes — the whole reason the exemption stopped being inferred.
+        // NOTE: First arm: serving, and nothing declared it. This is the previous installation, and it
+        // goes: the reason the exemption is declared rather than inferred.
         await regrant();
         const undeclared = await runBootstrap(APP_PW, APP_ROLE, {}, true);
         expect(undeclared.exitCode).toBe(0);
@@ -1175,12 +1302,11 @@ describe.skipIf(!dbUp)(
       await db.query(`DROP ROLE IF EXISTS ${STRAY_ROLE}`);
     });
 
-    // NOTE: what a database restored or cloned under a DIFFERENT name looks like from inside — the
-    // copied `fleet_super_admin` policies still name the source installation's fleet role, and the
-    // copied grants still give it every table. Measured across two real databases: the source's
-    // runtime role read 30 of 30 rows of the restored one, against 0 of 30 without the `SET ROLE`.
-    // `src/lib/db-guard.ts` refuses to serve such a database, and that refusal stops our process
-    // and nothing else, so the privileges have to actually go.
+    // NOTE: What a database restored or cloned under a DIFFERENT name looks like from inside: the copied
+    // `fleet_super_admin` policies still name the source installation's fleet role, and the copied
+    // grants still give it every table, so the source's runtime role reads every row of the restored
+    // one after a `SET ROLE`. `src/lib/db-guard.ts` refuses to serve such a database, but that stops
+    // our process and nothing else, so the privileges have to actually go.
     test("a restored database's foreign fleet role loses its privileges here", async () => {
       const db = su as Client;
       await db.query(`CREATE ROLE ${ALIEN_FLEET_ROLE} NOLOGIN`);
@@ -1237,9 +1363,9 @@ describe.skipIf(!dbUp)(
         true,
       );
       const out = `${stdout}${stderr}`;
-      // The boot COMPLETES: refusing from here would roll the repair back with it — measured on the
-      // SQL twin, which raised from the same transaction and undid its own revoke. Refusing is
-      // db-guard's job, and it does it on this exact condition ahead of every override.
+      // NOTE: The boot COMPLETES: refusing from here would roll the repair back with it, as a RAISE in
+      // the same transaction does in the SQL twin. Refusing is db-guard's job, and it does it on this
+      // exact condition ahead of every override.
       expect(exitCode).toBe(0);
       expect(out).toContain("carries fleet_super_admin policies naming");
       expect(out).toContain("revoked their privileges in this database");
@@ -1292,18 +1418,11 @@ describe.skipIf(!dbUp)(
       expect((await runBootstrap(APP_PW, APP_ROLE, {}, true)).exitCode).toBe(0);
     });
 
-    // NOTE: a role name may legally contain a double quote, and the reconcile interpolates names it
-    // read out of the catalog. Quoted by hand, this member survives the revoke — the statement is
-    // invalid SQL and the catch reads it as a permission problem.
-    // NOTE: the asymmetry the direct list already argued against and the reachability check did not
-    // implement. `FLEET_ROLE_FORBIDDEN_ATTRIBUTES` refuses CREATEDB, CREATEROLE and REPLICATION on
-    // the fleet role because "the runtime role ACQUIRES all of them the moment it enters this role"
-    // — and the reach beside it asked only about SUPERUSER and BYPASSRLS, so REACHING one of those
-    // roles passed while HOLDING the attribute did not.
-    //
-    // Measured end to end before this: with the fleet role a SET-only member of a CREATEROLE role,
-    // the runtime role entered it and CREATED A NEW CLUSTER ROLE. RLS is untouched in that state,
-    // which is exactly why the two-attribute question missed it.
+    // NOTE: `FLEET_ROLE_FORBIDDEN_ATTRIBUTES` refuses CREATEDB, CREATEROLE and REPLICATION on the fleet
+    // role because the runtime role ACQUIRES them on entering it, so REACHING such a role has to be
+    // refused as well as HOLDING the attribute. With the fleet role a SET-only member of a CREATEROLE
+    // role, the runtime role can enter it and create a cluster role, while RLS stays untouched, which
+    // is why asking only about SUPERUSER and BYPASSRLS misses it.
     test("a fleet role that can BECOME CREATEROLE stops the boot", async () => {
       const db = su as Client;
       const fleet = await probeFleetRole();
@@ -1350,6 +1469,9 @@ describe.skipIf(!dbUp)(
       expect((await runBootstrap(APP_PW, APP_ROLE, {}, true)).exitCode).toBe(0);
     });
 
+    // NOTE: A role name may legally contain a double quote, and the reconcile interpolates names it
+    // read out of the catalog. Quoted by hand, this member would survive the revoke: the statement
+    // is invalid SQL and the catch reads it as a permission problem.
     test("a stray member whose name carries a quote is still revoked", async () => {
       const db = su as Client;
       const fleet = await probeFleetRole();
@@ -1403,16 +1525,15 @@ describe.skipIf(!dbUp)(
 
     test("elevated attributes that do not defeat RLS are still taken away", async () => {
       const db = su as Client;
-      // NOTE: before this script branched by catalog state, every boot re-asserted one option list, so a
-      // role that picked up CREATEDB or CREATEROLE lost them again on the next boot. Nothing
-      // downstream notices these two -- the boot guard only reads rolsuper/rolbypassrls -- so this
-      // script is the only thing that takes them away.
+      // NOTE: Every boot strips CREATEDB and CREATEROLE again, so a role that picked them up loses them
+      // on the next boot. Nothing downstream notices these two (the boot guard only reads
+      // rolsuper/rolbypassrls), so this script is the only thing that takes them away.
       await db.query(`ALTER ROLE ${APP_ROLE} CREATEDB CREATEROLE`);
 
       const { exitCode, stdout, stderr } = await runBootstrap(ROTATED_PW);
       expect(exitCode).toBe(0);
 
-      // NOTE: partial, and deliberately so: an administrator may only set an attribute it holds itself,
+      // Partial, and deliberately so: an administrator may only set an attribute it holds itself,
       // and this one has CREATEROLE and not CREATEDB. One statement each is what makes the half it
       // CAN do still happen; a combined statement would lose both to the one it is refused.
       const after = await onProbe(
@@ -1474,7 +1595,7 @@ describe.skipIf(!dbUp)(
       );
       expect(exitCode).toBe(0);
 
-      // NOTE: it skipped the schema rather than pretending: what makes that safe is that the runtime
+      // It skipped the schema rather than pretending: what makes that safe is that the runtime
       // role can create it itself, which is exactly what PostgresSaver.setup() does at boot.
       const before = await onProbe(
         superuserOnProbe,
@@ -1607,7 +1728,7 @@ describe.skipIf(!dbUp)(
       expect(exitCode).toBe(0);
       expect(`${stdout}${stderr}`).toContain("does not own");
 
-      // NOTE: to the effect, not to the exit code — the runtime role reads the table the
+      // To the effect, not to the exit code — the runtime role reads the table the
       // checkpointer reads first and writes the one it writes, on a table it does not own.
       const state = await onProbe(
         urlFor(APP_ROLE, ROTATED_PW, PROBE_DB),
@@ -1690,7 +1811,7 @@ describe.skipIf(!dbUp)(
       expect(exitCode).toBe(0);
       expect(`${stdout}${stderr}`).toContain("does not own");
 
-      // NOTE: not owned, but usable: the checkpointer's first read and its write both go through.
+      // Not owned, but usable: the checkpointer's first read and its write both go through.
       const worked = await onProbe(
         urlFor(UNREACHABLE_ROLE, APP_PW, PROBE_DB),
         async (c) => {
@@ -1809,14 +1930,12 @@ describe.skipIf(!dbUp)(
     test("a healthy re-boot does not lock the checkpointer's tables", async () => {
       const admin = new URL(suUrl as string);
       const superuserOnProbe = urlFor(admin.username, admin.password, PROBE_DB);
-      // NOTE: the ordinary deploy — administrator and runtime role are different accounts, the
-      // tables are the runtime role's — held against a reader's lock. `ALTER TABLE ... OWNER TO`
-      // takes an ACCESS EXCLUSIVE lock even when the owner does not change, and this script runs on
-      // EVERY boot, including the overlap where the previous container is still answering
-      // customers. Either half of the transfer's filter keeps this case out of the loop, so no
-      // single mutation shows up here; what it pins is that the common path never takes the lock,
-      // however that comes about. Measured: 60ms as it stands, 2070ms with the filter gone
-      // entirely, the latter being the lock_timeout deadline rather than a race.
+      // NOTE: The ordinary deploy (administrator and runtime role are different accounts, the tables are
+      // the runtime role's) held against a reader's lock. `ALTER TABLE ... OWNER TO` takes an ACCESS
+      // EXCLUSIVE lock even when the owner does not change, and this script runs on EVERY boot, including
+      // the overlap where the previous container still answers customers. Either half of the transfer's
+      // filter keeps this case out of the loop, so what it pins is that the common path never takes the
+      // lock; with the filter gone the boot waits out the lock_timeout, a deadline rather than a race.
       await onProbe(superuserOnProbe, async (c) => {
         await c.query("DROP SCHEMA IF EXISTS langgraph CASCADE");
         await c.query(`CREATE SCHEMA langgraph AUTHORIZATION ${APP_ROLE}`);
@@ -1835,7 +1954,7 @@ describe.skipIf(!dbUp)(
         await reader.query("BEGIN");
         await reader.query("SELECT v FROM langgraph.checkpoint_migrations");
 
-        // NOTE: PGOPTIONS reaches the subprocess's own session, so an ALTER that queues behind the
+        // PGOPTIONS reaches the subprocess's own session, so an ALTER that queues behind the
         // reader fails in seconds instead of hanging the suite.
         const started = Date.now();
         const { exitCode } = await runBootstrap(ROTATED_PW, APP_ROLE, {
@@ -1843,11 +1962,9 @@ describe.skipIf(!dbUp)(
         });
         const elapsed = Date.now() - started;
 
-        // NOTE: the wait is the assertion, not the exit code — a lock timeout inside the transfer
-        // is caught and, on an install that needs no transfer, correctly swallowed, so a broken
-        // loop still exits 0. What it cannot hide is having waited. The threshold sits an order of
-        // magnitude above the healthy time and half the timeout below the broken one; both numbers are
-        // at the top of this file, with what a parallel run did to the previous pair.
+        // NOTE: The wait is the assertion, not the exit code: a lock timeout inside the transfer is caught
+        // and, on an install that needs no transfer, correctly swallowed, so a broken loop still exits 0.
+        // What it cannot hide is having waited. The threshold is at the top of this file.
         expect(exitCode).toBe(0);
         expect(elapsed).toBeLessThan(HEALTHY_BOOT_CEILING_MS);
       } finally {
@@ -1859,12 +1976,11 @@ describe.skipIf(!dbUp)(
     test("one account doing both jobs does not lock its own tables either", async () => {
       const db = su as Client;
       const admin = new URL(suUrl as string);
-      // NOTE: the case the `<> v_role` half of the filter exists for, and it is not hypothetical:
-      // an install can point MIGRATION_DATABASE_URL and DATABASE_URL at the same account. Measured:
-      // that install is STABLE rather than self-correcting — a role may not alter itself even with
-      // CREATEROLE, so this script cannot strip its own privileges and the shape survives every
-      // boot. The owner filter alone would then match every table (the account owns them all) and
-      // re-own each one to itself, taking ACCESS EXCLUSIVE for no change, once per deploy.
+      // NOTE: The case the `<> v_role` half of the filter exists for: an install can point
+      // MIGRATION_DATABASE_URL and DATABASE_URL at the same account. That install is STABLE rather than
+      // self-correcting (a role may not alter itself even with CREATEROLE), so the shape survives every
+      // boot, and the owner filter alone would re-own every table to itself, taking ACCESS EXCLUSIVE for
+      // no change, once per deploy.
       await db.query(
         `CREATE ROLE ${SOLO_ROLE} LOGIN PASSWORD '${APP_PW}' CREATEROLE NOSUPERUSER NOBYPASSRLS`,
       );
@@ -1900,8 +2016,8 @@ describe.skipIf(!dbUp)(
         });
         const elapsed = Date.now() - started;
 
-        // Same threshold and same reasoning as the re-boot case above: the wait is the assertion.
-        // Measured: 126ms as it stands, 2131ms with `<> v_role` dropped from the filter.
+        // NOTE: Same threshold and reasoning as the re-boot case above: the wait is the assertion, and
+        // without `<> v_role` in the filter the boot waits out the lock_timeout.
         expect(exitCode).toBe(0);
         expect(elapsed).toBeLessThan(HEALTHY_BOOT_CEILING_MS);
       } finally {
@@ -1947,11 +2063,10 @@ describe.skipIf(!dbUp)(
     test("neither schema privilege stands in for the other", async () => {
       const admin = new URL(suUrl as string);
       const superuserOnProbe = urlFor(admin.username, admin.password, PROBE_DB);
-      // NOTE: the two schema privileges are checked as an AND, and this is the case that tells them
-      // apart. Measured: with USAGE but not CREATE, `CREATE TABLE IF NOT EXISTS` is refused on the
-      // schema even when the table already exists — Postgres checks the privilege before it checks
-      // the IF NOT EXISTS — so setup() dies on its own migrations. A check that asked for USAGE
-      // alone would report this install as fine.
+      // NOTE: The two schema privileges are checked as an AND, and this is the case that tells them
+      // apart. With USAGE but not CREATE, `CREATE TABLE IF NOT EXISTS` is refused on the schema even when
+      // the table exists (Postgres checks the privilege before the IF NOT EXISTS), so setup() dies on its
+      // own migrations. A check that asked for USAGE alone would report this install as fine.
       await onProbe(superuserOnProbe, async (c) => {
         await c.query("DROP SCHEMA IF EXISTS langgraph CASCADE");
         await c.query(`CREATE SCHEMA langgraph AUTHORIZATION ${SPLIT_OWNER}`);
@@ -1997,10 +2112,9 @@ describe.skipIf(!dbUp)(
     test("a superuser administrator actually strips the attributes", async () => {
       const db = su as Client;
       const admin = new URL(suUrl as string);
-      // NOTE: the refusal case above proves what a CREATEROLE administrator CANNOT do; nothing so
-      // far proves the demotion works when it is allowed, so the DDL behind it went unmeasured —
-      // an `ALTER ROLE` missing NOSUPERUSER or NOBYPASSRLS passed every test in this file. Only a
-      // superuser can take those away, so only a superuser administrator exercises this path.
+      // NOTE: The refusal case above proves what a CREATEROLE administrator CANNOT do; this proves the
+      // demotion works when it is allowed, since an `ALTER ROLE` missing NOSUPERUSER or NOBYPASSRLS
+      // would otherwise pass every test here. Only a superuser administrator can exercise this path.
       await db.query(
         `CREATE ROLE ${PRIV_ROLE} LOGIN PASSWORD '${APP_PW}' SUPERUSER BYPASSRLS`,
       );
@@ -2019,7 +2133,7 @@ describe.skipIf(!dbUp)(
       expect(`${stdout}${stderr}`).not.toContain("makes RLS a no-op");
       expect(exitCode).toBe(0);
 
-      // NOTE: to the catalog, because the catalog IS the effect here — RLS being enforced for this
+      // To the catalog, because the catalog IS the effect here — RLS being enforced for this
       // role is exactly "these two columns are false", and the boot guard reads the same ones.
       const attrs = (
         await db.query(
@@ -2038,18 +2152,13 @@ describe.skipIf(!dbUp)(
     test("the account bootstrap adopts FROM may be serving too", async () => {
       const db = su as Client;
       const admin = new URL(suUrl as string);
-      // NOTE: the mirror of the rotation case, and the one the owner filter cannot rule out on its
-      // own: `current_user` is guaranteed not to be a RUNTIME role only if the install has one.
-      // A brownfield install pointing both URLs at the privileged account is exactly the shape
-      // #195 asks operators to correct, and during that correction the old container is still
-      // serving as the migration account whose tables are about to be adopted.
-      //
-      // NOTE: what saves it is the membership bootstrap grants itself one step earlier — the
-      // administrator inherits the incoming role, so it keeps reaching the tables it just handed
-      // over. That inheritance must not be left to the cluster's configuration: an explicit GRANT
-      // defaults `INHERIT` to the grantee's own `rolinherit`, so a NOINHERIT administrator gets
-      // `inherit_option = false` and loses access the moment the transfer commits (measured). The
-      // administrator here is NOINHERIT for that reason.
+      // NOTE: The mirror of the rotation case, which the owner filter cannot rule out alone: `current_user`
+      // is surely not a RUNTIME role only if the install has one. A brownfield install pointing both URLs
+      // at the privileged account is a shape operators are asked to correct, and during the correction
+      // the old container still serves as the account whose tables are being adopted. What saves it is
+      // the membership bootstrap grants itself one step earlier. An explicit GRANT defaults `INHERIT` to
+      // the grantee's `rolinherit`, so a NOINHERIT administrator would lose access the moment the
+      // transfer commits; the administrator here is NOINHERIT for that reason.
       await db.query(
         `CREATE ROLE ${NOINH_ADMIN} LOGIN PASSWORD '${ADMIN_PW}' CREATEROLE NOSUPERUSER NOBYPASSRLS NOINHERIT`,
       );
@@ -2111,15 +2220,12 @@ describe.skipIf(!dbUp)(
       }
     });
 
-    // NOTE: the arm that made all four of these checks wrong. `GRANT <superuser> TO <role> WITH
-    // INHERIT FALSE, SET TRUE` leaves `pg_has_role(role, superuser, 'USAGE')` FALSE — which is what
-    // every one of them asked — while the role runs `SET ROLE <superuser>` and comes back with
-    // `is_superuser = on`. Measured directly, and worse than it looks: SET permission is TRANSITIVE
-    // through the chain, so a runtime role granted a fleet role that is itself a SET-only member
-    // reaches the superuser in ONE statement, without entering the fleet role at all.
-    //
-    // 16-only by construction: before 16 a grant carried no options of its own, so this state
-    // cannot be built and `MEMBER` is the whole answer there.
+    // NOTE: The arm a USAGE check misses. `GRANT <superuser> TO <role> WITH INHERIT FALSE, SET TRUE`
+    // leaves `pg_has_role(role, superuser, 'USAGE')` FALSE while the role runs `SET ROLE <superuser>`
+    // and gets `is_superuser = on`. SET permission is TRANSITIVE through the chain, so a runtime role
+    // granted a fleet role that is itself a SET-only member reaches the superuser in ONE statement,
+    // without entering the fleet role. 16-only by construction: before 16 a grant carried no options,
+    // so `MEMBER` is the whole answer there.
     test("a role that only SET-reaches privilege is refused too", async () => {
       const db = su as Client;
       const version = (
@@ -2214,10 +2320,10 @@ describe.skipIf(!dbUp)(
         SU_PARENT,
       );
 
-      // NOTE: a transitive membership is the case the message has to get right. `heir -> team ->
-      // privileged` reaches the privileged role, but `REVOKE <privileged> FROM heir` names a grant
-      // that does not exist — and Postgres ACCEPTS it as a no-op (measured), so the operator runs
-      // it, sees success, restarts, and fails identically. The statement has to name the edge.
+      // NOTE: A transitive membership is the case the message has to get right. `heir -> team ->
+      // privileged` reaches the privileged role, but `REVOKE <privileged> FROM heir` names a grant that
+      // does not exist, and Postgres ACCEPTS it as a no-op: the operator runs it, sees success, restarts,
+      // and fails identically. The statement has to name the edge.
       await db.query(`REVOKE ${SU_PARENT} FROM ${HEIR_ROLE}`);
       await db.query(`CREATE ROLE ${TEAM_ROLE} NOLOGIN`);
       await db.query(`GRANT ${SU_PARENT} TO ${TEAM_ROLE}`);
@@ -2242,23 +2348,11 @@ describe.skipIf(!dbUp)(
       expect(via).not.toContain(`REVOKE ${SU_PARENT}`);
       expect(via).not.toContain(SIDE_ROLE);
 
-      // NOTE: and a membership that does NOT inherit is accepted, which fixes the choice rather
-      // than leaving it to look like an oversight. The question asked is `pg_has_role(..., 'USAGE')`
-      // — the boot guard's own — so bootstrap refuses exactly what the server refuses and no more.
-      // A stricter 'MEMBER' would reject an install the server starts on: measured, it is true of
-      // every membership, including the two that cannot escalate.
-      //
-      // NOTE: what neither question actually measures, for whoever revisits this or the guard.
-      // SUPERUSER and BYPASSRLS are role ATTRIBUTES, and attributes are not inherited through a
-      // membership — only object privileges are. Measured against a table under RLS: a role
-      // inheriting a BYPASSRLS role still sees one row, and sees two only after `SET ROLE` to it.
-      // So escalation needs `set_option`, not inheritance, and both checks are aimed slightly off:
-      // on PostgreSQL's defaults (an INHERIT role, a plain GRANT) the two coincide and the answer
-      // is right, which is why this holds. They diverge on a NOINHERIT runtime role, where a plain
-      // GRANT lands `inherit_option false, set_option true` and escalates unseen. Deliberately not
-      // changed here: `set_option` is 16-only, the real predicate is transitive, and tightening it
-      // would refuse installs that boot today — that is its own change, in `src/lib/db-guard.ts`,
-      // not a line to sneak into this one.
+      // NOTE: A membership that does NOT inherit is accepted on purpose. The question is
+      // `pg_has_role(..., 'USAGE')`, the boot guard's own, so bootstrap refuses exactly what the server
+      // refuses; 'MEMBER' is true of every membership, including the two that cannot escalate, and would
+      // reject installs the server starts on. Where USAGE and the real escalation (`set_option`) diverge,
+      // and why the guard is not tightened: docs/tenancy.md, "Role attributes are not inherited".
       await db.query(`REVOKE ${TEAM_ROLE} FROM ${HEIR_ROLE}`);
       await db.query(`REVOKE ${SIDE_ROLE} FROM ${HEIR_ROLE}`);
       await db.query(
@@ -2285,12 +2379,11 @@ describe.skipIf(!dbUp)(
       const db = su as Client;
       const admin = new URL(suUrl as string);
       const superuserOnProbe = urlFor(admin.username, admin.password, PROBE_DB);
-      // NOTE: `ALTER TABLE ... OWNER TO` needs MEMBERSHIP in the new owner; keeping access to the
-      // table afterwards needs to INHERIT it. A membership granted `SET TRUE, INHERIT FALSE` has
-      // the first and not the second, and bootstrap's own grant cannot repair it without ADMIN on
-      // the role — the GRANT fails, is warned about, and the transfer would still go through,
-      // leaving the administrator with `permission denied` on the table it just handed over
-      // (measured). So the transfer asks for inheritance, not for membership.
+      // NOTE: `ALTER TABLE ... OWNER TO` needs MEMBERSHIP in the new owner; keeping access to the table
+      // afterwards needs to INHERIT it. A membership granted `SET TRUE, INHERIT FALSE` has the first and
+      // not the second, and bootstrap's own grant cannot repair it without ADMIN on the role (the GRANT
+      // fails and is warned about), so the transfer would leave the administrator with
+      // `permission denied` on the table it just handed over. The transfer asks for inheritance.
       await db.query(
         `CREATE ROLE ${SETONLY_ROLE} LOGIN PASSWORD '${APP_PW}' NOSUPERUSER NOBYPASSRLS`,
       );

@@ -1,25 +1,16 @@
 import config from "@/config";
-import { CONSOLE_ROUTES, SWITCH_TENANT_PARAM } from "@/lib/console-params";
+import {
+  CONSOLE_ROUTES,
+  FILL_CHANNEL_PARAM,
+  SWITCH_TENANT_PARAM,
+} from "@/lib/console-params";
 
-// The console links an MCP answer hands back to the operator, so the two things that make such a
-// link work are decided in one place instead of at each call site.
-//
-// A link needs to name its TENANT. The console resolves the tenant from `localStorage`, never from
-// the URL, so a link that carries only a record id resolves against whatever the recipient's browser
-// happens to have selected. A fleet-level MCP session picks its tenant per call, so the two diverge
-// as a matter of course, and the operator lands on another tenant's list with nothing on screen
-// connecting the two (issue #151). The parameter is inert for a tenant-scoped user, since the
-// backend already ignores `X-Tenant-Id` for anyone but a SUPER_ADMIN, so the same URL is correct for
-// both.
-//
-// A link also needs to name a route that EXISTS. `/vault` and `/integrations` are not routes: the
-// vault panel is `/resources/vault` and integrations is `/resources/integrations` (`App.tsx`), and
-// the `path="*"` catch-all redirects to `/`. So two of the four links we hand out dropped the
-// operator on the dashboard with no explanation.
-//
-// The parameter name and the route names live in `@/lib/console-params`, which imports nothing: this
-// module needs `config`, and `config` cannot reach the browser (`docs/frontend-env-vars.md`), so a
-// constant shared through here would drag the whole server config into the SPA bundle.
+// The console links an MCP answer hands back to the operator. A link names its TENANT, because the
+// console resolves the tenant from `localStorage`, not the URL, and a fleet-level MCP session picks
+// its tenant per call (the parameter is inert for a tenant-scoped user). A link names a route that
+// EXISTS (`/resources/vault`, not `/vault`), since the catch-all redirects to `/`. Parameter and
+// route names live in `@/lib/console-params`, which imports nothing, because this module needs
+// server `config`.
 
 export function consoleUrl(
   path: string,
@@ -47,6 +38,14 @@ export function vaultFillUrl(
 // Open the vault list for this tenant, so the operator can create the entry the tool asked for.
 export function vaultCreateUrl(tenantId: bigint | null) {
   return consoleUrl(CONSOLE_ROUTES.vault, { tenantId });
+}
+
+// Open the instance health screen with one instance channel's dialog open, to fill its URL and
+// secret. No tenant: instance channels belong to none.
+export function instanceChannelFillUrl(channelId: bigint | number | string) {
+  return consoleUrl(
+    `${CONSOLE_ROUTES.instanceHealth}?${FILL_CHANNEL_PARAM}=${channelId}`,
+  );
 }
 
 export function integrationsUrl(tenantId: bigint | null) {

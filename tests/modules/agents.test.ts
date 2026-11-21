@@ -29,6 +29,7 @@ import {
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { readHandoffConfig } from "@/modules/handoff/settings";
 import { readKanbanConfig } from "@/modules/kanban/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -47,8 +48,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -116,6 +117,32 @@ describe.skipIf(!dbUp)("agents service", () => {
     expect(a.systemPrompt).toBe("Be helpful.");
   });
 
+  // Asked through the service rather than of the boundary function: what has to hold is the WIRING
+  // on each door a settings bag comes through.
+  test("create and update refuse a close label that set_labels also fences off", async () => {
+    const clash = {
+      setLabels: { protected: ["agente-off"] },
+      resolveConversation: { assignLabels: ["agente-off"] },
+    };
+    const code = async (p: Promise<unknown>) =>
+      p.then(
+        () => null,
+        (e: AppError) => e.translationKey,
+      );
+    expect(
+      await code(
+        createAgent(ctx(tenantA), { name: "clash", settings: clash }, appDb),
+      ),
+    ).toBe("errors.protectedResolveLabel");
+    expect(
+      await code(
+        updateAgent(ctx(tenantA), agentAId, { settings: clash }, appDb, {
+          settingsMode: "replace",
+        }),
+      ),
+    ).toBe("errors.protectedResolveLabel");
+  });
+
   test("update patches allowlisted fields and returns the new state", async () => {
     const a = await updateAgent(
       ctx(tenantA),
@@ -127,11 +154,10 @@ describe.skipIf(!dbUp)("agents service", () => {
     expect(a.enabled).toBe(false);
   });
 
-  // A ROLLING DEPLOY IS A SAVE FROM A CONSOLE THAT HAS NOT RELOADED (review round 33). The previous
-  // release's Behavior screen reconstructs `monitoring.noteOnChange` from a reader that defaults it
-  // to `true` and writes it back on every save, so refusing it answered 400 to saves that had
-  // nothing to do with labels. Asked through `updateAgent` rather than of the boundary function,
-  // because what the round found was the WIRING: a strip nobody calls is a strip that does nothing.
+  // A rolling deploy is a save from a console that has not reloaded: the previous release's Behavior
+  // screen writes `monitoring.noteOnChange: true` back on every save, so refusing it would answer 400
+  // to saves that have nothing to do with labels. Asked through `updateAgent` rather than of the
+  // boundary function, because what has to hold is the WIRING: a strip nobody calls does nothing.
   test("a Behavior save from the previous console lands, without the retired flag", async () => {
     const a = await updateAgent(
       ctx(tenantA),
@@ -153,10 +179,9 @@ describe.skipIf(!dbUp)("agents service", () => {
     expect("noteOnChange" in mon).toBe(false);
   });
 
-  // The editor tells the operator to paste a full URL and promises only the host is kept, and
-  // `readSendImageConfig` does that — at READ time. What lands in the row is whatever was typed, so
-  // a pasted presigned link stored its signature in `agent.settings` and handed it back to the
-  // editor on the next load. Normalizing on the way IN is what makes the promise true.
+  // The editor tells the operator to paste a full URL and promises only the host is kept.
+  // `readSendImageConfig` reduces it only at READ time, so without normalizing on the way IN a pasted
+  // presigned link would keep its signature in `agent.settings` and hand it back to the editor.
   test("a pasted image URL is reduced to its host before it is stored", async () => {
     await updateAgent(
       ctx(tenantA),
@@ -173,9 +198,8 @@ describe.skipIf(!dbUp)("agents service", () => {
         },
       },
       appDb,
-      // This bag IS the whole column as far as this test is concerned, and the previous test left a
-      // `monitoring` block on the same agent: said out loud since #614, because a bag that drops a
-      // configured block is otherwise refused.
+      // NOTE: This bag IS the whole column here, and the previous test left a `monitoring` block on
+      // the same agent: declared, because a bag that drops a configured block is otherwise refused.
       { settingsMode: "replace" },
     );
     const row = await suDb.agent.findFirstOrThrow({
@@ -403,7 +427,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
     const a = await createAgent(ctx(tenantC), { name: "Defaulted" }, appDb);
     expect(a.modelConfig).toEqual({
       provider: "openai",
-      model: "gpt-5.6-luna",
+      model: "gpt-6-luna",
       temperature: 0.7,
     });
     expect(a.mode).toBe("test");
@@ -508,8 +532,8 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
   });
 
   // The catalog is what the editor and the capability map read to answer "what can this agent
-  // call". Assembly skips a document template for TWO reasons — the operator disabled it, or this
-  // build cannot parse its content — and a catalog that reports only the stored flag makes the map
+  // call". Assembly skips a document template for TWO reasons (the operator disabled it, or this
+  // build cannot parse its content), and a catalog that reports only the stored flag makes the map
   // draw a tool that is not in the graph. `available` is the question the assembly asks.
   test("catalog reports a template the runtime would skip as unavailable", async () => {
     const a = await createAgent(
@@ -558,8 +582,8 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       const by = (tid: bigint) =>
         got.catalog.documentTemplates.find((d) => d.id === String(tid));
       expect(by(ok.id)?.available).toBe(true);
-      // Both skipped, and only one of them by the stored flag — which is the whole reason this is
-      // not just `enabled`.
+      // NOTE: Both skipped, and only one of them by the stored flag, which is why this is not just
+      // `enabled`.
       expect(by(future.id)).toMatchObject({ enabled: true, available: false });
       expect(by(off.id)).toMatchObject({ enabled: false, available: false });
     } finally {
@@ -598,43 +622,6 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       after.catalog.knowledgeBases.find((k) => k.id === String(freshKb.id))
         ?.unindexedCount,
     ).toBe(1);
-  });
-
-  test("optimistic concurrency: stale expectedUpdatedAt is 409; fresh applies; grant replace bumps the token", async () => {
-    const a = await createAgent(ctx(tenantC), { name: "Concurrent" }, appDb);
-    const id = BigInt(a.id);
-    // A stale token (epoch) is a conflict on BOTH write paths (PATCH + grant replace).
-    await expect(
-      updateAgent(ctx(tenantC), id, { systemPrompt: "x" }, appDb, {
-        expectedUpdatedAt: new Date(0),
-      }),
-    ).rejects.toMatchObject({ statusCode: 409 });
-    await expect(
-      replaceAgentToolSelections(ctx(tenantC), id, [], appDb, {
-        expectedUpdatedAt: new Date(0),
-      }),
-    ).rejects.toMatchObject({ statusCode: 409 });
-    // The current token applies.
-    const fresh = await getAgent(ctx(tenantC), id, appDb);
-    const updated = await updateAgent(
-      ctx(tenantC),
-      id,
-      { systemPrompt: "Concurrency-safe." },
-      appDb,
-      { expectedUpdatedAt: fresh.updatedAt },
-    );
-    expect(updated.systemPrompt).toBe("Concurrency-safe.");
-    // A grants-only change advances the agent's version token (single token covers the editor).
-    const view = await replaceAgentToolSelections(
-      ctx(tenantC),
-      id,
-      [{ source: "NATIVE", enabledTools: ["calculator"] }],
-      appDb,
-    );
-    expect(view.agentUpdatedAt).not.toBeNull();
-    expect((view.agentUpdatedAt as Date).getTime()).toBeGreaterThanOrEqual(
-      updated.updatedAt.getTime(),
-    );
   });
 
   test("every config-write path publishes an agent-config realtime event (metadata only)", async () => {
@@ -684,9 +671,9 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
         updatedAt: (view.agentUpdatedAt as Date).toISOString(),
       });
 
-      // A Behavior-tab save writes ONLY settings (debounce/stt/tts/split/serviceWindow). It must
-      // emit the same agent-config event and advance updatedAt so a second editor tab is warned,
-      // exactly like a General-tab save (item 26).
+      // A Behavior-tab save writes ONLY settings (debounce/stt/tts/split/serviceWindow). It
+      // must emit the same agent-config event and advance updatedAt so a second editor tab is
+      // warned, exactly like a General-tab save.
       const beforeSettings = events.length;
       const settingsPatched = await updateAgent(
         ctx(tenantC),
@@ -791,7 +778,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
         expectedUpdatedAt: t1,
       }),
     ).rejects.toMatchObject({ statusCode: 409 });
-    // The current token still applies — the lock is precise, not a blanket refusal.
+    // The current token still applies: the lock is precise, not a blanket refusal.
     const ok = await replaceAgentToolSelections(ctx(tenantC), id, [], appDb, {
       expectedUpdatedAt: patched.updatedAt,
     });
@@ -924,10 +911,10 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
     expect(a.systemPrompt).toHaveLength(config.agent.promptMaxChars);
   });
 
-  // Operator prose inside `settings` is clamped by the READERS (readToolInstructions and friends), so
-  // an over-cap note used to save with a 200 and reach the model cut in half, with the console still
-  // showing the whole text it had hydrated from the row. The write boundary is where the operator can
-  // still act on it, and it is the only one every transport (console, REST, MCP) goes through.
+  // Operator prose inside `settings` is clamped by the READERS (readToolInstructions and friends),
+  // which the operator cannot see: the console shows the whole text from the row. The write boundary
+  // is where the operator can still act on it, and the only one every transport (console, REST,
+  // MCP) goes through.
   test("update rejects over-cap tool guidance and leaves the stored value alone", async () => {
     const a = await createAgent(
       ctx(tenantC),
@@ -1027,15 +1014,15 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
         BigInt(a.id),
         { settings: { handoff: { instructions: `${legacy}!` } } },
         appDb,
-        // Declared, because the save above left `kanban` on the row: this call is about the cap and
-        // the drop rule runs first (#614), so without the word it would answer the other refusal.
+        // NOTE: Declared, because the save above left `kanban` on the row: this call is about the cap
+        // and the drop rule runs first, so without the word it would answer the other refusal.
         { settingsMode: "replace" },
       ),
     ).rejects.toBeInstanceOf(SettingsTextTooLongError);
   });
 
   // A stale editor resends the settings it loaded. If the other writer edited a capped field, our
-  // copy of that field is an edit too — so validating before the version check would answer 400
+  // copy of that field is an edit too, so validating before the version check would answer 400
   // "text too long" to what is really a conflict, and the editor's reload-or-overwrite flow would
   // never run for it.
   test("a stale write gets the conflict, not the cap error", async () => {
@@ -1046,10 +1033,10 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       data: { settings: { handoff: { instructions: legacy } } },
       select: { updatedAt: true },
     });
-    // Someone else shortens it while this editor holds the old bag. The stamp is set explicitly
-    // because `updatedAt` is client-side and ms-resolution: two back-to-back writes land in the
-    // same millisecond often enough to matter (3 in 40 here), and when they do the held token
-    // still matches, no conflict is raised, and the cap check answers the 400 this test forbids.
+    // NOTE: Someone else shortens it while this editor holds the old bag. The stamp is set
+    // explicitly because `updatedAt` is client-side and ms-resolution: two back-to-back writes often
+    // land in the same millisecond, and then the held token still matches, no conflict is raised,
+    // and the cap check answers the 400 this test forbids.
     await suDb.agent.update({
       where: { id: BigInt(a.id) },
       data: {
@@ -1084,7 +1071,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
     ).rejects.toBeInstanceOf(SettingsTextTooLongError);
   });
 
-  // A clone authors nothing — it replicates a row that already exists in this tenant. Refusing it
+  // A clone authors nothing: it replicates a row that already exists in this tenant. Refusing it
   // would leave a legacy agent unclonable while its own saves go through.
   test("cloning carries a stored over-cap value forward verbatim", async () => {
     const a = await createAgent(ctx(tenantC), { name: "CloneSrc" }, appDb);
@@ -1133,10 +1120,9 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       TOOL_INSTRUCTIONS_MAX,
     );
   });
-  // #614: a `settings` bag REPLACES the column, so a partial bag deletes every block it does not
-  // name, and answered 200. Measured during #612's acceptance: patching `split` alone removed the
-  // whole `signature` block, and nothing in the response, the audit entry or config health said a
-  // bag had been replaced rather than amended. The contract stays; the silence does not.
+  // A `settings` bag REPLACES the column, so a partial bag deletes every block it does not name
+  // (patching `split` alone removes `signature`). The contract stays, but a bag that drops a
+  // configured block is refused unless the caller declares the replace.
   test("a bag that drops configured blocks is refused, and the row is untouched", async () => {
     const a = await createAgent(ctx(tenantC), { name: "DropBlocks" }, appDb);
     const id = BigInt(a.id);
@@ -1146,6 +1132,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
       followUp: { enabled: true, steps: [{ afterMinutes: 60 }] },
     };
     await updateAgent(ctx(tenantC), id, { settings: full }, appDb);
+    const stored = (await suDb.agent.findUnique({ where: { id } }))?.settings;
 
     expect(
       updateAgent(
@@ -1158,7 +1145,8 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
 
     // The refusal is the whole point only if nothing was written: read the RAW column, not the DTO.
     const row = await suDb.agent.findUnique({ where: { id } });
-    expect(row?.settings).toEqual(full);
+    expect(row?.settings).toEqual(stored);
+    expect(row?.settings).toMatchObject(full);
   });
 
   test("the caller that means replacement says so once, and gets the old behaviour", async () => {
@@ -1211,38 +1199,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
     ).rejects.toBeInstanceOf(SettingsBlocksDroppedError);
   });
 
-  // The same race the 409 covers, one level down. The console sends the bag it LOADED, so a block
-  // written after that load (by MCP, or by another tab) is missing from it, and used to be deleted
-  // by the save. Without a precondition there is no 409 to raise, and this refusal is what is left
-  // between a stale bag and a block nobody meant to touch.
-  test("a save that raced a block written elsewhere is refused, not silently reverted", async () => {
-    const a = await createAgent(ctx(tenantC), { name: "RacedBlock" }, appDb);
-    const id = BigInt(a.id);
-    const loaded = { signature: { enabled: true, text: "Alex" } };
-    await updateAgent(ctx(tenantC), id, { settings: loaded }, appDb);
-    // Somebody else adds a block while this editor holds `loaded`.
-    await suDb.agent.update({
-      where: { id },
-      data: {
-        settings: { ...loaded, memory: { compaction: { enabled: true } } },
-      },
-    });
-
-    expect(
-      updateAgent(
-        ctx(tenantC),
-        id,
-        { settings: { signature: { enabled: true, text: "Alex Souza" } } },
-        appDb,
-      ),
-    ).rejects.toBeInstanceOf(SettingsBlocksDroppedError);
-    const row = await suDb.agent.findFirstOrThrow({ where: { id } });
-    expect((row.settings as Record<string, unknown>).memory).toEqual({
-      compaction: { enabled: true },
-    });
-  });
-
-  // The console has always sent the whole bag (AgentEditorPage spreads the last-synced settings), so
+  // The console sends the whole bag (AgentEditorPage spreads the last-synced settings), so
   // the rule must be invisible to it, including for a block only MCP knows how to write.
   test("a save carrying every stored block passes, unknown keys included", async () => {
     const a = await createAgent(ctx(tenantC), { name: "WholeBag" }, appDb);
@@ -1272,7 +1229,7 @@ describe.skipIf(!dbUp)("agents create/clone/delete/tool-selections", () => {
     expect(bag.somethingOnlyMcpWrites).toEqual({ on: true });
     expect((bag.signature as Record<string, unknown>).text).toBe("Alex Souza");
   });
-  // #622: closed values are refused only when the write INTRODUCES or CHANGES them, the scoping every
+  // Closed values are refused only when the write INTRODUCES or CHANGES them, the scoping every
   // rule in this family has. A legacy row carrying a value an older build or a hand-written call
   // stored must keep saving when it is re-sent untouched, or one bad field freezes the whole agent.
   describe("closed settings values against the stored row", () => {

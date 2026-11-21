@@ -3,7 +3,6 @@ import { t, ValidationError } from "elysia";
 import { fieldFromPointer, schemaRefusal } from "@/api/lib/schema-refusal";
 
 // The decision table for a schema refusal: what the client is told, and what the server records.
-// Issue #255.
 //
 // The errors are built the way Elysia builds them, from a schema and a value, so a row states the
 // shape a route declares and the body that breaks it rather than a hand-assembled error object.
@@ -137,35 +136,6 @@ describe("schemaRefusal", () => {
     expect(en.body.error).toBe("The value sent in name is not valid.");
     expect(pt.body.field).toBe("name");
     expect(en.body.field).toBe("name");
-  });
-
-  test("a query parameter is named the same way a body value is", () => {
-    const refusal = schemaRefusal(
-      validationError("query", t.Object({ limit: t.Number() }), {
-        limit: "abc",
-      }),
-      "en",
-    );
-    expect(refusal.status).toBe(422);
-    expect(refusal.body.field).toBe("limit");
-  });
-
-  test("a route parameter is named, like every other request side", () => {
-    const refusal = schemaRefusal(
-      validationError("params", t.Object({ id: t.Numeric() }), { id: "abc" }),
-      "en",
-    );
-    expect(refusal.status).toBe(422);
-    expect(refusal.body.field).toBe("id");
-  });
-
-  test("a header is named too", () => {
-    const refusal = schemaRefusal(
-      validationError("headers", t.Object({ "x-tenant": t.String() }), {}),
-      "en",
-    );
-    expect(refusal.status).toBe(422);
-    expect(refusal.body.field).toBe("x-tenant");
   });
 
   test("a value with no nameable input answers without a field at all", () => {

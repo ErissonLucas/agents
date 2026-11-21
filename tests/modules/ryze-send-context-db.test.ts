@@ -9,6 +9,7 @@ import { RyzeEmulator, setRyzeClientFactory } from "@/modules/ryze/emulator";
 import { sendRyzeCard, sendRyzeText } from "@/modules/ryze/interactive";
 import { drainLabelSyncs } from "@/modules/ryze/labels";
 import { connectRyzeGateway } from "@/modules/ryze/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { outboundUrl } from "../utils/outbound";
 
 // A send as the agent that carries conversation context against the database: the contact's name,
@@ -32,8 +33,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

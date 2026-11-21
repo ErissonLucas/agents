@@ -16,6 +16,10 @@ import {
   updateBusinessHours,
 } from "@/modules/business-hours/service";
 import {
+  type ApprovalLinkMode,
+  normalizeApprovalLink,
+} from "@/modules/documents/approval-link";
+import {
   assertExperimentAgentExists,
   assertExperimentNameUsable,
   createExperiment,
@@ -26,13 +30,24 @@ import {
   variantWriteSchema,
 } from "@/modules/experiments/service";
 import {
+  getProactiveBreakerStatus,
+  resumeProactiveBreaker,
+} from "@/modules/proactive-breaker/service";
+import {
+  type ProactiveBreakerConfig,
+  proactiveBreakerSettingsSchema,
+  readProactiveBreakerConfig,
+} from "@/modules/proactive-breaker/settings";
+import {
   assertEmbeddingCredentialUsable,
   assertLangfuseCredentialUsable,
   getTenantSettings,
   parsePriceOverrides,
+  updateApprovalLink,
   updateEmbeddingSettings,
   updateLangfuse,
   updatePriceOverrides,
+  updateProactiveBreakerSettings,
 } from "@/modules/tenant-settings/service";
 import {
   assertVaultEntryCreatable,
@@ -112,9 +127,8 @@ export async function experimentCreate(
   }
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own questions, asked before the preview answers them and INSIDE the branch,
-      // because the apply reaches the core, which asks them again (#490). The first is pure; the
-      // second READS, outside the transaction the apply writes in, and is ADVISORY for it.
+      // NOTE: the core's own questions, INSIDE the branch because the apply asks them again. The
+      // first is pure; the agent check READS outside the apply's transaction and is ADVISORY.
       assertExperimentNameUsable(args.name);
       // In the apply's own order: name, then variants, then the agent. The first two are pure and
       // the third READS, so a preview that asked the agent first would refuse a call the apply
@@ -289,10 +303,8 @@ export async function businessHoursCreate(
   if ("ok" in ctx) return ctx;
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       assertBusinessHoursCreatable({
         name: args.name,
         timezone: args.timezone,
@@ -370,8 +382,8 @@ export async function businessHoursUpdate(
       exceptions: current.exceptions,
     };
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it — and INSIDE the branch,
-      // because the apply reaches `updateBusinessHours`, which asks it again (#490, #510).
+      // NOTE: the core's own question, INSIDE the branch because `updateBusinessHours` asks it
+      // again.
       assertBusinessHoursUpdatable(patch);
       const previewAfter = {
         name: patch.name ?? current.name,
@@ -430,10 +442,17 @@ export interface TenantSettingsUpdateArgs {
     credential_ref?: string | null;
     send_content?: boolean;
     debug?: boolean;
+    sample_rate?: number | null;
   };
-  // The tenant's own model prices (issue #865): the WHOLE list, which replaces the saved one.
+  // The tenant's own model prices: the WHOLE list, which replaces the saved one.
   price_overrides?: McpPriceOverride[];
+  approval_link?: McpApprovalLink;
   dry_run?: boolean;
+}
+
+export interface McpApprovalLink {
+  mode: ApprovalLinkMode;
+  url_template?: string;
 }
 
 export interface McpPriceOverride {
@@ -467,10 +486,11 @@ export async function tenantSettingsUpdate(
   if (
     args.embedding === undefined &&
     args.langfuse === undefined &&
-    args.price_overrides === undefined
+    args.price_overrides === undefined &&
+    args.approval_link === undefined
   ) {
     return err(
-      "no updatable blocks provided (embedding, langfuse, price_overrides)",
+      "no updatable blocks provided (embedding, langfuse, price_overrides, approval_link)",
     );
   }
 
@@ -519,10 +539,26 @@ export async function tenantSettingsUpdate(
       args.price_overrides === undefined
         ? undefined
         : parsePriceOverrides(priceOverridesFromMcp(args.price_overrides));
+    const approvalLink =
+      args.approval_link === undefined
+        ? undefined
+        : {
+            mode: args.approval_link.mode,
+            urlTemplate: args.approval_link.url_template,
+          };
+    // Checked before any block is written, with the saved template when the call keeps it.
+    const approvalLinkProposed =
+      approvalLink === undefined
+        ? undefined
+        : normalizeApprovalLink({
+            mode: approvalLink.mode,
+            urlTemplate:
+              approvalLink.urlTemplate ??
+              (await getTenantSettings(ctx, base)).approvalLink.urlTemplate,
+          });
     if (args.dry_run !== false) {
-      // NOTE: the core's own KIND question, which resolving the ref above does not answer — a
-      // `vault:<id>` names an entry of any kind, and this preview said "will wire" for one whose
-      // kind `updateLangfuse` refuses (#510). Only when the patch actually sets a ref.
+      // NOTE: the core's own KIND question, which resolving the ref above does not answer: a
+      // `vault:<id>` names an entry of any kind. Only when the patch actually sets a ref.
       if (typeof embeddingRef === "string") {
         await assertEmbeddingCredentialUsable(ctx, embeddingRef, base);
       }
@@ -545,8 +581,10 @@ export async function tenantSettingsUpdate(
                   credentialRef: args.langfuse.credential_ref ?? null,
                   sendContent: args.langfuse.send_content,
                   debug: args.langfuse.debug,
+                  sampleRate: args.langfuse.sample_rate,
                 },
           priceOverrides: prices,
+          approvalLink: approvalLinkProposed,
         },
       });
     }
@@ -561,6 +599,7 @@ export async function tenantSettingsUpdate(
           credentialRef: langfuseRef,
           sendContent: args.langfuse.send_content,
           debug: args.langfuse.debug,
+          sampleRate: args.langfuse.sample_rate,
         },
         base,
       );
@@ -568,8 +607,11 @@ export async function tenantSettingsUpdate(
     if (prices !== undefined) {
       await updatePriceOverrides(ctx, prices, base);
     }
+    if (approvalLink !== undefined) {
+      await updateApprovalLink(ctx, approvalLink, base);
+    }
     const after = await getTenantSettings(ctx, base);
-    // NOTE: each block writer above records its own row, so a call touching both leaves TWO where
+    // Each block writer above records its own row, so a call touching both leaves TWO where
     // this tool used to leave one summarizing both. Same shape the console has always produced.
     // Project stored vault:<id> refs back to NAMES for the response (never a secret value).
     const embName = after.embedding.credentialRef
@@ -586,6 +628,7 @@ export async function tenantSettingsUpdate(
         embedding: { ...after.embedding, credentialRef: embName },
         langfuse: { ...after.langfuse, credentialRef: lfName },
         priceOverrides: after.priceOverrides,
+        approvalLink: after.approvalLink,
       },
     });
   } catch (e) {
@@ -629,14 +672,9 @@ export async function langfuseConnect(
   const enabled = args.enabled ?? true;
   try {
     if (args.dry_run !== false) {
-      // NOTE: the vault's own rule, asked before the preview answers, on the ENTRY THE APPLY WOULD
-      // BUILD rather than on one field of it. An earlier version checked `base_url` alone, and the
-      // apply also judges the vault name and both key values through `createVaultEntry` — a key
-      // with surrounding whitespace previewed clean and then refused, which is the same shape as
-      // the divergence this whole change is about, one level in (#490).
-      //
-      // `langfuse` is a kind that REQUIRES a base URL, so "   " — which normalizes to the empty
-      // string without raising — is refused in here rather than by a separate check out here.
+      // NOTE: the vault's own rule, on the whole ENTRY THE APPLY WOULD BUILD (name and both keys
+      // too, as `createVaultEntry` judges them), not on `base_url` alone. `langfuse` REQUIRES a
+      // base URL, so "   " (which normalizes to empty without raising) is refused in here.
       assertVaultEntryCreatable({
         name,
         value: { publicKey: args.public_key, secretKey: args.secret_key },
@@ -687,8 +725,8 @@ export async function langfuseConnect(
       { enabled, credentialRef: ref, sendContent: args.send_content },
       base,
     );
-    // NOTE: narrowed to the VAULT write, which is the half `updateLangfuse` cannot record. Two
-    // writes, two rows, not one write recorded twice; this one goes when the vault family moves (#399).
+    // NOTE: narrowed to the VAULT write, the half `updateLangfuse` cannot record: two writes, two
+    // rows, not one write recorded twice.
     await recordMcpAudit(ctx, base, {
       actorId: principal.userId,
       actorType: "mcp",
@@ -729,10 +767,8 @@ export async function apiKeyRevoke(
   const target = `api_key:${id}`;
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       await assertApiKeyRevocable(ctx, id, base);
       return ok({
         dryRun: true,
@@ -743,6 +779,92 @@ export async function apiKeyRevoke(
     }
     await revokeApiKey(ctx, id, base);
     return ok({ dryRun: false, applied: true, target });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// ── Proactive breaker (docs/proactive-breaker.md) ──
+
+export interface ProactiveBreakerSetArgs {
+  mode?: ProactiveBreakerConfig["mode"];
+  limit?: number | null;
+  dry_run?: boolean;
+}
+
+// Changes the account breaker's mode or fixed limit. The preview validates the merged block exactly
+// as the write will, so a refused value is refused in both.
+export async function proactiveBreakerSet(
+  principal: VerifiedToken,
+  args: ProactiveBreakerSetArgs,
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  if (args.mode === undefined && args.limit === undefined)
+    return err("nothing to change: pass mode and/or limit");
+  try {
+    const patch: Partial<ProactiveBreakerConfig> = {
+      ...(args.mode !== undefined ? { mode: args.mode } : {}),
+      ...(args.limit !== undefined ? { limit: args.limit } : {}),
+    };
+    if (args.dry_run !== false) {
+      const current = await getProactiveBreakerStatus(ctx, base);
+      const proposed = proactiveBreakerSettingsSchema.safeParse({
+        ...readProactiveBreakerConfig({
+          proactiveBreaker: { mode: current.mode, limit: current.fixedLimit },
+        }),
+        ...patch,
+      });
+      if (!proposed.success)
+        return err(
+          `proactive breaker: ${proposed.error.issues[0]?.message ?? "invalid"}`,
+        );
+      return ok({
+        dryRun: true,
+        target: "proactive_breaker",
+        current: { mode: current.mode, limit: current.fixedLimit },
+        proposed: proposed.data,
+      });
+    }
+    await updateProactiveBreakerSettings(ctx, patch, base);
+    return ok({
+      dryRun: false,
+      applied: true,
+      target: "proactive_breaker",
+      proactiveBreaker: await getProactiveBreakerStatus(ctx, base),
+    });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// Reopens a tripped breaker; the count toward the limit starts again from zero.
+export async function proactiveBreakerResume(
+  principal: VerifiedToken,
+  args: { dry_run?: boolean },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  try {
+    if (args.dry_run !== false) {
+      const current = await getProactiveBreakerStatus(ctx, base);
+      return ok({
+        dryRun: true,
+        target: "proactive_breaker",
+        tripped: current.tripped,
+        wouldChange: current.tripped !== null,
+      });
+    }
+    return ok({
+      dryRun: false,
+      applied: true,
+      target: "proactive_breaker",
+      proactiveBreaker: await resumeProactiveBreaker(ctx, base),
+    });
   } catch (e) {
     return failOf(e);
   }

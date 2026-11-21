@@ -77,6 +77,17 @@ enum SchedulerJobKind {
   INBOUND_SWEEP
   INBOUND_REDISPATCH
   NOTHING_TO_ANSWER
+  SUGGESTION_REVIEW
+  CLIENT_ANON_SWEEP
+  DOCUMENT_APPROVAL_EXPIRY
+  DOCUMENT_APPROVAL_OUTCOME
+  SNOOZED_FOLLOWUP
+  RECONCILE_SWEEP
+  INGEST_FALLBACK
+  OTHER_INBOX_SUMMARY
+  OCCURRENCE_ROUND
+  OCCURRENCE_SWEEP
+  DASHBOARD_LOG_FACTS_BACKFILL
 }
 
 enum SchedulerJobStatus {
@@ -92,6 +103,10 @@ enum ApprovalStatus {
   EDITED
   APPROVED
   REJECTED
+  // Waiting for the suggestion reviewer; not in the pending list yet.
+  SCREENING
+  // The reviewer judged it the same claim as something the base, the queue or a rejection holds.
+  DISCARDED
 }
 
 enum AgentToolSource {
@@ -127,9 +142,13 @@ model Tenant {
   inboxObservers                InboxObserver[]
   conversations                 Conversation[]
   messageReplyClaims            MessageReplyClaim[]
+  agentTurnDeliveries           AgentTurnDelivery[]
+  decisionRuleStates            DecisionRuleState[]
+  decisionRuleClaims            DecisionRuleClaim[]
   replyDispensals               ReplyDispensal[]
   agentThreads                  AgentThread[]
   attendanceSummaries           AttendanceSummary[]
+  otherInboxSummaries           OtherInboxSummary[]
   agents                        Agent[]
   businessHours                 BusinessHours[]
   knowledgeBases                KnowledgeBase[]
@@ -154,10 +173,13 @@ model Tenant {
   schedulerJobs                 SchedulerJob[]
   documentTemplates             DocumentTemplate[]
   issuedDocuments               IssuedDocument[]
+  documentApprovalRequests      DocumentApprovalRequest[]
   experiments                   Experiment[]
   promptVariantAssignments      PromptVariantAssignment[]
   llmUsages                     LlmUsage[]
   spendCostSnapshots            SpendCostSnapshot[]
+  proactiveBreaker              ProactiveBreaker?
+  unpricedModelAnnouncements    UnpricedModelAnnouncement[]
   executionLogs                 ExecutionLog[]
   alertChannels                 AlertChannel[]
   alertDeliveries               AlertDelivery[]
@@ -168,6 +190,35 @@ model Tenant {
   mcpOAuthRefreshTokens         McpOAuthRefreshToken[]
   mcpOAuthPendingAuthorizations McpOAuthPendingAuthorization[]
   appointments                  Appointment[]
+  externalUsers                 ExternalUser[]
+  detachedThreads               DetachedThread[]
+  clientThreadMessages          ClientThreadMessage[]
+  clientApps                    ClientApp[]
+  clientAllowanceUsage          ClientAllowanceUsage[]
+  clientAppSecrets              ClientAppSecret[]
+  dashboardLogFacts             DashboardLogFact[]
+  dashboardLogFactsState        DashboardLogFactsState?
+  fullDetailContents            FullDetailContent[]
+  fullDetailRefs                FullDetailRef[]
+  dashboards                    Dashboard[]
+  dashboardPanels               DashboardPanel[]
+  dashboardDataSources          DashboardDataSource[]
+  conversationReadings          ConversationReading[]
+  occurrenceConversationReads   OccurrenceConversationRead[]
+  occurrenceMonitors            OccurrenceMonitor[]
+  occurrenceRuns                OccurrenceRun[]
+  dashboardViewers              DashboardViewer[]
+  dashboardViewerSessions       DashboardViewerSession[]
+  dashboardViewerVisits         DashboardViewerVisit[]
+  dashboardViewerCodes          DashboardViewerCode[]
+  dashboardEmbedLinks           DashboardEmbedLink[]
+  occurrenceThemes              OccurrenceTheme[]
+  occurrenceThemeMembers        OccurrenceThemeMember[]
+  occurrenceThemeEvents         OccurrenceThemeEvent[]
+  occurrenceCanonicals          OccurrenceCanonical[]
+  occurrenceAlias               OccurrenceAlias[]
+  occurrenceSweepCursors        OccurrenceSweepCursor[]
+  occurrenceFlagEpisodes        OccurrenceFlagEpisode[]
   ryzeGateways                  RyzeGateway[]
   ryzeBots                      RyzeBot[]
   ryzeContacts                  RyzeContact[]
@@ -184,7 +235,7 @@ model Tenant {
 // so RLS would fail-closed. Writes are gated to SUPER_ADMIN at the service layer. Colors:
 // colorMode SIMPLE = one brandColor (the per-theme palette is derived on the client);
 // ADVANCED = explicit token maps per theme (tokensLight/tokensDark, keyed by BRANDABLE_KEYS).
-// Logo/favicon binaries live on disk (BRANDING_STORAGE_DIR); the *_key columns hold the stored
+// Logo/favicon/mark binaries live on disk (BRANDING_STORAGE_DIR); the *_key columns hold the stored
 // filename so the asset endpoint resolves the file + infers its content-type. updatedAt drives
 // cache-busting of the served asset URLs.
 model AppBranding {
@@ -198,6 +249,8 @@ model AppBranding {
   logoLightKey    String?  @map("logo_light_key")
   faviconDarkKey  String?  @map("favicon_dark_key")
   faviconLightKey String?  @map("favicon_light_key")
+  markDarkKey     String?  @map("mark_dark_key")
+  markLightKey    String?  @map("mark_light_key")
   siteUrl         String?  @map("site_url")
   supportEmail    String?  @map("support_email")
   hideGithubLink  Boolean  @default(false) @map("hide_github_link")
@@ -212,23 +265,104 @@ model AppBranding {
 // one password. Which tenants the person works in, and with what role, lives in `TenantUser`; the
 // only role on the person is SUPER_ADMIN, which needs no membership and sees every tenant. Issue #756.
 model User {
-  id           BigInt    @id @default(autoincrement())
-  email        String
-  passwordHash String?   @map("password_hash")
-  googleId     String?   @unique @map("google_id")
-  name         String?
-  isSuperAdmin Boolean   @default(false) @map("is_super_admin")
-  lastLoginAt  DateTime? @map("last_login_at")
+  id                        BigInt    @id @default(autoincrement())
+  email                     String
+  passwordHash              String?   @map("password_hash")
+  googleId                  String?   @unique @map("google_id")
+  name                      String?
+  isSuperAdmin              Boolean   @default(false) @map("is_super_admin")
+  lastLoginAt               DateTime? @map("last_login_at")
+  // The account's WebAuthn user handle: 32 random bytes, set on its first passkey. Never the account
+  // id: two apps on one RP ID would hand out the same small integers, and an authenticator replaces
+  // a discoverable credential that shares RP ID and user handle.
+  webauthnUserHandle        String?   @unique @map("webauthn_user_handle")
+  // "Not now" on the passkey offer after a password sign-in: when, and how many times. On the
+  // account so another browser does not reset it. The numbers are in passkeys/offer.ts.
+  passkeyPromptDismissedAt  DateTime? @map("passkey_prompt_dismissed_at")
+  passkeyPromptDismissCount Int       @default(0) @map("passkey_prompt_dismiss_count")
   // The pre-#756 shape, frozen by its migration and kept one release so the previous image can still
   // serve during the deploy. Ignored by this client; the next release drops both columns.
-  tenantId     BigInt?   @map("tenant_id") @ignore
-  role         UserRole  @default(AGENT) @ignore
-  createdAt    DateTime  @default(now()) @map("created_at")
-  updatedAt    DateTime  @updatedAt @map("updated_at")
+  tenantId                  BigInt?   @map("tenant_id") @ignore
+  role                      UserRole  @default(AGENT) @ignore
+  createdAt                 DateTime  @default(now()) @map("created_at")
+  updatedAt                 DateTime  @updatedAt @map("updated_at")
 
-  memberships TenantUser[]
+  memberships        TenantUser[]
+  endedSessions      EndedSession[]
+  passkeys           Passkey[]
+  webauthnChallenges WebauthnChallenge[]
 
   @@map("users")
+}
+
+model Passkey {
+  id         String    @id
+  userId     BigInt    @map("user_id")
+  publicKey  Bytes     @map("public_key")
+  // The signature counter, moved only by a compare-and-swap on sign-in.
+  counter    BigInt    @default(0)
+  transports String[]
+  deviceType String    @map("device_type")
+  backedUp   Boolean   @map("backed_up")
+  name       String?
+  // Who keeps it (iCloud Keychain, Google Password Manager...), from the AAGUID, or the browser and
+  // OS it was created from.
+  provider   String?
+  createdAt  DateTime  @default(now()) @map("created_at")
+  lastUsedAt DateTime? @map("last_used_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("passkeys")
+}
+
+enum WebauthnChallengeType {
+  REGISTRATION
+  // A registration asked for as a conditional create, the browser's silent upgrade after a password
+  // sign-in, which reports neither user presence nor verification. Only this type may skip them.
+  CONDITIONAL_REGISTRATION
+}
+
+// A registration challenge, single use. A sign-in challenge is not stored: it travels signed, and
+// only its spent mark is (`webauthn_consumed_challenges`).
+model WebauthnChallenge {
+  id        String                @id @default(uuid())
+  type      WebauthnChallengeType
+  challenge String
+  userId    BigInt                @map("user_id")
+  expiresAt DateTime              @map("expires_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@map("webauthn_challenges")
+}
+
+model WebauthnConsumedChallenge {
+  challengeHash String   @id @map("challenge_hash")
+  expiresAt     DateTime @map("expires_at")
+
+  @@index([expiresAt])
+  @@map("webauthn_consumed_challenges")
+}
+
+// A session that logged out, named by its token's `jti` and kept until that token would have expired
+// anyway. The session read refuses a token named here; a token with no `jti` cannot be named.
+model EndedSession {
+  jti       String   @id
+  userId    BigInt   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  endedAt   DateTime @default(now()) @map("ended_at")
+  // Ended because a re-issued cookie replaced it in the same browser, not by a logout: its sockets
+  // reconnect under the new cookie instead of signing out.
+  replaced  Boolean  @default(false)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("ended_sessions")
 }
 
 // A person's membership in a tenant, and their role THERE (Chatwoot's `account_users`). GLOBAL table
@@ -258,9 +392,12 @@ model TenantUser {
 // token is hashed at rest (sha256); the plaintext is returned ONCE as a copyable link. A CHECK
 // (in the migration) forbids role=SUPER_ADMIN (never invitable). One live invite per (tenant,
 // email) — re-invite rotates via upsert.
+// `tenantId` null is a FLEET invitation: it makes the invitee a SUPER_ADMIN and names no tenant. A
+// CHECK ties the two (`role = SUPER_ADMIN` ⟺ `tenant_id IS NULL`), and a partial unique index keeps
+// one fleet invitation per email, since the composite unique below treats every null as distinct.
 model Invitation {
   id          BigInt    @id @default(autoincrement())
-  tenantId    BigInt    @map("tenant_id")
+  tenantId    BigInt?   @map("tenant_id")
   email       String
   role        UserRole
   tokenHash   String    @unique @map("token_hash")
@@ -270,7 +407,7 @@ model Invitation {
   createdAt   DateTime  @default(now()) @map("created_at")
   updatedAt   DateTime  @updatedAt @map("updated_at")
 
-  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@unique([tenantId, email])
   @@index([tenantId, createdAt])
@@ -285,16 +422,28 @@ model Invitation {
 // Chatwoot deployment" is a structural invariant (it keeps conversation.id / contact.id / inbox.id —
 // all per-deployment — globally unique within the tenant, killing cross-deployment id collisions).
 model ChatwootDeployment {
-  id         BigInt   @id @default(autoincrement())
-  tenantId   BigInt   @unique @map("tenant_id")
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @unique @map("tenant_id")
   // NOT globally unique: one Chatwoot server can back MANY tenants (one client per tenant). The
   // shared admin token only ever acts on accounts resolved from RLS-scoped rows, so sharing is safe.
   // Uniqueness lives on the ACCOUNT (ChatwootInstance.serverKey + accountId), not the server.
   // Stored canonical (lowercase origin, no trailing slash) — see normalizeChatwootBaseUrl.
-  baseUrl    String   @map("base_url")
-  adminToken String   @map("admin_token") // encrypted; the shared user/admin access token
-  createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
+  baseUrl        String   @map("base_url")
+  adminToken     String   @map("admin_token") // encrypted; the shared user/admin access token
+  // The base THIS Chatwoot calls the agents on (each Agent Bot's outgoing_url). Null means PUBLIC_URL;
+  // set when the Chatwoot reaches the agents on a private address. Stored canonical, no trailing slash.
+  webhookBaseUrl String?  @map("webhook_base_url")
+  // The address people open this Chatwoot on, for the links the console and case notes print. Null
+  // means base_url; set when base_url is a private address only the servers reach.
+  publicUrl      String?  @map("public_url")
+  // The key the deployment's accounts are reserved under across tenants: the address it was first
+  // connected on. Null means base_url; pinned when the base URL moves, so a move never frees a claim.
+  serverKey      String?  @map("server_key")
+  // Every base URL it answered on before the current one, so each address a move left behind still
+  // holds its accounts for every other tenant.
+  formerBaseUrls String[] @default([]) @map("former_base_urls")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
 
   tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instances ChatwootInstance[]
@@ -307,23 +456,31 @@ model ChatwootDeployment {
 // identity (accountId/name) and the soft-disconnect flag. The 5 FK tables below still reference this
 // row's id, so reparenting it under a deployment leaves their keys untouched.
 model ChatwootInstance {
-  id             BigInt    @id @default(autoincrement())
-  tenantId       BigInt    @map("tenant_id")
-  deploymentId   BigInt    @map("deployment_id")
-  accountId      Int       @map("account_id")
+  id               BigInt      @id @default(autoincrement())
+  tenantId         BigInt      @map("tenant_id")
+  deploymentId     BigInt      @map("deployment_id")
+  accountId        Int         @map("account_id")
   // Normalized base URL of the parent deployment, denormalized so a Chatwoot ACCOUNT (server +
   // accountId) is globally unique to ONE tenant — a shared server can back many tenants, but the
   // same account can't. See normalizeChatwootBaseUrl + @@unique([serverKey, accountId]) below.
-  serverKey      String    @map("server_key")
-  accountName    String?   @map("account_name") // display name, refreshed on sync (Chatwoot can rename)
+  serverKey        String      @map("server_key")
+  // When Chatwoot created the account (`GET /api/v1/accounts/:id`, milliseconds): with accountId, the
+  // account's identity across tenants whatever address reaches it. Null until the reconcile sweep
+  // reads it for a row connected before it existed.
+  accountCreatedAt DateTime?   @map("account_created_at")
+  accountName      String?     @map("account_name") // display name, refreshed on sync (Chatwoot can rename)
   // Soft-disconnect: "remove account" keeps the rows (conversations/inboxes/contacts) for history +
   // analytics but unbinds agents and makes the webhook/runtime ignore the account. Null = active.
-  disconnectedAt DateTime? @map("disconnected_at")
+  disconnectedAt   DateTime?   @map("disconnected_at")
+  // How far the Chatwoot reconciliation sweep has read this account: the start of its last pass that
+  // finished. The next pass reads from here (minus a margin), so an outage of any length is read on
+  // the way back. Null until the first pass, which then reads one recovery ceiling back.
+  reconciledUntil  DateTime?   @map("reconciled_until")
   // WHO answers this account's API. CHATWOOT is a real Chatwoot; RYZE is the in-process emulator in
   // src/modules/ryze, which serves the same API over our own tables and delivers through RyzeAPI.
-  kind           ChannelKind @default(CHATWOOT)
-  createdAt      DateTime  @default(now()) @map("created_at")
-  updatedAt      DateTime  @updatedAt @map("updated_at")
+  kind             ChannelKind @default(CHATWOOT)
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
 
   tenant              Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   deployment          ChatwootDeployment        @relation(fields: [deploymentId], references: [id], onDelete: Cascade)
@@ -335,10 +492,14 @@ model ChatwootInstance {
   agentBots           ChatwootAgentBot[]
   agentThreads        AgentThread[]
   attendanceSummaries AttendanceSummary[]
+  otherInboxSummaries OtherInboxSummary[]
 
   @@unique([tenantId, accountId])
   // Global (no tenantId): one Chatwoot account belongs to a single tenant across the whole fleet.
   @@unique([serverKey, accountId])
+  // The same account reached through another address of its installation. Rows still without an
+  // identity are distinct under it (NULLs never collide) and keep the address index above.
+  @@unique([accountId, accountCreatedAt])
   @@index([deploymentId])
   @@map("chatwoot_instances")
 }
@@ -392,6 +553,13 @@ model ChatwootWebhookDelivery {
   // and measuring that live attempt from the ORIGINAL receipt makes it look abandoned the moment it
   // starts. NULL = never claimed, so the row is still measured from receipt.
   claimedAt                  DateTime?             @map("claimed_at")
+  // WHICH PROCESS made the current claim: its `process_leases` id, written by the same
+  // CAS that writes `claimedAt`. While that lease is renewed the row is being worked; once it lapses
+  // (or the process released it on exit) nothing will ever finish the attempt, and the dead-claim pass
+  // in src/modules/chatwoot/delivery-sweep.ts settles the row then instead of after the stranded
+  // sweep's 30 minutes. Null on a row an older build claimed and on one claimed while the process had
+  // no lease it could vouch for; those keep the 30-minute window.
+  claimedBy                  String?               @map("claimed_by") @db.Uuid
   // The Chatwoot display id this delivery was about. What the stranded-delivery sweep files its
   // report against, and deliberately the only thing stored: an id, never the event body, so nothing
   // here can hold what the customer wrote. Null on an event that names no conversation, and on every
@@ -538,12 +706,24 @@ model ChatwootWebhookDelivery {
   // cannot say" and falls back to deriving it now, which is what every delivery did before the
   // column.
   settleScopedToThisDelivery Boolean?              @map("settle_scoped_to_this_delivery")
+  // THE BODY CHATWOOT SENT, for an event the delivery recovery cannot rebuild (a status or assignment
+  // change, a colleague's reply), held only while it owes its first attempt (issues #1121, #1217). The
+  // ack writes it in the same INSERT as the row and answers only after that commits, so a process that
+  // dies after the 200 leaves a row a later pass can process from. A customer message stores none: the
+  // recovery rebuilds it from Chatwoot, so the exception to "nothing here holds what the customer
+  // wrote" (issue #228) stays as narrow as it can. The claim clears it in the same statement, the drain
+  // clears it on every row it gives up on (6 hours at most), and nothing reads it but the drain.
+  // Encrypted with `encryptJson`. Null on every row an older build wrote.
+  payload                    String?
 
   tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
 
   @@unique([chatwootInstanceId, deliveryId])
-  @@index([tenantId])
+  // The retention pass's range: settled rows by receipt. Full, not partial on the settled statuses,
+  // because under RLS an enum comparison is not leakproof and the planner cannot prove such a
+  // predicate (see 20261116170000). It also serves every read the bare tenant index served.
+  @@index([tenantId, receivedAt])
   // Serves the other half of the same contract: a turn retiring the rows of the messages it just ran
   // over. ACCOUNT FIRST, because that is how the write is keyed — display ids and message ids are
   // numbered per Chatwoot account, so a conversation id alone matches rows on every account a tenant
@@ -559,21 +739,41 @@ model ChatwootWebhookDelivery {
   // `(chatwoot_instance_id, conversation_id, human_reply_message_id) WHERE human_reply_message_id IS NOT NULL`.
   // The inbound half is the named index above; see 20260908170004 for why the absence case is the
   // one that had to be indexed.
+  // NOTE: and so is the drain's, `(tenant_id, received_at) WHERE payload IS NOT NULL`: only the rows still
+  // holding a body (20261010120100).
+  // NOTE: and so is the dead-claims pass's, `(claimed_at) WHERE claimed_by IS NOT NULL`: only the rows a
+  // process has claimed (20261116120000).
   @@map("chatwoot_webhook_deliveries")
 }
 
 model Inbox {
-  id                 BigInt    @id @default(autoincrement())
-  tenantId           BigInt    @map("tenant_id")
-  chatwootInstanceId BigInt    @map("chatwoot_instance_id")
-  chatwootInboxId    Int       @map("chatwoot_inbox_id")
-  name               String
-  channelType        String?   @map("channel_type")
+  id                  BigInt    @id @default(autoincrement())
+  tenantId            BigInt    @map("tenant_id")
+  chatwootInstanceId  BigInt    @map("chatwoot_instance_id")
+  chatwootInboxId     Int       @map("chatwoot_inbox_id")
+  name                String
+  channelType         String?   @map("channel_type")
+  // THE SOURCE POSITION OF `name` AND `channelType`: the newest Chatwoot timestamp of a
+  // delivery that changed either. The mirror writes the two only when a value differs and the payload
+  // is positioned after this, so an unchanged inbox is never rewritten and a late delivery cannot
+  // restore a replaced name. NULL until the first change.
+  metadataAt          DateTime? @map("metadata_at")
+  // The INBOX'S OWN version (`inbox.updated_at`, unix seconds) as of the name and channel stored, when
+  // the payload that wrote them carried it (message events only). Once set, a payload with
+  // its own clock is ordered by it alone; one without keeps the `metadataAt` rule. NULL: never stated.
+  metadataClock       Float?    @map("metadata_clock")
   // WhatsApp provider (whatsapp_cloud | default(=360dialog) | baileys | zapi) when channelType is
   // Channel::Whatsapp; null for other channels or until an inbox sync populates it. Drives the 24h
   // service-window gate (only the official providers have a window). Captured from the inbox-list sync.
-  provider           String?
-  agentId            BigInt?   @map("agent_id")
+  provider            String?
+  // The channel's connection as the Chatwoot fork last reported it (`open`, `close`, `connecting`,
+  // `reconnecting`, or NULL after a teardown), and WHEN the fork wrote it, with microseconds. The time
+  // orders deliveries: the same change reaches every bot route of the inbox, and two changes can
+  // arrive out of order, so only a report newer than the stored one is applied. Both NULL until the
+  // first report; only WhatsApp session inboxes ever get one. docs/chatwoot.md, "Channel connection".
+  connection          String?   @map("provider_connection")
+  connectionAt        DateTime? @map("provider_connection_at") @db.Timestamptz(6)
+  agentId             BigInt?   @map("agent_id")
   // WHEN THE CURRENT RESPONDER BINDING WAS MADE (issue #476 review, round 31). Chatwoot picks a
   // message's webhook recipients from the bindings that exist AT EMISSION, so an observer beside a
   // responder can only stand down for the responder's own delivery when that responder was already
@@ -583,7 +783,7 @@ model Inbox {
   // editor with the same agent leaves a binding that never lapsed, and its age with it. NULL while
   // the inbox is unbound, and on every row bound before this column existed, where the reader falls
   // back to treating the binding as older than any delivery (the behaviour that predates it).
-  responderBoundAt   DateTime? @map("responder_bound_at")
+  responderBoundAt    DateTime? @map("responder_bound_at")
   // HOW MANY TIMES WHO ROUTES THIS INBOX HAS CHANGED (issue #540). Stepped by a DATABASE TRIGGER on
   // every write that moves a binding — the responder bound, rebound or unbound, an observer attached
   // or detached — so the counter and the world it describes commit together and no writer can miss
@@ -603,19 +803,29 @@ model Inbox {
   //
   // It says nothing about WHAT changed, and it does not need to. Every reader that consults it is
   // deciding whether a re-derivation is still applicable, and any movement is enough to answer no.
-  bindingGeneration  Int       @default(0) @map("binding_generation")
-  workingHours       Json?     @map("working_hours")
+  bindingGeneration   Int       @default(0) @map("binding_generation")
+  // THE VOICE AGENT THAT ANSWERS THIS INBOX'S CALLS, independent of `agentId`, which
+  // answers its messages. NULL while none does.
+  voiceAgentId        BigInt?   @map("voice_agent_id")
+  // The route token of the inbox's call stream. A call never goes through the inbox's Agent Bot: the
+  // Chatwoot fork hands its audio to a stream URL carrying this token, minted once per inbox and
+  // never rotated, so every sync can send the same URL again (encryptJson blob) and the receiver
+  // finds the inbox by the hash. NULL until a voice agent is first bound.
+  voiceRouteToken     String?   @map("voice_route_token")
+  voiceRouteTokenHash String?   @unique @map("voice_route_token_hash")
+  workingHours        Json?     @map("working_hours")
   // Channel::WebWidget provisioning blob (encryptJson of { websiteToken, hmacToken, hmacMandatory,
   // websiteUrl }) for the WhatsApp→chat redirect feature. The hmac_token is secret (used to compute the
   // per-lead identifier_hash), so the whole blob is encrypted at rest. NULL for non-web-widget inboxes.
-  webWidget          String?   @map("web_widget")
-  createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
+  webWidget           String?   @map("web_widget")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
 
-  tenant        Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  instance      ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
-  conversations Conversation[]
-  observers     InboxObserver[]
+  tenant                 Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance               ChatwootInstance        @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  conversations          Conversation[]
+  observers              InboxObserver[]
+  occurrenceSweepCursors OccurrenceSweepCursor[]
 
   @@unique([tenantId, chatwootInstanceId, chatwootInboxId])
   @@map("inboxes")
@@ -671,32 +881,30 @@ model InboxObserver {
   inbox  Inbox  @relation(fields: [inboxId], references: [id], onDelete: Cascade)
   agent  Agent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
-  // ONE WATCHER PER INBOX, and the unique is on the inbox rather than on the pair (issue #476 review,
-  // round 8). The graph's memory thread is keyed by contact-inbox, NOT by agent, so two observers of
-  // one inbox write the same thread — the very duplicate this feature already refuses between an
-  // observer and a responder — and everything downstream (which route transcribes the audio, which
-  // one folds the message in) becomes a coordination problem with no owner. One watcher answers all
-  // of it. Lifting the cap is a memory change first, not a binding one.
-  @@unique([tenantId, inboxId])
+  // ONE ROW PER (INBOX, AGENT): an inbox carries as many watchers as it has rows. Nothing about
+  // observing is shared per inbox: the OBSERVE tick is stateless and keyed per conversation and
+  // agent, and the ingestion two routes can share (memory, STT, vision) is keyed per message, so it
+  // lands once.
+  @@unique([tenantId, inboxId, agentId])
   @@index([inboxId])
   @@index([agentId])
   @@map("inbox_observers")
 }
 
 model Contact {
-  id                 BigInt    @id @default(autoincrement())
-  tenantId           BigInt    @map("tenant_id")
+  id                     BigInt    @id @default(autoincrement())
+  tenantId               BigInt    @map("tenant_id")
   // A Chatwoot contact id is unique inside ONE account, not across the tenant. Without this column
   // two accounts under the same tenant collapsed contact 42 into one row, and the mirror's
   // last-writer-wins left one person's name over another's phone. Inbox and Conversation were
   // already scoped this way; the contact was the odd one out, and the contact-authorization gate
   // treats these fields as the identity it sends to the operator's endpoint.
-  chatwootInstanceId BigInt    @map("chatwoot_instance_id")
-  chatwootContactId  Int?      @map("chatwoot_contact_id")
-  name               String?
-  email              String?
-  phone              String?
-  attributes         Json      @default("{}")
+  chatwootInstanceId     BigInt    @map("chatwoot_instance_id")
+  chatwootContactId      Int?      @map("chatwoot_contact_id")
+  name                   String?
+  email                  String?
+  phone                  String?
+  attributes             Json      @default("{}")
   // Mirror of the contact's Chatwoot custom attributes (meta.sender.custom_attributes, refreshed on
   // every webhook event). Read-only projection: the agent WRITES through the Chatwoot API and this
   // column follows. Feeds the per-agent attribute context injected into the system prompt, so a turn
@@ -704,8 +912,13 @@ model Contact {
   // customAttributesAt is this bag's SOURCE watermark (the Chatwoot event timestamp it came from),
   // not a row mtime: the contact upsert runs outside the per-conversation lock and a contact can be
   // touched by several conversations, so the write is gated on it to keep the snapshot monotonic.
-  customAttributes   Json      @default("{}") @map("custom_attributes")
-  customAttributesAt DateTime? @map("custom_attributes_at")
+  customAttributes       Json      @default("{}") @map("custom_attributes")
+  customAttributesAt     DateTime? @map("custom_attributes_at")
+  // The CONTACT'S OWN version (`meta.sender.updated_at`, unix seconds) of the snapshot that wrote
+  // customAttributes, when that payload carried it. Once set, a payload with its own clock
+  // is ordered by it alone; one without keeps the customAttributesAt rule. NULL: never stated, or
+  // cleared by the agent's write-through, which writes a value no Chatwoot version describes.
+  customAttributesClock  Float?    @map("custom_attributes_clock")
   // Source watermark of each identity field above, for the same reason customAttributesAt exists one
   // field up: the write is unconditional otherwise, and deliveries do arrive out of order, so an
   // older event could restore what a newer one cleared. These are load-bearing beyond the prompt —
@@ -714,21 +927,28 @@ model Contact {
   // One per FIELD, because a Chatwoot payload states a subset of them and absent is not cleared: a
   // row-wide position would let an event that says nothing about the phone advance the phone's own
   // position, and a clear arriving late behind it would then be rejected as stale.
-  nameAt             DateTime? @map("name_at")
-  emailAt            DateTime? @map("email_at")
-  phoneAt            DateTime? @map("phone_at")
-  attributesAt       DateTime? @map("attributes_at")
+  nameAt                 DateTime? @map("name_at")
+  emailAt                DateTime? @map("email_at")
+  phoneAt                DateTime? @map("phone_at")
+  attributesAt           DateTime? @map("attributes_at")
+  // The four `additional_attributes` keys an agent may see and write (contact-fields.ts), as the last
+  // event stated them. Their own watermark, apart from attributesAt: they change for reasons that have
+  // nothing to do with identity, and sharing a position would let a city edit hide a later identifier
+  // change from the authorization gate.
+  additionalAttributes   Json      @default("{}") @map("additional_attributes")
+  additionalAttributesAt DateTime? @map("additional_attributes_at")
   // Per-contact audio-reply preference (TTS mode "preference"): true = wants audio, false = wants
   // text, null = unknown (falls back to mirroring what the customer sent). Set by the agent's
   // set_voice_preference native tool. RLS-scoped column — NOT a Chatwoot custom attribute.
-  voiceReply         Boolean?  @map("voice_reply")
-  createdAt          DateTime  @default(now()) @map("created_at")
-  updatedAt          DateTime  @updatedAt @map("updated_at")
+  voiceReply             Boolean?  @map("voice_reply")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
 
   tenant        Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   instance      ChatwootInstance   @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
   conversations Conversation[]
   authGrants    ContactAuthGrant[]
+  externalUsers ExternalUser[]
 
   @@unique([tenantId, chatwootInstanceId, chatwootContactId])
   @@map("contacts")
@@ -783,23 +1003,23 @@ model ContactAuthGrant {
 }
 
 model Conversation {
-  id                           BigInt    @id @default(autoincrement())
-  tenantId                     BigInt    @map("tenant_id")
-  chatwootInstanceId           BigInt    @map("chatwoot_instance_id")
-  inboxId                      BigInt?   @map("inbox_id")
-  contactId                    BigInt?   @map("contact_id")
-  chatwootConversationId       Int       @map("chatwoot_conversation_id")
+  id                              BigInt    @id @default(autoincrement())
+  tenantId                        BigInt    @map("tenant_id")
+  chatwootInstanceId              BigInt    @map("chatwoot_instance_id")
+  inboxId                         BigInt?   @map("inbox_id")
+  contactId                       BigInt?   @map("contact_id")
+  chatwootConversationId          Int       @map("chatwoot_conversation_id")
   // The Chatwoot ContactInbox id (native: one contact on one inbox/channel). This is the discriminator
   // for the agent's graph memory thread — keying by contact-inbox keeps a contact's parallel channels
   // (WhatsApp vs Instagram, …) in SEPARATE memories instead of mixing them. Mirrored from the webhook
   // payload (conversation.contact_inbox.id), always present for real traffic. NULL only on legacy rows.
-  contactInboxId               Int?      @map("contact_inbox_id")
-  status                       String // mirror: open|pending|resolved|snoozed
-  assigneeId                   Int?      @map("assignee_id")
-  assigneeType                 String?   @map("assignee_type") // User|AgentBot
+  contactInboxId                  Int?      @map("contact_inbox_id")
+  status                          String // mirror: open|pending|resolved|snoozed
+  assigneeId                      Int?      @map("assignee_id")
+  assigneeType                    String?   @map("assignee_type") // User|AgentBot
   // Display name of the current human assignee (meta.assignee.name), mirrored so the console shows a
   // real name instead of "Human #id". NULL when unassigned or assigned to a bot.
-  assigneeName                 String?   @map("assignee_name")
+  assigneeName                    String?   @map("assignee_name")
   // Who closed this conversation, recorded at the moment WE close it: "agent" (the
   // resolve_conversation tool), "followup_abandonment", "redirect_closing", "console",
   // "nothing_to_answer", or "legacy_unknown" for a row the migration found already resolved. NULL = not resolved, or
@@ -807,7 +1027,7 @@ model Conversation {
   // `auto_resolve_after`) — none of which reach us, which is why the dashboard reads a recorded
   // origin instead of inferring one from status + assignee. Cleared whenever the mirror applies a
   // status that is not "resolved". See src/modules/conversations/resolution-origin.ts.
-  resolvedBy                   String?   @map("resolved_by")
+  resolvedBy                      String?   @map("resolved_by")
   // The conversation's status version as the CLOSING CALLER observed it — the floor that says which
   // close the stamp is about. The caller's reading and not the row's at write time: a reopen
   // mirrored between the toggle returning and the write would otherwise date the stamp to the wrong
@@ -817,15 +1037,24 @@ model Conversation {
   // saying nothing about the current one. A claim at or below this floor predates the stamp and is
   // therefore a different close. NULL on a Chatwoot that sends no versions, where there is nothing
   // to compare and the rule falls back to its unprotected form.
-  resolvedByAt                 Float?    @map("resolved_by_at")
-  threadId                     String    @map("thread_id") // tenantId:instanceId:convId
+  resolvedByAt                    Float?    @map("resolved_by_at")
+  threadId                        String    @map("thread_id") // tenantId:instanceId:convId
   // Mirror of the conversation's Chatwoot custom attributes and of the LINKED KANBAN CARD's ones
   // (conversation.custom_attributes / conversation.kanban_task.custom_attributes on the webhook
   // payload). Same contract as Contact.customAttributes: refreshed on every event, read by the
   // attribute-context block. kanbanAttributes stays {} on upstream Chatwoot (no card in the payload).
-  customAttributes             Json      @default("{}") @map("custom_attributes")
-  kanbanAttributes             Json      @default("{}") @map("kanban_attributes")
-  lastEventAt                  DateTime? @map("last_event_at")
+  customAttributes                Json      @default("{}") @map("custom_attributes")
+  kanbanAttributes                Json      @default("{}") @map("kanban_attributes")
+  // The fork's `conversation.group_type` ("group" | "individual"), mirrored under the same rule as
+  // the bags above: written only when the payload carried it. Read by the contact gate's local rule
+  // (docs/contact-auth.md). NULL = the payload never said (a Chatwoot without the field).
+  conversationType                String?   @map("conversation_type")
+  // The conversation's Chatwoot label titles as the last applied event stated them (push_data.labels),
+  // assigned wholesale on the bags' terms. Read by the dashboard's outcome-by-label view and by the
+  // contact gate's `label` condition, which compares ignoring case. Empty until an event carrying
+  // them arrives.
+  labels                          String[]  @default([])
+  lastEventAt                     DateTime? @map("last_event_at")
   // Ordering watermark for conversation-level STATE (status + assignee), mirrored from the payload's
   // conversation `updated_at` — the source row's version stamp, which advances on every write to it,
   // including the status and assignee changes that `last_activity_at` ignores. lastEventAt cannot
@@ -842,15 +1071,48 @@ model Conversation {
   // as a timestamp: two writes to the same conversation land microseconds apart, and a TIMESTAMP(3)
   // would round them to the same millisecond, making the version comparison lose the ordering these
   // columns exist to provide.
-  chatwootStatusAt             Float?    @map("chatwoot_status_at")
-  chatwootAssigneeAt           Float?    @map("chatwoot_assignee_at")
+  chatwootStatusAt                Float?    @map("chatwoot_status_at")
+  // The version at which the status or the holder last MOVED at the source, beside the field marks,
+  // which move on every ordered conversation event, a restatement included. Read by one question
+  // only: whether a person's reply was overtaken by a later decision about who holds the
+  // conversation (issue #1028). The reply's own conversation_updated restates both a few
+  // milliseconds after the reply's snapshot, and against `chatwootStatusAt` it reads as a hand-back.
+  // Null on rows written before it existed.
+  chatwootOwnershipChangedAt      Float?    @map("chatwoot_ownership_changed_at")
+  chatwootAssigneeAt              Float?    @map("chatwoot_assignee_at")
   // Third mark, same axis, for `redirectOriginDisplayId`. It needs one of its own because the fork
   // records the pairing with an update of its own, so from that write on the field describes a
   // version the other two marks do not. And it cannot fall back to `lastEventAt` the way the
   // attribute bags do: a column write leaves Chatwoot's `last_activity_at` untouched, so the
   // conversation_updated that announces a new pairing arrives with a FROZEN activity timestamp and a
   // recency fence would discard exactly the payload that carries the answer.
-  chatwootRedirectOriginAt     Float?    @map("chatwoot_redirect_origin_at")
+  chatwootRedirectOriginAt        Float?    @map("chatwoot_redirect_origin_at")
+  // The facts with no version of their own (the labels, the two attribute bags, the type), each with
+  // the version (`updated_at`) of the payload that last wrote it. `last_activity_at` does not move
+  // when they change and `updated_at` does, so a payload behind a fact's mark is older than the value
+  // stored even when it shares its second. One per fact, written with the fact, for the reason the
+  // state has split marks: a payload that omits one must not advance a mark over a value it never
+  // stated. NULL until the first versioned payload writes that fact.
+  chatwootLabelsAt                Float?    @map("chatwoot_labels_at")
+  chatwootCustomAttributesAt      Float?    @map("chatwoot_custom_attributes_at")
+  chatwootConversationTypeAt      Float?    @map("chatwoot_conversation_type_at")
+  chatwootKanbanAttributesAt      Float?    @map("chatwoot_kanban_attributes_at")
+  // The kanban card whose attributes `kanbanAttributes` holds, and the card's own `updated_at` (unix
+  // seconds) as of them. Editing a card writes the card and not the conversation, so two snapshots of
+  // one conversation version can carry two states of the same card, and this clock orders them.
+  chatwootKanbanCardId            Int?      @map("chatwoot_kanban_card_id")
+  chatwootKanbanCardAt            Float?    @map("chatwoot_kanban_card_at")
+  // The version of the newest stated NULL pairing that did not count as an answer: a null on a
+  // conversation never told about a pairing, which stamps nothing above so `episodeOriginQuery` keeps
+  // its recency fallback. A stated origin older than this is refused, since the null is newer news.
+  chatwootRedirectOriginClearedAt Float?    @map("chatwoot_redirect_origin_cleared_at")
+  // The relations' marks: the version (`updated_at`) of the payload that last wrote the contact, the
+  // contact inbox and the inbox. Moving a relation is a write to the conversation, so its version
+  // moves and `last_activity_at` does not. Stamped only by a payload that NAMES the relation, so a
+  // degraded one cannot advance a mark over a value it never stated. NULL until then.
+  chatwootContactAt               Float?    @map("chatwoot_contact_at")
+  chatwootContactInboxAt          Float?    @map("chatwoot_contact_inbox_at")
+  chatwootInboxAt                 Float?    @map("chatwoot_inbox_at")
   // THE LOCAL STATUS CLAIM (issue #436): a status this side wrote that the source has not versioned,
   // and the instant that write stops fencing this row. NULL = no local write is outstanding.
   //
@@ -864,7 +1126,7 @@ model Conversation {
   //
   // A DEADLINE and not a flag, because the only thing that can end it other than the writer is the
   // writer's death. See src/modules/chatwoot/status-claim.ts for how long and why.
-  statusClaimUntil             DateTime? @map("status_claim_until")
+  statusClaimUntil                DateTime? @map("status_claim_until")
   // The status the claim is still REPLACING AT THE SOURCE, and the only one it refuses. A payload
   // restating it while the claim is live is a snapshot from before the write; a payload stating
   // anything else is news, and refusing that would drop a resolve nothing ever redelivers.
@@ -872,22 +1134,22 @@ model Conversation {
   // Written and cleared with the column above, always as a pair: only a write that moves the row
   // BEFORE it calls Chatwoot can take a claim, because only then is there a transition in flight for
   // a payload to be behind. See src/modules/chatwoot/status-claim.ts.
-  statusClaimFrom              String?   @map("status_claim_from")
+  statusClaimFrom                 String?   @map("status_claim_from")
   // The version the SOURCE gave the transition this claim announced, learned from the live read the
   // takeover makes after its toggle. NULL is the gap: until it is written there is nothing to place a
   // payload against, and no reading of the ordering marks supplies one, since a mark that moved says
   // only that some write arrived, never whose or when. Once it is written the question is ordinary
   // again — strictly ahead of it was committed after our write.
-  statusClaimStampedAt         Float?    @map("status_claim_stamped_at")
+  statusClaimStampedAt            Float?    @map("status_claim_stamped_at")
   // The newest version the claim refused while that gap was open. Kept because we ACK those events
   // and Chatwoot never redelivers them: the reconcile that stamps the column above adjudicates this
   // one against it, and a version ahead of ours is a transition committed after our write (a
   // colleague handing the conversation back) whose status therefore stands. Cleared with the answer.
-  statusClaimRefusedAt         Float?    @map("status_claim_refused_at")
+  statusClaimRefusedAt            Float?    @map("status_claim_refused_at")
   // Debounce watermark: the Chatwoot message id of the last inbound message already handled
   // (responded to or deliberately skipped). The flush re-fetches and answers only ids beyond it,
   // so re-arm / retry / a concurrent claim cannot produce a duplicate reply. NULL = nothing handled.
-  lastHandledMessageId         Int?      @map("last_handled_message_id")
+  lastHandledMessageId            Int?      @map("last_handled_message_id")
   // THE REPLY CLAIM: the burst id the last posting path claimed before sending — the debounce flush
   // and the manual re-engage alike, which is what keeps them exclusive. It cannot be the watermark
   // above, and that is the whole reason it exists (issue #452): the watermark is also advanced by
@@ -896,7 +1158,7 @@ model Conversation {
   // the tail the re-engage answers, and a CAS against it can never win again. Monotonic like the
   // watermark, and RELEASED when the turn throws before delivering, because that path does not
   // advance the watermark either. NULL = nothing has ever claimed a reply here.
-  lastRepliedMessageId         Int?      @map("last_replied_message_id")
+  lastRepliedMessageId            Int?      @map("last_replied_message_id")
   // WHEN our side last spoke here, and it is a different question from `lastInboundAt` below rather
   // than a second spelling of it. Stamped beside the claim above, which is one statement short of a
   // send, so a turn that never sends leaves it untouched.
@@ -910,23 +1172,44 @@ model Conversation {
   // NULL on every row that predates the column, and the fence falls back to `lastInboundAt` there:
   // a backfilled value would assert a moment nobody measured, and the fallback keeps today's
   // behaviour for everything already in flight.
-  lastRepliedAt                DateTime? @map("last_replied_at")
+  lastRepliedAt                   DateTime? @map("last_replied_at")
   // When our side last spoke PROACTIVELY and it reached the customer (issue #816): a follow-up, an
   // appointment reminder, a channel-redirect follow-up or an inbound `agent_nudge`, as a message or an
   // approved template. A nudge claims no customer message, so it moves neither reply mark above;
   // this is what `ourSideHasSpoken` reads for it. Deliberately NOT part of the follow-up's silence
   // key (`GREATEST(last_inbound_at, last_replied_at)`): a follow-up step that moved it would open a
   // new episode and restart its own ladder. NULL on rows that predate it.
-  lastProactiveAt              DateTime? @map("last_proactive_at")
+  lastProactiveAt                 DateTime? @map("last_proactive_at")
+  // When the per-agent turn limit last handed this conversation to a person
+  // (src/modules/turn-limit). The window counts only deliveries after it, so a conversation handed
+  // back to the bot starts from zero instead of tripping again on its first reply. NULL = never.
+  turnLimitTrippedAt              DateTime? @map("turn_limit_tripped_at")
+  // The mirror's `chatwootOwnershipChangedAt` as the trip read it, before its own transfer. A
+  // hand-back is the mark moving past it: source versions only, never our clock against Chatwoot's.
+  turnLimitTripMark               Float?    @map("turn_limit_trip_mark")
+  // The last `error` line of the proactive limit (src/modules/proactive-limit): a refusal within a
+  // day of it is logged below `error`, so the alert channels hear about a loop once.
+  proactiveLimitAlertedAt         DateTime? @map("proactive_limit_alerted_at")
   // Timestamp of the last INCOMING customer message — the WhatsApp 24h service-window anchor. A
   // proactive (follow-up/nudge) free-form send is only allowed within the window; outside it, an
   // approved template (HSM) is required. NULL = no inbound seen yet.
-  lastInboundAt                DateTime? @map("last_inbound_at")
+  lastInboundAt                   DateTime? @map("last_inbound_at")
+  // The Chatwoot id of the newest incoming customer message mirrored here, moved with
+  // `lastInboundAt` and only forward. An IDENTITY where that one is a time: two messages in one
+  // second share `lastInboundAt`, never this. Pinned by the failed-turn hand-over's claim
+  // (src/modules/conversations/failure-note.ts), so a message mirrored after its last ask makes the
+  // claim lose. NULL = none mirrored since the column existed.
+  lastInboundMessageId            Int?      @map("last_inbound_message_id")
+  // A row the occurrences sweep inserted for an inbox no agent receives (src/modules/occurrences/sweep.ts):
+  // written once, with the inbox, and never touched by the sweep again. The conversation list and the
+  // dashboards count what the agents received and leave it out; the first webhook that mirrors the
+  // conversation writes it as new and clears the flag.
+  sweepOnly                       Boolean   @default(false) @map("sweep_only")
   // The newest Chatwoot message id the contact authorization gate REFUSED here (issue #890). Media of a
   // message at or below it is never sent to an STT or vision provider, whatever the gate answers
   // later: a consent given after a file was sent does not cover that file, and a late update of the
   // refused message would otherwise ask the gate again and get the new yes. Only ever raised.
-  mediaRefusedThroughMessageId BigInt?   @map("media_refused_through_message_id")
+  mediaRefusedThroughMessageId    BigInt?   @map("media_refused_through_message_id")
   // Chatwoot's own first-response SLA, mirrored rather than derived. Chatwoot computes both from
   // the messages table and ships them on every conversation payload, so the pair answers "how long
   // did the team take to answer" on an inbox the agent never touched — the one question the
@@ -948,27 +1231,39 @@ model Conversation {
   // NULL = the payload never carried it: a conversation with no qualifying reply yet, or one no
   // event has been seen for since these columns existed. The KPI needs both, and reports the size
   // of its sample beside the median so a partial backfill can be seen instead of assumed away.
-  chatwootCreatedAt            DateTime? @map("chatwoot_created_at")
-  chatwootFirstReplyAt         DateTime? @map("chatwoot_first_reply_at")
+  chatwootCreatedAt               DateTime? @map("chatwoot_created_at")
+  chatwootFirstReplyAt            DateTime? @map("chatwoot_first_reply_at")
+  // When the earliest PUBLIC outgoing message the platform posted on the admin token
+  // (`fazer_ai_platform_sent`, such as a cross-inbox case opening) was created. Chatwoot signs that
+  // message with a user, so when it is the first one it becomes `first_reply_created_at` although
+  // no person answered, and the KPI leaves the conversation out. Earliest wins, whatever order the
+  // deliveries land in.
+  chatwootPlatformReplyAt         DateTime? @map("chatwoot_platform_reply_at")
   // Watermark for follow-up single-shot semantics: set after each follow-up (sent or silenced).
   // Another follow-up can only fire once the client speaks again (lastInboundAt > lastFollowUpAt).
   // NULL = no follow-up has ever been attempted for this conversation.
-  lastFollowUpAt               DateTime? @map("last_follow_up_at")
+  lastFollowUpAt                  DateTime? @map("last_follow_up_at")
+  // Where the SNOOZED ladder stands (issue #1184): the Chatwoot id of the person's message it chases, how
+  // many steps it has spent on that message, and when the last one ran. A new message from the person
+  // is a new anchor, and the ladder starts over at step 0. NULL = the ladder never ran here.
+  snoozedFollowUpAnchorId         Int?      @map("snoozed_follow_up_anchor_id")
+  snoozedFollowUpStep             Int?      @map("snoozed_follow_up_step")
+  snoozedFollowUpAt               DateTime? @map("snoozed_follow_up_at")
   // Last agent-turn failure for this conversation, surfaced to the operator with a manual
   // "re-engage" action. Sanitized (no PII/secret in the clear); cleared on a successful turn.
   // NULL = the last turn was fine (or none ran yet).
-  lastError                    String?   @map("last_error")
-  lastErrorAt                  DateTime? @map("last_error_at")
+  lastError                       String?   @map("last_error")
+  lastErrorAt                     DateTime? @map("last_error_at")
   // When the "the agent could not answer, a human has to take over" private note was last posted for
   // this conversation. Distinct from lastErrorAt, which is stamped on EVERY failed attempt including
   // the ones a retry will fix: this one is only stamped when the turn is definitively lost, and it is
   // the coalescing anchor + the concurrency claim (the conditional write that sets it is what elects
   // the single announcer). NULL = never announced.
-  failureNoticeSentAt          DateTime? @map("failure_notice_sent_at")
+  failureNoticeSentAt             DateTime? @map("failure_notice_sent_at")
   // When the customer activated test mode in this conversation by sending /teste (item 1). NULL =
   // not activated; a "test" agent stays silent until this is set. /reset deliberately does NOT clear
   // it (the conversation keeps answering after a reset).
-  testActivatedAt              DateTime? @map("test_activated_at")
+  testActivatedAt                 DateTime? @map("test_activated_at")
   // The Chatwoot message id of the last /reset that cleared this conversation — the EPISODE
   // boundary. A direct turn answering a message at or below it is from before the operator asked for
   // a clean slate and stands down (src/graph/reset-episode.ts). Every other caller of a turn answers
@@ -981,7 +1276,7 @@ model Conversation {
   // order the operator and the customer actually experienced — the same reason
   // `lastHandledMessageId` above is one. Written with GREATEST, so two commands landing out of order
   // cannot move the boundary back. NULL = never reset.
-  resetAtMessageId             Int?      @map("reset_at_message_id")
+  resetAtMessageId                Int?      @map("reset_at_message_id")
   /// THE SAME BOUNDARY, BUT WRITTEN BY THE CLEARING ITSELF (issue #728, review r7/r8). The column
   /// above records that the operator TYPED `/reset`: it is committed by an earlier, independent
   /// statement, and the memory-clearing step that follows refuses by design when a turn is already
@@ -990,7 +1285,7 @@ model Conversation {
   /// checkpoint, so it cannot exist without them. The ingestion fence reads THIS one, because its
   /// question is about the memory; the fences whose question is about the operator's intent (the
   /// direct turn's, the debounce watermark, the observe tick) keep reading the one above.
-  memoryClearedAtMessageId     Int?      @map("memory_cleared_at_message_id")
+  memoryClearedAtMessageId        Int?      @map("memory_cleared_at_message_id")
   // THE LABELS THAT `/reset` REMOVED, so the observer can tell the command's own removal line from
   // real history (issue #645). Chatwoot narrates a label change as an activity row that carries no
   // `content_attributes` at all, and the row is written by `ActivityMessageJob.perform_later`, so on
@@ -1007,7 +1302,7 @@ model Conversation {
   // or one whose clear never returned) and `[]` is "it removed nothing", which the filter answers
   // differently. Written only by the reset that OWNS the current boundary, so an older command
   // finishing last cannot overwrite a newer one's set.
-  resetClearedLabels           Json?     @map("reset_cleared_labels")
+  resetClearedLabels              Json?     @map("reset_cleared_labels")
   // THE CONSOLE WRITE'S PLACE IN THE SOURCE'S MESSAGE SEQUENCE (issue #469): the newest message
   // Chatwoot knew about when this side last wrote this row WITHOUT a version. NULL = no such write
   // has been made here, or the read that would have named one could not.
@@ -1023,34 +1318,40 @@ model Conversation {
   //
   // Written with GREATEST, like reset_at_message_id: two console writes are separate requests and
   // nothing serializes them, so the older one can commit last and must not move the mark back.
-  consoleWriteAtMessageId      Int?      @map("console_write_at_message_id")
+  consoleWriteAtMessageId         Int?      @map("console_write_at_message_id")
   // When the one-shot "this agent is in test mode, send /teste to activate" private note was posted
   // to a silenced conversation. Anti-spam: posted at most once per conversation (NULL = not yet).
   // /reset clears it so a fresh note can be posted on the next silenced message.
-  testNoticeSentAt             DateTime? @map("test_notice_sent_at")
+  testNoticeSentAt                DateTime? @map("test_notice_sent_at")
+  // When the test-mode silence opened this conversation for the team (Chatwoot starts it `pending` on
+  // a bot inbox, a tab nobody watches), and who Chatwoot assigned it to in that same write (NULL =
+  // nobody). /teste returns it to the agent only while it is still in that state; any other holder
+  // took it. Cleared by /teste.
+  testParkedOpenAt                DateTime? @map("test_parked_open_at")
+  testParkedAssigneeId            Int?      @map("test_parked_assignee_id")
   // When the one-shot "message received outside business hours" private note was posted. Same anti-spam
   // one-shot as testNoticeSentAt: the agent stays silent outside its configured business hours and the
   // operator is notified once per conversation (NULL = not yet). /reset clears it.
-  outOfHoursNoticeSentAt       DateTime? @map("out_of_hours_notice_sent_at")
+  outOfHoursNoticeSentAt          DateTime? @map("out_of_hours_notice_sent_at")
   // When the customer-facing out-of-hours message was last SENT (issue #153). Separate from the note
   // above because the two answer different questions on different clocks: the note tells the operator
   // why the bot is quiet, once per conversation; the message tells the CUSTOMER, once per local day,
   // and a conversation that already carried a note today must still get the message the first time the
   // operator writes one. NULL = never sent. /reset clears it.
-  awayMessageSentAt            DateTime? @map("away_message_sent_at")
+  awayMessageSentAt               DateTime? @map("away_message_sent_at")
   // WhatsApp→chat redirect gate watermarks (only on the entry WhatsApp conversation). redirectSentAt =
   // when the redirect link was last sent (one-shot + cooldown anchor); redirectCount = how many times it
   // has been sent (bounded by maxResends). NULL/0 = never redirected.
-  redirectSentAt               DateTime? @map("redirect_sent_at")
-  redirectCount                Int       @default(0) @map("redirect_count")
+  redirectSentAt                  DateTime? @map("redirect_sent_at")
+  redirectCount                   Int       @default(0) @map("redirect_count")
   // Cross-link watermark (only on the widget conversation). Set once, when the redirect merge is linked
   // to the WhatsApp sibling: test-mode activation propagated + the cross-link private notes posted. NULL
   // = not yet linked; a non-null value stops the one-shot from re-running / re-spamming.
-  redirectLinkedAt             DateTime? @map("redirect_linked_at")
+  redirectLinkedAt                DateTime? @map("redirect_linked_at")
   // Closing watermark (only on the widget conversation). Set once, via a CAS, by whichever fires first:
   // the follow-up ladder's terminal "closing" stage OR the widget conversation being resolved. Guarantees
   // the closing message + resolve is delivered at most once per redirect episode. NULL = not yet closed.
-  redirectClosedAt             DateTime? @map("redirect_closed_at")
+  redirectClosedAt                DateTime? @map("redirect_closed_at")
   // The WhatsApp entry conversation this widget thread was redirected FROM, as its chatwootConversationId
   // (Chatwoot's per-account display_id, the same number this table's chatwootConversationId holds — never
   // Chatwoot's primary key). Written by the fork's token resolve at the one moment the pairing is a fact
@@ -1060,7 +1361,7 @@ model Conversation {
   // It also goes BACK to NULL: the fork clears the pairing when a re-entry's token names no origin,
   // and states that as an explicit null on the payload rather than by omitting the key — which is
   // why the mirror distinguishes a stated null from an absent key (`normalize.ts`).
-  redirectOriginDisplayId      Int?      @map("redirect_origin_display_id")
+  redirectOriginDisplayId         Int?      @map("redirect_origin_display_id")
   // WHERE THE PER-MESSAGE ERA BEGINS ON THIS CONVERSATION (issue #690), and it is a VALUE rather
   // than "does this conversation have any claim rows yet". Written once, at the moment the first row
   // is written for it, holding `lastHandledMessageId` as it stood then.
@@ -1080,16 +1381,22 @@ model Conversation {
   // back into "no row above the floor", which is "open" — the pruned messages reopen and the bot
   // answers a year-old burst. Pruning above this floor requires moving it forward past what was
   // pruned, in the same transaction. Nothing prunes today; this is the rule the table is born with.
-  replyClaimFloorMessageId     Int?      @map("reply_claim_floor_message_id")
-  createdAt                    DateTime  @default(now()) @map("created_at")
-  updatedAt                    DateTime  @updatedAt @map("updated_at")
+  replyClaimFloorMessageId        Int?      @map("reply_claim_floor_message_id")
+  createdAt                       DateTime  @default(now()) @map("created_at")
+  updatedAt                       DateTime  @updatedAt @map("updated_at")
 
-  tenant          Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  instance        ChatwootInstance    @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
-  inbox           Inbox?              @relation(fields: [inboxId], references: [id], onDelete: SetNull)
-  contact         Contact?            @relation(fields: [contactId], references: [id], onDelete: SetNull)
-  replyClaims     MessageReplyClaim[]
-  replyDispensals ReplyDispensal[]
+  tenant                 Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance               ChatwootInstance             @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+  inbox                  Inbox?                       @relation(fields: [inboxId], references: [id], onDelete: SetNull)
+  contact                Contact?                     @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  replyClaims            MessageReplyClaim[]
+  turnDeliveries         AgentTurnDelivery[]
+  replyDispensals        ReplyDispensal[]
+  ruleStates             DecisionRuleState[]
+  ruleClaims             DecisionRuleClaim[]
+  readings               ConversationReading[]
+  occurrenceReads        OccurrenceConversationRead[]
+  occurrenceThemeMembers OccurrenceThemeMember[]
 
   @@unique([tenantId, chatwootInstanceId, chatwootConversationId])
   @@index([threadId])
@@ -1101,6 +1408,12 @@ model Conversation {
   /// each append walks that account's whole conversation history to find the handful of rows sharing
   /// one contact-inbox.
   @@index([tenantId, chatwootInstanceId, contactInboxId])
+  @@index([tenantId, createdAt])
+  /// WHAT A DELETED CONTACT'S `SetNull` READS (issue #1531). Every contact that goes makes Postgres
+  /// find the conversations pointing at it; unindexed, that is a scan of the whole table per contact,
+  /// and removing an account of 10k contacts spent 48.8 s of its 49.9 s there. Built CONCURRENTLY in
+  /// 20261018190000.
+  @@index([contactId])
   @@map("conversations")
 }
 
@@ -1299,37 +1612,75 @@ model AttendanceSummary {
   @@map("attendance_summaries")
 }
 
+// The summary of a conversation in another inbox, for the turns of the same contact elsewhere
+// (src/modules/other-inboxes/). Keyed on the conversation, not on the agent: what the conversation
+// says does not depend on who reads it. `coveredMessageId` is the newest PUBLIC message the summary
+// covers, so a private note or an activity row never makes it stale.
+model OtherInboxSummary {
+  id                     BigInt   @id @default(autoincrement())
+  tenantId               BigInt   @map("tenant_id")
+  chatwootInstanceId     BigInt   @map("chatwoot_instance_id")
+  // Chatwoot display_id of the summarized conversation.
+  chatwootConversationId Int      @map("chatwoot_conversation_id")
+  summary                String
+  coveredMessageId       Int      @map("covered_message_id")
+  // The newest public messages' fingerprint when the summary was written (other-inboxes/read.ts): an edit or a
+  // late transcription changes it without a new message id.
+  coveredFingerprint     String   @map("covered_fingerprint")
+  // When the summary was produced, which is what the minimum interval between two runs counts from.
+  generatedAt            DateTime @map("generated_at")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  tenant   Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  instance ChatwootInstance @relation(fields: [chatwootInstanceId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, chatwootInstanceId, chatwootConversationId])
+  @@map("other_inbox_summaries")
+}
+
 // ──────────────────────────────────────────────── agent config ──
 
 model Agent {
-  id                  BigInt    @id @default(autoincrement())
-  tenantId            BigInt    @map("tenant_id")
-  name                String
-  systemPrompt        String    @map("system_prompt")
-  modelConfig         Json      @default("{}") @map("model_config")
-  businessHoursId     BigInt?   @map("business_hours_id")
-  followUpHoursId     BigInt?   @map("follow_up_hours_id")
-  transferWithSummary Boolean   @default(true) @map("transfer_with_summary")
-  enabled             Boolean   @default(true)
+  id                     BigInt    @id @default(autoincrement())
+  tenantId               BigInt    @map("tenant_id")
+  name                   String
+  systemPrompt           String    @map("system_prompt")
+  modelConfig            Json      @default("{}") @map("model_config")
+  businessHoursId        BigInt?   @map("business_hours_id")
+  followUpHoursId        BigInt?   @map("follow_up_hours_id")
+  transferWithSummary    Boolean   @default(true) @map("transfer_with_summary")
+  enabled                Boolean   @default(true)
   // Test vs production mode (item 1). A "test" agent stays silent in a conversation until the
   // customer sends /teste (which sets Conversation.testActivatedAt); "production" answers normally.
   // New agents are created in "test"; existing rows default to "production" so live agents keep
   // answering after the migration.
-  mode                String    @default("production")
-  settings            Json      @default("{}")
+  mode                   String    @default("production")
+  // What the agent answers, fixed when it is created: "text" (messages) or "voice" (calls).
+  // A voice agent is bound to an inbox through `Inbox.voiceAgentId`, beside the text agent.
+  kind                   String    @default("text")
+  settings               Json      @default("{}")
   // NOTE: Watermark stamped when the EFFECTIVE follow-up state (enabled && production && followUp.enabled)
   // transitions OFF→ON. The sweep only STARTS a sequence for conversations whose lastInboundAt is at
   // or after this instant, so arming follow-up never blasts the historical backlog. NULL = never
   // armed (fail-safe: the sweep skips this agent's conversations entirely).
-  followUpArmedAt     DateTime? @map("follow_up_armed_at")
-  createdAt           DateTime  @default(now()) @map("created_at")
-  updatedAt           DateTime  @updatedAt @map("updated_at")
+  followUpArmedAt        DateTime? @map("follow_up_armed_at")
+  // NOTE: The same fence for the snoozed ladder (snoozedFollowUp, issue #1184), stamped on its own OFF→ON
+  // transition: a person's message older than this instant never starts that ladder, so switching it on
+  // does not remind the whole snoozed backlog at once. NULL = never armed, and the sweep skips the agent.
+  snoozedFollowUpArmedAt DateTime? @map("snoozed_follow_up_armed_at")
+  createdAt              DateTime  @default(now()) @map("created_at")
+  updatedAt              DateTime  @updatedAt @map("updated_at")
 
   tenant            Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   toolSelections    AgentToolSelection[]
   chatwootBots      ChatwootAgentBot[]
   contactAuthGrants ContactAuthGrant[]
   observedInboxes   InboxObserver[]
+  detachedThreads   DetachedThread[]
+  clientApps        ClientApp[]
+  ruleStates        DecisionRuleState[]
+  ruleClaims        DecisionRuleClaim[]
 
   @@index([tenantId])
   @@map("agents")
@@ -1352,6 +1703,188 @@ model BusinessHours {
 
   @@index([tenantId])
   @@map("business_hours")
+}
+
+// ──────────────────────────────────────────────── dashboards ──
+
+// A dashboard the account builds out of panels (docs/dashboards.md). Pro: the service, the routes
+// and the screens leave the Free tree; these tables exist in every edition so the schema never
+// diverges. `slug` is the readable part of its route, unique inside the tenant.
+model Dashboard {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  name           String
+  slug           String
+  // 24h | today | 7d | 30d: the period the view opens on.
+  defaultRange   String   @default("24h") @map("default_range")
+  // 0 (off), 60 or 300.
+  refreshSeconds Int      @default(60) @map("refresh_seconds")
+  // The TV mode's rotation: the dashboards it alternates, in order, by id, each for `tvSeconds`. Empty:
+  // the TV shows this dashboard alone. A removed id is skipped on read.
+  tvRotation     BigInt[] @default([]) @map("tv_rotation")
+  tvSeconds      Int      @default(30) @map("tv_seconds")
+  // Who may open it by its public address without a console account: verified e-mails, lower-case,
+  // and e-mail domains, lower-case, matched whole (docs/dashboards.md, "Viewer access").
+  viewerEmails   String[] @default([]) @map("viewer_emails")
+  viewerDomains  String[] @default([]) @map("viewer_domains")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  tenant     Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  panels     DashboardPanel[]
+  visits     DashboardViewerVisit[]
+  embedLinks DashboardEmbedLink[]
+
+  @@unique([tenantId, slug])
+  @@map("dashboards")
+}
+
+// One panel of a dashboard. `query` is the declarative query (src/modules/dashboards/query-schema.ts),
+// parsed on every read; `position` orders the grid.
+model DashboardPanel {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  dashboardId   BigInt   @map("dashboard_id")
+  position      Int
+  // third | half | two_thirds | full
+  width         String   @default("half")
+  title         String
+  description   String?
+  // number | timeseries | bars | table
+  visualization String
+  query         Json
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  dashboard Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, dashboardId, position])
+  @@map("dashboard_panels")
+}
+
+// An HTTP endpoint answering JSON that panels read their figures from (docs/dashboards.md, "HTTP
+// sources"). The request runs on the server: `credentialRef` names a vault entry, never its secret.
+// `{since}`, `{until}` and `{tz}` in the URL and the body are the panel's window.
+model DashboardDataSource {
+  id            BigInt   @id @default(autoincrement())
+  tenantId      BigInt   @map("tenant_id")
+  name          String
+  url           String
+  // GET | POST
+  method        String   @default("GET")
+  // [{ name, value }], not secret: shown to the account's admins.
+  headers       Json     @default("[]")
+  body          String?
+  credentialRef String?  @map("credential_ref")
+  // 0 (off) to 300: one request per window inside it, whoever reads.
+  cacheSeconds  Int      @default(60) @map("cache_seconds")
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@map("dashboard_data_sources")
+}
+
+// A person who reads a tenant's dashboards by their public address: its own principal, never a tenant
+// member, created on the first sign-in. One per tenant and e-mail.
+model DashboardViewer {
+  id         BigInt    @id @default(autoincrement())
+  tenantId   BigInt    @map("tenant_id")
+  // Lower-case, as verified by the sign-in that created it.
+  email      String
+  googleId   String?   @map("google_id")
+  lastSeenAt DateTime? @map("last_seen_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  tenant   Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  sessions DashboardViewerSession[]
+  visits   DashboardViewerVisit[]
+
+  @@unique([tenantId, email])
+  @@map("dashboard_viewers")
+}
+
+// A viewer's signed-in browser. The cookie carries a random token; only its sha256 is stored, and the
+// row is read on every request, so ending it (revocation) takes effect on the next one.
+model DashboardViewerSession {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  BigInt    @map("tenant_id")
+  viewerId  BigInt    @map("viewer_id")
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  endedAt   DateTime? @map("ended_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  viewer DashboardViewer @relation(fields: [viewerId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, viewerId])
+  @@map("dashboard_viewer_sessions")
+}
+
+// The last time a viewer read a dashboard: what the dashboard's settings list as "who opened it".
+model DashboardViewerVisit {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  dashboardId BigInt   @map("dashboard_id")
+  viewerId    BigInt   @map("viewer_id")
+  lastSeenAt  DateTime @map("last_seen_at")
+
+  tenant    Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  dashboard Dashboard       @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+  viewer    DashboardViewer @relation(fields: [viewerId], references: [id], onDelete: Cascade)
+
+  @@unique([dashboardId, viewerId])
+  @@index([tenantId, dashboardId])
+  @@map("dashboard_viewer_visits")
+}
+
+// A link that opens one dashboard inside another app's iframe, signed in by the link itself
+// (docs/dashboards.md, "Embed links"): a Chatwoot Dashboard App is a URL in a frame, so the only
+// credential it can carry is the URL. The token travels in the fragment and is stored as its sha256;
+// it reads that dashboard only. `origins` are the https origins allowed to frame it. Rotating replaces
+// the hash on the same row; revoking stamps `revokedAt`, and the next request is refused.
+model DashboardEmbedLink {
+  id              BigInt    @id @default(autoincrement())
+  tenantId        BigInt    @map("tenant_id")
+  dashboardId     BigInt    @map("dashboard_id")
+  label           String
+  origins         String[]  @default([])
+  // Whether a read through this link carries the contact's name, phone and e-mail (an occurrences
+  // panel's theme conversations). Off by default: the link opens without a sign-in.
+  showContactData Boolean   @default(false) @map("show_contact_data")
+  tokenHash       String    @unique @map("token_hash")
+  lastUsedAt      DateTime? @map("last_used_at")
+  revokedAt       DateTime? @map("revoked_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  dashboard Dashboard @relation(fields: [dashboardId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, dashboardId])
+  @@map("dashboard_embed_links")
+}
+
+// A one-time sign-in code sent by e-mail. Only an HMAC of it is stored; a wrong attempt is charged to
+// every live code of the address, and consuming one is a compare-and-set on it still being live.
+model DashboardViewerCode {
+  id         BigInt    @id @default(autoincrement())
+  tenantId   BigInt    @map("tenant_id")
+  email      String
+  codeHash   String    @map("code_hash")
+  attempts   Int       @default(0)
+  expiresAt  DateTime  @map("expires_at")
+  consumedAt DateTime? @map("consumed_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, email, createdAt])
+  @@map("dashboard_viewer_codes")
 }
 
 // ──────────────────────────────────────────────── knowledge (RAG) ──
@@ -1550,21 +2083,39 @@ model PlaygroundMedia {
 }
 
 model ApprovalQueueItem {
-  id              BigInt         @id @default(autoincrement())
-  tenantId        BigInt         @map("tenant_id")
-  knowledgeBaseId BigInt         @map("knowledge_base_id")
-  threadId        String?        @map("thread_id")
-  interruptKey    String?        @map("interrupt_key")
-  proposedTitle   String?        @map("proposed_title")
-  proposedContent String         @map("proposed_content")
-  rationale       String?
-  status          ApprovalStatus @default(PENDING)
-  createdAt       DateTime       @default(now()) @map("created_at")
-  updatedAt       DateTime       @updatedAt @map("updated_at")
+  id                 BigInt                       @id @default(autoincrement())
+  tenantId           BigInt                       @map("tenant_id")
+  knowledgeBaseId    BigInt                       @map("knowledge_base_id")
+  threadId           String?                      @map("thread_id")
+  interruptKey       String?                      @map("interrupt_key")
+  proposedTitle      String?                      @map("proposed_title")
+  proposedContent    String                       @map("proposed_content")
+  rationale          String?
+  status             ApprovalStatus               @default(PENDING)
+  // sha256 of the proposal with case, punctuation and runs of whitespace folded away, as proposed
+  // and never rewritten by an edit: the same entry proposed again for the same base lands here.
+  // NULL on rows written before the key, which never collide.
+  normalizedHash     String?                      @map("normalized_hash")
+  // The proposal's embedding, written by the reviewer job: what makes this row a candidate for
+  // the reviews of later proposals. NULL until reviewed, and on rows written before the reviewer.
+  embedding          Unsupported("vector(1536)")?
+  // The agent whose tool proposed it; its model (or its override) runs the review. NULL for a
+  // proposal through the REST route, which is never reviewed.
+  agentId            BigInt?                      @map("agent_id")
+  reviewerComment    String?                      @map("reviewer_comment")
+  // A document of the same base the reviewer says this proposal should replace on approval.
+  replacesDocumentId BigInt?                      @map("replaces_document_id")
+  // What a DISCARDED proposal matched: another queue item, or a document of the base.
+  matchedItemId      BigInt?                      @map("matched_item_id")
+  matchedDocumentId  BigInt?                      @map("matched_document_id")
+  // Why a person rejected it, optional; shown to the reviewer of later proposals, never audited.
+  rejectionReason    String?                      @map("rejection_reason")
+  createdAt          DateTime                     @default(now()) @map("created_at")
+  updatedAt          DateTime                     @updatedAt @map("updated_at")
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
-  @@index([tenantId])
+  @@unique([tenantId, knowledgeBaseId, normalizedHash], map: "approval_queue_items_suggestion_key")
   @@map("approval_queue_items")
 }
 
@@ -1655,6 +2206,14 @@ model ToolDefinition {
   // on the instance's deletion, which leaves a tool that refuses to run instead of one that sends a
   // handle nothing can correlate.
   conversationRefIntegrationId BigInt?  @map("conversation_ref_integration_id")
+  // How many characters of this tool's response (raw or rendered) the model receives. Null is the
+  // default, MODEL_RESPONSE_CHAR_LIMIT; writers refuse a value outside 500-20000 and the runtime
+  // clamps whatever it reads (`effectiveMaxResponseChars` in tool-definitions/response-template.ts).
+  maxResponseChars             Int?     @map("max_response_chars")
+  // A clip of this tool's response is expected (a search that always returns the first N results):
+  // the `response_clipped` line is written at info instead of warn, so it stops paging alert
+  // channels. Off by default; every other warning of the tool still alerts.
+  silenceTruncationAlert       Boolean  @default(false) @map("silence_truncation_alert")
   createdAt                    DateTime @default(now()) @map("created_at")
   updatedAt                    DateTime @updatedAt @map("updated_at")
 
@@ -1676,16 +2235,18 @@ model ToolDefinition {
 // run in the sandbox (graph/tools/code.ts). Invalid code is stored as written — the console and the
 // service WARN, never refuse — and fails at call time, as the operator's failure.
 model CodeToolDefinition {
-  id          BigInt   @id @default(autoincrement())
-  tenantId    BigInt   @map("tenant_id")
-  name        String
-  label       String
-  description String
-  inputSchema Json     @default("{}") @map("input_schema")
-  code        String
-  enabled     Boolean  @default(true)
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id                     BigInt   @id @default(autoincrement())
+  tenantId               BigInt   @map("tenant_id")
+  name                   String
+  label                  String
+  description            String
+  inputSchema            Json     @default("{}") @map("input_schema")
+  code                   String
+  enabled                Boolean  @default(true)
+  // The same switch as ToolDefinition.silenceTruncationAlert, for a clip of what the body returns.
+  silenceTruncationAlert Boolean  @default(false) @map("silence_truncation_alert")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
 
   tenant         Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   toolSelections AgentToolSelection[]
@@ -1702,6 +2263,10 @@ model McpServerConnection {
   url           String?
   command       String?
   credentialRef String?  @map("credential_ref")
+  // Request headers sent on every tools/call to this server, name -> value. A value may hold the
+  // {{placeholders}} an HTTP tool header accepts, resolved per call from the conversation (never from
+  // the model); discovery carries none. Network transports only. See docs/mcp.md.
+  headers       Json     @default("{}")
   enabled       Boolean  @default(true)
   createdAt     DateTime @default(now()) @map("created_at")
   updatedAt     DateTime @updatedAt @map("updated_at")
@@ -1752,8 +2317,11 @@ model IntegrationInstance {
 // Fail-closed for HTTP/MCP/INTEGRATION/RAG (a tool not granted is never exposed; a new
 // upstream tool is not auto-granted). NATIVE is the one permissive default: empty
 // enabledTools — or no row — means ALL native conversation-scoped tools. enabledTools is the
-// sub-tool allowlist (NATIVE/RAG/MCP/INTEGRATION); knowledgeBaseIds scopes RAG (empty = all
-// tenant KBs). Partial unique indexes (in the migration) cap NATIVE/RAG at one row per agent.
+// sub-tool allowlist (NATIVE/RAG/MCP/INTEGRATION); knowledgeBaseIds scopes RAG (empty = no
+// base: search_knowledge finds nothing, suggest_kb_entry is refused). No FK covers that array:
+// deleting a base removes its id here, and the whole RAG row when it was the only one
+// (deleteKnowledgeBase). Partial unique indexes (in the migration) cap NATIVE/RAG at one row per
+// agent.
 model AgentToolSelection {
   id                    BigInt          @id @default(autoincrement())
   tenantId              BigInt          @map("tenant_id")
@@ -1945,6 +2513,30 @@ model Appointment {
 
 // ──────────────────────────────────────────────────── scheduler ──
 
+// One row per running server process, renewed every few seconds while it lives
+// (src/lib/process-lease.ts). Not tenant data and not under tenant RLS: it says only that a process
+// exists, and is read across tenants by the pass that settles deliveries a dead process claimed.
+model ProcessLease {
+  id          String   @id @db.Uuid
+  startedAt   DateTime @default(now()) @map("started_at") @db.Timestamptz(3)
+  heartbeatAt DateTime @default(now()) @map("heartbeat_at") @db.Timestamptz(3)
+  host        String?
+  pid         Int?
+
+  @@map("process_leases")
+}
+
+// Who is starting a call on an ElevenLabs agent, across processes (migration 20261016220000).
+model VoiceEngineHold {
+  engineAgentId  String    @id @map("engine_agent_id")
+  holder         String?   @db.Uuid
+  heldUntil      DateTime? @map("held_until") @db.Timestamptz(3)
+  declaredDigest String?   @map("declared_digest")
+  configDigest   String?   @map("config_digest")
+
+  @@map("voice_engine_holds")
+}
+
 model SchedulerJob {
   id            BigInt             @id @default(autoincrement())
   tenantId      BigInt             @map("tenant_id")
@@ -1961,6 +2553,10 @@ model SchedulerJob {
   runAt         DateTime           @map("run_at")
   attempts      Int                @default(0)
   claimedAt     DateTime?          @map("claimed_at")
+  // When the current (or last) run STARTED: stamped by the claim with `claimed_at`, and left alone by
+  // the two writes that move `claimed_at` for the lease (the recovery after a deadline renews it, the
+  // reaper clears it). The snoozed sweep reads it as the instant the run's live read came after.
+  runStartedAt  DateTime?          @map("run_started_at")
   // Which claim on this row is the current one. The claim BUMPS it and hands the value to the
   // handler; the three writes that finish a job CAS on it, so a run whose claim was superseded
   // writes nothing instead of landing on work it does not own (issue #164).
@@ -1972,7 +2568,14 @@ model SchedulerJob {
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
   @@unique([tenantId, kind, dedupeKey])
+  // The lookup the scoped reads can use: under RLS `kind` (an enum) never reaches the unique index
+  // above, so a read by dedupe key walks every kind of the tenant. Byte-wise, so a prefix read reaches
+  // it too (`dedupeKeyStartsWith`): `LIKE` is not leakproof, `starts_with` is.
+  @@index([tenantId, dedupeKey(ops: raw("text_pattern_ops"))], map: "scheduler_jobs_tenant_id_dedupe_key_pattern_idx")
   @@index([status, runAt])
+  // NOTE: the claim's and the reaper's indexes are PARTIAL and live in raw SQL, which Prisma cannot
+  // express: `(run_at) WHERE status = 'PENDING'` and `(claimed_at) WHERE status = 'CLAIMED'`
+  // (20261116150000, 20261116150100).
   @@map("scheduler_jobs")
 }
 
@@ -1983,32 +2586,39 @@ model SchedulerJob {
 // are validated by modules/documents/blocks.ts, not by Prisma — the shapes are unions, and a JSON
 // column is what lets the vocabulary grow without a migration per block type.
 model DocumentTemplate {
-  id           BigInt   @id @default(autoincrement())
-  tenantId     BigInt   @map("tenant_id")
+  id               BigInt   @id @default(autoincrement())
+  tenantId         BigInt   @map("tenant_id")
   // UNIQUE per tenant, and not for tidiness: the name is what the MODEL reads to choose between the
   // document tools an agent was granted. Two templates called "Orçamento" publish two tools with the
   // same description and nothing to pick between them, so the agent sends whichever it happens to
   // choose. Enforced separately from the slug because a caller can supply its own slug, which would
   // otherwise let the same name through twice.
-  name         String
+  name             String
   // Tool-name-safe identifier. UNIQUE per tenant because it becomes the agent's tool name
   // (send_<slug>) and two tools with one name is a grant the operator cannot tell apart.
-  slug         String
-  description  String?
-  blocks       Json     @default("[]")
-  fields       Json     @default("[]")
-  style        Json     @default("{}")
+  slug             String
+  description      String?
+  blocks           Json     @default("[]")
+  fields           Json     @default("[]")
+  style            Json     @default("{}")
   // Per-template document counter, bumped once per issued row. Monotonic, not gapless: a crash
   // between the insert and the bump leaves the row unnumbered and the heal takes the next value.
-  lastNumber   Int      @default(0) @map("last_number")
-  numberPrefix String?  @map("number_prefix")
-  enabled      Boolean  @default(true)
-  createdAt    DateTime @default(now()) @map("created_at")
-  updatedAt    DateTime @updatedAt @map("updated_at")
+  lastNumber       Int      @default(0) @map("last_number")
+  numberPrefix     String?  @map("number_prefix")
+  enabled          Boolean  @default(true)
+  // A person approves every document this template issues before it reaches the customer. On the
+  // TEMPLATE, not on the grant: what the reviewer protects is the price and the wording, whichever
+  // agent emits it (docs/documents.md, Approval).
+  requiresApproval Boolean  @default(false) @map("requires_approval")
+  // How long a request waits for a person, in whole hours, 1 to 168 (a CHECK in the migration).
+  approvalTtlHours Int      @default(24) @map("approval_ttl_hours")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
 
-  tenant          Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  issuedDocuments IssuedDocument[]
-  toolSelections  AgentToolSelection[]
+  tenant           Tenant                    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  issuedDocuments  IssuedDocument[]
+  toolSelections   AgentToolSelection[]
+  approvalRequests DocumentApprovalRequest[]
 
   @@unique([tenantId, slug])
   @@unique([tenantId, name])
@@ -2049,13 +2659,61 @@ model IssuedDocument {
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 
-  tenant   Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  template DocumentTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  tenant          Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template        DocumentTemplate?        @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  approvalRequest DocumentApprovalRequest?
 
   @@unique([tenantId, idempotencyKey])
   @@index([tenantId, threadId])
   @@index([tenantId, templateId])
   @@map("issued_documents")
+}
+
+// A document waiting for a person before it is issued. `snapshot` is frozen when the agent asks,
+// with the date, so what the reviewer previews is what approval issues; only the NUMBER is taken at
+// approval, so a rejected or expired request burns none. The issued row keys on this id, not on
+// the calendar day the tool's key carries.
+model DocumentApprovalRequest {
+  id                 BigInt    @id @default(autoincrement())
+  tenantId           BigInt    @map("tenant_id")
+  templateId         BigInt?   @map("template_id")
+  title              String
+  numberPrefix       String?   @map("number_prefix")
+  threadId           String?   @map("thread_id")
+  chatwootInstanceId BigInt?   @map("chatwoot_instance_id")
+  conversationId     BigInt?   @map("conversation_id")
+  // The tool's own key (template, thread, day, values), so a retried turn lands on the request it
+  // already made instead of asking a second time.
+  idempotencyKey     String    @map("idempotency_key")
+  // "PENDING" | "APPROVED" | "REJECTED" | "EXPIRED" | "CANCELLED". A String for the reason
+  // IssuedDocument.status is one.
+  status             String    @default("PENDING")
+  snapshot           Json      @default("{}")
+  expiresAt          DateTime  @map("expires_at")
+  reviewerUserId     BigInt?   @map("reviewer_user_id")
+  note               String?
+  decidedAt          DateTime? @map("decided_at")
+  issuedDocumentId   BigInt?   @unique @map("issued_document_id")
+  // When the conversation was told the document is approved and on its way, claimed before the note
+  // goes out so a retried outcome never repeats it.
+  approvedNoteAt     DateTime? @map("approved_note_at")
+  // What the decision came to in the conversation, for the console: "DELIVERED" (the PDF reached the
+  // customer), "NOTED" (a private note says why it did not), "HANDED" (rejected, handed to a person),
+  // "NO_AGENT" (no bot left to write in it). Null while the outcome is on its way.
+  outcome            String?
+  outcomeAt          DateTime? @map("outcome_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  tenant         Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  template       DocumentTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  issuedDocument IssuedDocument?   @relation(fields: [issuedDocumentId], references: [id], onDelete: SetNull)
+
+  @@unique([tenantId, idempotencyKey])
+  @@index([tenantId, status, expiresAt])
+  @@index([tenantId, templateId])
+  @@index([tenantId, conversationId])
+  @@map("document_approval_requests")
 }
 
 // ───────────────────────────────────────────────── A/B testing ──
@@ -2096,37 +2754,115 @@ model PromptVariantAssignment {
 
 // NOTE: captured at the source (LangChain callback / model wrapper), not mirrored from
 // Langfuse. Substrate for the per-agent/per-conversation cost dashboard.
-// The month's cost per tenant and source, as the Langfuse poll last saw it (issue #426). The spend
-// ceiling's gate reads THIS row, never Langfuse: `polledAt` is the last successful poll, the
-// `pollError` pair the last failure, and a failure never overwrites the figure. `tracedCalls`,
-// `costedCalls` and `unpricedModels` reconcile the figure against the local ledger, because Langfuse
-// prices a model it does not know at zero and a ceiling that undercounts has to say so.
+// The month's cost per tenant and source, as the poll last summed it from `llm_usage` (issues #426,
+// #1060). The spend ceiling's gate reads THIS row, never the ledger: `polledAt` is the last
+// successful poll, the `pollError` pair the last failure, and a failure never overwrites the figure.
+// One row per agent turn that put something in front of the customer (a reply, an attachment, a
+// proactive message or template; never a private note), for the per-conversation turn limit
+// (src/modules/turn-limit). Written when the turn ends, so the window is counted from here and never
+// from the fire-and-forget execution log. Rows past the window are swept daily.
+model AgentTurnDelivery {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  conversationId BigInt   @map("conversation_id")
+  proactive      Boolean  @default(false)
+  // The proactive limit's reservation, taken before the nudge runs and cleared when its send reaches
+  // the customer: counted by the proactive limit, never by the turn limit.
+  pending        Boolean  @default(false)
+  deliveredAt    DateTime @default(now()) @map("delivered_at")
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, deliveredAt])
+  @@index([tenantId, deliveredAt])
+  @@map("agent_turn_deliveries")
+}
+
+// A decisions rule that acted and is held back by its trigger (docs/decisions.md, "When a rule
+// acts"): `on_start` until an observation in which its conditions do not hold, `once` for the rest of
+// the conversation. Per agent and conversation, by `ruleKey` (the rule's conditions, action and
+// trigger, `ruleStateKey`), so an edited rule starts empty and a reordered one keeps its state.
+model DecisionRuleState {
+  tenantId       BigInt   @map("tenant_id")
+  agentId        BigInt   @map("agent_id")
+  conversationId BigInt   @map("conversation_id")
+  ruleKey        String   @map("rule_key")
+  createdAt      DateTime @default(now()) @map("created_at")
+  // The claim generation that wrote it (DecisionRuleClaim).
+  jobId          BigInt   @default(0) @map("job_id")
+  generation     BigInt   @default(0)
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent        Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@id([agentId, conversationId, ruleKey])
+  @@index([conversationId])
+  @@index([tenantId])
+  @@map("decision_rule_states")
+}
+
+// The generation of a conversation's trigger state for one agent (decision_rule_states): each
+// observation that reads the state takes the next one, and only the holder of the current one may
+// write it.
+model DecisionRuleClaim {
+  tenantId       BigInt @map("tenant_id")
+  agentId        BigInt @map("agent_id")
+  conversationId BigInt @map("conversation_id")
+  // The observe job's (row id, claim_seq) that last read the state; 0 and a counter for a run
+  // with no scheduler claim (tests).
+  jobId          BigInt @default(0) @map("job_id")
+  generation     BigInt @default(0)
+
+  tenant       Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent        Agent        @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@id([agentId, conversationId])
+  @@index([conversationId])
+  @@index([tenantId])
+  @@map("decision_rule_claims")
+}
+
+// The account-wide proactive breaker's STATE (docs/proactive-breaker.md); its configuration is the
+// `proactiveBreaker` block of Tenant.settings. One row per tenant, created on first need.
+model ProactiveBreaker {
+  tenantId       BigInt    @id @map("tenant_id")
+  // The latch: set by the send that found the account at its limit, cleared only by a resume.
+  trippedAt      DateTime? @map("tripped_at")
+  // The count and the limit at the trip, as the banner and the alert state them.
+  tripCount      Int?      @map("trip_count")
+  tripLimit      Int?      @map("trip_limit")
+  // The last resume: the count after it starts from zero, so a resume is a fresh allowance.
+  resumedAt      DateTime? @map("resumed_at")
+  // The automatic limit's inputs: the largest proactive volume in any 24h window of the last 30 days
+  // and where that window started, refreshed at most daily.
+  autoPeak       Int?      @map("auto_peak")
+  autoPeakAt     DateTime? @map("auto_peak_at")
+  autoComputedAt DateTime? @map("auto_computed_at")
+  updatedAt      DateTime  @default(now()) @updatedAt @map("updated_at")
+  tenant         Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("proactive_breakers")
+}
+
 model SpendCostSnapshot {
-  id                    BigInt    @id @default(autoincrement())
-  tenantId              BigInt    @map("tenant_id")
-  // "inbox" | "playground": the same split `LlmUsage.source` carries, told apart on the Langfuse
-  // side by the trace's environment (`environmentForSource`).
-  source                String
+  id               BigInt    @id @default(autoincrement())
+  tenantId         BigInt    @map("tenant_id")
+  // A `LlmUsage.source` ("inbox", "playground", "client"), or `app:<client app id>` for one embedding
+  // app's share of the client source.
+  source           String
   // The calendar month, UTC, as `monthStart` derives it.
-  monthStart            DateTime  @map("month_start")
-  costUsd               Decimal   @default(0) @map("cost_usd") @db.Decimal(14, 6)
-  tracedCalls           Int       @default(0) @map("traced_calls")
-  costedCalls           Int       @default(0) @map("costed_calls")
-  unpricedModels        Json      @default("[]") @map("unpriced_models")
-  // Which Langfuse project the series belongs to (`<apiBase>#<projectId>`), null until the first
-  // successful poll, and what was carried over from the previous project when the tenant switched
-  // mid-month: the figure is the carry plus the current project's own total (poll.ts).
-  projectKey            String?   @map("project_key")
-  carriedUsd            Decimal   @default(0) @map("carried_usd") @db.Decimal(14, 6)
-  carriedTracedCalls    Int       @default(0) @map("carried_traced_calls")
-  carriedCostedCalls    Int       @default(0) @map("carried_costed_calls")
-  carriedUnpricedModels Json      @default("[]") @map("carried_unpriced_models")
-  polledAt              DateTime? @map("polled_at")
-  pollError             String?   @map("poll_error")
-  pollFailedAt          DateTime? @map("poll_failed_at")
-  pollLastFailedAt      DateTime? @map("poll_last_failed_at")
-  createdAt             DateTime  @default(now()) @map("created_at")
-  updatedAt             DateTime  @updatedAt @map("updated_at")
+  monthStart       DateTime  @map("month_start")
+  // The month's priced `llm_usage.cost_usd` for this source, as of `polledAt` (poll.ts).
+  costUsd          Decimal   @default(0) @map("cost_usd") @db.Decimal(14, 6)
+  polledAt         DateTime? @map("polled_at")
+  pollError        String?   @map("poll_error")
+  pollFailedAt     DateTime? @map("poll_failed_at")
+  pollLastFailedAt DateTime? @map("poll_last_failed_at")
+  createdAt        DateTime  @default(now()) @map("created_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -2134,42 +2870,66 @@ model SpendCostSnapshot {
   @@map("spend_cost_snapshots")
 }
 
+// ONE ANNOUNCEMENT PER MODEL, MONTH AND SOURCE for a model the usage ledger could not price
+// (src/modules/pricing/unpriced-alert.ts). The row is the claim: inserting it is what entitles the
+// caller to announce, and a line that did not land deletes it so the next call tries again.
+model UnpricedModelAnnouncement {
+  id          BigInt    @id @default(autoincrement())
+  tenantId    BigInt    @map("tenant_id")
+  source      String
+  monthStart  DateTime  @map("month_start")
+  model       String
+  claimedAt   DateTime  @default(now()) @map("claimed_at")
+  deliveredAt DateTime? @map("delivered_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, source, monthStart, model], map: "unpriced_model_announcements_claim_key")
+  @@map("unpriced_model_announcements")
+}
+
 model LlmUsage {
-  id                  BigInt   @id @default(autoincrement())
-  tenantId            BigInt   @map("tenant_id")
-  agentId             BigInt?  @map("agent_id")
-  conversationId      BigInt?  @map("conversation_id")
+  id                    BigInt   @id @default(autoincrement())
+  tenantId              BigInt   @map("tenant_id")
+  agentId               BigInt?  @map("agent_id")
+  conversationId        BigInt?  @map("conversation_id")
   // The DB Inbox.id this usage was attributed to (null in the playground and for legacy rows).
   // Granularity for the per-inbox dashboard break-down.
-  inboxId             BigInt?  @map("inbox_id")
-  threadId            String?  @map("thread_id")
-  model               String
-  node                String?
-  // "inbox" (real customer traffic) | "playground" (operator test turns). Lets the dashboard
-  // keep test usage from polluting the real figures.
-  source              String   @default("inbox")
-  promptTokens        Int      @default(0) @map("prompt_tokens")
-  completionTokens    Int      @default(0) @map("completion_tokens")
+  inboxId               BigInt?  @map("inbox_id")
+  threadId              String?  @map("thread_id")
+  model                 String
+  node                  String?
+  // "inbox" (real customer traffic) | "playground" (operator test turns) | "client" (the client
+  // channel). Lets the dashboard keep test usage from polluting the real figures.
+  source                String   @default("inbox")
+  // A client-channel call made for an anonymous visitor's session, as the turn knew it then.
+  anonymous             Boolean  @default(false)
+  promptTokens          Int      @default(0) @map("prompt_tokens")
+  completionTokens      Int      @default(0) @map("completion_tokens")
   // Cached-input accounting (a discounted SUBSET of promptTokens, never additive):
   // cachedReadTokens = prompt tokens served from the provider cache (OpenAI/Anthropic/Google);
   // cacheCreationTokens = tokens written to the cache this call (Anthropic, billed at a premium).
-  cachedReadTokens    Int      @default(0) @map("cached_read_tokens")
-  cacheCreationTokens Int      @default(0) @map("cache_creation_tokens")
+  cachedReadTokens      Int      @default(0) @map("cached_read_tokens")
+  cacheCreationTokens   Int      @default(0) @map("cache_creation_tokens")
+  // Of cacheCreationTokens, the writes made under the 1-hour TTL (Anthropic bills them at 2x the input
+  // rate against 1.25x for the 5-minute ones). A SUBSET, like the two above: 0 for every row before the
+  // column and every call without a 1-hour mark.
+  cacheCreation1hTokens Int      @default(0) @map("cache_creation_1h_tokens")
   // The turn this call was billed to, the same id as its ExecutionLog rows and its Langfuse trace
   // (issue #839). Null for rows from before the column and for a call no turn owns. The playground
   // groups a reopened session's calls by it, so each message gets back the line it had live.
-  turnId              String?  @map("turn_id")
+  turnId                String?  @map("turn_id")
   // How long the call took, in milliseconds, as the capture measured it (issue #855). Null for rows
   // from before the column and for a call nothing timed.
-  durationMs          Int?     @map("duration_ms")
+  durationMs            Int?     @map("duration_ms")
   // What the call cost in USD, priced from the price table when the row was written (issue #863).
   // Null for a call the table could not price and for rows from before the column: never zero,
   // which would enter every total silently.
-  costUsd             Decimal? @map("cost_usd") @db.Decimal(18, 10)
+  costUsd               Decimal? @map("cost_usd") @db.Decimal(18, 10)
   // Which price table was in force when the row was written (`litellm@<commit>`), so a table found
   // wrong later can be corrected on exactly the rows it priced. Null on rows from before the column.
-  priceTable          String?  @map("price_table")
-  createdAt           DateTime @default(now()) @map("created_at")
+  priceTable            String?  @map("price_table")
+  createdAt             DateTime @default(now()) @map("created_at")
 
   tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 
@@ -2182,6 +2942,11 @@ model LlmUsage {
   // A conversation's total and its turns' lines on the conversation screen (issue #853): the ledger
   // summed by conversation.
   @@index([tenantId, conversationId])
+  // The month's cost of one source: the spend-ceiling poll and the console's usage read
+  // sum `cost_usd` by tenant, source and month, and with `costUsd` in the key the sum never visits the
+  // heap. The table's insert-triggered autovacuum is tightened in
+  // 20261116160200_llm_usage_insert_vacuum so the visibility map keeps up with the appends.
+  @@index([tenantId, source, createdAt, costUsd])
   @@map("llm_usage")
 }
 
@@ -2206,8 +2971,10 @@ model ExecutionLog {
   provider       String?
   model          String?
   durationMs     Int?     @map("duration_ms")
-  // inbox|playground.
+  // inbox|playground|client.
   source         String   @default("inbox")
+  // A line of a client-channel turn served to an anonymous visitor's session.
+  anonymous      Boolean  @default(false)
   // Allowlisted ids/counts/enums only (redactSecretsDeep at write) — never message text/PII.
   detail         Json?
   errorMessage   String?  @map("error_message")
@@ -2223,8 +2990,193 @@ model ExecutionLog {
   @@map("execution_logs")
 }
 
+// A turn's full detail, kept for the agent's `observability.fullDetailRetentionDays` (issue #1761,
+// docs/logs.md "Full turn detail"). The log line keeps its cut `detail`; the whole text lives here,
+// stored ONCE per tenant by its sha256 (the same catalog page fetched by many conversations on the
+// same day is one row) and pointed to by one `FullDetailRef` per log line. A content row expires at
+// the latest expiry of the lines that point to it, so both tables are swept by `expires_at` alone,
+// with no reference counting (src/modules/flowlog/retention.ts).
+model FullDetailContent {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  // sha256 of `body`, hex.
+  hash      String
+  // Secrets redacted, never cut below FULL_DETAIL_MAX_CHARS.
+  body      String
+  chars     Int
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, hash])
+  @@index([tenantId, expiresAt])
+  @@map("full_detail_contents")
+}
+
+// One log line's pointer to its full text. No foreign key to `execution_logs`: a cascade would add a
+// lookup per row to the busiest delete of the database, and a pointer whose line is gone is never
+// read and leaves at its own expiry, which is never past the line's (FLOWLOG_RETENTION_DAYS).
+model FullDetailRef {
+  id             BigInt   @id @default(autoincrement())
+  tenantId       BigInt   @map("tenant_id")
+  executionLogId BigInt   @map("execution_log_id")
+  agentId        BigInt?  @map("agent_id")
+  // tool_output | system_prompt
+  kind           String
+  contentHash    String   @map("content_hash")
+  // This line's text was longer than FULL_DETAIL_MAX_CHARS and the content is its first part. On the
+  // pointer, not the content: two texts can store the same body and only one of them be cut.
+  clipped        Boolean  @default(false)
+  expiresAt      DateTime @map("expires_at")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, expiresAt])
+  @@index([tenantId, executionLogId])
+  @@index([tenantId, agentId, contentHash])
+  @@map("full_detail_refs")
+}
+
 // External alert sink (Discord / generic webhook) for execution-flow warnings/errors. `url` is an
 // encryptJson blob (a Discord URL embeds a token) — never stored or returned in the clear.
+// An alert channel of the INSTANCE (docs/logs.md, instance alerts): no tenant, fleet-only RLS.
+model InstanceAlertChannel {
+  id        BigInt   @id @default(autoincrement())
+  name      String
+  // discord|webhook, the same types as a tenant channel.
+  type      String
+  // encryptJson blob, masked in every DTO, decrypted only at delivery.
+  // Null for a channel created over MCP and still waiting for its URL in the console (fillAt).
+  url       String?
+  enabled   Boolean  @default(true)
+  // Signal allowlist; empty = all signals.
+  signals   String[] @default([])
+  // encryptJson blob of the HMAC signing secret (webhook type only). Kept on the row because the
+  // vault is per tenant and this channel has none.
+  secret    String?
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  deliveries InstanceAlertDelivery[]
+
+  @@map("instance_alert_channels")
+}
+
+// One firing or recovery of an instance signal on one channel. While PENDING, a repeat of the same
+// (channel, signal, kind) bumps `count` instead of inserting.
+model InstanceAlertDelivery {
+  id             BigInt                @id @default(autoincrement())
+  channelId      BigInt                @map("channel_id")
+  signal         String
+  // firing|recovered
+  kind           String
+  level          String
+  summary        String
+  count          Int                   @default(1)
+  status         WebhookDeliveryStatus @default(PENDING)
+  attempts       Int                   @default(0)
+  nextAttemptAt  DateTime?             @map("next_attempt_at")
+  deliveredAt    DateTime?             @map("delivered_at")
+  lastError      String?               @map("last_error")
+  // Set when a signing secret was stored but this attempt went out unsigned: the reason why.
+  unsignedReason String?               @map("unsigned_reason")
+  // The channel's updated_at when this row was last claimed: a delivery that died on a configuration
+  // edited since was never heard by the repaired channel.
+  channelVersion DateTime?             @map("channel_version")
+  createdAt      DateTime              @default(now()) @map("created_at")
+  updatedAt      DateTime              @updatedAt @map("updated_at")
+
+  channel InstanceAlertChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt])
+  @@index([channelId, signal, status])
+  @@map("instance_alert_deliveries")
+}
+
+// A super admin's override of one signal's default threshold. A signal with no row uses the default
+// from src/modules/instance-health/signals.ts.
+model InstanceAlertThreshold {
+  signal          String   @id
+  threshold       Float
+  durationSeconds Int      @map("duration_seconds")
+  enabled         Boolean  @default(true)
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("instance_alert_thresholds")
+}
+
+// The instance's database screen (docs/logs.md, "Database"). Fleet tables like the three above: no
+// tenant, RLS with the fleet policy only.
+model DbStatSnapshotRun {
+  takenAt             DateTime @id @map("taken_at")
+  statementsAvailable Boolean  @map("statements_available")
+
+  @@map("db_stat_snapshot_runs")
+}
+
+// Cumulative pg_stat_statements counters of an entry that moved since the previous snapshot.
+model DbStatementDelta {
+  takenAt     DateTime @map("taken_at")
+  userid      BigInt
+  dbid        BigInt
+  queryid     BigInt
+  calls       BigInt
+  totalExecMs Float    @map("total_exec_ms")
+  rows        BigInt
+
+  @@id([userid, dbid, queryid, takenAt])
+  @@index([takenAt])
+  @@map("db_statement_deltas")
+}
+
+model DbStatementText {
+  userid     BigInt
+  dbid       BigInt
+  queryid    BigInt
+  query      String
+  lastSeenAt DateTime @map("last_seen_at")
+  // 'metrics' or 'default': the budget the statement ran under (src/lib/statement-budgets.ts).
+  budgetKind String?  @map("budget_class")
+
+  @@id([userid, dbid, queryid])
+  @@index([lastSeenAt])
+  @@map("db_statement_texts")
+}
+
+model DbTableSnapshot {
+  takenAt    DateTime @map("taken_at")
+  tableName  String   @map("table_name")
+  totalBytes BigInt   @map("total_bytes")
+  liveTuples BigInt   @map("live_tuples")
+  deadTuples BigInt   @map("dead_tuples")
+
+  @@id([tableName, takenAt])
+  @@index([takenAt])
+  @@map("db_table_snapshots")
+}
+
+// A statement that failed with 57014, captured by the app with the scope it ran under; the plan is
+// captured for the first occurrence of a statement per window.
+model DbStatementTimeout {
+  id            BigInt   @id @default(autoincrement())
+  occurredAt    DateTime @map("occurred_at")
+  fingerprint   String
+  statement     String
+  label         String?
+  scopeTenantId BigInt?  @map("scope_tenant_id")
+  fleet         Boolean  @default(false)
+  budgetMs      Int?     @map("budget_ms")
+  plan          String?
+  planError     String?  @map("plan_error")
+  plannedAs     String?  @map("planned_as")
+
+  @@index([occurredAt])
+  @@index([fingerprint, occurredAt])
+  @@map("db_statement_timeouts")
+}
+
 model AlertChannel {
   id              BigInt   @id @default(autoincrement())
   tenantId        BigInt   @map("tenant_id")
@@ -2238,6 +3190,9 @@ model AlertChannel {
   minLevel        String   @default("error") @map("min_level")
   // Stage allowlist; empty = all stages.
   stages          String[] @default([])
+  // Events this channel leaves out inside its stages and level (src/modules/flowlog/events.ts); empty
+  // = none. A line that is none of the events is never left out by it.
+  excludeEvents   String[] @default([]) @map("exclude_events")
   // Agents whose lines never alert on this channel (issue #843), e.g. an evaluation battery's test
   // agents beside production on one instance. Their lines stay in the flow log, which the battery
   // reads; only this channel's dispatch skips them. No FK: an id whose agent is deleted matches
@@ -2286,6 +3241,14 @@ model AlertDelivery {
   // knew the conversation. No FK: an alert outlives the conversation it was about.
   turnId         String?               @map("turn_id")
   conversationId BigInt?               @map("conversation_id")
+  // The agent the first event ran as, which the alert names: not the inbox's, since an observer
+  // runs as another agent and an inbox can be rebound before the send. No FK, like the two above.
+  agentId        BigInt?               @map("agent_id")
+  // Set on a CAUSE alert (issue #1091): what an operator has to fix, such as `tts:elevenlabs:HTTP 401`
+  // or `spend_ceiling:over`. A later event with the same key on the same channel inside
+  // `ALERT_CAUSE_WINDOW_MS` bumps this row's `count` instead of opening another delivery, whatever
+  // the row's status. Null on every other alert, which coalesces by (channel, stage, level) only.
+  causeKey       String?               @map("cause_key")
   createdAt      DateTime              @default(now()) @map("created_at")
   updatedAt      DateTime              @updatedAt @map("updated_at")
 
@@ -2294,6 +3257,7 @@ model AlertDelivery {
 
   @@index([tenantId])
   @@index([status, nextAttemptAt])
+  @@index([channelId, causeKey, createdAt])
   @@map("alert_deliveries")
 }
 
@@ -2687,4 +3651,570 @@ model RyzeMedia {
   @@index([gatewayId, messageId])
   @@index([tenantId])
   @@map("ryze_media")
+}
+
+// A person who reaches an agent through a channel that is not Chatwoot, as the host system names
+// them. Today the only such channel is the client channel, where the host application's SERVER
+// authenticates with the tenant's API key and states who its signed-in user is; the agents trusts
+// that statement because the key already trusts the server (docs/client-channel.md). Keyed by
+// channel so a later channel without Chatwoot writes here without a schema change.
+//
+// `contactId` is the bridge to the Chatwoot mirror, set when a handoff opens a conversation there.
+// The mirror stays the mirror: nothing here is written into `contacts`.
+model ExternalUser {
+  id         BigInt   @id @default(autoincrement())
+  tenantId   BigInt   @map("tenant_id")
+  // Closed set in code (`EXTERNAL_CHANNELS`), a string here so adding a channel is not an enum
+  // migration.
+  channel    String
+  // The host's own stable id for its user. Opaque to us.
+  externalId String   @map("external_id")
+  name       String?
+  // The address the team replies to outside the host, as the host states it on each turn. Read when
+  // the agent opens a case in the team's inbox (`open_case_in_inbox`); never shown to the model.
+  email      String?
+  contactId  BigInt?  @map("contact_id")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  contact Contact?         @relation(fields: [contactId], references: [id], onDelete: SetNull)
+  threads DetachedThread[]
+
+  @@unique([tenantId, channel, externalId])
+  @@index([contactId])
+  @@map("external_users")
+}
+
+// Who a thread outside Chatwoot belongs to (graph/detached-thread.ts). The thread id is minted by
+// us, and a row here is what lets a later turn name it: a well-formed id with no row, or with a row
+// that belongs to another external user or scope, is answered as not found.
+model DetachedThread {
+  threadId           String    @id @map("thread_id")
+  tenantId           BigInt    @map("tenant_id")
+  agentId            BigInt    @map("agent_id")
+  // `DetachedThreadKind`: client | playground.
+  kind               String
+  externalUserId     BigInt?   @map("external_user_id")
+  // What the host scopes the conversation to (an organization, a workspace). Part of the thread,
+  // not of the person: one user in two organizations is one person with two threads.
+  scope              String?
+  createdAt          DateTime  @default(now()) @map("created_at")
+  lastTurnAt         DateTime  @default(now()) @map("last_turn_at")
+  // The user's first message, cut short: what the widget's list of earlier conversations names the
+  // thread by. Shown only to the thread's owner, who wrote it.
+  title              String?
+  // Whether all its messages are in `client_thread_messages`, set when the client channel mints it.
+  // False for threads from before that table, which reopen saying their earlier messages were not kept.
+  recorded           Boolean   @default(false)
+  // The round-trip running on this thread now, and until when that claim holds. One at a time: the
+  // browser's late answers and the user's next message must not both act on the same suspended turn.
+  // The expiry is what frees a thread whose process died mid-turn.
+  activeTurnId       String?   @map("active_turn_id")
+  activeUntil        DateTime? @map("active_until")
+  // The case this thread opened in the team's inbox (`open_case_in_inbox`): a conversation number
+  // inside one Chatwoot account, so the instance goes with it. A second call while the case is still
+  // open adds to it instead of opening another.
+  caseInstanceId     BigInt?   @map("case_instance_id")
+  caseConversationId Int?      @map("case_conversation_id")
+  // The address the case was opened under: the team's email replies on it are addressed from its
+  // earlier messages, so it is added to only while the user's email is still this one.
+  caseEmail          String?   @map("case_email")
+
+  tenant       Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent        Agent                 @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  externalUser ExternalUser?         @relation(fields: [externalUserId], references: [id], onDelete: Cascade)
+  messages     ClientThreadMessage[]
+
+  @@index([tenantId])
+  @@index([agentId])
+  @@index([externalUserId])
+  @@map("detached_threads")
+}
+
+// What a client thread's owner was shown, in order: their message as sent and the reply as delivered,
+// after the output screening and the external check. The widget reopens a conversation from it, on
+// any device; the model's own history stays in the checkpoint. Gone with its thread.
+model ClientThreadMessage {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  threadId  String   @map("thread_id")
+  // user | agent (a CHECK in the migration).
+  role      String
+  text      String
+  // A user's message that was spoken, shown with its mark beside the transcription.
+  voice     Boolean  @default(false)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  thread DetachedThread @relation(fields: [threadId], references: [threadId], onDelete: Cascade)
+
+  @@index([threadId, id])
+  @@index([tenantId])
+  @@map("client_thread_messages")
+}
+
+// A web application that embeds an agent through the client channel's SDK (docs/client-channel.md,
+// "Embedding with the SDK"). Its users reach the agent from the browser with a JWT the application's
+// server signs with one of this app's secrets, so the app is what the token names (`aud`) and what
+// the browser's origin is checked against.
+model ClientApp {
+  id                  BigInt   @id @default(autoincrement())
+  tenantId            BigInt   @map("tenant_id")
+  agentId             BigInt   @map("agent_id")
+  name                String
+  // What the page names in the tag and the JWT carries in `aud`. Random and not sequential, so it
+  // says nothing about how many apps the instance has; looked up before any tenant context.
+  publicId            String   @unique @map("public_id")
+  // Exact origins (`https://app.example.com`), no wildcard: the browser may call from these only.
+  allowedOrigins      String[] @map("allowed_origins")
+  // Whether a page with no signed user may open a session of its own. Off unless the operator says.
+  anonymousEnabled    Boolean  @default(false) @map("anonymous_enabled")
+  // What an anonymous visitor may cost: new sessions one address opens per hour, and messages one
+  // session sends per minute. The app's own per-minute budget still applies above both.
+  anonSessionsPerHour Int      @default(20) @map("anon_sessions_per_hour")
+  anonMessagesPerMin  Int      @default(10) @map("anon_messages_per_min")
+  // The app's own monthly spend ceiling, in US cents; null for none. Its turns are refused past it,
+  // under the tenant's client ceiling, which still applies (docs/spend-ceiling.md).
+  monthlyCeilingCents Int?     @map("monthly_ceiling_cents")
+  // A Cloudflare Turnstile challenge before a new anonymous session. The site key is public (the page
+  // renders the challenge with it); the secret is encrypted (`encryptJson`) and never returned.
+  turnstileEnabled    Boolean  @default(false) @map("turnstile_enabled")
+  turnstileSiteKey    String?  @map("turnstile_site_key")
+  turnstileSecret     String?  @map("turnstile_secret")
+  // Days an anonymous conversation may sit with no message before the sweep deletes it.
+  anonExpiryDays      Int      @default(30) @map("anon_expiry_days")
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  agent          Agent                  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  secrets        ClientAppSecret[]
+  allowanceUsage ClientAllowanceUsage[]
+
+  @@index([tenantId])
+  @@index([agentId])
+  @@map("client_apps")
+}
+
+// The messages one of an app's customers started in a calendar month, against the allowance the
+// app's server states in the token it signs. `customer` is `scope:<scope>` or `user:<sub>`.
+model ClientAllowanceUsage {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  clientAppId BigInt   @map("client_app_id")
+  customer    String
+  month       DateTime @db.Date
+  messages    Int      @default(0)
+  updatedAt   DateTime @default(now()) @map("updated_at")
+
+  tenant    Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientApp ClientApp @relation(fields: [clientAppId], references: [id], onDelete: Cascade)
+
+  @@unique([clientAppId, customer, month])
+  @@index([tenantId])
+  @@map("client_allowance_usage")
+}
+
+// A key the app's server signs its users' JWTs with (HS256). Kept encrypted rather than hashed,
+// because checking an HMAC needs the key itself. Two may be valid at once: rotating gives the old
+// one a grace window, so users already signed in do not fall out mid-session.
+model ClientAppSecret {
+  id        BigInt    @id @default(autoincrement())
+  tenantId  BigInt    @map("tenant_id")
+  appId     BigInt    @map("app_id")
+  // The JWT header's `kid`: which of the app's keys signed this token. Random, unique.
+  kid       String    @unique
+  secret    String
+  createdAt DateTime  @default(now()) @map("created_at")
+  // NULL while it is the current key; set when it was rotated out (the grace end) or revoked (now).
+  expiresAt DateTime? @map("expires_at")
+
+  tenant Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  app    ClientApp @relation(fields: [appId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([appId])
+  @@map("client_app_secrets")
+}
+
+// A flow-log line the dashboard counts, decided once when the line is written (docs/dashboard.md,
+// "Log facts"): a transfer with its cause and where it went, a silence with its reason, a follow-up
+// step that reached the customer. Written and deleted by triggers on `execution_logs` only, never by
+// the app; `lineId` is the line's id, with no foreign key, since the delete trigger removes it.
+model DashboardLogFact {
+  lineId         BigInt   @id @map("line_id")
+  tenantId       BigInt   @map("tenant_id")
+  createdAt      DateTime @map("created_at")
+  turnId         String   @map("turn_id")
+  conversationId BigInt?  @map("conversation_id")
+  agentId        BigInt?  @map("agent_id")
+  inboxId        BigInt?  @map("inbox_id")
+  source         String
+  anonymous      Boolean
+  // handoff | silence | followup
+  kind           String
+  // A transfer's cause, `taken_over` included as itself: the readers decide whether it is a person.
+  cause          String?
+  target         String?
+  // A silence's reason.
+  reason         String?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, kind, createdAt])
+  @@index([tenantId, conversationId, createdAt])
+  @@map("dashboard_log_facts")
+}
+
+// Where a tenant's backfill of the log facts stands. A row with no `backfilledAt` is a tenant whose
+// lines from before the facts are still being filled in, and its readers read the flow log meanwhile;
+// a tenant with no row was created after the facts and reads them from the start.
+model DashboardLogFactsState {
+  tenantId     BigInt    @id @map("tenant_id")
+  // The next hour of lines to fill in; null before the first batch.
+  cursorAt     DateTime? @map("cursor_at")
+  backfilledAt DateTime? @map("backfilled_at")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("dashboard_log_facts_state")
+}
+
+// WHAT AN OBSERVER READ OFF A CONVERSATION for the account's occurrence monitor (docs/occurrences.md):
+// one row per conversation and declared field, written by the `record_reading` tool. The fields are the
+// account's (`tenant.settings.occurrences.fields`), so `field` is whatever key it declared. Counting
+// "new conversations" reads `first_read_at`, which a later change of value does not move.
+// One occurrence monitor of an account (docs/occurrences.md): its name and the configuration an admin
+// chooses (the inboxes it reads, the fields, the thresholds, the model, the cadences), validated by
+// modules/occurrences/settings.ts. Its readings, themes, canonicals and rounds are its own rows; the
+// spending cap, prices and vault stay the account's. `position` orders the list, and the account's
+// first monitor (the lowest) is the one the paths without a monitor id answer for.
+model OccurrenceMonitor {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  name      String
+  config    Json     @default("{}")
+  position  Int      @default(0)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at")
+
+  tenant            Tenant                       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  readings          ConversationReading[]
+  conversationReads OccurrenceConversationRead[]
+  sweepCursors      OccurrenceSweepCursor[]
+  runs              OccurrenceRun[]
+  flagEpisodes      OccurrenceFlagEpisode[]
+  themes            OccurrenceTheme[]
+  members           OccurrenceThemeMember[]
+  events            OccurrenceThemeEvent[]
+  canonicals        OccurrenceCanonical[]
+  aliases           OccurrenceAlias[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId, position])
+  @@map("occurrence_monitors")
+}
+
+model ConversationReading {
+  id               BigInt    @id @default(autoincrement())
+  tenantId         BigInt    @map("tenant_id")
+  // The monitor that read it: two monitors reading one conversation keep a reading each.
+  monitorId        BigInt    @map("monitor_id")
+  conversationId   BigInt    @map("conversation_id")
+  field            String
+  value            String
+  // The agent that wrote the current value. Plain column: a reading outlives the agent that read it.
+  agentId          BigInt?   @map("agent_id")
+  firstReadAt      DateTime  @default(now()) @map("first_read_at")
+  lastReadAt       DateTime  @default(now()) @map("last_read_at")
+  // The customer message the first reading covered, which the flags count the conversation at. Null on
+  // a reading stored before it was kept, or with no customer message, which counts at `firstReadAt`.
+  firstInboundAt   DateTime? @map("first_inbound_at")
+  // The reference's canonical name, as the canonical step decided it for this value. Null on every
+  // other field, on an empty reference (the no-reference bucket) and until the step has run.
+  canonicalId      BigInt?   @map("canonical_id")
+  // Whether Chatwoot's attribute holds the canonical name: every write of the reading clears it, since
+  // the observer writes its raw spelling there, and the round's copy sets it.
+  canonicalWritten Boolean   @default(false) @map("canonical_written")
+  // The name the copy last put in Chatwoot for this value, kept across merges so a folder on it keeps
+  // the conversation; and what Chatwoot may still hold from before the current value (every spelling
+  // since the last copy, as the observer's writes of them may have failed), so a copy can tell such a
+  // leftover from a newer write.
+  writtenName      String?   @map("written_name")
+  remoteBefore     String[]  @default([]) @map("remote_before")
+  // When the copy last failed: a failed copy waits behind the ones never tried, so a conversation
+  // whose Chatwoot keeps refusing cannot take the round's whole batch. A new value clears it.
+  copyTriedAt      DateTime? @map("copy_tried_at")
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor      OccurrenceMonitor    @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  conversation Conversation         @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  canonical    OccurrenceCanonical? @relation(fields: [canonicalId], references: [id], onDelete: SetNull)
+
+  @@unique([monitorId, conversationId, field])
+  @@index([conversationId])
+  @@index([canonicalId])
+  @@index([monitorId, field, firstReadAt])
+  // The round counts what was read in its window.
+  @@index([monitorId, field, lastReadAt])
+  @@map("conversation_readings")
+}
+
+// Where the monitor's reading of a conversation stands: the customer message it last covered
+// (`readInboundAt`, the conversation's `last_inbound_at` when it was read), so a conversation is read
+// again only once the customer wrote after it. A read that failed is counted against the message it
+// was for (`failedInboundAt`); after a few, that message is given up on until the customer writes
+// again. The fields' values are `conversation_readings`, as before.
+model OccurrenceConversationRead {
+  id                     BigInt    @id @default(autoincrement())
+  tenantId               BigInt    @map("tenant_id")
+  monitorId              BigInt    @map("monitor_id")
+  conversationId         BigInt    @map("conversation_id")
+  readInboundAt          DateTime? @map("read_inbound_at")
+  // The covered message's Chatwoot id: two messages in one second share `readInboundAt`.
+  readInboundMessageId   Int?      @map("read_inbound_message_id")
+  readAt                 DateTime? @map("read_at")
+  failures               Int       @default(0)
+  failedInboundAt        DateTime? @map("failed_inbound_at")
+  // The failed message's Chatwoot id, beside its time, as `readInboundMessageId`.
+  failedInboundMessageId Int?      @map("failed_inbound_message_id")
+  // The conversation's latest activity as the sweep last listed it (an inbox no agent receives), and
+  // what the last reading covered of it: newer listed than read makes the conversation due. Only the
+  // sweep writes the first, only the reading the second.
+  sweptActivityAt        DateTime? @map("swept_activity_at")
+  // The listed activity at which the conversation last became due (newer than what was covered),
+  // kept while it waits: a first reading's window is measured from it, so later activity by the
+  // team does not age out a customer message the cap left for later. Written by the sweep only.
+  sweptDueSince          DateTime? @map("swept_due_since")
+  readSweptActivityAt    DateTime? @map("read_swept_activity_at")
+
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor      OccurrenceMonitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  conversation Conversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([monitorId, conversationId])
+  @@index([tenantId])
+  @@index([conversationId])
+  @@map("occurrence_conversation_reads")
+}
+
+// How far the occurrences sweep has listed an inbox no agent receives, per monitor (docs/occurrences.md,
+// "Inboxes no agent receives"). Only the sweep writes it.
+model OccurrenceSweepCursor {
+  tenantId   BigInt    @map("tenant_id")
+  monitorId  BigInt    @map("monitor_id")
+  inboxId    BigInt    @map("inbox_id")
+  // Every conversation listed with this activity or later was queued: the next listing stops here.
+  activityAt DateTime? @map("activity_at")
+  // When the inbox was last swept: the least recently swept goes first.
+  sweptAt    DateTime? @map("swept_at")
+  // When its listing last failed, cleared by the next one that lists: the round says so.
+  unlistedAt DateTime? @map("unlisted_at")
+
+  tenant  Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor OccurrenceMonitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  inbox   Inbox             @relation(fields: [inboxId], references: [id], onDelete: Cascade)
+
+  @@id([monitorId, inboxId])
+  @@index([tenantId])
+  @@map("occurrence_sweep_cursors")
+}
+
+// One round of the occurrence monitor: when it ran, how long it took, what it read and what its model
+// calls cost (the sum of the round's `llm_usage` rows). `status`: ok | failed.
+model OccurrenceRun {
+  id            BigInt    @id @default(autoincrement())
+  tenantId      BigInt    @map("tenant_id")
+  monitorId     BigInt    @map("monitor_id")
+  startedAt     DateTime  @default(now()) @map("started_at")
+  finishedAt    DateTime? @map("finished_at")
+  durationMs    Int?      @map("duration_ms")
+  status        String    @default("running")
+  readings      Int       @default(0)
+  // Where this round's count of readings stopped, stored with the count: the next round counts from
+  // the latest one, so a round that failed before counting leaves its window to the next.
+  countedUntil  DateTime? @map("counted_until")
+  modelCalls    Int       @default(0) @map("model_calls")
+  // Calls with no price: `costUsd` sums the priced ones only, and is null when none had a price.
+  unpricedCalls Int       @default(0) @map("unpriced_calls")
+  costUsd       Decimal?  @map("cost_usd") @db.Decimal(14, 6)
+  detail        Json      @default("{}")
+  // The round also ran the stronger model's consolidation; the next is due a consolidation cadence
+  // after the last round that did.
+  consolidated  Boolean   @default(false)
+
+  tenant       Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor      OccurrenceMonitor       @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  flagEpisodes OccurrenceFlagEpisode[]
+
+  @@index([tenantId, startedAt])
+  @@index([monitorId, startedAt])
+  @@map("occurrence_runs")
+}
+
+// A theme: reason sentences the assignment model judged to be one thing. `status`: open | merged |
+// split. A merged theme names its survivor in `mergedIntoId`, always the final one (never a chain).
+// `flags` is what the last round found (new, above_usual, concentrated), `flagReferenceId`
+// the canonical reference most of its window conversations share (the column keeps its first name).
+// `flagUnmetSince`: the first round a flagged theme met no rule; it keeps its flags until the monitor's
+// hold has passed since (a held theme), and is null while a rule is met.
+// `critical`: the model's judgment that the theme is a serious subject for the business (one of the
+// monitor's critical subjects, or clearly urgent), decided when the theme is created or renamed, with
+// `criticalBasis`, the digest of the list and business context it was judged by. A mark with no basis,
+// or one that is not the monitor's now (the list or the context changed since), reads as not judged:
+// not critical, and judged again by the next round.
+model OccurrenceTheme {
+  id              BigInt    @id @default(autoincrement())
+  tenantId        BigInt    @map("tenant_id")
+  monitorId       BigInt    @map("monitor_id")
+  title           String
+  status          String    @default("open")
+  mergedIntoId    BigInt?   @map("merged_into_id")
+  firstSeenAt     DateTime? @map("first_seen_at")
+  lastSeenAt      DateTime? @map("last_seen_at")
+  flags           String[]  @default([])
+  flagReferenceId BigInt?   @map("flag_subject_id")
+  flaggedAt       DateTime? @map("flagged_at")
+  flagUnmetSince  DateTime? @map("flag_unmet_since")
+  critical        Boolean?
+  criticalBasis   String?   @map("critical_basis")
+  // A split decided and not finished in its round: parts, reason and the sentences already placed.
+  splitPlan       Json?     @map("split_plan")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  tenant       Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor      OccurrenceMonitor       @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  members      OccurrenceThemeMember[]
+  events       OccurrenceThemeEvent[]
+  flagEpisodes OccurrenceFlagEpisode[]
+
+  @@index([tenantId, status])
+  @@index([monitorId, status])
+  @@map("occurrence_themes")
+}
+
+// One stretch a theme stayed flagged, held included (docs/occurrences.md, "Flag history"): opened by the
+// round that flagged it (`runId`; null for a save's recount), kept by every round while it stays flagged
+// (`kinds` seen, `peak` window count, `lastFlaggedAt`) and closed by the one that unflagged it
+// (`endedAt`). `title` and `referenceId` are what the theme had when it opened, so the history reads as
+// it was seen; a merge moves the absorbed theme's episodes to the survivor. At most one open episode
+// per theme (a partial unique index in the migration).
+model OccurrenceFlagEpisode {
+  id            BigInt    @id @default(autoincrement())
+  tenantId      BigInt    @map("tenant_id")
+  monitorId     BigInt    @map("monitor_id")
+  themeId       BigInt    @map("theme_id")
+  title         String
+  kinds         String[]  @default([])
+  referenceId   BigInt?   @map("reference_id")
+  startedAt     DateTime  @map("started_at")
+  lastFlaggedAt DateTime  @map("last_flagged_at")
+  endedAt       DateTime? @map("ended_at")
+  peak          Int       @default(0)
+  runId         BigInt?   @map("run_id")
+
+  tenant  Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor OccurrenceMonitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  theme   OccurrenceTheme   @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  run     OccurrenceRun?    @relation(fields: [runId], references: [id], onDelete: SetNull)
+
+  @@index([monitorId, startedAt])
+  @@index([tenantId])
+  @@index([themeId])
+  @@map("occurrence_flag_episodes")
+}
+
+// A conversation in a theme, with its own reason sentence verbatim. One theme per conversation: a
+// conversation whose sentence changes is assigned again. `readAt` is when the conversation was first
+// read, and `inboundAt` the customer message that read covered, which is what the flags count.
+model OccurrenceThemeMember {
+  id             BigInt    @id @default(autoincrement())
+  tenantId       BigInt    @map("tenant_id")
+  monitorId      BigInt    @map("monitor_id")
+  themeId        BigInt    @map("theme_id")
+  conversationId BigInt    @map("conversation_id")
+  sentence       String
+  readAt         DateTime  @map("read_at")
+  // The customer message the reading it was placed from covered (`firstInboundAt`), which the flags
+  // count it at. Null on a member placed before it was kept, which counts at `readAt`.
+  inboundAt      DateTime? @map("inbound_at")
+  assignedAt     DateTime  @default(now()) @map("assigned_at")
+
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor      OccurrenceMonitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  theme        OccurrenceTheme   @relation(fields: [themeId], references: [id], onDelete: Cascade)
+  conversation Conversation      @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@unique([monitorId, conversationId])
+  @@index([conversationId])
+  @@index([tenantId, themeId, readAt])
+  @@map("occurrence_theme_members")
+}
+
+// What consolidation did to a theme: `kind` merge (themeId absorbed into intoId), split (themeId
+// divided, `detail.into` the new ids) or rename (`detail.from`, `detail.to`).
+model OccurrenceThemeEvent {
+  id        BigInt   @id @default(autoincrement())
+  tenantId  BigInt   @map("tenant_id")
+  monitorId BigInt   @map("monitor_id")
+  kind      String
+  themeId   BigInt   @map("theme_id")
+  intoId    BigInt?  @map("into_id")
+  runId     BigInt?  @map("run_id")
+  detail    Json     @default("{}")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant  Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor OccurrenceMonitor @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  theme   OccurrenceTheme   @relation(fields: [themeId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, createdAt])
+  @@index([monitorId, createdAt])
+  @@map("occurrence_theme_events")
+}
+
+// A canonical reference: the name the reference's free spellings were unified to. Never renamed, since a
+// folder may filter by it; a merged one names its survivor in `mergedIntoId`, always the final one.
+model OccurrenceCanonical {
+  id           BigInt   @id @default(autoincrement())
+  tenantId     BigInt   @map("tenant_id")
+  monitorId    BigInt   @map("monitor_id")
+  // The reference field it was decided for: a field switched later starts its own dictionary.
+  field        String   @default("")
+  name         String
+  mergedIntoId BigInt?  @map("merged_into_id")
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  tenant   Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor  OccurrenceMonitor     @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  aliases  OccurrenceAlias[]
+  readings ConversationReading[]
+
+  @@unique([monitorId, field, name])
+  @@index([tenantId])
+  @@map("occurrence_canonicals")
+}
+
+// The canonical model's decision about one exact spelling, so the same spelling is never asked again.
+// The key is the raw value as stored: no folding of case or accents, which would be a similarity
+// judgment this code does not make.
+model OccurrenceAlias {
+  id          BigInt   @id @default(autoincrement())
+  tenantId    BigInt   @map("tenant_id")
+  monitorId   BigInt   @map("monitor_id")
+  field       String   @default("")
+  raw         String
+  canonicalId BigInt   @map("canonical_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  monitor   OccurrenceMonitor   @relation(fields: [monitorId], references: [id], onDelete: Cascade)
+  canonical OccurrenceCanonical @relation(fields: [canonicalId], references: [id], onDelete: Cascade)
+
+  @@unique([monitorId, field, raw])
+  @@index([tenantId])
+  @@map("occurrence_aliases")
 }

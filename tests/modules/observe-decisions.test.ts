@@ -1,0 +1,2601 @@
+import {
+  afterAll,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  spyOn,
+  test,
+} from "bun:test";
+import { AIMessage } from "@langchain/core/messages";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
+import { chatwootThreadId } from "@/graph/checkpointer";
+import { ChatwootClient } from "@/modules/chatwoot/client";
+import {
+  listInboxCustomAttributes,
+  listInboxLabels,
+} from "@/modules/chatwoot/management";
+import { __resetChatwootVocabCache } from "@/modules/chatwoot/vocab";
+import {
+  decisionsBlockFingerprint,
+  ruleStateKey,
+} from "@/modules/decisions/config";
+import * as decisionsRun from "@/modules/decisions/run";
+import * as triggerState from "@/modules/decisions/trigger-state";
+import { runObserve } from "@/modules/observe/job";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogRows } from "../utils/flowlog";
+
+// The `decisions` engine of a monitoring agent (docs/decisions.md): the tick reads the
+// conversation as it always has, asks a classification API typed questions instead of running the
+// model, and turns answers that cross a rule's threshold into the rule's tool call through the SAME
+// tool objects the LLM observer uses. Providers are doubles in the documented shapes; the real APIs
+// are exercised in the PR's live validation.
+
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
+  }
+}
+const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
+
+const INBOX_ID = 93;
+const OUR_BOT = 31;
+const CONV = 9301;
+const CUSTOMER_TEXT =
+  "Quero meu dinheiro de volta do pedido 4471, MARCADOR-1135";
+let tenantId = 0n;
+let instanceId = 0n;
+let agentId = 0n;
+let convRowId = 0n;
+let keyRef = "";
+
+interface ClientLog {
+  labelsWritten: string[][];
+  notes: string[];
+  attributes: Record<string, unknown>[];
+  publicSends: number;
+}
+
+// Rows a test appends after the customer's message, read on every fetch until it clears them.
+let extraMessages: Record<string, unknown>[] = [];
+
+function stubClient(labels: string[], log: ClientLog): ChatwootClient {
+  return {
+    // An observation's client is built muted, which is what shapes its tools' arguments.
+    muted: true,
+    getMessages: async () => ({
+      payload: [
+        {
+          id: 11,
+          content: CUSTOMER_TEXT,
+          message_type: 0,
+          private: false,
+          attachments: [],
+        },
+        ...extraMessages,
+      ],
+    }),
+    getConversationLabels: async () => [...labels],
+    setConversationLabels: async (_id: number, next: string[]) => {
+      log.labelsWritten.push(next);
+      labels.splice(0, labels.length, ...next);
+      return {};
+    },
+    sendPrivateNote: async (_id: number, text: string) => {
+      log.notes.push(text);
+      return {};
+    },
+    updateConversationCustomAttributes: async (
+      _id: number,
+      attrs: Record<string, unknown>,
+    ) => {
+      log.attributes.push(attrs);
+      return {};
+    },
+    sendMessage: async () => {
+      log.publicSends++;
+      return {};
+    },
+    toggleTyping: async () => {
+      log.publicSends++;
+      return {};
+    },
+  } as unknown as ChatwootClient;
+}
+
+// A provider double: records each request it receives and answers what the test scripted.
+function providerDouble(answer: (body: Record<string, unknown>) => Response) {
+  const requests: { url: string; body: Record<string, unknown> }[] = [];
+  const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    requests.push({ url: String(input), body });
+    return answer(body);
+  }) as typeof fetch;
+  return { requests, fetchImpl };
+}
+
+const json = (v: unknown, status = 200) =>
+  new Response(JSON.stringify(v), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+
+// TypeSafe's documented shape (docs.typesafe.ai/api).
+function typesafeAnswer(answers: Record<string, unknown>) {
+  return json({
+    model: "jev-1.13.0",
+    answers,
+    usage: { input_tokens: 1000, output_tokens: 60 },
+  });
+}
+
+const QUESTIONS = [
+  {
+    name: "pede_reembolso",
+    type: "yes_no",
+    instructions: "O cliente pede o dinheiro de volta?",
+  },
+  {
+    name: "assunto",
+    type: "choice",
+    instructions: "Assunto principal",
+    options: [
+      { value: "reembolso", description: "estorno ou reembolso" },
+      { value: "troca", description: "troca de ingresso" },
+      { value: "duvida", description: "outra dúvida" },
+    ],
+  },
+  {
+    name: "irritacao",
+    type: "score",
+    instructions: "Quão irritado está o cliente?",
+    levels: [
+      { value: "calmo", description: "" },
+      { value: "frustrado", description: "" },
+      { value: "muito_irritado", description: "" },
+    ],
+  },
+];
+
+async function setMonitoring(monitoring: Record<string, unknown>) {
+  await suDb.agent.update({
+    where: { id: agentId },
+    data: { settings: { monitoring } as never },
+  });
+}
+
+function decisionsBlock(over: Record<string, unknown> = {}) {
+  return {
+    engine: "decisions",
+    decisions: {
+      provider: "typesafe",
+      credentialRef: keyRef,
+      questions: QUESTIONS,
+      rules: [
+        {
+          when: [{ question: "pede_reembolso", minProbability: 0.7 }],
+          action: { tool: "set_labels", args: { add: ["reembolso"] } },
+        },
+      ],
+      ...over,
+    },
+  };
+}
+
+// A chat model that counts calls, so a test can assert the `decisions` engine never runs the graph.
+class CountingModel {
+  calls = 0;
+  async invoke() {
+    this.calls++;
+    return new AIMessage("");
+  }
+  bindTools() {
+    const self = this;
+    return {
+      async invoke() {
+        self.calls++;
+        return new AIMessage("nada.");
+      },
+    };
+  }
+}
+
+const observeLines = () =>
+  flowLogRows(suDb, {
+    where: { conversationId: convRowId, stage: "observe" },
+    orderBy: { id: "asc" },
+    select: {
+      status: true,
+      level: true,
+      detail: true,
+      provider: true,
+      model: true,
+      errorMessage: true,
+    },
+  });
+const lastLine = async () => {
+  const l = (await observeLines()).at(-1);
+  if (!l) throw new Error("no observe line");
+  return l;
+};
+const detail = async () => (await lastLine()).detail as Record<string, unknown>;
+const usageRows = () =>
+  suDb.llmUsage.findMany({
+    where: { tenantId, conversationId: convRowId },
+    orderBy: { id: "asc" },
+    select: {
+      node: true,
+      model: true,
+      promptTokens: true,
+      completionTokens: true,
+      costUsd: true,
+    },
+  });
+
+async function tick(
+  fetchImpl: typeof fetch,
+  labels: string[] = [],
+  extra: {
+    afterFailure?: "retry" | "dead_letter";
+    timeoutMs?: number;
+    // A private note that hangs until this promise settles.
+    slowNotes?: Promise<unknown>;
+  } = {},
+) {
+  const log: ClientLog = {
+    labelsWritten: [],
+    notes: [],
+    attributes: [],
+    publicSends: 0,
+  };
+  const model = new CountingModel();
+  const { slowNotes, ...deps } = extra;
+  const client = stubClient(labels, log);
+  if (slowNotes !== undefined) {
+    // A write that hangs past the tick's deadline (a keyed queue the signal does not cancel).
+    (client as unknown as { sendPrivateNote: unknown }).sendPrivateNote =
+      async () => {
+        await slowNotes;
+        return {};
+      };
+  }
+  const res = await runObserve(
+    tenantId,
+    {
+      instanceId,
+      conversationId: CONV,
+      agentId,
+      reason: "burst",
+      atMessageId: null,
+    },
+    appDb,
+    {
+      makeClient: async () => client,
+      makeModel: () => model as never,
+      decisionFetch: fetchImpl,
+      ...deps,
+    },
+  );
+  return { log, model, res };
+}
+
+describe.skipIf(!dbUp)("the decisions engine of a monitoring agent", () => {
+  beforeAll(async () => {
+    const t = await suDb.tenant.create({
+      data: { name: "DEC", slug: `dec-${process.pid}` },
+    });
+    tenantId = t.id;
+    const inst = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 63,
+      baseUrl: "https://chat.decisions.example",
+      adminToken: encryptJson("ADMIN"),
+    });
+    instanceId = inst.id;
+    const key = await suDb.vaultEntry.create({
+      data: { tenantId, name: "typesafe-teste", secret: encryptJson("ts-key") },
+      select: { id: true },
+    });
+    keyRef = `vault:${key.id}`;
+    const agent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Classificadora",
+        systemPrompt: "Você classifica conversas.",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+        settings: {},
+      },
+    });
+    agentId = agent.id;
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId,
+        chatwootAgentBotId: OUR_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `dec-route-${process.pid}`,
+        name: "Classificadora",
+      },
+    });
+    const inbox = await suDb.inbox.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: INBOX_ID,
+        name: "SAC",
+      },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId },
+    });
+    const conv = await suDb.conversation.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootConversationId: CONV,
+        inboxId: inbox.id,
+        status: "open",
+        threadId: chatwootThreadId(tenantId, instanceId, CONV),
+      },
+    });
+    convRowId = conv.id;
+  });
+
+  // Every test shares one conversation, so no rule's latch may carry from one test to the next (a
+  // note cut off by its deadline stays latched, docs/decisions.md).
+  beforeEach(async () => {
+    __resetChatwootVocabCache();
+    if (dbUp) {
+      await suDb.decisionRuleState.deleteMany({ where: { tenantId } });
+      await suDb.decisionRuleClaim.deleteMany({ where: { tenantId } });
+    }
+  });
+
+  afterAll(async () => {
+    if (!dbUp) return;
+    for (const table of [
+      "execution_logs",
+      "llm_usage",
+      "scheduler_jobs",
+      "decision_rule_states",
+      "decision_rule_claims",
+      "conversations",
+      "inbox_observers",
+      "inboxes",
+      "chatwoot_agent_bots",
+      "agents",
+      "vault_entries",
+      "chatwoot_instances",
+      "chatwoot_deployments",
+      "tenants",
+    ]) {
+      await suDb
+        .$executeRawUnsafe(
+          table === "tenants"
+            ? `DELETE FROM tenants WHERE id = ${tenantId}`
+            : `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
+        )
+        .catch(() => {});
+    }
+    await suDb.$disconnect();
+    await appDb.$disconnect();
+  });
+
+  test("without the engine key the tick runs the model and never calls a provider", async () => {
+    await setMonitoring({ decisions: decisionsBlock().decisions });
+    const p = providerDouble(() => typesafeAnswer({}));
+    const { model } = await tick(p.fetchImpl);
+    expect(p.requests).toHaveLength(0);
+    expect(model.calls).toBeGreaterThan(0);
+    const d = await detail();
+    expect(d.engine).toBeUndefined();
+    expect(Object.keys(d).sort()).toEqual(
+      ["acted", "labelsBefore", "messagesRead", "reason", "toolCalls"].sort(),
+    );
+  });
+
+  test("an unknown engine value reads as llm", async () => {
+    await setMonitoring({ ...decisionsBlock(), engine: "xyz" });
+    const p = providerDouble(() => typesafeAnswer({}));
+    const { model } = await tick(p.fetchImpl);
+    expect(p.requests).toHaveLength(0);
+    expect(model.calls).toBeGreaterThan(0);
+  });
+
+  test("the evidence names the instance's AI agent and a person apart", async () => {
+    await setMonitoring(decisionsBlock());
+    // A bot id of ANOTHER instance of the same tenant: bot ids are per Chatwoot server, so on this
+    // one the same number is somebody else's bot.
+    const OTHER_BOT = 4242;
+    const other = await seedChatwootInstance(suDb, {
+      tenantId,
+      accountId: 64,
+      baseUrl: "https://chat.other.example",
+      adminToken: encryptJson("ADMIN2"),
+    });
+    const otherAgent = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Outra",
+        systemPrompt: "x",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "agent",
+        settings: {},
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: other.id,
+        agentId: otherAgent.id,
+        chatwootAgentBotId: OTHER_BOT,
+        accessToken: encryptJson("BOT2"),
+        webhookSecret: encryptJson("S2"),
+        webhookRouteTokenHash: `dec-route-other-${process.pid}`,
+        name: "Outra",
+      },
+    });
+    extraMessages = [
+      {
+        id: 15,
+        content: "Eco do telefone",
+        message_type: 1,
+        private: false,
+        attachments: [],
+        content_attributes: { external_sender_name: "WhatsApp" },
+      },
+      {
+        id: 14,
+        content: "Bot de outra instância",
+        message_type: 1,
+        private: false,
+        attachments: [],
+        sender: { type: "agent_bot", id: OTHER_BOT },
+      },
+      {
+        id: 12,
+        content: "Resposta da assistente",
+        message_type: 1,
+        private: false,
+        attachments: [],
+        sender: { type: "agent_bot", id: OUR_BOT },
+      },
+      {
+        id: 13,
+        content: "Resposta da atendente",
+        message_type: 1,
+        private: false,
+        attachments: [],
+        sender: { type: "user", id: 7 },
+      },
+    ];
+    try {
+      const p = providerDouble(() =>
+        typesafeAnswer({
+          pede_reembolso: { type: "noul", noul: 0.1 },
+          assunto: {
+            type: "choice",
+            choice: "duvida",
+            confidence: 0.9,
+            probabilities: { reembolso: 0.05, troca: 0.05, duvida: 0.9 },
+          },
+          irritacao: {
+            type: "score",
+            score: 0.2,
+            confidence: 0.6,
+            probabilities: { "0": 0.8, "1": 0.1, "2": 0.1 },
+          },
+        }),
+      );
+      await tick(p.fetchImpl);
+      const state = String(p.requests[0]?.body.state);
+      expect(state).toContain("Assistente virtual: Resposta da assistente");
+      expect(state).toContain("Atendente (pessoa): Resposta da atendente");
+      expect(state).toContain("Atendente: Bot de outra instância");
+      // The test inbox names no provider, so the phone marker is not trusted to name a person.
+      expect(state).toContain("Atendente: Eco do telefone");
+      await suDb.inbox.updateMany({
+        where: { tenantId, chatwootInboxId: INBOX_ID },
+        data: { provider: "baileys" },
+      });
+      const p2 = providerDouble(() =>
+        typesafeAnswer({
+          pede_reembolso: { type: "noul", noul: 0.1 },
+          assunto: {
+            type: "choice",
+            choice: "duvida",
+            confidence: 0.9,
+            probabilities: { reembolso: 0.05, troca: 0.05, duvida: 0.9 },
+          },
+          irritacao: {
+            type: "score",
+            score: 0.2,
+            confidence: 0.6,
+            probabilities: { "0": 0.8, "1": 0.1, "2": 0.1 },
+          },
+        }),
+      );
+      await tick(p2.fetchImpl);
+      expect(String(p2.requests[0]?.body.state)).toContain(
+        "Atendente (pessoa): Eco do telefone",
+      );
+    } finally {
+      extraMessages = [];
+      await suDb.inbox.updateMany({
+        where: { tenantId, chatwootInboxId: INBOX_ID },
+        data: { provider: null },
+      });
+    }
+  });
+
+  test("enforce: an answer over the threshold runs the rule's tool, and nothing else", async () => {
+    await setMonitoring(decisionsBlock());
+    const before = (await usageRows()).length;
+    const p = providerDouble(() =>
+      typesafeAnswer({
+        pede_reembolso: { type: "noul", noul: 0.92 },
+        assunto: {
+          type: "choice",
+          choice: "reembolso",
+          confidence: 0.9,
+          probabilities: { reembolso: 0.95, troca: 0.03, duvida: 0.02 },
+        },
+        irritacao: {
+          type: "score",
+          score: 1.1,
+          confidence: 0.6,
+          probabilities: { "0": 0.1, "1": 0.7, "2": 0.2 },
+        },
+      }),
+    );
+    const { log, model } = await tick(p.fetchImpl);
+    expect(model.calls).toBe(0);
+    expect(log.labelsWritten).toEqual([["reembolso"]]);
+    expect(log.notes).toEqual([]);
+    expect(log.publicSends).toBe(0);
+
+    // The request: the official endpoint, the alias, the questions map in TypeSafe's dialect, and
+    // the evidence only, not the model-facing frame.
+    expect(p.requests).toHaveLength(1);
+    const req = p.requests[0];
+    expect(req?.url).toBe("https://api.typesafe.ai/v1/systemone");
+    expect(req?.body.model).toBe("jev-latest");
+    const qs = req?.body.questions as Record<string, Record<string, unknown>>;
+    expect(qs.pede_reembolso?.type).toBe("noul");
+    expect(qs.assunto?.criteria).toEqual({
+      reembolso: "estorno ou reembolso",
+      troca: "troca de ingresso",
+      duvida: "outra dúvida",
+    });
+    expect(Array.isArray(qs.irritacao?.criteria)).toBe(true);
+    const state = String(req?.body.state);
+    expect(state).toContain("MARCADOR-1135");
+    expect(state).not.toContain("Turno de observação");
+
+    const line = await lastLine();
+    expect(line.status).toBe("ok");
+    expect(line.level).toBe("info");
+    expect(line.provider).toBe("typesafe");
+    expect(line.model).toBe("jev-latest");
+    const d = line.detail as Record<string, unknown>;
+    expect(d.engine).toBe("decisions");
+    // Every rule that fires runs, so a line carries no `apply`.
+    expect("apply" in d).toBe(false);
+    // The mark of the questions and rules the tick ran, which the console matches its counts by.
+    expect(d.block).toBe(
+      decisionsBlockFingerprint(decisionsBlock().decisions) as string,
+    );
+    expect(d.acted).toBe(true);
+    expect(d.modelVersion).toBe("jev-1.13.0");
+    expect(d.actions).toEqual([
+      { rule: 0, tool: "set_labels", outcome: "ran" },
+    ]);
+    expect((d.answers as Record<string, unknown>).pede_reembolso).toEqual({
+      type: "yes_no",
+      probability: 0.92,
+    });
+    // A score's probabilities are keyed by the level's value, as a choice's are by the option's.
+    expect(
+      (d.answers as Record<string, { probabilities: unknown }>).irritacao
+        ?.probabilities,
+    ).toEqual({ calmo: 0.1, frustrado: 0.7, muito_irritado: 0.2 });
+    expect(JSON.stringify(d)).not.toContain("MARCADOR-1135");
+
+    // Billed on input only, at TypeSafe's published price, under its own node.
+    const rows = (await usageRows()).slice(before);
+    expect(rows.map((r) => r.node)).toEqual(["decision"]);
+    expect(rows[0]?.promptTokens).toBe(1000);
+    expect(rows[0]?.completionTokens).toBe(0);
+    expect(Number(rows[0]?.costUsd)).toBeCloseTo(0.000042, 9);
+  });
+
+  // The reason is the rule's own text, written in the rule: the agent's switch for a model-written
+  // summary does not apply to it, and an empty reason is what leaves no note.
+  test("a handoff rule's reason is left as a private note even with the summary switch off", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { transferWithSummary: false },
+    });
+    try {
+      await setMonitoring(
+        decisionsBlock({
+          rules: [
+            {
+              when: [{ question: "pede_reembolso", minProbability: 0.7 }],
+              action: {
+                tool: "handoff_to_human",
+                args: { reason: "Pede reembolso, ver com o financeiro" },
+              },
+            },
+          ],
+        }),
+      );
+      const p = providerDouble(() =>
+        typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.92 } }),
+      );
+      const { log } = await tick(p.fetchImpl);
+      expect(log.notes).toEqual(["Pede reembolso, ver com o financeiro"]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { transferWithSummary: true },
+      });
+    }
+  });
+
+  test("below the threshold nothing runs, and the line says which question and by how much", async () => {
+    await setMonitoring(decisionsBlock());
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.69 } }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.labelsWritten).toEqual([]);
+    const d = await detail();
+    expect(d.acted).toBe(false);
+    expect(d.actions).toEqual([]);
+    expect(d.notFired).toEqual([
+      {
+        rule: 0,
+        miss: {
+          question: "pede_reembolso",
+          why: "below_threshold",
+          got: 0.69,
+          threshold: 0.7,
+          measure: "probability",
+        },
+      },
+    ]);
+  });
+
+  test("a probability exactly at the threshold fires: the threshold is a minimum", async () => {
+    await setMonitoring(decisionsBlock());
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.7 } }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.labelsWritten).toEqual([["reembolso"]]);
+  });
+
+  test("a provider that omits confidence does not pass a condition that asks for one", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [
+              { question: "assunto", equals: "reembolso", minConfidence: 0.5 },
+            ],
+            action: { tool: "set_labels", args: { add: ["reembolso"] } },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      typesafeAnswer({
+        assunto: { type: "choice", choice: "reembolso", probabilities: {} },
+      }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.labelsWritten).toEqual([]);
+    expect(((await detail()).notFired as { miss: unknown }[])[0]?.miss).toEqual(
+      {
+        question: "assunto",
+        why: "below_threshold",
+        got: null,
+        threshold: 0.5,
+        measure: "confidence",
+      },
+    );
+  });
+
+  test("a choice with the right option but low confidence does not fire; conditions combine with AND", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [
+              { question: "pede_reembolso", minProbability: 0.7 },
+              { question: "assunto", equals: "reembolso", minConfidence: 0.8 },
+            ],
+            action: {
+              tool: "set_labels",
+              args: { add: ["reembolso-confirmado"] },
+            },
+          },
+        ],
+      }),
+    );
+    const low = providerDouble(() =>
+      typesafeAnswer({
+        pede_reembolso: { type: "noul", noul: 0.95 },
+        assunto: {
+          type: "choice",
+          choice: "reembolso",
+          confidence: 0.5,
+          probabilities: {},
+        },
+      }),
+    );
+    const a = await tick(low.fetchImpl);
+    expect(a.log.labelsWritten).toEqual([]);
+    expect(((await detail()).notFired as { miss: unknown }[])[0]?.miss).toEqual(
+      {
+        question: "assunto",
+        why: "below_threshold",
+        got: 0.5,
+        threshold: 0.8,
+        measure: "confidence",
+      },
+    );
+    const high = providerDouble(() =>
+      typesafeAnswer({
+        pede_reembolso: { type: "noul", noul: 0.95 },
+        assunto: {
+          type: "choice",
+          choice: "reembolso",
+          confidence: 0.93,
+          probabilities: {},
+        },
+      }),
+    );
+    const b = await tick(high.fetchImpl);
+    expect(b.log.labelsWritten).toEqual([["reembolso-confirmado"]]);
+  });
+
+  test("two rules firing the same action run it once", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.7 }],
+            action: {
+              tool: "private_note",
+              args: { content: "Pedido de reembolso" },
+            },
+          },
+          {
+            when: [{ question: "assunto", equals: "reembolso" }],
+            action: {
+              tool: "private_note",
+              args: { content: "Pedido de reembolso" },
+            },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      typesafeAnswer({
+        pede_reembolso: { type: "noul", noul: 0.95 },
+        assunto: {
+          type: "choice",
+          choice: "reembolso",
+          confidence: 0.95,
+          probabilities: {},
+        },
+      }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.notes).toEqual(["Pedido de reembolso"]);
+    // The second rule's identical action is the first one's: the line names it beside the outcome.
+    expect((await detail()).actions).toEqual([
+      { rule: 0, tool: "private_note", outcome: "ran", merged: [1] },
+    ]);
+  });
+
+  test("openai: questions travel as the documented array, a refusal stops only its own rule", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        provider: "openai",
+        rules: [
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+            action: { tool: "set_labels", args: { add: ["reembolso"] } },
+          },
+          {
+            when: [
+              { question: "assunto", equals: "reembolso", minConfidence: 0.8 },
+            ],
+            action: { tool: "private_note", args: { content: "reembolso" } },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      json({
+        model: "gpt-6-luna",
+        answers: [
+          { type: "refusal", name: "pede_reembolso" },
+          {
+            type: "choice",
+            name: "assunto",
+            choice: "reembolso",
+            probabilities: [
+              { value: "reembolso", probability: 0.95 },
+              { value: "troca", probability: 0.05 },
+            ],
+            confidence: 0.95,
+          },
+          {
+            type: "score",
+            name: "irritacao",
+            score: 0.2,
+            probabilities: [
+              { value: 0, label: "calmo", probability: 0.8 },
+              { value: 1, label: "frustrado", probability: 0.2 },
+            ],
+            confidence: 0.7,
+          },
+        ],
+        usage: { input_tokens: 500, output_tokens: 0 },
+      }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    const req = p.requests[0];
+    expect(req?.url).toBe("https://api.openai.com/v1/decisions");
+    expect(req?.body.model).toBe("gpt-6-luna");
+    const qs = req?.body.questions as Record<string, unknown>[];
+    expect(qs.map((q) => [q.name, q.type])).toEqual([
+      ["pede_reembolso", "predicate"],
+      ["assunto", "choice"],
+      ["irritacao", "score"],
+    ]);
+    expect(qs[1]?.choices).toBeDefined();
+    expect(qs[2]?.levels).toEqual([
+      { label: "calmo", description: "" },
+      { label: "frustrado", description: "" },
+      { label: "muito_irritado", description: "" },
+    ]);
+    // Text only: no image part anywhere in what the provider received.
+    expect(typeof req?.body.input).toBe("string");
+    expect(JSON.stringify(req?.body)).not.toContain("data:image");
+
+    expect(log.labelsWritten).toEqual([]);
+    expect(log.notes).toEqual(["reembolso"]);
+    const d = await detail();
+    expect((d.answers as Record<string, unknown>).pede_reembolso).toEqual({
+      type: "refusal",
+    });
+    expect(d.notFired).toEqual([
+      { rule: 0, miss: { question: "pede_reembolso", why: "refused" } },
+    ]);
+    expect(d.modelVersion).toBe("gpt-6-luna");
+    expect(
+      (d.answers as Record<string, { probabilities: unknown }>).irritacao
+        ?.probabilities,
+    ).toEqual({ calmo: 0.8, frustrado: 0.2 });
+    // gpt-6-luna is priced by the table's input rate, input only.
+    const row = (await usageRows()).at(-1);
+    expect(row?.node).toBe("decision");
+    expect(Number(row?.costUsd)).toBeCloseTo((500 * 0.1) / 1_000_000, 9);
+  });
+
+  test("a provider failure runs nothing, logs the status alone, and bills nothing", async () => {
+    await setMonitoring(decisionsBlock());
+    const before = (await usageRows()).length;
+    const p = providerDouble(() =>
+      json({ error: "SEGREDO-FORNECEDOR-1135 overloaded" }, 503),
+    );
+    const retry = await tick(p.fetchImpl, [], { afterFailure: "retry" });
+    expect(retry.res.outcome).toBe("fail");
+    expect(retry.log.labelsWritten).toEqual([]);
+    let line = await lastLine();
+    expect(line.status).toBe("error");
+    expect(line.level).toBe("info");
+    expect((line.detail as Record<string, unknown>).willRetry).toBe(true);
+    expect((line.detail as Record<string, unknown>).failure).toBe("HTTP 503");
+
+    await tick(p.fetchImpl, [], { afterFailure: "dead_letter" });
+    line = await lastLine();
+    expect(line.level).toBe("warn");
+    expect(JSON.stringify(await observeLines())).not.toContain(
+      "SEGREDO-FORNECEDOR",
+    );
+    expect((await usageRows()).length).toBe(before);
+  });
+
+  test("an invalid block or an unresolved credential stops the tick with the reason, never falling back to the model", async () => {
+    await setMonitoring({
+      engine: "decisions",
+      decisions: {
+        provider: "anthropic",
+        credentialRef: keyRef,
+        questions: QUESTIONS,
+      },
+    });
+    const p = providerDouble(() => typesafeAnswer({}));
+    const a = await tick(p.fetchImpl);
+    expect(p.requests).toHaveLength(0);
+    expect(a.model.calls).toBe(0);
+    let line = await lastLine();
+    expect(line.status).toBe("skipped");
+    expect(line.level).toBe("warn");
+    expect((line.detail as Record<string, unknown>).skipped).toBe(
+      "decisions_config_invalid",
+    );
+    expect(String((line.detail as Record<string, unknown>).problem)).toContain(
+      "monitoring.decisions.provider",
+    );
+
+    await setMonitoring(decisionsBlock({ credentialRef: "vault:999999999" }));
+    const b = await tick(p.fetchImpl);
+    expect(p.requests).toHaveLength(0);
+    expect(b.model.calls).toBe(0);
+    line = await lastLine();
+    expect((line.detail as Record<string, unknown>).skipped).toBe(
+      "decisions_credential_unresolved",
+    );
+  });
+
+  test("an observation withdrawn while the provider answered runs no action", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+            action: {
+              tool: "private_note",
+              args: { content: "não deveria sair" },
+            },
+          },
+        ],
+      }),
+    );
+    // The agent is switched off between the provider call and the action: `private_note` does not
+    // ask the fence itself, so only the engine's own check keeps it from writing.
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    const switchingOff = (async (u: RequestInfo | URL, init?: RequestInit) => {
+      const r = await p.fetchImpl(u, init);
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: false },
+      });
+      return r;
+    }) as typeof fetch;
+    try {
+      const { log } = await tick(switchingOff);
+      expect(log.notes).toEqual([]);
+      const line = await lastLine();
+      expect(line.status).toBe("skipped");
+      expect((line.detail as Record<string, unknown>).skipped).toBe(
+        "agent_no_longer_observes",
+      );
+      // The paid call was the classification API's, so the refusal is attributed to it.
+      expect([line.provider, line.model]).toEqual(["typesafe", "jev-latest"]);
+      expect((line.detail as Record<string, unknown>).engine).toBe("decisions");
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { enabled: true },
+      });
+    }
+  });
+
+  test("a provider that outlives the tick's deadline is a timeout, on the line and to the scheduler", async () => {
+    await setMonitoring(decisionsBlock());
+    const hanging = ((_u: RequestInfo | URL, init?: RequestInit) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () =>
+          reject(new Error("aborted")),
+        );
+      })) as typeof fetch;
+    const { res } = await tick(hanging, [], {
+      timeoutMs: 500,
+      afterFailure: "retry",
+    });
+    expect(res.outcome).toBe("fail");
+    expect(JSON.stringify(res)).toContain("timeout");
+    const d = await detail();
+    expect(d.failed).toBe("decision_call");
+    expect(d.failure).toBe("timeout");
+  });
+
+  test("an engine switched to the language model while the provider answered writes nothing", async () => {
+    const block = decisionsBlock({
+      rules: [
+        {
+          when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+          action: {
+            tool: "private_note",
+            args: { content: "não deveria sair" },
+          },
+        },
+      ],
+    });
+    await setMonitoring(block);
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    const switching = (async (u: RequestInfo | URL, init?: RequestInit) => {
+      const r = await p.fetchImpl(u, init);
+      await setMonitoring({ ...block, engine: "llm" });
+      return r;
+    }) as typeof fetch;
+    const { log } = await tick(switching);
+    expect(log.notes).toEqual([]);
+    const line = await lastLine();
+    expect(line.status).toBe("skipped");
+    expect((line.detail as Record<string, unknown>).skipped).toBe(
+      "engine_changed",
+    );
+  });
+
+  test("an action that outlives the tick's deadline ends the tick, and a committed one is not retried", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+            action: { tool: "private_note", args: { content: "lenta" } },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    // Never released while the tick runs: the tick returning at all is the deadline ending the wait.
+    const hold = Promise.withResolvers<void>();
+    const { res } = await tick(p.fetchImpl, [], {
+      timeoutMs: 1_500,
+      slowNotes: hold.promise,
+      afterFailure: "retry",
+    }).finally(() => hold.resolve());
+    expect(res.outcome).toBe("done");
+    const line = await lastLine();
+    expect(line.status).toBe("error");
+    expect(line.level).toBe("warn");
+    const d = line.detail as Record<string, unknown>;
+    expect(d.failed).toBe("decision_actions");
+    expect(d.retried).toBe(false);
+    expect(d.failure).toBe("timeout");
+  });
+
+  test("once the deadline passes, no later rule's action starts", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+            action: { tool: "private_note", args: { content: "lenta" } },
+          },
+          {
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+            action: { tool: "set_labels", args: { add: ["reembolso"] } },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    // The slow note settles after the tick returned; the next rule must not run then. The engine's
+    // own run is caught on the way in, so the read below waits for it to stop, not for a guess.
+    const hold = Promise.withResolvers<void>();
+    const realApply = decisionsRun.applyDecisions;
+    let engine: Promise<unknown> = Promise.resolve();
+    const apply = spyOn(decisionsRun, "applyDecisions").mockImplementation(
+      (...args: Parameters<typeof realApply>) => {
+        const run = realApply(...args);
+        engine = run;
+        return run;
+      },
+    );
+    let log: Awaited<ReturnType<typeof tick>>["log"];
+    try {
+      ({ log } = await tick(p.fetchImpl, [], {
+        timeoutMs: 1_000,
+        slowNotes: hold.promise,
+        afterFailure: "retry",
+      }));
+    } finally {
+      hold.resolve();
+      apply.mockRestore();
+    }
+    await Promise.allSettled([engine]);
+    expect(log.labelsWritten).toEqual([]);
+  });
+
+  test("a provider string outside the configured options never reaches the line", async () => {
+    await setMonitoring(
+      decisionsBlock({
+        rules: [
+          {
+            when: [{ question: "assunto", equals: "reembolso" }],
+            action: { tool: "set_labels", args: { add: ["x"] } },
+          },
+        ],
+      }),
+    );
+    const p = providerDouble(() =>
+      json({
+        // Id-shaped, so only the provider's model grammar keeps it out (a credential's base URL may
+        // point at anything that echoes the conversation).
+        model: "MARCADOR-1135_echoed",
+        answers: {
+          assunto: {
+            type: "choice",
+            choice: "MARCADOR-1135 texto do cliente",
+            confidence: 0.9,
+            probabilities: { "MARCADOR-1135": 0.9, reembolso: 0.1 },
+          },
+          irritacao: {
+            type: "score",
+            score: 1,
+            confidence: 0.9,
+            probabilities: { "0": 0.1, "1": 0.8, "MARCADOR-1135": 0.1 },
+          },
+        },
+        usage: { input_tokens: 10 },
+      }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.labelsWritten).toEqual([]);
+    const d = await detail();
+    expect(JSON.stringify(d)).not.toContain("MARCADOR-1135");
+    expect(d.modelVersion).toBeNull();
+    expect((d.answers as Record<string, unknown>).assunto).toBeUndefined();
+    expect(
+      (d.answers as Record<string, { probabilities: unknown }>).irritacao
+        ?.probabilities,
+    ).toEqual({ calmo: 0.1, frustrado: 0.8 });
+    expect(d.notFired).toEqual([
+      { rule: 0, miss: { question: "assunto", why: "unanswered" } },
+    ]);
+  });
+
+  test("modelVersion is the model asked for or its dated snapshot, never another model-shaped string", async () => {
+    await setMonitoring(decisionsBlock({ provider: "openai", rules: [] }));
+    for (const [model, kept] of [
+      ["gpt-6-luna-MARCADOR-1135", null],
+      ["gpt-6-luna-2026-09-01", "gpt-6-luna-2026-09-01"],
+    ] as const) {
+      const p = providerDouble(() =>
+        json({ model, answers: [], usage: { input_tokens: 1 } }),
+      );
+      await tick(p.fetchImpl);
+      expect((await detail()).modelVersion).toBe(kept);
+    }
+  });
+
+  test("arguments the tool would refuse fail the action and write nothing", async () => {
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    {
+      await setMonitoring(
+        decisionsBlock({
+          rules: [
+            {
+              when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+              action: { tool: "private_note", args: {} },
+            },
+          ],
+        }),
+      );
+      const { log } = await tick(p.fetchImpl);
+      expect(log.notes).toEqual([]);
+      const line = await lastLine();
+      expect(line.level).toBe("warn");
+      expect((line.detail as Record<string, unknown>).actions).toEqual([
+        {
+          rule: 0,
+          tool: "private_note",
+          outcome: "failed",
+          failure: "invalid_arguments",
+        },
+      ]);
+    }
+  });
+
+  test("the agent's limits.maxToolCalls caps the actions a tick dispatches", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          limits: { maxToolCalls: 1 },
+          monitoring: decisionsBlock({
+            rules: [
+              {
+                when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+                action: { tool: "private_note", args: { content: "primeira" } },
+              },
+              {
+                when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+                action: { tool: "private_note", args: { content: "segunda" } },
+              },
+            ],
+          }),
+        } as never,
+      },
+    });
+    const p = providerDouble(() =>
+      typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+    );
+    const { log } = await tick(p.fetchImpl);
+    expect(log.notes).toEqual(["primeira"]);
+    const line = await lastLine();
+    expect(line.level).toBe("warn");
+    expect(
+      (
+        (line.detail as Record<string, unknown>).actions as {
+          outcome: string;
+        }[]
+      ).map((a) => a.outcome),
+    ).toEqual(["ran", "over_budget"]);
+  });
+
+  test("a rule whose tool the agent was not granted does not act, and the line says so at warn", async () => {
+    const grant = await suDb.agentToolSelection.create({
+      data: {
+        tenantId,
+        agentId,
+        source: "NATIVE",
+        enabledTools: ["private_note"],
+        knowledgeBaseIds: [],
+      },
+    });
+    try {
+      await setMonitoring(decisionsBlock());
+      const p = providerDouble(() =>
+        typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.99 } }),
+      );
+      const { log } = await tick(p.fetchImpl);
+      expect(log.labelsWritten).toEqual([]);
+      const line = await lastLine();
+      expect(line.level).toBe("warn");
+      expect((line.detail as Record<string, unknown>).actions).toEqual([
+        { rule: 0, tool: "set_labels", outcome: "not_granted" },
+      ]);
+    } finally {
+      await suDb.agentToolSelection.delete({ where: { id: grant.id } });
+    }
+  });
+  // What one decision costs Chatwoot, counted at the transport on a real client: the calls a tick
+  // makes are sequential round trips the conversation waits through, so their number is latency
+  // whatever the machine. The fake answers a turn of the event loop later, as a network does.
+  describe("the requests one decision makes", () => {
+    function fakeChatwoot(seed: {
+      labels: string[];
+      attributes: Record<string, unknown>;
+      // Runs as the window's page is answered, after the labels were asked for.
+      onWindowRead?: (state: { labels: string[] }) => void;
+      // Awaited before the attribute bag is answered.
+      onAttributesRead?: () => Promise<unknown>;
+    }) {
+      const state = {
+        labels: [...seed.labels],
+        attributes: { ...seed.attributes },
+        notes: [] as string[],
+      };
+      const requests: string[] = [];
+      let inFlight = 0;
+      // For each request, how many others were still out when it started.
+      const startedBeside: number[] = [];
+      const fetchImpl = (async (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        const path = new URL(String(input)).pathname.replace(
+          /^.*\/api\/v1\/accounts\/\d+/,
+          "",
+        );
+        const method = init?.method ?? "GET";
+        requests.push(`${method} ${path}`);
+        inFlight += 1;
+        startedBeside.push(inFlight - 1);
+        await new Promise((r) => setTimeout(r, 2));
+        inFlight -= 1;
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        const conv = `/conversations/${CONV}`;
+        if (method === "GET" && path === `${conv}/messages`) {
+          seed.onWindowRead?.(state);
+          return json({
+            payload: [
+              {
+                id: 11,
+                content: CUSTOMER_TEXT,
+                message_type: 0,
+                private: false,
+                attachments: [],
+              },
+            ],
+          });
+        }
+        if (method === "GET" && path === `${conv}/labels`) {
+          return json({ payload: state.labels });
+        }
+        if (method === "POST" && path === `${conv}/labels`) {
+          state.labels = body.labels as string[];
+          return json({ payload: state.labels });
+        }
+        if (method === "GET" && path === conv) {
+          await seed.onAttributesRead?.();
+          return json({ id: CONV, custom_attributes: state.attributes });
+        }
+        if (method === "POST" && path === `${conv}/custom_attributes`) {
+          state.attributes = body.custom_attributes as Record<string, unknown>;
+          return json({ custom_attributes: state.attributes });
+        }
+        if (method === "POST" && path === `${conv}/messages`) {
+          state.notes.push(String(body.content));
+          return json({ id: 99 });
+        }
+        if (method === "GET" && path === "/labels") {
+          return json({ payload: [] });
+        }
+        if (method === "GET" && path === "/custom_attribute_definitions") {
+          return json([]);
+        }
+        return json({}, 404);
+      }) as typeof fetch;
+      return { state, requests, fetchImpl, startedBeside };
+    }
+
+    const onConversation = (requests: string[]) =>
+      requests.filter((r) => r.includes(`/conversations/${CONV}`));
+
+    async function decide(
+      chatwoot: ReturnType<typeof fakeChatwoot>,
+      rules: unknown[],
+    ) {
+      await setMonitoring(decisionsBlock({ rules }));
+      const p = providerDouble(() =>
+        typesafeAnswer({
+          pede_reembolso: { type: "noul", noul: 0.95 },
+          assunto: {
+            type: "choice",
+            choice: "reembolso",
+            confidence: 0.95,
+            probabilities: {},
+          },
+        }),
+      );
+      return runObserve(
+        tenantId,
+        {
+          instanceId,
+          conversationId: CONV,
+          agentId,
+          reason: "burst",
+          atMessageId: null,
+        },
+        appDb,
+        {
+          makeClient: async (cfg) =>
+            new ChatwootClient(cfg, chatwoot.fetchImpl),
+          makeModel: () => new CountingModel() as never,
+          decisionFetch: p.fetchImpl,
+        },
+      );
+    }
+
+    const yes = [{ question: "pede_reembolso", minProbability: 0.7 }];
+    const GATE = {
+      enabled: true,
+      rule: {
+        kind: "attribute",
+        scope: "conversation",
+        key: "active",
+        equals: "yes",
+      },
+    };
+    const attribute = (key: string, value: string) => ({
+      when: yes,
+      action: { tool: "set_custom_attribute", args: { key, value } },
+    });
+
+    // The grants a watcher of this shape has. Without them the toolset also offers the funnel tools
+    // and asks Chatwoot for the conversation's card on every tick, a read of its own.
+    let grantId = 0n;
+    beforeAll(async () => {
+      const grant = await suDb.agentToolSelection.create({
+        data: {
+          tenantId,
+          agentId,
+          source: "NATIVE",
+          enabledTools: ["set_labels", "set_custom_attribute", "private_note"],
+          knowledgeBaseIds: [],
+        },
+      });
+      grantId = grant.id;
+    });
+    afterAll(async () => {
+      await suDb.agentToolSelection.delete({ where: { id: grantId } });
+    });
+
+    test("six actions on a short conversation reach Chatwoot in six requests", async () => {
+      const chatwoot = fakeChatwoot({
+        labels: ["sentimento-neutro", "vip"],
+        attributes: { origem: "site" },
+      });
+      const res = await decide(chatwoot, [
+        {
+          when: yes,
+          action: {
+            tool: "set_labels",
+            args: {
+              add: ["sentimento-negativo"],
+              remove: ["sentimento-neutro"],
+            },
+          },
+        },
+        attribute("sentimento", "negativo"),
+        attribute("assunto", "reembolso"),
+        attribute("urgencia", "alta"),
+        {
+          when: yes,
+          action: { tool: "set_labels", args: { add: ["urgente"] } },
+        },
+        {
+          when: yes,
+          action: { tool: "private_note", args: { content: "Olhar agora" } },
+        },
+      ]);
+      expect(res).toEqual({ outcome: "done" });
+      const conv = `/conversations/${CONV}`;
+      const seen = onConversation(chatwoot.requests);
+      expect([...seen].sort()).toEqual(
+        [
+          // The window: one page, and a page Chatwoot did not fill has nothing older behind it.
+          `GET ${conv}/messages`,
+          // The labels, read ONCE: the evidence shows them and both label rules are applied to them.
+          `GET ${conv}/labels`,
+          `POST ${conv}/labels`,
+          // The three attribute rules: one read of the bag, one write.
+          `GET ${conv}`,
+          `POST ${conv}/custom_attributes`,
+          `POST ${conv}/messages`,
+        ].sort(),
+      );
+      // The evidence is read before anything is written, the attribute write follows its own read,
+      // and the note, which shares a write with nothing, goes out after the run ahead of it.
+      const at = (r: string) => seen.indexOf(r);
+      expect(at(`GET ${conv}/messages`)).toBeLessThan(2);
+      expect(at(`GET ${conv}/labels`)).toBeLessThan(2);
+      expect(at(`POST ${conv}/custom_attributes`)).toBeGreaterThan(
+        at(`GET ${conv}`),
+      );
+      expect(at(`POST ${conv}/messages`)).toBe(5);
+      // Reads that do not depend on each other are out at the same time: the second of the two
+      // evidence reads starts while the first is still out, and the attribute bag is being read
+      // before the label write has gone.
+      expect(chatwoot.startedBeside.slice(0, 2)).toEqual([0, 1]);
+      expect(at(`GET ${conv}`)).toBeLessThan(at(`POST ${conv}/labels`));
+      // What the conversation holds is what six separate writes would have left.
+      expect([...chatwoot.state.labels].sort()).toEqual([
+        "sentimento-negativo",
+        "urgente",
+        "vip",
+      ]);
+      expect(chatwoot.state.attributes).toEqual({
+        origem: "site",
+        sentimento: "negativo",
+        assunto: "reembolso",
+        urgencia: "alta",
+      });
+      expect(chatwoot.state.notes).toEqual(["Olhar agora"]);
+      // And the line records each action on its own, in rule order, with each label write.
+      const d = await detail();
+      expect(d.actions).toEqual([
+        { rule: 0, tool: "set_labels", outcome: "ran" },
+        { rule: 1, tool: "set_custom_attribute", outcome: "ran" },
+        { rule: 2, tool: "set_custom_attribute", outcome: "ran" },
+        { rule: 3, tool: "set_custom_attribute", outcome: "ran" },
+        { rule: 4, tool: "set_labels", outcome: "ran" },
+        { rule: 5, tool: "private_note", outcome: "ran" },
+      ]);
+      expect(d.labels).toEqual([
+        { scope: "conversation", added: 1, removed: 1, after: 2 },
+        { scope: "conversation", added: 1, removed: 0, after: 3 },
+      ]);
+    });
+
+    // The read is as old as the moment it was asked for, however late the tick got to use it: a
+    // window that took long to read leaves the labels stale, and the write reads them again.
+    test("labels asked for long before the write are read again", async () => {
+      const realNow = Date.now;
+      const chatwoot = fakeChatwoot({
+        labels: ["vip"],
+        attributes: {},
+        onWindowRead: (state) => {
+          state.labels.push("de-outro");
+          Date.now = () => realNow() + 11_000;
+        },
+      });
+      try {
+        const res = await decide(chatwoot, [
+          {
+            when: yes,
+            action: { tool: "set_labels", args: { add: ["urgente"] } },
+          },
+        ]);
+        expect(res).toEqual({ outcome: "done" });
+      } finally {
+        Date.now = realNow;
+      }
+      const conv = `/conversations/${CONV}`;
+      expect(
+        onConversation(chatwoot.requests).filter(
+          (r) => r === `GET ${conv}/labels`,
+        ),
+      ).toHaveLength(2);
+      expect([...chatwoot.state.labels].sort()).toEqual([
+        "de-outro",
+        "urgente",
+        "vip",
+      ]);
+    });
+
+    // A precondition reads what the rules before it wrote, so a tool carrying one is never sent out
+    // beside its neighbours: the attribute lands, and only then is the condition asked.
+    test("a rule whose tool has a precondition waits for the attribute rule ahead of it", async () => {
+      const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+      await suDb.conversation.update({
+        where: { id: convRowId },
+        data: { customAttributes: {} },
+      });
+      const rules = [
+        attribute("consent", "yes"),
+        {
+          when: yes,
+          action: { tool: "set_labels", args: { add: ["autorizado"] } },
+        },
+      ];
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: {
+            monitoring: decisionsBlock({ rules }),
+            toolPreconditions: {
+              set_labels: {
+                kind: "attribute",
+                scope: "conversation",
+                key: "consent",
+                equals: "yes",
+              },
+            },
+          } as never,
+        },
+      });
+      const p = providerDouble(() =>
+        typesafeAnswer({ pede_reembolso: { type: "noul", noul: 0.95 } }),
+      );
+      await runObserve(
+        tenantId,
+        {
+          instanceId,
+          conversationId: CONV,
+          agentId,
+          reason: "burst",
+          atMessageId: null,
+        },
+        appDb,
+        {
+          makeClient: async (cfg) =>
+            new ChatwootClient(cfg, chatwoot.fetchImpl),
+          makeModel: () => new CountingModel() as never,
+          decisionFetch: p.fetchImpl,
+        },
+      );
+      expect(chatwoot.state.attributes).toEqual({ consent: "yes" });
+      expect(chatwoot.state.labels).toEqual(["autorizado"]);
+      const conv = `/conversations/${CONV}`;
+      const seen = onConversation(chatwoot.requests);
+      expect(seen.indexOf(`POST ${conv}/custom_attributes`)).toBeLessThan(
+        seen.indexOf(`POST ${conv}/labels`),
+      );
+    });
+
+    test("two neighbouring rules writing one attribute leave the mirror on the value Chatwoot kept", async () => {
+      for (let round = 0; round < 4; round++) {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const last = `valor-${round}`;
+        await decide(chatwoot, [
+          attribute("etapa", "primeira"),
+          attribute("etapa", "segunda"),
+          attribute("etapa", last),
+        ]);
+        expect(chatwoot.state.attributes).toEqual({ etapa: last });
+        const row = await suDb.conversation.findUniqueOrThrow({
+          where: { id: convRowId },
+          select: { customAttributes: true },
+        });
+        expect((row.customAttributes as Record<string, unknown>).etapa).toBe(
+          last,
+        );
+      }
+    });
+
+    // The contact gate's conditions read the labels and attributes the actions write, so under a
+    // gate with conditions each action is asked for after the one before it has landed.
+    for (const [name, sinceTheCall] of [
+      [
+        "an action that takes the conversation out of the contact gate's rule stops the ones after it",
+        false,
+      ],
+      [
+        "a contact gate's rule saved while the provider answers still stops the actions after the one that leaves it",
+        true,
+      ],
+    ] as const) {
+      test(name, async () => {
+        const chatwoot = fakeChatwoot({
+          labels: [],
+          attributes: { active: "yes" },
+        });
+        // The gate refuses a conversation with no contact before it reaches the conditions.
+        const contact = await suDb.contact.create({
+          data: { tenantId, chatwootInstanceId: instanceId, name: "Ana" },
+        });
+        await suDb.conversation.update({
+          where: { id: convRowId },
+          data: { customAttributes: { active: "yes" }, contactId: contact.id },
+        });
+        const rules = [
+          attribute("active", "no"),
+          attribute("etapa", "segunda"),
+        ];
+        const save = (gated: boolean) =>
+          suDb.agent.update({
+            where: { id: agentId },
+            data: {
+              settings: {
+                monitoring: decisionsBlock({ rules }),
+                ...(gated
+                  ? {
+                      contactAuth: {
+                        enabled: true,
+                        rule: {
+                          kind: "attribute",
+                          scope: "conversation",
+                          key: "active",
+                          equals: "yes",
+                        },
+                      },
+                    }
+                  : {}),
+              } as never,
+            },
+          });
+        await save(!sinceTheCall);
+        const decisionFetch = (async () => {
+          if (sinceTheCall) await save(true);
+          return typesafeAnswer({
+            pede_reembolso: { type: "noul", noul: 0.95 },
+          });
+        }) as unknown as typeof fetch;
+        try {
+          await runObserve(
+            tenantId,
+            {
+              instanceId,
+              conversationId: CONV,
+              agentId,
+              reason: "burst",
+              atMessageId: null,
+            },
+            appDb,
+            {
+              makeClient: async (cfg) =>
+                new ChatwootClient(cfg, chatwoot.fetchImpl),
+              makeModel: () => new CountingModel() as never,
+              decisionFetch,
+            },
+          );
+        } finally {
+          await suDb.conversation.update({
+            where: { id: convRowId },
+            data: { customAttributes: {}, contactId: null },
+          });
+          await suDb.contact.delete({ where: { id: contact.id } });
+        }
+        expect(chatwoot.state.attributes).toEqual({ active: "no" });
+      });
+    }
+
+    // The same under the `llm` engine, whose model calls its tools in parallel: calls that arrive
+    // together would share one fence verdict and one write, so under such a gate each writes alone.
+    for (const [name, sinceTheRead] of [
+      [
+        "parallel tool calls of a model do not share a write under a contact gate with conditions",
+        false,
+      ],
+      [
+        "nor under one saved while the write they had joined was reading the bag",
+        true,
+      ],
+    ] as const) {
+      test(name, async () => {
+        const save = (gated: boolean) =>
+          suDb.agent.update({
+            where: { id: agentId },
+            data: {
+              settings: {
+                monitoring: {},
+                ...(gated ? { contactAuth: GATE } : {}),
+              } as never,
+            },
+          });
+        const chatwoot = fakeChatwoot({
+          labels: [],
+          attributes: { active: "yes" },
+          onAttributesRead: () => save(true),
+        });
+        const contact = await suDb.contact.create({
+          data: { tenantId, chatwootInstanceId: instanceId, name: "Ana" },
+        });
+        await suDb.conversation.update({
+          where: { id: convRowId },
+          data: { customAttributes: { active: "yes" }, contactId: contact.id },
+        });
+        await save(!sinceTheRead);
+        let turns = 0;
+        const model = {
+          invoke: async () => new AIMessage("pronto"),
+          bindTools: () => ({
+            invoke: async () => {
+              turns++;
+              return turns === 1
+                ? new AIMessage({
+                    content: "",
+                    tool_calls: [
+                      {
+                        name: "set_custom_attribute",
+                        args: { key: "active", value: "no" },
+                        id: "c1",
+                      },
+                      {
+                        name: "set_custom_attribute",
+                        args: { key: "etapa", value: "segunda" },
+                        id: "c2",
+                      },
+                    ],
+                  })
+                : new AIMessage("feito.");
+            },
+          }),
+        };
+        try {
+          await runObserve(
+            tenantId,
+            {
+              instanceId,
+              conversationId: CONV,
+              agentId,
+              reason: "burst",
+              atMessageId: null,
+            },
+            appDb,
+            {
+              makeClient: async (cfg) =>
+                new ChatwootClient(cfg, chatwoot.fetchImpl),
+              makeModel: () => model as never,
+            },
+          );
+        } finally {
+          await suDb.conversation.update({
+            where: { id: convRowId },
+            data: { customAttributes: {}, contactId: null },
+          });
+          await suDb.contact.delete({ where: { id: contact.id } });
+        }
+        expect(turns).toBeGreaterThan(0);
+        expect(chatwoot.state.attributes).toEqual({ active: "no" });
+      });
+    }
+
+    // An invalid rule in the middle is that rule's failure. It does not part the valid rules around
+    // it into two writes.
+    for (const [name, bad] of [
+      ["a value of the wrong type", { key: "obs_meio", value: 5 }],
+      ["no value at all", { key: "obs_meio" }],
+      [
+        "a scope that does not exist",
+        { key: "obs_meio", value: "x", scope: "galaxy" },
+      ],
+    ] as const) {
+      test(`an attribute rule with ${name} between two valid ones leaves one write`, async () => {
+        const chatwoot = fakeChatwoot({
+          labels: [],
+          attributes: { origem: "site" },
+        });
+        await decide(chatwoot, [
+          attribute("obs_reembolso", "sim"),
+          { when: yes, action: { tool: "set_custom_attribute", args: bad } },
+          attribute("obs_irritacao", "alta"),
+        ]);
+        const conv = `/conversations/${CONV}`;
+        expect(
+          onConversation(chatwoot.requests).filter((r) => r.startsWith("POST")),
+        ).toEqual([`POST ${conv}/custom_attributes`]);
+        expect(chatwoot.state.attributes).toEqual({
+          origem: "site",
+          obs_reembolso: "sim",
+          obs_irritacao: "alta",
+        });
+        expect((await detail()).actions).toEqual([
+          { rule: 0, tool: "set_custom_attribute", outcome: "ran" },
+          {
+            rule: 1,
+            tool: "set_custom_attribute",
+            outcome: "failed",
+            failure: "invalid_arguments",
+          },
+          { rule: 2, tool: "set_custom_attribute", outcome: "ran" },
+        ]);
+      });
+    }
+
+    test("a label rule that changes nothing writes nothing, and its neighbour still writes", async () => {
+      const chatwoot = fakeChatwoot({ labels: ["urgente"], attributes: {} });
+      await decide(chatwoot, [
+        {
+          when: yes,
+          action: { tool: "set_labels", args: { add: ["urgente"] } },
+        },
+        {
+          when: yes,
+          action: { tool: "set_labels", args: { add: ["reembolso"] } },
+        },
+      ]);
+      const conv = `/conversations/${CONV}`;
+      expect(
+        onConversation(chatwoot.requests).filter((r) => r.startsWith("POST")),
+      ).toEqual([`POST ${conv}/labels`]);
+      expect([...chatwoot.state.labels].sort()).toEqual([
+        "reembolso",
+        "urgente",
+      ]);
+      const d = await detail();
+      expect(d.actions).toEqual([
+        { rule: 0, tool: "set_labels", outcome: "ran" },
+        { rule: 1, tool: "set_labels", outcome: "ran" },
+      ]);
+      expect(d.labels).toEqual([
+        { scope: "conversation", added: 1, removed: 0, after: 2 },
+      ]);
+    });
+
+    test("an attribute write Chatwoot refuses fails every rule that rode on it, and nothing else", async () => {
+      const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+      const inner = chatwoot.fetchImpl;
+      chatwoot.fetchImpl = (async (
+        input: RequestInfo | URL,
+        init?: RequestInit,
+      ) => {
+        if (
+          init?.method === "POST" &&
+          String(input).endsWith("/custom_attributes")
+        ) {
+          chatwoot.requests.push("POST refused");
+          return json({ error: "no" }, 500);
+        }
+        return inner(input, init);
+      }) as typeof fetch;
+      await decide(chatwoot, [
+        attribute("sentimento", "negativo"),
+        attribute("assunto", "reembolso"),
+        {
+          when: yes,
+          action: { tool: "set_labels", args: { add: ["reembolso"] } },
+        },
+      ]);
+      expect(chatwoot.state.attributes).toEqual({});
+      expect(chatwoot.state.labels).toEqual(["reembolso"]);
+      expect((await detail()).actions).toEqual([
+        {
+          rule: 0,
+          tool: "set_custom_attribute",
+          outcome: "failed",
+          failure: "tool_error",
+        },
+        {
+          rule: 1,
+          tool: "set_custom_attribute",
+          outcome: "failed",
+          failure: "tool_error",
+        },
+        { rule: 2, tool: "set_labels", outcome: "ran" },
+      ]);
+    });
+
+    // WHEN A RULE ACTS (docs/decisions.md): every tick below is a separate observation
+    // of the same conversation, so the state between them is the table's, never the process's.
+    async function observeWith(
+      chatwoot: ReturnType<typeof fakeChatwoot>,
+      rules: unknown[],
+      holds: boolean,
+      extra: Record<string, unknown> = {},
+    ) {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: {
+            monitoring: decisionsBlock({ rules }),
+            ...extra,
+          } as never,
+        },
+      });
+      const p = providerDouble(() =>
+        typesafeAnswer({
+          pede_reembolso: { type: "noul", noul: holds ? 0.95 : 0.1 },
+        }),
+      );
+      await runObserve(
+        tenantId,
+        {
+          instanceId,
+          conversationId: CONV,
+          agentId,
+          reason: "burst",
+          atMessageId: null,
+        },
+        appDb,
+        {
+          makeClient: async (cfg) =>
+            new ChatwootClient(cfg, chatwoot.fetchImpl),
+          makeModel: () => new CountingModel() as never,
+          decisionFetch: p.fetchImpl,
+        },
+      );
+      return detail();
+    }
+    const note = (content: string, trigger?: string) => ({
+      when: yes,
+      action: { tool: "private_note", args: { content } },
+      ...(trigger ? { trigger } : {}),
+    });
+    const notesOf = (chatwoot: ReturnType<typeof fakeChatwoot>, text: string) =>
+      chatwoot.state.notes.filter((n) => n === text).length;
+    // Awaited inside: a Prisma query is lazy, and a hook handed the bare query never runs it.
+    const clearState = async () => {
+      await suDb.decisionRuleState.deleteMany({ where: { tenantId } });
+    };
+
+    describe("when a rule acts", () => {
+      beforeEach(clearState);
+
+      test("a note rule with the default trigger posts once while its conditions keep holding", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [note("Supervisor")];
+        const first = await observeWith(chatwoot, rules, true);
+        expect(first.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran" },
+        ]);
+        expect(first.held).toBeUndefined();
+        for (let i = 0; i < 4; i++) {
+          const d = await observeWith(chatwoot, rules, true);
+          expect(d.actions).toEqual([]);
+          expect(d.held).toEqual([{ rule: 0, trigger: "on_start" }]);
+          expect(d.notFired).toBeUndefined();
+        }
+        expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+      });
+
+      test("an observation in which it does not hold releases it, and the next hold posts again", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [note("Supervisor")];
+        await observeWith(chatwoot, rules, true);
+        await observeWith(chatwoot, rules, true);
+        const off = await observeWith(chatwoot, rules, false);
+        expect(off.held).toBeUndefined();
+        expect(off.notFired).toEqual([
+          {
+            rule: 0,
+            miss: {
+              question: "pede_reembolso",
+              why: "below_threshold",
+              got: 0.1,
+              threshold: 0.7,
+              measure: "probability",
+            },
+          },
+        ]);
+        const again = await observeWith(chatwoot, rules, true);
+        expect(again.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran" },
+        ]);
+        expect(notesOf(chatwoot, "Supervisor")).toBe(2);
+      });
+
+      test("once per conversation posts one note across holding, releasing and holding again", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [note("Supervisor", "once")];
+        for (const holds of [true, true, false, true, false, true]) {
+          const d = await observeWith(chatwoot, rules, holds);
+          if (holds && notesOf(chatwoot, "Supervisor") === 1 && d.held) {
+            expect(d.held).toEqual([{ rule: 0, trigger: "once" }]);
+          }
+        }
+        expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+        expect((await detail()).held).toEqual([{ rule: 0, trigger: "once" }]);
+      });
+
+      test("a label rule keeps acting every time by default, and puts back a label a person took off", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [
+          {
+            when: yes,
+            action: { tool: "set_labels", args: { add: ["furioso"] } },
+          },
+        ];
+        for (let i = 0; i < 3; i++) {
+          if (i === 2) chatwoot.state.labels = [];
+          const d = await observeWith(chatwoot, rules, true);
+          expect(d.actions).toEqual([
+            { rule: 0, tool: "set_labels", outcome: "ran" },
+          ]);
+          expect(d.held).toBeUndefined();
+        }
+        expect(chatwoot.state.labels).toEqual(["furioso"]);
+      });
+
+      test("a label rule set to once does not put back a label a person took off", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [
+          {
+            when: yes,
+            action: { tool: "set_labels", args: { add: ["furioso"] } },
+            trigger: "once",
+          },
+        ];
+        await observeWith(chatwoot, rules, true);
+        chatwoot.state.labels = [];
+        const d = await observeWith(chatwoot, rules, true);
+        expect(d.held).toEqual([{ rule: 0, trigger: "once" }]);
+        expect(chatwoot.state.labels).toEqual([]);
+      });
+
+      test("editing a rule starts it over, and leaves the other rule's state alone", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const before = [note("Supervisor"), note("Segunda")];
+        await observeWith(chatwoot, before, true);
+        await observeWith(chatwoot, before, true);
+        const edited = [
+          {
+            ...note("Supervisor"),
+            when: [{ question: "pede_reembolso", minProbability: 0.6 }],
+          },
+          note("Segunda"),
+        ];
+        const d = await observeWith(chatwoot, edited, true);
+        expect(d.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran" },
+        ]);
+        expect(d.held).toEqual([{ rule: 1, trigger: "on_start" }]);
+        expect(notesOf(chatwoot, "Supervisor")).toBe(2);
+        expect(notesOf(chatwoot, "Segunda")).toBe(1);
+        // The edited rule's old key is dropped by the tick that ran the new block.
+        expect(
+          await suDb.decisionRuleState.count({ where: { tenantId } }),
+        ).toBe(2);
+      });
+
+      test("a changed note text is a new rule, so the new text posts and the old one does not", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        await observeWith(chatwoot, [note("Supervisor")], true);
+        await observeWith(chatwoot, [note("Supervisor v2")], true);
+        expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+        expect(notesOf(chatwoot, "Supervisor v2")).toBe(1);
+      });
+
+      test("an action a fence refused does not count as acted: the rule tries again on the next hold", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [note("Precisa de pedido")];
+        const pre = {
+          toolPreconditions: {
+            private_note: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "pedido_id",
+            },
+          },
+        };
+        await suDb.conversation.update({
+          where: { id: convRowId },
+          data: { customAttributes: {} },
+        });
+        const refused = await observeWith(chatwoot, rules, true, pre);
+        expect(refused.actions).toEqual([
+          {
+            rule: 0,
+            tool: "private_note",
+            outcome: "refused",
+            fence: "precondition",
+          },
+        ]);
+        expect(notesOf(chatwoot, "Precisa de pedido")).toBe(0);
+        chatwoot.state.attributes = { pedido_id: "4471" };
+        await suDb.conversation.update({
+          where: { id: convRowId },
+          data: { customAttributes: { pedido_id: "4471" } },
+        });
+        const ran = await observeWith(chatwoot, rules, true, pre);
+        expect(ran.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran" },
+        ]);
+        expect(notesOf(chatwoot, "Precisa de pedido")).toBe(1);
+        await suDb.conversation.update({
+          where: { id: convRowId },
+          data: { customAttributes: {} },
+        });
+      });
+
+      // Different conditions, so two rules with two states: the merged one latches with the one it rode on.
+      test("two rules with the same note post it once, and both are held after", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [
+          note("Supervisor"),
+          {
+            ...note("Supervisor"),
+            when: [{ question: "pede_reembolso", minProbability: 0.5 }],
+          },
+        ];
+        const first = await observeWith(chatwoot, rules, true);
+        expect(first.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran", merged: [1] },
+        ]);
+        const next = await observeWith(chatwoot, rules, true);
+        expect(next.actions).toEqual([]);
+        expect(next.held).toEqual([
+          { rule: 0, trigger: "on_start" },
+          { rule: 1, trigger: "on_start" },
+        ]);
+        expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+      });
+
+      test("a rule that acts every time keeps no state", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rules = [
+          {
+            when: yes,
+            action: { tool: "set_labels", args: { add: ["furioso"] } },
+          },
+        ];
+        await observeWith(chatwoot, rules, true);
+        expect(await suDb.decisionRuleState.count({ where: { agentId } })).toBe(
+          0,
+        );
+      });
+
+      test("another agent's state on the same conversation does not hold this one back", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const rule = note("Supervisor");
+        const neighbour = await suDb.agent.create({
+          data: {
+            tenantId,
+            name: "Vizinha",
+            systemPrompt: "x",
+            modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+            enabled: true,
+            mode: "monitoring",
+            settings: {},
+          },
+        });
+        await suDb.decisionRuleState.create({
+          data: {
+            tenantId,
+            agentId: neighbour.id,
+            conversationId: convRowId,
+            ruleKey: ruleStateKey(rule as never),
+          },
+        });
+        const d = await observeWith(chatwoot, [rule], true);
+        expect(d.actions).toEqual([
+          { rule: 0, tool: "private_note", outcome: "ran" },
+        ]);
+        expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+        await suDb.agent.delete({ where: { id: neighbour.id } });
+      });
+
+      // THE INVARIANT (trigger-state.ts): an older observation never changes the state a newer one
+      // read. A reads, B reads after it; whatever A then writes is refused, in every shape a tick
+      // writes (latch ahead, release after the deadline, release, undo or drop at the end), whether
+      // B left the rule latched or clear.
+      describe("two observations of the same conversation", () => {
+        const scope = () => ({ tenantId, agentId, conversationId: convRowId });
+        const change = (
+          c: Partial<Record<"release" | "undo" | "keep", string[]>>,
+        ) => ({
+          latch: [],
+          release: c.release ?? [],
+          undo: c.undo ?? [],
+          keep: c.keep ?? ["k"],
+        });
+        const writes: Record<
+          string,
+          (g: triggerState.Generation) => Promise<boolean>
+        > = {
+          latch: (g) => triggerState.latchRules(suDb, scope(), g, ["k"]),
+          "release after the deadline": (g) =>
+            triggerState.writeTriggerState(suDb, scope(), g, {
+              release: ["k"],
+              undo: ["k"],
+            }),
+          release: (g) =>
+            triggerState.writeTriggerState(
+              suDb,
+              scope(),
+              g,
+              change({ release: ["k"] }),
+            ),
+          undo: (g) =>
+            triggerState.writeTriggerState(
+              suDb,
+              scope(),
+              g,
+              change({ undo: ["k"] }),
+            ),
+          drop: (g) =>
+            triggerState.writeTriggerState(
+              suDb,
+              scope(),
+              g,
+              change({ keep: [] }),
+            ),
+        };
+        // In the scheduler's order, as production claims: one observe job row, claim_seq 1, 2, ...
+        let seq = 0;
+        const claim = async () => {
+          seq += 1;
+          const c = await triggerState.claimTriggerState(suDb, scope(), {
+            jobId: 1n,
+            claimSeq: seq,
+          });
+          if (c === null) throw new Error("superseded");
+          return c;
+        };
+        beforeEach(() => {
+          seq = 0;
+        });
+        const state = async () => [...(await claim()).latched];
+        for (const [name, write] of Object.entries(writes)) {
+          for (const newer of ["latched", "clear"] as const) {
+            test(`the older one's ${name} leaves the newer one's state ${newer}`, async () => {
+              const a = await claim();
+              const b = await claim();
+              if (newer === "latched") {
+                expect(
+                  await triggerState.latchRules(suDb, scope(), b.generation, [
+                    "k",
+                  ]),
+                ).toBe(true);
+              }
+              expect(await write(a.generation)).toBe(false);
+              expect(await state()).toEqual(newer === "latched" ? ["k"] : []);
+            });
+          }
+        }
+
+        // The generation follows the scheduler, not the order the reads land: a run the scheduler
+        // already superseded gets none, and a newer job row outranks any claim_seq of an older one.
+        test("a run the scheduler superseded takes no generation", async () => {
+          const run = (jobId: bigint, claimSeq: number) =>
+            triggerState.claimTriggerState(suDb, scope(), { jobId, claimSeq });
+          expect(await run(1n, 2)).not.toBeNull();
+          expect(await run(1n, 1)).toBeNull();
+          expect(await run(2n, 1)).not.toBeNull();
+          expect(await run(1n, 9)).toBeNull();
+        });
+
+        // The one exception: a reservation the older tick wrote itself, for an action it never ran,
+        // is still its to withdraw. The newer one held the rule on it and changes nothing for it.
+        test("the older one withdraws its own reservation, and only that", async () => {
+          const a = await claim();
+          expect(
+            await triggerState.latchRules(suDb, scope(), a.generation, [
+              "mine",
+            ]),
+          ).toBe(true);
+          const b = await claim();
+          expect([...b.latched]).toEqual(["mine"]);
+          expect(
+            await triggerState.latchRules(suDb, scope(), b.generation, [
+              "theirs",
+            ]),
+          ).toBe(true);
+          expect(
+            await triggerState.writeTriggerState(suDb, scope(), a.generation, {
+              release: ["theirs"],
+              undo: ["mine", "theirs"],
+            }),
+          ).toBe(false);
+          expect(await state()).toEqual(["theirs"]);
+        });
+
+        test("the newer one writes after the older one read", async () => {
+          const a = await claim();
+          const b = await claim();
+          expect(
+            await triggerState.latchRules(suDb, scope(), b.generation, ["k"]),
+          ).toBe(true);
+          expect(
+            await triggerState.writeTriggerState(
+              suDb,
+              scope(),
+              b.generation,
+              change({ release: ["k"] }),
+            ),
+          ).toBe(true);
+          expect(await state()).toEqual([]);
+          expect(a.generation.seq < b.generation.seq).toBe(true);
+        });
+      });
+
+      test("a trigger state it cannot read fails the tick before any action", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const read = spyOn(triggerState, "claimTriggerState").mockRejectedValue(
+          new Error("db down"),
+        );
+        try {
+          const d = await observeWith(chatwoot, [note("Supervisor")], true);
+          expect(d.failed).toBe("trigger_state");
+          expect(notesOf(chatwoot, "Supervisor")).toBe(0);
+        } finally {
+          read.mockRestore();
+        }
+      });
+
+      test("a final write a newer observation superseded is said on the line, not as a failure", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const write = spyOn(
+          triggerState,
+          "writeTriggerState",
+        ).mockResolvedValue(false);
+        try {
+          const d = await observeWith(chatwoot, [note("Supervisor")], true);
+          expect(d.triggerStateSuperseded).toBe(true);
+          expect(d.triggerStateWritten).toBeUndefined();
+        } finally {
+          write.mockRestore();
+        }
+      });
+
+      test("a trigger state it cannot write is said on the line, and the action stands", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const write = spyOn(
+          triggerState,
+          "writeTriggerState",
+        ).mockRejectedValue(new Error("db down"));
+        try {
+          const d = await observeWith(chatwoot, [note("Supervisor")], true);
+          expect(d.actions).toEqual([
+            { rule: 0, tool: "private_note", outcome: "ran" },
+          ]);
+          expect(d.triggerStateWritten).toBe(false);
+          expect(notesOf(chatwoot, "Supervisor")).toBe(1);
+        } finally {
+          write.mockRestore();
+        }
+      });
+    });
+
+    // WHAT A FENCE REFUSED: the tool was invoked and a fence inside it said no, so the
+    // line must not say it ran.
+    describe("an action a fence inside the tool refused", () => {
+      beforeEach(clearState);
+      const PROTECTED = { setLabels: { protected: ["vip"] } };
+      const label = (...add: string[]) => ({
+        when: yes,
+        action: { tool: "set_labels", args: { add } },
+      });
+
+      test("a protected label is refused, named, and not written", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const d = await observeWith(chatwoot, [label("vip")], true, PROTECTED);
+        expect(d.actions).toEqual([
+          {
+            rule: 0,
+            tool: "set_labels",
+            outcome: "refused",
+            fence: "protected_label",
+          },
+        ]);
+        expect(d.acted).toBe(false);
+        expect(chatwoot.state.labels).toEqual([]);
+      });
+
+      test("a free label beside a protected one is written, and the line names the fence that held the rest", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const d = await observeWith(
+          chatwoot,
+          [label("reembolso", "vip")],
+          true,
+          PROTECTED,
+        );
+        expect(d.actions).toEqual([
+          {
+            rule: 0,
+            tool: "set_labels",
+            outcome: "ran",
+            fence: "protected_label",
+            partial: true,
+          },
+        ]);
+        expect(chatwoot.state.labels).toEqual(["reembolso"]);
+      });
+
+      test("two label rules sharing one write: only the protected one is refused", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const d = await observeWith(
+          chatwoot,
+          [label("vip"), label("reembolso")],
+          true,
+          PROTECTED,
+        );
+        expect(d.actions).toEqual([
+          {
+            rule: 0,
+            tool: "set_labels",
+            outcome: "refused",
+            fence: "protected_label",
+          },
+          { rule: 1, tool: "set_labels", outcome: "ran" },
+        ]);
+        expect(chatwoot.state.labels).toEqual(["reembolso"]);
+      });
+
+      test("a label outside the allowed list is refused by that fence", async () => {
+        const chatwoot = fakeChatwoot({ labels: [], attributes: {} });
+        const d = await observeWith(chatwoot, [label("solto")], true, {
+          setLabels: { allowed: ["reembolso"], outsideAllowed: "refuse" },
+        });
+        expect(d.actions).toEqual([
+          {
+            rule: 0,
+            tool: "set_labels",
+            outcome: "refused",
+            fence: "allowed_labels",
+          },
+        ]);
+        expect(chatwoot.state.labels).toEqual([]);
+      });
+    });
+  });
+
+  // A decisions observer never calls the chat model, so it does not need one: an agent configured
+  // only with questions, rules and a classifier key observes, and the llm engine keeps requiring it.
+  describe("a decisions observer and the chat model", () => {
+    const reembolso = () =>
+      providerDouble(() =>
+        typesafeAnswer({
+          pede_reembolso: { type: "noul", noul: 0.92 },
+          assunto: {
+            type: "choice",
+            choice: "reembolso",
+            confidence: 0.9,
+            probabilities: { reembolso: 0.95, troca: 0.03, duvida: 0.02 },
+          },
+          irritacao: {
+            type: "score",
+            score: 1,
+            confidence: 0.6,
+            probabilities: { "0": 0.1, "1": 0.7, "2": 0.2 },
+          },
+        }),
+      );
+    const setModelConfig = (modelConfig: Record<string, unknown>) =>
+      suDb.agent.update({
+        where: { id: agentId },
+        data: { modelConfig: modelConfig as never },
+      });
+
+    afterAll(async () => {
+      if (!dbUp) return;
+      await setModelConfig({ provider: "openai", model: "gpt-5.4-mini" });
+    });
+
+    test("with no chat model config at all, it decides and acts", async () => {
+      await setModelConfig({});
+      await setMonitoring(decisionsBlock());
+      const p = reembolso();
+      const { log, model } = await tick(p.fetchImpl);
+      expect(p.requests).toHaveLength(1);
+      expect(model.calls).toBe(0);
+      expect(log.labelsWritten).toEqual([["reembolso"]]);
+      const line = await lastLine();
+      expect(line.status).toBe("ok");
+      expect((line.detail as Record<string, unknown>).engine).toBe("decisions");
+    });
+
+    test("with a chat model whose key does not resolve, it decides and acts", async () => {
+      await setModelConfig({
+        provider: "openai",
+        model: "gpt-5.4-mini",
+        credentialRef: "vault:987654321",
+      });
+      await setMonitoring(decisionsBlock());
+      const p = reembolso();
+      const { log, model } = await tick(p.fetchImpl);
+      expect(p.requests).toHaveLength(1);
+      expect(model.calls).toBe(0);
+      expect(log.labelsWritten).toEqual([["reembolso"]]);
+    });
+
+    test("on the llm engine, a chat model whose key does not resolve still stops the tick", async () => {
+      await setModelConfig({
+        provider: "openai",
+        model: "gpt-5.4-mini",
+        credentialRef: "vault:987654321",
+      });
+      await setMonitoring({ engine: "llm" });
+      const p = reembolso();
+      const { log, model } = await tick(p.fetchImpl);
+      expect(p.requests).toHaveLength(0);
+      expect(model.calls).toBe(0);
+      expect(log.labelsWritten).toEqual([]);
+    });
+  });
+
+  // The agent editor lists the account's labels and attributes for the rules' actions, and a
+  // monitoring agent is attached through an observer row and answers no inbox at all.
+  test("the editor's label and attribute listings cover the inboxes the agent observes", async () => {
+    const ctx = { tenantId, userId: null, role: "TENANT_ADMIN" as const };
+    const makeClient = async () =>
+      ({
+        listLabelsDetailed: async () => [{ title: "reembolso", color: null }],
+        listCustomAttributeDefinitions: async () => [],
+      }) as unknown as ChatwootClient;
+    const labels = await listInboxLabels(ctx, agentId, { makeClient }, suDb);
+    expect(labels.accountCount).toBe(1);
+    expect(labels.labels.map((l) => l.title)).toEqual(["reembolso"]);
+    const attributes = await listInboxCustomAttributes(
+      ctx,
+      agentId,
+      { makeClient },
+      suDb,
+    );
+    expect(attributes.accountCount).toBe(1);
+  });
+});

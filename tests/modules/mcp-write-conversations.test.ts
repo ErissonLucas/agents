@@ -7,6 +7,7 @@ import {
   conversationHandoff,
   conversationStatus,
 } from "@/modules/mcp/write-conversations";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // Conversation-control write tools: gate is DB-free; dry-run previews + tenant fencing read the DB
@@ -26,8 +27,8 @@ function principal(over: Partial<VerifiedToken>): VerifiedToken {
 }
 
 describe("MCP conversation-control gate (no DB)", () => {
-  // A mesma afirmação de sempre, noutra tool: a #655 removeu conversation_reply, que era a única
-  // cobertura deste portão neste arquivo.
+  // NOTE: A mesma afirmação de sempre, noutra tool: conversation_status é a cobertura deste portão neste
+  // arquivo.
   test("conversation_status without mcp:write → insufficient_scope", async () => {
     const r = await conversationStatus(principal({ scopes: ["mcp:read"] }), {
       conversation_id: "1",
@@ -63,8 +64,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -145,8 +146,8 @@ describe.skipIf(!dbUp)("MCP conversation-control tools (DB)", () => {
     }
   });
 
-  // Idem: a cerca entre tenants numa APLICAÇÃO de verdade (dry_run false) só era exercitada pelo
-  // reply. `status` é a vizinha que também escreve no Chatwoot.
+  // NOTE: Idem: a cerca entre tenants numa APLICAÇÃO de verdade (dry_run false). `status` também escreve no
+  // Chatwoot.
   test("conversation_status cross-tenant → not found", async () => {
     const r = await conversationStatus(
       principal({ tenantId: tenantB }),

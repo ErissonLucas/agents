@@ -20,12 +20,11 @@ export interface TenantContext {
   // action, told apart here.
   actorType?: ActorType;
   // For an "api_key" principal: when the person minting the key answered the password step-up, or
-  // null for a key that predates the rule (review round 3 on #308). Absent for every other actor.
-  // Read by `confirmStepUp` only.
+  // null for a key minted without one. Absent for every other actor. Read by `confirmStepUp` only.
   stepUpAt?: Date | null;
 }
 
-// NOTE: branded transaction client. Only the TenancyProvider (runScoped/asSuperAdmin)
+// Branded transaction client. Only the TenancyProvider (runScoped/asSuperAdmin)
 // produces a value of this type, so passing the base `prisma` into a service that
 // expects a ScopedDb does not type-check. The brand symbol is intentionally unexported.
 declare const scopedDbBrand: unique symbol;
@@ -35,7 +34,7 @@ export type ScopedDb = Prisma.TransactionClient & {
 
 const storage = new AsyncLocalStorage<TenantContext>();
 
-// NOTE: always via run() (never enterWith), so the context cannot leak between sibling
+// Always via run() (never enterWith), so the context cannot leak between sibling
 // async continuations sharing the event loop.
 export function runWithTenantContext<T>(ctx: TenantContext, fn: () => T): T {
   return storage.run(ctx, fn);

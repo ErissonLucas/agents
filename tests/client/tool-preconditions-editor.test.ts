@@ -1,5 +1,13 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+/// <reference lib="dom" />
+
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import {
   parseToolPreconditionRows,
   serializeToolPreconditions,
@@ -10,6 +18,11 @@ import {
   invalidToolPreconditions,
   readToolPreconditions,
 } from "@/modules/agents/tool-preconditions";
+import {
+  type EditorStub,
+  renderEditor,
+  stubEditorApi,
+} from "../utils/agent-editor";
 
 // The editor's two pure halves, tested against the RUNTIME reader rather than against themselves.
 // The whole feature fails silently in one direction — a rule the console shows as saved and the turn
@@ -20,30 +33,29 @@ describe("serializeToolPreconditions", () => {
     const stored = serializeToolPreconditions([
       {
         tool: "handoff_to_human",
-        scope: "conversation",
-        key: "url",
-        equals: "",
+        conditions: [{ scope: "conversation", key: "url", equals: "" }],
       },
-      { tool: "create_invoice", scope: "contact", key: "plan", equals: "gold" },
+      {
+        tool: "create_invoice",
+        conditions: [{ scope: "contact", key: "plan", equals: "gold" }],
+      },
     ]);
     expect(readToolPreconditions({ toolPreconditions: stored })).toEqual({
-      handoff_to_human: {
-        kind: "attribute",
-        scope: "conversation",
-        key: "url",
-      },
-      create_invoice: {
-        kind: "attribute",
-        scope: "contact",
-        key: "plan",
-        equals: "gold",
-      },
+      handoff_to_human: [
+        { kind: "attribute", scope: "conversation", key: "url" },
+      ],
+      create_invoice: [
+        { kind: "attribute", scope: "contact", key: "plan", equals: "gold" },
+      ],
     });
   });
 
   test("an empty `equals` means ANY value, and is not written as an empty string", () => {
     const stored = serializeToolPreconditions([
-      { tool: "t", scope: "conversation", key: "k", equals: "" },
+      {
+        tool: "t",
+        conditions: [{ scope: "conversation", key: "k", equals: "" }],
+      },
     ]) as Record<string, Record<string, unknown>>;
     expect("equals" in (stored.t ?? {})).toBe(false);
   });
@@ -51,15 +63,24 @@ describe("serializeToolPreconditions", () => {
   test.each([
     [
       "no tool picked yet",
-      { tool: "", scope: "conversation", key: "k", equals: "" },
+      {
+        tool: "",
+        conditions: [{ scope: "conversation", key: "k", equals: "" }],
+      },
     ],
     [
       "no attribute key",
-      { tool: "t", scope: "conversation", key: "", equals: "" },
+      {
+        tool: "t",
+        conditions: [{ scope: "conversation", key: "", equals: "" }],
+      },
     ],
     [
       "a whitespace key",
-      { tool: "t", scope: "conversation", key: "  ", equals: "" },
+      {
+        tool: "t",
+        conditions: [{ scope: "conversation", key: "  ", equals: "" }],
+      },
     ],
   ])("drops a row with %s instead of saving it half-written", (_l, row) => {
     expect(
@@ -71,15 +92,21 @@ describe("serializeToolPreconditions", () => {
 
   test("a half-written row does not block its finished siblings", () => {
     const stored = serializeToolPreconditions([
-      { tool: "", scope: "conversation", key: "", equals: "" },
-      { tool: "t", scope: "contact", key: "k", equals: "" },
+      {
+        tool: "",
+        conditions: [{ scope: "conversation", key: "", equals: "" }],
+      },
+      { tool: "t", conditions: [{ scope: "contact", key: "k", equals: "" }] },
     ]);
     expect(Object.keys(stored)).toEqual(["t"]);
   });
 
   test("trims what the operator typed, because a trailing space is invisible", () => {
     const stored = serializeToolPreconditions([
-      { tool: " t ", scope: "contact", key: " k ", equals: " v " },
+      {
+        tool: " t ",
+        conditions: [{ scope: "contact", key: " k ", equals: " v " }],
+      },
     ]) as Record<string, Record<string, unknown>>;
     expect(Object.keys(stored)).toEqual(["t"]);
     expect(stored.t).toEqual({
@@ -98,15 +125,11 @@ describe("parseToolPreconditionRows", () => {
     const rows = [
       {
         tool: "handoff_to_human",
-        scope: "conversation" as const,
-        key: "k",
-        equals: "",
+        conditions: [{ scope: "conversation" as const, key: "k", equals: "" }],
       },
       {
         tool: "resolve_conversation",
-        scope: "contact" as const,
-        key: "j",
-        equals: "v",
+        conditions: [{ scope: "contact" as const, key: "j", equals: "v" }],
       },
     ];
     expect(parseToolPreconditionRows(serializeToolPreconditions(rows))).toEqual(
@@ -131,12 +154,17 @@ describe("parseToolPreconditionRows", () => {
         handoff_to_human: { kind: "somethingElse", host: "x.com" },
         set_labels: { kind: "attribute", scope: "contact", key: "k" },
       }),
-    ).toEqual([{ tool: "set_labels", scope: "contact", key: "k", equals: "" }]);
+    ).toEqual([
+      {
+        tool: "set_labels",
+        conditions: [{ scope: "contact", key: "k", equals: "" }],
+      },
+    ]);
   });
 });
 
-// Round 1 of PR #378: the editor used to COERCE what it could not render, and the next save turned
-// an entry the runtime ignores into a live rule.
+// The editor renders a stored entry exactly, or not at all: coercing what it cannot render would let
+// the next save turn an entry the runtime ignores into a live rule.
 describe("round 1: the editor renders exactly, or not at all", () => {
   test.each([
     ["an unknown scope", { kind: "attribute", scope: "moon", key: "k" }],
@@ -156,7 +184,7 @@ describe("round 1: the editor renders exactly, or not at all", () => {
     // REST, from a console that never showed it to them.
     const stored = { legacy: { kind: "linkOnHost", host: "x.com" } };
     const out = serializeToolPreconditions(
-      [{ tool: "t", scope: "contact", key: "k", equals: "" }],
+      [{ tool: "t", conditions: [{ scope: "contact", key: "k", equals: "" }] }],
       stored,
     );
     expect(out.legacy).toEqual({ kind: "linkOnHost", host: "x.com" });
@@ -170,28 +198,22 @@ describe("round 1: the editor renders exactly, or not at all", () => {
       set_labels: { kind: "attribute", scope: "contact", key: "j" },
     };
     const out = serializeToolPreconditions(
-      [{ tool: "set_labels", scope: "contact", key: "j", equals: "" }],
+      [
+        {
+          tool: "set_labels",
+          conditions: [{ scope: "contact", key: "j", equals: "" }],
+        },
+      ],
       stored,
     );
     expect(Object.keys(out)).toEqual(["set_labels"]);
   });
-
-  test("a malformed entry is NOT rewritten into a working rule by a save", () => {
-    const stored = { t: { kind: "attribute", scope: "moon", key: "k" } };
-    const out = serializeToolPreconditions([], stored);
-    expect(out.t).toEqual({ kind: "attribute", scope: "moon", key: "k" });
-    // And the runtime still ignores it, which is the state the operator asked for by never fixing it.
-    expect(readToolPreconditions({ toolPreconditions: out })).toEqual({});
-  });
 });
 
-// Round 2 of PR #378. Three of the seven findings were the same question asked of a different value,
-// and round 1 had already asked it once: what does a save do to a stored entry the operator did not
-// touch? A patch per value class was the wrong answer. This is the property, asserted per class.
-//
-// SAVING WITHOUT CHANGING A ROW MUST NOT CHANGE WHAT THE RUNTIME ACCEPTS. Both directions:
-// an entry the runtime refuses must stay refused (a save must not promote it into a live rule), and
-// an entry it accepts must survive byte-identical (a save must not drop or rewrite it).
+// SAVING WITHOUT CHANGING A ROW MUST NOT CHANGE WHAT THE RUNTIME ACCEPTS, asserted per class of
+// stored value rather than patched per class. Both directions: an entry the runtime refuses stays
+// refused (a save must not promote it into a live rule), and an entry it accepts survives
+// byte-identical (a save must not drop or rewrite it).
 describe("round 2: parse → serialize is a fixed point for the runtime", () => {
   const RUNTIME_ACCEPTS = [
     [
@@ -201,6 +223,13 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
     [
       "a rule with equals",
       { kind: "attribute", scope: "contact", key: "plan", equals: "gold" },
+    ],
+    [
+      "a list of conditions",
+      [
+        { kind: "attribute", scope: "conversation", key: "url" },
+        { kind: "attribute", scope: "contact", key: "plan", equals: "gold" },
+      ],
     ],
   ] as const;
 
@@ -224,6 +253,13 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
     ["a null entry", null],
     ["a string entry", "cpf"],
     ["an array entry", []],
+    [
+      "a list with one condition it cannot read",
+      [
+        { kind: "attribute", scope: "conversation", key: "url" },
+        { kind: "somethingElse" },
+      ],
+    ],
   ] as const;
 
   // A save that changes nothing: the rows come straight back out of the stored bag.
@@ -260,11 +296,11 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
     },
   );
 
-  test("a condition on a tool this editor cannot offer survives a save", () => {
-    // Configured over REST on an HTTP/MCP/integration tool. Rendering it would produce a row with a
-    // blank selector, and the only sensible reaction to a blank row is to delete it.
+  test("a condition on a name this editor cannot render survives a save", () => {
+    // A name the write boundary refuses (stored before the boundary existed, or by hand). Rendering it
+    // would produce a row the next save could not write, and the reaction to that is to delete it.
     const stored = {
-      create_invoice: { kind: "attribute", scope: "contact", key: "cpf" },
+      "create invoice": { kind: "attribute", scope: "contact", key: "cpf" },
     };
     expect(parseToolPreconditionRows(stored)).toEqual([]);
     expect(resave(stored)).toEqual(stored);
@@ -275,7 +311,10 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
 
   test("a tool named `__proto__` survives serialization as an entry", () => {
     const rows = [
-      { tool: "__proto__", scope: "contact" as const, key: "k", equals: "" },
+      {
+        tool: "__proto__",
+        conditions: [{ scope: "contact" as const, key: "k", equals: "" }],
+      },
     ];
     const out = serializeToolPreconditions(rows);
     // On an ordinary object this assignment changes the prototype and the key vanishes from JSON.
@@ -286,11 +325,12 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
     const out = serializeToolPreconditions([
       {
         tool: "handoff_to_human",
-        scope: "conversation",
-        key: "first",
-        equals: "",
+        conditions: [{ scope: "conversation", key: "first", equals: "" }],
       },
-      { tool: "handoff_to_human", scope: "contact", key: "second", equals: "" },
+      {
+        tool: "handoff_to_human",
+        conditions: [{ scope: "contact", key: "second", equals: "" }],
+      },
     ]) as Record<string, Record<string, unknown>>;
     expect(out.handoff_to_human?.key).toBe("first");
   });
@@ -298,74 +338,80 @@ describe("round 2: parse → serialize is a fixed point for the runtime", () => 
   test("a row the operator ADDED overwrites an unrenderable entry of the same name", () => {
     const stored = { handoff_to_human: { kind: "somethingElse" } };
     const out = serializeToolPreconditions(
-      [{ tool: "handoff_to_human", scope: "contact", key: "k", equals: "" }],
+      [
+        {
+          tool: "handoff_to_human",
+          conditions: [{ scope: "contact", key: "k", equals: "" }],
+        },
+      ],
       stored,
     ) as Record<string, Record<string, unknown>>;
     expect(out.handoff_to_human?.kind).toBe("attribute");
   });
 });
 
-// Round 2, the P1: the Tools save wrote `toolPreconditions` to the server and did NOT put it back
-// into the shared settings bag, so the next Behavior save spread the pre-save map over the rules that
-// had just been stored — with this tab still showing them as saved.
-//
-// Read from the source, like the other AgentEditorPage guards in this suite: rendering the editor
-// pulls auth, theme, toast and a live catalog, and what is being asserted is which keys the handler
-// names. Written as a FENCE rather than as a check for this one key, because the defect is
-// structural: every key the save PATCHes has to come back into the shared state, and the next block
-// added to this tab inherits the same hole otherwise.
+// The Tools save must put every key it PATCHes back into the shared settings bag, or the next Behavior
+// save spreads the pre-save map over the rules just stored, with this tab still showing them saved.
+// Asked of the whole bag: whatever the Tools save sends, the Behavior save that follows has to send
+// it back unchanged.
 describe("round 2: the Tools save puts back everything it wrote", () => {
-  const SRC = readFileSync(
-    "src/client/pages/agents/AgentEditorPage.tsx",
-    "utf8",
-  );
+  const realFetch = globalThis.fetch;
+  afterEach(() => {
+    cleanup();
+    globalThis.fetch = realFetch;
+  });
 
-  function keysOfObjectLiteral(src: string, start: number): string[] {
-    let depth = 0;
-    const keys: string[] = [];
-    for (let i = start; i < src.length; i++) {
-      const ch = src[i];
-      if (ch === "{") depth++;
-      else if (ch === "}") {
-        depth--;
-        if (depth === 0) break;
-      } else if (depth === 1) {
-        const m = /^\n\s{6,}([A-Za-z_$][\w$]*):/.exec(src.slice(i, i + 60));
-        if (m?.[1]) keys.push(m[1]);
-      }
-    }
-    return keys;
-  }
+  const patches = (stub: EditorStub) =>
+    stub.writes
+      .filter((w) => w.method === "PATCH" && w.body.settings)
+      .map((w) => w.body.settings as Record<string, unknown>);
 
-  test("every key sent in toolsSettings is written back to the settings state", () => {
-    const sentAt = SRC.indexOf("const toolsSettings = {");
-    expect(sentAt).toBeGreaterThan(-1);
-    const sent = keysOfObjectLiteral(SRC, SRC.indexOf("{", sentAt));
+  test("every key sent in toolsSettings is written back to the settings state", async () => {
+    const stub = stubEditorApi(
+      { settings: {} },
+      { catalog: { native: [{ name: "open_case_in_inbox" }] } },
+    );
+    await renderEditor(stub, "tools");
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    fireEvent.change(
+      await screen.findByPlaceholderText("case_conversation_id"),
+      { target: { value: "protocolo" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(1));
+    const tools = patches(stub)[0] as Record<string, unknown>;
+    // NOTE: the bag has to hold the edited block, or the comparison below passes over nothing. It holds
+    // only that one: the save sends the blocks the operator edited.
+    expect(Object.keys(tools)).toEqual(["crossInboxCase"]);
 
-    // The setSettings that belongs to this handler is the first one AFTER the send.
-    const backAt = SRC.indexOf("setSettings((s) => ({", sentAt);
-    expect(backAt).toBeGreaterThan(sentAt);
-    const back = keysOfObjectLiteral(SRC, SRC.indexOf("{", backAt + 18));
-
-    // Positive control: the parse has to actually find keys, or this passes on an empty set.
-    expect(sent).toContain("toolGuidance");
-    expect(sent.length).toBeGreaterThanOrEqual(4);
-    expect(sent.filter((k) => !back.includes(k))).toEqual([]);
+    fireEvent.click(screen.getByRole("tab", { name: /Behavior/ }));
+    await act(async () => {});
+    fireEvent.click(
+      await screen.findByRole("switch", {
+        name: /Stop answering when a person replies to the customer/,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(2));
+    const behavior = patches(stub)[1] as Record<string, unknown>;
+    const lost = Object.keys(tools).filter(
+      (k) => JSON.stringify(behavior[k]) !== JSON.stringify(tools[k]),
+    );
+    expect(lost).toEqual([]);
   });
 });
 
-// Round 5 of PR #378 closed the write boundary to non-native tool names. That created a THIRD party
-// to keep in agreement — the console, the runtime reader, and now the API — and two of the three
-// disagreeing is invisible from inside any one of them: a console offering a name the API refuses
-// makes the save fail on a row the operator just filled in, and a console hiding a name the API
-// accepts invites them to delete a guard they cannot see.
+// The console, the runtime reader and the API's write boundary have to agree on tool names, and a
+// disagreement is invisible from inside any one of them: a console offering a name the API refuses
+// fails the save on a row the operator just filled in, and one hiding a name the API accepts invites
+// them to delete a guard they cannot see.
 describe("the console offers exactly what the API accepts", () => {
   test("every native name round-trips through the editor and the write boundary", () => {
     const rows = NATIVE_TOOL_NAMES.map((tool) => ({
       tool,
-      scope: "conversation" as const,
-      key: "article_url",
-      equals: "",
+      conditions: [
+        { scope: "conversation" as const, key: "article_url", equals: "" },
+      ],
     }));
     const stored = serializeToolPreconditions(rows);
     expect(Object.keys(stored).sort()).toEqual([...NATIVE_TOOL_NAMES].sort());
@@ -384,11 +430,7 @@ describe("the console offers exactly what the API accepts", () => {
   });
 
   test("a name the API refuses is one the editor never renders", () => {
-    for (const tool of [
-      "create_invoice",
-      "mcp__crm__deal",
-      " handoff_to_human ",
-    ]) {
+    for (const tool of ["has space", "__proto__", " handoff_to_human "]) {
       const bag = {
         [tool]: { kind: "attribute", scope: "conversation", key: "k" },
       };
@@ -404,7 +446,7 @@ describe("the console offers exactly what the API accepts", () => {
   // the moment the API starts refusing a rule the operator never opened.
   test("saving an untouched tab does not turn a carried-through entry into a 400", () => {
     const legacy = {
-      mcp__crm__create_deal: {
+      "legacy tool": {
         kind: "attribute",
         scope: "conversation",
         key: "cpf",
@@ -425,7 +467,7 @@ describe("the console offers exactly what the API accepts", () => {
     const stored = { toolPreconditions: {} };
     const next = {
       toolPreconditions: {
-        mcp__crm__create_deal: {
+        "legacy tool": {
           kind: "attribute",
           scope: "conversation",
           key: "cpf",
@@ -433,5 +475,504 @@ describe("the console offers exactly what the API accepts", () => {
       },
     };
     expect(() => assertSettingsToolPreconditions(next, stored)).toThrow();
+  });
+});
+
+// Every source's granted tools can carry a rule, and the select is where the operator finds them. A
+// rule whose tool the agent no longer has (renamed, revoked, server gone) guards nothing, so the row
+// says so instead of reading as protection.
+describe("the Tools tab offers every granted tool, and flags a rule on one that is gone", () => {
+  afterEach(cleanup);
+
+  const catalog = {
+    toolDefinitions: [
+      {
+        id: "7",
+        name: "busca",
+        label: "Busca por CPF",
+        enabled: true,
+        toolName: "busca_por_cpf",
+        args: [],
+      },
+    ],
+    integrationInstances: [
+      {
+        id: "9",
+        catalogType: "google-calendar",
+        kind: "TOOLPACK",
+        name: "Agenda da escola",
+        enabled: true,
+        tools: [
+          { name: "calendar_check_availability", args: [] },
+          { name: "calendar_create_event", args: [] },
+        ],
+      },
+    ],
+    mcpConnections: [{ id: "5", name: "CRM", enabled: true, slug: "crm" }],
+  };
+  // The shape the server sends: every id key present, the arrays always arrays.
+  const grant = (g: Record<string, unknown>) => ({
+    toolDefinitionId: null,
+    mcpServerConnectionId: null,
+    integrationInstanceId: null,
+    documentTemplateId: null,
+    codeToolDefinitionId: null,
+    knowledgeBaseIds: [],
+    enabledTools: [],
+    ...g,
+  });
+  const grants = [
+    grant({ source: "HTTP", toolDefinitionId: "7" }),
+    grant({
+      source: "INTEGRATION",
+      integrationInstanceId: "9",
+      enabledTools: ["calendar_check_availability"],
+    }),
+    grant({
+      source: "MCP",
+      mcpServerConnectionId: "5",
+      enabledTools: ["create_deal"],
+    }),
+  ];
+  const GONE = /is not among the agent's tools/;
+  const offered = () =>
+    [
+      ...(screen.getByRole("combobox", { name: "Tool" }) as HTMLSelectElement)
+        .options,
+    ].map((o) => o.value);
+
+  test("toolpack, HTTP and MCP tools are offered, and only the granted ones", async () => {
+    const stub = stubEditorApi({ settings: {} }, { catalog, grants });
+    await renderEditor(stub, "tools");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add a precondition" }),
+    );
+    expect(offered()).toEqual(
+      expect.arrayContaining([
+        "busca_por_cpf",
+        "calendar_check_availability",
+        "mcp__crm__create_deal",
+      ]),
+    );
+    expect(offered()).not.toContain("calendar_create_event");
+  });
+
+  test("a rule on a toolpack tool is saved under the name the model calls", async () => {
+    const stub = stubEditorApi({ settings: {} }, { catalog, grants });
+    await renderEditor(stub, "tools");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add a precondition" }),
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Tool" }), {
+      target: { value: "calendar_check_availability" },
+    });
+    // NOTE: an input with suggestions (`list`) is a combobox, not a textbox.
+    fireEvent.change(screen.getByRole("combobox", { name: "Attribute" }), {
+      target: { value: "dia_turno" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(
+        stub.writes.some((w) => w.method === "PATCH" && w.body.settings),
+      ).toBe(true),
+    );
+    const settings = stub.writes.find(
+      (w) => w.method === "PATCH" && w.body.settings,
+    )?.body.settings as Record<string, Record<string, unknown>>;
+    expect(settings.toolPreconditions?.calendar_check_availability).toEqual({
+      kind: "attribute",
+      scope: "conversation",
+      key: "dia_turno",
+    });
+  });
+
+  const savedPreconditions = async (stub: EditorStub) => {
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(
+        stub.writes.some((w) => w.method === "PATCH" && w.body.settings),
+      ).toBe(true),
+    );
+    const settings = stub.writes.find(
+      (w) => w.method === "PATCH" && w.body.settings,
+    )?.body.settings as Record<string, unknown> | undefined;
+    return settings?.toolPreconditions as Record<string, unknown>;
+  };
+
+  test("a second condition added under a stored one is saved as a list of both", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "dia",
+            },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add a condition" }),
+    );
+    const keys = screen.getAllByRole("combobox", { name: "Attribute" });
+    expect(keys).toHaveLength(2);
+    fireEvent.change(keys[1] as HTMLElement, { target: { value: "turno" } });
+    expect(await savedPreconditions(stub)).toEqual({
+      calendar_check_availability: [
+        { kind: "attribute", scope: "conversation", key: "dia" },
+        { kind: "attribute", scope: "conversation", key: "turno" },
+      ],
+    });
+  });
+
+  test("a condition switched to the customer's choice is saved as that kind, beside an attribute", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "dia",
+            },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add a condition" }),
+    );
+    const kinds = screen.getAllByRole("combobox", { name: "Condition type" });
+    expect(kinds).toHaveLength(2);
+    fireEvent.change(kinds[1] as HTMLElement, {
+      target: { value: "customer_choice" },
+    });
+    // NOTE: the attribute fields leave that condition, and only that one.
+    expect(screen.getAllByRole("combobox", { name: "Attribute" })).toHaveLength(
+      1,
+    );
+    expect(
+      screen.getByText(/checked against the customer's messages/),
+    ).toBeTruthy();
+    const saved = await savedPreconditions(stub);
+    expect(saved).toEqual({
+      calendar_check_availability: [
+        { kind: "attribute", scope: "conversation", key: "dia" },
+        { kind: "customer_choice" },
+      ],
+    });
+    expect(
+      readToolPreconditions({ toolPreconditions: saved })
+        .calendar_check_availability,
+    ).toEqual([
+      { kind: "attribute", scope: "conversation", key: "dia" },
+      { kind: "customer_choice" },
+    ]);
+  });
+
+  test("a stored choice rule renders as that kind and saves back unchanged", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: { kind: "customer_choice" },
+            busca_por_cpf: { kind: "attribute", scope: "contact", key: "cpf" },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    const kinds = (await screen.findAllByRole("combobox", {
+      name: "Condition type",
+    })) as HTMLSelectElement[];
+    expect(kinds.map((k) => k.value).sort()).toEqual([
+      "attribute",
+      "customer_choice",
+    ]);
+    fireEvent.click(
+      screen.getAllByRole("button", {
+        name: "Remove precondition",
+      })[1] as HTMLElement,
+    );
+    expect(await savedPreconditions(stub)).toEqual({
+      calendar_check_availability: { kind: "customer_choice" },
+    });
+  });
+
+  test("removing one of three conditions saves the other two and leaves the other tool alone", async () => {
+    const cond = (key: string) => ({
+      kind: "attribute",
+      scope: "conversation",
+      key,
+    });
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: [cond("a"), cond("b"), cond("c")],
+            busca_por_cpf: cond("cpf"),
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    const removes = await screen.findAllByRole("button", {
+      name: "Remove condition",
+    });
+    expect(removes).toHaveLength(3);
+    fireEvent.click(removes[1] as HTMLElement);
+    expect(await savedPreconditions(stub)).toEqual({
+      calendar_check_availability: [cond("a"), cond("c")],
+      busca_por_cpf: cond("cpf"),
+    });
+  });
+
+  // The card's own button says what it removes, so it is not mistaken for a condition's, and the
+  // conditions after the first read as one sentence ("and until the attribute").
+  test("the card's button removes the whole rule, and each later condition reads as an and", async () => {
+    const cond = (key: string) => ({
+      kind: "attribute",
+      scope: "conversation",
+      key,
+    });
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: [cond("a"), cond("b")],
+            busca_por_cpf: cond("cpf"),
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    expect(await screen.findAllByText("and until")).toHaveLength(1);
+    const rules = await screen.findAllByRole("button", {
+      name: "Remove precondition",
+    });
+    expect(rules).toHaveLength(2);
+    fireEvent.click(rules[0] as HTMLElement);
+    expect(await savedPreconditions(stub)).toEqual({
+      busca_por_cpf: cond("cpf"),
+    });
+  });
+
+  test("a tool at the bound of ten conditions offers no eleventh", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            calendar_check_availability: Array.from({ length: 10 }, (_, i) => ({
+              kind: "attribute",
+              scope: "conversation",
+              key: `k${i}`,
+            })),
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    const add = (await screen.findByRole("button", {
+      name: "Add a condition",
+    })) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    fireEvent.click(add);
+    expect(screen.getAllByRole("combobox", { name: "Attribute" })).toHaveLength(
+      10,
+    );
+  });
+
+  test("a rule on a tool the agent no longer has is shown with a warning", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            busca_antiga: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "cpf",
+            },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    expect(
+      await screen.findByText(
+        "busca_antiga is not among the agent's tools: it was renamed, removed or turned off. This rule guards nothing.",
+      ),
+    ).toBeTruthy();
+    expect(offered()).toContain("busca_antiga");
+  });
+
+  // Two MCP connections whose names give one slug expose names the select holds back (a new rule
+  // could guard the other server's tool), but a saved rule on one still guards a tool the turn builds.
+  test("a rule on a built name the select holds back carries no warning", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            mcp__crm__create_deal: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "cpf",
+            },
+          },
+        },
+      },
+      {
+        catalog: {
+          ...catalog,
+          mcpConnections: [
+            { id: "5", name: "CRM", enabled: true, slug: "crm" },
+            { id: "6", name: "CRM!", enabled: true, slug: "crm" },
+          ],
+        },
+        grants: [
+          ...grants,
+          grant({
+            source: "MCP",
+            mcpServerConnectionId: "6",
+            enabledTools: ["create_deal"],
+          }),
+        ],
+      },
+    );
+    await renderEditor(stub, "tools");
+    expect(offered()).toContain("mcp__crm__create_deal");
+    expect(screen.queryByText(GONE)).toBeNull();
+  });
+
+  test("a rule on a granted tool carries no warning", async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            busca_por_cpf: {
+              kind: "attribute",
+              scope: "conversation",
+              key: "cpf",
+            },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    await screen.findByRole("combobox", { name: "Tool" });
+    expect(screen.queryByText(GONE)).toBeNull();
+  });
+  test('clearing a saved value keeps "equals" chosen while the new one is typed', async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            busca_por_cpf: {
+              kind: "attribute",
+              scope: "contact",
+              key: "cpf",
+              equals: "ok",
+            },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    fireEvent.change(
+      await screen.findByRole("textbox", { name: "Required value" }),
+      { target: { value: "" } },
+    );
+    expect(
+      (screen.getByRole("combobox", { name: "Condition" }) as HTMLSelectElement)
+        .value,
+    ).toBe("equals");
+    expect(
+      screen.getByRole("textbox", { name: "Required value" }),
+    ).toBeTruthy();
+  });
+
+  test("the select groups the offered tools by where they come from", async () => {
+    const stub = stubEditorApi({ settings: {} }, { catalog, grants });
+    await renderEditor(stub, "tools");
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Add a precondition" }),
+    );
+    const select = screen.getByRole("combobox", {
+      name: "Tool",
+    }) as HTMLSelectElement;
+    const groups = Object.fromEntries(
+      [...select.querySelectorAll("optgroup")].map((g) => [
+        g.label,
+        [...g.querySelectorAll("option")].map((o) => o.value),
+      ]),
+    );
+    expect(groups["HTTP tools"]).toEqual(["busca_por_cpf"]);
+    expect(groups["MCP servers"]).toEqual(["mcp__crm__create_deal"]);
+    expect(groups.Integrations).toEqual(["calendar_check_availability"]);
+  });
+
+  test('choosing "equals" saves the value, and going back to "any value" drops it', async () => {
+    const stub = stubEditorApi(
+      {
+        settings: {
+          toolPreconditions: {
+            busca_por_cpf: { kind: "attribute", scope: "contact", key: "cpf" },
+          },
+        },
+      },
+      { catalog, grants },
+    );
+    await renderEditor(stub, "tools");
+    const match = await screen.findByRole("combobox", { name: "Condition" });
+    expect(
+      screen.queryByRole("textbox", { name: "Required value" }),
+    ).toBeNull();
+    fireEvent.change(match, { target: { value: "equals" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Required value" }), {
+      target: { value: "ok" },
+    });
+    const saved = async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await waitFor(() =>
+        expect(
+          stub.writes.some((w) => w.method === "PATCH" && w.body.settings),
+        ).toBe(true),
+      );
+      const w = stub.writes.filter(
+        (x) => x.method === "PATCH" && x.body.settings,
+      );
+      const settings = w[w.length - 1]?.body.settings as Record<
+        string,
+        Record<string, unknown>
+      >;
+      return settings.toolPreconditions?.busca_por_cpf;
+    };
+    expect(await saved()).toEqual({
+      kind: "attribute",
+      scope: "contact",
+      key: "cpf",
+      equals: "ok",
+    });
+    stub.writes.length = 0;
+    fireEvent.change(screen.getByRole("combobox", { name: "Condition" }), {
+      target: { value: "any" },
+    });
+    expect(await saved()).toEqual({
+      kind: "attribute",
+      scope: "contact",
+      key: "cpf",
+    });
   });
 });

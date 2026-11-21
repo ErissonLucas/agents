@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ToolMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
+import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { googleCalendarToolpack } from "@/modules/integrations/toolpacks/google-calendar";
 import type {
   IntegrationSelection,
@@ -20,8 +21,8 @@ function stubFetch(status: number, json: unknown) {
   return { impl, calls };
 }
 
-// Since #345 the write tools READ availability before writing, so a create/update fixture has to
-// answer the freeBusy query too. Free by default: these tests are about what the write SENDS, not
+// The write tools READ availability before writing, so a create/update fixture has to answer the
+// freeBusy query too. Free by default: these tests are about what the write SENDS, not
 // about the booking rule (that one has its own file).
 function stubWriteFetch(
   json: unknown,
@@ -48,7 +49,7 @@ function stubWriteFetch(
   return { impl, calls };
 }
 
-// The requests that MUTATE, past the availability reads that now precede them.
+// The requests that MUTATE, past the availability reads that precede them.
 function writeCalls(calls: Array<{ url: string; init: RequestInit }>) {
   return calls.filter(
     (c) =>
@@ -57,7 +58,7 @@ function writeCalls(calls: Array<{ url: string; init: RequestInit }>) {
   );
 }
 
-// The request that MUTATES, past the availability read that now precedes it.
+// The request that MUTATES, past the availability read that precedes it.
 function writeCall(calls: Array<{ url: string; init: RequestInit }>) {
   return calls.find(
     (c) =>
@@ -223,18 +224,6 @@ describe("google calendar toolpack — credential + calendar binding", () => {
     expect(calls).toHaveLength(0);
   });
 
-  test("a single allowed calendar is auto-selected", async () => {
-    const { impl, calls } = stubFetch(200, { items: [] });
-    await toolFor(
-      "calendar_list_events",
-      { calendarIds: ["team@group.calendar.google.com"] },
-      baseCtx({ fetchImpl: impl }),
-    )?.invoke({});
-    expect(calls[0]?.url).toContain(
-      `/calendars/${encodeURIComponent("team@group.calendar.google.com")}/events`,
-    );
-  });
-
   test("several allowed calendars + no arg → asks to choose, no fetch", async () => {
     const { impl, calls } = stubFetch(200, { items: [] });
     const out = (await toolFor(
@@ -287,10 +276,9 @@ describe("google calendar toolpack — credential + calendar binding", () => {
   });
 });
 
-// A support report: an integration with ONE allowed calendar, and the agent calling availability with
-// calendarId set to a string that is not a calendar at all. The tool refused, and only omitting the
-// arg worked. The arg was offered with no hint of a valid value, because the <allowed_calendars> block
-// is deliberately suppressed when there is nothing to choose.
+// An integration with ONE allowed calendar: the <allowed_calendars> block is deliberately suppressed
+// when there is nothing to choose, so the model has no hint of a valid calendarId and may invent one.
+// The single allowed calendar is pinned instead of refusing the invented value.
 describe("google calendar toolpack — a single allowed calendar is pinned", () => {
   const PINNED = "clinic@group.calendar.google.com";
   const ONE = {
@@ -437,7 +425,7 @@ describe("google calendar toolpack — per-contact isolation", () => {
       summary: "Consulta",
       start: "2099-06-22T14:00:00-03:00",
       end: "2099-06-22T15:00:00-03:00",
-      // attendees is no longer in the schema; even if passed, it must never reach Google.
+      // NOTE: attendees is not in the schema; even if passed, it must never reach Google.
       attendees: ["lead@example.com"],
     });
     const body = bodyOf(writeCall(calls));
@@ -609,10 +597,9 @@ describe("google calendar toolpack — appointment reminders + confirmation", ()
     });
   });
 
-  // (#376) The reminder toggle decides the REMINDERS and nothing else. It used to decide whether the
-  // toolpack said anything at all, so an integration with reminders off booked appointments the
-  // platform never heard of: no follow-up pause, no console indicator, no block in the agent's own
-  // prompt. Asserting `reminders: null` rather than "not called" is the whole point of the test.
+  // NOTE: the reminder toggle decides the REMINDERS and nothing else: with reminders off the booking
+  // is still reported (follow-up pause, console indicator, the block in the agent's own prompt).
+  // Asserting `reminders: null` rather than "not called" is the whole point of the test.
   test("create still reports the booking when the integration has reminders disabled, arming none", async () => {
     const { impl, calls } = stubWriteFetch({
       id: "ev_2",
@@ -659,10 +646,9 @@ describe("google calendar toolpack — appointment reminders + confirmation", ()
     expect(cancelled).toEqual(["ev_9"]);
   });
 
-  // (#376) 410 Gone is a SUCCESS shape, and it used to return before the cleanup. The event is gone
-  // in Google either way, so leaving the record behind kept the follow-up paused and the appointment
-  // in the prompt until its start passed. It matters more now that the record exists even for an
-  // integration with reminders switched off, where there was previously no row to leave behind.
+  // NOTE: 410 Gone is a SUCCESS shape: the event is gone in Google either way, so a record left
+  // behind would keep the follow-up paused and the appointment in the prompt until its start passed
+  // (the record exists even with reminders switched off).
   test("cancel retires the appointment on 410 Gone too, not only on 204", async () => {
     const calls: string[] = [];
     const impl = (async (_url: string | URL | Request, init?: RequestInit) => {
@@ -811,8 +797,8 @@ describe("google calendar toolpack — event date shaping + default timezone", (
   // A patch that sets only dateTime leaves the all-day `date` on the event, and Google rejects an
   // event carrying both (HTTP 400). Both directions must null the field they replace.
   test("update: all-day → timed nulls the date field", async () => {
-    // An all-day event created before #345 can still be MOVED onto a bookable slot, and the patch
-    // has to clear the `date` it replaces (Google rejects an event carrying both, HTTP 400).
+    // An existing all-day event can still be MOVED onto a bookable slot, and the patch has to
+    // clear the `date` it replaces (Google rejects an event carrying both, HTTP 400).
     const { impl, calls } = stubWriteFetch({
       id: "ev_5",
       extendedProperties: stampedExt,
@@ -1034,11 +1020,10 @@ describe("google calendar toolpack — list + availability", () => {
     ]);
   });
 
-  // Regression: the spacing between start times is the operator's business rule (a 1h school visit
-  // offered on the half hour). While granularityMinutes was on the schema, the model could send 15
-  // and get back 14:15 — a real, bookable slot the school does not actually offer. The arg is gone
-  // now, so this also pins the strip: a residual key from an older tool definition never reaches the
-  // body, which is why no handler guard is needed.
+  // NOTE: the spacing between start times is the operator's business rule (a 1h visit offered on the
+  // half hour), so it is not in the schema: a model sending 15 would get 14:15, a slot the operator
+  // does not offer. This pins the strip: a residual key from an older tool definition never reaches
+  // the body, which is why no handler guard is needed.
   test("availability IGNORES a granularity the model sends", async () => {
     const day = spWeekday("2099-06-22T14:00:00-03:00");
     const { impl } = stubFetch(200, { calendars: { primary: { busy: [] } } });
@@ -1060,7 +1045,7 @@ describe("google calendar toolpack — list + availability", () => {
     )?.invoke({
       timeMin: "2099-06-22T00:00:00-03:00",
       timeMax: "2099-06-22T23:59:00-03:00",
-      // What the model actually sent in production. The pinned 30 must win.
+      // NOTE: the pinned 30 must win over the model's 15.
       granularityMinutes: 15,
       slotDurationMinutes: 15,
     })) as string;
@@ -1280,7 +1265,7 @@ describe("google calendar toolpack — blocking calendars (issue #1)", () => {
 
   test("an all-day event blocks the whole local day, even marked transparent (the freeBusy blind spot)", async () => {
     // All-day events default to transparency "transparent" ("Free"), which freeBusy ignores; the
-    // holiday calendar from the issue is exactly this shape, so blocking reads events.list instead.
+    // holiday calendar is exactly this shape, so blocking reads events.list instead.
     const { impl } = routedFetch([
       { match: "/freeBusy", json: FREE },
       {
@@ -1455,7 +1440,7 @@ describe("google calendar toolpack — Meet room on create", () => {
   });
 
   test("a pending room is re-read once so the reply still carries meetLink", async () => {
-    // NOTE: the POST answers without hangoutLink (createRequest still pending); one follow-up GET has it.
+    // The POST answers without hangoutLink (createRequest still pending); one follow-up GET has it.
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const pending = {
       ...CREATED,
@@ -1492,9 +1477,9 @@ describe("google calendar toolpack — Meet room on create", () => {
   });
 });
 
-// NOTE: Integration failures must reach the flow log as failures (issue #40): invoked as a
-// tool_call, a provider/credential failure returns a ToolMessage with status "error" (same friendly
-// content), while bad model input stays a plain success — it is normal operation, not an outage.
+// Integration failures reach the flow log as failures: invoked as a tool_call, a provider/credential
+// failure returns a ToolMessage with status "error" (same friendly content), while bad model input
+// stays a plain success, normal operation, not an outage.
 describe("google calendar toolpack — integration failures are marked (issue #40)", () => {
   test("a non-2xx and a missing credential return ToolMessage status error", async () => {
     const { impl } = stubFetch(500, { error: "boom" });
@@ -1544,10 +1529,9 @@ describe("google calendar toolpack — integration failures are marked (issue #4
   });
 });
 
-// Issue #100: a clinic with one calendar per professional. "Who can see me first?" used to force the
-// model to call this tool once per calendar and merge the results itself, burning the turn's tool
-// budget and risking a calendar never being asked. freeBusy already takes N calendars in ONE request,
-// so aggregating costs the same round trip it always did.
+// A clinic with one calendar per professional: "who can see me first?" is one call, not one per
+// calendar merged by the model (which burns the turn's tool budget and can skip a calendar). freeBusy
+// takes N calendars in ONE request, so aggregating costs a single round trip.
 describe("google calendar toolpack — aggregated availability (issue #100)", () => {
   const ANA = "ana@group.calendar.google.com";
   const PAULO = "paulo@group.calendar.google.com";
@@ -1642,8 +1626,11 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
       CLINIC,
       baseCtx({ fetchImpl: impl }),
     )?.invoke(RANGE)) as string;
-    const times = parse(out).slots.map((s) => Date.parse(s.start));
-    expect(times).toEqual([...times].sort((a, b) => a - b));
+    // Paulo is free at 09:00 and Ana at 11:00: the earlier start leads, whichever calendar holds it.
+    expect(parse(out).slots.map((s) => [s.label, s.calendarId])).toEqual([
+      ["seg 22/06 09:00", PAULO],
+      ["seg 22/06 11:00", ANA],
+    ]);
   });
 
   test("an explicit calendarId still asks that one calendar only", async () => {
@@ -1676,14 +1663,17 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
       baseCtx({ fetchImpl: impl }),
     )?.invoke(RANGE)) as string;
     const parsed = parse(out);
-    expect(parsed.slots.every((s) => s.calendarId === ANA)).toBe(true);
+    expect(parsed.slots.map((s) => [s.label, s.calendarId])).toEqual([
+      ["seg 22/06 09:00", ANA],
+      ["seg 22/06 10:00", ANA],
+      ["seg 22/06 11:00", ANA],
+    ]);
     expect(parsed.unavailableCalendars).toEqual(["Dr. Paulo"]);
   });
 
   test("a single calendar is NOT capped, even past the aggregate ceiling", async () => {
-    // The earlier version of this test used a 12-hour hourly window, which is 12 slots: it asserted
-    // the guarantee without ever reaching the ceiling it claimed did not apply. At the 5-minute floor
-    // a near-24h range yields ~287 starts, which is past the 250 an aggregate query is bound to.
+    // At the 5-minute floor a near-24h range yields ~287 starts, past the 250 an aggregate query
+    // is bound to (a small window would never reach the ceiling this claims does not apply).
     const { impl } = stubFetch(200, { calendars: { [ANA]: { busy: [] } } });
     const out = (await toolFor(
       "calendar_check_availability",
@@ -1751,13 +1741,17 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
     // is the model reporting later times unavailable.
     const desc = toolFor("calendar_check_availability", CLINIC, baseCtx())
       ?.description as string;
-    expect(desc).toContain("coveredUntil");
-    expect(desc).toContain("timeMin");
+    expect(desc).toContain(
+      "If `coveredUntil` comes back, the search stopped early and that timestamp is the FIRST start time it did not cover",
+    );
+    expect(desc).toContain(
+      "call again with timeMin set to that value to continue",
+    );
   });
 
   test("an afternoon is still offered: several calendars are not cut to their first few starts", async () => {
-    // The reviewer's scenario. At the default 15-minute grain an eight-slot-per-calendar bound
-    // exposes under two hours, so "do you have anything after lunch?" answers no while the afternoon
+    // At the default 15-minute grain an eight-slot-per-calendar bound would expose under two
+    // hours, so "do you have anything after lunch?" answers no while the afternoon
     // is free. Nothing may truncate the range.
     const { impl } = stubFetch(200, {
       calendars: { [ANA]: { busy: [] }, [PAULO]: { busy: [] } },
@@ -1781,9 +1775,8 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
   });
 
   test("the query is BATCHED across every allowed calendar", async () => {
-    // Google's calendarExpansionMax of 50 is a PER-REQUEST ceiling, so batching satisfies it. An
-    // earlier revision trimmed the allowlist at 50 and reported the tail as unavailable, throwing
-    // away calendars that one more batch would have covered.
+    // Google's calendarExpansionMax of 50 is a PER-REQUEST ceiling, so batching satisfies it;
+    // trimming the allowlist at 50 would report as unavailable calendars one more batch covers.
     const many = Array.from({ length: 50 }, (_, i) => `c${i}@x`);
     const { impl, calls } = stubFetch(200, {
       calendars: Object.fromEntries(many.map((id) => [id, { busy: [] }])),
@@ -1870,15 +1863,18 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
     )?.invoke(RANGE)) as string;
     const parsed = parse(out);
     expect(parsed.unavailableCalendars).toEqual(ids.slice(10));
-    expect(
-      parsed.slots.every((s) => ids.slice(0, 10).includes(s.calendarId)),
-    ).toBe(true);
+    // Every hour of the range, for each of the ten calendars the first batch read.
+    expect(parsed.slots.map((s) => `${s.label} ${s.calendarId}`)).toEqual(
+      ["09:00", "10:00", "11:00"].flatMap((hm) =>
+        ids.slice(0, 10).map((id) => `seg 22/06 ${hm} ${id}`),
+      ),
+    );
   });
 
   test("a calendar listed as BOTH operable and blocking still blocks its siblings", async () => {
     // freeBusy ignores transparent and all-day events, which is exactly the closure shape, so a
     // doubly-listed calendar has to be READ as a blocker for the others. Excluding every queried
-    // calendar from the blocking read (an earlier revision) made that closure invisible to everyone.
+    // calendar from the blocking read would make that closure invisible to everyone.
     const { impl } = routedFetch([
       {
         match: "/freeBusy",
@@ -1988,6 +1984,312 @@ describe("google calendar toolpack — aggregated availability (issue #100)", ()
     expect(bodyOf(calls[0] as { init: RequestInit })).toMatchObject({
       items: [{ id: ANA }],
     });
-    expect(parse(out).slots.every((s) => s.calendarId === ANA)).toBe(true);
+    expect(JSON.parse(out)).toEqual({
+      slots: ["09:00", "10:00", "11:00"].map((hm) => ({
+        start: expect.any(String),
+        end: expect.any(String),
+        label: `seg 22/06 ${hm}`,
+        calendarId: ANA,
+        calendarLabel: "Dra. Ana",
+      })),
+      timeZone: "America/Sao_Paulo",
+    });
+  });
+});
+
+describe("google calendar toolpack — inviting the customer (issue #1005)", () => {
+  const CREATED = {
+    id: "ev9",
+    summary: "Demo",
+    start: { dateTime: "2099-06-22T14:00:00-03:00" },
+    end: { dateTime: "2099-06-22T15:00:00-03:00" },
+  };
+  const INPUT = {
+    summary: "Demo",
+    start: "2099-06-22T14:00:00-03:00",
+    end: "2099-06-22T15:00:00-03:00",
+  };
+  const OFF = { createMeetLink: false };
+  const schemaKeys = (t: unknown) =>
+    Object.keys(
+      ((t as { schema: { shape?: Record<string, unknown> } }).schema.shape ??
+        {}) as Record<string, unknown>,
+    );
+
+  test("off by default: no attendees, no sendUpdates, no address arg", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    let read = 0;
+    const tool = toolFor(
+      "calendar_create_event",
+      OFF,
+      baseCtx({
+        fetchImpl: impl,
+        readContactEmail: async () => {
+          read++;
+          return "ana@example.com";
+        },
+      }),
+    );
+    expect(schemaKeys(tool)).not.toContain("attendeeEmail");
+    const out = (await tool?.invoke(INPUT)) as string;
+    expect(writeCall(calls).url).not.toContain("sendUpdates");
+    expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+    expect(read).toBe(0);
+    expect(JSON.parse(out).invitedEmail).toBeUndefined();
+  });
+
+  test("contact mode: the address read from Chatwoot at call time is the one attendee, notified", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    const tool = toolFor(
+      "calendar_create_event",
+      { inviteCustomer: "contact" },
+      baseCtx({
+        fetchImpl: impl,
+        resolveContactEmail: async () => "stale@example.com",
+        readContactEmail: async () => "ana@example.com",
+      }),
+    );
+    expect(schemaKeys(tool)).not.toContain("attendeeEmail");
+    const out = (await tool?.invoke(INPUT)) as string;
+    const url = new URL(writeCall(calls).url);
+    expect(url.searchParams.get("sendUpdates")).toBe("all");
+    expect(url.searchParams.get("conferenceDataVersion")).toBe("1");
+    const body = bodyOf(writeCall(calls));
+    expect(body.attendees).toEqual([{ email: "ana@example.com" }]);
+    expect(body.conferenceData).toBeDefined();
+    expect(body.extendedProperties).toEqual(stampedExt);
+    expect(JSON.parse(out).invitedEmail).toBe("ana@example.com");
+  });
+
+  test("contact mode without an email books the slot and says nobody was invited", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    const out = (await toolFor(
+      "calendar_create_event",
+      { ...OFF, inviteCustomer: "contact" },
+      baseCtx({
+        fetchImpl: impl,
+        resolveContactEmail: async () => "mirror@example.com",
+        readContactEmail: async () => null,
+      }),
+    )?.invoke({ ...INPUT, attendeeEmail: "model@example.com" })) as string;
+    expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+    expect(writeCall(calls).url).not.toContain("sendUpdates");
+    expect(JSON.parse(out).invitedEmail).toBeUndefined();
+    expect(JSON.parse(out).inviteNotSent).toContain("no email");
+  });
+
+  test("contact mode with a contact email that is not one books the slot without an invite", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    const out = (await toolFor(
+      "calendar_create_event",
+      { ...OFF, inviteCustomer: "contact" },
+      baseCtx({
+        fetchImpl: impl,
+        readContactEmail: async () => "ana at example",
+      }),
+    )?.invoke(INPUT)) as string;
+    expect(writeCalls(calls)).toHaveLength(1);
+    expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+    expect(JSON.parse(out).inviteNotSent).toBeTruthy();
+  });
+
+  test("contact mode when Chatwoot cannot be read books the slot without an invite", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    const out = (await toolFor(
+      "calendar_create_event",
+      { ...OFF, inviteCustomer: "contact" },
+      baseCtx({
+        fetchImpl: impl,
+        readContactEmail: async () => {
+          throw new Error("chatwoot down");
+        },
+      }),
+    )?.invoke(INPUT)) as string;
+    expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+    expect(JSON.parse(out).inviteNotSent).toBeTruthy();
+  });
+
+  test("agent mode: the address the model passes is the one attendee, notified even without Meet", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    const tool = toolFor(
+      "calendar_create_event",
+      { ...OFF, inviteCustomer: "agent" },
+      baseCtx({ fetchImpl: impl }),
+    );
+    expect(schemaKeys(tool)).toContain("attendeeEmail");
+    const out = (await tool?.invoke({
+      ...INPUT,
+      attendeeEmail: " Ana@Example.com ",
+    })) as string;
+    expect(new URL(writeCall(calls).url).searchParams.get("sendUpdates")).toBe(
+      "all",
+    );
+    expect(bodyOf(writeCall(calls)).attendees).toEqual([
+      { email: "Ana@Example.com" },
+    ]);
+    expect(JSON.parse(out).invitedEmail).toBe("Ana@Example.com");
+  });
+
+  test("agent mode without an address books without an invite", async () => {
+    const { impl, calls } = stubWriteFetch(CREATED);
+    await toolFor(
+      "calendar_create_event",
+      { ...OFF, inviteCustomer: "agent" },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(INPUT);
+    expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+    expect(writeCall(calls).url).not.toContain("sendUpdates");
+  });
+
+  for (const bad of ["not-an-email", "a@x.com, b@y.com", "a@x.com b@y.com"]) {
+    test(`agent mode refuses ${JSON.stringify(bad)} before anything is written`, async () => {
+      const { impl, calls } = stubWriteFetch(CREATED);
+      const out = (await toolFor(
+        "calendar_create_event",
+        { ...OFF, inviteCustomer: "agent" },
+        baseCtx({ fetchImpl: impl }),
+      )?.invoke({ ...INPUT, attendeeEmail: bad })) as string;
+      expect(writeCalls(calls)).toHaveLength(0);
+      expect(String(out)).toContain("one email address");
+    });
+  }
+
+  const owned = (attendees?: unknown) => ({
+    ...CREATED,
+    extendedProperties: stampedExt,
+    ...(attendees ? { attendees } : {}),
+  });
+
+  test("update of an event with a guest notifies, and leaves the guest list alone", async () => {
+    const { impl, calls } = stubWriteFetch(
+      owned([{ email: "ana@example.com" }]),
+    );
+    await toolFor(
+      "calendar_update_event",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({ eventId: "ev9", summary: "Novo" });
+    const patch = writeCall(calls);
+    expect(new URL(patch.url).searchParams.get("sendUpdates")).toBe("all");
+    expect(bodyOf(patch).attendees).toBeUndefined();
+    // The owner read asks for the guest list, or the check could not see it.
+    const get = calls.find((c) => c.init.method === "GET") as {
+      url: string;
+    };
+    expect(get.url).toContain("attendees");
+  });
+
+  test("update of an event without a guest sends no notification", async () => {
+    const { impl, calls } = stubWriteFetch(owned());
+    await toolFor(
+      "calendar_update_event",
+      { inviteCustomer: "contact" },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({ eventId: "ev9", summary: "Novo" });
+    expect(writeCall(calls).url).not.toContain("sendUpdates");
+  });
+
+  test("cancel of an event with a guest notifies; without one it does not", async () => {
+    for (const [ev, expected] of [
+      [owned([{ email: "ana@example.com" }]), "all"],
+      [owned(), null],
+    ] as const) {
+      const { impl, calls } = stubWriteFetch(ev);
+      await toolFor(
+        "calendar_cancel_event",
+        {},
+        baseCtx({ fetchImpl: impl }),
+      )?.invoke({ eventId: "ev9" });
+      const del = calls.find((c) => c.init.method === "DELETE") as {
+        url: string;
+      };
+      expect(new URL(del.url).searchParams.get("sendUpdates")).toBe(expected);
+      const get = calls.find((c) => c.init.method === "GET") as {
+        url: string;
+      };
+      expect(get.url).toContain("attendees");
+    }
+  });
+
+  // An observer's turn carries a muted client: Google's emails would reach the customer by a door
+  // the Chatwoot mute never sees.
+  const mutedChatwoot = {
+    chatwoot: {
+      client: { muted: true } as unknown as ChatwootClient,
+      conversationId: 77,
+    },
+  };
+
+  test("a muted turn invites nobody and offers no address arg, whatever the mode", async () => {
+    for (const mode of ["contact", "agent"]) {
+      const { impl, calls } = stubWriteFetch(CREATED);
+      let read = 0;
+      const tool = toolFor(
+        "calendar_create_event",
+        { ...OFF, inviteCustomer: mode },
+        baseCtx({
+          fetchImpl: impl,
+          ...mutedChatwoot,
+          readContactEmail: async () => {
+            read++;
+            return "ana@example.com";
+          },
+        }),
+      );
+      expect(schemaKeys(tool)).not.toContain("attendeeEmail");
+      const out = (await tool?.invoke({
+        ...INPUT,
+        attendeeEmail: "ana@example.com",
+      })) as string;
+      expect(bodyOf(writeCall(calls)).attendees).toBeUndefined();
+      expect(writeCall(calls).url).not.toContain("sendUpdates");
+      expect(read).toBe(0);
+      expect(JSON.parse(out).invitedEmail).toBeUndefined();
+    }
+  });
+
+  test("a muted turn moves and cancels a guest's event without notifying", async () => {
+    const ev = owned([{ email: "ana@example.com" }]);
+    const upd = stubWriteFetch(ev);
+    await toolFor(
+      "calendar_update_event",
+      {},
+      baseCtx({ fetchImpl: upd.impl, ...mutedChatwoot }),
+    )?.invoke({ eventId: "ev9", summary: "Novo" });
+    expect(writeCall(upd.calls).url).not.toContain("sendUpdates");
+    const del = stubWriteFetch(ev);
+    await toolFor(
+      "calendar_cancel_event",
+      {},
+      baseCtx({ fetchImpl: del.impl, ...mutedChatwoot }),
+    )?.invoke({ eventId: "ev9" });
+    const d = del.calls.find((c) => c.init.method === "DELETE") as {
+      url: string;
+    };
+    expect(d.url).not.toContain("sendUpdates");
+  });
+
+  test("a guest on a foreign event grants nothing: update and cancel still refuse", async () => {
+    const foreign = {
+      ...CREATED,
+      extendedProperties: { private: { secv4Contact: "1:99" } },
+      attendees: [{ email: "ana@example.com" }],
+    };
+    for (const name of ["calendar_update_event", "calendar_cancel_event"]) {
+      const { impl, calls } = stubWriteFetch(foreign);
+      await toolFor(
+        name,
+        { inviteCustomer: "contact" },
+        baseCtx({
+          fetchImpl: impl,
+          readContactEmail: async () => "ana@example.com",
+        }),
+      )?.invoke({ eventId: "ev9", summary: "x" });
+      expect(
+        calls.filter(
+          (c) => c.init.method !== "GET" && !c.url.includes("freeBusy"),
+        ),
+      ).toHaveLength(0);
+    }
   });
 });

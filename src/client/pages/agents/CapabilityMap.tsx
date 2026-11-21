@@ -5,13 +5,23 @@ import {
   Download,
   Network,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useContext, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Card, Modal, useModalController } from "@/client/components";
 import { useTheme } from "@/client/contexts/ThemeContext";
 import { nativeToolMeta } from "@/client/lib/nativeTools";
+import { importWithReload } from "@/client/lib/staleBuild";
 import { toolpackToolMeta } from "@/client/lib/toolpackTools";
 import { cn, slugify } from "@/client/lib/utils";
+import {
+  type CallFloor,
+  CallFloorContext,
+  findTool,
+  fmt,
+  groupTokens,
+  TokensLabel,
+  type ToolRef,
+} from "./CallFloor";
 import type { GrantState, ToolCatalog } from "./types";
 
 // A capability is one tool the agent can call, grouped by where it comes from. The graph draws the REAL
@@ -20,10 +30,19 @@ import type { GrantState, ToolCatalog } from "./types";
 // runs" (the LangGraph spine) and "what it can actually do" (one edge per tool / knowledge base). Built
 // entirely from the editor's catalog + grants (no backend); the graph renders client-side via mermaid.
 
+// `ref` and `source` say which tools of the call floor an item is, for its number; an item without
+// either (a knowledge base) has none of its own, and the group's `refs` carry what it costs.
+export interface MapItem {
+  label: string;
+  ref?: ToolRef;
+  source?: { mcp: string } | { integration: string };
+}
+
 export interface MapGroup {
   key: string;
   label: string;
-  items: string[];
+  items: MapItem[];
+  refs?: ToolRef[];
 }
 
 export function buildGroups(
@@ -43,7 +62,10 @@ export function buildGroups(
     groups.push({
       key: "native",
       label: t("editor.capabilities.native", "Built-in"),
-      items: nativeNames.map((n) => nativeToolMeta(n, t).label),
+      items: nativeNames.map((n) => ({
+        label: nativeToolMeta(n, t).label,
+        ref: { name: n, kind: "native" },
+      })),
     });
   }
 
@@ -51,12 +73,13 @@ export function buildGroups(
   const kbIds = new Set(grants.flatMap((g) => g.knowledgeBaseIds ?? []));
   const kbNames = catalog.knowledgeBases
     .filter((k) => kbIds.has(k.id))
-    .map((k) => k.name);
+    .map((k) => ({ label: k.name }));
   if (kbNames.length > 0) {
     groups.push({
       key: "knowledge",
       label: t("editor.capabilities.knowledge", "Knowledge"),
       items: kbNames,
+      refs: [{ system: "search_knowledge" }, { system: "suggest_kb_entry" }],
     });
   }
 
@@ -67,9 +90,11 @@ export function buildGroups(
       const td = catalog.toolDefinitions.find(
         (x) => x.id === g.toolDefinitionId,
       );
-      return td ? td.label : undefined;
+      return td
+        ? { label: td.label, ref: { name: td.name, kind: "http" as const } }
+        : undefined;
     })
-    .filter((n): n is string => !!n);
+    .filter((n) => !!n);
   if (httpNames.length > 0) {
     groups.push({
       key: "http",
@@ -87,9 +112,11 @@ export function buildGroups(
       const ct = catalog.codeTools.find((x) => x.id === g.codeToolDefinitionId);
       // Disabled is the same as absent here: the assembly skips a disabled definition, so the model
       // is never offered it, and a map that draws it claims a capability the agent does not have.
-      return ct?.enabled ? ct.label : undefined;
+      return ct?.enabled
+        ? { label: ct.label, ref: { name: ct.name, kind: "code" as const } }
+        : undefined;
     })
-    .filter((n): n is string => !!n);
+    .filter((n) => !!n);
   if (codeNames.length > 0) {
     groups.push({
       key: "code",
@@ -113,8 +140,16 @@ export function buildGroups(
       }),
       items:
         tools.length > 0
-          ? tools
-          : [t("editor.capabilities.allTools", "(all tools)")],
+          ? tools.map((tool) => ({
+              label: tool,
+              ref: { mcp: { connectionId: String(conn.id), tool } },
+            }))
+          : [
+              {
+                label: t("editor.capabilities.allTools", "(all tools)"),
+                source: { mcp: String(conn.id) },
+              },
+            ],
     });
   }
 
@@ -133,8 +168,16 @@ export function buildGroups(
       // Show the friendly label per tool (like NATIVE via nativeToolMeta), not the raw internal name.
       items:
         tools.length > 0
-          ? tools.map((n) => toolpackToolMeta(n, t).label)
-          : [t("editor.capabilities.allTools", "(all tools)")],
+          ? tools.map((n) => ({
+              label: toolpackToolMeta(n, t).label,
+              ref: { integration: { instanceId: String(inst.id), tool: n } },
+            }))
+          : [
+              {
+                label: t("editor.capabilities.allTools", "(all tools)"),
+                source: { integration: String(inst.id) },
+              },
+            ],
     });
   }
 
@@ -143,17 +186,19 @@ export function buildGroups(
   // same reason a stale MCP or integration grant does — the map shows what the agent can call.
   const documentNames = grants
     .filter((g) => g.source === "DOCUMENT")
-    .map(
-      (g) =>
-        catalog.documentTemplates.find(
-          // AVAILABLE, not merely enabled: assembly also skips a template whose content this build
-          // cannot parse. The map is the operator's answer to "what can this agent call", and
-          // drawing a tool that is not in the graph is worse than drawing nothing, since the
-          // picture reads as complete. One question, asked of the catalog that answers it.
-          (d) => d.id === g.documentTemplateId && d.available,
-        )?.toolName,
-    )
-    .filter((n): n is string => !!n);
+    .map((g) => {
+      const tpl = catalog.documentTemplates.find(
+        // AVAILABLE, not merely enabled: assembly also skips a template whose content this build
+        // cannot parse. The map is the operator's answer to "what can this agent call", and
+        // drawing a tool that is not in the graph is worse than drawing nothing, since the
+        // picture reads as complete. One question, asked of the catalog that answers it.
+        (d) => d.id === g.documentTemplateId && d.available,
+      );
+      return tpl
+        ? { label: tpl.toolName, ref: { templateId: String(tpl.id) } }
+        : undefined;
+    })
+    .filter((n) => !!n);
   if (documentNames.length > 0) {
     groups.push({
       key: "document",
@@ -163,6 +208,36 @@ export function buildGroups(
   }
 
   return groups;
+}
+
+// What one item adds to every call: its tool, or every tool of the source it stands for ("all tools").
+// Null when the floor has no number for it, which the map shows as no number rather than zero.
+export function itemTokens(
+  floor: CallFloor | null,
+  item: MapItem,
+): number | null {
+  if (item.ref) return findTool(floor, item.ref)?.estimatedTokens ?? null;
+  const source = item.source;
+  if (!source || floor?.engine !== "llm") return null;
+  const tools = floor.tools.filter((tl) =>
+    "mcp" in source
+      ? tl.mcp?.connectionId === source.mcp
+      : tl.integrationInstanceId === source.integration,
+  );
+  return tools.length > 0
+    ? tools.reduce((sum, tl) => sum + tl.estimatedTokens, 0)
+    : null;
+}
+
+export function groupTotal(
+  floor: CallFloor | null,
+  group: MapGroup,
+): number | null {
+  if (group.refs) return groupTokens(floor, group.refs);
+  const known = group.items
+    .map((item) => itemTokens(floor, item))
+    .filter((n): n is number => n !== null);
+  return known.length > 0 ? known.reduce((a, b) => a + b, 0) : null;
 }
 
 // Sanitize a label for a Mermaid node literal (it sits inside ["…"]).
@@ -202,7 +277,7 @@ export function toMermaid(groups: MapGroup[]): string {
     lines.push(`  subgraph g${gi}["${mmLabel(group.label)}"]`);
     lines.push("    direction TB");
     shown.forEach((item, ii) => {
-      lines.push(`    n${gi}_${ii}["${mmLabel(item)}"]`);
+      lines.push(`    n${gi}_${ii}["${mmLabel(item.label)}"]`);
     });
     if (overflow > 0) {
       lines.push(`    n${gi}_more["+${overflow}…"]`);
@@ -316,7 +391,8 @@ function GraphModalBody({
     setSvg(null);
     void (async () => {
       try {
-        const mermaid = (await import("mermaid")).default;
+        const mermaid = (await importWithReload(() => import("mermaid")))
+          .default;
         mermaid.initialize({
           startOnLoad: false,
           securityLevel: "strict",
@@ -356,7 +432,7 @@ function GraphModalBody({
             <button
               type="button"
               onClick={() => downloadSvg(svg, `${fileNameBase}.svg`)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2 py-1 text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary"
+              className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
             >
               <Download className="h-3.5 w-3.5" aria-hidden="true" />
               {t("editor.capabilities.saveSvg", "Save SVG")}
@@ -373,7 +449,7 @@ function GraphModalBody({
                   () => {},
                 );
               }}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border px-2 py-1 text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary"
+              className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
             >
               <Download className="h-3.5 w-3.5" aria-hidden="true" />
               {t("editor.capabilities.savePng", "Save PNG")}
@@ -382,7 +458,7 @@ function GraphModalBody({
         )}
       </div>
       {state === "error" ? (
-        <p className="text-sm text-text-muted">
+        <p className="text-text-muted text-sm">
           {t(
             "editor.capabilities.graphError",
             "Couldn't render the graph here. Try reopening it.",
@@ -402,6 +478,10 @@ function GraphModalBody({
   );
 }
 
+function GroupTokens({ n }: { n: number | null }) {
+  return n === null ? null : <TokensLabel n={n} />;
+}
+
 export function CapabilityMap({
   catalog,
   grants,
@@ -412,7 +492,8 @@ export function CapabilityMap({
   // Used to name the downloaded graph image (slugified, NFD-stripped).
   agentName?: string;
 }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const floor = useContext(CallFloorContext);
   const [open, setOpen] = useState(false);
   const graphModal = useModalController();
   const groups = buildGroups(catalog, grants, t);
@@ -422,7 +503,7 @@ export function CapabilityMap({
 
   return (
     <Card id="general-capabilities" className="flex scroll-mt-4 flex-col gap-3">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
@@ -431,17 +512,17 @@ export function CapabilityMap({
         >
           {open ? (
             <ChevronDown
-              className="h-4 w-4 shrink-0 text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0"
               aria-hidden="true"
             />
           ) : (
             <ChevronRight
-              className="h-4 w-4 shrink-0 text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0"
               aria-hidden="true"
             />
           )}
-          <Network className="h-4 w-4 text-accent" aria-hidden="true" />
-          <span className="font-medium text-sm text-text-primary">
+          <Network className="text-accent h-4 w-4" aria-hidden="true" />
+          <span className="text-text-primary text-sm font-medium">
             {t("editor.capabilities.title", "Capability map")}
           </span>
           <span className="text-text-muted text-xs">
@@ -454,7 +535,7 @@ export function CapabilityMap({
           <button
             type="button"
             onClick={() => graphModal.open()}
-            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-border px-2 py-1 text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary"
+            className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center gap-1.5 rounded-lg border px-2 py-1 text-xs"
           >
             <Network className="h-3.5 w-3.5" aria-hidden="true" />
             {t("editor.capabilities.viewGraph", "View graph")}
@@ -463,7 +544,7 @@ export function CapabilityMap({
       </div>
       {open &&
         (total === 0 ? (
-          <p className="text-sm text-text-muted">
+          <p className="text-text-muted text-sm">
             {t(
               "editor.capabilities.empty",
               "No tools granted yet — the agent can only chat.",
@@ -471,30 +552,41 @@ export function CapabilityMap({
           </p>
         ) : (
           <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:gap-4">
-            <div className="flex shrink-0 items-center gap-2 self-center rounded-xl border border-accent/40 bg-accent/10 px-3 py-2 font-medium text-sm text-text-primary">
-              <Bot className="h-4 w-4 text-accent" aria-hidden="true" />
+            <div className="border-accent/40 bg-accent-soft text-text-primary flex shrink-0 items-center gap-2 self-center rounded-xl border px-3 py-2 text-sm font-medium">
+              <Bot className="text-accent h-4 w-4" aria-hidden="true" />
               {t("editor.capabilities.agent", "Agent")}
             </div>
             <div className="flex flex-1 flex-col gap-2">
               {groups.map((group) => (
                 <div
                   key={group.key}
-                  className="rounded-lg border border-border bg-bg-secondary p-2"
+                  className="border-border bg-bg-secondary rounded-lg border p-2"
                 >
-                  <p className="mb-1.5 font-medium text-[10px] text-text-muted uppercase tracking-wider">
-                    {group.label}
-                  </p>
+                  <div className="mb-1.5 flex flex-wrap items-baseline justify-between gap-x-2">
+                    <p className="text-text-muted text-[10px] font-medium tracking-wider uppercase">
+                      {group.label}
+                    </p>
+                    <GroupTokens n={groupTotal(floor, group)} />
+                  </div>
                   <div className="flex flex-wrap gap-1.5">
-                    {group.items.map((item) => (
-                      <span
-                        key={item}
-                        className={cn(
-                          "inline-flex items-center rounded-full border border-border bg-bg-tertiary px-2 py-0.5 text-text-secondary text-xs",
-                        )}
-                      >
-                        {item}
-                      </span>
-                    ))}
+                    {group.items.map((item) => {
+                      const n = itemTokens(floor, item);
+                      return (
+                        <span
+                          key={`${item.label}:${JSON.stringify(item.ref ?? item.source ?? null)}`}
+                          className={cn(
+                            "border-border bg-bg-tertiary text-text-secondary inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-xs",
+                          )}
+                        >
+                          {item.label}
+                          {n !== null && (
+                            <span className="text-text-muted font-mono">
+                              {fmt(n, i18n.language)}
+                            </span>
+                          )}
+                        </span>
+                      );
+                    })}
                   </div>
                 </div>
               ))}

@@ -1,0 +1,409 @@
+/// <reference lib="dom" />
+
+import { describe, expect, test } from "bun:test";
+import { cleanup, render, waitFor } from "@testing-library/react";
+import { createElement } from "react";
+import { ThemeProvider } from "@/client/contexts/ThemeContext";
+import { LineTrend } from "@/client/pages/dashboard/charts";
+import { toCsv } from "@/client/pages/dashboard/csv";
+import {
+  apiQuery,
+  DEFAULT_FILTERS,
+  daysOf,
+  drillDownHref,
+  localDayKey,
+  previousWindow,
+  readFilters,
+  readUpTo,
+  trendPointHref,
+  windowOf,
+  writeFilters,
+} from "@/client/pages/dashboard/filters";
+import { logsHref } from "@/client/pages/dashboard/HealthSection";
+
+// THE DASHBOARD'S FILTER LIVES IN THE URL. A link reproduces the view, a hand-edited link opens on a
+// valid view rather than an error, and the window and the period before it are the operator's own
+// days.
+
+describe("reading the filter from a link", () => {
+  test("a full link reads back exactly", () => {
+    const f = readFilters(
+      new URLSearchParams("range=7d&agent=12&inbox=3&source=playground"),
+    );
+    expect(f).toEqual({
+      range: "7d",
+      from: null,
+      to: null,
+      agentId: "12",
+      inboxId: "3",
+      source: "playground",
+      audience: "all",
+    });
+  });
+
+  test("an audience refines the client segment and is dropped under any other", () => {
+    expect(
+      readFilters(new URLSearchParams("source=client&audience=anonymous"))
+        .audience,
+    ).toBe("anonymous");
+    for (const q of [
+      "source=playground&audience=anonymous",
+      "audience=identified",
+      "source=client&audience=bots",
+    ])
+      expect(readFilters(new URLSearchParams(q)).audience).toBe("all");
+    const anon = {
+      ...DEFAULT_FILTERS,
+      source: "client" as const,
+      audience: "anonymous" as const,
+    };
+    expect(readFilters(writeFilters(anon))).toEqual(anon);
+    const w = windowOf(anon, new Date(2026, 9, 6));
+    expect({
+      client: apiQuery(anon, w).audience,
+      all: apiQuery({ ...anon, audience: "all" }, w).audience,
+      elsewhere: apiQuery({ ...anon, source: "inbox" }, w).audience,
+    }).toEqual({ client: "anonymous", all: undefined, elsewhere: undefined });
+  });
+
+  test("the health block opens the Logs page on the same audience", () => {
+    const anon = {
+      ...DEFAULT_FILTERS,
+      source: "client" as const,
+      audience: "anonymous" as const,
+    };
+    const w = windowOf(anon, new Date(2026, 9, 6));
+    const row = { stage: "generate", tool: null, level: "error" };
+    const audienceOf = (href: string) =>
+      new URL(href, "http://x").searchParams.get("audience");
+    expect({
+      client: audienceOf(logsHref(anon, w, row)),
+      elsewhere: audienceOf(logsHref({ ...anon, source: "all" }, w, row)),
+    }).toEqual({ client: "anonymous", elsewhere: null });
+  });
+
+  test("what does not parse falls back to the default, parameter by parameter", () => {
+    const f = readFilters(
+      new URLSearchParams("range=forever&agent=abc&inbox=-1&source=prod"),
+    );
+    expect(f).toEqual(DEFAULT_FILTERS);
+  });
+
+  test("a custom range needs two real days in order", () => {
+    expect(
+      readFilters(
+        new URLSearchParams("range=custom&from=2026-09-02&to=2026-09-05"),
+      ).range,
+    ).toBe("custom");
+    for (const q of [
+      "range=custom&from=2026-09-05&to=2026-09-02",
+      "range=custom&from=2026-02-30&to=2026-03-02",
+      "range=custom&from=2026-09-02",
+      "range=custom",
+    ])
+      expect(readFilters(new URLSearchParams(q)).range).toBe(
+        DEFAULT_FILTERS.range,
+      );
+  });
+
+  test("defaults are left out of the URL, and what is written reads back", () => {
+    expect(writeFilters(DEFAULT_FILTERS).toString()).toBe("");
+    const f = {
+      ...DEFAULT_FILTERS,
+      range: "custom" as const,
+      from: "2026-09-02",
+      to: "2026-09-05",
+      agentId: "7",
+      source: "all" as const,
+    };
+    expect(readFilters(writeFilters(f))).toEqual(f);
+  });
+});
+
+describe("the window and the period before it", () => {
+  const now = new Date(2026, 9, 6, 15, 30);
+
+  test("seven days ends today, local days", () => {
+    const w = windowOf({ ...DEFAULT_FILTERS, range: "7d" }, now);
+    expect(w.firstDay).toBe("2026-09-30");
+    expect(w.lastDay).toBe("2026-10-06");
+    expect(daysOf(w)).toHaveLength(7);
+    expect(w.until.getTime()).toBe(new Date(2026, 9, 7).getTime());
+  });
+
+  test("twelve months is the 365 local days ending today, and a link keeps it", () => {
+    const w = windowOf({ ...DEFAULT_FILTERS, range: "12m" }, now);
+    expect(w.firstDay).toBe("2025-10-07");
+    expect(w.lastDay).toBe("2026-10-06");
+    expect(daysOf(w)).toHaveLength(365);
+    expect(readFilters(new URLSearchParams("range=12m")).range).toBe("12m");
+  });
+
+  test("a running period is compared up to the same time of day, as many days back", () => {
+    const w = windowOf({ ...DEFAULT_FILTERS, range: "7d" }, now);
+    const p = previousWindow(w, now);
+    expect(p?.firstDay).toBe("2026-09-23");
+    expect(p?.lastDay).toBe("2026-09-29");
+    expect(p?.since?.getTime()).toBe(new Date(2026, 8, 23).getTime());
+    expect(p?.until.getTime()).toBe(new Date(2026, 8, 29, 15, 30).getTime());
+  });
+
+  test("a period that has not started is compared with whole days, ending where it starts", () => {
+    const w = windowOf(
+      {
+        ...DEFAULT_FILTERS,
+        range: "custom",
+        from: "2026-10-25",
+        to: "2026-10-30",
+      },
+      now,
+    );
+    const p = previousWindow(w, now);
+    expect(p?.firstDay).toBe("2026-10-19");
+    expect(p?.until.getTime()).toBe(w.since?.getTime());
+  });
+
+  test("a running period is read up to the instant its previous period is cut at", () => {
+    const w = windowOf({ ...DEFAULT_FILTERS, range: "7d" }, now);
+    expect(readUpTo(w, now).until.getTime()).toBe(now.getTime());
+    expect(readUpTo(w, now).lastDay).toBe(w.lastDay);
+    const all = windowOf({ ...DEFAULT_FILTERS, range: "all" }, now);
+    expect(readUpTo(all, now).until.getTime()).toBe(now.getTime());
+    const over = windowOf(
+      {
+        ...DEFAULT_FILTERS,
+        range: "custom",
+        from: "2026-09-23",
+        to: "2026-09-29",
+      },
+      now,
+    );
+    expect(readUpTo(over, now)).toBe(over);
+  });
+
+  test("a period already over is compared with whole days, ending where it starts", () => {
+    const w = windowOf(
+      {
+        ...DEFAULT_FILTERS,
+        range: "custom",
+        from: "2026-09-23",
+        to: "2026-09-29",
+      },
+      now,
+    );
+    const p = previousWindow(w, now);
+    expect(p?.firstDay).toBe("2026-09-16");
+    expect(p?.until.getTime()).toBe(w.since?.getTime());
+  });
+
+  test("a custom range covers both days; a one-day range is one day", () => {
+    const w = windowOf(
+      {
+        ...DEFAULT_FILTERS,
+        range: "custom",
+        from: "2026-10-04",
+        to: "2026-10-04",
+      },
+      now,
+    );
+    expect(daysOf(w)).toEqual(["2026-10-04"]);
+    expect(w.days).toBe(1);
+    expect(previousWindow(w)?.firstDay).toBe("2026-10-03");
+  });
+
+  test("all time has no previous period", () => {
+    const w = windowOf({ ...DEFAULT_FILTERS, range: "all" }, now);
+    expect(w.since).toBeNull();
+    expect(previousWindow(w)).toBeNull();
+    expect(daysOf(w, "2026-10-04")).toEqual([
+      "2026-10-04",
+      "2026-10-05",
+      "2026-10-06",
+    ]);
+  });
+
+  test("a day key is the browser's day", () => {
+    expect(localDayKey(new Date(2026, 0, 5, 23, 59))).toBe("2026-01-05");
+  });
+});
+
+describe("the drill-down link", () => {
+  test("carries the window, the outcome and the view's agent and inbox", () => {
+    const href = drillDownHref(
+      { ...DEFAULT_FILTERS, agentId: "4", inboxId: "9" },
+      {
+        since: new Date("2026-10-04T03:00:00Z"),
+        until: new Date("2026-10-05T03:00:00Z"),
+      },
+      "handoff",
+    );
+    const url = new URL(href, "http://x");
+    expect(url.pathname).toBe("/conversations");
+    expect(Object.fromEntries(url.searchParams)).toEqual({
+      createdSince: "2026-10-04T03:00:00.000Z",
+      createdUntil: "2026-10-05T03:00:00.000Z",
+      outcome: "handoff",
+      agentId: "4",
+      inboxId: "9",
+    });
+  });
+});
+
+describe("a point of the funnel over time", () => {
+  const q = (href: string) =>
+    Object.fromEntries(new URL(href, "http://x").searchParams);
+
+  test("on the total chart, the line hit names the outcome; between lines, the whole day", () => {
+    expect(
+      q(
+        trendPointHref(
+          DEFAULT_FILTERS,
+          "2026-10-04",
+          "none",
+          "resolution",
+          "handoff",
+        ),
+      ).outcome,
+    ).toBe("handoff");
+    expect(
+      q(
+        trendPointHref(
+          DEFAULT_FILTERS,
+          "2026-10-04",
+          "none",
+          "resolution",
+          "involvement",
+        ),
+      ).outcome,
+    ).toBe("involved");
+    expect(
+      q(trendPointHref(DEFAULT_FILTERS, "2026-10-04", "none", "resolution"))
+        .outcome,
+    ).toBe("all");
+  });
+
+  test("on a split chart, the line hit narrows to its agent or inbox, and the rate names the outcome", () => {
+    const byAgent = q(
+      trendPointHref(
+        { ...DEFAULT_FILTERS, inboxId: "3" },
+        "2026-10-04",
+        "agent",
+        "handoff",
+        "s12",
+      ),
+    );
+    expect(byAgent).toMatchObject({
+      outcome: "handoff",
+      agentId: "12",
+      inboxId: "3",
+    });
+    const byInbox = q(
+      trendPointHref(
+        DEFAULT_FILTERS,
+        "2026-10-04",
+        "inbox",
+        "automation",
+        "s9",
+      ),
+    );
+    expect(byInbox).toMatchObject({
+      outcome: "resolved_by_agent",
+      inboxId: "9",
+    });
+    expect(byInbox.agentId).toBeUndefined();
+    const between = q(
+      trendPointHref(
+        { ...DEFAULT_FILTERS, agentId: "4" },
+        "2026-10-04",
+        "agent",
+        "involvement",
+      ),
+    );
+    expect(between).toMatchObject({ outcome: "involved", agentId: "4" });
+  });
+});
+
+describe("a block's CSV", () => {
+  test("numbers raw, empties empty, and a cell with a comma or quote quoted", () => {
+    expect(
+      toCsv(
+        ["Agent", "Cost", "Rate"],
+        [
+          ["Ana, SAC", 1.5, 0.25],
+          ['O "bot"', null, Number.NaN],
+        ],
+      ),
+    ).toBe('Agent,Cost,Rate\r\n"Ana, SAC",1.5,0.25\r\n"O ""bot""",,');
+  });
+
+  test("a name that starts like a formula is written as text; a negative number stays a number", () => {
+    expect(
+      toCsv(
+        ["Agent", "Delta"],
+        [
+          ['=HYPERLINK("x")', -2],
+          ["+1", null],
+          ["@cmd", null],
+          ["-5", null],
+        ],
+      ),
+    ).toBe(
+      'Agent,Delta\r\n"\'=HYPERLINK(""x"")",-2\r\n\'+1,\r\n\'@cmd,\r\n\'-5,',
+    );
+  });
+
+  test("a sum of cents reads as the screen shows it, not as its binary residue", () => {
+    expect(toCsv(["Total"], [[0.1 + 0.7], [1e-9], [123456.789]])).toBe(
+      "Total\r\n0.8\r\n1e-9\r\n123456.789",
+    );
+  });
+
+  test("a header alone is a valid file", () => {
+    expect(toCsv(["Day", "Cost"], [])).toBe("Day,Cost");
+  });
+});
+
+describe("a day with no figure", () => {
+  // The blocks send null for a day with no conversations or no priced call and say it is left
+  // blank; a line drawn across it would show a rate or a cost nobody measured.
+  test("is a gap in every line chart, never bridged", async () => {
+    // happy-dom has no layout, so the chart's own container is given a size; nothing else is.
+    const measure = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      return this.classList.contains("recharts-responsive-container")
+        ? DOMRect.fromRect({ width: 600, height: 260 })
+        : measure.call(this);
+    };
+    try {
+      const { container } = render(
+        createElement(
+          ThemeProvider,
+          null,
+          createElement(LineTrend, {
+            data: [
+              { day: "2026-01-01", turns: 1 },
+              { day: "2026-01-02", turns: null },
+              { day: "2026-01-03", turns: 3 },
+              { day: "2026-01-04", turns: 4 },
+            ],
+            series: [{ key: "turns", label: "Turns" }],
+            lang: "en",
+            format: String,
+          }),
+        ),
+      );
+      const line = await waitFor(() => {
+        const d = container
+          .querySelector(".recharts-line-curve")
+          ?.getAttribute("d");
+        if (!d) throw new Error("no line drawn yet");
+        return d;
+      });
+      // One segment before the missing day and one after it: two moves, not one.
+      expect(line.match(/M/g)?.length).toBe(2);
+    } finally {
+      HTMLElement.prototype.getBoundingClientRect = measure;
+      cleanup();
+    }
+  });
+});

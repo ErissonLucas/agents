@@ -1,30 +1,84 @@
 import { z } from "zod";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
+import { inRange, type NumberRange } from "@/lib/number-range";
+import {
+  CALL_RANGES,
+  CARRY_ATTACHMENTS_RANGES,
+  CHANNEL_REDIRECT_RANGES,
+  CONTACT_AUTH_RANGES,
+  DEBOUNCE_RANGES,
+  DELAY_VALUE_RANGE,
+  delayRange,
+  GROUNDING_RANGES,
+  GUARDRAIL_RANGES,
+  LIMITS_RANGES,
+  MODEL_FALLBACK_RANGES,
+  MONITORING_RANGES,
+  OBSERVABILITY_RANGES,
+  SERVICE_WINDOW_RANGES,
+  SPLIT_RANGES,
+  TTS_SPEAKABLE_RANGES,
+  TTS_TIMEOUT_RANGES,
+  TTS_VOICE_RANGES,
+} from "@/modules/agents/number-ranges";
+// NOTE: The text caps are IMPORTED, never retyped. They go in `.describe()` and never into the schema
+// itself, because they are refused by assertSettingsTextSizes on the write. A caller has to be able
+// to build a valid call from tools/list without failing first (docs/mcp.md), and a number copied here
+// would be a second copy that drifts.
+import { RESOLVE_LABELS_MAX } from "@/modules/agents/resolve-labels";
 import {
   CUSTOM_POLICY_MAX,
   GENERATION_PROMPT_MAX,
+  SNOOZED_FOLLOW_UP_MAX_CADENCES,
+  SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES,
   TEMPLATE_MESSAGE_MAX,
   TOOL_INSTRUCTIONS_MAX,
 } from "@/modules/agents/text-caps";
-// NOTE: The caps are IMPORTED, never retyped. They go in `.describe()` and never into the schema
-// itself — the rule the file's header states is type and choice, never size, because these are
-// refused by assertSettingsTextSizes on the write rather than clamped by the reader. A caller has to
-// be able to build a valid call from tools/list without failing first (docs/mcp.md), and a number
-// copied here would be a second copy that drifts.
 import {
   ALLOWED_LABELS_MAX,
   PROTECTED_LABELS_MAX,
+  WRITABLE_ATTRIBUTES_MAX,
 } from "@/modules/agents/tool-guidance";
+import {
+  GUARDABLE_TOOL_NAME,
+  TOOL_PRECONDITION_CONDITIONS_MAX,
+} from "@/modules/agents/tool-preconditions";
 import { REDIRECT_DELAY_UNITS } from "@/modules/channel-redirect/service";
+import { CONTACT_FIELDS } from "@/modules/chatwoot/contact-fields";
+import { CONVERSATION_NOTE_FORMATS } from "@/modules/conversation-notes/settings";
+import {
+  CARRY_ATTACHMENTS_DEFAULTS,
+  CARRY_FILE_TYPES,
+  CARRY_MODES,
+} from "@/modules/cross-inbox-case/carry-attachments-settings";
 import { CROSS_INBOX_CASE_ATTRIBUTE_KEY_RE } from "@/modules/cross-inbox-case/settings";
+import {
+  DECISION_PROVIDERS,
+  decisionsPatchSchema,
+  decisionsSchema,
+} from "@/modules/decisions/config";
 import {
   FULL_DETAIL_MAX_HOURS,
   parseIsoInstant,
 } from "@/modules/flowlog/settings";
 import { FOLLOW_UP_DELAY_UNITS } from "@/modules/followups/settings";
-import { GUARDRAIL_ACTIONS } from "@/modules/guardrails/settings";
+import {
+  GROUNDING_ACTIONS,
+  GUARDRAIL_ACTIONS,
+  GUARDRAIL_CLASSIFIERS,
+  GUARDRAIL_FAILURE_MODES,
+  GUARDRAIL_THRESHOLD_KEYS,
+  isExternalCheckUrl,
+  MAX_REFERENCE_KNOWLEDGE_BASES,
+  MAX_SOURCE_TOOLS,
+} from "@/modules/guardrails/settings";
 import { HANDOFF_MODES } from "@/modules/handoff/settings";
+import {
+  OTHER_INBOXES_LIMITS,
+  OTHER_INBOXES_MAX_INBOXES,
+} from "@/modules/other-inboxes/settings";
+import { PROACTIVE_KINDS } from "@/modules/service-window/kinds";
 import {
   SIGNATURE_FREQUENCIES,
   SIGNATURE_POSITIONS,
@@ -38,59 +92,25 @@ import {
   TTS_LATENCIES,
   TTS_MODES,
 } from "@/modules/tts/settings-shared";
+import {
+  ANTHROPIC_VISION_DEFAULT_MAX_TOKENS,
+  VISION_MAX_OUTPUT_TOKENS_CAP,
+  VISION_REASONING_EFFORTS,
+} from "@/modules/vision/output-limits";
 import { VISION_PROVIDER_NAMES } from "@/modules/vision/providers";
+import {
+  CALL_ASR_MODELS,
+  CALL_BACKGROUND_SOUNDS,
+  CALL_PROVIDERS,
+  CALL_TOOL_SOUNDS,
+  CALL_TTS_MODELS,
+  CALL_TURN_EAGERNESS,
+} from "@/modules/voice-call/settings";
 
-// The argument shape of the behavior blocks, as a schema instead of a paragraph.
-//
-// Every block used to be declared `z.record(z.string(), z.unknown())`, so a client was told "an
-// object" and every field name, choice, unit and default had to live in the tool description. That
-// is a place where a fact is easy to add and a stale one is impossible to find: `vision.provider`
-// was written up as `(openai|gemini|anthropic)` while the registry had grown to five, and nothing
-// could have caught it, because prose is not type-checked and the enum below is.
-//
-// WHAT GOES IN HERE, AND WHAT MUST NOT — the rule is type and choice, never size:
-//
-//   * A value the reader would THROW AWAY (wrong type, a provider that is not registered, a delay
-//     unit that does not exist) is declared, so the call is refused with the field named instead of
-//     succeeding and silently storing a default the caller never asked for.
-//   * A value the reader HONORS after measuring it (a number outside its band is clamped, operator
-//     text past its cap is refused only when the write CHANGES it, a list longer than its ceiling is
-//     truncated) must still parse. Copying those bounds here would turn a clamp into a refusal and
-//     break `agent_settings_set accepts a stored over-cap value it does not change`. They live in
-//     the field's `.describe()`, which reaches a client as the property's `description`.
-//
-// Two pairs where that question separates fields the eye reads as identical:
-//
-//   * `handoff.targetAgentId` is `.int().positive()` and `limits.maxHistoryTokens` is a bare number.
-//     `posInt` DISCARDS a 1.5 or a 0 — a pinned target silently cleared — while `readLimitsConfig`
-//     treats 0 as the documented way to say OFF. Zero is a value only where the consumer says so.
-//   * `stt.language` carries the reader's own pattern and `sendImage.allowedHosts` carries none.
-//     `LANG_RE` only TESTS, so "portugues" is thrown away and comes back as "pt"; the host
-//     normalizer TRANSFORMS what it accepts (a full URL, a port, a path all reduce to one host), so
-//     a pattern here would refuse spellings the reader honors.
-//
-// The blocks are LOOSE objects on purpose. An undeclared key still reaches the readers exactly as
-// before, so a field added to a reader by someone who never opened this file is merged rather than
-// silently dropped on the way in — the readers stay the authority, and this schema only says what is
-// already known about the shape.
-//
-// WHAT THIS SCHEMA ENFORCES IS WHAT IT PUBLISHES, and that is a second constraint, not the same one.
-// `tools/list` ships the generated JSON Schema, so a client may validate a call before sending it;
-// anything zod enforces that JSON Schema cannot express becomes a contract the two ends read
-// differently. It has bitten twice here: a `/…/i` pattern loses its flag on the way out (so the
-// published pattern refused the documented "pt-BR"), and a `z.preprocess` that trims before an enum
-// is invisible out there (so a padded " openai " parsed on the server and would be refused by a
-// client). The first was fixed by spelling the case classes out in the reader's own constant. The
-// second cannot be fixed that way: encoding the whitespace means publishing a pattern INSTEAD of an
-// enum, which trades away the one thing worth publishing — the list of options a client renders.
-//
-// So the schema is deliberately narrower than a reader in exactly two places, both for the same
-// reason: `observability.logToolValues` / `memory.compaction.enabled` also honor the STRING
-// spellings ("true"/"false"), and every `str()`-backed choice also honors surrounding whitespace.
-// Both are normalizations of what is STORED — a bag written by an older build, a row edited by hand
-// — and both stay true of everything already stored, because the readers are untouched. Neither was
-// ever an input contract: no description offered them, and no console path can produce one (a
-// provider comes from a dropdown). What narrows is only what a caller may newly SEND.
+// The argument shape of the behavior blocks. Two rules, both in docs/mcp.md: type, choice and range
+// (declare what a reader throws away, and every number's range from number-ranges.ts), and what the
+// schema enforces is what it publishes in `tools/list`. Blocks are LOOSE so a key added to a reader
+// still reaches it.
 
 // A registry list as a set of choices. `Object.keys` of a provider map is `string[]`, which is the
 // one shape `z.enum` cannot take; the registries are module-level literals and never empty.
@@ -122,35 +142,73 @@ const modelId = () =>
 // because that is how the field is cleared on purpose.
 const chatwootId = () => z.number().int().positive().nullable().optional();
 
-// BLANK IS WHAT THE READER THROWS AWAY, so the schema is where it gets declared. `readToolInstructions`
-// trims and returns null for an empty result, so a note of `""` or `"   "` is accepted by the write,
-// replaces whatever note was there, and then never reaches a tool description — the one outcome
-// docs/mcp.md says a caller cannot discover by trying, because what comes back is success.
-//
-// A PATTERN rather than a length: `minLength` would not catch `"   "`, and this is not the size rule
-// the contract forbids copying into zod ("type and choice, never size"). It refuses a KIND of value,
-// it is published faithfully (`\S` carries no flag to lose, unlike the /…/i case in docs/mcp.md), and
-// it diverges from no console path — all three fields are written by the editor as `.trim() || null`,
-// or with the key deleted (toolGuidance), so the console never produces the value this refuses.
-//
-// `followUps[].instructions` is deliberately NOT here: its stored default is `""` (see
-// modules/followups/settings.ts), the reader keeps it, and refusing it would break the round trip
-// this surface documents.
+// Blank is what the reader throws away (it trims to null), so it is refused here rather than stored
+// as a silent no-op. A pattern, since `minLength` misses `"   "`. Not used for
+// `followUps[].instructions`, whose stored default is `""`.
 const nonBlank = (message: string) => z.string().regex(/\S/, message);
 
 const toolNote = () => nonBlank("must not be blank; use null to clear it");
 
+// A configurable number, refused outside its range. The range is the reader's own
+// constant, so the schema, the reader and the console field cannot drift apart again; the JSON Schema
+// MCP clients read carries it as `minimum`/`maximum`. tests/modules/number-ranges.test.ts fails on a
+// settings number declared without one.
+export const ranged = (r: NumberRange) =>
+  (r.int ? z.number().int() : z.number()).min(r.min).max(r.max);
+
+// A delay's value, whose ceiling follows its unit (30 days in any unit). Refused at the value's own
+// path, and `pairedWith` names the unit, so the boundary asks it when the write changed either half.
+// Every way out of the range carries it, not just the unit's ceiling: a stored 1.5 with only its
+// unit changed is a new delay, and the value's own fraction issue alone would keep it as legacy.
+function refineDelay(
+  bag: Record<string, unknown>,
+  ctx: z.RefinementCtx,
+  value: string,
+  unit: string,
+): void {
+  const v = bag[value];
+  if (typeof v !== "number") return;
+  const r = delayRange(bag[unit]);
+  if (inRange(v, r)) return;
+  const at = { input: v, path: [value], params: { pairedWith: unit } };
+  if (v > r.max) {
+    ctx.addIssue({
+      ...at,
+      code: "too_big",
+      origin: "number",
+      maximum: r.max,
+      inclusive: true,
+      message: `at most ${r.max} ${String(bag[unit] ?? "minutes")}`,
+    });
+  } else if (v < r.min) {
+    ctx.addIssue({
+      ...at,
+      code: "too_small",
+      origin: "number",
+      minimum: r.min,
+      inclusive: true,
+      message: `at least ${r.min}`,
+    });
+  } else {
+    ctx.addIssue({
+      ...at,
+      code: "invalid_type",
+      expected: "int",
+      message: "a whole number",
+    });
+  }
+}
+const delayValue = () => ranged(DELAY_VALUE_RANGE).optional();
+
 const debounce = z.looseObject({
   enabled: z.boolean().optional(),
-  windowSeconds: z
-    .number()
+  windowSeconds: ranged(DEBOUNCE_RANGES.windowSeconds)
     .optional()
-    .describe("3-120, clamped, after the LAST inbound message"),
-  maxMessagesPerBurst: z.number().optional().describe("1-50, clamped"),
-  maxWindowSeconds: z
-    .number()
+    .describe("after the LAST inbound message"),
+  maxMessagesPerBurst: ranged(DEBOUNCE_RANGES.maxMessagesPerBurst).optional(),
+  maxWindowSeconds: ranged(DEBOUNCE_RANGES.maxWindowSeconds)
     .optional()
-    .describe("up to 600, clamped, from the START of the burst"),
+    .describe("from the START of the burst; read as at least the window"),
 });
 
 const stt = z.looseObject({
@@ -164,6 +222,48 @@ const stt = z.looseObject({
     .describe('ISO-639-1, e.g. "pt" or "pt-BR"'),
   credentialRef: credentialRef(),
   baseURL: baseURL(),
+});
+
+// WhatsApp calls (modules/voice-call/settings). The engine is the provider's, on the customer's key.
+const calls = z.looseObject({
+  provider: oneOf(CALL_PROVIDERS).optional(),
+  credentialRef: credentialRef().describe(
+    "provider key that can run agents; none = no answer",
+  ),
+  voice: z.string().optional().describe("provider voice id; empty = default"),
+  llm: z.string().optional().describe("model the provider runs"),
+  ttsModel: oneOf(CALL_TTS_MODELS).optional(),
+  asrModel: oneOf(CALL_ASR_MODELS).optional(),
+  speed: ranged(CALL_RANGES.speed).optional(),
+  openingDelayMs: ranged(CALL_RANGES.openingDelayMs)
+    .optional()
+    .describe("placed call's wait for hello, ms"),
+  turnEagerness: oneOf(CALL_TURN_EAGERNESS).optional(),
+  backgroundSound: oneOf(CALL_BACKGROUND_SOUNDS)
+    .nullable()
+    .optional()
+    .describe("ambience under the speech; null = none"),
+  backgroundVolume: ranged(CALL_RANGES.backgroundVolume)
+    .optional()
+    .describe("relative to the speech"),
+  toolSound: oneOf(CALL_TOOL_SOUNDS)
+    .nullable()
+    .optional()
+    .describe("plays while a tool runs; null = silence"),
+  silenceEndCallSecs: ranged(CALL_RANGES.silenceEndCallSecs)
+    .nullable()
+    .optional()
+    .describe("silence that ends the call, s; null = never"),
+  maxDurationSecs: ranged(CALL_RANGES.maxDurationSecs).optional(),
+  keywords: z
+    .array(z.string())
+    .optional()
+    .describe("terms the transcription expects; up to 50"),
+  providerAgentId: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("server-owned; a write is ignored"),
 });
 
 const tts = z.looseObject({
@@ -192,45 +292,57 @@ const tts = z.looseObject({
   normalizeModel: z.string().nullable().optional(),
   normalizeCredentialRef: credentialRef(),
   normalizeBaseURL: baseURL(),
-  stability: z
-    .number()
+  fallbackTimeoutMs: ranged(TTS_TIMEOUT_RANGES.fallbackTimeoutMs)
     .nullable()
     .optional()
-    .describe("0-1, clamped; null = the voice's own"),
-  similarityBoost: z.number().nullable().optional().describe("0-1, clamped"),
-  style: z.number().nullable().optional().describe("0-1, clamped"),
-  speed: z.number().nullable().optional().describe("0.25-4, clamped"),
+    .describe("per attempt, only with a fallback, ms; null = 60000"),
+  // The fallback voice, tried once before the reply goes as text. It exists once the provider is
+  // named; null removes it.
+  fallbackProvider: oneOf(TTS_PROVIDER_NAMES)
+    .nullable()
+    .optional()
+    .describe("tried on a timeout or 5xx/429; null = none"),
+  fallbackModel: modelId(),
+  fallbackVoice: z.string().optional(),
+  fallbackCredentialRef: credentialRef(),
+  fallbackBaseURL: baseURL(),
+  stability: ranged(TTS_VOICE_RANGES.stability)
+    .nullable()
+    .optional()
+    .describe("null = the voice's own"),
+  similarityBoost: ranged(TTS_VOICE_RANGES.similarityBoost)
+    .nullable()
+    .optional(),
+  style: ranged(TTS_VOICE_RANGES.style).nullable().optional(),
+  speed: ranged(TTS_VOICE_RANGES.speed).nullable().optional(),
   speakerBoost: z.boolean().nullable().optional(),
   latency: oneOf(TTS_LATENCIES).nullable().optional(),
   checkMode: oneOf(TTS_CHECK_MODES)
     .nullable()
     .optional()
     .describe("null = the instance default"),
-  // Issue #856: with `textInstead` on, a reply past one of these goes as TEXT instead of a voice
+  // With `textInstead` on, a reply past one of these goes as TEXT instead of a voice
   // note. Absent = the default, null = that criterion off; the reader clamps, so a number outside the
   // band is read at its end.
   textInstead: z
     .boolean()
     .optional()
     .describe("send a reply past a textOver* limit as text; default false"),
-  textOverChars: z
-    .number()
+  textOverChars: ranged(TTS_SPEAKABLE_RANGES.textOverChars)
     .nullable()
     .optional()
-    .describe("text above this many chars (80-4000, default 450); null = off"),
-  textOverListItems: z
-    .number()
+    .describe("text above this many chars (default 450); null = off"),
+  textOverListItems: ranged(TTS_SPEAKABLE_RANGES.textOverListItems)
     .nullable()
     .optional()
-    .describe("text from this many list items (2-50, default 3); null = off"),
-  textOverNumbers: z
-    .number()
+    .describe("text from this many list items (default 3); null = off"),
+  textOverNumbers: ranged(TTS_SPEAKABLE_RANGES.textOverNumbers)
     .nullable()
     .optional()
     .describe(
-      "text from this many prices or 4+ digit numbers (2-50, default 3); null = off",
+      "text from this many prices or 4+ digit numbers (default 3); null = off",
     ),
-  // Issue #859: what the model is told about a spoken reply. Both switches default to false.
+  // What the model is told about a spoken reply. Both switches default to false.
   spokenNotice: z
     .boolean()
     .optional()
@@ -256,7 +368,7 @@ const vision = z.looseObject({
   credentialRef: credentialRef(),
   baseURL: baseURL(),
   // Nullable because the reader honours null as "the default prompt" and the console sends exactly that
-  // on every Behavior save; this schema's rule is that a value the reader honours must parse (#622).
+  // on every Behavior save; a value the reader honours must parse.
   extractionPrompt: z
     .string()
     .nullable()
@@ -266,15 +378,25 @@ const vision = z.looseObject({
     .boolean()
     .optional()
     .describe("PDF text read locally; default true"),
+  // Null is the provider's default; a number is refused outside 1..cap.
+  maxOutputTokens: z
+    .number()
+    .int()
+    .positive()
+    .max(VISION_MAX_OUTPUT_TOKENS_CAP)
+    .nullable()
+    .optional()
+    .describe(`anthropic default ${ANTHROPIC_VISION_DEFAULT_MAX_TOKENS}`),
+  reasoningEffort: oneOf(VISION_REASONING_EFFORTS).nullable().optional(),
 });
 
 const split = z.looseObject({
   enabled: z.boolean().optional(),
-  maxChars: z.number().optional().describe("balloon size, 80-4000, clamped"),
-  typingWpm: z.number().optional().describe("40-1000, clamped"),
-  minDelayMs: z.number().optional().describe("0-10000, clamped"),
-  maxDelayMs: z.number().optional().describe("0-30000, clamped"),
-  maxChunks: z.number().optional().describe("1-12, clamped"),
+  maxChars: ranged(SPLIT_RANGES.maxChars).optional().describe("balloon size"),
+  typingWpm: ranged(SPLIT_RANGES.typingWpm).optional(),
+  minDelayMs: ranged(SPLIT_RANGES.minDelayMs).optional(),
+  maxDelayMs: ranged(SPLIT_RANGES.maxDelayMs).optional(),
+  maxChunks: ranged(SPLIT_RANGES.maxChunks).optional(),
 });
 
 const signature = z.looseObject({
@@ -294,38 +416,71 @@ const signature = z.looseObject({
     .describe("blank = 2 newlines; -- adds a -- line. Chatwoot's own bytes"),
 });
 
+export const templateChoice = z.looseObject({
+  name: z
+    .string()
+    .refine((s) => s.trim() !== "", "blank")
+    .describe("approved HSM name"),
+  language: z.string().optional().describe('default "pt_BR"'),
+  category: z.string().optional().describe('default "UTILITY"'),
+  params: z.array(z.string()).optional().describe("body {{1}}.. in order"),
+  headerParams: z.array(z.string()).optional().describe("text header {{1}}"),
+  buttonParams: z
+    .array(z.string())
+    .optional()
+    .describe("per button: dynamic URL suffix, else empty"),
+  content: z.string().nullable().optional(),
+});
+
 const serviceWindow = z.looseObject({
   enabled: z.boolean().optional(),
-  windowHours: z.number().optional().describe("1-168, clamped"),
+  windowHours: ranged(SERVICE_WINDOW_RANGES.windowHours).optional(),
   templateName: z
     .string()
     .nullable()
     .optional()
-    .describe("approved HSM outside the window; null = a private note"),
+    .describe("default HSM outside the window; null = a note"),
   templateLanguage: z.string().optional().describe('e.g. "pt_BR"'),
   templateCategory: z.string().optional().describe('e.g. "UTILITY"'),
   templateParams: z
     .array(z.string())
     .optional()
-    .describe("positional body params; {contact_name} interpolates"),
+    .describe(
+      "positional body params; {{nome_contato}} interpolates, {{var|text}} when empty",
+    ),
+  templateHeaderParams: z.array(z.string()).optional(),
+  templateButtonParams: z.array(z.string()).optional(),
   templateContent: z
     .string()
     .nullable()
     .optional()
     .describe("dashboard-facing only; the send uses the params"),
+  // NOTE: Both maps validated by `assertSettingsServiceWindow`, where the key is known: a schema per
+  // kind would repeat the choice six times in every MCP listing.
+  templates: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe(
+      `${PROACTIVE_KINDS.join("|")} → {name,language,params,headerParams,buttonParams}; reminders add {{data_agendamento}} {{hora_agendamento}} {{dia_semana_agendamento}} {{agenda}}`,
+    ),
+  reminderTemplates: z
+    .record(z.string(), z.unknown())
+    .optional()
+    .describe("offset hours → same"),
 });
 
 const grounding = z.looseObject({
   maxDistance: z
     .number()
     .positive()
+    .max(GROUNDING_RANGES.maxDistance.max)
     .nullable()
     .optional()
     .describe("cosine ceiling for a knowledge hit; null = no filter"),
 });
 
-const followUpStep = z.looseObject({
-  delayValue: z.number().optional().describe("≥ 1, clamped"),
+const followUpStepShape = z.looseObject({
+  delayValue: delayValue().describe("30 days at most, in any unit"),
   delayUnit: oneOf(FOLLOW_UP_DELAY_UNITS).optional(),
   instructions: z
     .string()
@@ -343,18 +498,44 @@ const followUpStep = z.looseObject({
       "let THIS step fire while a booking stands; no-op unless followUp.pauseWhileAppointment is on",
     ),
 });
+const followUpStep = followUpStepShape.superRefine((v, ctx) =>
+  refineDelay(v, ctx, "delayValue", "delayUnit"),
+);
 
-const followUp = z.looseObject({
-  enabled: z.boolean().optional(),
-  pauseWhileAppointment: z
-    .boolean()
-    .optional()
-    .describe("hold while a reminder is scheduled; default true"),
-  steps: z
-    .array(followUpStep)
-    .optional()
-    .describe("replaced as a unit, not merged; first 10 kept"),
-});
+// Built from a step schema so the MCP arguments can take the steps unrefined (see
+// BEHAVIOR_PATCH_ARGS_SHAPE) while the write boundary asks the refined ones.
+const followUpOf = <S extends z.ZodType>(step: S) =>
+  z.looseObject({
+    enabled: z.boolean().optional(),
+    pauseWhileAppointment: z
+      .boolean()
+      .optional()
+      .describe("hold while a reminder is scheduled; default true"),
+    steps: z
+      .array(step)
+      .optional()
+      .describe("replaced as a unit, not merged; first 10 kept"),
+  });
+
+const snoozedFollowUpOf = <S extends z.ZodType>(step: S) => {
+  const cadence = z.looseObject({
+    label: z.string().nullable().optional().describe("null = default cadence"),
+    steps: z.array(step).optional(),
+  });
+
+  return z.looseObject({
+    enabled: z.boolean().optional(),
+    cadences: z
+      .array(cadence)
+      .optional()
+      .describe(
+        `replaced whole; first label match wins; first ${SNOOZED_FOLLOW_UP_MAX_CADENCES} kept (default + ${SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES} labeled)`,
+      ),
+    signature: z.boolean().optional(),
+  });
+};
+const followUp = followUpOf(followUpStep);
+const snoozedFollowUp = snoozedFollowUpOf(followUpStep);
 
 const handoff = z.looseObject({
   mode: oneOf(HANDOFF_MODES)
@@ -409,20 +590,30 @@ const replyGate = z.looseObject({
     .describe("hand-off removes requiredLabel; default true"),
 });
 
+const conversationNotes = z.looseObject({
+  toolsUsed: z.enum(CONVERSATION_NOTE_FORMATS).optional(),
+  errors: z.enum(CONVERSATION_NOTE_FORMATS).optional(),
+});
+
 const limits = z.looseObject({
-  maxToolCalls: z
-    .number()
+  maxToolCalls: ranged(LIMITS_RANGES.maxToolCalls)
     .optional()
-    .describe("tool executions in ONE turn; 1-50, clamped"),
+    .describe("tool executions in ONE turn"),
   maxHistoryTokens: z
-    .number()
+    .union([z.literal(0), ranged(LIMITS_RANGES.maxHistoryTokens)])
     .nullable()
     .optional()
-    .describe("2000-1000000, clamped; null/0/absent = OFF"),
+    .describe("null/0/absent = OFF"),
   retrySilence: z
     .boolean()
     .optional()
     .describe("retry a silent reply turn once; default TRUE"),
+  maxTurnsPerHour: ranged(LIMITS_RANGES.maxTurnsPerHour)
+    .optional()
+    .describe("per conversation per hour; 0 = off"),
+  maxProactivePerDay: ranged(LIMITS_RANGES.maxProactivePerDay)
+    .optional()
+    .describe("per conversation per 24h; 0 = off"),
 });
 
 const availability = z.looseObject({
@@ -435,74 +626,94 @@ const availability = z.looseObject({
     ),
 });
 
-// The local rule (issue #646). Either this or `url`: with a rule, the endpoint is never called.
+// The local rule, asked before `url` (which is then called only under `askEndpointAfterRule`). One
+// flat union: a nested one publishes an `anyOf` wrapper per level and refuses the same values.
+// `effect` is declared on every top-level shape because the MCP argument parse drops a key the shape does not name, and a dropped `exclude` would store the opposite rule.
+const contactAuthRuleEffect = z.enum(["serve", "exclude"]).optional();
+const contactAuthConditions = [
+  z.object({
+    kind: z.literal("allowlist"),
+    phones: z.array(z.string()).optional(),
+    identifiers: z.array(z.string()).optional(),
+    effect: contactAuthRuleEffect,
+  }),
+  z.object({
+    kind: z.literal("attribute"),
+    scope: z.enum(["conversation", "contact"]),
+    key: nonBlank("must not be blank"),
+    equals: nonBlank("must not be blank").optional(),
+    effect: contactAuthRuleEffect,
+  }),
+  z.object({
+    kind: z.literal("conversation_type"),
+    type: z.enum(["group", "individual"]),
+    effect: contactAuthRuleEffect,
+  }),
+  z.object({
+    kind: z.literal("label"),
+    label: nonBlank("must not be blank"),
+    effect: contactAuthRuleEffect,
+  }),
+] as const;
+
 const contactAuthRule = z
   .union([
+    ...contactAuthConditions,
     z.object({
-      kind: z.literal("allowlist"),
-      phones: z.array(z.string()).optional(),
-      identifiers: z.array(z.string()).optional(),
+      kind: z.enum(["all", "any"]),
+      // NOTE: each condition is one of the shapes above; only the kind is declared here, so the
+      // published schema does not carry the union twice. The write boundary parses the rest.
+      conditions: z.array(
+        z.looseObject({
+          kind: z.enum([
+            "allowlist",
+            "attribute",
+            "conversation_type",
+            "label",
+          ]),
+        }),
+      ),
+      effect: contactAuthRuleEffect,
     }),
-    z.object({
-      kind: z.literal("attribute"),
-      scope: z.enum(["conversation", "contact"]),
-      key: nonBlank("must not be blank"),
-      equals: nonBlank("must not be blank").optional(),
-    }),
+    z.null(),
   ])
-  .nullable()
   .optional()
   .describe(
-    "decides instead of `url`: allowlist = phone (with country code) or identifier listed, 1-500 entries; attribute = set, or equal to `equals`. null clears",
+    "allowlist 1-500 entries; all/any 1-10 conditions, one level; effect exclude inverts the rule; null clears",
   );
 
+// The descriptions carry only what a caller cannot read off the shape: clamps, refusals, and what
+// null or 0 means. The gate's semantics are in docs/contact-auth.md.
 const contactAuth = z.looseObject({
   enabled: z.boolean().optional(),
   rule: contactAuthRule,
+  askEndpointAfterRule: z.boolean().optional(),
   url: z
     .string()
     .nullable()
     .optional()
-    .describe("the authorization endpoint; fixed origin, no placeholders"),
+    .describe("fixed origin, no placeholders"),
   credentialRef: credentialRef(),
-  timeoutMs: z.number().optional().describe("1000-10000, clamped"),
-  noticeCooldownSeconds: z
-    .number()
+  timeoutMs: ranged(CONTACT_AUTH_RANGES.timeoutMs).optional(),
+  noticeCooldownSeconds: ranged(CONTACT_AUTH_RANGES.noticeCooldownSeconds)
     .optional()
-    .describe(
-      "cooldown on the refusal NOTICES, never on the verdict; 0 = notify on every refusal",
-    ),
-  includeMessageText: z
-    .boolean()
-    .optional()
-    .describe(
-      "forward the message text under `message.text` so the endpoint can accept an unlock code",
-    ),
-  denyMessage: z
-    .string()
-    .nullable()
-    .optional()
-    .describe("what a REFUSED contact receives; null = say nothing"),
+    .describe("notices only; 0 = every refusal"),
+  includeMessageText: z.boolean().optional(),
+  denyMessage: z.string().nullable().optional().describe("null = say nothing"),
   handoffEnabled: z.boolean().optional(),
+  operatorNoteEnabled: z.boolean().optional(),
   mode: z
     .enum(["perMessage", "once"])
     .optional()
-    .describe(
-      "perMessage (default) re-checks every message; once stores the first positive verdict per contact and reuses it until it expires",
-    ),
-  grantTtlSeconds: z
-    .number()
-    .optional()
-    .describe(
-      "how long a stored verdict counts for under mode=once; 60-2592000, clamped. Part of the policy a verdict is stored under, so a stored verdict stops counting while a different value is in force",
-    ),
-  handoffTeamId: chatwootId().describe("Chatwoot team id"),
+    .describe("once = keep a contact's first allow"),
+  grantTtlSeconds: ranged(CONTACT_AUTH_RANGES.grantTtlSeconds).optional(),
+  handoffTeamId: chatwootId(),
   handoffTeamInstanceId: chatwootId().describe(
-    "our ChatwootInstance id the team was picked from; the team is only assigned in that account",
+    "our ChatwootInstance id the team is from",
   ),
 });
 
-const channelRedirect = z.looseObject({
+const channelRedirectShape = z.looseObject({
   enabled: z.boolean().optional(),
   entryInboxId: chatwootId().describe(
     "the WhatsApp chatwootInboxId leads arrive on",
@@ -511,29 +722,39 @@ const channelRedirect = z.looseObject({
     "the widget chatwootInboxId; set via the console",
   ),
   redirectMessage: z.string().optional().describe("must carry {link}"),
-  resendDelayValue: z.number().optional().describe("≥ 1, clamped"),
+  resendDelayValue: delayValue(),
   resendDelayUnit: oneOf(REDIRECT_DELAY_UNITS).optional(),
-  maxResends: z.number().optional().describe("0-10, clamped"),
+  maxResends: ranged(CHANNEL_REDIRECT_RANGES.maxResends).optional(),
   openWidget: z.boolean().optional(),
   cloneWaMessage: z
     .boolean()
     .optional()
     .describe("replay it as the first widget message"),
   chatFollowupEnabled: z.boolean().optional(),
-  chatFollowupDelayValue: z.number().optional().describe("≥ 1, clamped"),
+  chatFollowupDelayValue: delayValue(),
   chatFollowupDelayUnit: oneOf(REDIRECT_DELAY_UNITS).optional(),
   chatFollowupInstructions: z.string().optional(),
   waFollowupEnabled: z.boolean().optional(),
-  waFollowupDelayValue: z.number().optional().describe("≥ 1, clamped"),
+  waFollowupDelayValue: delayValue(),
   waFollowupDelayUnit: oneOf(REDIRECT_DELAY_UNITS).optional(),
   waFollowupMessage: z.string().optional().describe("must carry {link}"),
   closingEnabled: z.boolean().optional(),
-  closingDelayValue: z.number().optional().describe("≥ 1, clamped"),
+  closingDelayValue: delayValue(),
   closingDelayUnit: oneOf(REDIRECT_DELAY_UNITS).optional(),
   closingMessage: z
     .string()
     .optional()
     .describe("fixed, posted on BOTH channels"),
+});
+const REDIRECT_DELAY_PAIRS: [value: string, unit: string][] = [
+  ["resendDelayValue", "resendDelayUnit"],
+  ["chatFollowupDelayValue", "chatFollowupDelayUnit"],
+  ["waFollowupDelayValue", "waFollowupDelayUnit"],
+  ["closingDelayValue", "closingDelayUnit"],
+];
+const channelRedirect = channelRedirectShape.superRefine((v, ctx) => {
+  for (const [value, unit] of REDIRECT_DELAY_PAIRS)
+    refineDelay(v, ctx, value, unit);
 });
 
 // The Chatwoot attribute KEYS injected into the prompt, per scope. The keys themselves are the
@@ -545,6 +766,38 @@ const attributeContext = z.looseObject({
   conversation: attributeKeys(),
   contact: attributeKeys(),
   task: attributeKeys(),
+});
+
+// The contact's standard Chatwoot fields: a closed set, so an unknown name is refused rather than
+// stored and dropped by the reader.
+const contactFields = z.looseObject({
+  context: z.array(oneOf(CONTACT_FIELDS)).optional(),
+  writable: z
+    .array(oneOf(CONTACT_FIELDS))
+    .optional()
+    .describe("⊆ context, else refused; empty = no update_contact"),
+});
+
+const otherInboxInt = (b: { min: number; max: number }) =>
+  z.number().int().min(b.min).max(b.max).optional();
+
+const otherInboxes = z.looseObject({
+  enabled: z.boolean().optional(),
+  inboxes: z
+    .array(
+      z.object({
+        instanceId: z.number().int().positive(),
+        inboxId: z.number().int().positive(),
+      }),
+    )
+    .max(OTHER_INBOXES_MAX_INBOXES)
+    .optional()
+    .describe("chatwootInboxId + our instance id; empty = none read"),
+  maxConversations: otherInboxInt(OTHER_INBOXES_LIMITS.maxConversations),
+  lookbackDays: otherInboxInt(OTHER_INBOXES_LIMITS.lookbackDays),
+  fullTranscriptMaxChars: otherInboxInt(
+    OTHER_INBOXES_LIMITS.fullTranscriptMaxChars,
+  ),
 });
 
 const crossInboxCase = z.looseObject({
@@ -559,6 +812,16 @@ const crossInboxCase = z.looseObject({
     .nullable()
     .optional()
     .describe("email subject; {{resumo}} = model's summary"),
+  openingTemplate: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("{{mensagem}} = model's part"),
+  noteTemplate: z
+    .string()
+    .nullable()
+    .optional()
+    .describe("{{assunto}} {{motivo}} {{link_origem}}"),
   // Checked with `refine`, not `regex`: a pattern would enter the published JSON Schema and its
   // ceiling, and the refusal message already names the rule to whoever sends a bad key.
   caseAttributeKey: z
@@ -578,7 +841,41 @@ const crossInboxCase = z.looseObject({
     .boolean()
     .optional()
     .describe("close the origin after the reply once the case is open"),
+  carryAttachments: z
+    .looseObject({
+      mode: z
+        .enum(CARRY_MODES)
+        .optional()
+        .describe(
+          "off (default); attendance = the origin's current attendance; conversation = all of it",
+        ),
+      fileTypes: z
+        .array(z.string())
+        .optional()
+        .describe(
+          `of ${CARRY_FILE_TYPES.join(", ")}; others dropped; default image, file`,
+        ),
+      maxFiles: ranged(CARRY_ATTACHMENTS_RANGES.maxFiles)
+        .optional()
+        .describe(`newest win; default ${CARRY_ATTACHMENTS_DEFAULTS.maxFiles}`),
+    })
+    .optional()
+    .describe("the customer's files copied into the case as one private note"),
 });
+
+// The labels the agent's own close writes, merged into the conversation's set right
+// before resolve_conversation changes the status, so anything keyed on them at resolve time (a CSAT
+// survey rule, a folder) sees them whether or not the model called set_labels.
+const resolveConversation = z
+  .looseObject({
+    assignLabels: z
+      .array(z.string())
+      .optional()
+      .describe(
+        `merged in before the close; one in setLabels.protected is refused. First ${RESOLVE_LABELS_MAX} kept`,
+      ),
+  })
+  .describe("labels resolve_conversation writes itself");
 
 const sendImage = z.looseObject({
   allowedHosts: z
@@ -618,6 +915,12 @@ const observability = z.looseObject({
     .describe(
       `ISO instant the log debug mode ends, at most ${FULL_DETAIL_MAX_HOURS}h ahead; until then this agent's log detail is stored whole instead of cut at 2000 chars`,
     ),
+  fullDetailRetentionDays: ranged(OBSERVABILITY_RANGES.fullDetailRetentionDays)
+    .nullable()
+    .optional()
+    .describe(
+      "days each turn's full tool results and prompt are kept (null = off)",
+    ),
 });
 
 const memory = z.looseObject({
@@ -651,16 +954,37 @@ const memory = z.looseObject({
     .optional(),
 });
 
+const knowledge = z.looseObject({
+  // The model that reviews the agent's knowledge suggestions before they reach the queue, as an
+  // override of the agent's. Resolved at READ time like memory.compaction: a half-named override is
+  // stored without complaint and the review falls back to queueing the proposal unreviewed. All
+  // four absent (the default) reviews on the agent's model.
+  suggestionReview: z
+    .looseObject({
+      provider: oneOf(MODEL_PROVIDERS)
+        .nullable()
+        .optional()
+        .describe("reviewer model PROVIDER; null inherits the agent's"),
+      model: z.string().nullable().optional(),
+      credentialRef: credentialRef(),
+      baseURL: baseURL(),
+    })
+    .optional(),
+});
+
+// The customer_choice judge's model, as an override of the agent's (`resolveModelOverride`). All four
+// absent judges on the agent's model; one that cannot run refuses every guarded call.
+const choiceCheck = z.looseObject({
+  provider: oneOf(MODEL_PROVIDERS).nullable().optional(),
+  model: z.string().nullable().optional(),
+  credentialRef: credentialRef(),
+  baseURL: baseURL(),
+});
+
 const modelFallback = z.looseObject({
-  // WHERE THE TURN GOES when the agent's own provider cannot take it. Resolved by the same
-  // `resolveModelOverride` the speech rewrite and the summariser use, so the rules about whose key
-  // may travel to which host are written once — a fallback on another vendor carries its own
-  // credential or it does not run.
-  //
-  // The one place this block reads DIFFERENTLY from its two siblings: there, everything absent means
-  // "run on the agent's own model", which is a useful default. Here that would be a fallback to the
-  // provider that just failed — configured-looking and a guaranteed no-op. So a fallback exists only
-  // when the operator named BOTH a provider and a model, and anything less is no fallback at all.
+  // Where the turn goes when the agent's own provider cannot take it (`resolveModelOverride`). Unlike
+  // its siblings, absent does NOT mean the agent's model (that is the provider that just failed): a
+  // fallback exists only when BOTH a provider and a model are named.
   provider: oneOf(MODEL_PROVIDERS)
     .nullable()
     .optional()
@@ -672,23 +996,17 @@ const modelFallback = z.looseObject({
     .describe("the fallback's model id; absent = no fallback"),
   credentialRef: credentialRef(),
   baseURL: baseURL(),
+  timeoutMs: ranged(MODEL_FALLBACK_RANGES.timeoutMs)
+    .nullable()
+    .optional()
+    .describe("per attempt, both models, ms; null = 45000"),
 });
 
 // The 18 behavior blocks of `agent_settings_set`, each a partial patch over the stored block.
-// --- Blocks added by issue #402 ---------------------------------------------------------------
-//
-// Five blocks of the settings bag were written by the console and REST and reachable through MCP
-// not at all. Four were never registered anywhere; `guardrails` was the one deliberate omission, and
-// the reason was never written down. The guard that discovers this now
-// (tests/modules/agent-settings-mcp-parity.test.ts) probes the readers rather than reading a list,
-// so what follows only has to keep its promise: type and choice, never size.
+// tests/modules/agent-settings-mcp-parity.test.ts probes the readers so no block is left out.
 
-// NOTE: THE TWO DIRECTIONS PUBLISH DIFFERENT FIELDS, because two of the checks only mean something about
-// a REPLY. `activeChecks` drops `promptAdherence` and `answerRelevance` whenever the direction is
-// `input`, and the generated-reply guidance is only read for `output` (prompts.ts). Publishing them
-// under `input` advertised three settings that store, read back through agent_settings_get, and do
-// nothing — configuration that reports success, which is the same failure `appointmentReminders` was
-// removed from this change for. The console has always gated them behind `dir === "output"`.
+// The two directions publish different fields: `promptAdherence` and `answerRelevance` only mean
+// something about a REPLY (`activeChecks` drops them for `input`), as in the console.
 const sharedChecks = {
   toxicity: z.boolean().optional(),
   unsafeContent: z.boolean().optional(),
@@ -698,30 +1016,11 @@ const sharedChecks = {
     .describe("matches the names in guardrails.competitors"),
 };
 
-// The two reply checks are REFUSED under `input`, not merely left unpublished. Splitting the
-// published shape was round 4; round 5 showed it was half a fix, because a loose object still
-// ACCEPTS them — and the shape `agent_settings_get` returns carries all five, so a caller doing the
-// most ordinary thing (read, change one field, write back) would have sent them and had them stored
-// as a silent no-op. The refusal names the field.
-//
-// Refused HERE and dropped from the read projection (modules/mcp/write.ts) together, because only
-// one of the two would trade a silent no-op for a broken round trip: a `get` that returns a field
-// the `set` refuses is a 400 for a caller who changed nothing.
-//
-// Still LOOSE otherwise, for the reason the header gives: an undeclared key reaches the readers as
-// before, so a field someone adds to the reader is merged rather than silently dropped. What is
-// refused is the specific, known, direction-wrong set.
-// PUBLISHED as a prohibition, not merely enforced. `docs/mcp.md` states the constraint this failed
-// on the first attempt: what the schema ENFORCES has to be what it PUBLISHES, because tools/list
-// ships the generated JSON Schema and a client may validate a call before sending it. A zod
-// `.check()` is invisible out there, so the client accepted what the server refused — the same shape
-// of mismatch the doc already records twice (a regex flag lost on the way out, a preprocess trim).
-// `z.never().optional()` serializes as `{"not": {}}`: both ends read the same rule.
+// The reply checks are REFUSED under `input` (a loose object would accept them as a silent no-op),
+// and dropped from the read projection in modules/mcp/write.ts so a read-then-write round trip holds.
+// `z.never().optional()` publishes as `{"not": {}}`, where a zod `.check()` would be invisible.
 const inputChecks = z.looseObject({
   ...sharedChecks,
-  // NOTE: These two only mean something about a REPLY — activeChecks drops them whenever the direction
-  // is `input` — so accepting them here would store configuration the runtime never acts on. That is
-  // the one outcome a caller cannot discover by trying, because what comes back is success.
   promptAdherence: z.never().optional(),
   answerRelevance: z.never().optional(),
 });
@@ -738,7 +1037,7 @@ const outputChecks = z.looseObject({
 });
 
 const ACTION_DESC =
-  "on a violation: template = send templateMessage verbatim; generated = guardrails writes a safe reply; silent = send nothing; handoff = send handoffMessage and give the conversation to the team";
+  "on a violation: template = send templateMessage; generated = guardrails writes a safe reply; silent = send nothing; handoff = send handoffMessage and hand over to the team; observe = only log it";
 
 const directionCommon = {
   enabled: z.boolean().optional(),
@@ -770,10 +1069,18 @@ const guardrailInput = z.looseObject({
   checks: inputChecks.optional(),
   // NOTE: Input analysis never generates a replacement reply (prompts.ts reads this only for `output`).
   generationPrompt: z.never().optional(),
+  contextMessages: ranged(GUARDRAIL_RANGES.contextMessages)
+    .optional()
+    .describe(
+      "earlier messages read as context, never judged; 0 = the message alone; new agents start at 4",
+    ),
 });
 
 const guardrailOutput = z.looseObject({
   ...directionCommon,
+  // NOTE: Refused rather than ignored: the reply is judged on its own, and a loose object would take
+  // the field as a silent no-op.
+  contextMessages: z.never().optional(),
   action: oneOf(GUARDRAIL_ACTIONS).optional().describe(ACTION_DESC),
   checks: outputChecks.optional(),
   generationPrompt: z
@@ -784,38 +1091,175 @@ const guardrailOutput = z.looseObject({
     ),
 });
 
-const guardrails = z.looseObject({
-  enabled: z.boolean().optional(),
-  provider: oneOf(MODEL_PROVIDERS)
-    .optional()
-    .describe("the guardrails agent's OWN model provider, not the agent's"),
-  model: z
-    .string()
-    .optional()
-    .describe(
-      "empty resolves to the provider default (openai-compatible keeps empty: the server picks)",
-    ),
-  credentialRef: z
-    .string()
-    .nullable()
-    .optional()
-    .describe("vault entry NAME (never the key itself)"),
-  baseURL: z.string().nullable().optional(),
-  // NOTE: Item type declared, count and length not: readCompetitors DROPS a non-string (so declaring it
-  // turns a silent loss into a named refusal) but truncates the list and each name, which must keep
-  // parsing.
-  competitors: z.array(z.string()).optional(),
-  customPolicy: z
-    .string()
+// A threshold is refused outside 0..1 rather than clamped: GET returns what was stored, and a stored
+// -0.5 would be read by the screening as 0 while the API kept showing -0.5.
+const guardrailThreshold = ranged(GUARDRAIL_RANGES.threshold)
+  .optional()
+  .describe("probability at or above which the check trips; default 0.8");
+
+const guardrailDecisions = z.looseObject({
+  provider: oneOf(DECISION_PROVIDERS)
     .optional()
     .describe(
-      `free text appended to every analysis prompt; refused above ${CUSTOM_POLICY_MAX} characters, not trimmed`,
+      "the classification API: typesafe (Jev) or openai (OpenAI Decisions)",
     ),
-  input: guardrailInput.optional().describe("screens the CUSTOMER message"),
-  output: guardrailOutput
+  model: modelId(),
+  credentialRef: credentialRef(),
+  thresholds: z
+    .looseObject(
+      Object.fromEntries(
+        GUARDRAIL_THRESHOLD_KEYS.map((k) => [k, guardrailThreshold]),
+      ),
+    )
     .optional()
-    .describe("screens the AGENT reply before it is sent"),
+    .describe(
+      "per check, plus customPolicy for the operator's policy; absent = 0.8",
+    ),
 });
+
+const guardrails = z
+  .looseObject({
+    enabled: z.boolean().optional(),
+    classifier: oneOf(GUARDRAIL_CLASSIFIERS)
+      .optional()
+      .describe(
+        "who judges: chat = the guardrails model writes a verdict (default); decisions = a classification API asks each check as a yes/no question, configured under `decisions`",
+      ),
+    decisions: guardrailDecisions
+      .optional()
+      .describe(
+        "the classification API used when classifier is decisions; the chat model fields stay stored for switching back",
+      ),
+    provider: oneOf(MODEL_PROVIDERS)
+      .optional()
+      .describe("the guardrails agent's OWN model provider, not the agent's"),
+    model: z
+      .string()
+      .optional()
+      .describe(
+        "empty resolves to the provider default (openai-compatible keeps empty: the server picks)",
+      ),
+    credentialRef: z
+      .string()
+      .nullable()
+      .optional()
+      .describe("vault entry NAME (never the key itself)"),
+    baseURL: z.string().nullable().optional(),
+    // NOTE: Item type declared, count and length not: readCompetitors DROPS a non-string (so declaring it
+    // turns a silent loss into a named refusal) but truncates the list and each name, which must keep
+    // parsing.
+    competitors: z.array(z.string()).optional(),
+    customPolicy: z
+      .string()
+      .optional()
+      .describe(
+        `free text appended to every analysis prompt; refused above ${CUSTOM_POLICY_MAX} characters, not trimmed`,
+      ),
+    input: guardrailInput.optional().describe("screens the CUSTOMER message"),
+    output: guardrailOutput
+      .optional()
+      .describe("screens the AGENT reply before it is sent"),
+    external: z
+      .looseObject({
+        url: z
+          .string()
+          .refine(
+            isExternalCheckUrl,
+            "must be an https URL with no credentials in it",
+          )
+          .nullable()
+          .optional()
+          .describe(
+            "the endpoint that judges each reply before delivery; null = no external check",
+          ),
+        credentialRef: credentialRef().describe(
+          "vault entry NAME or vault:<id> of the HMAC signing secret; null = unsigned",
+        ),
+        sendToolValues: z
+          .boolean()
+          .optional()
+          .describe(
+            "false sends tool call names and sizes without arguments and results (default true)",
+          ),
+      })
+      .optional()
+      .describe(
+        "an endpoint that answers allow, replace or block for each reply to a customer message; a block fires output.action, a failure follows onFailure",
+      ),
+    factualGrounding: z
+      .looseObject({
+        enabled: z.boolean().optional(),
+        sourceTools: z
+          .array(z.string())
+          .max(MAX_SOURCE_TOOLS)
+          .optional()
+          .describe(
+            "tools whose results are sources; runs only when one returned",
+          ),
+        referenceKnowledgeBaseIds: z
+          .array(z.string().regex(/^[1-9][0-9]{0,17}$/))
+          .max(MAX_REFERENCE_KNOWLEDGE_BASES)
+          .optional(),
+        action: oneOf(GROUNDING_ACTIONS)
+          .optional()
+          .describe("revise = one more generation told the claims"),
+        contextMessages: ranged(
+          GUARDRAIL_RANGES.groundingContextMessages,
+        ).optional(),
+        reviseWithTools: z
+          .boolean()
+          .optional()
+          .describe(
+            "revise: the rewrite may call the read-only sources (default true)",
+          ),
+        reviseMaxToolCalls: ranged(GUARDRAIL_RANGES.reviseMaxToolCalls)
+          .optional()
+          .describe("revise: at most limits.maxToolCalls (default 3)"),
+        provider: oneOf(MODEL_PROVIDERS)
+          .nullable()
+          .optional()
+          .describe("null = the guardrails model"),
+        model: z.string().nullable().optional(),
+        credentialRef: credentialRef(),
+        baseURL: baseURL(),
+      })
+      .optional()
+      .describe("reviews the reply against recent source results"),
+    onFailure: oneOf(GUARDRAIL_FAILURE_MODES)
+      .optional()
+      .describe(
+        "when a check cannot judge (timeout, error, missing credential): pass = the message continues unchecked (default); hold = it is stopped and the conversation goes to the team with the direction's handoffMessage. Proactive sends always pass",
+      ),
+  })
+  .superRefine(
+    (v, ctx) => {
+      // A classification API answers numbers: no model writes the replacement `generated` sends.
+      // Asked over the whole block (`wholeBlock`), since switching the classifier makes an unchanged
+      // action wrong. The MCP patch reaches here merged, so REST and MCP refuse the same write.
+      const bag = v as Record<string, unknown>;
+      if (bag.classifier !== "decisions") return;
+      for (const dir of ["input", "output"] as const) {
+        const d = bag[dir];
+        if (
+          d &&
+          typeof d === "object" &&
+          "action" in d &&
+          d.action === "generated"
+        ) {
+          ctx.addIssue({
+            code: "custom",
+            path: [dir, "action"],
+            message:
+              "the decisions classifier cannot write a replacement reply: choose template, silent or handoff",
+            params: { wholeBlock: 2 },
+          });
+        }
+      }
+    },
+    // Runs past the aborting issues too: a normalized block carries the input's reply-only checks,
+    // which fail their `never` and are let through by the write boundary when typed as the reader's.
+    { when: (payload) => !!payload.value && typeof payload.value === "object" },
+  );
 
 const kanban = z.looseObject({
   instructions: toolNote()
@@ -826,20 +1270,8 @@ const kanban = z.looseObject({
     ),
 });
 
-// NOTE: Keyed BY THE CATALOG, and NOT by an open string-keyed record. Both of these are maps whose keys are
-// native tool names, and both readers DROP a key outside the catalog — so a record schema would
-// publish "any string" and let a typo be accepted by the API and ignored by the turn, which for a
-// precondition means an unguarded tool that reads as guarded. Generated from NATIVE_TOOL_NAMES so a
-// tool added later is publishable the day it ships instead of the day someone remembers this file.
-// NOTE: `__proto__` is refused BEFORE the object parser can lose it. It is the one key name that
-// survives JSON.parse as an own property and then disappears inside zod's loose-object rebuild, so
-// the entry reaches neither the write boundary nor the merge and the call answers ok having done
-// nothing — a tombstone the caller believes deleted an enforced rule, or a rule the catalog refusal
-// never sees. Checked on the RAW value, which is the only place it still exists.
-//
-// The runtime half of this hazard is already closed (#378 keys these maps on null-prototype objects
-// and looks up with Object.hasOwn); this is the same name at the transport boundary, where the loss
-// runs the other way.
+// `__proto__` is refused on the RAW value, before zod's loose-object rebuild silently drops it and the
+// call answers ok having done nothing (a removal that removed nothing, a rule never checked).
 const refuseProtoKey = <T extends z.ZodObject>(schema: T) =>
   schema.check((ctx) => {
     const raw = ctx.value as Record<string, unknown> | null;
@@ -854,11 +1286,11 @@ const refuseProtoKey = <T extends z.ZodObject>(schema: T) =>
     }
   });
 
+// A map keyed BY THE NATIVE CATALOG, not an open record: both readers drop any other key, so "any
+// string" would accept a typo the turn then ignores (for a precondition, an unguarded tool).
 const nativeToolKeys = <T extends z.ZodTypeAny>(value: T) => {
-  // ONE instance shared by all thirteen keys, not thirteen `.optional()` calls. This is about the
-  // PUBLISHED schema, not about the parse: distinct instances serialize as thirteen full copies of
-  // the value, which for the precondition object alone came to 5.2 KB — 23% of the whole tool's
-  // schema, for one block, in a catalogue the model pays for on every conversation.
+  // ONE shared instance: distinct ones serialize as a full copy per key in the published
+  // schema, which the model pays for on every conversation.
   const shared = value.optional();
   return refuseProtoKey(
     z.looseObject(
@@ -870,10 +1302,29 @@ const nativeToolKeys = <T extends z.ZodTypeAny>(value: T) => {
   );
 };
 
-// The `set_labels` guard. A block of its own rather than a key beside the taxonomy, because
-// `settings.labels` is now REFUSED on the write (it was retired with the taxonomy, issue #568) and
-// because what this list does is fence a tool, not describe a vocabulary. Loose like its siblings,
-// so a field added to the reader later still reaches it.
+// Keyed by any tool name, so the names are checked rather than published: a catalog of native
+// properties would not refuse a typo here (the catchall takes any valid name) and only adds size.
+const guardableToolKeys = <T extends z.ZodTypeAny>(value: T) =>
+  z
+    .object({})
+    .catchall(value)
+    .check((ctx) => {
+      for (const [name, value] of Object.entries(ctx.value)) {
+        // NOTE: a removal (`null`) passes whatever its name, so a rule stored under a name that is no
+        // longer valid can still be deleted; the write boundary says whether it was there.
+        if (value === null || GUARDABLE_TOOL_NAME.test(name)) continue;
+        ctx.issues.push({
+          code: "custom",
+          input: ctx.value,
+          path: [name],
+          message:
+            "must be a tool name: letters, digits, `_` or `-`, up to 64, not starting with `_`",
+        });
+      }
+    });
+
+// The `set_labels` guard: a block of its own, since it fences a tool (`settings.labels` is refused on
+// write). Loose like its siblings.
 const setLabels = z
   .looseObject({
     protected: z
@@ -885,7 +1336,7 @@ const setLabels = z
     allowed: z
       .array(z.string())
       .describe(
-        `the only titles set_labels may ADD; empty = any, and a new one is created. Removal is not limited. At most ${ALLOWED_LABELS_MAX}`,
+        `the only titles set_labels may ADD; empty = any, and a new one is created. Removal is not limited unless removal says so. At most ${ALLOWED_LABELS_MAX}`,
       )
       .optional(),
     outsideAllowed: z
@@ -894,108 +1345,207 @@ const setLabels = z
         "a title outside `allowed`: refuse (default: not written) or accept (written, counted in the log)",
       )
       .optional(),
+    removal: z
+      .enum(["any", "allowed"])
+      .describe(
+        "what set_labels may REMOVE: any (default) or allowed (only titles in `allowed`; others stay, counted)",
+      )
+      .optional(),
   })
   .describe(
     "per-agent configuration for the set_labels native tool that is not a note (the note lives in toolGuidance.set_labels)",
+  );
+
+// The `set_custom_attribute` fence: the attributes it may write. The VALUE rules come from the
+// account's Chatwoot definitions, not from here.
+const setCustomAttribute = z
+  .looseObject({
+    allowed: z
+      .array(
+        z.object({
+          scope: z.enum(["conversation", "contact", "task"]),
+          key: z.string().trim().min(1),
+        }),
+      )
+      .max(WRITABLE_ATTRIBUTES_MAX)
+      .describe(
+        `the only attributes set_custom_attribute may write or clear; empty = any key. A key with a Chatwoot definition is also held to it. At most ${WRITABLE_ATTRIBUTES_MAX}`,
+      )
+      .optional(),
+  })
+  .describe(
+    "set_custom_attribute config that is not a note (the note is toolGuidance.set_custom_attribute)",
   );
 
 const toolGuidance = nativeToolKeys(toolNote().nullable()).describe(
   `per-native-tool guidance appended to that tool's description; null clears one. A key outside the catalog is dropped by the reader, so only the names published here take effect. Each note is refused above ${TOOL_INSTRUCTIONS_MAX} characters, not trimmed. PRECEDENCE: handoff_to_human and kanban_move_card also have a note in their own block (handoff.instructions, kanban.instructions); a non-empty value THERE wins over this map for that tool, so the value here applies only while the grouped one is empty.`,
 );
 
-// NOTE: The field descriptions live on the BLOCK, once, rather than on each field — the value is
-// serialized once per key, so a per-field `.describe()` is published thirteen times. That alone was
-// worth ~2 KB of a schema the model pays for on every conversation, and thirteen copies of the same
-// sentence is noise to the reader as much as it is bytes on the wire.
-const toolPreconditions = nativeToolKeys(
-  z
-    .looseObject({
-      kind: z.literal("attribute"),
-      scope: z.enum(["conversation", "contact"]),
-      // BLANK IS REFUSED BY THE SERVER HERE, so it is published rather than left to the caller to
-      // discover. `parseToolPrecondition` trims both and returns null for either — and the write
-      // boundary REFUSES what does not parse instead of dropping it, so a schema-valid call came
-      // back as an MCP error with nothing in tools/list to predict it.
-      //
-      // The line that decides which refusals belong in the schema is whether JSON Schema can carry
-      // them faithfully. A pattern can. `modelFallback`'s half-named pair cannot — that is a
-      // requirement BETWEEN fields, and docs/mcp.md puts those in the description, which is where
-      // it already is.
-      key: nonBlank("must not be blank"),
-      // NOTE: blank is refused rather than treated as absent, and the reader says why: dropping it
-      // would turn "the attribute must equal X" into "the attribute must exist", a weaker rule than
-      // the operator wrote, and weaker in silence.
-      equals: nonBlank(
-        "must not be blank; omit it to require only that the attribute is set",
-      ).optional(),
-    })
-    // NOTE: NULLABLE, and it is the only way to REMOVE a rule over this surface. The merge treats each
+// The field descriptions live on the BLOCK: the value is serialized once per key, so a per-field
+// `.describe()` would be published once per native tool.
+const preconditionCondition = z.looseObject({
+  kind: z.literal("attribute"),
+  scope: z.enum(["conversation", "contact"]),
+  // NOTE: Blank is refused by the write boundary (`parseToolPrecondition` trims to null), so the
+  // schema publishes it as a pattern, which JSON Schema carries faithfully.
+  key: nonBlank("must not be blank"),
+  // NOTE: blank is refused rather than treated as absent, and the reader says why: dropping it
+  // would turn "the attribute must equal X" into "the attribute must exist", a weaker rule than
+  // the operator wrote, and weaker in silence.
+  equals: nonBlank(
+    "must not be blank; omit it to require only that the attribute is set",
+  ).optional(),
+});
+
+// Discriminated by `kind`, so a refused field is told at its own path inside the kind it belongs to
+// (the write boundary trims and names it) instead of the union being told whole.
+const condition = z.discriminatedUnion("kind", [
+  preconditionCondition,
+  z.looseObject({ kind: z.literal("customer_choice") }),
+]);
+
+const toolPreconditions = guardableToolKeys(
+  z.union([
+    condition,
+    z.array(condition).min(1).max(TOOL_PRECONDITION_CONDITIONS_MAX),
+    // NOTE: NULL, and it is the only way to REMOVE a rule over this surface. The merge treats each
     // tool's value as a replacement and an absent key as "leave it alone", so without a tombstone
     // there is no deletion at all — an empty object just replaces the rule with an unparseable one.
     // `toolGuidance` accepted one from the start because its value was already nullable, which is
     // exactly why the gap here survived a round: the test written for the tombstone covered the half
-    // that already worked.
-    .nullable(),
+    // that already worked. A branch of the union rather than `.nullable()`, which publishes a nested
+    // `anyOf` a client has to unwrap twice.
+    z.null(),
+  ]),
 ).describe(
-  "per-native-tool precondition, checked by the runtime BEFORE the call runs (send `null` for a tool to remove its rule): `key` is the custom-attribute key that must be set on the chosen `scope`, and `equals` is the required value (omit it to require any non-blank value). Unmet, the tool does not run and the model is told why. Only native tools can be guarded (issue #389 tracks the rest).",
+  `per-tool precondition, keyed by the name the model calls (native, toolpack, HTTP, code, \`mcp__<server>__<tool>\`); \`null\` removes one. One condition, or a list of up to ${TOOL_PRECONDITION_CONDITIONS_MAX} that must ALL hold. \`key\` is the attribute that must be set on \`scope\`, \`equals\` the required value (omit for any). \`customer_choice\`: the customer said or confirmed every value of the call. Unmet, the call does not run and the model is told what is missing.`,
 );
 
-// What a monitoring agent does with what it reads (issue #477). Descriptions kept to the bone: the
-// MCP schema ceiling (tests/modules/mcp-tool-descriptions.test.ts) is a ratchet, and the reader has
-// docs/chatwoot.md for the rest. The label groups that used to live here are gone with the
-// classifier (issue #568): a watcher labels with `set_labels` like any other agent.
-const monitoring = z.looseObject({
+// What a monitoring agent does with what it reads. Descriptions kept short: the MCP schema ceiling
+// (tests/modules/mcp-tool-descriptions.test.ts) is a ratchet, and docs/chatwoot.md has the rest.
+const monitoringShape = (decisions: z.ZodType<Record<string, unknown>>) => ({
+  engine: oneOf(["llm", "decisions"] as const)
+    .optional()
+    .describe("llm (prompt+tools, default) or decisions (docs/decisions.md)"),
+  decisions: decisions
+    .nullable()
+    .optional()
+    .describe(
+      "provider openai|typesafe, model, credentialRef, questions, rules",
+    ),
   analysis: oneOf(["incremental", "on_resolve"] as const)
     .optional()
     .describe(
       "per burst + on resolve, or on resolve only; default incremental",
     ),
   window: z
-    .looseObject({ messages: z.number().optional() })
+    .looseObject({
+      messages: ranged(MONITORING_RANGES.windowMessages).optional(),
+    })
     .optional()
-    .describe(
-      "newest messages the model reads; 4-60, rounded and clamped, default 20",
-    ),
+    .describe("newest messages the model reads; default 20"),
   debounce: z
     .looseObject({
-      windowSeconds: z.number().optional(),
-      maxWindowSeconds: z.number().optional(),
+      // A negative window is refused, not read as 0: 0 is the one value that changes what the agent
+      // costs (a model call per message), so it is never reached by a typo's clamp.
+      windowSeconds: ranged(MONITORING_RANGES.windowSeconds).optional(),
+      maxWindowSeconds: ranged(MONITORING_RANGES.maxWindowSeconds).optional(),
     })
     .optional()
     .describe(
-      "burst window; 3-600s, rounded and clamped, default 20s with a 60s ceiling from the START of the burst",
+      "burst window in seconds (0: every message, no coalescing); default 20s with a 60s ceiling from the START of the burst",
     ),
 });
+// The engine and its block are one choice: `decisions` without a block would skip every tick.
+// `wholeBlock`, so any edit of the monitoring block re-asks it (see decisionsSchema).
+function refineMonitoringEngine(
+  v: { engine?: unknown; decisions?: unknown },
+  ctx: z.RefinementCtx,
+) {
+  if (v.engine === "decisions" && (v.decisions ?? null) === null) {
+    ctx.addIssue({
+      code: "custom",
+      path: ["engine"],
+      message: "the decisions engine needs a decisions block",
+      params: { wholeBlock: 1 },
+    });
+  }
+}
+// The write boundary asks the whole block; the MCP argument is a patch, merged before it is whole.
+const monitoring = z
+  .looseObject(monitoringShape(decisionsSchema))
+  .superRefine(refineMonitoringEngine);
+const monitoringPatch = z.looseObject(monitoringShape(decisionsPatchSchema));
 
 export const BEHAVIOR_PATCH_SHAPE = {
   debounce: debounce.optional(),
   stt: stt.optional(),
   tts: tts.optional(),
+  calls: calls.optional(),
   vision: vision.optional(),
   split: split.optional(),
   signature: signature.optional(),
   serviceWindow: serviceWindow.optional(),
   grounding: grounding.optional(),
   followUp: followUp.optional(),
+  snoozedFollowUp: snoozedFollowUp.optional(),
   handoff: handoff.optional(),
   takeover: takeover.optional(),
   replyGate: replyGate.optional(),
+  conversationNotes: conversationNotes.optional(),
   limits: limits.optional(),
   availability: availability.optional(),
   contactAuth: contactAuth.optional(),
   channelRedirect: channelRedirect.optional(),
   attributeContext: attributeContext.optional(),
+  contactFields: contactFields.optional(),
   sendImage: sendImage.optional(),
+  resolveConversation: resolveConversation.optional(),
   crossInboxCase: crossInboxCase.optional(),
+  otherInboxes: otherInboxes.optional(),
   observability: observability.optional(),
   memory: memory.optional(),
+  knowledge: knowledge.optional(),
   modelFallback: modelFallback.optional(),
   guardrails: guardrails.optional(),
   kanban: kanban.optional(),
   toolGuidance: toolGuidance.optional(),
   setLabels: setLabels.optional(),
+  setCustomAttribute: setCustomAttribute.optional(),
   toolPreconditions: toolPreconditions.optional(),
+  choiceCheck: choiceCheck.optional(),
   monitoring: monitoring.optional(),
+} satisfies z.ZodRawShape;
+
+// Each block's refinements alone (the delay pairs, the monitoring engine), for the write boundary to
+// ask on their own: zod skips an object's refinement once any of its fields fails, so a legacy
+// fraction elsewhere in the block would let a changed pair through unchecked. Each level is an empty
+// loose object, which any object parses.
+const delayPairs = (...pairs: [value: string, unit: string][]) =>
+  z.looseObject({}).superRefine((v, ctx) => {
+    for (const [value, unit] of pairs) refineDelay(v, ctx, value, unit);
+  });
+const stepDelays = z.array(delayPairs(["delayValue", "delayUnit"]));
+export const BLOCK_REFINEMENTS: Record<string, z.ZodType> = {
+  followUp: z.looseObject({ steps: stepDelays.optional() }),
+  snoozedFollowUp: z.looseObject({
+    cadences: z
+      .array(z.looseObject({ steps: stepDelays.optional() }))
+      .optional(),
+  }),
+  channelRedirect: delayPairs(...REDIRECT_DELAY_PAIRS),
+  monitoring: z.looseObject({}).superRefine(refineMonitoringEngine),
+};
+
+// What agent_settings_set takes: the patch shape with `monitoring.decisions` and the delays unrefined,
+// since each refinement needs the merged block (a delay's unit may be stored while the patch names only
+// its value) and JSON Schema cannot publish it. The handler asks the refined shape before the merge.
+export const BEHAVIOR_PATCH_ARGS_SHAPE = {
+  ...BEHAVIOR_PATCH_SHAPE,
+  followUp: followUpOf(followUpStepShape).optional(),
+  snoozedFollowUp: snoozedFollowUpOf(followUpStepShape).optional(),
+  channelRedirect: channelRedirectShape.optional(),
+  monitoring: monitoringPatch.optional(),
 } satisfies z.ZodRawShape;
 
 export type BehaviorPatchArgs = z.infer<

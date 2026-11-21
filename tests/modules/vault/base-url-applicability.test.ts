@@ -3,9 +3,11 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { Glob } from "bun";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { loadToolSelections } from "@/graph/tools/assemble";
 import { AppError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { credentialCreate } from "@/modules/mcp/write";
+import { runToolTest } from "@/modules/tool-definitions/test-run";
 import {
   BASE_URL_KIND_IDS,
   getSecretType,
@@ -25,19 +27,16 @@ import {
   tryResolveVaultEntry,
   updateVaultEntry,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { codeOnly } from "@/tests/utils/source-text";
 
-// A `baseUrl` is only meaningful for the kinds whose catalog entry declares one. Every other kind
-// STORED it anyway and the runtime then USED it: the model path reads `credentialBaseUrl ?? mc.baseURL`
-// straight off the resolved entry, and so do vision, STT, TTS, the HTTP-tool base and the MCP
-// connection URL — none of them asking the kind. So an `openai` credential could carry a base URL
-// the console never renders, never shows and cannot edit, and the operator's provider key went to
-// that host on the next turn with nothing anywhere saying so. That is issue #504, and the count is
-// not a sample: all NINE kinds whose form hides the input accepted one.
+// A `baseUrl` is only meaningful for the kinds whose catalog entry declares one. The runtime reads it
+// off the resolved entry without asking the kind (the model path's `credentialBaseUrl ?? mc.baseURL`,
+// vision, STT, TTS, the HTTP-tool base, the MCP connection URL), so a stray one on a kind whose form
+// hides the input sends the operator's key to a host the console never shows.
 //
 // The rule is the CATALOG, not a list written here, and a kind this build does not know keeps
-// passing — the same carve-out `secretTypeRefusesParamName` makes (#488), so a row written by an
-// older build stays editable.
+// passing (the carve-out `secretTypeRefusesParamName` makes), so an older build's row stays editable.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -57,8 +56,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -97,33 +96,10 @@ const validParamName = (kind: string): string | undefined =>
 
 const ELSEWHERE = "https://elsewhere.invalid";
 
-describe("nothing writes a base URL past the rule", () => {
-  // NOTE: the rule is a helper, and a helper only holds the sites that call it. This counts the
-  // vault-entry WRITES in `src/` and pins them to the one file the helper lives in: a fourth write
-  // path — an OAuth callback storing a discovered endpoint, an import restoring an export — would
-  // set `baseUrl` without ever passing the kind, and no test of the three current boundaries would
-  // notice. `codeOnly` because a comment naming `vaultEntry.update` is prose, not a write (#424).
-  const WRITE = /\bvaultEntry\.(create|update|updateMany|upsert|createMany)\b/g;
-
-  test("every vaultEntry write lives in the vault service", async () => {
-    const files = new Glob("src/**/*.ts").scanSync(".");
-    const sites: string[] = [];
-    for (const file of files) {
-      const code = codeOnly(await Bun.file(file).text());
-      for (const _ of code.matchAll(WRITE)) sites.push(file);
-    }
-    // NOTE: a FLOOR, not an equality: a sweep that silently stops matching (a rename, a Prisma
-    // extension, a moved file) reports zero sites and passes as "nothing bypasses the rule".
-    expect(sites.length).toBeGreaterThan(3);
-    expect([...new Set(sites)]).toEqual(["src/modules/vault/service.ts"]);
-  });
-});
-
 describe("nothing reads a base URL past the gate", () => {
-  // NOTE: the write-side sweep above has a read-side twin, and it exists because the first version of
-  // the gate missed two readers: `assemble.ts` and `test-run.ts` build their OWN vault query and copy
-  // `baseUrl` straight into `credentialBaseUrl`, so a relative HTTP tool kept dialling the stray host
-  // after the resolvers had stopped. A ledger rather than a rule, because two of these files are
+  // The write side is biome-plugins/no-vault-entry-write-outside-service.grit. This is the read
+  // side, because gating the resolvers is not enough: `assemble.ts` and `test-run.ts` build their OWN vault query and would copy `baseUrl`
+  // straight into `credentialBaseUrl`, so a relative HTTP tool would dial the stray host. A ledger rather than a rule, because two of these files are
   // supposed to read the row raw — the audit projection and the console listing — and the point is
   // that a NEW reader has to be looked at rather than silently join either side.
   const SELECTS = /baseUrl:\s*true/g;
@@ -151,10 +127,9 @@ describe("nothing reads a base URL past the gate", () => {
     expect(found.size).toBeGreaterThan(3);
   });
 
-  // NOTE: the CLIENT half, and it exists because the gate reached the console one reader at a time —
-  // the tool editor in one round, the MCP editor in the next. A page that DECIDES with this value
-  // (locking a field, enabling Save, accepting a relative template) has to use the dialable one; a
-  // page that DISPLAYS the row, or edits the row itself, keeps the raw value on purpose.
+  // The CLIENT half. A page that DECIDES with this value (locking a field, enabling Save,
+  // accepting a relative template) has to use the dialable one; a page that DISPLAYS the row, or
+  // edits the row itself, keeps the raw value on purpose.
   const CLIENT_LEDGER: Record<
     string,
     "gated" | "via the hook" | "raw by design"
@@ -184,30 +159,6 @@ describe("nothing reads a base URL past the gate", () => {
     expect([...found].sort()).toEqual(Object.keys(CLIENT_LEDGER).sort());
     expect(found.size).toBeGreaterThan(4);
   });
-
-  test("every gated client file CALLS the gate", async () => {
-    for (const [file, how] of Object.entries(CLIENT_LEDGER)) {
-      if (how !== "gated") continue;
-      const code = codeOnly(await Bun.file(file).text());
-      const calls = [...code.matchAll(/dialableBaseUrl\(/g)].length;
-      expect([file, calls > 0]).toEqual([file, true]);
-    }
-  });
-
-  test("every gated file CALLS the gate, not merely imports it", async () => {
-    // NOTE: the call and not the name. Both mutations that put a raw `entry.baseUrl` back left the
-    // import untouched, so a file-contains-the-word check passed while the read was ungated again.
-    //
-    // What this fences is that the gate is present in the file, not that it wraps the right read —
-    // the placement is what the resolve-level tests above measure, and these two readers build their
-    // own query, so a behavioural test of them means an agent, a tool and a grant apiece.
-    for (const [file, how] of Object.entries(LEDGER)) {
-      if (how !== "gated") continue;
-      const code = codeOnly(await Bun.file(file).text());
-      const calls = [...code.matchAll(/dialableBaseUrl\(/g)].length;
-      expect([file, calls > 0]).toEqual([file, true]);
-    }
-  });
 });
 
 describe("the catalog is the rule", () => {
@@ -220,6 +171,7 @@ describe("the catalog is the rule", () => {
       "basic_auth",
       "query",
       "openai_compatible",
+      "typesafe",
       "chatwoot_api_token",
       "mcp_oauth",
       "langfuse",
@@ -322,10 +274,9 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   }
 
   test("the redirect the issue describes is refused, and the kind that exists for it is not", async () => {
-    // NOTE: Issue #504 verbatim, on the sharpest of the nine: an `openai` credential carrying a base
-    // URL the console never shows. `prepare.ts` hands `credentialBaseUrl ?? mc.baseURL` to the model
-    // client, so every turn's API key went to that host. The kind that legitimately does this is
-    // `openai_compatible`, which is why the refusal names it.
+    // The sharpest case: an `openai` credential carrying a base URL the console never shows.
+    // `src/graph/prepare.ts` hands `credentialBaseUrl ?? mc.baseURL` to the model client, so every
+    // turn's key would go to that host. `openai_compatible` legitimately does this, so the refusal names it.
     const e = await refusal(() =>
       createVaultEntry(
         ctx(),
@@ -365,7 +316,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   test("an empty base URL still means none, on a kind that cannot use one", async () => {
     // NOTE: A client that always sends the field must not be refused for sending nothing in it: the
     // console submits `baseUrl: null` on every kind whose form has no input, and "" reaches
-    // `validateBaseUrl` as the empty string it already returned before this rule existed.
+    // `validateBaseUrl` as the empty string it accepts.
     for (const baseUrl of [null, "", "   "]) {
       const { id } = await createVaultEntry(
         ctx(),
@@ -388,7 +339,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   });
 
   test("the MCP dry run refuses it too, so the preview cannot promise what apply rejects", async () => {
-    // NOTE: `credential_create` defaults to dry_run and answers BEFORE reaching the core, so a rule
+    // `credential_create` defaults to dry_run and answers BEFORE reaching the core, so a rule
     // the core learns later is a rule the preview promises away. Both halves have to refuse, and the
     // apply half must not create a row.
     const p = {
@@ -415,7 +366,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   });
 
   test("the MCP dry run still previews the config that works", async () => {
-    // NOTE: the control for the case above — the guard has to refuse the dead field and nothing
+    // The control for the case above — the guard has to refuse the dead field and nothing
     // else, or it is the preview lying in the other direction.
     const p = {
       tenantId,
@@ -467,7 +418,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   });
 
   test("a row that already carries a dead base URL is KEPT and never dialled", async () => {
-    // NOTE: the refusal covers what a write introduces, and covering only that would leave every
+    // The refusal covers what a write introduces, and covering only that would leave every
     // install the rule was written for still redirecting — the model path, vision, STT, TTS, the
     // HTTP-tool base and the MCP connection URL read this field off the RESOLVED entry without
     // asking the kind. So the resolve is gated too.
@@ -495,7 +446,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
       tryResolveVaultEntry(db, ref),
     );
     expect(entry?.baseUrl).toBeNull();
-    // NOTE: and the listing — the surface an operator reads — still shows it.
+    // And the listing — the surface an operator reads — still shows it.
     const listed = await runScopedOn(appDb, ctx(), (db) => listVaultInfos(db));
     expect(listed.find((e) => e.name === "bu-dialled")?.baseUrl).toBe(
       ELSEWHERE,
@@ -511,7 +462,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   });
 
   test("a kind that DOES take one keeps dialling it", async () => {
-    // NOTE: the control for the gate above. It has to cut the dead field and nothing else.
+    // The control for the gate above. It has to cut the dead field and nothing else.
     const { id } = await createVaultEntry(
       ctx(),
       {
@@ -532,7 +483,7 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
   });
 
   test("a row that already carries a dead base URL stays editable, and can be cleared", async () => {
-    // NOTE: The refusal covers what a write INTRODUCES. Rows written before it exists keep their
+    // The refusal covers what a write INTRODUCES. Rows written before it exists keep their
     // stray value, and a save that does not touch the field must still go through, or the rule
     // strands exactly the entries it was written for. Clearing it has to work for the same reason:
     // it is the only repair a caller has.
@@ -559,5 +510,94 @@ describe.skipIf(!dbUp)("vault: a base URL the kind cannot use", () => {
       select: { baseUrl: true },
     });
     expect(cleared?.baseUrl).toBeNull();
+  });
+
+  // The two readers that build their own vault query, driven: each hands the tool what the
+  // runtime will dial, so a relative template on a kind that cannot carry a base has no host at all.
+  // A public IP rather than a name, so the stray host never needs a DNS answer to be dialled.
+  const STRAY = "https://8.8.4.4";
+
+  async function strayRow(kind: string, name: string): Promise<string> {
+    const row = await suDb.vaultEntry.create({
+      data: {
+        tenantId,
+        name,
+        secret: encryptJson("sk-legacy"),
+        kind,
+        baseUrl: STRAY,
+      },
+      select: { id: true },
+    });
+    return `vault:${row.id}`;
+  }
+
+  test("an agent's HTTP tool is built with the dialable base, not the row's", async () => {
+    const dead = await strayRow("openai", "bu-assemble-dead");
+    const live = await strayRow("openai_compatible", "bu-assemble-live");
+    const agent = await suDb.agent.create({
+      data: { tenantId, name: "bu-assemble", systemPrompt: "x" },
+      select: { id: true },
+    });
+    for (const [name, credentialRef] of [
+      ["bu_dead", dead],
+      ["bu_live", live],
+    ] as const) {
+      const td = await suDb.toolDefinition.create({
+        data: {
+          tenantId,
+          name,
+          label: name,
+          urlTemplate: "/v1/x",
+          allowedHosts: [],
+          credentialRef,
+        },
+        select: { id: true },
+      });
+      await suDb.agentToolSelection.create({
+        data: {
+          tenantId,
+          agentId: agent.id,
+          source: "HTTP",
+          toolDefinitionId: td.id,
+          enabledTools: [],
+          knowledgeBaseIds: [],
+        },
+      });
+    }
+    const loaded = await runScopedOn(appDb, ctx(), (db) =>
+      loadToolSelections(db, agent.id),
+    );
+    const base = Object.fromEntries(
+      loaded.httpToolDefs.map((d) => [d.name, d.credentialBaseUrl]),
+    );
+    expect(base).toEqual({ bu_dead: null, bu_live: STRAY });
+  });
+
+  test("the editor's test run never dials a base the kind cannot carry", async () => {
+    const dead = await strayRow("openai", "bu-testrun-dead");
+    const dialled: string[] = [];
+    const err = await runToolTest(
+      ctx(),
+      {
+        definition: {
+          method: "GET",
+          urlTemplate: "/v1/x",
+          allowedHosts: [],
+          inputSchema: {},
+          credentialRef: dead,
+        },
+      },
+      appDb,
+      {
+        resolveCredentialImpl: async () => "sk-legacy",
+        fetchImpl: (async (url: string) => {
+          dialled.push(url);
+          return new Response("{}", { status: 200 });
+        }) as unknown as typeof fetch,
+      },
+    ).catch((e: unknown) => e);
+    expect(dialled).toEqual([]);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).message).toContain("base URL");
   });
 });

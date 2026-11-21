@@ -1,8 +1,9 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
 import { unstorableProblem } from "@/lib/text";
+import * as agentsService from "@/modules/agents/service";
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
 import { truncForAudit } from "@/modules/audit/projection";
@@ -20,6 +21,7 @@ import {
   tenantUpdate,
 } from "@/modules/mcp/write";
 import { langfuseConnect } from "@/modules/mcp/write-settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // MCP write tools: the security gate (scope + tenant target) is DB-free and always runs; the
 // dry-run/apply/audit path and cross-tenant fencing need a real Postgres (skipIf).
@@ -258,12 +260,6 @@ describe("MCP write gate (no DB)", () => {
     if (!r.ok) expect(r.error).toContain("insufficient_scope");
   });
 
-  test("agent_settings_set with no blocks → error before any DB access", async () => {
-    const r = await agentSettingsSet(principal({}), { agent_id: "1" });
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error).toContain("no updatable fields");
-  });
-
   test("agent_settings_set invalid agent_id → error", async () => {
     const r = await agentSettingsSet(principal({}), {
       agent_id: "nope",
@@ -324,58 +320,57 @@ describe("MCP write gate (no DB)", () => {
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
-// EVERY BLOCK THIS TOOL PUBLISHES IS A BLOCK IT ACTUALLY WRITES.
-//
-// `agentSettingsSet` used to copy the args into its patch with one `if (args.X !== undefined)` line
-// per block, seventeen of them, and the eighteenth went in without one. `modelFallback` was in the
-// tool's schema, accepted by the parser, and dropped on the floor: a fallback-only call answered
-// "no updatable fields provided" and a call that also carried some other block succeeded while
-// ignoring the fallback entirely. Nothing failed; the tool reported success for a write it did not
-// make.
-//
-// The copy is a loop over `BEHAVIOR_PATCH_SHAPE` now, so this fence is not what stops the next one —
-// it is what proves the loop is still wired to the schema rather than to a list that drifted from
-// it. Keyed on the schema, DB-free, and one test per block so a failure names the block.
+// EVERY BLOCK THIS TOOL PUBLISHES IS A BLOCK IT ACTUALLY WRITES. A block in the tool's schema that
+// the patch copy skips is dropped on the floor: a call with only that block answers "no updatable
+// fields provided", and a call that also carries another block succeeds while ignoring it. The copy
+// is a loop over `BEHAVIOR_PATCH_SHAPE`, so this fence proves the loop is still wired to the schema
+// rather than to a list that drifted from it. Keyed on the schema, DB-free, and one test per block
+// so a failure names the block.
 describe("agent_settings_set writes every block it advertises", () => {
   const KEYS = Object.keys(
     BEHAVIOR_PATCH_SHAPE,
   ) as (keyof typeof BEHAVIOR_PATCH_SHAPE)[];
 
-  // "Did this key reach the patch" and nothing more. Past the patch the call needs a row, so what it
-  // answers there — not found, or a database that is not up — is not this test's subject; the one
-  // answer that means the key was dropped is the refusal that lists the accepted fields.
-  const reachedThePatch = async (key: string): Promise<boolean> => {
+  // The patch the first check after the copy receives. The agent read and that check are stubbed, so
+  // the probe needs no row and stops there; undefined means the call never got that far.
+  const patchFor = async (key: string): Promise<unknown> => {
+    let seen: unknown;
+    const read = spyOn(agentsService, "getAgent").mockResolvedValue({
+      settings: {},
+    } as never);
+    const sizes = spyOn(
+      agentsService,
+      "assertSettingsTextSizes",
+    ).mockImplementation((patch) => {
+      seen = structuredClone(patch);
+      throw new Error("the probe stops here");
+    });
     try {
-      const r = await agentSettingsSet(principal({}), {
+      await agentSettingsSet(principal({}), {
         agent_id: "1",
-        [key]: {},
-      } as never);
-      return r.ok || !r.error.includes("no updatable fields");
-    } catch {
-      return true;
+        [key]: { probe: key },
+      } as never).catch(() => undefined);
+    } finally {
+      read.mockRestore();
+      sizes.mockRestore();
     }
+    return seen;
   };
 
   for (const key of KEYS) {
     test(`${key} reaches the patch on its own`, async () => {
-      expect(await reachedThePatch(key)).toBe(true);
+      expect(await patchFor(key)).toEqual({ [key]: { probe: key } });
     });
   }
 
-  // POSITIVE CONTROL. Without it, a probe that answered `true` for anything at all would report the
-  // whole schema as wired and be unable to tell that from the code being right.
+  // POSITIVE CONTROL. Without it, a probe that answered for anything at all would report the whole
+  // schema as wired and be unable to tell that from the code being right.
   test("a block the schema does not publish does NOT reach it", async () => {
-    expect(await reachedThePatch("nonesuch")).toBe(false);
+    expect(await patchFor("nonesuch")).toBeUndefined();
   });
 
-  test("the scan sees the real schema, including the newest block", () => {
-    expect(KEYS.length).toBeGreaterThanOrEqual(18);
-    expect(KEYS).toContain("modelFallback");
-  });
-
-  // The refusal is the operator's only list of what this tool takes, so it is derived from the same
-  // keys rather than typed out beside them — it named seventeen blocks while the schema had
-  // eighteen, and the missing one was exactly the block a caller would have been refused for.
+  // NOTE: The refusal is the operator's only list of what this tool takes, so it is derived from the same
+  // keys rather than typed out beside them, where it would drift from the schema.
   test("and the refusal names every one of them", async () => {
     const r = await agentSettingsSet(principal({}), { agent_id: "1" });
     expect(r.ok).toBe(false);
@@ -398,8 +393,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -592,9 +587,9 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
       expect(r.data.status).toBe("pending");
       expect(String(r.data.ref)).toMatch(/^vault:\d+$/);
       expect(String(r.data.fillAt)).toContain("/resources/vault?fill=");
-      // Issue #151: the link has to name the tenant the entry belongs to. The console resolves the
-      // tenant from localStorage, so without this a fleet-level session's link opens whatever tenant
-      // the recipient's browser had selected, and the id is simply absent there.
+      // NOTE: The link has to name the tenant the entry belongs to. The console resolves the tenant from
+      // localStorage, so without this a fleet-level session's link opens whatever tenant the recipient's
+      // browser had selected, and the id is simply absent there.
       expect(String(r.data.fillAt)).toContain(`&switchTenant=${tenantA}`);
     }
     const row = await suDb.vaultEntry.findFirst({
@@ -608,6 +603,49 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     expect(audits).toHaveLength(1);
     // The audit projection must never carry a secret (the tool never receives one).
     expect(JSON.stringify(audits[0]?.after ?? {})).not.toContain("sk-");
+  });
+
+  test("credential_create for langfuse carries the .env paste hint in the preview and the result", async () => {
+    const p = principal({ tenantId: tenantA });
+    const args = {
+      name: "lf-pending",
+      kind: "langfuse",
+      base_url: "https://langfuse.example.com",
+    };
+    try {
+      const dry = await credentialCreate(p, args, { base: appDb });
+      const applied = await credentialCreate(
+        p,
+        { ...args, dry_run: false },
+        { base: appDb },
+      );
+      expect(dry.ok && applied.ok).toBe(true);
+      if (!dry.ok || !applied.ok) return;
+      const preview = dry.data.preview as { fillHint?: string };
+      for (const hint of [
+        String(preview.fillHint),
+        String(applied.data.fillHint),
+      ]) {
+        expect(hint).toContain("Langfuse .env");
+        expect(hint).toContain("API Keys");
+      }
+      if (applied.ok) expect(String(applied.data.fillAt)).toContain("fill=");
+    } finally {
+      await suDb.vaultEntry.deleteMany({
+        where: { tenantId: tenantA, name: "lf-pending" },
+      });
+    }
+  });
+
+  test("credential_create for a kind without a paste shortcut returns no fillHint", async () => {
+    const p = principal({ tenantId: tenantA });
+    const r = await credentialCreate(
+      p,
+      { name: "no-hint", kind: "openai", dry_run: false },
+      { base: appDb },
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect("fillHint" in r.data).toBe(false);
   });
 
   test("resolveSecretRef resolves a PENDING entry to its ref (wiring works before fill)", async () => {
@@ -689,10 +727,120 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     expect(audits).toBe(0);
   });
 
-  // Operator prose (handoff/kanban/tool guidance, guardrails policy, vision prompt, follow-up steps)
-  // is clamped by the readers, so an over-cap note used to come back as a SUCCESSFUL diff already
-  // showing the shortened value, which reads as "applied" rather than "cut". The dry run is checked
-  // too: a preview that promises a write the apply would refuse is worse than no preview.
+  // The bug it catches: the factual-grounding rewrite's cap saved above the agent's own turn limit,
+  // which the schema cannot see because the limit lives in another block. Both halves are asked:
+  // the MCP preview on the merged bag (the limit stored, or arriving in the same patch) and REST.
+  test("the rewrite's cap stops at limits.maxToolCalls: under 8, MCP and REST accept 8 and refuse 9", async () => {
+    await suDb.agent.update({
+      where: { id: agentA },
+      data: { settings: { limits: { maxToolCalls: 8 } } },
+    });
+    const since = new Date();
+    try {
+      const p = principal({ tenantId: tenantA });
+      const preview = async (args: Record<string, unknown>) => {
+        const r = await agentSettingsSet(
+          p,
+          { agent_id: String(agentA), ...args } as never,
+          { base: appDb },
+        );
+        return r.ok ? "ok" : r.error;
+      };
+      const cap = (n: number) => ({
+        guardrails: { factualGrounding: { reviseMaxToolCalls: n } },
+      });
+      expect(await preview(cap(8))).toBe("ok");
+      expect(await preview(cap(9))).toContain(
+        "guardrails.factualGrounding.reviseMaxToolCalls",
+      );
+      // The limit raised in the same patch is the one the cap is judged against.
+      expect(await preview({ ...cap(9), limits: { maxToolCalls: 9 } })).toBe(
+        "ok",
+      );
+      expect(
+        await preview({ ...cap(8), limits: { maxToolCalls: 7 } }),
+      ).not.toBe("ok");
+      const ctx = { tenantId: tenantA, userId: null, role: "TENANT_ADMIN" };
+      const write = (n: number) =>
+        agentsService
+          .updateAgent(
+            ctx as never,
+            agentA,
+            {
+              settings: {
+                limits: { maxToolCalls: 8 },
+                guardrails: { factualGrounding: { reviseMaxToolCalls: n } },
+              },
+            },
+            appDb,
+          )
+          .then(
+            () => "ok",
+            (e: { statusCode?: number }) => e.statusCode,
+          );
+      expect([await write(9), await write(8)]).toEqual([422, "ok"]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentA },
+        data: { settings: {} },
+      });
+      // A sibling counts this tenant's audits: the one the REST write recorded goes with it.
+      await suDb.auditLog.deleteMany({
+        where: { tenantId: tenantA, createdAt: { gte: since } },
+      });
+    }
+  });
+
+  // The voice provider's agent id is the server's (the call setup writes it): a write's own value is
+  // ignored by the apply, so the preview must not promise it either.
+  test("agent_settings_set previews the stored voice provider id, as the apply keeps it", async () => {
+    await suDb.agent.update({
+      where: { id: agentA },
+      data: { settings: { calls: { providerAgentId: "agent_stored" } } },
+    });
+    const since = new Date();
+    try {
+      const p = principal({ tenantId: tenantA });
+      const args = {
+        agent_id: String(agentA),
+        calls: { providerAgentId: "agent_other", maxDurationSecs: 300 },
+      };
+      const preview = await agentSettingsSet(p, args, { base: appDb });
+      expect(preview.ok).toBe(true);
+      const text = JSON.stringify(preview.ok ? preview.data.diff : null);
+      expect(text).toContain("300");
+      expect(text).not.toContain("agent_other");
+      const applied = await agentSettingsSet(
+        p,
+        { ...args, dry_run: false },
+        { base: appDb },
+      );
+      expect(applied.ok).toBe(true);
+      const row = await suDb.agent.findUnique({ where: { id: agentA } });
+      expect(
+        (row?.settings as { calls?: { providerAgentId?: string } } | undefined)
+          ?.calls?.providerAgentId,
+      ).toBe("agent_stored");
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentA },
+        data: { settings: {} },
+      });
+      // A sibling counts this tenant's settings audits: the one this apply wrote goes with it.
+      await suDb.auditLog.deleteMany({
+        where: {
+          tenantId: tenantA,
+          action: "agent.settings_set",
+          createdAt: { gte: since },
+        },
+      });
+    }
+  });
+
+  // NOTE: Operator prose (handoff/kanban/tool guidance, guardrails policy, vision prompt, follow-up steps) is
+  // clamped by the readers, so an over-cap note would come back as a SUCCESSFUL diff already showing
+  // the shortened value, which reads as "applied" rather than "cut". The dry run is checked too: a
+  // preview that promises a write the apply would refuse is worse than no preview.
   test("agent_settings_set refuses over-cap guidance, on the preview and on the apply", async () => {
     const p = principal({ tenantId: tenantA });
     const boom = "h".repeat(TOOL_INSTRUCTIONS_MAX + 1);
@@ -752,11 +900,10 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
     );
   });
 
-  // #614 fenced the REST bag: a `settings` write that omits blocks the row holds is refused. The MCP
-  // patch reaches the SAME service function and must not be caught by it, because
-  // `mergeBehaviorSettings` starts from a copy of the stored bag, so by the time `updateAgent` sees
-  // it every stored key is present. Asked here rather than assumed: the fence protects this path too
-  // the day that merge stops carrying a key, which is the failure it would otherwise hide.
+  // NOTE: A REST `settings` write that omits blocks the row holds is refused. The MCP patch reaches the SAME
+  // service function and must not be caught by it: `mergeBehaviorSettings` starts from a copy of the
+  // stored bag, so by the time `updateAgent` sees it every stored key is present. Asked here rather
+  // than assumed, so the day that merge stops carrying a key the failure shows instead of hiding.
   test("a one-block MCP patch still applies on an agent with other blocks configured", async () => {
     const p = principal({ tenantId: tenantLegacy });
     const ag = await suDb.agent.create({
@@ -1076,18 +1223,12 @@ describe.skipIf(!dbUp)("MCP write tools (DB)", () => {
   });
 });
 
-// `brandingAssetSet` takes a Prisma client precisely so the caller decides which database the tool
-// answers from, and then read the CURRENT branding off the module-level client instead. The row it
-// reported as "already there" came from a different database than the one it was about to write.
-// Issue #502.
-//
-// Nothing reached it before: every other branding_asset_set test in this file refuses ahead of the
-// read (wrong scope, wrong kind, wrong mime, bad base64), and the dry-run fence's row for this tool
-// refuses on `content_base64` for the same reason. `brandingSet` had the identical defect and #490
-// fixed it because that tool had to be measurable; this is the sibling that was left behind.
-//
-// `app_branding` is a fleet singleton (id 1, no tenant column, outside RLS), so seeding it is a
-// global mutation rather than a per-tenant one. The block restores whatever it found.
+// `brandingAssetSet` takes a Prisma client so the caller decides which database the tool answers
+// from, and it reads the CURRENT branding off that same client: read off the module-level one, the
+// row it reports as "already there" would come from a different database than the one it writes.
+// Every other branding_asset_set test refuses ahead of the read, and the dry-run fence's row refuses
+// on `content_base64`, so this block is what reaches it. `app_branding` is a fleet singleton (id 1,
+// no tenant column, outside RLS), so seeding it is a global mutation; the block restores what it found.
 describe.skipIf(!dbUp)(
   "branding_asset_set reads through the client it was handed",
   () => {

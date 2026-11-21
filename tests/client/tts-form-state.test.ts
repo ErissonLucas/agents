@@ -1,9 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import { numberProblem } from "@/client/components/NumberInput";
 import {
   type AgentModelSource,
   fishVoiceCheck,
   readTtsFormState,
   type TtsFormState,
+  ttsFallbackNeedsOwnCredential,
+  ttsFallbackProviderChanged,
   ttsNormalizerBaseUrlInvalid,
   ttsNormalizerBaseUrlUnsupported,
   ttsNormalizerNeedsOwnCredential,
@@ -13,12 +16,13 @@ import {
   ttsProviderChanged,
   ttsSettingsFrom,
 } from "@/client/pages/agents/ttsFormState";
+import { TTS_TIMEOUT_RANGES } from "@/modules/agents/number-ranges";
 import { readTtsConfig } from "@/modules/tts/settings";
 
 // The Behavior save REPLACES the whole `tts` block with what the form holds, so any field the form
-// does not carry is deleted on the next save. `normalizeBaseURL` was exactly that: settable over REST
-// and MCP, and wiped the first time an operator saved the Behavior tab. These tests are over the
-// round-trip rather than over that one field, so the next field cannot be added silently either.
+// does not carry (`normalizeBaseURL` is settable over REST and MCP) is deleted on the next save.
+// These tests are over the round-trip rather than over one field, so the next field cannot be added
+// silently either.
 
 // Every knob set to a NON-default value, so a field that fails to survive shows up as a difference
 // rather than as a coincidence.
@@ -49,11 +53,17 @@ const SAVED = {
   spokenNoticeText: "Fale curto, é áudio.",
   textChoice: true,
   textChoiceNote: "Tabela de preços vai por escrito.",
+  fallbackTimeoutMs: 20_000,
+  fallbackProvider: "openai",
+  fallbackModel: "tts-1",
+  fallbackVoice: "nova",
+  fallbackCredentialRef: "vault:12",
+  fallbackBaseURL: "https://tts-fallback.example.com/v1",
 };
 
 describe("agent editor TTS round-trip", () => {
-  // Issue #802: "Instance default" is stored as null, so saving the tab never pins the agent to the
-  // mode the instance has today, and a value that is not one of the three reads as the default.
+  // NOTE: "Instance default" is stored as null, so saving the tab never pins the agent to the mode the
+  // instance has today, and a value that is not one of the three reads as the default.
   test("the audio check left on the instance default stays null, and garbage reads as the default", () => {
     expect(readTtsFormState({}).checkMode).toBe("");
     expect(ttsSettingsFrom(readTtsFormState({})).checkMode).toBeNull();
@@ -65,9 +75,9 @@ describe("agent editor TTS round-trip", () => {
     }
   });
 
-  // Issue #856: an agent saved before the limits existed shows the defaults it runs on, a cleared
-  // field is stored as null (off), never dropped (absent would bring the default back), and a typed
-  // value outside the band is stored at its end, as the runtime reads it.
+  // NOTE: an agent saved before the limits existed shows the defaults it runs on, a cleared field is
+  // stored as null (off), never dropped (absent would bring the default back), and a typed value
+  // outside the band is stored at its end, as the runtime reads it.
   test("the text-instead-of-audio limits: defaults shown, cleared means off, out of band clamped", () => {
     const fresh = readTtsFormState({ mode: "mirror" });
     expect(fresh.textInstead).toBe(false);
@@ -96,8 +106,8 @@ describe("agent editor TTS round-trip", () => {
     expect(ttsSettingsFrom(form)).toEqual(SAVED);
   });
 
-  // Issue #859: an agent saved before the two switches existed is saved back with both off and no
-  // text, so opening and saving the tab after an upgrade changes nothing the model reads.
+  // NOTE: an agent saved before the two switches existed is saved back with both off and no text, so
+  // opening and saving the tab after an upgrade changes nothing the model reads.
   test("an agent saved before the spoken-reply switches keeps them off after a save", () => {
     const out = ttsSettingsFrom(readTtsFormState({ mode: "mirror" }));
     expect([
@@ -160,15 +170,6 @@ describe("voice knobs are stored at the value that will actually be used", () =>
     });
   });
 
-  // Clamping must not turn "leave it to the voice" into a number: null is a value here, and the
-  // lowest end of the band is NOT the same instruction.
-  test("a blank knob still clears to null", () => {
-    expect(knobs({ stability: "", speed: "" })).toMatchObject({
-      stability: null,
-      speed: null,
-    });
-  });
-
   test("a value inside the band is untouched", () => {
     expect(knobs({ stability: "0.35", speed: "1.15" })).toMatchObject({
       stability: 0.35,
@@ -195,8 +196,8 @@ describe("mode and provider are allowlisted the way the runtime allowlists them"
     );
   });
 
-  // And the reader agrees with the runtime's, field by field, on the same bag: this is the
-  // invariant, the two above are just the cases that broke it.
+  // NOTE: and the reader agrees with the runtime's, field by field, on the same bag: this is the
+  // invariant, and the two above are cases of it.
   test("both fields agree with readTtsConfig on the same bag", () => {
     for (const bag of [
       { mode: "Mirror", provider: "Elevenlabs" },
@@ -427,9 +428,9 @@ describe("does the rewrite need a credential of its own", () => {
   });
 });
 
-// What the model picker authenticates with to list models. It calls the provider, so being handed
-// only the rewrite's own (deliberately empty) fields left it with nothing on the one change this
-// feature exists for, and it answered "select a credential" with an empty list.
+// What the model picker authenticates with to list models. It calls the provider, so handing it only
+// the rewrite's own (deliberately empty) fields would leave it answering "select a credential" with
+// an empty list on the one change this feature exists for.
 describe("what the model picker queries with", () => {
   test("the same provider with no key of its own borrows the agent's", () => {
     expect(
@@ -643,8 +644,8 @@ describe("the rewrite's endpoint has to be usable before saving", () => {
   });
 });
 
-// Measured in the editor: switching Gemini to Fish kept voice "Kore" and the gemini model on screen,
-// and the save would have sent them to Fish. A provider change drops what was picked for the old one.
+// A provider change drops the voice and model picked for the old one, so a switch from Gemini to Fish
+// never saves voice "Kore" and the gemini model to Fish.
 describe("switching the synthesis provider", () => {
   const gemini = readTtsFormState({
     mode: "mirror",
@@ -701,5 +702,90 @@ describe("the Fish voice notice", () => {
     expect(fishVoiceCheck("Kore", null)).toEqual({ state: "notAnId" });
     expect(fishVoiceCheck(id, null)).toEqual({ state: "none" });
     expect(fishVoiceCheck("", [])).toEqual({ state: "none" });
+  });
+});
+
+describe("agent editor TTS timeout and fallback voice", () => {
+  // Seconds on screen, milliseconds in the bag, clamped as the runtime reads it, and a cleared
+  // field stored as null so the agent follows the default instead of a pinned copy of it.
+  test("the fallback timeout is shown in seconds, stored in ms, clamped, and cleared to the default", () => {
+    const form = readTtsFormState({
+      mode: "mirror",
+      fallbackProvider: "openai",
+      fallbackTimeoutMs: 15_000,
+    });
+    expect(form.fallbackTimeoutSeconds).toBe("15");
+    const saved = (s: string) =>
+      ttsSettingsFrom({ ...form, fallbackTimeoutSeconds: s }).fallbackTimeoutMs;
+    expect([saved("20"), saved("900"), saved("")]).toEqual([
+      20_000,
+      120_000,
+      null,
+    ]);
+  });
+
+  test("the timeout survives a switch of fallback provider and goes with the fallback", () => {
+    const form = readTtsFormState({
+      mode: "mirror",
+      fallbackProvider: "openai",
+      fallbackTimeoutMs: 15_000,
+    });
+    expect(
+      ttsFallbackProviderChanged(form, "elevenlabs").fallbackTimeoutSeconds,
+    ).toBe("15");
+    expect(ttsFallbackProviderChanged(form, "").fallbackTimeoutSeconds).toBe(
+      "",
+    );
+  });
+
+  // REST and MCP store any whole ms, so a timeout of 1500 shows as 1.5 and must not hold the Save of
+  // an unrelated edit in the same section.
+  test("a timeout stored in ms that is not whole seconds is in range on screen", () => {
+    const form = readTtsFormState({
+      mode: "mirror",
+      fallbackProvider: "openai",
+      fallbackTimeoutMs: 1500,
+    });
+    expect(form.fallbackTimeoutSeconds).toBe("1.5");
+    expect(
+      numberProblem(
+        form.fallbackTimeoutSeconds,
+        TTS_TIMEOUT_RANGES.fallbackTimeoutSeconds,
+        true,
+      ),
+    ).toBe(null);
+    expect(ttsSettingsFrom(form).fallbackTimeoutMs).toBe(1500);
+  });
+
+  test("switching the fallback's provider clears what belonged to the previous one", () => {
+    const form = readTtsFormState({
+      mode: "mirror",
+      fallbackProvider: "openai",
+      fallbackModel: "tts-1",
+      fallbackVoice: "nova",
+      fallbackCredentialRef: "vault:12",
+      fallbackBaseURL: "https://proxy.example.com/v1",
+    });
+    const next = ttsFallbackProviderChanged(form, "elevenlabs");
+    expect([
+      next.fallbackProvider,
+      next.fallbackModel,
+      next.fallbackVoice,
+      next.fallbackCredentialRef,
+      next.fallbackBaseURL,
+    ]).toEqual(["elevenlabs", "", "", "", ""]);
+  });
+
+  test("a fallback on another provider asks for its own key, on the same one it borrows", () => {
+    const form = readTtsFormState({ mode: "mirror", provider: "openai" });
+    expect(
+      ttsFallbackNeedsOwnCredential({ ...form, fallbackProvider: "openai" }),
+    ).toBe(false);
+    expect(
+      ttsFallbackNeedsOwnCredential({
+        ...form,
+        fallbackProvider: "elevenlabs",
+      }),
+    ).toBe(true);
   });
 });

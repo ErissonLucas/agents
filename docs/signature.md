@@ -35,7 +35,7 @@ The defaults match too, `top` included.
 
 Both answers are needed before a customer sees anything: `enabled` says whether to sign, `text` says what with. An enabled block with an empty text signs nothing, and that is not an error state, it is an operator who has not finished.
 
-**The field seeds itself once.** The first time the switch goes on over an empty field, the editor fills it with `**{{nome_agente}}**`, the agent's own name in bold, which is the signature most operators write by hand. It only ever seeds an empty field: turning the switch off keeps what you wrote, and seeding over a kept text would hand it back with the other hand.
+**The field seeds itself once.** The first time the switch goes on over an empty field, the editor fills it with `**{{nome_agente}}**`, the agent's own name in bold, which is the signature most operators write by hand. It only ever seeds an empty field: turning the switch off keeps what you wrote, and seeding over a kept text would hand it back with the other hand. The seed is the switch's suggestion, not your text, so turning the switch straight back off over it, untouched, gives back what the field held before (empty): on and off again is no change, and the tab is not marked as edited (issue #1440). The editor remembers the form the switch seeded, across the editor's tabs, and only that exact form is undone: once you edit the field (even typing the seed back), save, or reload, the text is yours and turning the switch off keeps it, as it keeps a seed you typed by hand.
 
 ## Position and repetition are the same decision
 
@@ -169,6 +169,8 @@ The "insert a variable" chips under the field offer the **context** vars only, n
 A chip whose token does not fit in what is left before the cap is **disabled**, with the reason on hover, and the insert refuses the same case on its own. Clipping an insert is not the same defect as clipping a paste: the caret is at the front and the loss is at the back, so the operator watches a variable appear where they asked while a URL loses its tail where they are not looking. A selection counts as free room, because the insert replaces it.
 
 An unknown placeholder is **left standing**, not blanked. That is `interpolatePromptVars`'s own rule, and it is what makes a typo visible on the customer's screen instead of silently deleting the operator's text.
+
+Chatwoot then renders the whole message as Liquid, and the signature keeps that: `{{contact.name}}` in a signature is filled by Chatwoot as before. The model's text beside it is not, since issue #943: `attachSignature` takes a `body` function applied to each chunk's own text and never to the signature, and every Chatwoot send passes `literalForChatwoot` there (see [`chatwoot.md`](chatwoot.md)). The dedupe still reads the chunks as the model wrote them.
 
 ## The playground signs the live turn, and the reload does not
 

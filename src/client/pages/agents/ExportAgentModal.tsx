@@ -15,10 +15,13 @@ import {
 export function ExportAgentModal({
   modal,
   anyDirty,
+  saving,
   onExport,
 }: {
   modal: ModalController;
   anyDirty: boolean;
+  // A save of the editor's is running: exporting now would read, or write, beside it.
+  saving: boolean;
   onExport: (opts: {
     includeComponents: boolean;
     includeDocuments: boolean;
@@ -59,6 +62,7 @@ export function ExportAgentModal({
       modal={modal}
       size="md"
       title={t("editor.exportModalTitle", "Export agent")}
+      busy={busy}
       footer={
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Button
@@ -74,15 +78,20 @@ export function ExportAgentModal({
                 variant="secondary"
                 onClick={() => run(false)}
                 loading={busy}
+                disabled={saving}
               >
                 {t("editor.exportSaved", "Export saved version")}
               </Button>
-              <Button onClick={() => run(true)} loading={busy}>
+              <Button
+                onClick={() => run(true)}
+                loading={busy}
+                disabled={saving}
+              >
                 {t("editor.saveAndExport", "Save and export")}
               </Button>
             </>
           ) : (
-            <Button onClick={() => run(false)} loading={busy}>
+            <Button onClick={() => run(false)} loading={busy} disabled={saving}>
               {t("editor.export", "Export")}
             </Button>
           )}
@@ -95,7 +104,7 @@ export function ExportAgentModal({
             <label
               htmlFor={switchId}
               data-clickable="true"
-              className="font-medium text-sm text-text-primary"
+              className="text-text-primary text-sm font-medium"
             >
               {t("editor.exportIncludeComponents", "Include full components")}
             </label>
@@ -124,7 +133,7 @@ export function ExportAgentModal({
             <label
               htmlFor={documentsSwitchId}
               data-clickable="true"
-              className="font-medium text-sm text-text-primary"
+              className="text-text-primary text-sm font-medium"
             >
               {t(
                 "editor.exportIncludeDocuments",
@@ -150,7 +159,7 @@ export function ExportAgentModal({
           />
         </div>
         {anyDirty && (
-          <p className="rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+          <p className="border-warning bg-warning-soft text-text-primary rounded-lg border px-3 py-2 text-xs">
             {t(
               "editor.exportUnsavedNote",
               "You have unsaved changes. Save first to export the current version, or export the last saved one.",

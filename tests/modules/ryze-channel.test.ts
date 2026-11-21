@@ -18,6 +18,7 @@ import { drainEmits, setBotDeliverer } from "@/modules/ryze/emit";
 import { setRyzeClientFactory } from "@/modules/ryze/emulator";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import { connectRyzeGateway } from "@/modules/ryze/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { outboundUrl } from "../utils/outbound";
 
 // The RyzeAPI channel end to end, minus the model: connecting a number, binding an agent, a customer
@@ -41,8 +42,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

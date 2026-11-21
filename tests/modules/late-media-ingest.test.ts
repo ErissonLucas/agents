@@ -1,26 +1,24 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { fileURLToPath } from "node:url";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { LEDGER_READ_HORIZON_MS } from "@/modules/chatwoot/ledger-retention";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import {
   fillLedgerTranscribedMessage,
   processChatwootDelivery,
   recordAndProcessChatwootDelivery,
 } from "@/modules/chatwoot/webhook";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // Some transports emit `message_created` with no attachment and hang the voice note on a
-// `message_updated` a moment later. The receiver ANALYSED that update — `hasPendingInboundMediaUpdate`
-// sends it to the eager pass — but never ingested it, because continuous ingestion asked
-// `isNewIncomingMessage`, which a `message_updated` is not. The creation had nothing renderable and
-// appended nothing, so the transcription the provider was paid for reached no memory at all
-// (issue #478).
-//
-// Offline by construction: the transcription rides on the ATTACHMENT, which `runEagerMedia` reuses
-// verbatim ("never re-transcribe"), so no provider is reached and no model is asked for.
+// `message_updated` a moment later. The receiver analyses that update (`hasPendingInboundMediaUpdate`
+// sends it to the eager pass), and it has to ingest it too: ingestion keyed on `isNewIncomingMessage`
+// skips an update, the creation had nothing renderable, and the paid transcription would reach no
+// memory. Offline by construction: the transcription rides on the ATTACHMENT, which `runEagerMedia`
+// reuses verbatim ("never re-transcribe"), so no provider is reached and no model is asked for.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -37,8 +35,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -55,7 +53,7 @@ const WATCHED_CONV_ID = 9742;
 const OBSERVER_BOT_ID = 79;
 // An inbox with BOTH: a responder of ours and the same watcher beside it. The shape where the
 // observer must NOT remember on its own, because the responder's own delivery of the same message
-// already did (issue #478 review, round 1).
+// already did.
 const BOTH_INBOX_ID = 4713;
 const BOTH_CONV_ID = 9743;
 // The same inbox, on a conversation the bot may act on: `pending` and unassigned. `act` is read from
@@ -78,9 +76,9 @@ function lateAudio(
     transcribed: boolean;
     conversationId?: number;
     chatwootInboxId?: number;
-    // The conversation is the bot's and nobody has taken it: `act` is true, which is the reading
-    // issue #576 is about on an update.
+    // NOTE: The conversation is the bot's and nobody has taken it: `act` is true, on an update too.
     ownedByBot?: boolean;
+    createdAt?: Date;
   },
 ) {
   const convId =
@@ -91,6 +89,7 @@ function lateAudio(
     content: "",
     message_type: "incoming",
     private: false,
+    ...(opts.createdAt ? { created_at: opts.createdAt.toISOString() } : {}),
     attachments: [
       {
         id: 90 + messageId,
@@ -123,15 +122,16 @@ function lateAudio(
 
 // A client whose scheduler writes for an ingestion all throw: the transient failure the arm is
 // retried against, driven to the end of its retries.
-function failingIngest() {
+function failingIngest(onArm: () => Promise<void> = async () => {}) {
   return appDb.$extends({
     query: {
       schedulerJob: {
-        $allOperations({ args, query }) {
+        async $allOperations({ args, query }) {
           const shape = JSON.stringify(args, (_k, v) =>
             typeof v === "bigint" ? String(v) : v,
           );
           if (shape.includes("INGEST_MESSAGE")) {
+            await onArm();
             throw new Error("injected: scheduler unavailable");
           }
           return query(args);
@@ -313,10 +313,9 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
       },
       select: { id: true },
     });
-    // The inbox with a responder AND a watcher. The binding is stamped NOW, which is what forces
+    // The inbox with a responder AND a watcher. The binding is stamped NOW, which forces
     // `responderCoversMessage` past its clock shortcuts and onto the ledger: a binding older than the
-    // event answers "covered" without looking, and then the test would prove nothing about the
-    // sibling lookup this round is here to fix.
+    // event answers "covered" without looking, and the test would prove nothing about the sibling lookup.
     const responder = await suDb.agent.create({
       data: {
         tenantId,
@@ -474,9 +473,9 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(mine).toHaveLength(1);
   });
 
-  // An inbox no responder of ours answers, watched by a monitoring agent: nothing reads the
-  // contact-inbox thread there (issue #620). The words live in Chatwoot, where the watcher's own tick
-  // reads them, so the write-back arms no append and the delivery still settles.
+  // NOTE: An inbox no responder of ours answers, watched by a monitoring agent: nothing reads the
+  // contact-inbox thread there. The words live in Chatwoot, where the watcher's own tick reads them,
+  // so the write-back arms no append and the delivery still settles.
   test("a watcher's conversation with no responder folds nothing in, and the delivery settles", async () => {
     const n = lateAudio(6005, {
       transcribed: true,
@@ -501,13 +500,12 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     ).toBe("PROCESSED");
   });
 
-  // THE OTHER HALF OF WIDENING THE GATE (issue #478 review, round 1). On an inbox with a responder
-  // of ours, Chatwoot fans the same message to both routes, and the responder's own delivery of it
-  // is what folds it into the shared memory. The observer's copy must stand down — and standing
-  // down means finding the responder's sibling row, which it can only do if this update NAMES the
-  // message. Called with `message: null`, the check answered "not covered" without looking and the
-  // thread gained a duplicate the ingest dedup window cannot see: it is written by the ingest job
-  // alone, so a message a TURN handled was never in it.
+  // NOTE: THE OTHER HALF OF WIDENING THE GATE. On an inbox with a responder of ours, Chatwoot fans the same
+  // message to both routes, and the responder's own delivery folds it into the shared memory. The
+  // observer's copy must stand down, which means finding the responder's sibling row, possible only if
+  // this update NAMES the message. With `message: null` the check would answer "not covered" without
+  // looking, and the thread would gain a duplicate the ingest dedup window cannot see (it is written by
+  // the ingest job alone, so a message a TURN handled is never in it).
   test("beside a responder that already has the message, the watcher stands down", async () => {
     const n = lateAudio(6006, {
       transcribed: true,
@@ -557,13 +555,11 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(mine).toHaveLength(1);
   });
 
-  // AND WHAT AN ENQUEUE THAT DOES NOT LAND MEANS (issue #478 review, round 2). `observerHolds` is
-  // inbound-only — an update is not a creation — so on its own it settles this delivery PROCESSED
-  // whatever the arm answered, and a scheduler blip then discards the transcription for good: the
-  // row is terminal, and the row was the only thing that knew. The words come around once.
-  //
-  // Two assertions and they are the pair: the delivery must FAIL (the row stays PROCESSING, which is
-  // what the sweep reads and replays) and nothing may be marked handled behind it.
+  // NOTE: AND WHAT AN ENQUEUE THAT DOES NOT LAND MEANS. `observerHolds` is inbound-only (an update is not a
+  // creation), so on its own it would settle this delivery PROCESSED whatever the arm answered, and a
+  // scheduler blip would discard the transcription for good: the row terminal, and the row the only
+  // thing that knew. Two assertions and they are the pair: the delivery must FAIL (the row stays
+  // PROCESSING, which the sweep reads and replays) and nothing may be marked handled behind it.
   test("an arm that cannot be queued leaves the delivery for the sweep", async () => {
     const n = lateAudio(6010, { transcribed: true });
     if (!n) throw new Error("unreachable: the fixture is a valid event");
@@ -626,20 +622,16 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(row?.conversationId).toBe(CONV_ID);
   });
 
-  // And the row an ordinary write-back leaves is unchanged, which is what keeps the pair a
-  // discriminator: an inbound id on a `message_updated` can only have come from this build, so the
-  // sweep can read it as "a transcription was owed" without mistaking a legacy row for one.
-  // ── WHAT A TURN DID WITH THE MESSAGE, AGAINST WHO OWNS THE CONVERSATION NOW (issue #576) ──
+  // NOTE: ── WHAT A TURN DID WITH THE MESSAGE, AGAINST WHO OWNS THE CONVERSATION NOW ──
   //
-  // The gate reads bot ownership at the moment it runs. On an update that is a reading taken after
-  // the decision it is asking about, and it is wrong in both directions. Both tests below plant the
-  // creation's own settled row — which is what the ledger really holds — and then deliver the
-  // write-back into an ownership that disagrees with it.
+  // Bot ownership read when the gate runs is, on an update, a reading taken after the decision it asks
+  // about, and wrong in both directions. Both tests below plant the creation's own settled row (what
+  // the ledger really holds) and deliver the write-back into an ownership that disagrees with it.
 
-  // THE DUPLICATE. The write-back lands once the conversation changed hands, so `act` is false and
-  // the old gate reads "no turn is coming" — appending a second copy of what the turn already folded
-  // in. The dedup window cannot catch it: that window is the ingest job's own, so an id a TURN
-  // handled was never put in it.
+  // NOTE: THE DUPLICATE. The write-back lands once the conversation changed hands, so `act` is false and an
+  // ownership reading says "no turn is coming", appending a second copy of what the turn already folded
+  // in. The dedup window cannot catch it: that window is the ingest job's own, so an id a TURN handled
+  // is never put in it.
   test("a message a turn answered is not folded in again when the bot no longer holds it", async () => {
     const messageId = 6101;
     await settledSibling(messageId, true);
@@ -651,10 +643,10 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(await armedFor(messageId)).toHaveLength(0);
   });
 
-  // THE LOSS, and it is the half that costs data. A row stranded while a colleague held the
-  // conversation is replayed once the bot has it back: `act && !consumed` reads as "a turn will
-  // cover this", nothing is appended, and the row closes as recovered with the words in nobody's
-  // memory.
+  // NOTE: THE LOSS, and it is the half that costs data. A row stranded while a colleague held the
+  // conversation is replayed once the bot has it back: an ownership reading (`act && !consumed`) says
+  // "a turn will cover this", appends nothing, and closes the row as recovered with the words in
+  // nobody's memory.
   test("a message deliberately silenced is folded in even when the bot holds the conversation now", async () => {
     const messageId = 6102;
     await settledSibling(messageId, false, BOT_OWNED_CONV_ID);
@@ -666,11 +658,10 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(await armedFor(messageId)).toHaveLength(1);
   });
 
-  // A TURN THAT RAN ON THE PLACEHOLDER DOES NOT HAVE THE WORDS (PR review, round 8). A voice note
-  // reaches the graph as a placeholder until STT writes back, and a flush armed by an EARLIER message
-  // can invoke inside that window (docs/stt.md, "Known limits"). Recorded as covered, that turn
-  // suppresses the ingest the write-back exists to arm and the transcription reaches nobody — the
-  // loss this whole feature is about, reintroduced by its own record.
+  // NOTE: A TURN THAT RAN ON THE PLACEHOLDER DOES NOT HAVE THE WORDS. A voice note reaches the graph as a
+  // placeholder until STT writes back, and a flush armed by an EARLIER message can invoke inside that
+  // window (docs/stt.md, "Known limits"). Recorded as covered, that turn would suppress the ingest the
+  // write-back exists to arm, and the transcription would reach nobody.
   test("a turn that ran before the transcription does not suppress the write-back", async () => {
     const messageId = 6106;
     // What the turn writes when it ran on the placeholder: it folded the message in, not the words.
@@ -683,12 +674,11 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(await armedFor(messageId)).toHaveLength(1);
   });
 
-  // A TURN THAT RAN AND SAID NOTHING STILL HAS THE MESSAGE (PR review, round 2). `graph.invoke`
-  // persists the channel, so an `empty` outcome leaves the customer's words in memory exactly as a
-  // posted one does — while the SETTLEMENT calls it `consumed`, the same word a gate that took the
-  // message before any turn existed gets. Read off the settlement, this folded the message in a
-  // second time, and the dedup window could not catch it: that window is the ingest job's own, so an
-  // id a turn handled was never put in it.
+  // NOTE: A TURN THAT RAN AND SAID NOTHING STILL HAS THE MESSAGE. `graph.invoke` persists the channel, so an
+  // `empty` outcome leaves the customer's words in memory exactly as a posted one does, while the
+  // SETTLEMENT calls it `consumed`, the same word a gate that took the message before any turn gets.
+  // Read off the settlement, this would fold the message in a second time, past the dedup window (the
+  // ingest job's own, so an id a turn handled is never in it).
   test("a turn that produced nothing still counts as having the message", async () => {
     const messageId = 6105;
     // What the direct path writes for `empty`: consumed to the sweep, covered to memory.
@@ -701,12 +691,11 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(await armedFor(messageId)).toHaveLength(0);
   });
 
-  // AN `answered` IS NOT HIDDEN BY A LATER `consumed` (PR review, round 1). One message reaches
-  // several rows — the two bot routes Chatwoot fans to, plus its own creation and update — and they
-  // do not all say the same thing: an observer settles its own row `consumed` because it answers
-  // nobody by design, and so does a route that stood down for the bot holding the conversation. With
-  // the newest row deciding, that `false` landing after the responder's `true` hid it on nothing
-  // better than insertion order, and the message was folded in a second time.
+  // NOTE: AN `answered` IS NOT HIDDEN BY A LATER `consumed`. One message reaches several rows (the two bot
+  // routes Chatwoot fans to, plus its own creation and update), and they do not all agree: an observer
+  // settles its own row `consumed` because it answers nobody by design, and so does a route that stood
+  // down for the bot holding the conversation. With the newest row deciding, that `false` landing
+  // after the responder's `true` would hide it on nothing better than insertion order.
   test("a consumed sibling inserted after an answered one does not undo the answer", async () => {
     const messageId = 6104;
     await settledSibling(messageId, true);
@@ -728,6 +717,27 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     await deliver(n);
 
     expect(await armedFor(6103)).toHaveLength(0);
+  });
+
+  // The creation's rows of a message this old may be gone to the ledger's retention, and without them
+  // the gate reads ownership: a colleague holds the conversation, so it would fold the words in again.
+  test("a late transcription of a message older than the ledger keeps is not folded in", async () => {
+    const old = lateAudio(6110, {
+      transcribed: true,
+      createdAt: new Date(Date.now() - LEDGER_READ_HORIZON_MS - 60_000),
+    });
+    const recent = lateAudio(6111, {
+      transcribed: true,
+      createdAt: new Date(Date.now() - LEDGER_READ_HORIZON_MS + 60_000 * 60),
+    });
+    if (!old || !recent)
+      throw new Error("unreachable: the fixture is a valid event");
+
+    await deliver(old);
+    await deliver(recent);
+
+    expect(await armedFor(6110)).toHaveLength(0);
+    expect(await armedFor(6111)).toHaveLength(1);
   });
 
   test("an update with nothing analysed leaves the ledger's message column null", async () => {
@@ -764,11 +774,11 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(row?.inboundMessageId).toBeNull();
   });
 
-  // WHEN THE WORDS ARE OURS, NOT THE WIRE'S (issue #478 review, round 3). `ledgerFactsOf` runs before
-  // the eager pass and reads the payload: on the update that brings an audio nobody has transcribed
-  // yet it writes no message id, correctly — there were no words. The pass then pays a provider for
-  // them and stashes them on the event, and from that instant this delivery owes an append that only
-  // the row could name. So the row learns it there, and these are the two rules that fill has.
+  // NOTE: WHEN THE WORDS ARE OURS, NOT THE WIRE'S. `ledgerFactsOf` runs before the eager pass and reads the
+  // payload: on the update that brings an audio nobody has transcribed yet it writes no message id,
+  // correctly (there were no words). The pass then pays a provider for them and stashes them on the
+  // event, and from that instant this delivery owes an append that only the row could name. So the row
+  // learns it there, and these are the two rules that fill has.
   test("the ledger learns a message whose words the eager pass produced", async () => {
     const rowId = await newDeliveryRow();
     const n = lateAudio(6011, { transcribed: true });
@@ -819,10 +829,10 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     ).toBeNull();
   });
 
-  // RETRIED, because what this write buys is the ROW'S recoverability (issue #478 review, round 6).
-  // A single attempt made the crash story depend on a blip: the fill misses, the process dies before
-  // the arm, and the sweep reads a `message_updated` naming nothing and closes it. Same attempts and
-  // backoff as the ledger claim, and the sleep is injected so the case costs no wall clock.
+  // NOTE: RETRIED, because what this write buys is the ROW'S recoverability: with a single attempt, a blip on
+  // the fill plus a process death before the arm leaves the sweep reading a `message_updated` that
+  // names nothing, and it closes it. Same attempts and backoff as the ledger claim, and the sleep is
+  // injected so the case costs no wall clock.
   test("the fill is retried when the write blips", async () => {
     const rowId = await newDeliveryRow();
     const n = lateAudio(6014, { transcribed: true });
@@ -856,81 +866,90 @@ describe.skipIf(!dbUp)("late media reaches memory", () => {
     expect(row.inboundMessageId).toBe(6014);
   });
 
-  // WHERE THE FILL IS CALLED FROM, read off the source. The two cases above prove the rules; this
-  // one proves the wiring, and it is read rather than driven because driving it means a vault
-  // credential and an HTTP fake of a provider — the STT registry is a frozen map, so no stub can be
-  // registered. What matters is the POSITION: inside the branch that just produced a transcription,
-  // before the statement after it, because from there on the words exist nowhere durable but the row.
-  test("the fill sits in the branch that produced the transcription", async () => {
-    const src = await Bun.file(
-      fileURLToPath(
-        new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url),
-      ),
-    ).text();
-    const stash = src.indexOf("n.message.transcribedText = text;");
-    expect(stash).toBeGreaterThan(-1);
-    const fill = src.indexOf("fillLedgerTranscribedMessage(", stash);
-    expect(fill).toBeGreaterThan(stash);
-    // Nothing between them but the assignment itself, comments, and the fill's own `await`: no other
-    // call, no branch, nothing that could be skipped or that could throw first.
-    const between = src
-      .slice(stash, fill)
-      .split("\n")
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0 && !l.startsWith("//"))
-      .join(" ");
-    expect(between).toBe("n.message.transcribedText = text; await");
+  // THE WORDS THIS SIDE PAID FOR, on an update that arrived with raw audio: the eager pass transcribes
+  // it (the injected transcriber stands in for download, provider and write-back), and the scheduler
+  // refuses every ingestion arm, the transient failure a process death between the pass and the arm
+  // looks like to the sweep. Both cases below drive that one delivery.
+  async function deliverRawAudioThroughFailingArm(messageId: number) {
+    const n = lateAudio(messageId, { transcribed: false });
+    if (!n) throw new Error("unreachable: the fixture is a valid event");
+    const rowId = await newDeliveryRow();
+    const transcribed: number[] = [];
+    // What the row named when each arm was tried: a process dying at that instant leaves exactly this.
+    const namedAtArm: (number | null)[] = [];
+    const base = failingIngest(async () => {
+      const at = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+        where: { id: rowId },
+        select: { inboundMessageId: true },
+      });
+      namedAtArm.push(at.inboundMessageId);
+    });
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: { settings: { stt: { enabled: true } } },
+    });
+    let outcome: unknown = null;
+    try {
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: rowId,
+        agentBotId: AGENT_BOT_ID,
+        normalized: n,
+        base,
+        deps: {
+          sleep: async () => {},
+          transcribe: async (p) => {
+            transcribed.push(p.messageId);
+            return TRANSCRIPTION;
+          },
+          makeClient: (async () =>
+            ({
+              sendMessage: async () => ({}),
+              sendPrivateNote: async () => ({}),
+            }) as unknown as ChatwootClient) as never,
+          makeModel: () => {
+            throw new Error("a late-media update must not run a turn");
+          },
+        },
+      });
+    } catch (err) {
+      outcome = err;
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: {} },
+      });
+    }
+    const row = await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+      where: { id: rowId },
+      select: { inboundMessageId: true, status: true },
+    });
+    return { transcribed, namedAtArm, outcome, row };
+  }
+
+  // The fill sits in the branch that produced the transcription, before anything that can fail: from
+  // there on the words exist nowhere durable but the row, and a row that names nothing is closed by
+  // the sweep as carrying nothing.
+  test("a transcription the pass produced is on the ledger row before the arm can fail", async () => {
+    const r = await deliverRawAudioThroughFailingArm(6015);
+    expect(r.transcribed).toEqual([6015]);
+    expect(r.namedAtArm.length).toBeGreaterThan(0);
+    expect(r.namedAtArm.every((id) => id === 6015)).toBe(true);
+    expect(r.row.inboundMessageId).toBe(6015);
   });
 
-  // ASKED AFTER THE ANALYSIS, not before it (issue #478 review, round 4). The value at the top of
-  // the receiver is the WIRE's answer, and it is right there — it decides whether the event reaches
-  // the runtime at all. But an update can arrive carrying RAW audio, and then it is the eager pass
-  // that produces the words: read from the top's value, the retry and the failure guard would both
-  // stand down on exactly the delivery that paid a provider for the transcription, and a scheduler
-  // blip would discard it with the row already terminal.
-  //
-  // Read off the source for the same reason the fill's position is: the STT registry is a frozen
-  // map, so no stub provider can be registered and a real transcription needs a vault credential and
-  // an HTTP fake. What is asserted is the ORDER — the value the guards read is computed after every
-  // eager pass in the function, not before them.
+  // NOTE: ASKED AFTER THE ANALYSIS, not before it. The value at the top of the receiver is the WIRE's
+  // answer, which here is "no words". Read from there, the arm would be tried once and the failure
+  // guard would stand down, settling the row and losing the words the pass just paid for.
   test("the ingestion guards read a transcription the eager pass produced", async () => {
-    const src = await Bun.file(
-      fileURLToPath(
-        new URL("../../src/modules/chatwoot/webhook.ts", import.meta.url),
-      ),
-    ).text();
-    const receiver = src.indexOf(
-      "export async function processChatwootDelivery(",
+    const r = await deliverRawAudioThroughFailingArm(6016);
+    expect(r.transcribed).toEqual([6016]);
+    expect(String(r.outcome)).toContain(
+      "the late transcription could not be armed",
     );
-    expect(receiver).toBeGreaterThan(-1);
-    const decl = src.indexOf(
-      "const carriesTranscription = inboundTranscriptionOnUpdate(n) !== null;",
-      receiver,
-    );
-    expect(decl).toBeGreaterThan(receiver);
-    // Every eager pass the receiver runs is behind it...
-    const before = src.slice(receiver, decl);
-    const after = src.slice(decl);
-    expect(before).toContain("await runEagerMedia(");
-    expect(after.slice(0, after.indexOf("\nexport "))).not.toContain(
-      "await runEagerMedia(",
-    );
-    // ...and the guards are the only readers, so none of them can see the wire's answer instead.
-    for (const guard of [
-      'if (carriesTranscription && ingested === "failed") {',
-      'if (carriesTranscription && ingested === "no-thread") {',
-    ]) {
-      expect(after).toContain(guard);
-    }
-    // O `retryArm` é o terceiro, e ele é procurado pelo CORPO e não por uma linha: a lista de
-    // disjuntos cresceu com a #688 e o formatter a quebrou em várias linhas, o que fazia a cerca
-    // reprovar por FORMA. O que ela sempre quis dizer é que o valor lido ali é o de depois do eager
-    // pass, então o que se prende é `carriesTranscription` estar dentro do argumento.
-    const arm = after.indexOf("retryArm:");
-    expect(arm).toBeGreaterThan(-1);
-    expect(after.slice(arm, after.indexOf("sleep:", arm))).toContain(
-      "carriesTranscription",
-    );
+    expect(r.row.status).toBe("PROCESSING");
+    expect(r.namedAtArm.length).toBeGreaterThan(1);
   });
 
   // The gate is what the analysis PRODUCED, not the event's shape: an update carrying an audio

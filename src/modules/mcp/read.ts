@@ -1,4 +1,6 @@
+import { withAbortSignal } from "@/api/lib/i18n";
 import basePrisma from "@/api/lib/prisma";
+import metricsPrisma from "@/api/lib/prisma-metrics";
 import {
   CODE_TOOL_CONTEXT_MAX_CHARS,
   CODE_TOOL_INPUT_MAX_CHARS,
@@ -7,6 +9,7 @@ import {
   SANDBOX_STACK_BYTES,
   SANDBOX_TIMEOUT_MS,
 } from "@/graph/tools/code-sandbox-limits";
+import type { ClientAudience } from "@/graph/usage-sources";
 import { AUDIT_SCOPES, isAuditScope } from "@/lib/audit/scope";
 import { checkCodeToolSyntax } from "@/lib/code-tool-syntax";
 import {
@@ -37,7 +40,7 @@ import {
   getConversationMessages,
 } from "@/modules/conversations/service";
 import { documentAuthoringSchema } from "@/modules/documents/blocks";
-import { listIssuedDocuments } from "@/modules/documents/issue";
+import { pageIssuedDocuments } from "@/modules/documents/issue";
 import { documentStarters } from "@/modules/documents/starters";
 import {
   getDocumentTemplate,
@@ -54,19 +57,22 @@ import {
   listExperiments,
 } from "@/modules/experiments/service";
 import { listAlertChannels } from "@/modules/flowlog/channels";
+import { ALERT_EVENTS } from "@/modules/flowlog/events";
 import { exportExecutionLogs } from "@/modules/flowlog/export";
 import { listExecutionLogs } from "@/modules/flowlog/read";
 import { parseIsoInstant } from "@/modules/flowlog/settings";
-import { FLOW_LEVELS, FLOW_STAGES } from "@/modules/flowlog/stages";
+import { FLOW_LEVELS, SELECTABLE_STAGES } from "@/modules/flowlog/stages";
 import {
   listCatalog,
   listIntegrationInstances,
 } from "@/modules/integrations/service";
 import { listMcpConnections } from "@/modules/mcp-connections/service";
+import { estimateCallFloor } from "@/modules/playground/service";
+import { getProactiveBreakerStatus } from "@/modules/proactive-breaker/service";
 import { getDocument, listDocuments } from "@/modules/rag/documents";
 import {
+  listApprovals,
   listKnowledgeBases,
-  listPendingApprovals,
   searchKnowledge,
 } from "@/modules/rag/service";
 import { getTenantSettings } from "@/modules/tenant-settings/service";
@@ -84,7 +90,10 @@ import {
   getWebhookDelivery,
   listWebhookDeliveries,
 } from "@/modules/webhooks/outbound/deliveries";
-import { OUTBOUND_EVENTS } from "@/modules/webhooks/outbound/events";
+import {
+  OUTBOUND_EVENTS,
+  outboundEventGroups,
+} from "@/modules/webhooks/outbound/events";
 import { listWebhookSubscriptions } from "@/modules/webhooks/outbound/subscriptions";
 import type { VerifiedToken } from "./oauth/tokens";
 import {
@@ -97,20 +106,13 @@ import {
   type WriteResult,
 } from "./write";
 
-// MCP READ tools — the read half of the expanded admin surface, all gated by the same fence as
-// write reads (mcp:read scope + a tenant target). Each tool projects a tenant-scoped service and
-// serializes bigints to strings (JSON.stringify throws on a bigint). Secret-bearing fields are
-// never returned: services redact them (Chatwoot adminToken → hasAdminToken, alert URL → urlMasked,
-// API key → prefix).
-//
-// A ref-bearing field comes back in one of TWO vocabularies. The settings reads translate to a vault
-// entry NAME here (`vaultNameByRef`); the entity reads hand back the service DTO, which carries the
-// stable `vault:<id>` the column holds. This comment claimed NAMES for all of them and was true of
-// the two it could see — the entity DTOs were passing the COLUMN through, and until #126 that column
-// took any string, so a secret typed into it reached every `mcp:read` client (issue #438). The
-// services redact through `readableVaultRef` now: a stored value that is not a reference reads as null. A ref whose
-// ENTRY was deleted still comes back — the guard proves the value is a reference, deliberately not
-// that it resolves, so a dangling ref stays visible instead of reading as an empty field.
+// MCP READ tools, gated by the same fence as write reads (mcp:read scope + a tenant target). Each
+// projects a tenant-scoped service and serializes bigints to strings. Secret-bearing fields are
+// never returned (Chatwoot adminToken → hasAdminToken, alert URL → urlMasked, API key → prefix). A
+// ref-bearing field comes back in one of TWO vocabularies: the settings reads translate to a vault
+// entry NAME (`vaultNameByRef`), the entity reads return the DTO's stable `vault:<id>`. Services
+// redact through `readableVaultRef`: a non-reference reads as null, while a dangling ref stays
+// visible (the guard proves the value is a reference, not that it resolves).
 
 const sid = (v: bigint): string => v.toString();
 const sidn = (v: bigint | null): string | null =>
@@ -142,11 +144,8 @@ export async function agentGet(
   }
 }
 
-// "Is this agent's configuration healthy?" — the same warnings the console's editor panel computes,
-// for the caller that never opens it. An onboarding driven entirely through these tools is the path
-// the docs recommend, and until this existed it was also the one that ran blind: nothing on it ever
-// rendered the page those checks live on, so it finished by reporting success over a vault entry
-// nobody had filled. Issue #467.
+// "Is this agent's configuration healthy?": the same warnings the console's editor panel computes,
+// for the caller that never opens it, such as an onboarding driven entirely through these tools.
 export async function agentConfigHealth(
   principal: VerifiedToken,
   args: { agent_id: string },
@@ -159,6 +158,23 @@ export async function agentConfigHealth(
   if (typeof id !== "bigint") return id;
   try {
     return ok({ health: await readAgentConfigHealth(ctx, id, { base }) });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+export async function agentCallFloor(
+  principal: VerifiedToken,
+  args: { agent_id: string },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = readGate(principal);
+  if ("ok" in ctx) return ctx;
+  const id = parseMcpId(args.agent_id, "agent_id");
+  if (typeof id !== "bigint") return id;
+  try {
+    return ok({ floor: await estimateCallFloor({ ctx, agentId: id, base }) });
   } catch (e) {
     return failOf(e);
   }
@@ -215,7 +231,7 @@ export async function toolGet(
   }
 }
 
-// ── code tools (operator-authored, issue #363) ──
+// ── code tools (operator-authored) ──
 
 export async function codeToolList(
   principal: VerifiedToken,
@@ -259,37 +275,13 @@ export async function codeToolGet(
 }
 
 // The authoring contract for a code tool body, served on demand rather than inlined into
-// `code_tool_create`'s description (issue #538). The precedent is `document_template_schema`, and
-// the reason is the same one measured there: a vocabulary that every caller pays for on every
-// session, for a contract only a caller actually WRITING a body needs.
-//
-// It answers what a body cannot discover by trying: which `context` keys exist, which of them can be
-// ABSENT (all but three, because the runtime builds that object by spreading conditionals), which
-// GLOBALS the sandbox puts in scope, and the limits that turn a run into a failure. Everything here
-// is derived from the modules that enforce it, never restated, so the answer cannot drift from the
-// sandbox.
-//
-// `available` is the same `CODE_TOOL_GLOBALS` the console's Ctrl-Space offers, as data rather than
-// as the sentence it used to be. The sentence named three of the twenty and went stale the moment a
-// name moved, which is the drift the vocabulary module exists to close: a caller writing through MCP
-// and a caller writing in the console have to be told the same list.
-//
-// Seven limits are served and they bite at three DIFFERENT moments, so they are described in three
-// sentences rather than one. `timeoutMs`, `memoryBytes`, `stackBytes` and `contextMaxChars` mark the
-// call failed. `inputMaxChars` is the model's doing and comes back as an ordinary result saying what
-// to change (graph/tools/code.ts). `codeMaxChars` never reaches a call at all: the write is REFUSED,
-// so nothing is saved. `resultMaxChars` is the fourth thing a body cannot discover by trying: what
-// the body returns is CLIPPED (code-sandbox.ts), and it bounds the VALUE rather than the rendered
-// line, so a caller reading it as a bound on the whole text sizes a return by the wrong number. The
-// cut itself is marked, but the `console.log` block is dropped WHOLE when the value leaves it under
-// forty characters of budget, and that is the one case nothing marks. A caller told these are all
-// failures reads a correctable argument size as a broken tool and an authoring refusal as an outage.
-//
-// The gate is `authoringGate`, not `readGate`: `code_tool_create` names this tool for the contract
-// it no longer restates, and `filterScopes` grants exactly the scopes a client asked for, so a token
-// holding `mcp:write` without `mcp:read` is a real token that would otherwise be sent to a tool it
-// can neither list nor call. It answers a constant either way, so admitting the writer gives away
-// nothing the reader was not already given.
+// `code_tool_create`'s description (like `document_template_schema`), since only a caller WRITING
+// a body needs it. It answers what a body cannot discover by trying (which `context` keys exist and
+// may be absent, the sandbox GLOBALS, the limits), all derived from the enforcing modules. The
+// limits bite at different moments: some fail the call, `inputMaxChars` returns a correctable
+// result, `codeMaxChars` refuses the write, and `resultMaxChars` clips the returned value.
+// `authoringGate`, not `readGate`: a token with `mcp:write` alone is sent here by
+// `code_tool_create`.
 export function codeToolSchema(principal: VerifiedToken): WriteResult {
   const ctx = authoringGate(principal);
   if ("ok" in ctx) return ctx;
@@ -358,7 +350,10 @@ export async function documentTemplateList(
         ),
         numberPrefix: t.numberPrefix,
         lastNumber: t.lastNumber,
+        nextNumber: t.nextNumber,
         enabled: t.enabled,
+        requiresApproval: t.requiresApproval,
+        approvalTtlHours: t.approvalTtlHours,
       })),
     });
   } catch (e) {
@@ -420,7 +415,7 @@ export async function documentStarterList(
     starters: starters.map((s) => ({
       key: s.key,
       name: s.name,
-      description: s.description,
+      description: s.summary,
       blocks: s.blocks.length,
       fields: s.fields.map(
         (f) => `${f.name}:${f.type}${f.required ? "*" : ""}`,
@@ -431,12 +426,24 @@ export async function documentStarterList(
 
 export async function issuedDocumentList(
   principal: VerifiedToken,
-  args: { template_id?: string; thread_id?: string; limit?: number } = {},
+  args: {
+    template_id?: string;
+    thread_id?: string;
+    limit?: number;
+    before?: string;
+    q?: string;
+  } = {},
   deps: WriteDeps = {},
 ): Promise<WriteResult> {
   const base = deps.base ?? basePrisma;
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
+  let before: bigint | undefined;
+  if (args.before !== undefined) {
+    const parsed = parseMcpId(args.before, "before");
+    if (typeof parsed !== "bigint") return parsed;
+    before = parsed;
+  }
   let templateId: bigint | undefined;
   // `!== undefined`, not truthiness: an explicitly empty template_id is a malformed NARROWING
   // filter, and treating it as absent answers the tenant's whole recent list — the widest possible
@@ -448,11 +455,17 @@ export async function issuedDocumentList(
   }
   try {
     return ok({
-      documents: await listIssuedDocuments(
+      ...(await pageIssuedDocuments(
         ctx,
-        { templateId, threadId: args.thread_id, limit: args.limit },
+        {
+          templateId,
+          threadId: args.thread_id,
+          limit: args.limit,
+          before,
+          query: args.q,
+        },
         base,
-      ),
+      )),
     });
   } catch (e) {
     return failOf(e);
@@ -585,9 +598,9 @@ export async function knowledgeDocumentsList(
   }
 }
 
-// One document WITH its text (issue #708). The list carries metadata and `contentChars` only, and
-// `knowledge_search` returns chunks cut by relevance, so without this the whole text of a document
-// was reachable from nowhere an MCP client could go.
+// One document WITH its text. The list carries metadata and `contentChars` only, and
+// `knowledge_search` returns chunks cut by relevance, so this is the only way to read a whole
+// document.
 export async function knowledgeDocumentGet(
   principal: VerifiedToken,
   args: { document_id: string },
@@ -614,13 +627,16 @@ export async function knowledgeDocumentGet(
 
 export async function knowledgeApprovalsList(
   principal: VerifiedToken,
+  args: { view?: "pending" | "discarded" } = {},
   deps: WriteDeps = {},
 ): Promise<WriteResult> {
   const base = deps.base ?? basePrisma;
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
   try {
-    return ok({ approvals: await listPendingApprovals(ctx, base) });
+    return ok({
+      approvals: await listApprovals(ctx, args.view ?? "pending", base),
+    });
   } catch (e) {
     return failOf(e);
   }
@@ -694,7 +710,7 @@ export async function webhookEventsList(
 ): Promise<WriteResult> {
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
-  return ok({ events: [...OUTBOUND_EVENTS] });
+  return ok({ events: [...OUTBOUND_EVENTS], families: outboundEventGroups() });
 }
 
 // ── outbound webhook deliveries ──
@@ -792,7 +808,11 @@ export async function alertStageList(
 ): Promise<WriteResult> {
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
-  return ok({ stages: [...FLOW_STAGES], levels: [...FLOW_LEVELS] });
+  return ok({
+    stages: [...SELECTABLE_STAGES],
+    levels: [...FLOW_LEVELS],
+    events: [...ALERT_EVENTS],
+  });
 }
 
 // ── business hours ──
@@ -873,6 +893,21 @@ export async function experimentResultsGet(
 
 // ── tenant settings (embedding / langfuse) ──
 
+// The account-wide proactive breaker, as the console card and REST read it.
+export async function proactiveBreakerGet(
+  principal: VerifiedToken,
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = readGate(principal);
+  if ("ok" in ctx) return ctx;
+  try {
+    return ok({ proactiveBreaker: await getProactiveBreakerStatus(ctx, base) });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
 export async function tenantSettingsGet(
   principal: VerifiedToken,
   deps: WriteDeps = {},
@@ -893,8 +928,9 @@ export async function tenantSettingsGet(
       settings: {
         embedding: { ...settings.embedding, credentialRef: embeddingRef },
         langfuse: { ...settings.langfuse, credentialRef: langfuseRef },
-        // The tenant's own model prices (issue #865), USD per million tokens.
+        // NOTE: The tenant's own model prices, USD per million tokens.
         priceOverrides: settings.priceOverrides,
+        approvalLink: settings.approvalLink,
       },
     });
   } catch (e) {
@@ -975,14 +1011,11 @@ export async function auditList(
 ): Promise<WriteResult> {
   const base = deps.base ?? basePrisma;
   const opts: Parameters<typeof listAudit>[1] = {};
-  // The same three trails the console offers (#520), for the same reason: the rows keyed to no
-  // tenant are unreachable from a tenant read rather than filtered out of it, so an agent asking
-  // "was this MCP client ever created" against the tenant trail gets an empty answer that reads as
-  // "no". `listAudit` refuses the wider two to anyone but a SUPER_ADMIN, so the door is the same one
-  // the REST surface uses; this only forwards the ask.
-  //
-  // READ BEFORE THE GATE, because it is what the gate depends on: a tenant target is required by the
-  // SCOPE and not by the tool, exactly as `ctxOrThrow` has it on the REST side.
+  // NOTE: The same three trails the console offers: rows keyed to no tenant are unreachable from a
+  // tenant read, so asking the tenant trail about a fleet row gets an empty answer that reads as
+  // "no". `listAudit` refuses the wider two to anyone but a SUPER_ADMIN. Read BEFORE the gate,
+  // because a tenant target is required by the SCOPE, not by the tool (as `ctxOrThrow` does on the
+  // REST side).
   if (args.scope !== undefined) {
     if (typeof args.scope !== "string" || !isAuditScope(args.scope)) {
       return err(`scope must be one of: ${AUDIT_SCOPES.join(", ")}`);
@@ -1040,9 +1073,8 @@ export async function auditList(
     opts.actorId = v;
   }
   if (args.cursor !== undefined) {
-    // TWO COLUMNS SINCE #530, so not `parseMcpId`. A bare id was the cursor before that, and was
-    // accepted for one release after it so an agent holding one mid-walk kept walking across a
-    // rolling deploy; since #544 it is refused like any other malformed cursor.
+    // The cursor is TWO COLUMNS, so not `parseMcpId`; a bare id is refused like any other
+    // malformed cursor.
     const c = parseAuditCursor(args.cursor);
     if (c === null) {
       return err(
@@ -1074,6 +1106,7 @@ export interface LogsQueryArgs {
   conversation_id?: string;
   turn_id?: string;
   source?: string;
+  audience?: ClientAudience;
   search?: string;
   limit?: number;
   cursor?: string;
@@ -1094,6 +1127,7 @@ export async function logsQuery(
   if (args.stage) opts.stage = args.stage;
   if (args.turn_id) opts.turnId = args.turn_id;
   if (args.source) opts.source = args.source;
+  if (args.audience) opts.audience = args.audience;
   if (args.search) opts.search = args.search;
   if (args.limit !== undefined) opts.limit = args.limit;
   if (args.agent_id) {
@@ -1128,6 +1162,7 @@ export interface LogsExportArgs {
   conversation_id?: string;
   turn_id?: string;
   source?: string;
+  audience?: ClientAudience;
   search?: string;
   format?: string;
   max_rows?: number;
@@ -1156,6 +1191,7 @@ export async function logsExport(
   if (args.stage) opts.stage = args.stage;
   if (args.turn_id) opts.turnId = args.turn_id;
   if (args.source) opts.source = args.source;
+  if (args.audience) opts.audience = args.audience;
   if (args.search) opts.search = args.search;
   if (args.agent_id) {
     const v = parseMcpId(args.agent_id, "agent_id");
@@ -1186,27 +1222,32 @@ export async function logsExport(
 function metricsFilter(args: {
   since?: string;
   source?: string;
+  audience?: ClientAudience;
 }): MetricsFilter {
   const filter: MetricsFilter = {};
   if (args.since) filter.since = new Date(args.since);
   if (args.source) filter.source = args.source as MetricsFilter["source"];
+  if (args.audience) filter.audience = args.audience;
   return filter;
 }
 
 export async function metricsGet(
   principal: VerifiedToken,
-  args: { since?: string; source?: string },
-  deps: WriteDeps = {},
+  args: { since?: string; source?: string; audience?: ClientAudience },
+  deps: WriteDeps & { signal?: AbortSignal } = {},
 ): Promise<WriteResult> {
-  const base = deps.base ?? basePrisma;
+  const base = deps.base ?? metricsPrisma;
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
   const filter = metricsFilter(args);
   try {
-    const [kpis, usage] = await Promise.all([
-      getKpis(ctx, filter, base),
-      getInstanceMetrics(ctx, filter, base),
-    ]);
+    // A cancelled call starts no read that has not started yet.
+    const [kpis, usage] = await withAbortSignal(deps.signal, () =>
+      Promise.all([
+        getKpis(ctx, filter, base),
+        getInstanceMetrics(ctx, filter, base),
+      ]),
+    );
     return ok({ kpis, usage });
   } catch (e) {
     return failOf(e);
@@ -1215,10 +1256,10 @@ export async function metricsGet(
 
 export async function metricsTimeseries(
   principal: VerifiedToken,
-  args: { since?: string; source?: string },
+  args: { since?: string; source?: string; audience?: ClientAudience },
   deps: WriteDeps = {},
 ): Promise<WriteResult> {
-  const base = deps.base ?? basePrisma;
+  const base = deps.base ?? metricsPrisma;
   const ctx = readGate(principal);
   if ("ok" in ctx) return ctx;
   const filter = metricsFilter(args);

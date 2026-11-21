@@ -21,13 +21,10 @@ import {
   rejectApprovalItem,
   updateKnowledgeBase,
 } from "@/modules/rag/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// THE KNOWLEDGE FAMILY (issue #396), where ten actions had a name over MCP and twelve REST routes
-// wrote nothing at all: the console is the door an operator actually uses, and everything they did
-// to a knowledge base through it was invisible.
-//
-// `PATCH /v1/knowledge/documents/:id` had no MCP twin either, so `knowledge_document.update` is a
-// name this issue invents.
+// THE KNOWLEDGE FAMILY, recorded by the service, so the console's REST routes leave the same rows as
+// MCP.
 //
 // The rule that shapes every projection here is the one the family makes unavoidable: a document's
 // CONTENT is the payload most likely to carry a customer's data, the row is append-only and readable
@@ -53,8 +50,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -161,7 +158,13 @@ async function makeDoc(text = BODY, title = `Doc ${uniq()}`) {
   return doc;
 }
 
-async function makeSuggestion(content = PROPOSAL) {
+// A proposal repeated for the same base lands on the row already there, so each test proposes its own
+// text: the agent's words plus a suffix of fixed width, so the length below is known.
+let proposalSeq = 0;
+const nextProposal = () =>
+  `${PROPOSAL}-${String(++proposalSeq).padStart(4, "0")}`;
+
+async function makeSuggestion(content = nextProposal()) {
   return createSuggestion({
     ctx: ctx(),
     knowledgeBaseId: kbId,
@@ -320,7 +323,6 @@ describe.skipIf(!dbUp)("the knowledge family records its own changes", () => {
     await deleteDocument(ctx(), doc.id, appDb);
   });
 
-  // The action with no name on any transport before this issue.
   test("editing a document records that the text moved, by its length", async () => {
     const doc = await makeDoc();
     await clearAudit();
@@ -342,9 +344,7 @@ describe.skipIf(!dbUp)("the knowledge family records its own changes", () => {
     await collect();
   });
 
-  // A title-only edit is metadata: the chunks are the content, so nothing is re-embedded and the
-  // document does not leave the state it was in.
-  // Issue #857: the title is part of every chunk's vector, so a rename re-queues the document.
+  // The title is part of every chunk's vector, so a rename re-queues the document.
   test("renaming a document records the rename and re-indexes it", async () => {
     const doc = await makeDoc();
     await suDb.knowledgeDocument.update({
@@ -438,9 +438,9 @@ describe.skipIf(!dbUp)("the knowledge family records its own changes", () => {
       includeFailed: false,
       includeIndexed: false,
     });
-    // The jobs, committed with the transition and with the row that counts them. Enqueuing after
-    // the commit is what leaves documents in PENDING with no job: they are no longer UNINDEXED, so
-    // the next bulk re-index does not select them either.
+    // NOTE: the jobs are committed with the transition and with the row that counts them. Enqueued
+    // after the commit, a failure leaves documents in PENDING with no job: they are not UNINDEXED,
+    // so the next bulk re-index does not select them either.
     expect(
       await suDb.schedulerJob.count({
         where: {
@@ -546,6 +546,11 @@ describe.skipIf(!dbUp)("the knowledge family records its own changes", () => {
       proposedTitle: "Título revisado",
       proposedContent: `${PROPOSAL} revisado`,
       base: appDb,
+      // NOTE: The re-embed after an edit is best effort and outside the audit's transaction, so a
+      // provider that answers at once keeps this test about the audit row and off the network.
+      embedText: async () => {
+        throw new Error("no embedding provider in this test");
+      },
     });
     expect(outcome).toBe("updated");
     const [row, ...rest] = await rows();
@@ -624,7 +629,7 @@ describe.skipIf(!dbUp)("the knowledge family records its own changes", () => {
     });
     expect(all[1]?.after).toMatchObject({
       sourceType: "approval",
-      chars: PROPOSAL.length,
+      chars: PROPOSAL.length + 5,
     });
     expect(dump(all)).not.toContain(PROPOSAL);
     await collect();

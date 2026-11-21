@@ -1,5 +1,11 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { z } from "zod";
 import {
   invalidCaseAttributeKey,
@@ -10,8 +16,20 @@ import {
 } from "@/client/pages/agents/CrossInboxCaseFields";
 import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 import { readCrossInboxCaseConfig } from "@/modules/cross-inbox-case/settings";
+import {
+  type EditorStub,
+  lastSavedSettings,
+  renderEditor,
+  stubEditorApi,
+} from "../utils/agent-editor";
 
-// Issue #700: `crossInboxCase` is config OF the open_case_in_inbox tool, so it is edited on the
+const realFetch = globalThis.fetch;
+afterEach(() => {
+  cleanup();
+  globalThis.fetch = realFetch;
+});
+
+// `crossInboxCase` is config OF the open_case_in_inbox tool, so it is edited on the
 // tool's card and written by the Tools tab's save, the way `handoff` is. Two saves write the same
 // settings column, and each one resends the whole bag, so the ownership has to be exact on both
 // sides: the Tools save writes the block and keeps the shared bag in step, and the Behavior save
@@ -28,9 +46,31 @@ describe("the form round-trips what is stored", () => {
       resolveOrigin: true,
       caseLabels: ["agente-sac", "veio-do-whatsapp"],
       subjectTemplate: "Solicitação de {{nome_contato}}: {{resumo}}",
+      openingTemplate: "Olá {{primeiro_nome}}\n\n{{mensagem}}",
+      noteTemplate: "{{motivo}} {{link_origem}}",
+      carryAttachments: {
+        mode: "attendance" as const,
+        fileTypes: ["file" as const, "video" as const],
+        maxFiles: 4,
+      },
     };
     const saved = serializeCrossInboxCase(readCrossInboxCaseState(stored));
     expect(readCrossInboxCaseConfig({ crossInboxCase: saved })).toEqual(stored);
+  });
+
+  test("clearing the opening and the note templates saves none (issue #923)", () => {
+    const state = readCrossInboxCaseState({
+      targetInboxId: 40,
+      openingTemplate: "Olá {{mensagem}}",
+      noteTemplate: "{{motivo}}",
+    });
+    const saved = serializeCrossInboxCase({
+      ...state,
+      openingTemplate: "  ",
+      noteTemplate: "",
+    });
+    expect(saved.openingTemplate).toBeNull();
+    expect(saved.noteTemplate).toBeNull();
   });
 
   test("clearing the inbox clears the instance too, and an empty key falls back to the default", () => {
@@ -68,54 +108,110 @@ test("case labels picked on the card are saved, and an empty pick saves an empty
   expect(serializeCrossInboxCase(state).caseLabels).toEqual([]);
 });
 
-describe("which save owns the block (source)", () => {
-  const src = readFileSync(
-    "src/client/pages/agents/AgentEditorPage.tsx",
-    "utf8",
-  );
-  const slice = (from: string, to: string) => {
-    const start = src.indexOf(from);
-    expect(start, `anchor not found: ${from}`).toBeGreaterThan(-1);
-    const end = src.indexOf(to, start + from.length);
-    expect(end, `closing anchor not found: ${to}`).toBeGreaterThan(-1);
-    return src.slice(start, end);
+// The two saves write the same settings column, each resending the whole bag: the Tools save owns
+// the block, and a Behavior save carries whatever the Tools save last stored.
+describe("which save owns the block", () => {
+  const STORED = {
+    targetInboxId: 40,
+    targetInstanceId: 3,
+    caseAttributeKey: "protocolo",
   };
+  const KEY_ERROR =
+    "Use lowercase letters, digits and _, starting with a letter.";
 
-  test("the Tools save writes it and keeps the shared bag in step", () => {
-    const body = slice("async function saveTools(", "\n  }\n");
-    expect(body).toContain(
-      "const crossInboxCaseJson = serializeCrossInboxCase(crossInboxCase);",
+  async function openTools(): Promise<EditorStub> {
+    const stub = stubEditorApi(
+      { settings: { crossInboxCase: STORED } },
+      { catalog: { native: [{ name: "open_case_in_inbox" }] } },
     );
+    await renderEditor(stub, "tools");
+    return stub;
+  }
+  async function keyField(): Promise<HTMLInputElement> {
+    if (!screen.queryByPlaceholderText("case_conversation_id")) {
+      fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    }
+    return (await screen.findByPlaceholderText(
+      "case_conversation_id",
+    )) as HTMLInputElement;
+  }
+  async function typeKey(value: string) {
+    fireEvent.change(await keyField(), { target: { value } });
+  }
+  const goTo = async (name: string) => {
+    fireEvent.click(screen.getByRole("tab", { name }));
+    await act(async () => {});
+  };
+  const patches = (stub: EditorStub) =>
+    stub.writes.filter((w) => w.method === "PATCH" && w.body.settings);
+  const savedKey = (stub: EditorStub) =>
+    (lastSavedSettings(stub)?.crossInboxCase as { caseAttributeKey?: string })
+      ?.caseAttributeKey;
+  async function saveBehaviorEdit(stub: EditorStub) {
+    const before = patches(stub).length;
+    await goTo("Behavior");
+    fireEvent.click(
+      await screen.findByRole("switch", {
+        name: /Stop answering when a person replies to the customer/,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(before + 1));
+  }
+  const dirty = (name: string) =>
+    screen.getByRole("tab", { name }).querySelector(".bg-warning") !== null;
+
+  test("the Tools save writes it, and a later Behavior save keeps what it wrote", async () => {
+    const stub = await openTools();
+    await typeKey("protocolo_novo");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(savedKey(stub)).toBe("protocolo_novo"));
+
+    await saveBehaviorEdit(stub);
+    expect(savedKey(stub)).toBe("protocolo_novo");
+  });
+
+  // The bar saves Behavior and Tools in one write. Refused, it stores neither, and the field keeps
+  // the draft.
+  test("a refused save stores neither the key nor Behavior, and keeps the draft", async () => {
+    const stub = await openTools();
+    await typeKey("rascunho");
+    stub.override = (method) =>
+      method === "PATCH"
+        ? Response.json({ error: "boom" }, { status: 500 })
+        : undefined;
+
+    await saveBehaviorEdit(stub);
     expect(
-      body.match(/crossInboxCase: crossInboxCaseJson,/g)?.length ?? 0,
-    ).toBe(2);
+      (stub.agent.settings as { crossInboxCase?: typeof STORED })
+        .crossInboxCase,
+    ).toEqual(STORED);
+    await goTo("Tools");
+    expect((await keyField()).value).toBe("rascunho");
+    expect(dirty("Tools")).toBe(true);
   });
 
-  test("the Behavior save does not name it, so it cannot write a stale form over it", () => {
-    const body = slice("function buildSettings(", "\n  }\n");
-    expect(body).toContain("...settings,");
-    expect(body).not.toContain("crossInboxCase");
+  test("the stored block loads into the card, and an edit lights the Tools tab's unsaved dot only", async () => {
+    await openTools();
+    expect((await keyField()).value).toBe("protocolo");
+    expect(dirty("Tools")).toBe(false);
+    await typeKey("outro_campo");
+    await waitFor(() => expect(dirty("Tools")).toBe(true));
+    expect(dirty("Behavior")).toBe(false);
   });
 
-  test("it is re-read with the other tool config, not by a Behavior save", () => {
-    const body = slice("const syncToolConfig = useCallback(", "}, []);");
-    expect(body).toContain("setCrossInboxCase(b.crossInboxCase);");
-    expect(src.match(/setCrossInboxCase\(b\.crossInboxCase\)/g)?.length).toBe(
-      1,
-    );
-  });
-
-  test("it lights the Tools tab's unsaved dot, not Behavior's", () => {
-    expect(slice("tools: JSON.stringify({", "}),")).toContain(
-      "crossInboxCase,",
-    );
-    expect(slice("behavior: JSON.stringify({", "}),")).not.toContain(
-      "crossInboxCase",
-    );
+  // The key is checked before the write, where the field can say so.
+  test("a key the reader would replace is flagged on the field and stops the Tools save", async () => {
+    const stub = await openTools();
+    await typeKey("Ticket-ID");
+    expect(screen.getAllByText(KEY_ERROR).length).toBe(1);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.getAllByText(KEY_ERROR).length).toBe(2));
+    expect(stub.writes).toEqual([]);
   });
 });
 
-// Review round 7 of #881: the reader replaces a key outside lowercase snake_case with the default, so
+// The reader replaces a key outside lowercase snake_case with the default, so
 // a key like that is refused where it is written instead of saved and silently ignored.
 describe("the attribute key is checked where it is written", () => {
   const patch = z.object(BEHAVIOR_PATCH_SHAPE);
@@ -141,31 +237,6 @@ describe("the attribute key is checked where it is written", () => {
     expect(at("protocolo_caso")).toBe(false);
     expect(at(" protocolo ")).toBe(false);
     expect(at("")).toBe(false);
-    const src = readFileSync(
-      "src/client/pages/agents/CrossInboxCaseFields.tsx",
-      "utf8",
-    );
-    expect(src).toContain("invalidCaseAttributeKey(value)");
-  });
-  test("the Tools save refuses a bad key before the grants PUT", () => {
-    // Review round 10: the PUT went out, then the PATCH refused the key, leaving new grants beside
-    // the old settings.
-    const src = readFileSync(
-      "src/client/pages/agents/AgentEditorPage.tsx",
-      "utf8",
-    );
-    const start = src.indexOf("async function saveTools(");
-    const body = src.slice(start, src.indexOf("\n  }\n", start));
-    // The call itself is the condition of the refusal, chained after the other preflight errors.
-    const check = body.indexOf("// Refused by the PATCH");
-    expect(body).toContain(
-      "(invalidCaseAttributeKey(crossInboxCase)\n          ? t(",
-    );
-    expect(check).toBeGreaterThan(-1);
-    expect(check).toBeLessThan(body.indexOf('["tool-selections"].put('));
-    expect(
-      body.slice(check, body.indexOf('["tool-selections"].put(')),
-    ).toContain('showToast(toolsText, "error");\n        return;');
   });
 });
 

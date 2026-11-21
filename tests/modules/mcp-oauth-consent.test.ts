@@ -11,6 +11,7 @@ import {
   issueConsentCsrf,
   upsertApproval,
 } from "@/modules/mcp/oauth/consent";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -23,8 +24,8 @@ if (suUrl) {
     });
     await su.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -186,19 +187,14 @@ describe.skipIf(!dbUp)("mcp oauth consent (pending + approvals)", () => {
     expect(approval?.scopes).toEqual(["mcp:read", "mcp:write"]);
   });
 
-  // TWO GRANTS FOR THE SAME (user, client) AT ONCE, and the union has to hold across them (#497).
-  //
-  // The widening above is sequential, so it passes on a merge computed in application code from a
-  // value read earlier. This one is not: the first grant runs inside a transaction held open, so it
-  // keeps the row lock while the second one runs. A merge that closes over a read taken before that
-  // lock was released writes a set that never saw the other's scope, and the last write wins —
-  // silently, since both calls return normally and the approval row is there.
-  //
-  // THE RENDEZVOUS IS THE DATABASE'S OWN LOCK, not a hook on either implementation's queries. An
-  // earlier version of this blocked the approval's `findUnique`, which measured the SHAPE of the
-  // read-then-write and hung the moment the fix stopped reading. What both shapes must do is wait
-  // for that row, so the test waits for Postgres to say someone is waiting for it, and fails if
-  // nobody ever does rather than sleeping and hoping.
+  // NOTE: TWO GRANTS FOR THE SAME (user, client) AT ONCE, and the union has to hold across them. The widening
+  // above is sequential, so it passes on a merge computed in application code from an earlier read.
+  // Here the first grant runs inside a transaction held open, keeping the row lock while the second
+  // runs; a merge over a read taken before that lock was released writes a set that never saw the
+  // other's scope, and the last write wins silently. THE RENDEZVOUS IS THE DATABASE'S OWN LOCK, not a
+  // hook on either implementation's queries (a hook on the read measures the SHAPE of read-then-write
+  // and hangs once nothing reads): the test waits for Postgres to say someone is waiting for the row,
+  // and fails if nobody ever does.
   test("two grants at once keep both scopes, not the last writer's", async () => {
     const client = `${CLIENT}-race`;
     let release!: () => void;
@@ -209,7 +205,7 @@ describe.skipIf(!dbUp)("mcp oauth consent (pending + approvals)", () => {
     const blocked = async (): Promise<boolean> => {
       const rows = await suDb.$queryRaw<{ n: bigint }[]>`
         SELECT count(*) AS n FROM pg_stat_activity
-         WHERE wait_event_type = 'Lock'
+         WHERE datname = current_database() AND wait_event_type = 'Lock'
            AND query ILIKE '%mcp_oauth_client_approvals%'`;
       return (rows[0]?.n ?? 0n) > 0n;
     };

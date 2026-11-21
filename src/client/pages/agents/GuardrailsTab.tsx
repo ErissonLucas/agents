@@ -1,30 +1,72 @@
-import { MessageCircle, Send, ShieldCheck, TriangleAlert } from "lucide-react";
+import {
+  FileSearch,
+  MessageCircle,
+  Send,
+  ShieldCheck,
+  TriangleAlert,
+  Webhook,
+} from "lucide-react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  Button,
   CredentialPicker,
   FormField,
+  Input,
   ModelPicker,
+  NumberInput,
   Select,
   SwitchField,
   Textarea,
 } from "@/client/components";
+import { api } from "@/client/lib/api";
 import { credentialCompat } from "@/client/lib/credentialCompat";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { MODEL_PROVIDERS } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
+import { inRange } from "@/lib/number-range";
+import { DEFAULT_MAX_TOOL_CALLS } from "@/modules/agents/limits";
+import { GUARDRAIL_RANGES } from "@/modules/agents/number-ranges";
 import {
   CUSTOM_POLICY_MAX,
   GENERATION_PROMPT_MAX,
   TEMPLATE_MESSAGE_MAX,
 } from "@/modules/agents/text-caps";
+import {
+  DECISION_PROVIDERS,
+  DEFAULT_DECISION_MODEL,
+  type DecisionProvider,
+} from "@/modules/decisions/config";
 import type {
   GuardrailAction,
   GuardrailChecks,
+  GuardrailClassifier,
+  GuardrailFailureMode,
   GuardrailsConfig,
+  GuardrailThresholdKey,
 } from "@/modules/guardrails/settings";
+import {
+  GROUNDING_ACTIONS,
+  type GroundingAction,
+  MAX_REFERENCE_KNOWLEDGE_BASES,
+  MAX_SOURCE_TOOLS,
+  readCompetitors,
+} from "@/modules/guardrails/settings";
+import { FieldSize } from "./CallFloor";
+import { ExternalCheckContract } from "./ExternalCheckContract";
+import { ManagedKnowledgeBaseCards } from "./KnowledgeBaseCards";
+import {
+  ModelOverrideFields,
+  type ModelOverrideForm,
+} from "./ModelOverrideFields";
+import {
+  type AgentModelSource,
+  overrideBaseUrlInvalid,
+  overrideBaseUrlUnsupported,
+} from "./modelOverrideForm";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
-import type { GuardrailsRefusals } from "./types";
+import type { GuardrailsRefusals, ToolCatalog } from "./types";
 
 // Agent editor "Guardrails" tab: input/output moderation (agent.settings.guardrails). Own Save +
 // dirty tracking (its own SECTION_KEY). A dedicated LLM screens the customer message (input) and/or
@@ -32,6 +74,8 @@ import type { GuardrailsRefusals } from "./types";
 // IS the config shape (GuardrailsConfig) — no separate form model needed.
 
 interface GuardrailsTabProps {
+  // The saved agent's id, to offer its tools as factual-grounding sources; empty for an unsaved one.
+  agentId: string;
   guardrails: GuardrailsConfig;
   setGuardrails: React.Dispatch<React.SetStateAction<GuardrailsConfig>>;
   // The refused input this tab draws, if the standing refusal is about one of them. Read in
@@ -41,16 +85,110 @@ interface GuardrailsTabProps {
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
+  // The endpoints the guardrails chat model's credential and the grounding reviewer's credential
+  // carry, which outrank the typed fields; null when they carry none.
+  guardrailsCredBaseUrl?: string | null;
+  groundingCredBaseUrl?: string | null;
+  // The tenant's knowledge bases, offered as the reviewer's reference bases (undefined while they
+  // load), and how to reload them after one is created or edited from its card.
+  knowledgeBases?: ToolCatalog["knowledgeBases"];
+  onCatalogChange?: () => void | Promise<void>;
+  // The agent's tool calls per turn as the form holds them (Behavior tab, `limits.maxToolCalls`):
+  // the ceiling of the factual-grounding rewrite's cap, which spends calls from the same budget.
+  maxToolCalls?: number;
 }
+
+// Product names, the same in every language (as on the Classifier card, DecisionsFields).
+const DECISION_PROVIDER_NAMES: Record<DecisionProvider, string> = {
+  openai: "OpenAI Decisions",
+  typesafe: "TypeSafe (Jev)",
+};
 
 const ACTIONS: GuardrailAction[] = [
   "template",
   "generated",
   "silent",
   "handoff",
+  "observe",
 ];
 
+// A threshold field. Its text is the tab's draft for that check, shared by every field drawing the
+// same threshold (a check on in both directions shows two), so typing in one shows in the other
+// keystroke by keystroke: "0." is kept as typed, a value out of 0..1 is shown clamped as soon as it is
+// typed, and leaving the field draws it again from the form, so what is shown is what will be saved.
+function ThresholdInput({
+  text,
+  onType,
+  onLeave,
+  label,
+  testId,
+}: {
+  text: string;
+  onType: (raw: string) => void;
+  onLeave: () => void;
+  label: string;
+  testId: string;
+}) {
+  return (
+    <NumberInput
+      range={GUARDRAIL_RANGES.threshold}
+      step={0.05}
+      optional
+      value={text}
+      onChange={(e) => onType(e.target.value)}
+      onBlur={onLeave}
+      aria-label={label}
+      data-testid={testId}
+    />
+  );
+}
+
+// The agent's tool names, as a playground turn would have them, for the source picker. Best-effort:
+// a failed load leaves the list empty and the names already saved still show.
+function useAgentToolNames(agentId: string, wanted: boolean): string[] {
+  const [names, setNames] = useState<string[]>([]);
+  useEffect(() => {
+    if (!wanted || !/^\d+$/.test(agentId)) return;
+    let live = true;
+    api.api.v1
+      .agents({ id: agentId })
+      .playground.tools.get()
+      .then(({ data }) => {
+        // NOTE: the conversation natives (labels, notes, hand-over) act on the conversation and
+        // return no facts, so they are not offered as sources.
+        if (live && data)
+          setNames(
+            data.tools
+              .filter((tl) => tl.category !== "native")
+              .map((tl) => tl.name),
+          );
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [agentId, wanted]);
+  return names;
+}
+
+// The shared fields' blank strings back to the stored block's nulls.
+function groundingFromForm(
+  o: ModelOverrideForm,
+): Pick<
+  GuardrailsConfig["factualGrounding"],
+  "provider" | "model" | "credentialRef" | "baseURL"
+> {
+  return {
+    provider: (o.provider ||
+      null) as GuardrailsConfig["factualGrounding"]["provider"],
+    model: o.model,
+    credentialRef: o.credentialRef || null,
+    baseURL: o.baseURL || null,
+  };
+}
+
 export function GuardrailsTab({
+  agentId,
   guardrails: g,
   setGuardrails: setG,
   refusals,
@@ -58,8 +196,19 @@ export function GuardrailsTab({
   saving,
   onSave,
   onDiscard,
+  guardrailsCredBaseUrl = null,
+  groundingCredBaseUrl = null,
+  knowledgeBases,
+  onCatalogChange = () => {},
+  maxToolCalls = DEFAULT_MAX_TOOL_CALLS,
 }: GuardrailsTabProps) {
   const { t } = useTranslation();
+  // The rewrite's cap stops at the agent's turn limit, as the write boundary does
+  // (assertSettingsReviseToolCalls); the schema's own range is the outer fence.
+  const reviseCallsRange = {
+    ...GUARDRAIL_RANGES.reviseMaxToolCalls,
+    max: Math.min(GUARDRAIL_RANGES.reviseMaxToolCalls.max, maxToolCalls),
+  };
 
   const sections = [
     {
@@ -82,7 +231,123 @@ export function GuardrailsTab({
       icon: TriangleAlert,
       label: t("editor.guardrails.navPolicy", "Policy"),
     },
+    {
+      id: "gr-grounding",
+      icon: FileSearch,
+      label: t("editor.guardrails.navGrounding", "Factual grounding"),
+    },
+    {
+      id: "gr-external",
+      icon: Webhook,
+      label: t("editor.guardrails.navExternal", "External check"),
+    },
   ];
+  const fg = g.factualGrounding;
+  const setGrounding = (patch: Partial<GuardrailsConfig["factualGrounding"]>) =>
+    setG((s) => ({
+      ...s,
+      factualGrounding: { ...s.factualGrounding, ...patch },
+    }));
+  const toolNames = useAgentToolNames(agentId, g.enabled && fg.enabled);
+  // The reviewer's model, an override of the guardrails chat model drawn by the shared fields. The
+  // stored block spells "unset" as null; the fields spell it as a blank string.
+  const groundingOverride: ModelOverrideForm = {
+    provider: fg.provider ?? "",
+    model: fg.model,
+    credentialRef: fg.credentialRef ?? "",
+    baseURL: fg.baseURL ?? "",
+  };
+  const guardrailsModel: AgentModelSource = {
+    provider: g.provider,
+    credentialRef: g.credentialRef ?? "",
+    baseURL: guardrailsCredBaseUrl ?? g.baseURL ?? "",
+  };
+  const groundingShown = g.enabled && fg.enabled;
+  const groundingBlocksSave =
+    overrideBaseUrlInvalid(
+      groundingOverride,
+      guardrailsModel,
+      groundingCredBaseUrl,
+      groundingShown,
+    ) ||
+    overrideBaseUrlUnsupported(
+      groundingOverride,
+      guardrailsModel,
+      groundingCredBaseUrl,
+      groundingShown,
+    );
+  // Every name the picker draws: the agent's tools, then any saved name the agent no longer offers.
+  const sourceChoices = [
+    ...toolNames,
+    ...fg.sourceTools.filter((n) => !toolNames.includes(n)),
+  ];
+  const [extraSource, setExtraSource] = useState("");
+  // The window as typed while it is not a whole number in range; the form keeps its last valid value.
+  const [groundingContextDraft, setGroundingContextDraft] = useState<
+    string | null
+  >(null);
+  // The rewrite's cap as typed, kept the same way as the window above.
+  const [groundingReviseCallsDraft, setGroundingReviseCallsDraft] = useState<
+    string | null
+  >(null);
+  // At the schema's limit a new source is refused here, so the save never fails on it; taking one out
+  // always works.
+  const sourcesFull = fg.sourceTools.length >= MAX_SOURCE_TOOLS;
+  const toggleSource = (name: string, on: boolean) => {
+    if (on && sourcesFull && !fg.sourceTools.includes(name)) return;
+    setGrounding({
+      sourceTools: on
+        ? [...fg.sourceTools.filter((n) => n !== name), name]
+        : fg.sourceTools.filter((n) => n !== name),
+    });
+  };
+  const addExtraSource = () => {
+    const name = extraSource.trim();
+    if (!name || sourcesFull) return;
+    toggleSource(name, true);
+    setExtraSource("");
+  };
+  // A picked base deleted since has no card to take it out with, so any pick drops it, and a line
+  // below the cards offers to drop it on its own. Asked only once the tenant's bases have loaded.
+  const knownBases = knowledgeBases
+    ? new Set(knowledgeBases.map((b) => b.id))
+    : null;
+  const liveReference = knownBases
+    ? fg.referenceKnowledgeBaseIds.filter((id) => knownBases.has(id))
+    : fg.referenceKnowledgeBaseIds;
+  const staleReference =
+    fg.referenceKnowledgeBaseIds.length - liveReference.length;
+  const referenceIds = new Set(liveReference);
+  const toggleReference = (id: string) => {
+    if (referenceIds.has(id))
+      setGrounding({
+        referenceKnowledgeBaseIds: liveReference.filter((k) => k !== id),
+      });
+    else if (liveReference.length < MAX_REFERENCE_KNOWLEDGE_BASES)
+      setGrounding({ referenceKnowledgeBaseIds: [...liveReference, id] });
+  };
+  const groundingActionLabel = (a: GroundingAction) =>
+    a === "observe"
+      ? t(
+          "editor.guardrails.groundingActionObserve",
+          "Only record it (the reply goes out as written)",
+        )
+      : a === "revise"
+        ? t(
+            "editor.guardrails.groundingActionRevise",
+            "Ask the agent to correct the reply, consulting the sources if needed",
+          )
+        : a === "template"
+          ? t(
+              "editor.guardrails.groundingActionTemplate",
+              "Reply with the Output template message",
+            )
+          : t(
+              "editor.guardrails.groundingActionHandoff",
+              "Hand the conversation to the team",
+            );
+  const setExternal = (patch: Partial<GuardrailsConfig["external"]>) =>
+    setG((s) => ({ ...s, external: { ...s.external, ...patch } }));
 
   const setDir = (
     dir: "input" | "output",
@@ -98,6 +363,105 @@ export function GuardrailsTab({
       [dir]: { ...s[dir], checks: { ...s[dir].checks, [key]: v } },
     }));
 
+  const byClassifier = g.classifier === "decisions";
+  // Switching to a classification API takes `generated` off both directions, since no model writes
+  // the replacement there: the screen shows the action that will run instead of saving one the
+  // server refuses. Switching back leaves the template, and `generated` can be picked again.
+  const setClassifier = (classifier: GuardrailClassifier) =>
+    setG((s) => ({
+      ...s,
+      classifier,
+      ...(classifier === "decisions"
+        ? {
+            input:
+              s.input.action === "generated"
+                ? { ...s.input, action: "template" }
+                : s.input,
+            output:
+              s.output.action === "generated"
+                ? { ...s.output, action: "template" }
+                : s.output,
+          }
+        : {}),
+    }));
+  const setDecisions = (patch: Partial<GuardrailsConfig["decisions"]>) =>
+    setG((s) => ({ ...s, decisions: { ...s.decisions, ...patch } }));
+  // Typed text per threshold, while a field for it is being edited: one draft per check, so the
+  // check's field in Input and its field in Output always show the same text.
+  const [thresholdDrafts, setThresholdDrafts] = useState<
+    Partial<Record<GuardrailThresholdKey, string>>
+  >({});
+  const typeThreshold = (key: GuardrailThresholdKey, raw: string) => {
+    const n = Number(raw);
+    if (raw.trim() === "" || !Number.isFinite(n)) {
+      setThresholdDrafts((d) => ({ ...d, [key]: raw }));
+      return;
+    }
+    const clamped = Math.min(Math.max(n, 0), 1);
+    setThresholdDrafts((d) => ({
+      ...d,
+      [key]: clamped === n ? raw : String(clamped),
+    }));
+    setG((s) => ({
+      ...s,
+      decisions: {
+        ...s.decisions,
+        thresholds: { ...s.decisions.thresholds, [key]: clamped },
+      },
+    }));
+  };
+  const leaveThreshold = (key: GuardrailThresholdKey) =>
+    setThresholdDrafts(({ [key]: _left, ...rest }) => rest);
+  // The context window as typed, when it is not a whole number in range: the form keeps its last valid
+  // value and the field shows the text out of range. The draft belongs to the input block it was typed
+  // over, so any other change to that block (a discard, a reload, another field) shows the form again.
+  const [contextDraft, setContextDraft] = useState<{
+    raw: string;
+    over: GuardrailsConfig["input"];
+  } | null>(null);
+  const typeContext = (raw: string) => {
+    if (
+      raw.trim() !== "" &&
+      inRange(Number(raw), GUARDRAIL_RANGES.contextMessages)
+    ) {
+      setContextDraft(null);
+      setG((s) => ({
+        ...s,
+        input: { ...s.input, contextMessages: Number(raw) },
+      }));
+    } else setContextDraft({ raw, over: g.input });
+  };
+  const contextText =
+    contextDraft && contextDraft.over === g.input
+      ? contextDraft.raw
+      : String(g.input.contextMessages);
+  const checkLabel = (k: keyof GuardrailChecks) =>
+    ({
+      toxicity: t("editor.guardrails.checkToxicity", "Toxicity / abuse"),
+      unsafeContent: t("editor.guardrails.checkUnsafe", "Unsafe content"),
+      competitorMentions: t(
+        "editor.guardrails.checkCompetitors",
+        "Competitor mentions",
+      ),
+      promptAdherence: t(
+        "editor.guardrails.checkAdherence",
+        "Adherence to the agent's instructions",
+      ),
+      answerRelevance: t(
+        "editor.guardrails.checkRelevance",
+        "The reply answers what the customer asked",
+      ),
+    })[k];
+  const thresholdInput = (key: GuardrailThresholdKey, label: string) => (
+    <ThresholdInput
+      text={thresholdDrafts[key] ?? String(g.decisions.thresholds[key])}
+      onType={(raw) => typeThreshold(key, raw)}
+      onLeave={() => leaveThreshold(key)}
+      label={label}
+      testId={`gr-threshold-${key}`}
+    />
+  );
+
   const actionLabel = (a: GuardrailAction) =>
     a === "template"
       ? t("editor.guardrails.actionTemplate", "Reply with a template message")
@@ -111,10 +475,48 @@ export function GuardrailsTab({
               "editor.guardrails.actionHandoff",
               "Hand the conversation to the team",
             )
-          : t(
-              "editor.guardrails.actionSilent",
-              "Send nothing (leave the customer without a reply)",
-            );
+          : a === "observe"
+            ? t(
+                "editor.guardrails.actionObserve",
+                "Only record it (the conversation is not changed)",
+              )
+            : t(
+                "editor.guardrails.actionSilent",
+                "Send nothing (leave the customer without a reply)",
+              );
+
+  // A check's switch, and beside it the check's threshold when a classification API judges and the
+  // check is on in this direction. The threshold belongs to the check, not to the direction: a check
+  // on in both directions draws the same value twice, and editing either edits both.
+  const checkRow = (
+    dir: "input" | "output",
+    key: keyof GuardrailChecks,
+    help?: string,
+  ) => {
+    const on = g[dir].checks[key];
+    return (
+      <div className="flex items-center gap-3">
+        <div className="min-w-0 grow">
+          <SwitchField
+            checked={on}
+            onCheckedChange={(v) => setCheck(dir, key, v)}
+            label={checkLabel(key)}
+            help={help}
+          />
+        </div>
+        {byClassifier && on && (
+          <div className="w-24 shrink-0">
+            {thresholdInput(
+              key,
+              t("editor.guardrails.checkThreshold", "Threshold: {{check}}", {
+                check: checkLabel(key),
+              }),
+            )}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const renderDirection = (dir: "input" | "output") => {
     const d = g[dir];
@@ -126,68 +528,78 @@ export function GuardrailsTab({
           label={t("editor.guardrails.directionEnabled", "Enable")}
         />
         {d.enabled && (
+          <FormField
+            label={t("editor.guardrails.checks", "Checks")}
+            description={
+              byClassifier
+                ? t(
+                    "editor.guardrails.thresholdsHint",
+                    "The number beside each check is its threshold, from 0 to 1: the check trips when the API's probability reaches it. Lower blocks more; higher lets more through.",
+                  )
+                : undefined
+            }
+            group
+          >
+            <div className="flex flex-col gap-2">
+              {checkRow(dir, "toxicity")}
+              {checkRow(dir, "unsafeContent")}
+              {checkRow(dir, "competitorMentions")}
+              {dir === "output" && (
+                <>
+                  {checkRow(dir, "promptAdherence")}
+                  {checkRow(
+                    dir,
+                    "answerRelevance",
+                    t(
+                      "editor.guardrails.checkRelevanceHelp",
+                      "This check determines whether the agent's reply addresses the customer's message.\n\nIf it fails, the configured action always uses the prepared message. The model does not write a replacement reply.\n\nIt is off by default because short messages such as “yes” can cause false failures. When another check is active, each reply makes two separately billed model requests.",
+                    ),
+                  )}
+                </>
+              )}
+            </div>
+          </FormField>
+        )}
+        {dir === "input" && d.enabled && (
+          <FormField
+            label={t(
+              "editor.guardrails.contextMessages",
+              "Conversation context",
+            )}
+            description={t(
+              "editor.guardrails.contextMessagesHint",
+              "How many earlier messages the check reads to understand the customer's message. Only the customer's message is judged. 0 reads it alone. 0-20.",
+            )}
+            help={t(
+              "editor.guardrails.contextMessagesHelp",
+              "A short reply such as “yes, the VIP one, how?” can read as something else on its own. With the question it answers beside it, its meaning is plain.\n\nThe earlier messages are context only: they never trip a check themselves, and a message a check stopped is not among them.\n\nEach message read adds a little to the cost of every screening. Agents created before this setting existed start at 0, which is how they were screened until then.",
+            )}
+          >
+            <NumberInput
+              range={GUARDRAIL_RANGES.contextMessages}
+              value={contextText}
+              onChange={(e) => typeContext(e.target.value)}
+              data-testid="gr-context-messages"
+            />
+          </FormField>
+        )}
+        {/* The action and its messages are also what the external check's block and a held failure
+            use, so they stay editable while it is configured, built-in screening on or off. */}
+        {(d.enabled || (dir === "output" && !!g.external.url)) && (
           <>
-            <FormField label={t("editor.guardrails.checks", "Checks")} group>
-              <div className="flex flex-col gap-2">
-                <SwitchField
-                  checked={d.checks.toxicity}
-                  onCheckedChange={(v) => setCheck(dir, "toxicity", v)}
-                  label={t(
-                    "editor.guardrails.checkToxicity",
-                    "Toxicity / abuse",
-                  )}
-                />
-                <SwitchField
-                  checked={d.checks.unsafeContent}
-                  onCheckedChange={(v) => setCheck(dir, "unsafeContent", v)}
-                  label={t("editor.guardrails.checkUnsafe", "Unsafe content")}
-                />
-                <SwitchField
-                  checked={d.checks.competitorMentions}
-                  onCheckedChange={(v) =>
-                    setCheck(dir, "competitorMentions", v)
-                  }
-                  label={t(
-                    "editor.guardrails.checkCompetitors",
-                    "Competitor mentions",
-                  )}
-                />
-                {dir === "output" && (
-                  <>
-                    <SwitchField
-                      checked={d.checks.promptAdherence}
-                      onCheckedChange={(v) =>
-                        setCheck(dir, "promptAdherence", v)
-                      }
-                      label={t(
-                        "editor.guardrails.checkAdherence",
-                        "Adherence to the agent's instructions",
-                      )}
-                    />
-                    <SwitchField
-                      checked={d.checks.answerRelevance}
-                      onCheckedChange={(v) =>
-                        setCheck(dir, "answerRelevance", v)
-                      }
-                      label={t(
-                        "editor.guardrails.checkRelevance",
-                        "The reply answers what the customer asked",
-                      )}
-                      help={t(
-                        "editor.guardrails.checkRelevanceHelp",
-                        "This check determines whether the agent's reply addresses the customer's message.\n\nIf it fails, the configured action always uses the prepared message. The model does not write a replacement reply.\n\nIt is off by default because short messages such as “yes” can cause false failures. When another check is active, each reply makes two separately billed model requests.",
-                      )}
-                    />
-                  </>
-                )}
-              </div>
-            </FormField>
             <FormField
               label={t("editor.guardrails.action", "On violation")}
-              description={t(
-                "editor.guardrails.actionHint",
-                "What to do when a check trips.",
-              )}
+              description={
+                d.action === "observe"
+                  ? t(
+                      "editor.guardrails.actionObserveHint",
+                      'Only records the trip in the Logs; the conversation goes on as if the check had passed. The rationale is logged only with "Log the values sent to tools" on, in Behavior.',
+                    )
+                  : t(
+                      "editor.guardrails.actionHint",
+                      "What to do when a check trips.",
+                    )
+              }
             >
               <Select
                 value={d.action}
@@ -196,20 +608,30 @@ export function GuardrailsTab({
                 }
               >
                 {ACTIONS.map((a) => (
-                  <option key={a} value={a}>
-                    {actionLabel(a)}
+                  <option
+                    key={a}
+                    value={a}
+                    disabled={a === "generated" && byClassifier}
+                  >
+                    {a === "generated" && byClassifier
+                      ? t(
+                          "editor.guardrails.actionGeneratedUnavailable",
+                          "{{action}} (not available with a classification API)",
+                          { action: actionLabel(a) },
+                        )
+                      : actionLabel(a)}
                   </option>
                 ))}
               </Select>
             </FormField>
             {/* Shown for "generated" too, because that action falls back to this text whenever no
                 replacement is written: when the model returns none, and always when the relevance
-                check is what tripped. Hiding it here left the operator unable to see or edit the
-                message their customers actually receive. */}
-            {/* The hand-over's own sentence (issue #704). Not the template: that one is a refusal,
-                and this says a person will continue. Empty is a choice, so the box may be left
-                blank on purpose. */}
-            {d.action === "handoff" && (
+                check is what tripped. It is the message customers actually receive then. */}
+            {/* The hand-over's own sentence. Not the template: that one is a refusal, and this says
+                a person will continue. Empty is a choice, so the box may be left blank on purpose.
+                Shown under hold too, where a check that cannot run sends it. */}
+            {(d.action === "handoff" ||
+              (g.onFailure === "hold" && d.action !== "observe")) && (
               <FormField
                 label={t(
                   "editor.guardrails.handoffMessage",
@@ -235,48 +657,50 @@ export function GuardrailsTab({
                 />
               </FormField>
             )}
-            {d.action !== "silent" && d.action !== "handoff" && (
-              <FormField
-                label={t("editor.guardrails.template", "Template message")}
-                error={
-                  dir === "input"
-                    ? refusals.inputTemplateMessage
-                    : refusals.outputTemplateMessage
-                }
-                // The two directions say different KINDS of thing about the same box, so they take
-                // different homes. Outbound is one sentence about when this text is used, which is
-                // what the operator needs to fill the field: inline. Inbound is why the field can
-                // never be anything else, read once: behind the `?`. It matters here more than
-                // elsewhere that the inbound text is not inline, because this field renders an
-                // `error` in the same slot, so a refusal would erase the explanation of the rule
-                // it just enforced.
-                description={
-                  d.action === "generated" && dir === "output"
-                    ? t(
-                        "editor.guardrails.templateFallbackHint",
-                        "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
-                      )
-                    : undefined
-                }
-                help={
-                  d.action === "generated" && dir === "input"
-                    ? t(
-                        "editor.guardrails.templateInboundHelp",
-                        "On customer messages, this text is ALWAYS what gets sent.\n\nThere is no reply to rewrite: the text under review is the customer's own message.\n\nThis was measured: a message telling it to state a price and a partnership produced exactly that, word for word, in all 16 runs.",
-                      )
-                    : undefined
-                }
-              >
-                <Textarea
-                  value={d.templateMessage}
-                  onChange={(e) =>
-                    setDir(dir, { templateMessage: e.target.value })
+            {d.action !== "silent" &&
+              d.action !== "handoff" &&
+              d.action !== "observe" && (
+                <FormField
+                  label={t("editor.guardrails.template", "Template message")}
+                  error={
+                    dir === "input"
+                      ? refusals.inputTemplateMessage
+                      : refusals.outputTemplateMessage
                   }
-                  rows={2}
-                  maxLength={TEMPLATE_MESSAGE_MAX}
-                />
-              </FormField>
-            )}
+                  // The two directions say different KINDS of thing about the same box, so they take
+                  // different homes. Outbound is one sentence about when this text is used, which is
+                  // what the operator needs to fill the field: inline. Inbound is why the field can
+                  // never be anything else, read once: behind the `?`. It matters here more than
+                  // elsewhere that the inbound text is not inline, because this field renders an
+                  // `error` in the same slot, so a refusal would erase the explanation of the rule
+                  // it just enforced.
+                  description={
+                    d.action === "generated" && dir === "output"
+                      ? t(
+                          "editor.guardrails.templateFallbackHint",
+                          "Sent whenever no replacement gets written: when the model returns none, and always when the relevance check is the one that tripped, since there is no reply to rewrite.",
+                        )
+                      : undefined
+                  }
+                  help={
+                    d.action === "generated" && dir === "input"
+                      ? t(
+                          "editor.guardrails.templateInboundHelp",
+                          "On customer messages, this text is ALWAYS what gets sent.\n\nThere is no reply to rewrite: the text under review is the customer's own message.\n\nThis was measured: a message telling it to state a price and a partnership produced exactly that, word for word, in all 16 runs.",
+                        )
+                      : undefined
+                  }
+                >
+                  <Textarea
+                    value={d.templateMessage}
+                    onChange={(e) =>
+                      setDir(dir, { templateMessage: e.target.value })
+                    }
+                    rows={2}
+                    maxLength={TEMPLATE_MESSAGE_MAX}
+                  />
+                </FormField>
+              )}
             {/* Output only. On the customer's message nothing is ever composed, so this field
                 would steer nothing — and a control that visibly does nothing is worse than one that
                 is not offered. The template hint above says why, where the operator is looking. */}
@@ -303,6 +727,11 @@ export function GuardrailsTab({
                     "editor.guardrails.generationPromptPlaceholder",
                     "e.g. Politely decline, keep a warm tone, and offer to connect them with a human agent.",
                   )}
+                />
+                <FieldSize
+                  max={GENERATION_PROMPT_MAX}
+                  text={d.generationPrompt}
+                  sentWith="guardrail"
                 />
               </FormField>
             )}
@@ -332,6 +761,154 @@ export function GuardrailsTab({
               label={t("editor.guardrails.enabled", "Enable guardrails")}
             />
             {g.enabled && (
+              <FormField
+                label={t("editor.guardrails.classifier", "Who judges")}
+                description={
+                  byClassifier
+                    ? t(
+                        "editor.guardrails.classifierDecisionsHint",
+                        "A classification API answers one yes/no question per check. Faster, but it gives only numbers and writes no reply.",
+                      )
+                    : t(
+                        "editor.guardrails.classifierChatHint",
+                        "A language model reads the message and explains its verdict. It can write a replacement reply.",
+                      )
+                }
+                help={
+                  byClassifier
+                    ? t(
+                        "editor.guardrails.classifierDecisionsHelp",
+                        "Each enabled check, and the custom policy, is one yes/no question to the classification API.\n\nA check trips when its probability reaches its threshold.\n\nThe API writes no reply of its own, so the generated reply action is not available: a tripped message gets the template or is silenced.",
+                      )
+                    : undefined
+                }
+              >
+                <Select
+                  value={g.classifier}
+                  onChange={(e) =>
+                    setClassifier(e.target.value as GuardrailClassifier)
+                  }
+                  data-testid="gr-classifier"
+                >
+                  <option value="chat">
+                    {t(
+                      "editor.guardrails.classifierChat",
+                      "A language model (default)",
+                    )}
+                  </option>
+                  <option value="decisions">
+                    {t(
+                      "editor.guardrails.classifierDecisions",
+                      "A classification API (Jev, OpenAI Decisions)",
+                    )}
+                  </option>
+                </Select>
+              </FormField>
+            )}
+            {g.enabled && (
+              <FormField
+                label={t(
+                  "editor.guardrails.onFailure",
+                  "When a check cannot run",
+                )}
+                description={
+                  g.onFailure === "hold"
+                    ? t(
+                        "editor.guardrails.onFailureHoldHint",
+                        "The message is stopped and the conversation goes to your team, with the direction's handoff message. Follow-ups the agent starts on its own still go out.",
+                      )
+                    : t(
+                        "editor.guardrails.onFailurePassHint",
+                        "The message continues unchecked, and the Logs page records that the check failed.",
+                      )
+                }
+              >
+                <Select
+                  value={g.onFailure}
+                  onChange={(e) =>
+                    setG((s) => ({
+                      ...s,
+                      onFailure: e.target.value as GuardrailFailureMode,
+                    }))
+                  }
+                  data-testid="gr-on-failure"
+                >
+                  <option value="pass">
+                    {t(
+                      "editor.guardrails.onFailurePass",
+                      "Let the message through (default)",
+                    )}
+                  </option>
+                  <option value="hold">
+                    {t(
+                      "editor.guardrails.onFailureHold",
+                      "Hold it and hand the conversation to the team",
+                    )}
+                  </option>
+                </Select>
+              </FormField>
+            )}
+            {g.enabled && byClassifier && (
+              <>
+                <FormField
+                  label={t(
+                    "editor.guardrails.decisionsProvider",
+                    "Classification API",
+                  )}
+                >
+                  <Select
+                    value={g.decisions.provider}
+                    onChange={(e) => {
+                      const provider = e.target.value as DecisionProvider;
+                      setDecisions({
+                        provider,
+                        model: DEFAULT_DECISION_MODEL[provider],
+                      });
+                    }}
+                    data-testid="gr-decisions-provider"
+                  >
+                    {DECISION_PROVIDERS.map((p) => (
+                      <option key={p} value={p}>
+                        {DECISION_PROVIDER_NAMES[p]}
+                      </option>
+                    ))}
+                  </Select>
+                </FormField>
+                <FormField
+                  label={t("editor.credential", "API key")}
+                  error={refusals.decisionsCredential}
+                  group
+                >
+                  <CredentialPicker
+                    value={g.decisions.credentialRef ?? ""}
+                    onChange={(v) => setDecisions({ credentialRef: v || null })}
+                    required
+                    compatibleTypes={credentialCompat.decisions(
+                      g.decisions.provider,
+                    )}
+                    defaultCreateType={
+                      credentialCompat.decisions(g.decisions.provider)[0]
+                    }
+                    ariaLabel={t("editor.credential", "API key")}
+                  />
+                </FormField>
+                <FormField
+                  label={t("editor.model", "Model")}
+                  description={t(
+                    "editor.guardrails.decisionsModelHint",
+                    "Empty uses the default, {{model}}.",
+                    { model: DEFAULT_DECISION_MODEL[g.decisions.provider] },
+                  )}
+                >
+                  <Input
+                    value={g.decisions.model}
+                    onChange={(e) => setDecisions({ model: e.target.value })}
+                    placeholder={DEFAULT_DECISION_MODEL[g.decisions.provider]}
+                  />
+                </FormField>
+              </>
+            )}
+            {g.enabled && !byClassifier && (
               <>
                 <FormField label={t("editor.provider", "Provider")}>
                   <Select
@@ -422,6 +999,7 @@ export function GuardrailsTab({
                     "One per line. Used by the competitor-mentions check.",
                   )}
                 >
+                  {/* biome-ignore lint/plugin/require-textarea-cap: bounded by entry count and per-entry length, so a dropped entry shows as a missing row, not a sentence that ends early */}
                   <Textarea
                     value={g.competitors.join("\n")}
                     onChange={(e) =>
@@ -432,14 +1010,33 @@ export function GuardrailsTab({
                     }
                     rows={3}
                   />
+                  <FieldSize
+                    text={readCompetitors(g.competitors).join(", ")}
+                    sentWith="guardrail"
+                  />
                 </FormField>
                 <FormField
                   label={t("editor.guardrails.customPolicy", "Custom policy")}
                   error={refusals.customPolicy}
-                  description={t(
-                    "editor.guardrails.customPolicyHint",
-                    "Extra rules appended to every analysis.",
-                  )}
+                  description={
+                    byClassifier
+                      ? t(
+                          "editor.guardrails.customPolicyQuestionHint",
+                          "Write it as one yes/no question where yes means a violation.",
+                        )
+                      : t(
+                          "editor.guardrails.customPolicyHint",
+                          "Extra rules appended to every analysis.",
+                        )
+                  }
+                  help={
+                    byClassifier
+                      ? t(
+                          "editor.guardrails.customPolicyQuestionHelp",
+                          "For example: “Does the reply promise the customer a refund?”\n\nA rule written as a statement (“the assistant must not…”) is read the wrong way round, and clean replies trip it.",
+                        )
+                      : undefined
+                  }
                 >
                   <Textarea
                     value={g.customPolicy}
@@ -449,7 +1046,405 @@ export function GuardrailsTab({
                     rows={3}
                     maxLength={CUSTOM_POLICY_MAX}
                   />
+                  <FieldSize
+                    max={CUSTOM_POLICY_MAX}
+                    text={g.customPolicy}
+                    sentWith="guardrail"
+                  />
                 </FormField>
+                {byClassifier && g.customPolicy.trim() && (
+                  <FormField
+                    label={t(
+                      "editor.guardrails.customPolicyThreshold",
+                      "Threshold for the custom policy",
+                    )}
+                    description={t(
+                      "editor.guardrails.customPolicyThresholdHint",
+                      "From 0 to 1, like the checks' thresholds.",
+                    )}
+                  >
+                    {thresholdInput(
+                      "customPolicy",
+                      t(
+                        "editor.guardrails.customPolicyThreshold",
+                        "Threshold for the custom policy",
+                      ),
+                    )}
+                  </FormField>
+                )}
+              </Section>
+              <Section
+                id="gr-grounding"
+                icon={FileSearch}
+                title={t("editor.guardrails.grounding", "Factual grounding")}
+                description={t(
+                  "editor.guardrails.groundingDesc",
+                  "Before a reply is sent, a reviewer model compares it with what the source tools returned, in that turn and in the earlier turns of the conversation it reads, and lists the claims they do not support. It reviews every reply: when no source was consulted, any fact the sources would cover counts as unsupported.",
+                )}
+              >
+                <SwitchField
+                  checked={fg.enabled}
+                  onCheckedChange={(v) => setGrounding({ enabled: v })}
+                  label={t(
+                    "editor.guardrails.groundingEnabled",
+                    "Check the reply against the tool results",
+                  )}
+                />
+                {fg.enabled && (
+                  <>
+                    <FormField
+                      label={t(
+                        "editor.guardrails.groundingSources",
+                        "Source tools",
+                      )}
+                      description={t(
+                        "editor.guardrails.groundingSourcesHint",
+                        "The tools whose results count as sources, such as a catalog or the knowledge search. With no source tool and no reference base, the check does not run.",
+                      )}
+                      group
+                    >
+                      <div
+                        className="flex flex-col gap-1"
+                        data-testid="gr-grounding-sources"
+                      >
+                        {sourceChoices.map((name) => (
+                          <SwitchField
+                            key={name}
+                            checked={fg.sourceTools.includes(name)}
+                            disabled={
+                              sourcesFull && !fg.sourceTools.includes(name)
+                            }
+                            onCheckedChange={(v) => toggleSource(name, v)}
+                            label={name}
+                          />
+                        ))}
+                        <div className="flex gap-2">
+                          <Input
+                            value={extraSource}
+                            onChange={(e) => setExtraSource(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === "Enter") {
+                                e.preventDefault();
+                                addExtraSource();
+                              }
+                            }}
+                            placeholder={t(
+                              "editor.guardrails.groundingSourceAdd",
+                              "Another tool, by name",
+                            )}
+                            aria-label={t(
+                              "editor.guardrails.groundingSourceAdd",
+                              "Another tool, by name",
+                            )}
+                            data-testid="gr-grounding-source-input"
+                          />
+                          <Button
+                            variant="secondary"
+                            onClick={addExtraSource}
+                            disabled={!extraSource.trim()}
+                          >
+                            {t("common.add", "Add")}
+                          </Button>
+                        </div>
+                      </div>
+                    </FormField>
+                    <FormField
+                      label={t(
+                        "editor.guardrails.groundingReference",
+                        "Reference knowledge bases",
+                      )}
+                      description={t(
+                        "editor.guardrails.groundingReferenceHint",
+                        "The reviewer reads every indexed document of these bases on every reply, searched or not, so a house rule written there grounds the reply. They go whole on each review.",
+                      )}
+                      group
+                    >
+                      <div data-testid="gr-grounding-reference">
+                        {!knowledgeBases?.length ? (
+                          <p className="text-text-muted text-xs">
+                            {t(
+                              "editor.knowledge.noBases",
+                              "No knowledge bases yet. Create some in Components.",
+                            )}
+                          </p>
+                        ) : (
+                          <ManagedKnowledgeBaseCards
+                            bases={knowledgeBases}
+                            selected={referenceIds}
+                            onToggle={toggleReference}
+                            onChanged={onCatalogChange}
+                          />
+                        )}
+                        {staleReference > 0 && (
+                          <p className="text-warning mt-2 flex items-center gap-2 text-xs">
+                            {t(
+                              "editor.guardrails.groundingReferenceStale",
+                              "{{count}} picked bases no longer exist and are not read.",
+                              { count: staleReference },
+                            )}
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setGrounding({
+                                  referenceKnowledgeBaseIds: liveReference,
+                                })
+                              }
+                              className="text-accent hover:underline"
+                            >
+                              {t("common.remove", "Remove")}
+                            </button>
+                          </p>
+                        )}
+                      </div>
+                    </FormField>
+                    <FormField
+                      label={t(
+                        "editor.guardrails.groundingAction",
+                        "On unsupported claims",
+                      )}
+                      description={
+                        fg.action === "revise"
+                          ? t(
+                              "editor.guardrails.groundingActionReviseHint",
+                              "The agent writes the reply once more, told which claims the sources do not support, and the new reply is sent. One extra generation per flagged turn, plus any source calls.",
+                            )
+                          : fg.action === "observe"
+                            ? t(
+                                "editor.guardrails.groundingActionObserveHint",
+                                "The verdict, the claims and the evidence go to the Logs page. Use it to measure before letting the check act.",
+                              )
+                            : t(
+                                "editor.guardrails.groundingActionReplaceHint",
+                                "Uses the messages set in Output. A false positive replaces a correct answer, so measure with “only record it” first.",
+                              )
+                      }
+                    >
+                      <Select
+                        value={fg.action}
+                        onChange={(e) =>
+                          setGrounding({
+                            action: e.target.value as GroundingAction,
+                          })
+                        }
+                        data-testid="gr-grounding-action"
+                      >
+                        {GROUNDING_ACTIONS.map((a) => (
+                          <option key={a} value={a}>
+                            {groundingActionLabel(a)}
+                          </option>
+                        ))}
+                      </Select>
+                    </FormField>
+                    {fg.action === "revise" && (
+                      <>
+                        <SwitchField
+                          checked={fg.reviseWithTools}
+                          onCheckedChange={(v) =>
+                            setGrounding({ reviseWithTools: v })
+                          }
+                          label={t(
+                            "editor.guardrails.groundingReviseTools",
+                            "Let the rewrite consult the source tools",
+                          )}
+                          help={t(
+                            "editor.guardrails.groundingReviseToolsHelp",
+                            "The rewrite may call the source tools above that only read, never a transfer, a label, a case or another tool with an effect. The new reply is reviewed once more against what they returned, and if it is still flagged the Output template is sent.\n\nOff, the rewrite runs without tools and can only drop the claims or say the information is not available.",
+                          )}
+                          id="gr-grounding-revise-tools"
+                        />
+                        {fg.reviseWithTools && (
+                          <FormField
+                            label={t(
+                              "editor.guardrails.groundingReviseCalls",
+                              "Calls the rewrite may make",
+                            )}
+                            description={t(
+                              "editor.guardrails.groundingReviseCallsHint",
+                              "From 1 to {{max}}, the agent's tool calls per turn. Each call adds latency to a flagged reply.",
+                              { max: reviseCallsRange.max },
+                            )}
+                          >
+                            <NumberInput
+                              range={reviseCallsRange}
+                              value={
+                                groundingReviseCallsDraft ??
+                                String(fg.reviseMaxToolCalls)
+                              }
+                              onChange={(e) => {
+                                const raw = e.target.value;
+                                setGroundingReviseCallsDraft(raw);
+                                if (
+                                  raw.trim() !== "" &&
+                                  inRange(Number(raw), reviseCallsRange)
+                                )
+                                  setGrounding({
+                                    reviseMaxToolCalls: Number(raw),
+                                  });
+                              }}
+                              onBlur={() => setGroundingReviseCallsDraft(null)}
+                              data-testid="gr-grounding-revise-calls"
+                            />
+                          </FormField>
+                        )}
+                      </>
+                    )}
+                    {(fg.action === "template" || fg.action === "handoff") && (
+                      <FormField
+                        label={
+                          fg.action === "template"
+                            ? t(
+                                "editor.guardrails.groundingTemplate",
+                                "Template message (the same one as Output)",
+                              )
+                            : t(
+                                "editor.guardrails.groundingHandoff",
+                                "Message to the customer (the same one as Output)",
+                              )
+                        }
+                      >
+                        <Textarea
+                          value={
+                            fg.action === "template"
+                              ? g.output.templateMessage
+                              : g.output.handoffMessage
+                          }
+                          onChange={(e) =>
+                            setDir(
+                              "output",
+                              fg.action === "template"
+                                ? { templateMessage: e.target.value }
+                                : { handoffMessage: e.target.value },
+                            )
+                          }
+                          rows={2}
+                          maxLength={TEMPLATE_MESSAGE_MAX}
+                          data-testid="gr-grounding-message"
+                        />
+                      </FormField>
+                    )}
+                    <FormField
+                      label={t(
+                        "editor.guardrails.groundingContext",
+                        "Earlier messages the reviewer reads",
+                      )}
+                      description={t(
+                        "editor.guardrails.groundingContextHint",
+                        "Customer and agent messages before the turn, past conversations with this contact included. Sources from the last 60 messages and the memory of past conversations count too. 0-40.",
+                      )}
+                    >
+                      <NumberInput
+                        range={GUARDRAIL_RANGES.groundingContextMessages}
+                        value={
+                          groundingContextDraft ?? String(fg.contextMessages)
+                        }
+                        onChange={(e) => {
+                          const raw = e.target.value;
+                          setGroundingContextDraft(raw);
+                          if (
+                            raw.trim() !== "" &&
+                            inRange(
+                              Number(raw),
+                              GUARDRAIL_RANGES.groundingContextMessages,
+                            )
+                          )
+                            setGrounding({ contextMessages: Number(raw) });
+                        }}
+                        onBlur={() => setGroundingContextDraft(null)}
+                        data-testid="gr-grounding-context"
+                      />
+                    </FormField>
+                    {/* The reviewer's model, drawn exactly as every other model of its own (the
+                    suggestion reviewer, the choice check): the same fields, no title of its own. */}
+                    <ModelOverrideFields
+                      value={groundingOverride}
+                      onChange={(update) =>
+                        setGrounding(
+                          groundingFromForm(update(groundingOverride)),
+                        )
+                      }
+                      parent={guardrailsModel}
+                      credBaseUrl={groundingCredBaseUrl}
+                      credentialError={
+                        refusals.groundingCredential ?? undefined
+                      }
+                      sameAsLabel={t(
+                        "editor.guardrails.groundingSameModel",
+                        "Same as the guardrails",
+                      )}
+                      credentialHint={t(
+                        "editor.guardrails.groundingCredentialHint",
+                        "Required when the reviewer uses another provider; without its own key, replies go out unreviewed.",
+                      )}
+                      baseURLHint={t(
+                        "editor.reviewBaseURLHint",
+                        "Required for OpenAI-compatible endpoints, unless the credential already carries one.",
+                      )}
+                    />
+                  </>
+                )}
+              </Section>
+              <Section
+                id="gr-external"
+                icon={Webhook}
+                title={t("editor.guardrails.external", "External check")}
+                description={t(
+                  "editor.guardrails.externalDesc",
+                  "Before a reply to a customer is delivered, it is sent to your endpoint with the turn's messages and tool calls, and your endpoint answers allow, replace or block. A block uses the Output action; no answer within 15 s follows “When a check cannot run”.",
+                )}
+              >
+                <div>
+                  <ExternalCheckContract />
+                </div>
+                <FormField
+                  label={t("editor.guardrails.externalUrl", "Endpoint URL")}
+                  error={refusals.externalUrl}
+                  description={t(
+                    "editor.guardrails.externalUrlHint",
+                    "https only. Empty turns the external check off.",
+                  )}
+                >
+                  <Input
+                    value={g.external.url ?? ""}
+                    onChange={(e) =>
+                      setExternal({ url: e.target.value.trim() || null })
+                    }
+                    placeholder="https://"
+                    data-testid="gr-external-url"
+                  />
+                </FormField>
+                <FormField
+                  label={t(
+                    "editor.guardrails.externalSecret",
+                    "Signing secret",
+                  )}
+                  error={refusals.externalSecret}
+                  description={t(
+                    "editor.guardrails.externalSecretHint",
+                    "Signs each request with HMAC-SHA256, like the outbound webhooks. Empty sends it unsigned.",
+                  )}
+                  group
+                >
+                  <CredentialPicker
+                    value={g.external.credentialRef ?? ""}
+                    onChange={(v) => setExternal({ credentialRef: v || null })}
+                    ariaLabel={t(
+                      "editor.guardrails.externalSecret",
+                      "Signing secret",
+                    )}
+                  />
+                </FormField>
+                <SwitchField
+                  checked={g.external.sendToolValues}
+                  onCheckedChange={(v) => setExternal({ sendToolValues: v })}
+                  label={t(
+                    "editor.guardrails.externalToolValues",
+                    "Send tool values",
+                  )}
+                  help={t(
+                    "editor.guardrails.externalToolValuesHint",
+                    "Off sends each tool call's name and sizes, without its arguments and result.",
+                  )}
+                />
               </Section>
             </>
           )}
@@ -460,6 +1455,8 @@ export function GuardrailsTab({
         saving={saving}
         onSave={onSave}
         onDiscard={onDiscard}
+        // The reviewer's endpoint checks, as every own-model section holds its save on them.
+        saveDisabled={groundingBlocksSave}
       />
     </div>
   );

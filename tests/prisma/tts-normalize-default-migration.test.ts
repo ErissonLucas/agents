@@ -1,22 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Client } from "pg";
 import { ENTER_FLEET_ROLE_SQL } from "@/lib/tenancy/fleet-role";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Runs the ACTUAL migration file against the test database, over the settings shapes an install can
-// really hold. Two failure modes are being pinned, and neither is hypothetical:
-//
-//   * `#-` RAISES when the path does not land in an object. `PATCH /v1/agents/:id` accepts
-//     `settings: z.record(z.string(), z.unknown())` and stores it verbatim, so `{"tts": [1,2]}` is
-//     reachable. The container runs `migrate deploy` BEFORE `serve`, so one such row anywhere in the
-//     fleet would crash-loop that install's deploy, on a data migration that changes a default.
-//   * FORCE ROW LEVEL SECURITY on "agents" binds even the table OWNER. A managed-Postgres admin role
-//     (RDS/Neon/Supabase) is typically owner WITHOUT rolsuper, and there the UPDATE would match zero
-//     rows and report success. The negative twin below runs the same statement as the APP role with
-//     and without the `SET`, so the guard cannot be dropped without a red test.
-//
-// The migration file is executed from DISK on purpose: a copy pasted in here would drift, and
-// Prisma's $executeRawUnsafe rejects multiple statements anyway, which would silently swallow the
-// `SET`.
+// Runs the ACTUAL migration file from DISK (a copy would drift, and $executeRawUnsafe rejects
+// multiple statements, silently swallowing the `SET`) over the settings shapes an install can hold:
+//   * `#-` RAISES when the path does not land in an object, and `PATCH /v1/agents/:id` stores
+//     `settings` verbatim, so `{"tts": [1,2]}` is reachable. `migrate deploy` runs BEFORE `serve`,
+//     so one such row crash-loops the install's deploy.
+//   * FORCE ROW LEVEL SECURITY on "agents" binds even the OWNER. A managed-Postgres admin role is
+//     typically owner WITHOUT rolsuper, and there the UPDATE would match zero rows and report
+//     success. The negative twin below runs it as the APP role with and without the `SET`.
 
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -33,14 +27,17 @@ if (suUrl && appUrl) {
     await su.query("SELECT 1");
     sql = await Bun.file(MIGRATION).text();
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as Client;
 
 let tenantId = 0n;
 const ids: Record<string, bigint> = {};
+// What the migration's first run raised, if anything. Captured rather than thrown so a raise fails a
+// NAMED test on its expect: thrown from beforeAll it shows up as "(unnamed)" and no test below runs.
+let migrationError: string | null = null;
 
 // Every shape an agent's settings bag can be in when this migration runs. The names are the point:
 // each one is a row that has to survive.
@@ -93,6 +90,11 @@ describe.skipIf(!dbUp)("migration: tts normalize default on", () => {
       );
       ids[name] = BigInt(r.rows[0].id);
     }
+    try {
+      await suDb.query(sql);
+    } catch (e) {
+      migrationError = e instanceof Error ? e.message : String(e);
+    }
   });
 
   afterAll(async () => {
@@ -105,9 +107,11 @@ describe.skipIf(!dbUp)("migration: tts normalize default on", () => {
     await suDb.end();
   });
 
-  test("runs over every settings shape without raising, including a non-object tts", async () => {
-    // No try/catch: a throw here IS the failure being guarded against.
-    await suDb.query(sql);
+  // The shapes `#-` cannot walk (an array holding "normalize", a string equal to it) are seeded above,
+  // so this is where a missing jsonb_typeof guard shows: "path element at position 2 is not an
+  // integer", and on a real install a deploy that crash-loops before `serve`.
+  test("the migration runs over every settings shape, including a non-object tts", () => {
+    expect(migrationError).toBeNull();
   });
 
   test("drops the stored flag so the new default reaches the agent", async () => {
@@ -191,12 +195,10 @@ describe.skipIf(!dbUp)("migration: tts normalize default on", () => {
       }
     }
 
-    // The file's own `SET app.is_super_admin` line is INERT against today's schema. The policy that
-    // read it was split into a role-restricted one (issue #382), and this migration only ever runs
-    // BEFORE that split, on a database whose policy still carried the OR. So re-executing it here
-    // has to supply the bypass of the era it is being run in, or the pair below stops
-    // discriminating: both halves would report "changed nothing", for two different reasons, and
-    // the guard would be green by invisibility rather than by working.
+    // NOTE: The file's `SET app.is_super_admin` is INERT against today's schema (the policy that read
+    // it is now role-restricted), and this migration only runs on a database whose policy still has
+    // the OR. So the re-run supplies that bypass, or both halves below would report "changed nothing"
+    // for different reasons and the guard would be green by invisibility rather than by working.
     test("the migration's statements reach the rows under the bypass of the era they run in", async () => {
       const id = await seedProbe("rls-probe-with-bypass");
       await runAsApp(`${ENTER_FLEET_ROLE_SQL};\n${sql}`);

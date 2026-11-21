@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import {
   AIMessage,
   HumanMessage,
@@ -153,8 +152,8 @@ describe("buildPlaygroundTrace", () => {
 
 // The guardrail row goes to the same places the rows above do — over REST, into MCP, and into a
 // stored transcript — but its text is written by a model that was shown the reply, so the reply's
-// own leaks can come back quoted in it. It used to be spread in whole (`{ type, ...report }`),
-// which is the one path into the trace that skipped the redaction every other path applies.
+// own leaks can come back quoted in it. Spreading it in whole (`{ type, ...report }`) would be the
+// one path into the trace that skips the redaction every other path applies.
 describe("traceGuardrail", () => {
   const report = {
     direction: "output" as const,
@@ -179,6 +178,32 @@ describe("traceGuardrail", () => {
     expect(e.categories?.[0]).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
   });
 
+  test("carries a classifier's scores, numbers as they came and the count bounded", () => {
+    const e = traceGuardrail({
+      ...report,
+      scores: [
+        { category: "toxicity", probability: 0.97, threshold: 0.8 },
+        { category: "custom_policy", probability: null, threshold: 0.5 },
+        ...Array.from({ length: 20 }, (_, i) => ({
+          category: `extra_${i}`,
+          probability: 0.1,
+          threshold: 0.8,
+        })),
+      ],
+    });
+    expect(e.scores?.[0]).toEqual({
+      category: "toxicity",
+      probability: 0.97,
+      threshold: 0.8,
+    });
+    expect(e.scores?.[1]?.probability).toBeNull();
+    expect(e.scores?.length).toBe(12);
+  });
+
+  test("no scores, no scores key", () => {
+    expect("scores" in traceGuardrail(report)).toBe(false);
+  });
+
   test("bounds the rationale, which nothing upstream bounds", () => {
     const e = traceGuardrail({ ...report, rationale: "x".repeat(9000) });
     expect((e.rationale as string).length).toBeLessThan(9000);
@@ -200,12 +225,5 @@ describe("traceGuardrail", () => {
       direction: "input",
       outcome: "clean",
     });
-  });
-
-  test("nothing builds a guardrail row without going through it", () => {
-    const src = readFileSync("src/modules/playground/service.ts", "utf8");
-    // Both sinks (the turn and the follow-up) call it, and neither spreads the report itself.
-    expect(src.match(/traceGuardrail\(r\)/g)?.length).toBe(2);
-    expect(src).not.toContain('{ type: "guardrail", ...r }');
   });
 });

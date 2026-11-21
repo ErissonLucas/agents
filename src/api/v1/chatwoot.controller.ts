@@ -1,9 +1,15 @@
 import { Elysia, t } from "elysia";
-import logger from "@/api/lib/logger";
 import { doc, errorResponse, jsonResponse } from "@/api/lib/openapi";
+import basePrisma from "@/api/lib/prisma";
 import {
+  admissionHolds,
+  admitChatwootDelivery,
+  queueOverflowHandoff,
+} from "@/modules/chatwoot/delivery-queue";
+import {
+  handToRecovery,
+  processRecordedChatwootDelivery,
   receiveChatwootWebhook,
-  recordAndProcessChatwootDelivery,
 } from "@/modules/chatwoot/webhook";
 
 // Public, JWT-less Chatwoot Agent Bot webhook receiver. Not behind tenancyPlugin/requireAuth:
@@ -17,7 +23,7 @@ export const chatwootController = new Elysia({
 }).post(
   "/webhook/:routeToken",
   async ({ params, request }) => {
-    // NOTE: read the RAW body — the HMAC signs the exact bytes Chatwoot sent; re-serializing the
+    // Read the RAW body: the HMAC signs the exact bytes Chatwoot sent; re-serializing the
     // parsed JSON would not match. We never declare/access `body`, so Elysia does not pre-parse.
     const rawBody = await request.text();
     const result = await receiveChatwootWebhook({
@@ -26,47 +32,64 @@ export const chatwootController = new Elysia({
       getHeader: (name) => request.headers.get(name),
     });
 
-    // Ack fast (<5s): a slow or non-2xx ack makes Chatwoot move the conversation pending→open
-    // (auto-escalate to a human). The dispatch runs detached.
-    //
-    // A DUPLICATE DISPATCHES TOO, and the CAS decides. `recordDelivery` calls every redelivery a
-    // duplicate the moment the ledger row exists, but the row existing is not the same as the work
-    // having been done: this dispatch is detached and fires AFTER the ack, so a process that dies in
-    // between (deploy, OOM, restart) strands the row on PENDING with nothing running. Dropping the
-    // redelivery there loses the message for good: Chatwoot, having been handed a 200, never sends
-    // it again. That is the one failure here that is not recoverable, and turning the retries
-    // back on upstream is what makes it reachable.
-    //
-    // Nothing double-processes: processChatwootDelivery opens with a CAS on `status: "PENDING"`, so
-    // a row already PROCESSING or PROCESSED matches zero rows and returns "skipped". The redelivery
-    // carries the same frozen payload, so a claim it wins reprocesses the same event.
+    // NOTE: The ledger row is committed by the time `receiveChatwootWebhook` returns, so this 200 is
+    // backed: a death from here on leaves a PENDING row the next drain hands to the delivery recovery
+    // (a customer message) or processes from its stored body (anything else). Processing waits behind
+    // the admission bound rather than competing for the pool; a customer message the waiting bound turns
+    // away goes to the recovery now. A redelivery of a row still PENDING is dispatched too and the CAS
+    // decides; one of a settled row is not (docs/chatwoot.md, "Webhook receiver").
     if (
       result.outcome === "queued" &&
+      result.dispatch === true &&
       result.tenantId !== undefined &&
       result.instanceId !== undefined &&
-      result.deliveryId !== undefined &&
+      result.deliveryRowId !== undefined &&
       result.normalized !== undefined
     ) {
       const {
         tenantId,
         instanceId,
-        deliveryId,
+        deliveryRowId,
         agentBotId = null,
+        receiptBindingGeneration = null,
         normalized,
+        receivedAt = Date.now(),
       } = result;
-      void recordAndProcessChatwootDelivery({
-        tenantId,
-        instanceId,
-        deliveryId,
-        agentBotId,
-        normalized,
-      }).catch((err) => {
-        logger.error(
-          "chatwoot async dispatch failed (delivery %s): %s",
-          deliveryId,
-          err instanceof Error ? err.message : String(err),
+      const lane = result.turnBearing === true ? "turn" : "meta";
+      // Held already (a redelivery of a row waiting here) is a duplicate, not a full lane.
+      const duplicate = admissionHolds(deliveryRowId);
+      const admitted = admitChatwootDelivery(
+        deliveryRowId,
+        () =>
+          processRecordedChatwootDelivery({
+            tenantId,
+            instanceId,
+            deliveryRowId,
+            agentBotId,
+            normalized,
+            receiptBindingGeneration,
+          }),
+        lane,
+        receivedAt,
+      );
+      // Not admitted and not a duplicate: the waiting bound turned it away.
+      // A control command in the turn lane stays PENDING with its body for the drain instead.
+      if (!admitted && !duplicate && result.recoverable === true) {
+        // One handoff at a time, behind the others. Failures are logged inside, and a handoff refused
+        // or failed leaves the row PENDING, which the next drain hands over.
+        queueOverflowHandoff(() =>
+          handToRecovery(basePrisma, {
+            tenantId,
+            instanceId,
+            rowId: deliveryRowId,
+            from: "PENDING",
+            event: normalized.event,
+            conversationId: normalized.conversationId,
+            messageId: normalized.message?.id ?? null,
+            reason: "waiting_bound",
+          }),
         );
-      });
+      }
     }
 
     return { ack: true, outcome: result.outcome };
@@ -75,12 +98,12 @@ export const chatwootController = new Elysia({
     detail: {
       ...doc(
         "Chatwoot bot webhook",
-        "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast (<5s) and processes asynchronously; an unknown token and a bad signature collapse into the same 401, so a probe cannot tell which routes are live.",
+        "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Records the delivery durably, then acks (<5s) and processes asynchronously; a delivery that could not be recorded is a 503, for the sender to retry. An unknown token and a bad signature collapse into the same 401, so a probe cannot tell which routes are live.",
       ),
       security: [],
       responses: {
         200: jsonResponse(
-          "Returned once the caller is authenticated; `outcome` says what happened to the event.",
+          "Returned once the caller is authenticated and the delivery is recorded; `outcome` says what happened to the event.",
           t.Object({
             ack: t.Literal(true),
             outcome: t.Union(
@@ -88,16 +111,18 @@ export const chatwootController = new Elysia({
                 t.Literal("queued"),
                 t.Literal("duplicate"),
                 t.Literal("ignored"),
+                t.Literal("processed"),
               ],
               {
                 description:
-                  "queued = accepted for async handling; duplicate = replay of an already-recorded event; ignored = an event shape the receiver does not handle.",
+                  "queued = accepted for async handling; duplicate = replay of an already-recorded event; ignored = an event shape the receiver does not handle, or a message update that repeats the last processed payload of the same message (a delivery receipt), acked with nothing recorded, or a channel connection change that is not newer than the one stored or names an inbox not mirrored here; processed = a channel connection change applied before the ack.",
               },
             ),
           }),
         ),
         400: errorResponse(400),
         401: errorResponse(401),
+        503: errorResponse(503),
       },
     },
     params: t.Object({

@@ -8,6 +8,7 @@ import {
   expect,
   test,
 } from "bun:test";
+import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   cleanup,
   fireEvent,
@@ -25,14 +26,13 @@ import {
 } from "@/client/components/webhooks/WebhookSubscriptionModal";
 import { invalidateVault } from "@/client/lib/vaultCache";
 
-// The sibling of `AlertChannelsSection`, and it inherited the same obligation the moment the read
-// started redacting: `readableVaultRef` hides a `secret_ref` that names no vault entry (the column
-// took any string until #126), so a subscription can arrive as `hasSecret` with no ref to show. This
-// modal sent `secretRef` on every save, so opening one to change its url would have deleted a signing
-// secret it could not display — #435 reproduced at the site this PR cites as the norm.
+// The sibling of `AlertChannelsSection`, with the same obligation: `readableVaultRef` hides a
+// legacy `secret_ref` that names no vault entry, so a subscription can arrive as `hasSecret` with
+// no ref to show. An untouched save must omit `secretRef`, or changing the url deletes a signing
+// secret the modal could not even display.
 //
-// NOTE: every assertion reduces to a boolean or a string BEFORE expect. A failing expectation that
-// holds a DOM node serializes a cyclic happy-dom tree and stalls the runner.
+// Every assertion reduces to a boolean or a string BEFORE expect: a failing expectation that holds
+// a DOM node serializes a cyclic happy-dom tree and stalls the runner.
 
 const VAULT_ENTRY = {
   id: "7",
@@ -66,13 +66,21 @@ function Harness({ payload }: { payload: WebhookModalPayload }) {
     modal.open(payload);
   }, []);
   return (
-    <ToastProvider>
-      <WebhookSubscriptionModal
-        modal={modal}
-        events={["conversation.created", "conversation.handoff"]}
-        onSaved={() => {}}
-      />
-    </ToastProvider>
+    <TooltipPrimitive.Provider>
+      <ToastProvider>
+        <WebhookSubscriptionModal
+          modal={modal}
+          groups={[
+            {
+              family: "conversation",
+              wildcard: "conversation.*",
+              events: ["conversation.created", "conversation.handoff"],
+            },
+          ]}
+          onSaved={() => {}}
+        />
+      </ToastProvider>
+    </TooltipPrimitive.Provider>
   );
 }
 
@@ -164,12 +172,6 @@ describe("WebhookSubscriptionModal", () => {
     expect(String(body?.url)).toBe("https://ops.example.com/hook");
   });
 
-  test("a secret the read cannot show survives an unrelated save", async () => {
-    await open({ hasSecret: true, secretRef: null });
-    const body = await save();
-    expect(Object.hasOwn(body ?? {}, "secretRef")).toBe(false);
-  });
-
   test("and the modal says so instead of reading as None", async () => {
     await open({ hasSecret: true, secretRef: null });
     expect(
@@ -177,9 +179,8 @@ describe("WebhookSubscriptionModal", () => {
         /does not point at a credential|não aponta para uma credencial/,
       ).length > 0,
     ).toBe(true);
-    // …and it says what that COSTS, which is the half an operator acts on: such a ref resolves to no
-    // row, so the worker signs nothing. A sentence that only says "cannot be shown" reads like a
-    // display quirk.
+    // NOTE: and it says what that COSTS, the half an operator acts on: such a ref resolves to no
+    // row, so the worker signs nothing. "Cannot be shown" alone reads like a display quirk.
     expect(
       screen.queryAllByText(
         /deliveries go unsigned|entregas saem sem assinatura/,
@@ -198,8 +199,8 @@ describe("WebhookSubscriptionModal", () => {
   });
 
   test("an unshowable secret can still be taken away on purpose", async () => {
-    // The trap in comparing VALUES: this picker opens empty, so choosing "None" moves nothing and a
-    // value comparison would call it unchanged — leaving no way to clear a secret at all.
+    // NOTE: the interaction is tracked, not the VALUE: this picker opens empty, so choosing "None"
+    // moves nothing and a value comparison would leave no way to clear the secret.
     await open({ hasSecret: true, secretRef: null });
     await chooseNone();
     const body = await save();

@@ -11,25 +11,28 @@ import { SWITCH_TENANT_PARAM } from "@/lib/console-params";
 interface ProtectedRouteProps {
   children: ReactNode;
   requireAdmin?: boolean;
+  // Without the console's sidebar and header: a dashboard's TV mode fills the screen on its own.
+  bare?: boolean;
 }
 
 export function ProtectedRoute({
   children,
   requireAdmin = false,
+  bare = false,
 }: ProtectedRouteProps) {
   const { user, loading } = useAuth();
   const location = useLocation();
 
   if (loading) {
     return (
-      <div className="flex min-h-dvh items-center justify-center bg-bg-primary">
-        <Loader2 className="h-6 w-6 animate-spin text-text-secondary" />
+      <div className="bg-bg-primary flex min-h-dvh items-center justify-center">
+        <Loader2 className="text-text-secondary h-6 w-6 animate-spin" />
       </div>
     );
   }
 
   if (!user) {
-    const redirectTo = location.pathname + location.search;
+    const redirectTo = location.pathname + location.search + location.hash;
     const loginUrl =
       redirectTo !== "/"
         ? `/login?redirect=${encodeURIComponent(redirectTo)}`
@@ -37,19 +40,17 @@ export function ProtectedRoute({
     return <Navigate to={loginUrl} replace />;
   }
 
-  // Non-admins (AGENT) have no dashboard; "/" is the dashboard, so bounce them to their
-  // primary surface instead of looping back to "/". The role read here is the one held in the ACTIVE
-  // tenant, so a link to another tenant where the person IS an administrator goes through to the
-  // switch below, and meets this gate again after the reload with the role held there (issue #756,
-  // review round 2).
+  // NOTE: non-admins (AGENT) have no dashboard, and "/" is the dashboard, so bounce them to their
+  // primary surface instead of looping back to "/". The role is the one held in the ACTIVE tenant, so
+  // a link to a tenant where the person IS an administrator goes through to the switch below, and
+  // meets this gate again after the reload with the role held there.
   if (requireAdmin && !isAdminRole(user.role)) {
     const requested = new URLSearchParams(location.search).get(
       SWITCH_TENANT_PARAM,
     );
-    // A fresh login answers with the DEFAULT membership's role and no membership list; `/auth/me`
+    // NOTE: a fresh login answers with the DEFAULT membership's role and no membership list; `/auth/me`
     // brings the role held in the selected tenant, and the list, a moment later. Deciding before it
-    // lands would send an administrator of the selected or linked tenant away and lose the page they
-    // asked for (review rounds 3 and 6).
+    // lands would send an administrator of the selected or linked tenant away from the page they asked for.
     if (user.tenants === undefined) {
       return <SessionPending />;
     }
@@ -64,7 +65,7 @@ export function ProtectedRoute({
   // TenantDeepLink).
   return (
     <TenantDeepLink>
-      <Layout>{children}</Layout>
+      {bare ? children : <Layout>{children}</Layout>}
     </TenantDeepLink>
   );
 }
@@ -85,8 +86,8 @@ function switchesToAdministeredTenant(
 function SessionPending() {
   useSessionRetry(true);
   return (
-    <div className="flex min-h-dvh items-center justify-center bg-bg-primary">
-      <Loader2 className="h-6 w-6 animate-spin text-text-secondary" />
+    <div className="bg-bg-primary flex min-h-dvh items-center justify-center">
+      <Loader2 className="text-text-secondary h-6 w-6 animate-spin" />
     </div>
   );
 }

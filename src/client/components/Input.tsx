@@ -12,12 +12,36 @@ type BaseInputProps = Omit<
   errorMessage?: string;
   helperText?: string;
   wrapperClassName?: string;
+  /**
+   * The value is a secret that is not the user's sign-in password (a setup token, an API key):
+   * password managers must neither offer a saved password for it nor offer to save it as one.
+   */
+  secret?: boolean;
 };
 
+// The opt-outs 1Password, LastPass, Bitwarden and Dashlane read, in that order. `autocomplete="off"`
+// alone does not stop them on a masked field.
+const PASSWORD_MANAGER_IGNORE = {
+  "data-1p-ignore": "",
+  "data-lpignore": "true",
+  "data-bwignore": "",
+  "data-form-type": "other",
+} as const;
+
+// A masked field says what it holds, because a password manager reads that and nothing else: the
+// user's current password (fill it), a new one (generate and save it), one it must not touch
+// (`off`), or a secret that is no password at all. There is no default, so a new masked field
+// cannot inherit an answer that is wrong for it.
 type PasswordToggleInputProps = BaseInputProps & {
   showPasswordToggle: true;
   type: "password";
-};
+} & (
+    | { secret: true; autoComplete?: never }
+    | {
+        secret?: false;
+        autoComplete: "current-password" | "new-password" | "off";
+      }
+  );
 
 type RegularInputProps = BaseInputProps & {
   showPasswordToggle?: false;
@@ -37,6 +61,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
       showPasswordToggle,
       type,
       autoComplete,
+      secret,
       ...props
     },
     ref,
@@ -61,18 +86,15 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
         <div className={cn("relative", wrapperClassName && "h-full")}>
           <input
             // {...props} FIRST, so every attribute this component COMPUTES wins over the same one
-            // passed in. The order used to be the reverse, and the spread then overwrote the merged
-            // `aria-describedby`: a caller that described its control lost the field's own message,
-            // which is how a validation message goes unannounced. Anything a caller may legitimately
+            // passed in. In the reverse order the spread overwrites the merged `aria-describedby`: a
+            // caller that described its control loses the field's own message, and a validation
+            // message goes unannounced. Anything a caller may legitimately
             // override is folded into the computation instead of racing it.
             {...props}
+            {...(secret ? PASSWORD_MANAGER_IGNORE : undefined)}
             ref={ref}
             type={showPasswordToggle && showPassword ? "text" : type}
-            autoComplete={
-              showPasswordToggle
-                ? (autoComplete ?? "new-password")
-                : autoComplete
-            }
+            autoComplete={secret ? "off" : autoComplete}
             aria-invalid={hasError || undefined}
             id={props.id ?? field.controlId}
             aria-labelledby={props["aria-labelledby"] ?? field.labelledById}
@@ -85,7 +107,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
               hasDescription ? descriptionId : undefined,
             )}
             className={cn(
-              "w-full rounded-lg border border-border bg-bg-tertiary px-4 py-2 text-text-primary placeholder-text-placeholder focus:border-border-focus focus:outline-none disabled:opacity-60",
+              "border-border-hover bg-bg-tertiary text-text-primary placeholder-text-placeholder focus:border-border-focus focus:ring-accent-soft h-8 w-full rounded-md border px-2.5 text-sm transition-colors focus:ring-2 focus:outline-none disabled:opacity-60",
               { "border-error": hasError, "pr-10": !!showPasswordToggle },
               className,
             )}
@@ -94,7 +116,7 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
             <button
               type="button"
               onClick={() => setShowPassword(!showPassword)}
-              className="absolute top-1/2 right-3 -translate-y-1/2 text-text-muted hover:text-text-primary"
+              className="text-text-muted hover:text-text-primary absolute top-1/2 right-3 -translate-y-1/2"
               tabIndex={-1}
               aria-label={
                 showPassword
@@ -111,14 +133,14 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
           )}
         </div>
         {errorMessage && (
-          <span id={descriptionId} className="mt-1 block text-error text-xs">
+          <span id={descriptionId} className="text-error mt-1 block text-xs">
             {errorMessage}
           </span>
         )}
         {helperText && !errorMessage && (
           <span
             id={descriptionId}
-            className="mt-1 block text-text-muted text-xs"
+            className="text-text-muted mt-1 block text-xs"
           >
             {helperText}
           </span>

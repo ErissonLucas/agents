@@ -1,21 +1,12 @@
 import { useEffect, useRef } from "react";
 
-// Browser-level guards for unsaved changes. Two independent mechanisms, both
-// reference-counted at the module level so they survive component unmounts and
-// compose across several simultaneously-dirty forms:
-//
-//   1. `beforeunload` — the NATIVE browser prompt ("Leave site? Changes may not
-//      be saved."). Fires on refresh, tab/window close, and navigation to an
-//      external URL. It is the only place the native prompt is reachable; it
-//      does NOT fire on in-app (SPA) navigation, including the Back button
-//      between two app routes.
-//   2. Back-button trap — a small history sentinel. The native prompt is
-//      impossible for SPA Back navigation (and react-router's `useBlocker`
-//      needs a data router, which this app does not use), so instead we push a
-//      same-URL sentinel entry while a guard is active and, when the user pops
-//      it with Back, re-arm it and notify the top blocker so it can show our
-//      own in-app confirmation. The URL never changes, so react-router's
-//      location is untouched.
+// Browser-level guards for unsaved changes, reference-counted at module level so they survive
+// unmounts and compose across several dirty forms:
+//   1. `beforeunload`, the NATIVE prompt: refresh, tab close, external navigation. It never fires on
+//      in-app (SPA) navigation, the Back button between two app routes included.
+//   2. A Back-button trap: `useBlocker` needs a data router, which this app does not use, so a
+//      same-URL sentinel entry is pushed while a guard is active; popping it with Back re-arms it and
+//      notifies the top blocker, which shows our own confirm. react-router's location is untouched.
 
 const isBrowser = typeof window !== "undefined";
 
@@ -48,6 +39,114 @@ export function acquireBeforeUnload(): () => void {
   };
 }
 
+// Input that is not a form change but a reload would still lose: a composer's unsent message, or a
+// modal's save in flight (`busy`). It arms no prompt (leaving the screen keeps it in memory, as
+// before), and only stops the reloads the console starts by itself (client/lib/staleBuild.ts).
+let heldDrafts = 0;
+
+export function useHeldDraft(active: boolean) {
+  useEffect(() => {
+    if (!active) return;
+    heldDrafts += 1;
+    return () => {
+      heldDrafts -= 1;
+    };
+  }, [active]);
+}
+
+// Work the operator started that the server does not have yet (a write on the wire, a voice note
+// between stop and upload). Held by the operation itself, not by a component, so leaving the screen
+// mid-flight still keeps the console's own reloads off until it settles.
+let inFlight = 0;
+
+export function holdInFlight(): () => void {
+  inFlight += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    inFlight -= 1;
+  };
+}
+
+export async function holdWhile<T>(work: () => Promise<T>): Promise<T> {
+  const release = holdInFlight();
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+// A write the server may already be applying (POST, PUT, PATCH, DELETE) holds the console's own reloads
+// until its answer has been read: a reload aborts the request mid-flight and drops the answer, which
+// for a password change is the cookie of the session that replaces the current one. Wraps the API
+// client's fetch, so it holds whichever screen started the write and outlives that screen. A read
+// holds nothing.
+const WRITES = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+export function holdingWrites(
+  fetcher: () => typeof fetch = () => globalThis.fetch,
+): typeof fetch {
+  return (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const method = (
+      init?.method ?? (input instanceof Request ? input.method : "GET")
+    ).toUpperCase();
+    if (!WRITES.has(method)) return fetcher()(input, init);
+    const release = holdInFlight();
+    let response: Response;
+    try {
+      response = await fetcher()(input, init);
+    } catch (error) {
+      release();
+      throw error;
+    }
+    return releasedWhenRead(response, release);
+  }) as typeof fetch;
+}
+
+// The same response, whose body releases the hold once it has been read to the end, fails or is
+// cancelled.
+function releasedWhenRead(response: Response, release: () => void): Response {
+  if (!response.body) {
+    release();
+    return response;
+  }
+  const reader = response.body.getReader();
+  const body = new ReadableStream<Uint8Array>(
+    {
+      async pull(controller) {
+        try {
+          const { done, value } = await reader.read();
+          if (done) {
+            release();
+            controller.close();
+          } else controller.enqueue(value);
+        } catch (error) {
+          release();
+          controller.error(error);
+        }
+      },
+      cancel(reason) {
+        release();
+        return reader.cancel(reason);
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers,
+  });
+}
+
+// Whether a reload now would lose something: a form or modal the native prompt is guarding, a held
+// draft, or work in flight.
+export function hasUnsavedChanges(): boolean {
+  return beforeUnloadCount > 0 || heldDrafts > 0 || inFlight > 0;
+}
+
 // Force-detach the native prompt. For a confirmed full-page reload (e.g. the
 // tenant switch) where the user already approved leaving via our own dialog and
 // the document is about to be replaced anyway — so the native prompt would be a
@@ -64,6 +163,29 @@ type BackBlocker = () => void;
 
 const blockers: BackBlocker[] = [];
 let armed = false;
+// When the Back that pops our own leftover sentinel (`disarm`) was issued, until it lands. That Back
+// is asynchronous, so another guard can arm in between: a modal that closes on save while the page
+// behind it turns dirty (an inline "New credential" selected by its save). The listener stays
+// attached until the cleanup pop arrives, so it is recognized as ours and never reaches a blocker as
+// a user's Back. A pop that never comes (the document went away, a test environment) must not leave
+// the next guard unarmed, so the wait is bounded: a same-document Back lands in tens of milliseconds.
+const CLEANUP_POP_MS = 1000;
+let cleanupAt: number | null = null;
+let listening = false;
+
+function cleanupInFlight(): boolean {
+  if (cleanupAt === null) return false;
+  if (Date.now() - cleanupAt < CLEANUP_POP_MS) return true;
+  cleanupAt = null;
+  return false;
+}
+
+function listen(on: boolean) {
+  if (on === listening) return;
+  listening = on;
+  if (on) window.addEventListener("popstate", onPopState);
+  else window.removeEventListener("popstate", onPopState);
+}
 
 function sentinelState(): unknown {
   // Preserve react-router's history state (idx/key/usr) and just add our marker,
@@ -78,7 +200,25 @@ function hasSentinel(): boolean {
   return !!s && s[SENTINEL_KEY] === true;
 }
 
+// Work waiting for the trap to let go of the page (`afterTrapRelease`).
+let afterRelease: Array<() => void> = [];
+
+function flushAfterRelease() {
+  const waiting = afterRelease;
+  afterRelease = [];
+  for (const run of waiting) run();
+}
+
 function onPopState() {
+  if (cleanupInFlight()) {
+    // Our own cleanup pop, not the user's Back. A guard that armed while it was on the way pushed no
+    // sentinel (`arm` waits for this pop), so it goes on top now.
+    cleanupAt = null;
+    if (blockers.length > 0) window.history.pushState(sentinelState(), "");
+    else listen(false);
+    flushAfterRelease();
+    return;
+  }
   if (blockers.length === 0) return;
   // The user pressed Back, consuming our sentinel (the URL is unchanged because
   // the sentinel was pushed for the same location). Re-arm immediately so the
@@ -92,20 +232,45 @@ function onPopState() {
 function arm() {
   if (armed) return;
   armed = true;
-  window.history.pushState(sentinelState(), "");
-  window.addEventListener("popstate", onPopState);
+  listen(true);
+  // With a cleanup pop still on the way, a sentinel pushed now would be the entry that pop leaves
+  // from; the pop's own handling pushes the sentinel once it lands.
+  if (!cleanupInFlight()) window.history.pushState(sentinelState(), "");
 }
 
 function disarm() {
   if (!armed) return;
   armed = false;
-  // Detach BEFORE popping the sentinel: the back() below fires a popstate for a
-  // same-URL entry that is our own cleanup, not a user Back, so the listener
-  // must already be gone when it arrives (no flag needed).
-  window.removeEventListener("popstate", onPopState);
-  // Pop the leftover sentinel (if still on top) so the next Back is not wasted
-  // on a dead same-URL entry.
-  if (hasSentinel()) window.history.back();
+  // Armed and disarmed again before the earlier cleanup pop landed: that pop already takes the
+  // sentinel away, and a second back() would leave the page.
+  if (cleanupInFlight()) return;
+  // Pop the leftover sentinel (if still on top) so the next Back is not wasted on a dead same-URL
+  // entry. The back() is asynchronous and its popstate is our own cleanup, not a user Back: the
+  // listener stays attached to recognize it, because a guard may arm before it arrives.
+  if (hasSentinel()) {
+    cleanupAt = Date.now();
+    window.history.back();
+  } else {
+    listen(false);
+    flushAfterRelease();
+  }
+}
+
+// Run `run` once the trap has let go of the page: after its cleanup pop, when it has one to make. A
+// navigation started before that pop would race it, and the pop can cancel a full reload. Bounded
+// like the pop itself, so a trap that never lets go does not hold the work forever.
+export function afterTrapRelease(run: () => void) {
+  if (!isBrowser || (!armed && !cleanupInFlight())) {
+    run();
+    return;
+  }
+  afterRelease.push(run);
+  setTimeout(() => {
+    const i = afterRelease.indexOf(run);
+    if (i < 0) return;
+    afterRelease.splice(i, 1);
+    run();
+  }, CLEANUP_POP_MS);
 }
 
 // Register a Back-button blocker. While at least one is registered, the Back
@@ -125,6 +290,12 @@ export function pushBackBlocker(onBack: BackBlocker): () => void {
   };
 }
 
+// Whether the trap's sentinel is the current history entry. A page that leaves by a link while it is
+// navigates in its place, so Back from the destination returns to the page once.
+export function sentinelOnTop(): boolean {
+  return isBrowser && hasSentinel();
+}
+
 // Honor a Back press that a PAGE guard confirmed (the user chose "discard").
 // When the trap fired, `onPopState` re-pushed the sentinel, so we are now
 // sitting on it, one entry above the guarded page. Unlike a modal (which just
@@ -133,8 +304,9 @@ export function pushBackBlocker(onBack: BackBlocker): () => void {
 // previous location. A single `history.go` avoids racing two history ops.
 export function leaveViaBackTrap() {
   if (!isBrowser) return;
-  window.removeEventListener("popstate", onPopState);
+  listen(false);
   armed = false;
+  cleanupAt = null;
   window.history.go(hasSentinel() ? -2 : -1);
 }
 

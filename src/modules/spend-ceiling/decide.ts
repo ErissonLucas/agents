@@ -1,9 +1,8 @@
 import type { UsageSource } from "@/graph/usage";
 import type { SpendCeilingConfig } from "./settings";
 
-// THE RULE, on its own, so it can be proved by a decision table instead of by a database (issue
-// #146). Everything that reads the snapshot, posts the copy or hands the conversation off is wiring
-// around this function.
+// THE RULE, on its own, so it can be proved by a decision table instead of by a database. Everything
+// that reads the snapshot, posts the copy or hands the conversation off is wiring around it.
 
 export type SpendVerdict =
   // Under the ceiling, or no ceiling applies to this source.
@@ -19,15 +18,18 @@ export interface SpendDecisionInput {
   usedUsd: number;
 }
 
-// WHICH CEILING A SOURCE ANSWERS TO. Two numbers rather than one, because the ledger already tells
-// the two kinds of traffic apart and an operator burning the month in the playground must not be
-// able to silence the agent for customers.
+// WHICH CEILING A SOURCE ANSWERS TO. One number per source, because the ledger already tells the
+// kinds of traffic apart and an operator burning the month in the playground, or a host
+// application's users, must not be able to silence the agent for the others.
 export function ceilingFor(
   cfg: SpendCeilingConfig,
   source: UsageSource,
 ): number | null {
-  const configured =
-    source === "playground" ? cfg.monthlyPlaygroundUsd : cfg.monthlyInboxUsd;
+  const configured = {
+    inbox: cfg.monthlyInboxUsd,
+    playground: cfg.monthlyPlaygroundUsd,
+    client: cfg.monthlyClientUsd,
+  }[source];
   // 0 IS "NO CEILING ON THIS HALF", not "refuse everything". An operator who wants to bound only
   // the playground leaves the other at zero, and reading that as a ceiling of zero dollars would
   // switch the agent off for every customer the moment the block is enabled.
@@ -70,7 +72,22 @@ export function monthStart(now: Date): Date {
 // The other end of the same window, EXCLUSIVE: the first instant of the next month, so the pair is
 // `[monthStart, monthEnd)` and no instant belongs to two months. `Date.UTC` normalises month 12
 // into January of the next year on its own. The snapshot is keyed by `monthStart`, so the gate
-// never builds the pair; the console's ledger count and the poll's Langfuse window do.
+// never builds the pair; the poll's ledger sum and the console's counts do.
 export function monthEnd(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+}
+
+// WHERE THE MONTH IS HEADED, at the pace it has run so far: the month's spend over the days already
+// elapsed, stretched to the whole calendar month (UTC, the ceiling's own month). The elapsed span is
+// floored at one day, so the first hours of a month do not multiply one early call into a month of
+// them; the projection is never below what was already spent. A straight line, labelled as one on
+// screen: a campaign starting on the 20th is not in it.
+export function projectMonthEnd(usedUsd: number, now: Date): number {
+  const start = monthStart(now).getTime();
+  const end = monthEnd(now).getTime();
+  const day = 86_400_000;
+  const elapsed = Math.max(now.getTime() - start, day);
+  const span = end - start;
+  if (elapsed >= span) return usedUsd;
+  return (usedUsd * span) / elapsed;
 }

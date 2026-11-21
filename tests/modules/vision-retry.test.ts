@@ -24,6 +24,7 @@ import {
   resolveVisionConfig,
 } from "@/modules/vision/service";
 import type { VisionConfig } from "@/modules/vision/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
 
@@ -47,7 +48,7 @@ describe("isTransientVisionFailure", () => {
     ["404 unknown model", new VisionError("gemini", 404), false],
     ["413 too large", new VisionError("gemini", 413), false],
     ["422 unprocessable", new VisionError("gemini", 422), false],
-    // AbortSignal.timeout rejects with a DOMException named TimeoutError (measured on Bun 1.4).
+    // NOTE: AbortSignal.timeout rejects with a DOMException named TimeoutError (on Bun 1.4).
     [
       "the attempt budget expiring",
       new DOMException("The operation timed out.", "TimeoutError"),
@@ -104,9 +105,9 @@ describe("attemptBudgetMs", () => {
 
   test("a non-final attempt is capped only where a measurement backs the cap", () => {
     expect(at("image", 1, 0)).toBe(VISION_IMAGE_CEILING_MS);
-    // Unmeasured, both of them: a document is 25MB and ~100 pages of provider work, and a custom
-    // `baseURL` is the operator's own hardware. Cutting either at 20s would turn a slow SUCCESS
-    // into a permanent marker, so they keep the whole total, exactly as the single call had it.
+    // NOTE: no latency data backs a cap for either: a document is 25MB and ~100 pages of provider
+    // work, and a custom `baseURL` is the operator's own hardware. Cutting either at 20s would turn a
+    // slow SUCCESS into a permanent marker, so they keep the whole total.
     expect(at("document", 1, 0)).toBe(VISION_TOTAL_BUDGET_MS);
     expect(at("image", 1, 0, true)).toBe(VISION_TOTAL_BUDGET_MS);
   });
@@ -125,7 +126,7 @@ describe("attemptBudgetMs", () => {
   });
 
   test("a remainder too short to answer is no budget at all", () => {
-    // 500ms buys a timeout, not an extraction: the fastest measured call is 2.0s.
+    // NOTE: 500ms buys a timeout, not an extraction: the fastest observed call takes 2.0s.
     expect(at("document", 2, 59_500)).toBeNull();
     expect(at("image", 2, VISION_TOTAL_BUDGET_MS)).toBeNull();
   });
@@ -156,10 +157,9 @@ describe("attemptBudgetMs", () => {
   });
 });
 
-// A transient provider failure (503, rate limit, timeout) used to end the attachment: `extract` was
-// called once and the catch below it degraded to the "couldn't extract" marker, permanently — no
-// later turn can recover the content of that attachment (issue #319). These drive the real service
-// through a fetch that personifies the vendor: Gemini's generateContent answering 503 then 200.
+// A transient provider failure (503, rate limit, timeout) is retried: the "couldn't extract" marker is
+// permanent, since no later turn recovers that attachment's content. These drive the real service
+// through a fetch that plays the vendor: Gemini's generateContent answering 503 then 200.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -177,8 +177,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -219,12 +219,15 @@ function geminiFetch(statuses: number[]) {
 // deadline would leave the policy above deciding nothing, and three attempts of 60s would spend
 // three minutes of a turn a customer is waiting on.
 describe("the per-attempt budget is what aborts the call", () => {
-  // Honors the abort signal, like a real fetch: resolves late, rejects the moment it is cut off.
+  // Honors the abort signal, like a real fetch: resolves late, rejects the moment it is cut off. A
+  // passing run never pays `LATE_MS` (the abort cancels it); a provider that ignores its budget gets
+  // the late answer and fails on the assertion instead of hanging.
+  const LATE_MS = 5_000;
   const slowFetch = (async (_url: string | URL, init?: RequestInit) => {
     return await new Promise<Response>((resolve, reject) => {
       const t = setTimeout(
         () => resolve(new Response("{}", { status: 200 })),
-        5_000,
+        LATE_MS,
       );
       init?.signal?.addEventListener("abort", () => {
         clearTimeout(t);
@@ -310,6 +313,23 @@ describe("extractWithRetry", () => {
     // total is actually spent here and the remainder IS the total. That the remainder shrinks with
     // real elapsed time is the pure table's assertion, not this one's.
     expect(budgets[1] as number).toBeLessThanOrEqual(VISION_TOTAL_BUDGET_MS);
+  });
+
+  test("no attempt starts once the caller's deadline has passed", async () => {
+    const { provider, budgets } = recordingProvider([503]);
+    const deadline = new AbortController();
+    await expect(
+      extractWithRetry({
+        provider,
+        providerName: "gemini",
+        model: "m",
+        req: req(),
+        // The deadline passes during the wait before the second attempt.
+        sleep: async () => deadline.abort(),
+        signal: deadline.signal,
+      }),
+    ).rejects.toThrow("vision gemini failed with 503");
+    expect(budgets).toHaveLength(1);
   });
 
   test("unmeasured work is handed the whole budget on the first attempt", async () => {
@@ -417,11 +437,14 @@ describe("extractWithRetry", () => {
   });
 });
 
-function stubClient(meta: Array<Record<string, unknown>>) {
+function stubClient(
+  meta: Array<Record<string, unknown>>,
+  contentType = "image/png",
+) {
   const client = {
     downloadAttachment: async () => ({
       bytes: new ArrayBuffer(16),
-      contentType: "image/png",
+      contentType,
     }),
     updateAttachmentMeta: async (
       conversationId: number,
@@ -591,10 +614,9 @@ describe.skipIf(!dbUp)("vision retry", () => {
       if (rows.length < VISION_MAX_ATTEMPTS)
         await new Promise((r) => setTimeout(r, 20));
     }
-    // Sorted BY `attempt`, not taken in row order: `emitFlowEvent` is fire-and-forget, so the lines
-    // of one turn race each other to the table and their ids do not carry the order (measured —
-    // three lines landed 1, 3, 2). `attempt` carries it, which is the whole reason it is on the
-    // line, and every positional assertion below reads this ordering rather than the table's.
+    // Sorted BY `attempt`, not row order: `emitFlowEvent` is fire-and-forget, so one turn's
+    // lines race to the table and their ids do not carry the order. `attempt` does, which is why it
+    // is on the line, and every positional assertion below reads this ordering.
     const details = rows
       .map((r) => r.detail as Record<string, unknown>)
       .sort((a, b) => (a.attempt as number) - (b.attempt as number));
@@ -604,6 +626,104 @@ describe.skipIf(!dbUp)("vision retry", () => {
     expect(details[0]?.budgetMs).toBe(VISION_IMAGE_CEILING_MS);
     expect(details[1]?.budgetMs as number).toBeGreaterThan(
       VISION_IMAGE_CEILING_MS,
+    );
+  });
+
+  // The inbound path hands the agent's ceiling to the provider, not just the playground.
+  test("the agent's output ceiling reaches the inbound provider request", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const impl = (async (_url: string | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse((init?.body as string) ?? "{}"));
+      return new Response(
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: EXTRACTED }] } }],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    const out = await extractInboundFile({
+      tenantId,
+      instanceId,
+      conversationId: 704,
+      messageId: 44,
+      attachmentId: 7,
+      dataUrl: "https://chat.example.com/recibo.png",
+      cfg: { ...(await cfg()), maxOutputTokens: 3000 },
+      base: appDb,
+      deps: {
+        makeClient: stubClient([]),
+        fetchImpl: impl,
+        sleep: async () => {},
+      },
+    });
+    expect(out?.text).toBe(EXTRACTED);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.generationConfig).toEqual({ maxOutputTokens: 3000 });
+  });
+
+  // A read the provider cut at the output ceiling still returns its text, so without this mark
+  // the cut was invisible: the agent answered from half a document and nothing said so.
+  test("a read cut by the output ceiling is marked truncated on its vision line, and only that one", async () => {
+    const reply = (stop: string, text: string) =>
+      (async () =>
+        new Response(
+          JSON.stringify({
+            content: [{ type: "text", text }],
+            stop_reason: stop,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        )) as unknown as typeof fetch;
+    const provider = getVisionProvider("anthropic") as VisionProvider;
+    const run = (turnId: string, fetchImpl: typeof fetch) =>
+      extractWithRetry({
+        provider,
+        providerName: "anthropic",
+        model: "claude-haiku-5-5",
+        flow: { tenantId, turnId, source: "inbox", base: appDb },
+        sleep: async () => {},
+        req: {
+          bytes: new ArrayBuffer(4),
+          mimeType: "application/pdf",
+          kind: "document",
+          prompt: "p",
+          model: "claude-haiku-5-5",
+          apiKey: "k",
+          baseURL: null,
+          fetchImpl,
+          maxOutputTokens: null,
+          reasoningEffort: null,
+        },
+      });
+    const cutTurn = `vision-cut-${process.pid}`;
+    const wholeTurn = `vision-whole-${process.pid}`;
+    const cut = await run(cutTurn, reply("max_tokens", 'com status "APRO'));
+    const whole = await run(
+      wholeTurn,
+      reply("end_turn", "Documento completo."),
+    );
+    expect(cut.text).toBe('com status "APRO');
+    expect(whole.text).toBe("Documento completo.");
+
+    const cutRows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: { tenantId, turnId: cutTurn, stage: "vision" },
+      select: { detail: true, status: true, errorMessage: true },
+    });
+    expect(cutRows).toHaveLength(1);
+    const cutDetail = (cutRows[0]?.detail ?? {}) as Record<string, unknown>;
+    expect(cutDetail.truncated).toBe(true);
+    expect(cutRows[0]?.status).toBe("ok");
+    // The flow log never carries message text, and a cut read is no exception.
+    expect(JSON.stringify(cutRows[0])).not.toContain("APRO");
+
+    const wholeRows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: { tenantId, turnId: wholeTurn, stage: "vision" },
+      select: { detail: true },
+    });
+    expect(wholeRows).toHaveLength(1);
+    expect(wholeRows[0]?.detail as Record<string, unknown>).not.toHaveProperty(
+      "truncated",
     );
   });
 
@@ -628,5 +748,251 @@ describe.skipIf(!dbUp)("vision retry", () => {
     expect(calls.length).toBe(VISION_MAX_ATTEMPTS);
     expect(out).toBeNull();
     expect(meta).toEqual([]);
+  });
+  // THE LEVEL STATES THE OUTCOME, decided where the outcome is known: an attempt the loop is about
+  // to repeat is `info` with `willRetry`, and only the attempt that ends the extraction without
+  // content is a `warn`, naming what was left unread. `status` stays `error` on every failed
+  // attempt, since the attempt did fail.
+  async function visionLines(turnId: string) {
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: { tenantId, turnId, stage: "vision" },
+      select: { level: true, status: true, detail: true },
+    });
+    return rows
+      .map((r) => ({
+        level: r.level,
+        status: r.status,
+        detail: r.detail as Record<string, unknown>,
+      }))
+      .sort(
+        (a, b) => (a.detail.attempt as number) - (b.detail.attempt as number),
+      );
+  }
+
+  // A message id of its own per call: extractions are shared in flight and annotated by message.
+  let nextMessageId = 50;
+  async function extractWith(
+    statuses: number[],
+    turnId: string,
+    contentType = "image/png",
+  ) {
+    const { impl } = geminiFetch(statuses);
+    return extractInboundFile({
+      tenantId,
+      instanceId,
+      conversationId: 710,
+      messageId: nextMessageId++,
+      attachmentId: 7,
+      dataUrl: "https://chat.example.com/recibo",
+      cfg: await cfg(),
+      base: appDb,
+      flow: { tenantId, turnId, source: "inbox", base: appDb },
+      deps: {
+        makeClient: stubClient([], contentType),
+        fetchImpl: impl,
+        sleep: async () => {},
+      },
+    });
+  }
+
+  test("an attempt the loop repeats is info with willRetry, and a recovered read leaves no warn", async () => {
+    const turnId = `vision-outcome-recovered-${process.pid}`;
+    const out = await extractWith([503, 200], turnId);
+    expect(out?.text).toBe(EXTRACTED);
+    const lines = await visionLines(turnId);
+    expect(lines.map((l) => [l.level, l.status])).toEqual([
+      ["info", "error"],
+      ["info", "ok"],
+    ]);
+    expect(lines[0]?.detail.willRetry).toBe(true);
+  });
+
+  test("the attempt that gives up is the one warn, and it names the image it left unread", async () => {
+    const turnId = `vision-outcome-down-${process.pid}`;
+    expect(await extractWith([503], turnId)).toBeNull();
+    const lines = await visionLines(turnId);
+    expect(lines.map((l) => l.level)).toEqual(["info", "warn"]);
+    expect(lines[0]?.detail.willRetry).toBe(true);
+    expect(lines[1]?.detail.willRetry).toBeUndefined();
+    expect(lines[1]?.detail.unread).toBe("image");
+  });
+
+  test("a permanent failure is a warn on the first attempt, naming the document", async () => {
+    const turnId = `vision-outcome-permanent-${process.pid}`;
+    expect(await extractWith([401], turnId, "application/pdf")).toBeNull();
+    const lines = await visionLines(turnId);
+    expect(lines.map((l) => l.level)).toEqual(["warn"]);
+    expect(lines[0]?.detail.willRetry).toBeUndefined();
+    expect(lines[0]?.detail.unread).toBe("document");
+  });
+
+  // The same reading the loop makes before waiting: an attempt that spent the budget has no retry
+  // behind it, so its own line is the outcome, and it is not announced as one more try.
+  test("an attempt that spent the budget is the warn itself, not a retry announced", async () => {
+    const turnId = `vision-outcome-spent-${process.pid}`;
+    let clock = 0;
+    const provider = {
+      defaultModel: "m",
+      extract: async () => {
+        clock += VISION_TOTAL_BUDGET_MS - 500;
+        throw new VisionError("gemini", 503);
+      },
+    } as VisionProvider;
+    await expect(
+      extractWithRetry({
+        provider,
+        providerName: "gemini",
+        model: "m",
+        req: {
+          bytes: new ArrayBuffer(4),
+          mimeType: "image/png",
+          kind: "image",
+          prompt: "Descreva.",
+          model: "m",
+          apiKey: "k",
+          baseURL: null,
+          fetchImpl: fetch,
+        },
+        flow: { tenantId, turnId, source: "inbox", base: appDb },
+        now: () => clock,
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow("vision gemini failed with 503");
+    const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
+      where: { tenantId, turnId, stage: "vision" },
+      select: { level: true, detail: true },
+    });
+    expect(rows.map((r) => r.level)).toEqual(["warn"]);
+    expect(
+      (rows[0]?.detail as Record<string, unknown> | undefined)?.willRetry,
+    ).toBeUndefined();
+  });
+
+  // The wait is jittered, and the answer to "does a retry follow" is only true if the loop then waits
+  // the same wait: drawn twice, one draw can predict no retry at the edge of the budget and the other
+  // fund it, and the line would say the file went unread right before it is read.
+  test("the retry the line predicts is the one the loop makes, at the edge of the budget", async () => {
+    const turnId = `vision-outcome-jitter-${process.pid}`;
+    const longest = retryDelayMs(2, () => 1) as number;
+    const shortest = retryDelayMs(2, () => 0) as number;
+    // A point where the shortest wait still funds attempt 2 and the longest does not.
+    let edge = -1;
+    for (let e = 0; e < VISION_TOTAL_BUDGET_MS; e += 10) {
+      const funded = (wait: number) =>
+        attemptBudgetMs({
+          kind: "document",
+          attempt: 2,
+          elapsedMs: e + wait,
+          customEndpoint: false,
+        }) !== null;
+      if (funded(shortest) && !funded(longest)) {
+        edge = e;
+        break;
+      }
+    }
+    expect(edge).toBeGreaterThan(0);
+    let clock = 0;
+    let calls = 0;
+    // Attempt 1's own (zero) wait takes the first draw; the failure's question takes the second.
+    const draws = [0, 1, 0];
+    const realRandom = Math.random;
+    Math.random = () => draws.shift() ?? 0;
+    try {
+      const provider = {
+        defaultModel: "m",
+        extract: async () => {
+          calls += 1;
+          if (calls === 1) {
+            clock = edge;
+            throw new VisionError("gemini", 503);
+          }
+          return { text: "ok", usage: null };
+        },
+      } as VisionProvider;
+      const settled = await extractWithRetry({
+        provider,
+        providerName: "gemini",
+        model: "m",
+        req: {
+          bytes: new ArrayBuffer(4),
+          mimeType: "application/pdf",
+          kind: "document",
+          prompt: "Leia.",
+          model: "m",
+          apiKey: "k",
+          baseURL: null,
+          fetchImpl: fetch,
+        },
+        flow: { tenantId, turnId, source: "inbox", base: appDb },
+        now: () => clock,
+        sleep: async (ms) => {
+          clock += ms;
+        },
+      }).then(
+        () => "read",
+        () => "unread",
+      );
+      const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: { tenantId, turnId, stage: "vision" },
+        select: { level: true },
+      });
+      const warned = rows.some((r) => r.level === "warn");
+      expect(warned).toBe(settled === "unread");
+      expect(calls).toBe(settled === "read" ? 2 : 1);
+    } finally {
+      Math.random = realRandom;
+    }
+  });
+
+  // The promise of a retry is read before the wait, and the wait can oversleep the budget: the loop
+  // then stops without the attempt it announced, and the extraction still ended unread. Without a
+  // line of its own, that outcome would be an `info` and nothing else.
+  test("a retry announced and then lost to the budget still ends on a warn", async () => {
+    const turnId = `vision-outcome-overslept-${process.pid}`;
+    let clock = 0;
+    let calls = 0;
+    const provider = {
+      defaultModel: "m",
+      extract: async () => {
+        calls += 1;
+        throw new VisionError("gemini", 503);
+      },
+    } as VisionProvider;
+    await expect(
+      extractWithRetry({
+        provider,
+        providerName: "gemini",
+        model: "m",
+        req: {
+          bytes: new ArrayBuffer(4),
+          mimeType: "image/png",
+          kind: "image",
+          prompt: "Descreva.",
+          model: "m",
+          apiKey: "k",
+          baseURL: null,
+          fetchImpl: fetch,
+        },
+        flow: { tenantId, turnId, source: "inbox", base: appDb },
+        now: () => clock,
+        sleep: async () => {
+          clock += VISION_TOTAL_BUDGET_MS - 1_000;
+        },
+      }),
+    ).rejects.toThrow("vision gemini failed with 503");
+    expect(calls).toBe(1);
+    const rows = await flowLogRows(suDb, {
+      where: { tenantId, turnId, stage: "vision" },
+      select: { level: true, detail: true },
+      orderBy: { id: "asc" },
+    });
+    expect(rows.map((r) => r.level).sort()).toEqual(["info", "warn"]);
+    const warn = rows.find((r) => r.level === "warn");
+    expect((warn?.detail as Record<string, unknown> | undefined)?.unread).toBe(
+      "image",
+    );
   });
 });

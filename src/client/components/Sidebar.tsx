@@ -1,6 +1,6 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { PanelLeftClose, PanelLeftOpen, RotateCw, X } from "lucide-react";
+import { type ReactNode, useId } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, NavLink } from "react-router";
 
@@ -10,6 +10,7 @@ import { Tooltip } from "@/client/components/Tooltip";
 import { usePendingApprovals } from "@/client/contexts/ApprovalsContext";
 import { useAuth } from "@/client/contexts/AuthContext";
 import { useBranding } from "@/client/contexts/BrandingContext";
+import { useConfirmLeave } from "@/client/contexts/NavGuardContext";
 import {
   SIDEBAR_COLLAPSED_WIDTH,
   useSidebar,
@@ -20,12 +21,14 @@ import {
   AGENTS_REPO_URL,
   type FooterLink,
   filterNavItems,
+  groupNavItems,
   NAV_ITEMS,
   type NavItem,
   SECONDARY_LINKS,
   SUPPORT_LINK,
   type SupportContact,
 } from "@/client/lib/navigation";
+import { reloadIntoServedBuild, useStaleBuild } from "@/client/lib/staleBuild";
 import { cn, isSafeHttpUrl } from "@/client/lib/utils";
 import { Logo } from "./Logo";
 import { SidebarResizer } from "./SidebarResizer";
@@ -49,82 +52,118 @@ function SidebarNav({
 }: SidebarNavProps) {
   const { t } = useTranslation();
   const isCollapsed = variant === "desktop" && collapsed;
+  const groupIdPrefix = useId();
+
+  const renderItem = (item: NavItem) => {
+    const Icon = item.icon;
+    // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in src/client/lib/navigation.tsx
+    const label = t(item.labelKey, item.defaultLabel);
+    const badgeCount = item.badge === "approvals" ? approvalsCount : 0;
+    const link = (
+      <NavLink
+        to={item.to}
+        end={item.to === "/"}
+        onClick={onNavigate}
+        className={({ isActive }) =>
+          cn(
+            // NOTE: never re-centered when collapsed. The icon keeps its left-aligned position (see
+            // SIDEBAR_COLLAPSED_WIDTH), which is already the rail's center, so nothing jumps when
+            // the label goes.
+            "flex items-center gap-3 rounded-md px-4 py-1.5 text-sm font-medium transition-colors",
+            {
+              "bg-bg-hover text-text-primary": isActive,
+              "text-text-muted hover:bg-bg-tertiary hover:text-text-primary":
+                !isActive,
+            },
+          )
+        }
+      >
+        <span className="relative flex shrink-0">
+          <Icon className="h-4 w-4 shrink-0" />
+          {isCollapsed && badgeCount > 0 && (
+            // Collapsed: a dot stands in for the count (no room for a pill); the count is
+            // still announced via the sr-only label below.
+            <span
+              aria-hidden="true"
+              className="bg-accent-solid ring-bg-primary absolute -top-1 -right-1 h-2 w-2 rounded-full ring-2"
+            />
+          )}
+        </span>
+        {isCollapsed ? (
+          // NOTE: accessible name for the icon-only collapsed link; the Tooltip wrapping this link
+          // contributes aria-describedby, not a name, so the link still needs its own label.
+          <span className="sr-only">
+            {badgeCount > 0 ? `${label} (${badgeCount})` : label}
+          </span>
+        ) : (
+          <>
+            <span className="truncate">{label}</span>
+            {badgeCount > 0 && (
+              <span className="bg-accent-solid text-accent-foreground ml-auto inline-flex min-w-5 items-center justify-center rounded-full px-1.5 py-0.5 text-[0.6875rem] leading-none font-medium">
+                {badgeCount}
+              </span>
+            )}
+          </>
+        )}
+      </NavLink>
+    );
+
+    return (
+      <li key={item.to}>
+        {/* Wrapped in <span> so Radix Tooltip's Slot does not clone the NavLink, whose function
+            className (isActive) it would stringify. Always wrapped, only disabled while expanded, so
+            ⌘B does not remount a focused link. */}
+        <Tooltip
+          content={label}
+          side="right"
+          sideOffset={10}
+          disabled={!isCollapsed}
+        >
+          <span className="block">{link}</span>
+        </Tooltip>
+      </li>
+    );
+  };
 
   return (
     <nav
       aria-label={t("nav.mainNavigation", "Main navigation")}
-      className="sidebar-nav flex-1 overflow-y-auto p-2"
+      className="sidebar-nav flex flex-1 flex-col gap-3 overflow-y-auto p-2"
     >
-      <ul className="flex flex-col gap-1">
-        {items.map((item) => {
-          const Icon = item.icon;
-          // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in src/client/lib/navigation.tsx
-          const label = t(item.labelKey, item.defaultLabel);
-          const badgeCount = item.badge === "approvals" ? approvalsCount : 0;
-          const link = (
-            <NavLink
-              to={item.to}
-              end={item.to === "/"}
-              onClick={onNavigate}
-              className={({ isActive }) =>
-                cn(
-                  "flex items-center gap-3 rounded-lg px-3 py-2 text-sm transition-colors",
-                  {
-                    "justify-center": isCollapsed,
-                    "bg-bg-hover text-text-primary": isActive,
-                    "text-text-secondary hover:bg-bg-tertiary hover:text-text-primary":
-                      !isActive,
-                  },
-                )
-              }
+      {groupNavItems(items).map((group, index) => {
+        const headingId = `${groupIdPrefix}-${index}`;
+        const heading = group.section
+          ? // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in src/client/lib/navigation.tsx
+            t(group.section.labelKey, group.section.defaultLabel)
+          : null;
+        return (
+          <div key={group.section?.labelKey ?? `__root-${index}`}>
+            {heading &&
+              (isCollapsed ? (
+                // NOTE: collapsed, a heading has no room; a hairline keeps the groups apart and the
+                // heading stays for screen readers.
+                <div className="bg-border mx-2 mb-2 h-px">
+                  <span id={headingId} className="sr-only">
+                    {heading}
+                  </span>
+                </div>
+              ) : (
+                <p
+                  id={headingId}
+                  className="text-text-muted mb-1 truncate px-4 text-xs font-medium"
+                >
+                  {heading}
+                </p>
+              ))}
+            <ul
+              aria-labelledby={heading ? headingId : undefined}
+              className="flex flex-col gap-0.5"
             >
-              <span className="relative flex shrink-0">
-                <Icon className="h-4 w-4 shrink-0" />
-                {isCollapsed && badgeCount > 0 && (
-                  // Collapsed: a dot stands in for the count (no room for a pill); the count is
-                  // still announced via the sr-only label below.
-                  <span
-                    aria-hidden="true"
-                    className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-accent ring-2 ring-bg-secondary"
-                  />
-                )}
-              </span>
-              {isCollapsed ? (
-                // NOTE: accessible name for the icon-only collapsed link; the
-                // Tooltip wrapping this link contributes aria-describedby, not
-                // a name, so the link still needs its own label.
-                <span className="sr-only">
-                  {badgeCount > 0 ? `${label} (${badgeCount})` : label}
-                </span>
-              ) : (
-                <>
-                  <span className="truncate">{label}</span>
-                  {badgeCount > 0 && (
-                    <span className="ml-auto inline-flex min-w-5 items-center justify-center rounded-full bg-accent px-1.5 py-0.5 font-medium text-[0.6875rem] text-accent-foreground leading-none">
-                      {badgeCount}
-                    </span>
-                  )}
-                </>
-              )}
-            </NavLink>
-          );
-
-          return (
-            <li key={item.to}>
-              {isCollapsed ? (
-                // NOTE: wrap in <span> so Radix Tooltip's Slot does not clone
-                // the NavLink directly; cloning breaks NavLink's function
-                // className (isActive) by stringifying it during prop merge.
-                <Tooltip content={label} side="right" sideOffset={10}>
-                  <span className="block">{link}</span>
-                </Tooltip>
-              ) : (
-                link
-              )}
-            </li>
-          );
-        })}
-      </ul>
+              {group.items.map(renderItem)}
+            </ul>
+          </div>
+        );
+      })}
     </nav>
   );
 }
@@ -132,6 +171,8 @@ function SidebarNav({
 interface SidebarFooterProps {
   collapsed?: boolean;
   onNavigate?: () => void;
+  // Only the desktop sidebar can collapse; the mobile drawer closes.
+  showCollapseToggle?: boolean;
 }
 
 // Label for a white-labeled website link: the hostname reads like the default
@@ -144,17 +185,22 @@ function hostnameOf(url: string): string {
   }
 }
 
-function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
+function SidebarFooter({
+  collapsed = false,
+  onNavigate,
+  showCollapseToggle = false,
+}: SidebarFooterProps) {
   const { t } = useTranslation();
   const { config: branding } = useBranding();
   const supportModal = useModalController();
 
-  if (!SUPPORT_LINK && SECONDARY_LINKS.length === 0) return null;
+  if (!SUPPORT_LINK && SECONDARY_LINKS.length === 0 && !showCollapseToggle)
+    return null;
 
-  // White-label overrides (issue #4): the operator's own site/support inbox replace the
-  // defaults, and the GitHub entry can be hidden. The server sanitizes what it stores, but
-  // the URL still only rides into an href after the same allowlist check we apply to any
-  // externally-sourced link (defense in depth against a tampered cache/response).
+  // White-label overrides: the operator's own site and support inbox replace the defaults, and
+  // the GitHub entry can be hidden. The server sanitizes what it stores, but the URL still only rides
+  // into an href after the allowlist check any externally-sourced link gets (defense in depth against
+  // a tampered cache or response).
   const customSiteUrl =
     branding?.siteUrl && isSafeHttpUrl(branding.siteUrl)
       ? branding.siteUrl
@@ -169,10 +215,8 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
     : null;
   const supportMailto = supportEmail ? `mailto:${supportEmail}` : null;
 
-  const itemCls = cn(
-    "flex items-center gap-3 rounded-lg px-3 py-2 text-sm text-text-secondary transition-colors hover:bg-bg-tertiary hover:text-text-primary",
-    { "justify-center": collapsed },
-  );
+  const itemCls =
+    "flex items-center gap-3 rounded-md px-4 py-1 text-text-muted text-xs transition-colors hover:bg-bg-tertiary hover:text-text-primary";
 
   const renderBody = (
     Icon: SupportContact["icon"] | FooterLink["icon"],
@@ -190,13 +234,14 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
 
   const wrapLi = (key: string, trigger: ReactNode, label: string) => (
     <li key={key}>
-      {collapsed ? (
-        <Tooltip content={label} side="right" sideOffset={10}>
-          <span className="block">{trigger}</span>
-        </Tooltip>
-      ) : (
-        trigger
-      )}
+      <Tooltip
+        content={label}
+        side="right"
+        sideOffset={10}
+        disabled={!collapsed}
+      >
+        <span className="block">{trigger}</span>
+      </Tooltip>
     </li>
   );
 
@@ -241,26 +286,14 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
 
   return (
     <>
-      <div className="shrink-0 border-border border-t p-2">
-        {supportItem && (
-          <>
-            {!collapsed && (
-              <p className="mb-1 truncate px-3 text-text-muted text-xs uppercase tracking-wide">
-                {t("nav.needHelp", "Need help?")}
-              </p>
-            )}
-            <ul className="flex flex-col gap-1">{supportItem}</ul>
-          </>
-        )}
-        {secondaryItems.length > 0 && (
-          <ul
-            className={cn("flex flex-col gap-1", {
-              "mt-3": !collapsed && supportItem !== null,
-            })}
-          >
+      <div className="flex shrink-0 flex-col gap-1 p-2">
+        {(supportItem || secondaryItems.length > 0) && (
+          <ul className="flex flex-col">
+            {supportItem}
             {secondaryItems}
           </ul>
         )}
+        {showCollapseToggle && <SidebarCollapseToggle collapsed={collapsed} />}
       </div>
       {supportEmail && supportMailto && (
         <SupportModal
@@ -273,12 +306,14 @@ function SidebarFooter({ collapsed = false, onNavigate }: SidebarFooterProps) {
   );
 }
 
-// App version line, pinned at the very bottom of the sidebar (item 2). Independent of the footer
+// App version line, pinned at the very bottom of the sidebar. Independent of the footer
 // links (which can be absent). Expanded → "v<version>"; collapsed → a "v" with the full version in a
 // tooltip. Renders nothing when no version is known (dev, where BUN_PUBLIC_* isn't inlined).
 function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
   const { t } = useTranslation();
   const { update } = useUpdates();
+  const { stale, serverVersion } = useStaleBuild();
+  const confirmLeave = useConfirmLeave();
   if (!APP_VERSION) return null;
   const full = `v${APP_VERSION}`;
   const hasUpdate = update.available && !!update.latestVersion;
@@ -298,25 +333,63 @@ function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
       })
     : full;
 
+  // A tab older than the server says so here too, ahead of the release link: the release check
+  // compares the server with GitHub, so after a deploy it goes quiet while this tab is still behind.
+  // Its mark is the reload icon, never the release dot: the dot means a newer release exists, and
+  // while the tab is stale the reload is the one thing to do, so the release link waits for it.
+  const staleTooltip = serverVersion
+    ? t("staleBuild.badgeTooltipVersion", "Console updated to v{{version}}", {
+        version: serverVersion,
+      })
+    : t("staleBuild.badgeTooltip", "Console updated");
+  const reloadButton = (content: ReactNode, className: string) => (
+    <button
+      type="button"
+      onClick={() => confirmLeave(reloadIntoServedBuild)}
+      aria-label={`${staleTooltip}. ${t("staleBuild.reload", "Reload")}`}
+      className={className}
+    >
+      {content}
+    </button>
+  );
+
   const proBadge = isPro ? (
-    <span className="rounded bg-accent px-1 font-semibold text-[9px] text-accent-foreground uppercase leading-tight tracking-wide">
+    <span className="bg-accent-solid text-accent-foreground rounded-sm px-1 text-[9px] leading-tight font-semibold tracking-wide uppercase">
       {proLabel}
     </span>
   ) : null;
 
   return (
     <div
-      className={cn("shrink-0 px-3 pb-2 text-[10px] text-text-muted", {
-        "text-center": collapsed,
+      className={cn("text-text-muted shrink-0 pb-2 text-[10px]", {
+        "px-2 text-center": collapsed,
+        "px-4": !collapsed,
       })}
     >
       {collapsed ? (
         <Tooltip
-          content={isPro ? `${versionTooltip} · ${proLabel}` : versionTooltip}
+          content={
+            isPro
+              ? `${stale ? staleTooltip : versionTooltip} · ${proLabel}`
+              : stale
+                ? staleTooltip
+                : versionTooltip
+          }
           side="right"
           sideOffset={10}
         >
-          {hasUpdate ? (
+          {stale ? (
+            reloadButton(
+              <>
+                <RotateCw
+                  className="mx-auto mb-0.5 h-3 w-3"
+                  aria-hidden="true"
+                />
+                {APP_VERSION}
+              </>,
+              "block w-full truncate text-info hover:underline",
+            )
+          ) : hasUpdate ? (
             // Focusable link so keyboard/SR users can reach the tooltip and act on the update; the
             // dot stays decorative (aria-hidden) and aria-label carries the "new version" state.
             <a
@@ -324,11 +397,11 @@ function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
               target="_blank"
               rel="noreferrer"
               aria-label={versionTooltip}
-              className="relative block truncate text-accent hover:underline"
+              className="text-accent relative block truncate hover:underline"
             >
               {APP_VERSION}
               <span
-                className="absolute top-0 right-0 h-1.5 w-1.5 rounded-full bg-accent"
+                className="bg-accent-solid absolute top-0 right-0 h-1.5 w-1.5 rounded-full"
                 aria-hidden="true"
               />
             </a>
@@ -341,17 +414,28 @@ function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
       ) : (
         <span className="inline-flex items-center gap-1.5">
           {proBadge}
-          {hasUpdate ? (
+          {stale ? (
+            <Tooltip content={staleTooltip} side="top">
+              {reloadButton(
+                <>
+                  {full}
+                  <RotateCw className="h-3 w-3" aria-hidden="true" />
+                  {t("staleBuild.reloadShort", "reload")}
+                </>,
+                "inline-flex items-center gap-1 text-info hover:underline",
+              )}
+            </Tooltip>
+          ) : hasUpdate ? (
             <Tooltip content={versionTooltip} side="top">
               <a
                 href={upgradeHref}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex items-center gap-1 text-accent hover:underline"
+                className="text-accent inline-flex items-center gap-1 hover:underline"
               >
                 {full}
                 <span
-                  className="h-1.5 w-1.5 rounded-full bg-accent"
+                  className="bg-accent-solid h-1.5 w-1.5 rounded-full"
                   aria-hidden="true"
                 />
                 {t("updates.update", "update")}
@@ -366,27 +450,100 @@ function SidebarVersion({ collapsed = false }: { collapsed?: boolean }) {
   );
 }
 
+// Shown next to the collapse control so the shortcut useSidebarShortcut already handles is
+// discoverable. Read once: the platform does not change.
+const COLLAPSE_SHORTCUT =
+  typeof navigator !== "undefined" &&
+  /Mac|iPhone|iPad/.test(navigator.userAgent)
+    ? "⌘B"
+    : "Ctrl+B";
+
 function SidebarCollapseToggle({ collapsed }: { collapsed: boolean }) {
   const { t } = useTranslation();
   const { toggleCollapsed } = useSidebar();
   const label = collapsed
     ? t("nav.expand", "Expand")
     : t("nav.collapse", "Collapse");
-  const Icon = collapsed ? ChevronRight : ChevronLeft;
+  const Icon = collapsed ? PanelLeftOpen : PanelLeftClose;
 
+  const button = (
+    <button
+      type="button"
+      onClick={toggleCollapsed}
+      aria-pressed={!collapsed}
+      aria-controls="app-sidebar"
+      aria-keyshortcuts="Meta+B Control+B"
+      className="text-text-muted hover:bg-bg-tertiary hover:text-text-primary flex w-full items-center gap-3 rounded-md px-4 py-1.5 text-sm transition-colors"
+    >
+      <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+      {collapsed ? (
+        <span className="sr-only">{label}</span>
+      ) : (
+        <>
+          <span className="flex-1 truncate text-left">{label}</span>
+          {/* Only once the sidebar is wide enough for label and hint side by side; mid-transition
+              the hint would otherwise sit on top of the label for a few frames. */}
+          <kbd className="text-text-muted hidden shrink-0 font-sans text-xs @min-[11rem]:inline">
+            {COLLAPSE_SHORTCUT}
+          </kbd>
+        </>
+      )}
+    </button>
+  );
+
+  // The same tree in both states: this is the control that flips them, so a conditional wrapper
+  // would unmount it under the keyboard focus that just activated it.
   return (
-    <Tooltip content={label} side="right" sideOffset={10}>
-      <button
-        type="button"
-        onClick={toggleCollapsed}
-        aria-pressed={!collapsed}
-        aria-controls="app-sidebar"
-        aria-label={label}
-        className="absolute top-[20%] right-0 z-(--z-sidebar-toggle) flex h-6 w-6 translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-bg-secondary text-text-secondary shadow-sm transition-[background-color,color] hover:bg-bg-hover hover:text-text-primary"
-      >
-        <Icon className="h-3 w-3" />
-      </button>
+    <Tooltip
+      content={`${label} (${COLLAPSE_SHORTCUT})`}
+      side="right"
+      sideOffset={10}
+      disabled={!collapsed}
+    >
+      {button}
     </Tooltip>
+  );
+}
+
+function SidebarBrand({ collapsed }: { collapsed: boolean }) {
+  const { t } = useTranslation();
+  const { logoUrl } = useBranding();
+  return (
+    // mt-2 + h-12 centers the logo on the panel's top bar, which starts below the panel's own top
+    // margin. The symbol has the same size and x in both states, so the swap only adds or removes
+    // the name: the mark renders at 5 steps, and the default wordmark is scaled so its own symbol
+    // (470px of the asset's 816px height) also lands at 5 steps, with the 5.5-step padding
+    // offsetting its transparent left margin. A custom logo has no known geometry, so it is only
+    // fitted to the bar.
+    <div
+      className={cn("mt-2 flex h-12 shrink-0 items-center overflow-hidden", {
+        "pl-4": collapsed || !!logoUrl,
+        "pl-[calc(var(--spacing)*5.5)]": !collapsed && !logoUrl,
+      })}
+    >
+      <NavLink
+        to="/"
+        end
+        aria-label={t("nav.home", "Home")}
+        className="flex shrink-0 items-center rounded-md"
+      >
+        {/* Switched on the collapsed flag, so the logo always matches the sidebar's state. The
+            wordmark keeps its natural width (shrink-0 + max-w-none) and the container clips it,
+            so while the rail grows it is revealed, never squeezed. */}
+        {collapsed ? (
+          <span className="grid size-8 shrink-0 place-items-center">
+            <Logo variant="mark" className="size-5 max-w-none" />
+          </span>
+        ) : (
+          <Logo
+            className={cn("w-auto max-w-none shrink-0", {
+              "h-[calc(var(--spacing)*5*816/470)]": !logoUrl,
+              "h-7": !!logoUrl,
+            })}
+          />
+        )}
+      </NavLink>
+    </div>
   );
 }
 
@@ -412,12 +569,12 @@ function MobileSidebar({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 fixed inset-0 z-(--z-drawer-overlay) bg-black/50 data-[state=closed]:animate-out data-[state=open]:animate-in md:hidden" />
+        <DialogPrimitive.Overlay className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 bg-overlay data-[state=closed]:animate-out data-[state=open]:animate-in fixed inset-0 z-(--z-drawer-overlay) md:hidden" />
         <DialogPrimitive.Content
           aria-describedby={undefined}
-          className="data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left fixed inset-y-0 left-0 z-(--z-drawer) flex w-72 max-w-[85vw] flex-col border-border border-r bg-bg-secondary shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in md:hidden"
+          className="data-[state=closed]:slide-out-to-left data-[state=open]:slide-in-from-left border-border bg-bg-primary data-[state=closed]:animate-out data-[state=open]:animate-in fixed inset-y-0 left-0 z-(--z-drawer) flex w-72 max-w-[85vw] flex-col border-r shadow-lg md:hidden"
         >
-          <div className="flex shrink-0 items-center justify-between border-border border-b px-4 py-3">
+          <div className="border-border flex shrink-0 items-center justify-between border-b px-4 py-3">
             <DialogPrimitive.Title className="sr-only">
               {t("nav.mainNavigation", "Main navigation")}
             </DialogPrimitive.Title>
@@ -431,7 +588,7 @@ function MobileSidebar({
             </Link>
             <DialogPrimitive.Close
               aria-label={t("nav.closeMenu", "Close menu")}
-              className="rounded-lg p-1 text-text-muted transition-colors hover:bg-bg-tertiary hover:text-text-primary"
+              className="text-text-muted hover:bg-bg-tertiary hover:text-text-primary rounded-md p-1 transition-colors"
             >
               <X className="h-4 w-4" aria-hidden="true" />
             </DialogPrimitive.Close>
@@ -462,18 +619,18 @@ export function Sidebar() {
       <aside
         id="app-sidebar"
         style={{ width: effectiveWidth }}
-        className="group/sidebar relative hidden shrink-0 flex-col border-border border-r bg-bg-secondary transition-[width] duration-150 md:flex"
+        className="group/sidebar bg-bg-primary @container relative hidden shrink-0 flex-col transition-[width] duration-200 ease-out md:flex"
       >
+        <SidebarBrand collapsed={collapsed} />
         <SidebarNav
           items={items}
           variant="desktop"
           collapsed={collapsed}
           approvalsCount={approvalsCount}
         />
-        <SidebarFooter collapsed={collapsed} />
+        <SidebarFooter collapsed={collapsed} showCollapseToggle />
         <SidebarVersion collapsed={collapsed} />
         <SidebarResizer />
-        <SidebarCollapseToggle collapsed={collapsed} />
       </aside>
 
       <MobileSidebar

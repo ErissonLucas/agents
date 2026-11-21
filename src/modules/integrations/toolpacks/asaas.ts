@@ -7,6 +7,7 @@ import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { fetchBounded } from "@/lib/outbound";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { ASAAS_ORIGINS, type AsaasEnv, asaasEnvFromKey } from "./asaas-env";
 import {
   type IntegrationSelection,
   registerToolpack,
@@ -15,35 +16,14 @@ import {
   type ToolSpec,
 } from "./types";
 
-// Asaas (Brazilian payments) OUTBOUND toolpack. The agent generates a payment link to send to a
-// lead; we record an IntegrationExternalRef keyed by an opaque correlation id (sent to Asaas as
-// `externalReference` and echoed back in the payment webhook) so the inbound mapper correlates
-// the eventual PAYMENT_RECEIVED to THIS conversation by PK, never by LLM.
-//
-// Security invariants (hardened spec):
-//   - `environment` (sandbox/production) is bound to the INSTANCE CONFIG, never a tool arg — a
-//     prompt-injection cannot force a prod charge against a sandbox credential (or vice-versa);
-//   - the access token (per-tenant, from the vault) flows ONLY into the access_token header,
-//     never the URL / body / model-visible return / trace;
-//   - the origin is a fixed constant per environment (never interpolated); SSRF-guarded anyway;
-//   - https-only, no redirects, bounded timeout.
-//
-// NOTE: validated against the Asaas SANDBOX (2026-06). `POST /paymentLinks` with header
-// `access_token` at https://api-sandbox.asaas.com/v3 returns `{ id, url, externalReference, … }`;
-// chargeType DETACHED + billingType UNDEFINED are accepted and `externalReference` is echoed back.
-// `dueDateLimitDays` is REQUIRED (omitting it → 400 "É necessário informar a quantidade de dias
-// úteis para vencimento"), so it has a default below. The remaining webhook-side check — that a
-// link-PAID payment echoes the externalReference — needs a paid payment (inbound mapper open note).
-// Request-body defaults stay overridable via instance config (config.paymentLink).
-
-// Base URLs confirmed against the official Asaas docs (docs.asaas.com → Authentication / Sandbox,
-// 2026-06): the sandbox host is `api-sandbox.asaas.com` — NOT the legacy `sandbox.asaas.com/api/v3`,
-// which 404s/redirects and broke every sandbox call.
-const ASAAS_ORIGINS = {
-  sandbox: "https://api-sandbox.asaas.com/v3",
-  production: "https://api.asaas.com/v3",
-} as const;
-type AsaasEnv = keyof typeof ASAAS_ORIGINS;
+// Asaas (Brazilian payments) OUTBOUND toolpack. The agent generates a payment link; we record an
+// IntegrationExternalRef keyed by an opaque correlation id (sent as `externalReference`, echoed in
+// the payment webhook) so the inbound mapper ties the payment to THIS conversation by PK, never by
+// LLM. Invariants: `environment` is bound to the INSTANCE CONFIG, never a tool arg; the vault
+// access token goes ONLY into the access_token header; the origin is a fixed constant per
+// environment (SSRF-guarded anyway); https-only, no redirects, bounded timeout. `dueDateLimitDays`
+// is REQUIRED by `POST /paymentLinks` (400 without it), so it has a default below; request-body
+// defaults stay overridable via config.paymentLink.
 
 const TIMEOUT_MS = 12_000;
 const MAX_RESPONSE_CHARS = 2_000;
@@ -52,10 +32,68 @@ function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Bound to config, never a tool arg. Anything other than the explicit "production" string is
-// treated as sandbox (safe default — never accidentally charge in production).
-function resolveEnv(config: Record<string, unknown>): AsaasEnv {
-  return config.environment === "production" ? "production" : "sandbox";
+// Bound to config and key, never a tool arg. A key is valid in exactly one environment, so when the
+// config says nothing the key's prefix decides; a config the key contradicts is refused before any
+// request, because Asaas would answer a bare 401 and following the key over an explicit "sandbox"
+// would turn a test setup into real charges. Neither saying anything ⇒ sandbox.
+function resolveAsaasEnv(
+  config: Record<string, unknown>,
+  token: string,
+): { env: AsaasEnv } | { refusal: string } {
+  const configured =
+    config.environment === "production" || config.environment === "sandbox"
+      ? config.environment
+      : null;
+  const fromKey = asaasEnvFromKey(token);
+  if (configured && fromKey && configured !== fromKey)
+    return {
+      refusal: `This integration is set to the ${configured} environment, but its Asaas key is a ${fromKey} key. Set the integration's environment to ${fromKey}, or clear it so the key decides.`,
+    };
+  return { env: configured ?? fromKey ?? "sandbox" };
+}
+
+const OTHER_ENV: Record<AsaasEnv, AsaasEnv> = {
+  production: "sandbox",
+  sandbox: "production",
+};
+
+// Asaas answers a key from the other environment with 401 `invalid_environment`, which only the body
+// tells apart from a wrong key; a key without the prefix reaches this point when the config is wrong.
+function withEnvironmentHint(
+  message: string,
+  res: AsaasResponse,
+  env: AsaasEnv,
+): string {
+  const errors = (res.json as { errors?: unknown } | null)?.errors;
+  const wrongEnv =
+    Array.isArray(errors) &&
+    errors.some(
+      (e) => (e as { code?: unknown } | null)?.code === "invalid_environment",
+    );
+  if (!wrongEnv) return message;
+  return `${message} Asaas says the key does not belong to the ${env} environment this integration calls; set the integration's environment to ${OTHER_ENV[env]}.`;
+}
+
+type AsaasCall =
+  | { token: string; env: AsaasEnv; base: string }
+  | { failure: ReturnType<typeof toolFailure> };
+
+async function resolveAsaasCall(
+  sel: IntegrationSelection,
+  ctx: ToolpackCtx,
+): Promise<AsaasCall> {
+  const token = sel.credentialRef
+    ? await ctx.resolveCredential(sel.credentialRef)
+    : null;
+  if (!token)
+    return {
+      failure: toolFailure(
+        "Asaas credential is not configured for this integration.",
+      ),
+    };
+  const target = resolveAsaasEnv(sel.config, token);
+  if ("refusal" in target) return { failure: toolFailure(target.refusal) };
+  return { token, env: target.env, base: ASAAS_ORIGINS[target.env] };
 }
 
 interface AsaasResponse {
@@ -73,8 +111,8 @@ async function asaasFetch(
   const assertSafe = ctx.assertSafe ?? assertSafeOutboundUrl;
   await assertSafe(url);
   const doFetch = ctx.fetchImpl ?? fetch;
-  // The cap is on what is READ, not a slice of what was already read: `.text()` buffers the whole
-  // body before any limit applies (#464).
+  // The cap is on what is READ, not a slice of what was already read: `.text()` buffers the
+  // whole body before any limit applies.
   const { res, body } = await fetchBounded(
     url,
     {
@@ -136,7 +174,7 @@ const PIX_CHARGE_SCHEMA = z.object({
     .describe("Due date as YYYY-MM-DD (optional; defaults to today)"),
 });
 
-// NOTE: field order is the arg order the UI projection renders (argsFromZod iterates the shape).
+// Field order is the arg order the UI projection renders (argsFromZod iterates the shape).
 // Exactly one id is required, enforced in code (not .refine) so the model gets a short
 // instructive message instead of a zod validation dump.
 const PAYMENT_STATUS_SCHEMA = z.object({
@@ -164,19 +202,13 @@ function buildCreateLinkTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
 ): StructuredToolInterface {
-  const env = resolveEnv(sel.config);
-  const base = ASAAS_ORIGINS[env];
   const overrides = (sel.config.paymentLink ?? {}) as Record<string, unknown>;
 
   return failableTool(
     async (input: { value: number; description?: string; name?: string }) => {
-      const token = sel.credentialRef
-        ? await ctx.resolveCredential(sel.credentialRef)
-        : null;
-      if (!token)
-        return toolFailure(
-          "Asaas credential is not configured for this integration.",
-        );
+      const call = await resolveAsaasCall(sel, ctx);
+      if ("failure" in call) return call.failure;
+      const { token, env, base } = call;
 
       // Opaque correlation token: sent as externalReference, stored as the ref's externalId, and
       // read back from the payment webhook by the inbound mapper. Never the internal thread id
@@ -192,10 +224,9 @@ function buildCreateLinkTool(
         // stays payable. Overridable via config.paymentLink.
         dueDateLimitDays: 3,
         ...overrides,
-        // Last: a config override must NOT clobber the correlation token. externalReference is the
-        // field Asaas offers for the merchant's own identifier, so an operator stamping an ERP id
-        // in config.paymentLink is the expected use of that map — and it used to win, leaving the
-        // paid webhook with nothing to tie back to the conversation (issue #108).
+        // NOTE: Last, so a config override cannot clobber the correlation token: an operator
+        // stamping an ERP id in config.paymentLink is the expected use of that field, and winning
+        // would leave the paid webhook with nothing to tie back to the conversation.
         externalReference: correlationId,
       };
 
@@ -219,7 +250,11 @@ function buildCreateLinkTool(
           String(res.status),
         );
         return toolFailure(
-          `The payment provider rejected the request (HTTP ${res.status}).`,
+          withEnvironmentHint(
+            `The payment provider rejected the request (HTTP ${res.status}).`,
+            res,
+            env,
+          ),
         );
       }
       const data = (res.json ?? {}) as Record<string, unknown>;
@@ -283,8 +318,6 @@ function buildCreatePixChargeTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
 ): StructuredToolInterface {
-  const env = resolveEnv(sel.config);
-  const base = ASAAS_ORIGINS[env];
   const overrides = (sel.config.payment ?? {}) as Record<string, unknown>;
 
   return failableTool(
@@ -296,13 +329,9 @@ function buildCreatePixChargeTool(
       description?: string;
       dueDate?: string;
     }) => {
-      const token = sel.credentialRef
-        ? await ctx.resolveCredential(sel.credentialRef)
-        : null;
-      if (!token)
-        return toolFailure(
-          "Asaas credential is not configured for this integration.",
-        );
+      const call = await resolveAsaasCall(sel, ctx);
+      if ("failure" in call) return call.failure;
+      const { token, env, base } = call;
 
       const cpfCnpj = input.cpfCnpj.replace(/\D/g, "");
       if (cpfCnpj.length !== 11 && cpfCnpj.length !== 14)
@@ -313,7 +342,9 @@ function buildCreatePixChargeTool(
       try {
         const found = await asaasFetch(
           base,
-          `/customers?cpfCnpj=${cpfCnpj}`,
+          // NOTE: Only the first customer is used, and Asaas returns up to 10 by default at about
+          // 700 bytes each, which a body cap of MAX_RESPONSE_CHARS cuts mid-JSON from the third on.
+          `/customers?cpfCnpj=${cpfCnpj}&limit=1`,
           { method: "GET", token },
           ctx,
         );
@@ -325,10 +356,14 @@ function buildCreatePixChargeTool(
             String(found.status),
           );
           return toolFailure(
-            `The payment provider rejected the customer lookup (HTTP ${found.status}).`,
+            withEnvironmentHint(
+              `The payment provider rejected the customer lookup (HTTP ${found.status}).`,
+              found,
+              env,
+            ),
           );
         }
-        // NOTE: A malformed 2xx body must also fail the call (asaasFetch yields json: null on an
+        // A malformed 2xx body must also fail the call (asaasFetch yields json: null on an
         // unparseable body) — only a valid data array may reach the create branch, and a non-empty
         // one must carry a string id, otherwise a parse glitch would duplicate the customer.
         const json = found.json as { data?: unknown } | null;
@@ -339,7 +374,7 @@ function buildCreatePixChargeTool(
           );
         }
         const first = (json.data as Array<{ id?: unknown }>)[0]?.id;
-        // NOTE: A blank ("" / whitespace) id must count as missing — it would leave customerId
+        // A blank ("" / whitespace) id must count as missing — it would leave customerId
         // falsy and reach the create branch anyway.
         const firstId = typeof first === "string" ? first.trim() : "";
         if (json.data.length > 0 && !firstId) {
@@ -387,7 +422,11 @@ function buildCreatePixChargeTool(
             String(created.status),
           );
           return toolFailure(
-            `The payment provider rejected the customer (HTTP ${created.status}).`,
+            withEnvironmentHint(
+              `The payment provider rejected the customer (HTTP ${created.status}).`,
+              created,
+              env,
+            ),
           );
         }
         const cd = (created.json ?? {}) as Record<string, unknown>;
@@ -433,7 +472,11 @@ function buildCreatePixChargeTool(
           String(charge.status),
         );
         return toolFailure(
-          `The payment provider rejected the request (HTTP ${charge.status}).`,
+          withEnvironmentHint(
+            `The payment provider rejected the request (HTTP ${charge.status}).`,
+            charge,
+            env,
+          ),
         );
       }
       const cdata = (charge.json ?? {}) as Record<string, unknown>;
@@ -489,8 +532,8 @@ function buildCreatePixChargeTool(
           const qd = (qr.json ?? {}) as Record<string, unknown>;
           if (typeof qd.payload === "string") payload = qd.payload;
         } else {
-          // NOTE: A non-2xx never threw, so this used to vanish silently — the charge exists and
-          // the tool returns success either way, but the customer gets no copy-and-paste code.
+          // NOTE: A non-2xx does not throw, so without this log it vanishes silently: the charge
+          // exists and the tool returns success either way, but the customer gets no copy-and-paste code.
           // (A 2xx without a payload is a legitimate state — e.g. no PIX key, invoiceUrl still
           // payable — and stays quiet.)
           logger.warn(
@@ -537,18 +580,11 @@ function buildStatusTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
 ): StructuredToolInterface {
-  const env = resolveEnv(sel.config);
-  const base = ASAAS_ORIGINS[env];
-
   return failableTool(
     async (input: { paymentId?: string; paymentLinkId?: string }) => {
-      const token = sel.credentialRef
-        ? await ctx.resolveCredential(sel.credentialRef)
-        : null;
-      if (!token)
-        return toolFailure(
-          "Asaas credential is not configured for this integration.",
-        );
+      const call = await resolveAsaasCall(sel, ctx);
+      if ("failure" in call) return call.failure;
+      const { token, env, base } = call;
       let paymentId = input.paymentId?.trim() || undefined;
       let linkId = input.paymentLinkId?.trim() || undefined;
       // Defensive: a pay_... id in the link field is a payment id (models mix them up).
@@ -585,7 +621,13 @@ function buildStatusTool(
         // caught here: turn the provider's 404 into recoverable guidance instead of a dead end.
         if (res.status === 404)
           return "The payment provider returned HTTP 404 (id not found). If this value was extracted from an invoice/payment URL, that slug is not a valid id — use the paymentId returned by asaas_create_pix_charge or the paymentLinkId returned by asaas_payment_link_create.";
-        return toolFailure(`The payment provider returned HTTP ${res.status}.`);
+        return toolFailure(
+          withEnvironmentHint(
+            `The payment provider returned HTTP ${res.status}.`,
+            res,
+            env,
+          ),
+        );
       }
       const d = (res.json ?? {}) as Record<string, unknown>;
       // Bounded projections (no secrets; status-relevant fields only). The payment path skips

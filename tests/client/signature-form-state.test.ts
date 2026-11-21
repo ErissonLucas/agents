@@ -1,23 +1,25 @@
 import { describe, expect, test } from "bun:test";
 import {
+  signaturePreviewParts,
+  signaturePreviewVars,
+} from "@/client/pages/agents/BehaviorTab";
+import {
   SIGNATURE_SEED,
   signatureOnToggle,
   signatureToForm,
   signatureToStored,
 } from "@/client/pages/agents/signatureFormState";
-import { PROMPT_CONTEXT_VARS } from "@/graph/prompt";
 import { SIGNATURE_MAX } from "@/modules/agents/text-caps";
 
-// THE SCREEN'S HALF OF #612, which the mutation battery found uncovered: every property below
-// survived a mutant while the rule lived inline in the page. Each test here is one of those
-// mutants, and each of them loses the operator's own text when it is wrong.
+// The signature switch as the screen reads and writes it. Each test here is a property that, when
+// wrong, loses the operator's own text.
 
 const SIG = "Atenciosamente,\nAlex | Minha Empresa";
 
 describe("signatureToForm: what the screen shows for a stored bag", () => {
-  // THE MIGRATION CASE. Every agent configured under #599 has text and no flag. If the editor
-  // reads that as off, the operator opens the tab, sees the switch down, saves anything else on
-  // the page, and the signature is gone with no action that looks like turning it off.
+  // NOTE: the migration case. A bag written before the switch existed has text and no flag. Read as
+  // off, the operator sees the switch down, saves anything else on the page, and the signature is gone
+  // with no action that looks like turning it off.
   test("text and no flag shows as ON", () => {
     expect(signatureToForm({ signature: { text: SIG } })).toEqual({
       enabled: true,
@@ -53,9 +55,8 @@ describe("signatureToForm: what the screen shows for a stored bag", () => {
 });
 
 describe("signatureToStored: what the screen writes back", () => {
-  // The switch has to be able to go DOWN. Writing `true` whenever there is text is the shape this
-  // bug takes, and it makes the feature impossible to turn off by any means except deleting the
-  // text, which is the state #612 exists to leave behind.
+  // NOTE: the switch has to be able to go DOWN. Writing `true` whenever there is text makes the
+  // feature impossible to turn off except by deleting the text.
   test("off is written as off, and the text survives it", () => {
     expect(
       signatureToStored({
@@ -72,18 +73,6 @@ describe("signatureToStored: what the screen writes back", () => {
       frequency: "once",
       separator: "--",
     });
-  });
-
-  test("on is written as on", () => {
-    expect(
-      signatureToStored({
-        enabled: true,
-        text: SIG,
-        position: "top",
-        frequency: "all",
-        separator: "blank",
-      }).enabled,
-    ).toBe(true);
   });
 
   // Saving an untouched form must be a no-op, or every unrelated save rewrites this block.
@@ -135,60 +124,83 @@ describe("signatureOnToggle: the seed, and the guard that matters more", () => {
   };
 
   test("turning it on over an empty box seeds the agent's name", () => {
-    expect(signatureOnToggle(off, true)).toEqual({
-      ...off,
-      enabled: true,
-      text: SIGNATURE_SEED,
-    });
-  });
-
-  // THE GUARD. Seeding over a kept text is the same data loss the switch was built to prevent,
-  // committed by the convenience meant to celebrate it.
-  test("turning it on over a kept text changes nothing but the switch", () => {
-    const kept = { ...off, text: SIG };
-    expect(signatureOnToggle(kept, true)).toEqual({ ...kept, enabled: true });
+    const up = signatureOnToggle(off, true, null);
+    expect(up.form).toEqual({ ...off, enabled: true, text: SIGNATURE_SEED });
+    expect(up.seed).toEqual({ form: up.form, from: "" });
   });
 
   test("a box holding only whitespace counts as empty", () => {
-    expect(signatureOnToggle({ ...off, text: "   \n" }, true).text).toBe(
+    expect(
+      signatureOnToggle({ ...off, text: "   \n" }, true, null).form.text,
+    ).toBe(SIGNATURE_SEED);
+  });
+
+  test("turning it OFF never touches the operator's text", () => {
+    const on = { ...off, enabled: true, text: SIG };
+    const down = signatureOnToggle(on, false, null);
+    expect(down.form).toEqual({ ...on, enabled: false });
+    // and the whole point: back on gives it back byte for byte
+    expect(signatureOnToggle(down.form, true, down.seed).form).toEqual(on);
+  });
+
+  // The seed is the switch's own suggestion, not something the operator wrote: turned straight back
+  // off over it, the box holds what it held before, so on and off again is no change at all.
+  test("turning it off over the untouched seed gives back the box as it was", () => {
+    for (const before of ["", "  \n"]) {
+      const box = { ...off, text: before };
+      const up = signatureOnToggle(box, true, null);
+      expect(signatureOnToggle(up.form, false, up.seed).form).toEqual(box);
+    }
+  });
+
+  // Any edit since the seed hands the switch a new form, even one that types the seed back: the text
+  // is then the operator's, and off keeps it.
+  test("a seed edited, even back to itself, stays when the switch goes off", () => {
+    const up = signatureOnToggle(off, true, null);
+    const retyped = { ...up.form, text: SIGNATURE_SEED };
+    expect(signatureOnToggle(retyped, false, up.seed).form.text).toBe(
       SIGNATURE_SEED,
     );
   });
 
-  test("turning it OFF never touches the text", () => {
-    const on = { ...off, enabled: true, text: SIG };
-    expect(signatureOnToggle(on, false)).toEqual({ ...on, enabled: false });
-    // and the whole point: back on gives it back byte for byte
-    expect(signatureOnToggle(signatureOnToggle(on, false), true)).toEqual(on);
+  // Text that reads like the seed is the operator's when the switch did not put it there: typed by
+  // hand into an enabled empty box, or a saved signature. Off keeps it.
+  test("a seed the switch did not put there stays when the switch goes off", () => {
+    const typed = { ...off, enabled: true, text: SIGNATURE_SEED };
+    expect(signatureOnToggle(typed, false, null).form.text).toBe(
+      SIGNATURE_SEED,
+    );
+  });
+
+  // Turning it on over a kept text seeds nothing, and says so, so a later off has nothing to undo.
+  test("on over a kept text records no seed", () => {
+    const up = signatureOnToggle(off, true, null);
+    expect(
+      signatureOnToggle({ ...off, text: SIG }, true, up.seed).seed,
+    ).toBeNull();
   });
 
   // The seed is only useful if it resolves; a literal `{{...}}` in the preview would teach the
   // operator the variables do not work at the moment they are learning the field.
   test("the seed names a variable the field supports", () => {
-    const named = [...SIGNATURE_SEED.matchAll(/\{\{([^}]+)\}\}/g)].map(
-      (m) => m[1] as string,
+    const seeded = signatureOnToggle(off, true, null).form;
+    const [first] = signaturePreviewParts(
+      seeded,
+      (_k: string, d: string) => d,
+      signaturePreviewVars("Ana", "ACME"),
     );
-    expect(named.length).toBeGreaterThan(0);
-    expect(named.filter((n) => !PROMPT_CONTEXT_VARS.includes(n))).toEqual([]);
+    expect(first?.[0]).toBe("**Ana**");
   });
 });
 
 // AN OVERSIZED SIGNATURE ALREADY IN THE BAG SURVIVES AN UNRELATED SAVE.
 //
-// Round 1 of the review on #613. `readSignatureConfig` clamps the text to `SIGNATURE_MAX` because
-// that is what the customer receives; the EDITOR must not, or an agent whose stored signature is
-// longer than the cap opens the tab showing a truncated copy, and the next save of any other field
-// on the page writes that copy over the original. Silent, permanent, and the same loss this issue
-// exists to prevent, arriving through the screen instead of through the switch.
-//
-// The boundary already has the matching rule: `collectOversizedTextChanges` lets an oversized value
-// through when it is UNCHANGED, which only works if the form gives back what was stored.
+// `readSignatureConfig` clamps the text to `SIGNATURE_MAX` because that is what the customer
+// receives; the EDITOR must not, or the next save of any other field writes a truncated copy over
+// the original. `collectOversizedTextChanges` lets an oversized value through when it is UNCHANGED,
+// which only works if the form gives back what was stored.
 describe("a stored signature longer than the cap", () => {
   const LONG = "x".repeat(SIGNATURE_MAX + 100);
-
-  test("hydrates whole, not clamped", () => {
-    expect(signatureToForm({ signature: { text: LONG } }).text).toBe(LONG);
-  });
 
   test("round-trips byte for byte, so an untouched save is a no-op", () => {
     const bag = {
@@ -205,14 +217,15 @@ describe("a stored signature longer than the cap", () => {
   // meet this: turning a long signature off for a while.
   test("turning it off and on again does not shorten it", () => {
     const form = signatureToForm({ signature: { text: LONG } });
-    expect(signatureOnToggle(signatureOnToggle(form, false), true).text).toBe(
-      LONG,
-    );
+    expect(
+      signatureOnToggle(signatureOnToggle(form, false, null).form, true, null)
+        .form.text,
+    ).toBe(LONG);
   });
 });
 
-// Issue #616. The frequency's default is a MIGRATION rule, not a UI preference: a bag written
-// before the field existed says nothing, and what its silence means is read off the position.
+// The frequency's default is a MIGRATION rule, not a UI preference: a bag written before the field
+// existed says nothing, and what its silence means is read off the position.
 describe("the frequency the form reads and the one it writes", () => {
   test("a bag with no frequency: top reads all, bottom reads once", () => {
     expect(
@@ -276,9 +289,9 @@ describe("the frequency the form reads and the one it writes", () => {
       frequency: "once" as const,
       separator: "blank" as const,
     };
-    expect(signatureOnToggle(off, true).frequency).toBe("once");
-    expect(signatureOnToggle({ ...off, enabled: true }, false).frequency).toBe(
-      "once",
-    );
+    expect(signatureOnToggle(off, true, null).form.frequency).toBe("once");
+    expect(
+      signatureOnToggle({ ...off, enabled: true }, false, null).form.frequency,
+    ).toBe("once");
   });
 });

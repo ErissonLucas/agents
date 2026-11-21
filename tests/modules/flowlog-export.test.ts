@@ -8,6 +8,7 @@ import {
   serializeLogItems,
 } from "@/modules/flowlog/export";
 import type { ExecutionLogItem } from "@/modules/flowlog/read";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog } from "@/tests/utils/flowlog";
 
 // ── pure serialization (no DB) ──
@@ -27,6 +28,7 @@ function item(over: Partial<ExecutionLogItem> = {}): ExecutionLogItem {
     model: null,
     durationMs: null,
     source: "inbox",
+    anonymous: false,
     detail: null,
     errorMessage: null,
     createdAt: "2026-07-01T00:00:00.000Z",
@@ -48,14 +50,16 @@ describe("serializeLogItems", () => {
     const csv = serializeLogItems([item(), item({ id: "2" })], "csv");
     const [header] = csv.split("\r\n");
     expect(header).toBe(
-      "id,createdAt,source,turnId,stage,level,status,provider,model,durationMs,conversationId,agentId,inboxId,threadId,errorMessage,detail",
+      "id,createdAt,source,anonymous,turnId,stage,level,status,provider,model,durationMs,conversationId,agentId,inboxId,threadId,errorMessage,detail",
     );
     // header + 2 rows (rows never contain a bare newline here).
     expect(csv.split("\r\n")).toHaveLength(3);
   });
 
   test("csv of an empty export is header-only", () => {
-    expect(serializeLogItems([], "csv")).not.toContain("\r\n");
+    expect(serializeLogItems([], "csv")).toBe(
+      "id,createdAt,source,anonymous,turnId,stage,level,status,provider,model,durationMs,conversationId,agentId,inboxId,threadId,errorMessage,detail",
+    );
   });
 
   test("csv quotes cells with commas, quotes or newlines (RFC 4180)", () => {
@@ -93,8 +97,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -200,13 +204,23 @@ describe.skipIf(!dbUp)("exportExecutionLogs", () => {
   });
 
   test("maxRows is clamped to the hard cap", async () => {
+    // One row past the cap, under a turn of their own so the other cases never see them.
+    await suDb.executionLog.createMany({
+      data: Array.from({ length: MAX_LOG_EXPORT_ROWS + 1 }, () => ({
+        tenantId: tenantA,
+        turnId: "bulk",
+        stage: "generate",
+        level: "info",
+        source: "inbox",
+      })),
+    });
     const res = await exportExecutionLogs(
       ctx(tenantA),
-      { format: "json", maxRows: MAX_LOG_EXPORT_ROWS * 10 },
+      { format: "json", turnId: "bulk", maxRows: MAX_LOG_EXPORT_ROWS * 10 },
       appDb,
     );
-    // Everything fits under the cap, so nothing is truncated.
-    expect(res.truncated).toBe(false);
+    expect(res.count).toBe(MAX_LOG_EXPORT_ROWS);
+    expect(res.truncated).toBe(true);
   });
 
   test("RLS: a tenant's export never leaks another tenant's rows", async () => {

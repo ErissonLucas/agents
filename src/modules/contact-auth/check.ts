@@ -49,10 +49,13 @@ export interface ContactAuthVerdict {
   reason?: string;
   endpointReason?: string;
   // True when the endpoint was not asked at all: the answer is a grant it gave earlier, kept under
-  // `contactAuth.mode = "once"` (issue #189, ./grants.ts). Absent on every other verdict, including
-  // the ask that WROTE the grant. There is no `status` on a reused verdict for the same reason the
-  // endpoint's own `reason` is not carried over: neither is a fact about this message.
+  // `contactAuth.mode = "once"` (./grants.ts). Absent on every other verdict, including the ask that
+  // WROTE the grant. A reused verdict carries no `status` or endpoint `reason`: neither is a fact
+  // about this message.
   reused?: boolean;
+  // Which stage gave the answer (docs/contact-auth.md, Two stages): the agent's rule, or the endpoint
+  // the operator configured. Set by the orchestration, never by the endpoint.
+  stage?: "rule" | "endpoint";
 }
 
 // The identity the request carries. ALWAYS from trusted context (the mirrored Chatwoot contact),
@@ -101,16 +104,11 @@ export function reasonSlug(v: unknown): string | undefined {
   return typeof v === "string" && REASON_SLUG_RE.test(v) ? v : undefined;
 }
 
-// The endpoint resolved WHO this contact is in order to answer at all, so it may hand the facts it
-// already has to the turn that follows (issue #190): the alternative is the model spending its
-// first tool call asking the operator's system the same question. What travels is a flat bag of
-// codes to one-line values, and both halves are bounded here rather than at the prompt, so nothing
-// downstream has to remember that this text came from outside.
-//
-// Trusted the way the mirrored identity is trusted: it arrives from the operator's own system over
-// an authenticated channel, never from the customer's text. Trusted is not unbounded, though. The
-// endpoint may well be echoing something the customer typed into it, so a value is stripped of
-// anything that could forge a new line of prompt framing and cut to a length a fact fits in.
+// The endpoint had to resolve WHO this contact is, so it may hand those facts to the turn instead of
+// the model spending its first tool call asking again. A flat bag of codes to one-line values, bounded
+// here so nothing downstream has to remember it came from outside. Trusted like the mirrored identity
+// (operator's system, authenticated channel), but a value may echo customer text, so anything that
+// could forge a new line of prompt framing is stripped and it is cut to a fact's length.
 export const AUTH_CONTEXT_KEYS_MAX = 20;
 export const AUTH_CONTEXT_VALUE_MAX = 200;
 // The bag rides in EVERY turn's prompt, so its cost is paid per turn, forever; the per-value cap
@@ -210,11 +208,10 @@ export function classifyAuthorizationResponse(
   body: string | null,
 ): AuthorizationVerdict {
   const json = body === null ? null : parseJsonObject(body);
-  // FIRST, because these three say everything they need to say in the status line: an endpoint may
+  // NOTE: FIRST, because these three say everything they need to say in the status line: an endpoint may
   // answer REST-style with no body at all, so a body we could not read cannot turn the answer into
-  // something else. Checked after the body used to mean a 403 behind a proxy with a large error
-  // page landed as an ERROR — read as transient, so the customer got no deny message, nobody got
-  // the handoff, and every following message asked again about a refusal that was permanent.
+  // something else. Checked after the body, a 403 behind a proxy's error page would read as a
+  // transient ERROR: no deny message, no handoff, and every following message asking again.
   if (deniesOnStatus(status)) {
     const endpointReason = reasonSlug(json?.reason);
     return {
@@ -264,7 +261,7 @@ export function buildAuthorizationRequest(
     cfg.includeMessageText && identity.messageText?.trim()
       ? clipText(identity.messageText.trim(), MESSAGE_TEXT_MAX)
       : null;
-  // NOTE: The nesting IS the contract: `contact` is what Chatwoot mirrored (trusted context),
+  // The nesting IS the contract: `contact` is what Chatwoot mirrored (trusted context),
   // `message` is what the customer typed. An endpoint must never read identity out of `message`.
   const body = JSON.stringify({
     contact: {
@@ -296,7 +293,7 @@ export function buildAuthorizationRequest(
 
 // Reads at most `max` bytes; null when the body is larger (declared or streamed). The cap is applied
 // BEFORE parsing, so an oversized answer costs neither memory nor a JSON.parse of it.
-async function readBodyCapped(
+export async function readBodyCapped(
   res: Response,
   max: number,
 ): Promise<string | null> {
@@ -364,7 +361,7 @@ export async function checkContactAuthorization(
       // tools make (prepare.ts): a local endpoint works in development, production stays https.
       assertSafeOutboundUrl(u, { allowHttp: config.ssrf.allowPrivateTargets }));
   const { url, init } = buildAuthorizationRequest(cfg, identity, credential);
-  // NOTE: The deadline is armed BEFORE the URL check, because that check resolves DNS. One
+  // The deadline is armed BEFORE the URL check, because that check resolves DNS. One
   // unreachable resolver would otherwise hold the pre-turn gate — and the webhook turn behind it —
   // for as long as the resolver takes, with `timeoutMs` only starting to count afterwards. The
   // budget covers every step that waits: the lookup, the fetch, and the body.
@@ -390,7 +387,7 @@ export async function checkContactAuthorization(
       redirect: "error",
       signal,
     });
-    // NOTE: The timer stays armed while the body is read: a server that answers the status line and
+    // The timer stays armed while the body is read: a server that answers the status line and
     // then stalls would otherwise hold the gate past its timeout.
     let body: string | null;
     try {

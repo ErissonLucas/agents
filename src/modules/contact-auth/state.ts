@@ -1,21 +1,10 @@
 import type { ContactAuthVerdict } from "./check";
 
-// In-process coordination for the contact authorization gate. NOT a verdict cache: every incoming
-// message asks the endpoint again (docs/contact-auth.md), so a revocation on the operator's side
-// takes effect on the customer's next message, and an unlock (a code the customer sends) is seen
-// the moment it arrives. What lives here instead:
-//
-//  - Single-flight: concurrent deliveries for one contact coalesce into ONE request in flight.
-//    Dedupe of work in flight, not memory of a verdict; nothing outlives the promise.
-//  - Notice cooldown: how recently a conversation was told about a refusal (the customer copy and
-//    the operator note), so a refused burst is voiced once per window rather than once per message.
-//    Memory only, by design: losing it on a restart merely repeats a notice, which is harmless,
-//    unlike a verdict would be.
-//
-// The cooldown store is bounded twice, and the first bound is active rather than lazy: a
-// rescheduled sweep wakes at the earliest lapse and deletes what has expired, so an idle process
-// FORGETS old cooldowns instead of holding them until restart (same idiom as the media annotations
-// store); a hard entry cap absorbs a burst that outruns every window.
+// In-process coordination for the contact authorization gate; verdict reuse under `mode: "once"` is
+// grants.ts, not here. Single-flight coalesces concurrent deliveries for one contact into ONE request
+// (nothing outlives the promise). The notice cooldown voices a refused burst once per window; memory
+// only, since losing it merely repeats a notice. The cooldown store is bounded by a rescheduled sweep
+// that deletes expired entries (so an idle process forgets them) and by a hard entry cap.
 
 const MAX_ENTRIES = 10_000;
 
@@ -28,11 +17,9 @@ let sweepAt = 0;
 // Scoped to the CONVERSATION (not the contact): the copy and the note land on a conversation, and a
 // contact writing on two channels is two conversations, each entitled to its own notice.
 //
-// And scoped to the NOTICE, because the two are not interchangeable. They used to share one claim,
-// so an endpoint ERROR — which writes a note and never speaks to the customer — consumed the window
-// for a denial arriving right after it, and the deny copy was skipped. That copy is usually the
-// unlock instructions, and the handoff that follows ends the bot's attribution, so there is no
-// later message to carry it: the customer is refused and never told why or how to fix it.
+// And scoped to the NOTICE: an endpoint ERROR writes only a note, and sharing one claim would let it
+// consume the window for a denial right after, skipping the deny copy (usually the unlock
+// instructions, which no later message carries once the handoff ends the bot's attribution).
 export type ContactAuthNotice = "copy" | "note";
 
 export function contactAuthNoticeKey(
@@ -44,20 +31,11 @@ export function contactAuthNoticeKey(
   return `${tenantId}:${agentId}:${conversationRowId}:${notice}`;
 }
 
-// Single-flight is scoped to the CONTACT: the same person writing twice concurrently is one
-// question to the endpoint, whichever conversations the messages landed on.
-//
-// It is scoped to the REQUEST as well, and that half is not an optimization. What collapses here is
-// the same delivery arriving twice (a retry, a duplicated webhook), which shares its message id.
-// Two DIFFERENT askings are not the same question:
-//
-//   - a proactive nudge carries no message text, so an unlock endpoint answering "denied until they
-//     send the code" would hand its refusal to the very message that carries the code;
-//   - and the joiner is told `shared`, which is what suppresses its own deny copy, handoff and
-//     note — so a nudge's refusal would silently swallow the customer's.
-//
-// `request` is the message id under an unlock flow (the text is part of the question), and the
-// source otherwise. Same message id ⇒ same question ⇒ one call, which is the case worth collapsing.
+// Single-flight is scoped to the CONTACT (one person writing twice concurrently is one question) and
+// to the REQUEST, which is not an optimization: a proactive nudge carries no message text, so an
+// unlock endpoint's refusal to it would be handed to the message carrying the code, and the joiner is
+// told `shared`, suppressing its own deny copy, handoff and note. `request` is the message id under an
+// unlock flow and the source otherwise; only the same delivery arriving twice collapses.
 export function contactAuthFlightKey(
   tenantId: bigint,
   agentId: bigint,
@@ -116,7 +94,7 @@ export function sweepContactAuthNotices(nowMs: number = Date.now()): void {
   }
 }
 
-// NOTE: Second, independent bound: a burst that outruns every window is capped by entry count. Map
+// Second, independent bound: a burst that outruns every window is capped by entry count. Map
 // iteration is insertion-ordered and claim() re-inserts on renewal, so the front is the oldest.
 function enforceSizeCap(): void {
   while (notices.size > MAX_ENTRIES) {
@@ -135,7 +113,7 @@ export function nextSweepDelayMs(nowMs: number = Date.now()): number | null {
   return earliest === null ? null : Math.max(0, earliest - nowMs);
 }
 
-// NOTE: One timer, armed for the earliest lapse and re-armed when a newer entry lapses sooner,
+// One timer, armed for the earliest lapse and re-armed when a newer entry lapses sooner,
 // unref'd so a pending sweep never keeps the process alive at shutdown.
 function scheduleSweep(nowMs: number): void {
   const delay = nextSweepDelayMs(nowMs);
@@ -161,19 +139,31 @@ function scheduleSweep(nowMs: number): void {
 // endpoint. The second caller awaits the first caller's promise and is told the verdict was SHARED,
 // which the gate reads as "the leader acts, I stay silent". Same idiom as the OAuth refresh
 // coalescing in modules/vault/mcp-oauth.ts.
-const inFlight = new Map<string, Promise<ContactAuthVerdict>>();
+const inFlight = new Map<
+  string,
+  { p: Promise<ContactAuthVerdict>; askedAt: number }
+>();
 
+// `askedAt` is when the flight began, the same for every caller that joined it: a caller that joins
+// late is answered by the question asked then, not by one asked when it arrived.
 export async function singleFlight(
   key: string,
   run: () => Promise<ContactAuthVerdict>,
-): Promise<{ verdict: ContactAuthVerdict; shared: boolean }> {
+): Promise<{ verdict: ContactAuthVerdict; shared: boolean; askedAt: number }> {
   const existing = inFlight.get(key);
-  if (existing) return { verdict: await existing, shared: true };
+  if (existing) {
+    return {
+      verdict: await existing.p,
+      shared: true,
+      askedAt: existing.askedAt,
+    };
+  }
+  const askedAt = Date.now();
   const p = run().finally(() => {
     inFlight.delete(key);
   });
-  inFlight.set(key, p);
-  return { verdict: await p, shared: false };
+  inFlight.set(key, { p, askedAt });
+  return { verdict: await p, shared: false, askedAt };
 }
 
 // Messages whose media the gate let through, so the `message_updated` Chatwoot sends after a voice
@@ -236,7 +226,7 @@ export function mediaRefusedHereThrough(key: string): number | null {
   return mediaRefusedHere.get(key) ?? null;
 }
 
-// NOTE: Test isolation only. Production never clears the state wholesale; the sweep does.
+// Test isolation only. Production never clears the state wholesale; the sweep does.
 export function clearContactAuthState(): void {
   notices.clear();
   inFlight.clear();
@@ -248,13 +238,13 @@ export function clearContactAuthState(): void {
   }
 }
 
-// NOTE: How many cooldowns are actually RETAINED (not merely lapsed but unswept ones hidden from
+// How many cooldowns are actually RETAINED (not merely lapsed but unswept ones hidden from
 // readers; those count until the sweep runs). Exposed so the sweep contract is assertable.
 export function contactAuthNoticeCount(): number {
   return notices.size;
 }
 
-// NOTE: Test-only view of what is retained, so a test can prove this module holds ids and
+// Test-only view of what is retained, so a test can prove this module holds ids and
 // timestamps and nothing anyone said.
 export function contactAuthNoticeEntries(): Array<{
   key: string;

@@ -45,6 +45,7 @@ type VaultEntry = NonNullable<
 // t('vault.secretType.deepseek', 'DeepSeek')
 // t('vault.secretType.openrouter', 'OpenRouter')
 // t('vault.secretType.openai_compatible', 'OpenAI-compatible')
+// t('vault.secretType.typesafe', 'TypeSafe')
 // t('vault.secretType.elevenlabs', 'ElevenLabs')
 // t('vault.secretType.assemblyai', 'AssemblyAI')
 // t('vault.secretType.fish', 'Fish Audio')
@@ -103,14 +104,12 @@ export function VaultPanel() {
     void load();
   }, [load]);
 
-  // Deeplink: /resources/vault?fill=<id> opens the fill modal for a pending entry once the list is
-  // loaded, then strips the param so a re-render / back-nav doesn't re-open it.
+  // Deeplink /resources/vault?fill=<id> opens the fill modal for a pending entry once the
+  // list is loaded, then strips the param so a re-render / back-nav doesn't re-open it.
   //
-  // A MISS keeps the parameter and says so. The id belongs to a tenant, and the console resolves the
-  // tenant from localStorage: a link built for another one finds nothing here (issue #151). Stripping
-  // it on the way, which is what used to happen, spent the link on a page that then looked like an
-  // ordinary navigation, so there was nothing to retry and nothing on screen explaining it. Kept, the
-  // operator switches tenant in the header (a full reload) and the same URL resolves.
+  // A MISS keeps the parameter and says so: the console resolves the tenant from localStorage, so a
+  // link built for another tenant finds nothing here, and keeping it lets the operator switch
+  // tenant in the header (a full reload) and resolve the same URL.
   const [searchParams, setSearchParams] = useSearchParams();
   const fillId = searchParams.get("fill");
   const missReported = useRef<string | null>(null);
@@ -213,7 +212,7 @@ export function VaultPanel() {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <p className="text-sm text-text-muted">
+        <p className="text-text-muted text-sm">
           {t(
             "vault.subtitle",
             "API keys and tokens your agents and integrations use.",
@@ -222,7 +221,7 @@ export function VaultPanel() {
         {entries.length > 0 && (
           <div className="relative w-64 max-w-xs">
             <Search
-              className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted"
+              className="text-text-muted pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2"
               aria-hidden="true"
             />
             <input
@@ -237,7 +236,7 @@ export function VaultPanel() {
                 "Search by name or type…",
               )}
               className={cn(
-                "w-full rounded-lg border border-border bg-bg-tertiary py-1.5 pl-9 text-sm text-text-primary placeholder-text-placeholder focus:border-border-focus focus:outline-none",
+                "border-border-hover bg-bg-tertiary text-text-primary placeholder-text-placeholder focus:border-border-focus focus:ring-accent-soft h-8 w-full rounded-md border pl-8 text-sm transition-colors focus:ring-2 focus:outline-none",
                 { "pr-8": !!query, "pr-4": !query },
               )}
             />
@@ -245,7 +244,7 @@ export function VaultPanel() {
               <button
                 type="button"
                 onClick={() => setQuery("")}
-                className="absolute top-1/2 right-3 -translate-y-1/2 text-text-muted hover:text-text-primary"
+                className="text-text-muted hover:text-text-primary absolute top-1/2 right-3 -translate-y-1/2"
                 aria-label={t("common.clearSearch", "Clear search")}
               >
                 <X className="h-4 w-4" aria-hidden="true" />
@@ -300,7 +299,7 @@ export function VaultPanel() {
 
             if (q && filtered.length === 0) {
               return (
-                <p className="px-4 py-3 text-sm text-text-muted">
+                <p className="text-text-muted px-4 py-3 text-sm">
                   {t("vault.noSearchResults", "No secrets match your search.")}
                 </p>
               );
@@ -311,19 +310,19 @@ export function VaultPanel() {
                 {filtered.map((e) => (
                   <li
                     key={e.id}
-                    className="flex items-center justify-between gap-3 border-border border-b px-4 py-3 last:border-b-0"
+                    className="border-border flex items-center justify-between gap-3 border-b px-4 py-3 last:border-b-0"
                   >
                     <div className="flex min-w-0 items-center gap-2">
                       <ServiceLogo
                         service={secretTypeService(e.kind)}
-                        className="h-4 w-4 shrink-0 text-text-muted"
+                        className="text-text-muted h-4 w-4 shrink-0"
                       />
                       <div className="min-w-0">
-                        <span className="truncate font-mono text-sm text-text-primary">
+                        <span className="text-text-primary truncate font-mono text-sm">
                           {e.name}
                         </span>
                         {e.baseUrl && (
-                          <p className="truncate text-text-muted text-xs">
+                          <p className="text-text-muted truncate text-xs">
                             {e.baseUrl}
                           </p>
                         )}
@@ -413,7 +412,7 @@ export function VaultPanel() {
         modal={deleteModal}
         size="sm"
         title={t("vault.deleteTitle", "Delete secret")}
-        onCloseRequest={deleting ? () => undefined : undefined}
+        busy={deleting}
         footer={
           <div className="flex justify-end gap-2">
             <Button
@@ -430,7 +429,7 @@ export function VaultPanel() {
         }
       >
         <div className="flex flex-col gap-3">
-          <p className="text-sm text-text-secondary">
+          <p className="text-text-secondary text-sm">
             {t(
               "vault.deleteMessage",
               'Delete "{{name}}"? Anything using it will stop working.',
@@ -449,7 +448,7 @@ function RefList({ refs }: { refs: References | null }) {
   const { t } = useTranslation();
   if (!refs) {
     return (
-      <p className="text-sm text-text-muted">
+      <p className="text-text-muted text-sm">
         {t("common.loading", "Loading…")}
       </p>
     );
@@ -461,6 +460,7 @@ function RefList({ refs }: { refs: References | null }) {
     refs.agents.length === 0 &&
     refs.webhooks.length === 0 &&
     refs.alertChannels.length === 0 &&
+    refs.dashboardSources.length === 0 &&
     refs.tenantSettings.length === 0;
   return (
     <div className="flex flex-col gap-3 text-sm">
@@ -513,12 +513,23 @@ function RefList({ refs }: { refs: References | null }) {
         }))}
       />
       <RefGroup
+        label={t("vault.refDashboardSources", "Dashboard data sources")}
+        items={refs.dashboardSources.map((n) => ({
+          key: n,
+          label: n,
+          to: "/dashboards/_sources",
+        }))}
+      />
+      <RefGroup
         label={t("vault.refTenantSettings", "Tenant settings")}
         items={refs.tenantSettings.map((k) => ({
           key: k,
           // biome-ignore lint/plugin/no-dynamic-i18n-key: tenant-setting keys registered via magic comments
           label: t(`vault.tenantSetting.${k}`, k),
-          to: "/resources/advanced",
+          to:
+            k === "occurrences"
+              ? "/resources/occurrences"
+              : "/resources/advanced",
         }))}
       />
       {empty && (
@@ -532,6 +543,7 @@ function RefList({ refs }: { refs: References | null }) {
 
 // Magic comments register the dynamic tenant-setting keys for the i18n extractor.
 // t('vault.tenantSetting.embedding', 'Knowledge base embeddings')
+// t('vault.tenantSetting.occurrences', 'Occurrence monitor')
 // t('vault.tenantSetting.langfuse', 'Observability (Langfuse)')
 
 interface RefItem {
@@ -546,7 +558,7 @@ function RefGroup({ label, items }: { label: string; items: RefItem[] }) {
   if (items.length === 0) return null;
   return (
     <div>
-      <p className="mb-1 font-medium text-text-secondary text-xs uppercase">
+      <p className="text-text-secondary mb-1 text-xs font-medium uppercase">
         {label}
       </p>
       <div className="flex flex-wrap gap-1.5">
@@ -555,7 +567,7 @@ function RefGroup({ label, items }: { label: string; items: RefItem[] }) {
             <Link key={i.key} to={i.to}>
               <Badge
                 variant="secondary"
-                className="transition-colors hover:bg-bg-hover"
+                className="hover:bg-bg-hover transition-colors"
               >
                 {i.label}
               </Badge>

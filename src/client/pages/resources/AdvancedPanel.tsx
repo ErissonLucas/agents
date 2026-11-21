@@ -1,5 +1,7 @@
+import { Binary, Gauge, ScrollText, ShieldAlert, Tags } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useSearchParams } from "react-router";
 import {
   Button,
   Card,
@@ -7,13 +9,18 @@ import {
   DataBoundary,
   FormField,
   HelpPopover,
+  NumberInput,
+  RangeHolds,
   Switch,
   useToast,
 } from "@/client/components";
 import { ServiceLogo } from "@/client/components/icons/ServiceLogo";
 import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
+import { SectionNav } from "@/client/pages/agents/SectionNav";
+import { numberRange } from "@/lib/number-range";
 import { PriceOverridesCard } from "./PriceOverridesCard";
+import { ProactiveBreakerCard } from "./ProactiveBreakerCard";
 import { SpendCeilingCard } from "./SpendCeilingCard";
 
 type Settings = NonNullable<
@@ -25,6 +32,20 @@ type Settings = NonNullable<
 // hooks because they save separately: a refusal about one must not mark the other's picker.
 const EMBEDDING_FIELDS = ["embedding.credentialRef"] as const;
 const LANGFUSE_FIELDS = ["langfuse.credentialRef"] as const;
+
+// The share of turns traced, as the operator types it: a percentage. Empty follows the deployment.
+const SAMPLE_PERCENT_RANGE = numberRange(0, 100);
+
+// Twelve significant digits drop the binary noise of the scaling (0.07 * 100 is 7.000000000000001)
+// and keep every rate the API accepts, however small, from rounding to 0.
+function percentOf(rate: number): string {
+  return String(Number((rate * 100).toPrecision(12)));
+}
+
+function rateOf(percent: string): number | null {
+  if (percent.trim() === "") return null;
+  return Number((Number(percent) / 100).toPrecision(12));
+}
 
 // Pinned server-side (see updateEmbeddingSettings); shown read-only until flexible embeddings ship.
 const EMBEDDING_MODEL = "text-embedding-3-small";
@@ -53,9 +74,9 @@ export function AdvancedPanel() {
   const [lfCredentialRef, setLfCredentialRef] = useState<string | null>(null);
   const [lfSendContent, setLfSendContent] = useState(false);
   const [lfDebug, setLfDebug] = useState(false);
+  const [lfSamplePercent, setLfSamplePercent] = useState("");
+  const [lfDefaultPercent, setLfDefaultPercent] = useState("100");
   const [lfSaving, setLfSaving] = useState(false);
-  // Counts the Langfuse saves, so the spend ceiling card re-reads its flag on each.
-  const [lfVersion, setLfVersion] = useState(0);
   const lfRefusal = useFieldRefusal(LANGFUSE_FIELDS);
   const lfRefRef = useRef(lfCredentialRef);
   lfRefRef.current = lfCredentialRef;
@@ -73,6 +94,10 @@ export function AdvancedPanel() {
     setLfCredentialRef(s.langfuse.credentialRef);
     setLfSendContent(s.langfuse.sendContent);
     setLfDebug(s.langfuse.debug);
+    setLfSamplePercent(
+      s.langfuse.sampleRate === null ? "" : percentOf(s.langfuse.sampleRate),
+    );
+    setLfDefaultPercent(percentOf(s.langfuse.defaultSampleRate));
     setSpendCeiling(s.spendCeiling);
     setPriceOverrides(s.priceOverrides);
   }, []);
@@ -94,6 +119,17 @@ export function AdvancedPanel() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // A link that names a card (`?section=proactive-breaker`, which the breaker's alert and banner use)
+  // lands on it once the page has drawn.
+  const [searchParams] = useSearchParams();
+  const section = searchParams.get("section");
+  useEffect(() => {
+    if (loading || !section) return;
+    document
+      .getElementById(section)
+      ?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [loading, section]);
 
   async function saveEmbedding() {
     setEmbSaving(true);
@@ -131,11 +167,11 @@ export function AdvancedPanel() {
         credentialRef: lfCredentialRef,
         sendContent: lfSendContent,
         debug: lfDebug,
+        sampleRate: rateOf(lfSamplePercent),
       });
       if (err || !data) throw err ?? new Error("no data");
       lfRefusal.clear();
       setLfCredentialRef(data.langfuse.credentialRef);
-      setLfVersion((v) => v + 1);
       showToast(
         t("advanced.observability.saved", "Observability settings saved."),
         "success",
@@ -156,197 +192,266 @@ export function AdvancedPanel() {
     }
   }
 
+  // The left-rail index of the Behavior tab, one entry per card in the order they are drawn. The two
+  // cards that render their own Card are anchored by a wrapper.
+  const sections = [
+    {
+      id: "spend-ceiling",
+      icon: Gauge,
+      label: t("spendCeiling.title", "Spend ceiling"),
+    },
+    {
+      id: "proactive-breaker",
+      icon: ShieldAlert,
+      label: t("proactiveBreaker.title", "Proactive message breaker"),
+    },
+    {
+      id: "model-prices",
+      icon: Tags,
+      label: t("priceOverrides.title", "Model prices"),
+    },
+    {
+      id: "embedding",
+      icon: Binary,
+      label: t("advanced.embedding.title", "Embedding"),
+    },
+    {
+      id: "observability",
+      icon: ScrollText,
+      label: t("advanced.observability.title", "Observability (Langfuse)"),
+    },
+  ];
+
   return (
     <DataBoundary loading={loading} error={error} onRetry={load}>
-      <div className="flex flex-col gap-4">
-        {spendCeiling && (
-          <SpendCeilingCard
-            value={spendCeiling}
-            onSaved={setSpendCeiling}
-            reloadKey={lfVersion}
-          />
-        )}
-        {priceOverrides && (
-          <PriceOverridesCard
-            value={priceOverrides}
-            onSaved={setPriceOverrides}
-          />
-        )}
-        <Card className="flex flex-col gap-4">
-          <div>
-            <h2 className="font-medium text-text-primary">
-              {t("advanced.embedding.title", "Embedding")}
-            </h2>
-            <p className="mt-0.5 text-sm text-text-muted">
-              {t(
-                "advanced.embedding.desc",
-                "Provider and credential used to vectorize and search your knowledge bases.",
-              )}
-            </p>
-          </div>
-          <div className="flex items-center justify-between gap-3 rounded-lg border border-border px-3 py-2">
-            <div className="flex min-w-0 items-center gap-2.5">
-              <ServiceLogo
-                service="openai"
-                className="h-5 w-5 shrink-0 text-text-secondary"
+      <div className="flex gap-6">
+        <SectionNav sections={sections} />
+        <div className="flex min-w-0 grow flex-col gap-4">
+          {spendCeiling && (
+            <div id="spend-ceiling" className="scroll-mt-4">
+              <SpendCeilingCard
+                value={spendCeiling}
+                onSaved={setSpendCeiling}
               />
-              <div className="min-w-0">
-                <p className="font-medium text-sm text-text-primary">
-                  {t("vault.secretType.openai", "OpenAI")}
-                </p>
-                <p className="truncate text-text-muted text-xs">
-                  {EMBEDDING_MODEL}
-                </p>
-              </div>
             </div>
-            <span className="shrink-0 rounded-full bg-bg-tertiary px-2 py-0.5 text-text-muted text-xs">
-              {t(
-                "advanced.embedding.comingSoon",
-                "More embedding providers and models coming soon.",
-              )}
-            </span>
+          )}
+          <div id="proactive-breaker" className="scroll-mt-4">
+            <ProactiveBreakerCard />
           </div>
-          <div className="flex flex-col gap-1.5">
-            <span className="font-medium text-sm text-text-secondary">
-              {t("advanced.embedding.credential", "Credential")}
-            </span>
-            <div className="flex items-start gap-2">
-              <div className="flex-1">
-                <CredentialPicker
-                  value={embCredential}
-                  onChange={setEmbCredential}
-                  compatibleTypes={["openai"]}
-                  ariaLabel={t("advanced.embedding.credential", "Credential")}
-                />
-                {embRefusal.at(
-                  "embedding.credentialRef",
-                  embCredential || null,
-                ) && (
-                  <p className="mt-1 text-error text-xs">
-                    {embRefusal.at(
-                      "embedding.credentialRef",
-                      embCredential || null,
-                    )}
-                  </p>
-                )}
-              </div>
-              <Button size="sm" onClick={saveEmbedding} loading={embSaving}>
-                {t("common.save", "Save")}
-              </Button>
+          {priceOverrides && (
+            <div id="model-prices" className="scroll-mt-4">
+              <PriceOverridesCard
+                value={priceOverrides}
+                onSaved={setPriceOverrides}
+              />
             </div>
-          </div>
-        </Card>
-
-        <Card className="flex flex-col gap-4">
-          <div>
-            <h2 className="font-medium text-text-primary">
-              {t("advanced.observability.title", "Observability (Langfuse)")}
-            </h2>
-            <p className="mt-0.5 text-sm text-text-muted">
-              {t(
-                "advanced.observability.desc",
-                "Send agent traces to Langfuse. Content is redacted unless you opt in.",
-              )}
-            </p>
-          </div>
-          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-            <label
-              htmlFor={tracingId}
-              data-clickable="true"
-              className="font-medium text-sm text-text-primary"
-            >
-              {t("advanced.observability.enabled", "Enable tracing")}
-            </label>
-            <Switch
-              id={tracingId}
-              checked={lfEnabled}
-              onCheckedChange={setLfEnabled}
-            />
-          </div>
-          <FormField
-            label={t(
-              "advanced.observability.credential",
-              "Langfuse credential",
-            )}
-            group
-            description={t(
-              "advanced.observability.credentialHint",
-              "Public key, secret key and host are stored in the credential. Use the Vault tab to create or update it.",
-            )}
-            error={lfRefusal.at("langfuse.credentialRef", lfCredentialRef)}
-          >
-            <CredentialPicker
-              value={lfCredentialRef ?? ""}
-              onChange={(v) => setLfCredentialRef(v || null)}
-              compatibleTypes={["langfuse"]}
-              allowNone
-              ariaLabel={t(
-                "advanced.observability.credential",
-                "Langfuse credential",
-              )}
-            />
-          </FormField>
-          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-            <div className="flex items-center gap-1.5 pr-4">
-              <label
-                htmlFor={sendContentId}
-                data-clickable="true"
-                className="text-sm text-text-secondary"
-              >
+          )}
+          <Card id="embedding" className="flex scroll-mt-4 flex-col gap-4">
+            <div>
+              <h2 className="text-text-primary font-medium">
+                {t("advanced.embedding.title", "Embedding")}
+              </h2>
+              <p className="text-text-muted mt-0.5 text-sm">
                 {t(
-                  "advanced.observability.sendContent",
-                  "Send conversation content",
+                  "advanced.embedding.desc",
+                  "Provider and credential used to vectorize and search your knowledge bases.",
                 )}
-              </label>
-              <HelpPopover
-                content={t(
-                  "advanced.observability.sendContentHelp",
-                  "This option controls whether message text is included in the Logs sent to Langfuse.\n\nWhen on, Langfuse receives the full conversation content.\n\nWhen off, the text is hidden before sending. Logs still show conversation structure, tool use, response times, processed volume, and costs.",
-                )}
-                label={t(
-                  "advanced.observability.sendContent",
-                  "Send conversation content",
-                )}
-              />
+              </p>
             </div>
-            <Switch
-              id={sendContentId}
-              checked={lfSendContent}
-              onCheckedChange={setLfSendContent}
-            />
-          </div>
-          <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-            <div className="flex items-center gap-1.5 pr-4">
-              <label
-                htmlFor={debugId}
-                data-clickable="true"
-                className="text-sm text-text-secondary"
+            <div className="border-border flex items-center justify-between gap-3 rounded-lg border px-3 py-2">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <ServiceLogo
+                  service="openai"
+                  className="text-text-secondary h-5 w-5 shrink-0"
+                />
+                <div className="min-w-0">
+                  <p className="text-text-primary text-sm font-medium">
+                    {t("vault.secretType.openai", "OpenAI")}
+                  </p>
+                  <p className="text-text-muted truncate text-xs">
+                    {EMBEDDING_MODEL}
+                  </p>
+                </div>
+              </div>
+              <span className="bg-bg-tertiary text-text-muted shrink-0 rounded-full px-2 py-0.5 text-xs">
+                {t(
+                  "advanced.embedding.comingSoon",
+                  "More embedding providers and models coming soon.",
+                )}
+              </span>
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <span className="text-text-secondary text-sm font-medium">
+                {t("advanced.embedding.credential", "Credential")}
+              </span>
+              <div className="flex items-start gap-2">
+                <div className="flex-1">
+                  <CredentialPicker
+                    value={embCredential}
+                    onChange={setEmbCredential}
+                    compatibleTypes={["openai"]}
+                    ariaLabel={t("advanced.embedding.credential", "Credential")}
+                  />
+                  {embRefusal.at(
+                    "embedding.credentialRef",
+                    embCredential || null,
+                  ) && (
+                    <p className="text-error mt-1 text-xs">
+                      {embRefusal.at(
+                        "embedding.credentialRef",
+                        embCredential || null,
+                      )}
+                    </p>
+                  )}
+                </div>
+                <Button size="sm" onClick={saveEmbedding} loading={embSaving}>
+                  {t("common.save", "Save")}
+                </Button>
+              </div>
+            </div>
+          </Card>
+
+          <RangeHolds>
+            <Card
+              id="observability"
+              className="flex scroll-mt-4 flex-col gap-4"
+            >
+              <div>
+                <h2 className="text-text-primary font-medium">
+                  {t(
+                    "advanced.observability.title",
+                    "Observability (Langfuse)",
+                  )}
+                </h2>
+                <p className="text-text-muted mt-0.5 text-sm">
+                  {t(
+                    "advanced.observability.desc",
+                    "Send agent traces to Langfuse. Content is redacted unless you opt in.",
+                  )}
+                </p>
+              </div>
+              <div className="border-border flex items-center justify-between rounded-lg border px-3 py-2">
+                <label
+                  htmlFor={tracingId}
+                  data-clickable="true"
+                  className="text-text-primary text-sm font-medium"
+                >
+                  {t("advanced.observability.enabled", "Enable tracing")}
+                </label>
+                <Switch
+                  id={tracingId}
+                  checked={lfEnabled}
+                  onCheckedChange={setLfEnabled}
+                />
+              </div>
+              <FormField
+                label={t(
+                  "advanced.observability.credential",
+                  "Langfuse credential",
+                )}
+                group
+                description={t(
+                  "advanced.observability.credentialHint",
+                  "Public key, secret key and host are stored in the credential. Use the Vault tab to create or update it.",
+                )}
+                error={lfRefusal.at("langfuse.credentialRef", lfCredentialRef)}
               >
-                {t("advanced.observability.debug", "Debug mode (tool schemas)")}
-              </label>
-              <HelpPopover
-                content={t(
-                  "advanced.observability.debugHelp",
-                  "This mode includes the full definition of every available tool in Logs.\n\nUse it to check which tools the agent received and how they were described.\n\nTool names already appear when this mode is off. Full definitions increase Langfuse data volume, so turn it off after debugging.",
-                )}
+                <CredentialPicker
+                  value={lfCredentialRef ?? ""}
+                  onChange={(v) => setLfCredentialRef(v || null)}
+                  compatibleTypes={["langfuse"]}
+                  allowNone
+                  ariaLabel={t(
+                    "advanced.observability.credential",
+                    "Langfuse credential",
+                  )}
+                />
+              </FormField>
+              <div className="border-border flex items-center justify-between rounded-lg border px-3 py-2">
+                <div className="flex items-center gap-1.5 pr-4">
+                  <label
+                    htmlFor={sendContentId}
+                    data-clickable="true"
+                    className="text-text-secondary text-sm"
+                  >
+                    {t(
+                      "advanced.observability.sendContent",
+                      "Send conversation content",
+                    )}
+                  </label>
+                  <HelpPopover
+                    content={t(
+                      "advanced.observability.sendContentHelp",
+                      "This option controls whether message text is included in the Logs sent to Langfuse.\n\nWhen on, Langfuse receives the full conversation content.\n\nWhen off, the text is hidden before sending. Logs still show conversation structure, tool use, response times, processed volume, and costs.",
+                    )}
+                    label={t(
+                      "advanced.observability.sendContent",
+                      "Send conversation content",
+                    )}
+                  />
+                </div>
+                <Switch
+                  id={sendContentId}
+                  checked={lfSendContent}
+                  onCheckedChange={setLfSendContent}
+                />
+              </div>
+              <div className="border-border flex items-center justify-between rounded-lg border px-3 py-2">
+                <div className="flex items-center gap-1.5 pr-4">
+                  <label
+                    htmlFor={debugId}
+                    data-clickable="true"
+                    className="text-text-secondary text-sm"
+                  >
+                    {t(
+                      "advanced.observability.debug",
+                      "Debug mode (tool schemas)",
+                    )}
+                  </label>
+                  <HelpPopover
+                    content={t(
+                      "advanced.observability.debugHelp",
+                      "This mode includes the full definition of every available tool in Logs.\n\nUse it to check which tools the agent received and how they were described.\n\nTool names already appear when this mode is off. Full definitions increase Langfuse data volume, so turn it off after debugging.",
+                    )}
+                    label={t(
+                      "advanced.observability.debug",
+                      "Debug mode (tool schemas)",
+                    )}
+                  />
+                </div>
+                <Switch
+                  id={debugId}
+                  checked={lfDebug}
+                  onCheckedChange={setLfDebug}
+                />
+              </div>
+              <FormField
                 label={t(
-                  "advanced.observability.debug",
-                  "Debug mode (tool schemas)",
+                  "advanced.observability.sampleRate",
+                  "Share of turns traced (%)",
                 )}
-              />
-            </div>
-            <Switch
-              id={debugId}
-              checked={lfDebug}
-              onCheckedChange={setLfDebug}
-            />
-          </div>
-          <div className="flex justify-end">
-            <Button onClick={saveLangfuse} loading={lfSaving}>
-              {t("common.save", "Save")}
-            </Button>
-          </div>
-        </Card>
+                description={t(
+                  "advanced.observability.sampleRateHint",
+                  "Each turn is traced whole or not at all, and a turn left out cannot be found in Langfuse. Leave it empty to follow this deployment's default ({{percent}}%).",
+                  { percent: lfDefaultPercent },
+                )}
+              >
+                <NumberInput
+                  range={SAMPLE_PERCENT_RANGE}
+                  optional
+                  value={lfSamplePercent}
+                  placeholder={lfDefaultPercent}
+                  onChange={(e) => setLfSamplePercent(e.target.value)}
+                />
+              </FormField>
+              <div className="flex justify-end">
+                <Button onClick={saveLangfuse} loading={lfSaving} holdOnRange>
+                  {t("common.save", "Save")}
+                </Button>
+              </div>
+            </Card>
+          </RangeHolds>
+        </div>
       </div>
     </DataBoundary>
   );

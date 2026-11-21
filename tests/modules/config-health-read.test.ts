@@ -10,6 +10,7 @@ import {
   configHealthAfterWrite,
   readAgentConfigHealth,
 } from "@/modules/agents/config-health-read";
+import { listKnowledgeBasesNeedingIndex } from "@/modules/agents/service";
 import {
   AGENT_EXPORT_KIND,
   AGENT_EXPORT_VERSION,
@@ -25,20 +26,15 @@ import {
   agentToolsSet,
   agentUpdate,
 } from "@/modules/mcp/write-agents";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The same warnings the console's editor panel computes, asked for by something that is not a
-// browser. Issue #467.
-//
-// The state under test is the one the issue reports and the one this product actually produces: an
-// onboarding driven through MCP wires a credential whose secret was never filled (credential_create
-// leaves exactly that), and switches guardrails on. Both are silent at runtime — the pending
-// credential fails at first use, and the guardrail block is skipped entirely, so every message goes
-// out unscreened while the switch reads "on" — and until this module existed neither was COMPUTED
-// anywhere off the editor page.
-//
-// The seed builds those states through the vault the way the product does (a `pending` row, and a
-// live entry to prove the reading distinguishes them), then asks the three surfaces this change
-// adds: the module, the MCP read tool, and what a write reports back about what it just left behind.
+// browser. The state under test is the one an onboarding driven through MCP produces: a credential
+// whose secret was never filled (`credential_create` leaves exactly that) and guardrails switched on.
+// Both are silent at runtime: the pending credential fails at first use, and the guardrail block is
+// skipped, so every message goes out unscreened while the switch reads "on". The seed builds those
+// states through the vault the way the product does (a `pending` row, plus a live entry to prove the
+// reading tells them apart), then asks the module, the MCP read tool, and a write's own report.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -56,8 +52,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -104,7 +100,7 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       })
     ).id;
     // A reference-only entry: `credential_create` over MCP writes exactly this, and the operator is
-    // supposed to fill the secret afterwards. Nothing on the MCP path ever said they had not.
+    // supposed to fill the secret afterwards; nothing else on the MCP path says it is still pending.
     const pending = await suDb.vaultEntry.create({
       data: {
         tenantId,
@@ -475,13 +471,12 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       expect(embedding?.unresolved).toBeUndefined();
     });
 
-    // The line `healthy` draws, tested from the side that makes it dangerous: a reading with nothing
-    // to report on an agent that answers nobody. The credential check cannot raise this — it asks
-    // whether a CONFIGURED provider has a key, and there is no provider to ask about.
-    // The scope the focused query has to keep: the grant is per AGENT and the count is per BASE, so
-    // a base with unindexed documents that this agent was never granted must not appear. The old
-    // path got this by filtering a tenant-wide list; the new one filters in the query, which is the
-    // half a refactor gets wrong.
+    // NOTE: The line `healthy` draws, tested from the side that makes it dangerous: a reading with nothing
+    // to report on an agent that answers nobody. The credential check cannot raise this: it asks whether
+    // a CONFIGURED provider has a key, and there is no provider to ask about.
+    // The scope the focused query has to keep: the grant is per AGENT and the count is per BASE, so a
+    // base with unindexed documents this agent was never granted must not appear. The query filters it,
+    // not a tenant-wide list, and that filter is the half a refactor gets wrong.
     test("a knowledge base this agent was not granted stays out", async () => {
       const stranger = await suDb.knowledgeBase.create({
         data: { tenantId, name: "Não concedida" },
@@ -497,18 +492,15 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
           status: "UNINDEXED",
         },
       });
-      const health = await readAgentConfigHealth(ctx(tenantId), ragAgent, {
-        base: appDb,
-        live: false,
-      });
-      // Still exactly one rollup, and it is the granted base's — a leak would raise a second issue
-      // or name the wrong base.
-      expect(health.issues.filter((i) => i.key === "embedding")).toHaveLength(
-        1,
+      // The focused query the reading takes its bases from: only the granted one, by name. The rollup
+      // into one embedding issue would hide a leak from the reading's own answer.
+      const needing = await listKnowledgeBasesNeedingIndex(
+        ctx(tenantId),
+        ragAgent,
+        appDb,
       );
-      expect(
-        health.issues.some((i) => i.knowledgeBaseName === "Não concedida"),
-      ).toBe(false);
+      expect(needing.map((b) => b.name)).toEqual(["Catálogo"]);
+      expect(needing.map((b) => b.id)).not.toContain(String(stranger.id));
     });
 
     // AN EXPORT CARRYING TWO RAG GRANTS. The export vocabulary does not forbid it, and the table
@@ -576,7 +568,7 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       const unset = health.issues.find((i) => i.key === "modelNotRunnable");
       expect(unset?.severity).toBe("blocking");
       // The sentence a caller acts on, not just the key.
-      expect(unset?.message).toContain("cannot be built");
+      expect(unset?.message).toContain("Choose a provider, a model");
       expect(health.healthy).toBe(false);
     });
 
@@ -593,14 +585,12 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       );
     });
 
-    // The reading runs on EVERY agent write now, so what it touches is part of its contract. The
+    // NOTE: The reading runs on EVERY agent write, so what it touches is part of its contract. The
     // editor's `getAgentToolSelections` answers the same question by loading the tenant's whole tool
-    // catalog — every tool definition, MCP connection, integration instance and document-template
-    // body — which is right for a page that draws all of it and wrong for a write path.
-    //
-    // Asserted by counting the models the read actually queries, because the alternative is a
-    // sentence in a comment that nothing checks: a later refactor reaching for the convenient helper
-    // would put the tenant-wide work back with every test still green.
+    // catalog (tool definitions, MCP connections, integration instances, document-template bodies):
+    // right for a page that draws all of it, wrong for a write path. Asserted by counting the models the
+    // read queries, because a refactor reaching for the convenient helper would put the tenant-wide work
+    // back with every other test still green.
     test("it does not load the tenant's whole tool catalog", async () => {
       const touched = new Set<string>();
       const counted = appDb.$extends({
@@ -676,8 +666,7 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
     });
   });
 
-  // The transport the issue is actually about: an install done entirely through MCP, with the
-  // console never opened.
+  // NOTE: An install done entirely through MCP, with the console never opened.
   describe("agent_config_health (MCP)", () => {
     test("the tool returns the same list the editor would have shown", async () => {
       const r = await agentConfigHealth(
@@ -696,25 +685,29 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       expect(health.issues.every((i) => i.message.length > 0)).toBe(true);
     });
 
-    // THE DOCUMENTED SHAPE IS PART OF THE TOOL, and it is read by something that cannot check it
-    // against the code: a model calls the tool, reads the description, and goes looking for the
-    // fields it named. Round 3 of review found the description promising a flat payload while the
-    // tool returned `{ health: … }`, and the same round found the REST route's OpenAPI text naming a
-    // field that had been renamed — one class, two surfaces, neither visible to any other test.
-    //
-    // So this compares the TEXT against the answer actually produced, rather than against a second
-    // list of field names that would drift the same way.
+    // NOTE: THE DOCUMENTED SHAPE IS PART OF THE TOOL: a model reads the description and goes looking for
+    // the fields it names, and nothing else checks that text against the code. So this compares the TEXT
+    // against the answer actually produced, rather than against a second list of field names that would
+    // drift the same way.
     test("the tool's own description names the shape it returns", async () => {
-      const source = await Bun.file(
-        new URL("../../src/modules/mcp/server.ts", import.meta.url),
-      ).text();
-      const start = source.indexOf('"agent_config_health"');
-      expect(start).toBeGreaterThan(0);
-      // The registration block, up to the handler: description plus input schema.
-      const description = source.slice(start, start + 2000);
+      // The description as a client is handed it, from tools/list.
+      const server = buildMcpServer(principal(tenantId));
+      const [clientT, serverT] = InMemoryTransport.createLinkedPair();
+      await server.connect(serverT);
+      const client = new Client({ name: "config-health-shape", version: "0" });
+      await client.connect(clientT);
+      let description = "";
+      try {
+        description =
+          (await client.listTools()).tools.find(
+            (t) => t.name === "agent_config_health",
+          )?.description ?? "";
+      } finally {
+        await client.close();
+      }
       // A SET COMPARISON against the documented shape line, not "is each field mentioned somewhere":
-      // the description names these fields more than once, so a presence check passes with one
-      // occurrence wrong — measured on the REST twin of this fence, which is how it was written.
+      // the description names these fields more than once, so a presence check passes with one occurrence
+      // wrong.
       const shape = description.match(/Returns `\{ health: \{([^}]*)\}/);
       expect(shape).not.toBeNull();
       const documented = (shape?.[1] ?? "")
@@ -729,7 +722,7 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       );
       expect(r.ok).toBe(true);
       if (!r.ok) return;
-      // The wrapper itself, which is what round 3 found undocumented.
+      // NOTE: The `{ health: … }` wrapper itself is part of the documented shape.
       expect(Object.keys(r.data)).toEqual(["health"]);
       expect(description).toContain("{ health:");
       const health = r.data.health as Record<string, unknown>;
@@ -812,10 +805,10 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       expect(health.unchecked).toContain("chatwootOutOfOffice");
     });
 
-    // The write has already COMMITTED by the time this runs, so a rejection here would replace a
-    // successful apply with an error — and the client reading that error retries, duplicating a
-    // create, a clone or an import. Driven through the failure the reviewer named (an agent read
-    // that rejects), which is what an id nobody can resolve produces.
+    // NOTE: The write has already COMMITTED by the time this runs, so a rejection here would replace a
+    // successful apply with an error, and a client reading that error retries, duplicating a create, a
+    // clone or an import. Driven through an agent read that rejects, which is what an id nobody can
+    // resolve produces.
     test("a health read that fails does not turn a successful write into an error", async () => {
       const after = await configHealthAfterWrite(
         ctx(tenantId),
@@ -919,6 +912,66 @@ describe.skipIf(!dbUp)("agent configuration health", () => {
       expect(
         after.configHealth.issues.some((i) => i.severity === "advisory"),
       ).toBe(false);
+    });
+
+    // The endpoint warnings follow the endpoint STAGE: a rule alone never asks it, a rule with the
+    // endpoint after it does, and then a missing URL refuses everything the rule lets through.
+    test("a rule with the endpoint after it and no URL is reported; the rule alone is not", async () => {
+      const noUrlAfter = async (askEndpointAfterRule: boolean) => {
+        const r = await agentSettingsSet(
+          principal(tenantId),
+          {
+            agent_id: String(healthyAgent),
+            contactAuth: {
+              enabled: true,
+              rule: { kind: "label", label: "suporte" },
+              askEndpointAfterRule,
+              url: null,
+            },
+            dry_run: false,
+          },
+          { base: appDb },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return null;
+        const health = r.data.configHealth as { issues: { key: string }[] };
+        return health.issues.some((i) => i.key === "contactAuthNoUrl");
+      };
+      expect(await noUrlAfter(true)).toBe(true);
+      expect(await noUrlAfter(false)).toBe(false);
+    });
+
+    // A monitoring agent runs only the rule, before it arms an observation: no endpoint is asked, so
+    // an endpoint-only gate with no URL is not a gate that refuses everything there.
+    test("a monitoring agent's endpoint-only gate with no URL is reported, since it asks the endpoint too", async () => {
+      const noUrlOn = async (mode: "monitoring" | "production") => {
+        await suDb.agent.update({
+          where: { id: healthyAgent },
+          data: { mode },
+        });
+        const r = await agentSettingsSet(
+          principal(tenantId),
+          {
+            agent_id: String(healthyAgent),
+            contactAuth: { enabled: true, rule: null, url: null },
+            dry_run: false,
+          },
+          { base: appDb },
+        );
+        expect(r.ok).toBe(true);
+        if (!r.ok) return null;
+        const health = r.data.configHealth as { issues: { key: string }[] };
+        return health.issues.some((i) => i.key === "contactAuthNoUrl");
+      };
+      try {
+        expect(await noUrlOn("monitoring")).toBe(true);
+        expect(await noUrlOn("production")).toBe(true);
+      } finally {
+        await suDb.agent.update({
+          where: { id: healthyAgent },
+          data: { mode: "production" },
+        });
+      }
     });
   });
 });

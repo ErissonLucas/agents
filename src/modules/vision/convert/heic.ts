@@ -1,21 +1,13 @@
-// OWNERSHIP OF THE DECODER, ours rather than the library's, and the reason is licensing before it is
-// anything else. libheif is LGPL-3.0 and this product is proprietary, so §4(d)(1) of that licence
-// asks for "a suitable shared library mechanism" — one that "will operate properly with a modified
-// version of the Library that is interface-compatible". The `heic-decode` wrapper reaches libheif
-// through `libheif-js/wasm-bundle`, which base64's the binary INSIDE a 1.9 MB JavaScript file:
-// nothing an operator can replace without rebuilding. Here the binary is the 1.4 MB `libheif.wasm`
-// on disk, loaded by path, and the path is overridable — so swapping libheif is copying a file.
-//
-// The same change happens to answer two engineering findings from the review of #697: we now release
-// the decoder on the failure paths the library never returned a handle for, and the WASM is loaded
-// lazily instead of at import time.
-//
-// Byte-identity with the previous path was measured before the swap: the same fixture through
-// `heic-decode` and through this module returns 15,360,000 bytes of RGBA with zero differences.
+// We own the libheif decoder rather than going through `heic-decode`, for licensing first: libheif
+// is LGPL-3.0, and §4(d)(1) asks for a mechanism that works with a modified, interface-compatible
+// library. The wrapper embeds the binary base64'd in a JS file; here it is `libheif.wasm` on disk,
+// loaded lazily by an overridable path, so swapping libheif is copying a file. Owning it also lets
+// us release the decoder on every failure path.
 
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { FitAccumulator, type Rgba } from "./raster";
 
 export type HeicFrame = {
   readonly width: number;
@@ -46,7 +38,76 @@ type HeifImage = {
   ): void;
 };
 
-type LibHeif = {
+// The C API underneath the embind wrapper, which is where libheif's grid calls live: the wrapper
+// exposes whole-image decoding only. Every `heif_error` comes back through a pointer passed first
+// (the wasm32 ABI for a returned struct), and every pointer is an offset into `HEAPU8`.
+type LibHeifC = {
+  HEAPU8: Uint8Array;
+  HEAP32: Int32Array;
+  HEAPU32: Uint32Array;
+  _malloc(size: number): number;
+  _free(ptr: number): void;
+  _heif_context_alloc(): number;
+  _heif_context_free(ctx: number): void;
+  _heif_context_read_from_memory_without_copy(
+    err: number,
+    ctx: number,
+    data: number,
+    size: number,
+    options: number,
+  ): void;
+  _heif_context_get_primary_image_handle(
+    err: number,
+    ctx: number,
+    out: number,
+  ): void;
+  _heif_context_get_image_handle(
+    err: number,
+    ctx: number,
+    id: number,
+    out: number,
+  ): void;
+  _heif_image_handle_get_ispe_width(handle: number): number;
+  _heif_image_handle_get_ispe_height(handle: number): number;
+  _heif_image_handle_release(handle: number): void;
+  _heif_image_handle_get_width(handle: number): number;
+  _heif_image_handle_get_height(handle: number): number;
+  _heif_image_handle_has_alpha_channel(handle: number): number;
+  _heif_image_handle_get_image_tiling(
+    err: number,
+    handle: number,
+    processTransformations: number,
+    out: number,
+  ): void;
+  _heif_image_handle_decode_image_tile(
+    err: number,
+    handle: number,
+    out: number,
+    colorspace: number,
+    chroma: number,
+    options: number,
+    tileX: number,
+    tileY: number,
+  ): void;
+  _heif_image_handle_get_grid_image_tile_id(
+    err: number,
+    handle: number,
+    processTransformations: number,
+    tileX: number,
+    tileY: number,
+    out: number,
+  ): void;
+  _heif_image_release(image: number): void;
+  _heif_image_get_primary_width(image: number): number;
+  _heif_image_get_primary_height(image: number): number;
+  _heif_image_get_plane_readonly2(
+    image: number,
+    channel: number,
+    outStride: number,
+  ): number;
+};
+
+type LibHeif = LibHeifC & {
   ready: Promise<unknown>;
   HeifDecoder: new () => {
     decode(bytes: Uint8Array): HeifImage[];
@@ -67,6 +128,12 @@ export function libheifWasmPath(): string {
     "libheif-js/libheif-wasm/libheif.js",
   );
   return join(dirname(entry), "libheif.wasm");
+}
+
+// The whole environment a conversion process gets: where the library lives, resolved here and now so
+// an override set after boot holds there too, and nothing else, so no secret of the app's reaches it.
+export function libheifChildEnv(): Record<string, string> {
+  return { [LIBHEIF_WASM_PATH_ENV]: libheifWasmPath() };
 }
 
 // LAZY, and cached across calls. The binary is 1.4 MB and instantiating it costs real milliseconds,
@@ -102,33 +169,12 @@ export function __resetLibheifForTest(): void {
   loading = null;
 }
 
-// EVERYTHING IS RELEASED, on every path out, because all of it is ours from the moment it is built.
-// This is what `heic-decode` could not offer: it constructs the decoder and only then decides whether
-// to hand the caller anything to release, so a file that parses to zero images strands the context
-// with no handle left to free it (measured at 6.5 KB per malformed file; PR #707 review round 2).
-//
-// TWO RELEASES, and neither covers the other. Measured against libheif's own allocator (the boundary
-// a `malloc(1)` probe returns) and against the wasm heap's size:
-//
-//   the context, `decoder.delete()`   the embind destructor bound to `heif_context_free`. Calling it
-//                                     AND `heif_context_free` throws "Cannot pass deleted object as
-//                                     a pointer". Over 500 malformed files, no release drifts the
-//                                     heap 400 KB and this one holds it flat at 440 bytes, which is
-//                                     one allocator step and not per-file.
-//   each image, `image.free()`        `heif_image_handle_release`. Freeing the context does NOT do
-//                                     it: a single extra conversion of the 2400x1600 fixture grows
-//                                     the wasm heap 4.5 MB without it, and 0 with it, measured at
-//                                     every count from 1 to 100 (PR #707 review round 5).
-//
-// The parse-only path hides the second one completely — 100 parse-and-delete cycles drift nothing,
-// with or without the free — because what the handle retains is the DECODED image. So is RSS, in
-// both directions: the 15 MB RGBA buffer each conversion hands back dominates it, and a run that
-// releases everything can report MORE resident memory than one that leaks, purely on GC timing.
-//
-// The `lib` parameter is for the battery, and it is the only way to ask the question that matters
-// here: a release is invisible from outside, and the symptom it prevents (the heap growing in 4 MB
-// steps every ~70 conversions) needs a minute of decoding to show. Standing in for the library turns
-// "is every handle released on every path out" into an assertion instead of a measurement.
+// Everything is released on every path out, including a file that parses to zero images. Two
+// releases, and neither covers the other: the context via `decoder.delete()` (the embind destructor
+// for `heif_context_free`; calling both throws), and each image via `image.free()`
+// (`heif_image_handle_release`), which freeing the context does NOT do and which holds the DECODED
+// image. The leak is invisible from outside (RSS is dominated by the returned RGBA and GC timing), so
+// `lib` lets a test stand in for the library and assert every handle is released.
 export async function withHeicFrames<T>(
   bytes: ArrayBuffer,
   use: (frames: readonly HeicFrame[]) => Promise<T>,
@@ -176,3 +222,285 @@ function displayImage(image: HeifImage): Promise<{
     );
   });
 }
+
+// libheif's enum values, from heif_image.h and heif_tiling.h in the version the binary is built from.
+const HEIF_COLORSPACE_RGB = 1;
+const HEIF_CHROMA_INTERLEAVED_RGBA = 11;
+const HEIF_CHANNEL_INTERLEAVED = 10;
+// `struct heif_image_tiling` on wasm32: an int version, eight uint32 (columns, rows, tile width and
+// height, image width and height, top and left offset), a uint8 and eight more uint32 after padding.
+// The two offsets are not read: see `placement`.
+const TILING_STRUCT_BYTES = 72;
+
+export type GridDecode =
+  | { kind: "not-a-grid" }
+  | { kind: "tile-too-large"; tileWidth: number; tileHeight: number }
+  // A crop, or a transform whose padded side cannot be told apart: see `placement`.
+  | { kind: "unsupported"; reason: string }
+  | { kind: "decoded"; image: Rgba };
+
+// A GRID image decoded one tile at a time into `FitAccumulator`, so what is alive at once is one
+// decoded tile plus the output's sums, never the full image. Tiles are asked for in the TRANSFORMED
+// image (rotation and mirror applied), which is the picture the file shows and the one the
+// whole-image decode produces.
+// Returns `not-a-grid` for an image stored in one piece, since decoding its single "tile" is decoding
+// the whole image. Everything allocated is released on every path out.
+export async function decodeGridFitted(
+  bytes: ArrayBuffer,
+  opts: { maxEdge: number; maxTilePixels: number },
+  lib?: LibHeifC,
+): Promise<GridDecode> {
+  const c = lib ?? (await loadLibheif());
+  const err = c._malloc(12);
+  const out = c._malloc(4);
+  const tiling = c._malloc(TILING_STRUCT_BYTES);
+  const data = c._malloc(bytes.byteLength);
+  const ctx = c._heif_context_alloc();
+  let handle = 0;
+  const check = (what: string) => {
+    const code = c.HEAP32[err >> 2] as number;
+    if (code !== 0)
+      throw new Error(
+        `libheif ${what} failed (${code}/${c.HEAP32[(err >> 2) + 1]})`,
+      );
+  };
+  try {
+    c.HEAPU8.set(new Uint8Array(bytes), data);
+    c._heif_context_read_from_memory_without_copy(
+      err,
+      ctx,
+      data,
+      bytes.byteLength,
+      0,
+    );
+    check("read");
+    c._heif_context_get_primary_image_handle(err, ctx, out);
+    check("primary handle");
+    handle = c.HEAPU32[out >> 2] as number;
+    const readTiling = (transformed: number) => {
+      c.HEAPU8.fill(0, tiling, tiling + TILING_STRUCT_BYTES);
+      c._heif_image_handle_get_image_tiling(err, handle, transformed, tiling);
+      check("tiling");
+      const t = (i: number) => c.HEAPU32[(tiling >> 2) + i] as number;
+      return {
+        columns: t(1),
+        rows: t(2),
+        tileWidth: t(3),
+        tileHeight: t(4),
+        width: t(5),
+        height: t(6),
+      };
+    };
+    const stored = readTiling(0);
+    const shown = readTiling(1);
+    const { columns, rows, tileWidth, tileHeight } = shown;
+    if (columns * rows <= 1) return { kind: "not-a-grid" };
+    if (tileWidth * tileHeight > opts.maxTilePixels)
+      return { kind: "tile-too-large", tileWidth, tileHeight };
+    // A tile decode does not carry the alpha, which lives in an auxiliary image of its own: the
+    // transparent part comes back black and opaque, and a cutout would reach the model on black.
+    if (c._heif_image_handle_has_alpha_channel(handle) !== 0)
+      return { kind: "unsupported", reason: "a grid with alpha" };
+    const width = c._heif_image_handle_get_width(handle);
+    const height = c._heif_image_handle_get_height(handle);
+    // Tiles are decoded whole, padding included, so the work is what they cover and not the image:
+    // a thin grid (150,000,000x1 in 512x512 tiles) decodes 512 times its pixels, time the cap on the
+    // image's pixels does not see. A photo's grid covers it plus at most one tile per axis.
+    if (columns * rows * tileWidth * tileHeight > 2 * width * height)
+      return {
+        kind: "unsupported",
+        reason: "a grid whose tiles cover more than twice the image",
+      };
+    const tileId = (transformed: number, x: number, y: number) => {
+      c._heif_image_handle_get_grid_image_tile_id(
+        err,
+        handle,
+        transformed,
+        x,
+        y,
+        out,
+      );
+      check(`tile id ${x},${y}`);
+      return c.HEAPU32[out >> 2] as number;
+    };
+    // The tiling reports ONE tile size, the first tile's, and libheif allocates each tile at the size
+    // that tile declares before it notices a mismatch. So every stored tile is opened and measured
+    // before any is decoded: one larger than declared would walk past the per-tile cap.
+    for (let y = 0; y < stored.rows; y++)
+      for (let x = 0; x < stored.columns; x++) {
+        c._heif_context_get_image_handle(err, ctx, tileId(0, x, y), out);
+        check(`tile handle ${x},${y}`);
+        const tile = c.HEAPU32[out >> 2] as number;
+        const w = Math.max(
+          c._heif_image_handle_get_width(tile),
+          c._heif_image_handle_get_ispe_width(tile),
+        );
+        const h = Math.max(
+          c._heif_image_handle_get_height(tile),
+          c._heif_image_handle_get_ispe_height(tile),
+        );
+        c._heif_image_handle_release(tile);
+        if (w > stored.tileWidth || h > stored.tileHeight)
+          return {
+            kind: "unsupported",
+            reason: "a grid with a tile larger than it declares",
+          };
+      }
+    const place = placement(stored, shown, width, height, tileId);
+    if (typeof place === "string")
+      return { kind: "unsupported", reason: place };
+    const { leftOffset, topOffset } = place;
+    const fit = new FitAccumulator(width, height, opts.maxEdge);
+    for (let ty = 0; ty < rows; ty++) {
+      for (let tx = 0; tx < columns; tx++) {
+        const piece = decodeTile(c, handle, err, out, tx, ty, check);
+        try {
+          const left = tx * tileWidth - leftOffset;
+          const top = ty * tileHeight - topOffset;
+          const clipped = clipTile(c, piece, left, top, width, height);
+          if (clipped === null) continue;
+          fit.add(clipped.rgba, clipped.left, clipped.top);
+        } finally {
+          c._heif_image_release(piece);
+        }
+      }
+    }
+    return { kind: "decoded", image: fit.result() };
+  } finally {
+    if (handle !== 0) c._heif_image_handle_release(handle);
+    c._heif_context_free(ctx);
+    for (const p of [err, out, tiling, data]) c._free(p);
+  }
+}
+
+type Tiling = {
+  columns: number;
+  rows: number;
+  tileWidth: number;
+  tileHeight: number;
+  width: number;
+  height: number;
+};
+
+// WHERE THE TOP-LEFT TILE SITS in the shown image. A grid's padding lies past the stored right and
+// bottom edges, and a rotation or mirror can move it to the left or top. libheif 1.23.2 reports that
+// offset wrong (276 for a 90-degree turn whose tiles start 236 px in), so it is derived from which
+// stored tile each shown tile is: per shown axis, the stored axis it runs along and whether it runs
+// backwards, which puts the stored end padding at the shown start. A crop is refused, since it moves
+// the picture by an amount this does not read, and so is a padded axis only one tile long, whose
+// direction no second tile tells.
+function placement(
+  stored: Tiling,
+  shown: Tiling,
+  width: number,
+  height: number,
+  tileId: (transformed: number, x: number, y: number) => number,
+): { leftOffset: number; topOffset: number } | string {
+  const where = new Map<number, [number, number]>();
+  for (let y = 0; y < stored.rows; y++)
+    for (let x = 0; x < stored.columns; x++) where.set(tileId(0, x, y), [x, y]);
+  const at = (x: number, y: number) => {
+    const p = where.get(tileId(1, x, y));
+    if (p === undefined)
+      throw new Error("libheif mapped a tile outside its grid");
+    return p;
+  };
+  const origin = at(0, 0);
+  // Whether the shown axes run along the stored ones or across them, read off a second tile: the
+  // sizes cannot say it for a square grid, where a 180-degree turn and a 90-degree one agree on them.
+  const swapped =
+    shown.columns > 1
+      ? (at(1, 0)[0] as number) === (origin[0] as number)
+      : (at(0, 1)[1] as number) === (origin[1] as number);
+  const [storedWidth, storedHeight] = swapped
+    ? [stored.height, stored.width]
+    : [stored.width, stored.height];
+  if (width !== storedWidth || height !== storedHeight) return "a cropped grid";
+  // Padding at the END of each stored axis, in pixels.
+  const pad = [
+    stored.columns * stored.tileWidth - stored.width,
+    stored.rows * stored.tileHeight - stored.height,
+  ];
+  // The shown axis runs along stored axis `swapped ? 1 - i : i`; which way is read off its second
+  // tile when it has one.
+  const offset = (axis: 0 | 1, count: number): number | string => {
+    const storedAxis = swapped ? 1 - axis : axis;
+    if ((pad[storedAxis] as number) === 0) return 0;
+    if (count < 2) return "a padded grid axis one tile long";
+    const next = axis === 0 ? at(1, 0) : at(0, 1);
+    const backwards =
+      (next[storedAxis] as number) < (origin[storedAxis] as number);
+    return backwards ? (pad[storedAxis] as number) : 0;
+  };
+  const leftOffset = offset(0, shown.columns);
+  const topOffset = offset(1, shown.rows);
+  if (typeof leftOffset === "string") return leftOffset;
+  if (typeof topOffset === "string") return topOffset;
+  return { leftOffset, topOffset };
+}
+
+function decodeTile(
+  c: LibHeifC,
+  handle: number,
+  err: number,
+  out: number,
+  tx: number,
+  ty: number,
+  check: (what: string) => void,
+): number {
+  c._heif_image_handle_decode_image_tile(
+    err,
+    handle,
+    out,
+    HEIF_COLORSPACE_RGB,
+    HEIF_CHROMA_INTERLEAVED_RGBA,
+    0,
+    tx,
+    ty,
+  );
+  check(`tile ${tx},${ty}`);
+  return c.HEAPU32[out >> 2] as number;
+}
+
+// The part of a decoded tile that lies inside the image, copied out of the wasm heap row by row (the
+// plane's stride can be wider than the tile). Null when none of it does.
+function clipTile(
+  c: LibHeifC,
+  image: number,
+  left: number,
+  top: number,
+  width: number,
+  height: number,
+): { rgba: Rgba; left: number; top: number } | null {
+  const tw = c._heif_image_get_primary_width(image);
+  const th = c._heif_image_get_primary_height(image);
+  const x0 = Math.max(0, left);
+  const y0 = Math.max(0, top);
+  const x1 = Math.min(width, left + tw);
+  const y1 = Math.min(height, top + th);
+  if (x1 <= x0 || y1 <= y0) return null;
+  const strideAt = c._malloc(4);
+  try {
+    const plane = c._heif_image_get_plane_readonly2(
+      image,
+      HEIF_CHANNEL_INTERLEAVED,
+      strideAt,
+    );
+    if (plane === 0) throw new Error("libheif tile has no interleaved plane");
+    const stride = c.HEAPU32[strideAt >> 2] as number;
+    const w = x1 - x0;
+    const h = y1 - y0;
+    const data = new Uint8ClampedArray(w * h * 4);
+    const heap = c.HEAPU8;
+    for (let y = 0; y < h; y++) {
+      const from = plane + (y0 - top + y) * stride + (x0 - left) * 4;
+      data.set(heap.subarray(from, from + w * 4), y * w * 4);
+    }
+    return { rgba: { data, width: w, height: h }, left: x0, top: y0 };
+  } finally {
+    c._free(strideAt);
+  }
+}
+
+// Exported for the battery: a crop and a one-tile padded axis are refusals no fixture here reaches.
+export const __placementForTest = placement;

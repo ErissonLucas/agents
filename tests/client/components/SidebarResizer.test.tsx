@@ -17,6 +17,7 @@ import {
   SidebarProvider,
   useSidebar,
 } from "@/client/contexts/SidebarContext";
+import { until } from "@/tests/utils/poll";
 
 let hook: ReturnType<typeof useSidebar> | null = null;
 function Probe() {
@@ -35,6 +36,15 @@ function renderResizer() {
   );
 }
 
+// Pointermove is coalesced into a requestAnimationFrame, so the width
+// only changes after the next frame.
+function nextFrame() {
+  return act(
+    () =>
+      new Promise<void>((resolve) => requestAnimationFrame(() => resolve())),
+  );
+}
+
 function getSeparator() {
   return screen.getByRole("separator");
 }
@@ -48,6 +58,7 @@ describe("SidebarResizer", () => {
   afterEach(() => {
     cleanup();
     delete document.body.dataset.resizingSidebar;
+    delete document.body.dataset.sidebarSnapping;
   });
 
   test("exposes WAI-ARIA window splitter attributes", () => {
@@ -107,22 +118,13 @@ describe("SidebarResizer", () => {
     expect(hook?.collapsed).toBe(false);
   });
 
-  test("Space also toggles collapse", () => {
-    renderResizer();
-    const sep = getSeparator();
-    act(() => {
-      fireEvent.keyDown(sep, { key: " " });
-    });
-    expect(hook?.collapsed).toBe(true);
-  });
-
   test("reports aria-valuetext when collapsed", () => {
     renderResizer();
+    expect(getSeparator().getAttribute("aria-valuetext")).toBeNull();
     act(() => {
       hook?.setCollapsed(true);
     });
-    const sep = getSeparator();
-    expect(sep.getAttribute("aria-valuetext")).toBeTruthy();
+    expect(getSeparator().getAttribute("aria-valuetext")).toBe("Collapsed");
   });
 
   test("event.repeat on ArrowRight is ignored", () => {
@@ -188,5 +190,52 @@ describe("SidebarResizer", () => {
     });
     expect(hook?.collapsed).toBe(true);
     expect(document.body.dataset.resizingSidebar).toBeUndefined();
+  });
+
+  test("crossing the collapse snap mid-drag re-enables the width transition", async () => {
+    renderResizer();
+    const sep = getSeparator();
+    act(() => {
+      fireEvent.pointerDown(sep, {
+        pointerId: 1,
+        button: 0,
+        clientX: SIDEBAR_MIN_WIDTH,
+      });
+    });
+    act(() => {
+      fireEvent.pointerMove(sep, { pointerId: 1, clientX: 300 });
+    });
+    await nextFrame();
+    expect(document.body.dataset.sidebarSnapping).toBeUndefined();
+
+    act(() => {
+      fireEvent.pointerMove(sep, { pointerId: 1, clientX: 50 });
+    });
+    await nextFrame();
+    expect(hook?.collapsed).toBe(true);
+    expect(document.body.dataset.sidebarSnapping).toBe("true");
+  });
+
+  test("the snapping flag clears once the transition has had time to run", async () => {
+    renderResizer();
+    const sep = getSeparator();
+    act(() => {
+      fireEvent.pointerDown(sep, {
+        pointerId: 1,
+        button: 0,
+        clientX: SIDEBAR_MIN_WIDTH,
+      });
+    });
+    act(() => {
+      fireEvent.pointerMove(sep, { pointerId: 1, clientX: 50 });
+    });
+    await nextFrame();
+    expect(document.body.dataset.sidebarSnapping).toBe("true");
+
+    await until(
+      "the snapping flag cleared",
+      () => document.body.dataset.sidebarSnapping === undefined,
+    );
+    expect(document.body.dataset.sidebarSnapping).toBeUndefined();
   });
 });

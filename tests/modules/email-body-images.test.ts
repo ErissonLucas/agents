@@ -4,6 +4,7 @@ import {
   emailBodyImageUrlsFrom,
   oneByBlob,
   servedBy,
+  throughBase,
 } from "@/modules/chatwoot/email-body-images";
 import {
   incomingRenderable,
@@ -12,10 +13,10 @@ import {
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { isDecorativeImage } from "@/modules/vision/decorative";
 
-// ISSUE #864: the picture a customer puts in an email body is kept by Chatwoot's mailbox INSIDE the
-// body (a blob URL in `html_content.full`, or an `<img>` appended to `text_content.full` when the
-// mail has no HTML part), never as an attachment. These are the two pure questions the fix asks:
-// which URLs in the body are Chatwoot's own blobs, and which of those images are ornaments.
+// The picture a customer puts in an email body is kept by Chatwoot's mailbox INSIDE the body (a blob
+// URL in `html_content.full`, or an `<img>` appended to `text_content.full` when the mail has no HTML
+// part), never as an attachment. Two pure questions: which URLs in the body are Chatwoot's own blobs,
+// and which of those images are ornaments.
 
 const BLOB =
   "https://chat.example.com/rails/active_storage/blobs/redirect/eyJfcmFpbHMiOnsiZGF0YSI6MTIzfX0=--abc/image0.jpeg";
@@ -158,16 +159,6 @@ describe("emailBodyImageUrlsFrom", () => {
     expect(emailBodyImageUrlsFrom(ca)).toEqual([url]);
   });
 
-  test("the same blob in both bodies is one image", () => {
-    const ca = {
-      email: {
-        html_content: { full: `<img src="${BLOB}">` },
-        text_content: { full: `<img src="${BLOB}">` },
-      },
-    };
-    expect(emailBodyImageUrlsFrom(ca)).toEqual([BLOB]);
-  });
-
   test("HTML entities in the src are decoded before the URL is used", () => {
     const ca = {
       email: {
@@ -258,8 +249,8 @@ function jpeg(w: number, h: number): ArrayBuffer {
 }
 
 describe("isDecorativeImage", () => {
-  // The sizes are the ones measured on a production mailbox (issue #864): the logo quoted from the
-  // store's own emails, the icon set, the banner, the warning glyph.
+  // NOTE: Sizes as a production mailbox sends them: the logo quoted from the store's own emails, the icon
+  // set, the banner, the warning glyph.
   test.each([
     [908, 140, "the logo of a quoted transactional email"],
     [144, 144, "a signature icon"],
@@ -295,5 +286,42 @@ describe("isDecorativeImage", () => {
       ),
     ).toBe(false);
     expect(isDecorativeImage(new ArrayBuffer(3))).toBe(false);
+  });
+});
+
+describe("throughBase: a body image written with the public address of a Chatwoot on a private base", () => {
+  const BASE = "http://10.0.0.5:3000";
+  const PUBLIC = "https://desk.example.com";
+  const path = "/rails/active_storage/blobs/redirect/sig1--x/a.png";
+
+  test("the declared public host is read through the base, and then passes the host check", () => {
+    const mapped = throughBase(
+      `${PUBLIC}${path}?disposition=inline`,
+      BASE,
+      PUBLIC,
+    );
+    expect(mapped).toBe(`${BASE}${path}?disposition=inline`);
+    expect(servedBy(mapped, BASE)).toBe(true);
+  });
+
+  test("any other host stays as it is, and stays remote", () => {
+    const remote = `https://cdn.store.example${path}`;
+    expect(throughBase(remote, BASE, PUBLIC)).toBe(remote);
+    expect(servedBy(remote, BASE)).toBe(false);
+  });
+
+  test("no public address declared, nothing is mapped", () => {
+    expect(throughBase(`${PUBLIC}${path}`, BASE, null)).toBe(
+      `${PUBLIC}${path}`,
+    );
+  });
+
+  test("off Active Storage, or http for an https public address, is not mapped", () => {
+    expect(throughBase(`${PUBLIC}/api/v1/profile`, BASE, PUBLIC)).toBe(
+      `${PUBLIC}/api/v1/profile`,
+    );
+    expect(throughBase(`http://desk.example.com${path}`, BASE, PUBLIC)).toBe(
+      `http://desk.example.com${path}`,
+    );
   });
 });

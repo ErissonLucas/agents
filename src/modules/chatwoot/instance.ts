@@ -21,12 +21,12 @@ export interface LoadChatwootClientDeps {
   makeClient?: (
     cfg: ConstructorParameters<typeof ChatwootClient>[0],
   ) => Promise<ChatwootClient>;
-  // The persona bot token to act AS (bot-token endpoints: send/toggle/assign). Default "" =
-  // admin-only client (the bot identity now lives per-persona on ChatwootAgentBot, not the instance).
+  // The persona bot token to act AS (bot-token endpoints: send/toggle/assign). Default "" is an
+  // admin-only client: the bot identity lives per persona on ChatwootAgentBot, not on the instance.
   botToken?: string;
-  // A client for an agent that must never post to the customer (issue #568): the monitoring turn
-  // gets one, so every tool it holds keeps working while a customer-visible send throws. See
-  // ChatwootClientConfig.mute — the refusal is at the transport, not on a list of methods.
+  // A client for an agent that must never post to the customer: the monitoring turn gets one, so
+  // its tools keep working while a customer-visible send throws. The refusal is at the transport
+  // (ChatwootClientConfig.mute), not on a list of methods.
   mute?: boolean;
   // See ChatwootClientConfig.expiresOn: the whole client stops answering past this.
   expiresOn?: AbortSignal;
@@ -46,7 +46,14 @@ export async function loadChatwootClient(
       select: {
         accountId: true,
         kind: true,
-        deployment: { select: { baseUrl: true, adminToken: true } },
+        deployment: {
+          select: {
+            id: true,
+            baseUrl: true,
+            publicUrl: true,
+            adminToken: true,
+          },
+        },
       },
     }),
   );
@@ -69,6 +76,8 @@ export async function loadChatwootClient(
   const factory = deps.makeClient ?? createChatwootClient;
   return factory({
     baseUrl: instance.deployment.baseUrl,
+    publicUrl: instance.deployment.publicUrl,
+    identity: `chatwoot-deployment:${instance.deployment.id}`,
     accountId: instance.accountId,
     adminToken: decryptJson<string>(instance.deployment.adminToken),
     botToken: deps.botToken ?? "",
@@ -77,22 +86,26 @@ export async function loadChatwootClient(
   });
 }
 
-// The instance's Chatwoot base URL, without building a client (no token decrypted, no DNS). What an
-// email body image is compared against before it is read (issue #864).
-export async function chatwootBaseUrl(
+// The instance's base URL and the public address its connection declares (null when there is none),
+// without building a client. Body images Chatwoot wrote with the public address are read through the
+// base.
+export async function chatwootAddresses(
   tenantId: bigint,
   instanceId: bigint,
   base: PrismaClient = basePrisma,
-): Promise<string> {
+): Promise<{ baseUrl: string; publicUrl: string | null }> {
   const instance = await runScopedOn(base, sysCtx(tenantId), (db) =>
     db.chatwootInstance.findUniqueOrThrow({
       where: { id: instanceId },
-      select: { kind: true, deployment: { select: { baseUrl: true } } },
+      select: {
+        kind: true,
+        deployment: { select: { baseUrl: true, publicUrl: true } },
+      },
     }),
   );
   return instance.kind === "RYZE"
-    ? ryzeEmulatorBaseUrl(instanceId)
-    : instance.deployment.baseUrl;
+    ? { baseUrl: ryzeEmulatorBaseUrl(instanceId), publicUrl: null }
+    : instance.deployment;
 }
 
 // Resolves the persona's Chatwoot Agent Bot for an instance: its numeric id (the gate's "our bot")
@@ -129,6 +142,22 @@ export async function agentBotChatwootId(
     }),
   );
   return row?.chatwootAgentBotId ?? null;
+}
+
+// Every Chatwoot agent bot this instance provisioned, one per agent persona. A reader that names who
+// wrote a message needs all of them: an observer reads the replies of the agents beside it.
+export async function instanceAgentBotChatwootIds(
+  tenantId: bigint,
+  instanceId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<number[]> {
+  const rows = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.chatwootAgentBot.findMany({
+      where: { tenantId, chatwootInstanceId: instanceId },
+      select: { chatwootAgentBotId: true },
+    }),
+  );
+  return rows.map((r) => r.chatwootAgentBotId);
 }
 
 export async function loadAgentBot(

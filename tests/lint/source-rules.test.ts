@@ -1,0 +1,702 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+// The repo-wide rules in biome-plugins/ that replaced sweeps under tests/lib (the source rules and
+// the rules for tests), run through the real Biome over probe files. biome.jsonc
+// applies the source rules under tests/lint/.probe-src-*, and the test rules apply to every file under
+// tests/. The probes end in `.ts` or `.tsx`, never `.test.ts`, so `bun test` never collects them, and
+// each run writes under its own pid. One Biome process lints every probe.
+
+const ROOT = join(import.meta.dir, "../..");
+const PROBE = `tests/lint/.probe-src-${process.pid}`;
+// Built rather than written: a literal path into the source tree is what no-test-reads-source refuses.
+const SRC = ["s", "rc"].join("");
+const ENV_WAIVED = [
+  `${SRC}/lib/instance.ts`,
+  `${SRC}/modules/vision/convert/heic.ts`,
+  `${SRC}/client/lib/env.ts`,
+];
+const JOSE_WAIVED = "tests/api/features/auth/google.service.test.ts";
+const NUMBER_INPUT = `${SRC}/client/components/NumberInput.tsx`;
+
+const P = (name: string) => `${PROBE}/${name}`;
+const CLIENT_STUBBED = [
+  "@/client/contexts/AuthContext",
+  "@/client/contexts/ThemeContext",
+  "@/client/hooks/useTenantEvents",
+];
+
+const PROBES: Record<string, string> = {
+  // no-jsx-comment-note
+  [P("jsx-note-after-text.tsx")]:
+    "export const a = (\n  <div>\n    label {/* NOTE: after text */}\n    <i />\n  </div>\n);\n",
+  [P("jsx-note-after-container.tsx")]:
+    "declare const ok: boolean;\nexport const a = (\n  <div>\n    {ok && <i />}{/* NOTE: after a container */}\n  </div>\n);\n",
+  [P("jsx-note-two-lines.tsx")]:
+    "export const a = (\n  <div>\n    {/* NOTE: two\n        lines */}\n    <i />\n  </div>\n);\n",
+  [P("jsx-note-after-quote.tsx")]:
+    'export const a = <p>He said "hi {/* NOTE: hidden */} bye"</p>;\n',
+  [P("jsx-untagged.tsx")]:
+    "export const a = (\n  <div>\n    {/* Filters */}\n    <i />\n  </div>\n);\n",
+  [P("jsx-todo.tsx")]:
+    "export const a = (\n  <div>\n    {/* TODO: owed work */}\n    <i />\n  </div>\n);\n",
+  [P("jsx-note-in-string.tsx")]:
+    'export const sample = "{/* NOTE: not a comment */}";\n',
+  [P("jsx-note-in-code.tsx")]:
+    "export function C() {\n  // NOTE: an aside about code\n  return <div />;\n}\n",
+  [P("jsx-note-beside-expression.tsx")]:
+    "declare const x: string;\nexport const a = <div>{x /* NOTE: beside */}</div>;\n",
+
+  // no-noop-close-request
+  [P("close-noop-ternary.tsx")]:
+    "declare const M: (p: { onCloseRequest?: () => void }) => null;\ndeclare const saving: boolean;\nexport const a = <M onCloseRequest={saving ? () => {} : undefined} />;\n",
+  [P("close-noop-undefined.tsx")]:
+    "declare const M: (p: { onCloseRequest?: () => void }) => null;\ndeclare const busy: boolean;\nexport const a = <M onCloseRequest={busy ? () => undefined : undefined} />;\n",
+  [P("close-noop-bare.tsx")]:
+    "declare const M: (p: { onCloseRequest?: () => void }) => null;\nexport const a = <M onCloseRequest={() => {}} />;\n",
+  [P("close-noop-multiline.tsx")]:
+    "declare const M: (p: { onCloseRequest?: () => void }) => null;\ndeclare const saving: boolean;\nexport const a = (\n  <M\n    onCloseRequest={\n      saving\n        ? () => {}\n        : undefined\n    }\n  />\n);\n",
+  [P("close-confirm.tsx")]:
+    "declare const M: (p: { onCloseRequest?: () => void }) => null;\ndeclare const dirty: boolean;\ndeclare function ask(): void;\nexport const a = <M onCloseRequest={dirty ? () => { ask(); } : undefined} />;\n",
+  [P("close-busy.tsx")]:
+    "declare const M: (p: { busy?: boolean; onClose?: () => void }) => null;\ndeclare const saving: boolean;\nexport const a = <M busy={saving} onClose={() => {}} />;\n",
+
+  // no-bare-number-input
+  [P("number-input-self-closing.tsx")]:
+    'declare const Input: (p: object) => null;\nexport const a = <Input type="number" min={0} />;\n',
+  [P("number-input-raw.tsx")]: 'export const a = <input type="number" />;\n',
+  [P("number-input-with-children.tsx")]:
+    'declare const Input: (p: object) => null;\nexport const a = (\n  <Input\n    value="1"\n    type="number"\n  >\n    x\n  </Input>\n);\n',
+  [P("number-input-other.tsx")]:
+    'declare const Input: (p: object) => null;\ndeclare const XAxis: (p: object) => null;\nexport const a = <Input type="text" />;\nexport const b = <XAxis type="number" />;\n',
+
+  // require-pool-connect-bound
+  [P("pool-unbounded.ts")]:
+    'declare const Pool: new (o: object) => object;\nexport const p = new Pool({ connectionString: "x", max: 2 });\n',
+  [P("pool-adapter-unbounded.ts")]:
+    'declare const PrismaPg: new (o: object) => object;\nexport const a = new PrismaPg({ connectionString: "x" });\n',
+  [P("pool-namespaced-unbounded.ts")]:
+    'declare const pg: { Pool: new (o: object) => object };\nexport const p = new pg.Pool({ connectionString: "x", max: 2 });\n',
+  [P("pool-connect-option.ts")]:
+    "declare const Pool: new (o: object) => object;\ndeclare function connectTimeoutOption(): object;\nexport const p = new Pool({ max: 2, ...connectTimeoutOption() });\n",
+  [P("pool-timeout-millis.ts")]:
+    'declare const PrismaPg: new (o: object) => object;\nexport const a = new PrismaPg({ connectionString: "x", connectionTimeoutMillis: 5_000 });\n',
+  [P("pool-built-elsewhere.ts")]:
+    "declare const Pool: new (o: object) => object;\ndeclare function opts(): object;\nexport const p = new Pool(opts());\n",
+
+  // require-pool-session-zone
+  [P("zone-unpinned.ts")]:
+    "declare const Pool: new (o: object) => object;\ndeclare function connectTimeoutOption(): object;\nexport const p = new Pool({ max: 2, ...connectTimeoutOption() });\n",
+  [P("zone-adapter-unpinned.ts")]:
+    'declare const PrismaPg: new (o: object) => object;\nexport const a = new PrismaPg({ connectionString: "x", connectionTimeoutMillis: 5_000 });\n',
+  [P("zone-pinned.ts")]:
+    'declare const Pool: new (o: object) => object;\ndeclare function withSessionOptions(u: string): object;\nexport const p = new Pool({ ...withSessionOptions("x"), connectionTimeoutMillis: 5_000 });\n',
+
+  // require-pool-error-listener
+  [P("drop-bare.ts")]:
+    "declare const Pool: new (o: object) => object;\ndeclare function opts(): object;\nexport const p = new Pool(opts());\n",
+  [P("drop-namespaced.ts")]:
+    "declare const pg: { Pool: new (o: object) => object };\ndeclare function opts(): object;\nexport const p = new pg.Pool(opts());\n",
+  [P("drop-adapter-options.ts")]:
+    "declare const PrismaPg: new (o: object) => object;\ndeclare function opts(): object;\nexport const a = new PrismaPg(opts());\n",
+  [P("drop-adapter-raw-pool.ts")]:
+    'declare const Pool: new (o: object) => object;\ndeclare const PrismaPg: new (o: object) => object;\ndeclare function absorbPoolErrors<T>(n: string, p: T): T;\ndeclare function opts(): object;\nconst raw = absorbPoolErrors("x", new Pool(opts()));\nexport const a = new PrismaPg(raw);\n',
+  [P("drop-absorbed.ts")]:
+    'declare const Pool: new (o: object) => object;\ndeclare function absorbPoolErrors<T>(n: string, p: T): T;\ndeclare function opts(): object;\nexport const p = absorbPoolErrors("x", new Pool(opts()));\n',
+  [P("drop-instrumented-adapter.ts")]:
+    'declare const Pool: new (o: object) => object;\ndeclare const PrismaPg: new (o: object, x?: object) => object;\ndeclare function instrumentPool<T>(n: string, p: T): T;\ndeclare function opts(): object;\nexport const a = new PrismaPg(\n  instrumentPool("main", new Pool(opts())),\n  { disposeExternalPool: true },\n);\n',
+
+  // require-work-label-on-timer
+  [P("timer-bare.ts")]:
+    "export const t = setInterval(() => undefined, 1_000);\n",
+  [P("timer-in-start.ts")]:
+    "export function start(): void {\n  setInterval(() => undefined, 1_000);\n}\n",
+  [P("timer-labeled.ts")]:
+    'declare function runWithWorkLabel<T>(l: string, f: () => T): T;\nexport function start(): void {\n  runWithWorkLabel("worker", () => {\n    setInterval(() => undefined, 1_000);\n  });\n}\n',
+  [P("timer-labeled-inner.ts")]:
+    'declare function runWithWorkLabel<T>(l: string, f: () => T): T;\nexport const t = setInterval(() => runWithWorkLabel("worker", () => undefined), 1_000);\n',
+
+  // no-raw-violation-code
+  [P("violation-eq.ts")]:
+    'declare const e: { code?: string };\nexport const a = e.code === "P2002";\n',
+  [P("violation-neq.ts")]:
+    'declare const e: { code?: string };\nexport const a = e.code !== "P2003";\n',
+  [P("violation-left.ts")]:
+    'declare const e: { code?: string };\nexport const a = "23505" === e.code;\n',
+  [P("violation-sqlstate-fk.ts")]:
+    'declare const e: { code?: string };\nexport const a = e.code === "23503";\n',
+  [P("violation-other-code.ts")]:
+    'declare const e: { code?: string };\nexport const a = e.code === "P2025";\n',
+  [P("violation-comment.ts")]:
+    "// a P2002 is a unique violation\nexport const a = 1;\n",
+
+  // no-prisma-cursor
+  [P("cursor-direct.ts")]:
+    "declare const db: { c: { findMany(a: object): unknown } };\nexport const a = db.c.findMany({ where: {}, cursor: { id: 1n }, skip: 1, take: 2 });\n",
+  [P("cursor-spread.ts")]:
+    "declare const db: { c: { findMany(a: object): unknown } };\ndeclare const k: bigint | null;\nexport const a = db.c.findMany({\n  take: 2,\n  ...(k != null ? { cursor: { id: k }, skip: 1 } : {}),\n});\n",
+  [P("cursor-column.ts")]:
+    'declare const db: { c: { findMany(a: object): unknown } };\nexport const a = db.c.findMany({ where: { cursor: 1 }, take: 2 });\nexport const payload = { cursor: { appId: "1" } };\n',
+
+  // no-raw-tick-failure-log
+  [P("tick-error-object.ts")]:
+    'declare const logger: { error: (...a: unknown[]) => void };\ndeclare const err: unknown;\nexport const a = () => logger.error({ err }, "observe tick failed");\n',
+  [P("tick-error-format.ts")]:
+    'declare const logger: { error: (...a: unknown[]) => void };\nexport const a = () =>\n  logger.error(\n    "Alert tick failed: %s",\n    "x",\n  );\n',
+  [P("tick-warn.ts")]:
+    'declare const logger: { warn: (...a: unknown[]) => void };\nexport const a = () => logger.warn("database screen tick failed");\n',
+  [P("tick-error-other.ts")]:
+    'declare const logger: { error: (...a: unknown[]) => void };\nexport const a = () => logger.error("delivery failed");\n',
+
+  // no-bigint-cast
+  [P("bigint-param.ts")]:
+    "declare const params: { id: string };\nexport const a = BigInt(params.id);\n",
+  [P("bigint-ternary.ts")]:
+    "declare const b: { agentId?: string };\nexport const a = b.agentId ? BigInt(b.agentId) : undefined;\n",
+  [P("bigint-map.ts")]: "export const a = ['1'].map((s) => BigInt(s));\n",
+  [P("bigint-slice.ts")]:
+    "declare const r: string;\nexport const a = BigInt(r.slice(6));\n",
+  [P("bigint-index-as.ts")]:
+    "declare const parts: unknown[];\nexport const a = BigInt(parts[2] as string);\n",
+  [P("bigint-wrapped.ts")]:
+    "declare const data: { businessHoursId: string };\nexport const a = BigInt(\n  data.businessHoursId,\n);\n",
+  [P("bigint-starts-literal.ts")]:
+    'declare const params: { id: string };\nexport const a = BigInt("0" + params.id);\n',
+  [P("bigint-literal-plus.ts")]:
+    "declare const offset: bigint;\nexport const a = BigInt(7n + offset);\n",
+  [P("bigint-template.ts")]:
+    "declare const raw: string;\nexport const a = BigInt(`\u0024{raw}`);\n",
+  [P("bigint-in-template-hole.ts")]:
+    "declare const body: { id: string };\nexport const a = `t:\u0024{BigInt(body.id)}`;\n",
+  [P("bigint-literals.ts")]:
+    "export const a = [BigInt(7), BigInt(\"7\"), BigInt('7'), BigInt(0x1f), BigInt(1_000n)];\n",
+  [P("bigint-prose.ts")]:
+    '// never write BigInt(params.id)\nexport const re = /BigInt\\(params\\.id\\)/;\nexport const m = "BigInt(query.z) is banned";\n',
+  [P("bigint-waived.ts")]:
+    "declare const raw: string;\n// biome-ignore lint/plugin/no-bigint-cast: the probe's argued-for call\nexport const a = BigInt(raw);\n",
+  [P("bigint-waiver-covers-one.ts")]:
+    "declare const raw: string;\n// biome-ignore lint/plugin/no-bigint-cast: the probe's argued-for call\nexport const a = BigInt(raw);\nexport const b = BigInt(raw);\n",
+  [P("bigint-waiver-stale.ts")]:
+    "// biome-ignore lint/plugin/no-bigint-cast: the call it argued for is a literal now\nexport const a = BigInt(7);\n",
+
+  // no-env-read-outside-config
+  [P("env-process.ts")]: "export const a = Number(process.env.PROBE_X ?? 0);\n",
+  [P("env-bun.ts")]: 'export const a = Bun.env["X"];\n',
+  [P("env-import-meta.ts")]: "export const a = import.meta.env;\n",
+  [P("env-prose.ts")]:
+    '// reads process.env only in config\nexport const a = "process.env";\nconst myprocess = { env: 1 };\nexport const b = myprocess.env;\n',
+
+  // require-model-call-deadline
+  [P("model-call-bare.ts")]:
+    "declare function runModelCall<T>(f: () => T, o?: object): T;\nexport const a = runModelCall(() => 1); // deadlineMs handled elsewhere\n",
+  [P("model-call-comment-only.ts")]:
+    "declare function runModelCall<T>(f: () => T, o?: object): T;\nexport const a = runModelCall(() => 1, { /* deadlineMs */ x: 1 });\n",
+  [P("model-call-named.ts")]:
+    "declare function runModelCall<T>(f: () => T, o?: object): T;\ndeclare const deadlineMs: number;\nexport const a = runModelCall(() => 1, { deadlineMs: 15_000 });\nexport const b = runModelCall<string>(() => String(1), { deadlineMs: 5 });\nexport const c = runModelCall(() => 1, { deadlineMs });\n",
+
+  // require-database-screen-budget
+  [P("db-screen-budgetless.ts")]:
+    "declare function fleetWithin<T>(b: unknown, ...r: unknown[]): T;\ndeclare const base: { $queryRaw: (s: TemplateStringsArray) => unknown };\nexport const a = fleetWithin(base, (db: unknown) => db); // budget elsewhere\nexport const b = base.$queryRaw`SELECT 1`;\n",
+  [P("db-screen-fleet-helper.ts")]:
+    "declare function asFleetForInstanceHealth<T>(...r: unknown[]): T;\ndeclare function runScopedOn<T>(...r: unknown[]): T;\ndeclare const budget: unknown;\nexport const a = asFleetForInstanceHealth(budget, () => 1);\nexport const b = runScopedOn(budget, () => 1, budget);\n",
+  [P("db-screen-budgeted.ts")]:
+    "declare function fleetWithin<T>(...r: unknown[]): T;\ndeclare function plainWithin<T>(...r: unknown[]): T;\ndeclare function budgetUntil(d: number): unknown;\ndeclare function left(c: number): unknown;\ndeclare const base: unknown;\ndeclare const opts: { budget: unknown };\nexport const a = fleetWithin(base, budgetUntil(1), (db: unknown) => db);\nexport const b = plainWithin(base, left(2000), (db: unknown) => db);\nexport const c = fleetWithin(base, opts.budget, (db: unknown) => db);\n",
+
+  // no-scrub-around-cut
+  [P("scrub-around-cut.ts")]:
+    "declare function redactSecretsInText(s: string): string;\ndeclare function truncate(s: string, n: number): string;\nexport const a = redactSecretsInText(truncate('v', 10));\n",
+  [P("scrub-around-storable-cut.ts")]:
+    "declare function redactSecretsInText(s: string): string;\ndeclare function makeStorable(s: string): string;\ndeclare function truncate(s: string, n: number): string;\nexport const a = redactSecretsInText(\n  makeStorable(truncate('v', 10)),\n);\n",
+  [P("cut-around-scrub.ts")]:
+    "declare function redactSecretsInText(s: string): string;\ndeclare function truncate(s: string, n: number): string;\nexport const a = truncate(redactSecretsInText('v'), 10);\n",
+
+  // no-package-module-mock
+  [P("mock-bare-package.ts")]:
+    'import { mock } from "bun:test";\nmock.module("jose", () => ({}));\n',
+  [P("mock-scoped-package.ts")]:
+    'import { mock } from "bun:test";\nmock.module("@elysiajs/jwt", () => ({}));\n',
+  [P("mock-two-packages.ts")]:
+    'import { mock } from "bun:test";\nmock.module("jose", () => ({}));\nmock.module("react-i18next", () => ({}));\n',
+  [P("mock-restored-package.ts")]:
+    'import { afterAll, mock } from "bun:test";\nmock.module("jose", () => ({}));\nafterAll(() => {\n  mock.module("jose", () => ({}));\n});\n',
+  [P("mock-own-modules.ts")]:
+    'import { mock } from "bun:test";\nmock.module("@/api/lib/prisma", () => ({}));\nmock.module("./helpers", () => ({}));\n',
+  [P("jose-waived-copy.ts")]: readFileSync(join(ROOT, JOSE_WAIVED), "utf8"),
+
+  // no-module-mock-live-namespace
+  [P("undo-live-namespace.ts")]:
+    'import { afterAll, mock } from "bun:test";\nconst svc = await import("@/config");\nmock.module("@/config", () => ({ ...svc }));\nafterAll(() => {\n  mock.module("@/config", () => svc);\n});\n',
+  [P("undo-copy.ts")]:
+    'import { afterAll, mock } from "bun:test";\nconst svc = await import("@/config");\nconst real = { ...svc };\nmock.module("@/config", () => ({ ...svc }));\nafterAll(() => {\n  mock.module("@/config", () => real);\n});\n',
+  [P("undo-object-literal.ts")]:
+    'import { mock } from "bun:test";\nconst cfg = await import("@/config");\nmock.module("@/config", () => ({ default: cfg.default }));\n',
+  [P("undo-no-namespace.ts")]:
+    'import { mock } from "bun:test";\ndeclare const real: object;\nmock.module("@/config", () => real);\n',
+  [P("undo-in-comment.ts")]:
+    'export const svc = await import("@/config");\n// mock.module("@/config", () => svc) would undo nothing.\n',
+
+  // no-raw-auth-context-mock
+  ...Object.fromEntries(
+    CLIENT_STUBBED.flatMap((spec, i) => [
+      [
+        P(`client-mock-double-${i}.ts`),
+        `import { mock } from "bun:test";\nmock.module("${spec}", () => ({}));\n`,
+      ],
+      [
+        P(`client-mock-single-${i}.ts`),
+        `import { mock } from "bun:test";\nmock.module(\n  '${spec}',\n  () => ({}),\n);\n`,
+      ],
+    ]),
+  ),
+  [P("client-mock-other.ts")]:
+    'import { mock } from "bun:test";\nmock.module("@/client/contexts/SidebarContext", () => ({}));\n',
+  [P("client-mock-other-hook.ts")]:
+    'import { mock } from "bun:test";\nmock.module("@/client/hooks/useTenantEventsSoon", () => ({}));\n',
+
+  // no-raw-read-of-globbed-source
+  [P("glob-raw.ts")]:
+    `const { Glob } = await import("bun");\nlet n = 0;\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  n += (await Bun.file(\`${SRC}/\${rel}\`).text()).length;\n}\nexport { n };\n`,
+  [P("glob-raw-from-root.ts")]:
+    `let n = 0;\nfor await (const f of new Bun.Glob("${SRC}/**/*.ts").scan(".")) {\n  n += (await Bun.file(f).text()).length;\n}\nexport { n };\n`,
+  [P("glob-imports-only.ts")]:
+    `const { Glob } = await import("bun");\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  await import(\`../../${SRC}/\${rel}\`);\n}\nexport const t = await Bun.file("package.json").text();\n`,
+  [P("glob-scanned.ts")]:
+    `import { codeOnly } from "@/tests/utils/source-text";\nconst { Glob } = await import("bun");\nlet n = 0;\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  n += codeOnly(await Bun.file(\`${SRC}/\${rel}\`).text()).length;\n}\nexport { n };\n`,
+  // The sweep read the file without its comments, strings kept, so a literal spelling the glob, the
+  // read or the import counted as one.
+  [P("glob-spelled-glob.ts")]:
+    `export const doc = 'new Glob("${SRC}/**").scan(".")';\nexport const t = await Bun.file("package.json").text();\n`,
+  [P("glob-spelled-read.ts")]:
+    `const { Glob } = await import("bun");\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  void rel;\n}\nexport const doc = "Bun.file(x).text()";\n`,
+  [P("glob-spelled-import.ts")]:
+    `const { Glob } = await import("bun");\nconst note = 'from "@/tests/utils/source-text"';\nlet n = 0;\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  n += (await Bun.file(\`${SRC}/\${rel}\`).text()).length;\n}\nexport { n, note };\n`,
+  // Biome's own lexer tells a regex literal, a comment and a string apart, as the sweep's scan did.
+  [P("glob-after-regex-literal.ts")]:
+    `const re = /["']/;\nconst { Glob } = await import("bun");\nlet n = 0;\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  n += (await Bun.file(\`${SRC}/\${rel}\`).text()).length;\n}\nexport { n, re };\n`,
+  [P("glob-in-comment.ts")]:
+    `/* new Glob("${SRC}/**").scan(".") */\nexport const t = await Bun.file("package.json").text();\n`,
+  [P("glob-import-in-comment.ts")]:
+    `/**\n * import { codeOnly } from "@/tests/utils/source-text";\n */\nconst { Glob } = await import("bun");\nlet n = 0;\nfor await (const rel of new Glob("**/*.ts").scan("${SRC}")) {\n  n += (await Bun.file(\`${SRC}/\${rel}\`).text()).length;\n}\nexport { n };\n`,
+  [P("glob-none.ts")]:
+    'export const t = await Bun.file("package.json").text();\n',
+
+  ...Object.fromEntries(
+    ENV_WAIVED.map((path, i) => [
+      P(`env-waived-copy-${i}.ts`),
+      readFileSync(join(ROOT, path), "utf8"),
+    ]),
+  ),
+};
+
+const RULES = {
+  jsx: "A JSX comment documents the element below it",
+  pool: "A pool's options bound its connect",
+  zone: "A pool pins its session time zone",
+  close: "A no-op `onCloseRequest` does not block",
+  bigint: "A caller's id is parsed, never cast",
+  env: "The environment is read in",
+  deadline: "Every model call names its own `deadlineMs`",
+  dbBudget: "A database screen transaction runs under a budget",
+  scrub: "A scrub wrapped around a cut",
+  pkg: "This replaces a third-party package",
+  undo: "rewrote this namespace in place",
+  auth: "Stub this client context or hook per file with `stubExports`",
+  unused: "Suppression comment has no effect",
+  glob: "A test that globs src/ reads each file",
+  violation: "A violation code read by hand misses the other shape",
+  number: "A number field takes the range the server enforces",
+  timer: "A recurring timer runs under a work label",
+  drop: "A pool survives a dropped connection",
+  cursor: "Prisma's `cursor` sends a findMany with no LIMIT",
+  tick: "A failed tick is reported through `tickFailures`",
+} as const;
+type Rule = keyof typeof RULES;
+
+let hits: Map<string, Partial<Record<Rule, number>>>;
+
+beforeAll(() => {
+  for (const [path, body] of Object.entries(PROBES)) {
+    mkdirSync(join(ROOT, path, ".."), { recursive: true });
+    writeFileSync(join(ROOT, path), body);
+  }
+  const run = Bun.spawnSync({
+    cmd: [
+      "bun",
+      "biome",
+      "lint",
+      "--max-diagnostics=none",
+      "--reporter=github",
+      ...Object.keys(PROBES),
+      ...ENV_WAIVED,
+      JOSE_WAIVED,
+      NUMBER_INPUT,
+    ],
+    cwd: ROOT,
+  });
+  hits = new Map();
+  for (const line of run.stdout.toString().split("\n")) {
+    const m = line.match(/file=([^,]+),.*::(.*)$/);
+    if (!m?.[1] || !m[2]) continue;
+    const key = m[1].startsWith(`${ROOT}/`)
+      ? m[1].slice(ROOT.length + 1)
+      : m[1];
+    const h = hits.get(key) ?? {};
+    for (const [rule, text] of Object.entries(RULES) as [Rule, string][]) {
+      if (m[2].includes(text)) h[rule] = (h[rule] ?? 0) + 1;
+    }
+    hits.set(key, h);
+  }
+});
+
+afterAll(() => {
+  rmSync(join(ROOT, PROBE), { recursive: true, force: true });
+});
+
+const of = (path: string, rule: Rule): number => hits.get(path)?.[rule] ?? 0;
+
+describe("no-jsx-comment-note", () => {
+  test.each([
+    ["jsx-note-after-text.tsx"],
+    ["jsx-note-after-container.tsx"],
+    ["jsx-note-two-lines.tsx"],
+    ["jsx-note-after-quote.tsx"],
+  ])("a NOTE: in a JSX comment is refused (%s)", (name) => {
+    expect(of(P(name), "jsx")).toBe(1);
+  });
+
+  test.each([
+    ["jsx-untagged.tsx"],
+    ["jsx-todo.tsx"],
+    ["jsx-note-in-string.tsx"],
+    ["jsx-note-in-code.tsx"],
+    ["jsx-note-beside-expression.tsx"],
+  ])(
+    "an untagged or TODO: JSX comment, and a NOTE: that is not one, pass (%s)",
+    (name) => {
+      expect(of(P(name), "jsx")).toBe(0);
+    },
+  );
+});
+
+describe("no-noop-close-request", () => {
+  test.each([
+    ["close-noop-ternary.tsx"],
+    ["close-noop-undefined.tsx"],
+    ["close-noop-bare.tsx"],
+    ["close-noop-multiline.tsx"],
+  ])("a no-op onCloseRequest is refused (%s)", (name) => {
+    expect(of(P(name), "close")).toBe(1);
+  });
+
+  test("an onCloseRequest that does something, and busy, pass", () => {
+    expect(of(P("close-confirm.tsx"), "close")).toBe(0);
+    expect(of(P("close-busy.tsx"), "close")).toBe(0);
+  });
+});
+
+describe("no-bare-number-input", () => {
+  test.each([
+    ["number-input-self-closing.tsx"],
+    ["number-input-raw.tsx"],
+    ["number-input-with-children.tsx"],
+  ])("a bare number field is refused (%s)", (name) => {
+    expect(of(P(name), "number")).toBe(1);
+  });
+
+  // Another type on Input, or type="number" on a component that is not a field (a chart axis).
+  test("other inputs and other elements pass", () => {
+    expect(of(P("number-input-other.tsx"), "number")).toBe(0);
+  });
+
+  test("NumberInput itself, which draws the one bare field, is exempt", () => {
+    expect(of(NUMBER_INPUT, "number")).toBe(0);
+  });
+});
+
+describe("require-pool-connect-bound", () => {
+  test.each([
+    ["pool-unbounded.ts"],
+    ["pool-adapter-unbounded.ts"],
+    ["pool-namespaced-unbounded.ts"],
+  ])("a pool whose options bound nothing is refused (%s)", (name) => {
+    expect(of(P(name), "pool")).toBe(1);
+  });
+
+  test.each([
+    ["pool-connect-option.ts"],
+    ["pool-timeout-millis.ts"],
+    ["pool-built-elsewhere.ts"],
+  ])("a bounded pool, or options built elsewhere, pass (%s)", (name) => {
+    expect(of(P(name), "pool")).toBe(0);
+  });
+});
+
+describe("require-pool-error-listener", () => {
+  test.each([
+    ["drop-bare.ts"],
+    ["drop-namespaced.ts"],
+    ["drop-adapter-options.ts"],
+    ["drop-adapter-raw-pool.ts"],
+  ])(
+    "a pool built outside the error listener, or an adapter not handed one, is refused (%s)",
+    (name) => {
+      expect(of(P(name), "drop")).toBe(1);
+    },
+  );
+
+  test.each([["drop-absorbed.ts"], ["drop-instrumented-adapter.ts"]])(
+    "a pool built inside the listener, and an adapter handed it, pass (%s)",
+    (name) => {
+      expect(of(P(name), "drop")).toBe(0);
+    },
+  );
+});
+
+describe("require-pool-session-zone", () => {
+  test.each([
+    ["zone-unpinned.ts"],
+    ["zone-adapter-unpinned.ts"],
+    ["pool-namespaced-unbounded.ts"],
+  ])(
+    "a pool whose options leave the session zone to the server is refused (%s)",
+    (name) => {
+      expect(of(P(name), "zone")).toBe(1);
+    },
+  );
+
+  test.each([["zone-pinned.ts"], ["pool-built-elsewhere.ts"]])(
+    "a pinned pool, or options built elsewhere, pass (%s)",
+    (name) => {
+      expect(of(P(name), "zone")).toBe(0);
+    },
+  );
+});
+
+describe("require-work-label-on-timer", () => {
+  test.each([["timer-bare.ts"], ["timer-in-start.ts"]])(
+    "a timer created under no work label is refused (%s)",
+    (name) => {
+      expect(of(P(name), "timer")).toBe(1);
+    },
+  );
+
+  test("a timer created inside runWithWorkLabel passes", () => {
+    expect(of(P("timer-labeled.ts"), "timer")).toBe(0);
+  });
+
+  // One shape for the whole tree: the label goes around where the timer is created, so the code that
+  // runs before the first pass (a start's first read) carries it too. A label entered only inside the
+  // callback is refused.
+  test("a label entered only inside the callback is refused", () => {
+    expect(of(P("timer-labeled-inner.ts"), "timer")).toBe(1);
+  });
+});
+
+describe("no-raw-violation-code", () => {
+  test.each([
+    ["violation-eq.ts"],
+    ["violation-neq.ts"],
+    ["violation-left.ts"],
+    ["violation-sqlstate-fk.ts"],
+  ])("a violation code written out is refused (%s)", (name) => {
+    expect(of(P(name), "violation")).toBe(1);
+  });
+
+  test("another Prisma code, and a comment naming one, pass", () => {
+    expect(of(P("violation-other-code.ts"), "violation")).toBe(0);
+    expect(of(P("violation-comment.ts"), "violation")).toBe(0);
+  });
+});
+
+describe("no-raw-tick-failure-log", () => {
+  test.each([["tick-error-object.ts"], ["tick-error-format.ts"]])(
+    "a failed tick logged straight at error is refused (%s)",
+    (name) => {
+      expect(of(P(name), "tick")).toBe(1);
+    },
+  );
+
+  test("a warn, and an error that is not a tick, pass", () => {
+    expect(of(P("tick-warn.ts"), "tick")).toBe(0);
+    expect(of(P("tick-error-other.ts"), "tick")).toBe(0);
+  });
+});
+
+describe("no-bigint-cast", () => {
+  test.each([
+    ["bigint-param.ts"],
+    ["bigint-ternary.ts"],
+    ["bigint-map.ts"],
+    ["bigint-slice.ts"],
+    ["bigint-index-as.ts"],
+    ["bigint-wrapped.ts"],
+    ["bigint-starts-literal.ts"],
+    ["bigint-literal-plus.ts"],
+    ["bigint-template.ts"],
+    ["bigint-in-template-hole.ts"],
+  ])("a cast of anything but a literal is refused (%s)", (name) => {
+    expect(of(P(name), "bigint")).toBe(1);
+  });
+
+  test("literals, prose, patterns and strings that spell the call pass", () => {
+    expect(of(P("bigint-literals.ts"), "bigint")).toBe(0);
+    expect(of(P("bigint-prose.ts"), "bigint")).toBe(0);
+  });
+
+  test("a waiver covers the one call below it, not a second call that reads the same", () => {
+    expect(of(P("bigint-waived.ts"), "bigint")).toBe(0);
+    expect(of(P("bigint-waiver-covers-one.ts"), "bigint")).toBe(1);
+  });
+
+  test("a waiver whose call is gone is reported, and `bun run lint` fails on it", () => {
+    expect(of(P("bigint-waiver-stale.ts"), "unused")).toBe(1);
+  });
+});
+
+describe("no-env-read-outside-config", () => {
+  test.each([["env-process.ts"], ["env-bun.ts"], ["env-import-meta.ts"]])(
+    "a read of the environment is refused (%s)",
+    (name) => {
+      expect(of(P(name), "env")).toBe(1);
+    },
+  );
+
+  test("a comment or a string that names it, and another object's env, pass", () => {
+    expect(of(P("env-prose.ts"), "env")).toBe(0);
+  });
+
+  test("each file biome.jsonc exempts still reads the environment, and only the exemption silences it", () => {
+    ENV_WAIVED.forEach((path, i) => {
+      expect(of(path, "env")).toBe(0);
+      expect(of(P(`env-waived-copy-${i}.ts`), "env")).toBeGreaterThan(0);
+    });
+  });
+});
+
+describe("require-model-call-deadline", () => {
+  test("a call that leaves deadlineMs to the default is refused, whatever a comment says", () => {
+    expect(of(P("model-call-bare.ts"), "deadline")).toBe(1);
+    expect(of(P("model-call-comment-only.ts"), "deadline")).toBe(1);
+  });
+
+  test("a call that names it passes, generic or shorthand", () => {
+    expect(of(P("model-call-named.ts"), "deadline")).toBe(0);
+  });
+});
+
+describe("require-database-screen-budget", () => {
+  test("a transaction without a budget, a tenancy helper called directly and a statement on base are refused", () => {
+    expect(of(P("db-screen-budgetless.ts"), "dbBudget")).toBe(2);
+    expect(of(P("db-screen-fleet-helper.ts"), "dbBudget")).toBe(2);
+  });
+
+  test("a transaction handed a budget passes, built, carved or passed down", () => {
+    expect(of(P("db-screen-budgeted.ts"), "dbBudget")).toBe(0);
+  });
+});
+
+describe("no-scrub-around-cut", () => {
+  test("a scrub wrapped around a cut is refused", () => {
+    expect(of(P("scrub-around-cut.ts"), "scrub")).toBe(1);
+    expect(of(P("scrub-around-storable-cut.ts"), "scrub")).toBe(1);
+  });
+
+  test("a cut around a scrub passes", () => {
+    expect(of(P("cut-around-scrub.ts"), "scrub")).toBe(0);
+  });
+});
+
+describe("no-package-module-mock", () => {
+  test("a stub of a package is refused, bare or scoped, each call, restored or not", () => {
+    expect(of(P("mock-bare-package.ts"), "pkg")).toBe(1);
+    expect(of(P("mock-scoped-package.ts"), "pkg")).toBe(1);
+    expect(of(P("mock-two-packages.ts"), "pkg")).toBe(2);
+    expect(of(P("mock-restored-package.ts"), "pkg")).toBe(2);
+  });
+
+  test("a stub of our own modules passes", () => {
+    expect(of(P("mock-own-modules.ts"), "pkg")).toBe(0);
+  });
+
+  test("the argued-for pair still stubs, and only that file is exempt", () => {
+    expect(of(JOSE_WAIVED, "pkg")).toBe(0);
+    expect(of(P("jose-waived-copy.ts"), "pkg")).toBeGreaterThan(0);
+  });
+});
+
+describe("no-module-mock-live-namespace", () => {
+  test("handing back a namespace bound from await import() is refused", () => {
+    expect(of(P("undo-live-namespace.ts"), "undo")).toBe(1);
+  });
+
+  test.each([
+    ["undo-copy.ts"],
+    ["undo-object-literal.ts"],
+    ["undo-no-namespace.ts"],
+    ["undo-in-comment.ts"],
+  ])("a copy, a literal, an unbound name or prose passes (%s)", (name) => {
+    expect(of(P(name), "undo")).toBe(0);
+  });
+});
+
+describe("no-raw-auth-context-mock", () => {
+  test.each(CLIENT_STUBBED.map((spec, i) => [spec, i] as const))(
+    "a mock of %s is refused, in double or single quotes",
+    (_spec, i) => {
+      expect(of(P(`client-mock-double-${i}.ts`), "auth")).toBe(1);
+      expect(of(P(`client-mock-single-${i}.ts`), "auth")).toBe(1);
+    },
+  );
+
+  test("a mock of another client module passes", () => {
+    expect(of(P("client-mock-other.ts"), "auth")).toBe(0);
+    expect(of(P("client-mock-other-hook.ts"), "auth")).toBe(0);
+  });
+});
+
+describe("no-raw-read-of-globbed-source", () => {
+  test.each([
+    ["glob-raw.ts"],
+    ["glob-raw-from-root.ts"],
+    ["glob-imports-only.ts"],
+  ])(
+    "a raw read in a test that globs the source tree is refused (%s)",
+    (name) => {
+      expect(of(P(name), "glob")).toBe(1);
+    },
+  );
+
+  test("a string that spells the glob or the read counts as one, as it did for the sweep", () => {
+    expect(of(P("glob-spelled-glob.ts"), "glob")).toBe(1);
+    expect(of(P("glob-spelled-read.ts"), "glob")).toBe(1);
+  });
+
+  test("a regex literal holding quotes does not hide a raw read, and a comment is neither a glob nor an import", () => {
+    expect(of(P("glob-after-regex-literal.ts"), "glob")).toBe(1);
+    expect(of(P("glob-in-comment.ts"), "glob")).toBe(0);
+    expect(of(P("glob-import-in-comment.ts"), "glob")).toBe(1);
+  });
+
+  test("a string that spells the import counts as adoption, as it did for the sweep", () => {
+    expect(of(P("glob-spelled-import.ts"), "glob")).toBe(0);
+  });
+
+  test("a read through the scan, and a raw read in a test that globs nothing, pass", () => {
+    expect(of(P("glob-scanned.ts"), "glob")).toBe(0);
+    expect(of(P("glob-none.ts"), "glob")).toBe(0);
+  });
+});
+
+describe("no-prisma-cursor", () => {
+  test.each([["cursor-direct.ts"], ["cursor-spread.ts"]])(
+    "a findMany paged by Prisma's cursor is refused (%s)",
+    (name) => {
+      expect(of(P(name), "cursor")).toBe(1);
+    },
+  );
+
+  test("a column named cursor in the where, and a payload outside a findMany, pass", () => {
+    expect(of(P("cursor-column.ts"), "cursor")).toBe(0);
+  });
+});

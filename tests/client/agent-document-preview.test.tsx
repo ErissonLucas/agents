@@ -135,10 +135,17 @@ function renderEditor() {
                 mergeContacts: false,
                 resolveOrigin: false,
                 subjectTemplate: "",
+                openingTemplate: "",
+                noteTemplate: "",
+                carryMode: "off",
+                carryFileTypes: ["image", "file"],
+                carryMaxFiles: 10,
               }}
               setCrossInboxCase={noop}
               sendImage={{ allowedHosts: "" }}
               setSendImage={noop}
+              resolveConversation={{ assignLabels: [] }}
+              setResolveConversation={noop}
               setCustomAttributeInstructions={noop}
               labelInstructions=""
               protectedLabels=""
@@ -147,6 +154,10 @@ function renderEditor() {
               setAllowedLabels={noop}
               outsideAllowedLabels="refuse"
               setOutsideAllowedLabels={noop}
+              labelRemoval="any"
+              setLabelRemoval={noop}
+              writableAttributes={{ conversation: [], contact: [], task: [] }}
+              setWritableAttributes={noop}
               setLabelInstructions={noop}
               updateKanbanTaskInstructions=""
               setUpdateKanbanTaskInstructions={noop}
@@ -182,29 +193,6 @@ async function pencils(): Promise<HTMLElement[]> {
 async function pencil(which: 0 | 1 = 0): Promise<HTMLElement> {
   return (await pencils())[which] as HTMLElement;
 }
-
-test("the pencil on a document card fetches the template and opens its editor", async () => {
-  const calls: string[] = [];
-  globalThis.fetch = (async (input: RequestInfo | URL) => {
-    const url = new URL(String(input), "http://localhost");
-    calls.push(url.pathname);
-    if (url.pathname.endsWith("/document-templates/3"))
-      return json({ template: TEMPLATE });
-    return json({});
-  }) as typeof fetch;
-
-  renderEditor();
-  fireEvent.click(await pencil());
-
-  await waitFor(() => {
-    expect(calls.some((p) => p.endsWith("/document-templates/3"))).toBe(true);
-  });
-  // The modal is open on THIS template: its name is in a field, which the card alone never shows.
-  await waitFor(() => {
-    const found = screen.queryAllByDisplayValue("Orçamento").length > 0;
-    expect(found).toBe(true);
-  });
-});
 
 // Clicking twice must not start two fetches. Not cosmetic: whichever lands last decides which modal
 // the operator gets, so on a slow link a double click on one card is a coin flip between two

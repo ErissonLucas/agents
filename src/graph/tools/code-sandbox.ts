@@ -17,34 +17,12 @@ import {
 } from "./zone-offset";
 
 // Runs the body of an operator-authored code tool (tools/code.ts) where it can compute and decide,
-// and cannot reach anything else (issue #363). The tool kind exists because a verdict left to the
-// model is periodically wrong even when every number it holds is right: the CPF case that opened
-// the issue had the two check digits computed correctly by `calculator` on every run and the model
-// still answering "does not match". A body the OPERATOR wrote once, that RETURNS the verdict, leaves
-// nothing for the model to compare and nothing for it to author: the model supplies arguments.
-//
-// Each call gets its own thread (code-sandbox.worker.ts) and the thread gets a fresh interpreter,
-// which costs 13–16 ms measured end to end and buys three things the in-thread design could not:
-//
-//   - A runaway snippet never stalls the process. The interpreter's deadline is a poll, and until
-//     it fires the CPU is busy; on the main thread that is the Chatwoot webhook's 5 s ack budget
-//     shared with every other tenant's turn. Measured with `while(true){}` in flight: a 50 ms timer
-//     on the main thread fired at 51 ms.
-//   - The interpreter's own failure is contained. With the stack ceiling set high enough, a runaway
-//     recursion overflowed the HOST stack before QuickJS could refuse it — a RangeError thrown out
-//     of WASM, and an assertion abort on the next dispose. In a thread that is a dead thread; in the
-//     process it is a corrupted module shared by every later call.
-//   - `terminate()` is a hard stop that does not depend on the interrupt being polled.
-//
-// The limits below are the measured safe values. The stack budget is the one the ENGINE must reach
-// before the thread's native stack does: the interrupt handler is a JS callback fired from inside
-// the WASM frames every 10k opcodes, and JSC refuses to enter it past a depth (~2,400 interpreter
-// frames on macOS) by throwing a RangeError through those frames. At 512 KiB the engine's own limit
-// sat past that depth, and the runaway-recursion test only passed when no interrupt happened to
-// fire deep — fewer than ~1,200 opcodes before the recursion; with more, `aborted`. At 448 KiB the
-// engine came first; 256 KiB (~1,340 honest frames) leaves half the measured room, and the worker
-// still maps the host's RangeError to the stack limit for a thread with less. The CPU deadline is
-// polled and lands within a few ms of the figure.
+// and cannot reach anything else. Each call gets its own thread (code-sandbox.worker.ts) and a fresh
+// interpreter: a runaway snippet never stalls the process (the deadline is a poll, and the main
+// thread holds the Chatwoot webhook's ack budget), an interpreter crash kills only that thread, and
+// `terminate()` is a hard stop. The stack limit must be hit by the engine before the thread's native
+// stack runs out (JSC throws a RangeError through the WASM frames past ~2,400 frames), hence 256
+// KiB. Design and limits: docs/graph.md, the `src/graph/tools/code.ts` entry.
 
 export {
   CODE_TOOL_CONTEXT_MAX_CHARS,
@@ -54,24 +32,34 @@ export {
   SANDBOX_STACK_BYTES,
   SANDBOX_TIMEOUT_MS,
 } from "./code-sandbox-limits";
-// How many sandbox threads may run at once, process-wide. Without a cap every call spawns its own
-// thread the moment it arrives — a ToolNode runs a turn's calls in parallel, and turns run in
-// parallel — and the ceiling is the machine's, not ours. Measured with 50 at once on an 18-core
-// machine: RSS 15 → 2,485 MB across three batches, and 4 of the 50 busy ones reported "unavailable"
-// because their thread had not even booted when the kill timer fired. n8n's task runner caps the
-// same thing at 10 per runner (N8N_RUNNERS_MAX_CONCURRENCY). Calls past the cap wait their turn,
-// and the deadline only starts once they have it. The same 50-at-once through this gate: RSS
-// peaked at 571 MB, and all 50 came back with their real outcome.
+// How many sandbox threads may run at once, process-wide. Uncapped, parallel tool calls and parallel
+// turns each spawn a thread on arrival, and a burst exhausts memory and starves threads of boot time
+// before the kill timer. Calls past the cap wait, and their deadline starts once they run.
 export const SANDBOX_MAX_CONCURRENCY = 8;
-// Boot (module load, ~6 ms measured) plus the deadline plus slack for a loaded machine, after
+// Boot (module load, a few ms) plus the deadline plus slack for a loaded machine, after
 // which the thread is killed whether or not the interrupt ever fired.
 const HARD_KILL_GRACE_MS = 1500;
 
 export type SandboxOutcome =
   // The code finished; `value` is the rendered return value (JSON where possible).
-  | { kind: "value"; value: string; logs: string[]; ms: number }
+  // `clippedFrom`, on this and on an error, is the length the value or the message had when it was
+  // cut to the budget, and is absent when nothing was cut.
+  | {
+      kind: "value";
+      value: string;
+      logs: string[];
+      ms: number;
+      clippedFrom?: number;
+    }
   // The code threw, or did not parse. The code's own fault, reported as such.
-  | { kind: "error"; name: string; message: string; logs: string[]; ms: number }
+  | {
+      kind: "error";
+      name: string;
+      message: string;
+      logs: string[];
+      ms: number;
+      clippedFrom?: number;
+    }
   // A limit stopped it. `aborted` is the interpreter giving up in a way its own error path did not
   // catch (the thread died); the code is still the cause.
   | {
@@ -147,10 +135,10 @@ export function localIsoNow(timezone: string, now: Date = new Date()): string {
   const fmt = zoneFormatter(resolveTimezone(timezone));
   const w = wallClock(fmt, now.getTime());
   const pad = (n: number, width = 2) => String(n).padStart(width, "0");
-  // NOTE: With the milliseconds: without them, `new Date(NOW_LOCAL)` was up to 999 ms before the
-  // instant it was written from, and the description promises the instant (PR #485, round 11).
+  // With the milliseconds, so `new Date(NOW_LOCAL)` is the instant itself, as the tool
+  // description promises, rather than up to 999 ms before it.
   const ms = now.getTime() - Math.floor(now.getTime() / 1000) * 1000;
-  // The expanded year of ISO 8601 outside 0000–9999, the spelling `new Date` reads back (round 21).
+  // The expanded ISO 8601 year outside 0000 to 9999, the spelling `new Date` reads back.
   const year =
     w.year >= 0 && w.year <= 9999
       ? pad(w.year, 4)
@@ -162,7 +150,7 @@ export function localIsoNow(timezone: string, now: Date = new Date()): string {
   return `${wall}${sign}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
 }
 
-const WORKER_URL = new URL("./code-sandbox.worker.ts", import.meta.url).href;
+const WORKER_URL = new URL("./code-sandbox.thread.ts", import.meta.url).href;
 
 export async function runSandboxedCode(
   code: string,
@@ -292,31 +280,51 @@ function asJsonText(value: unknown): string {
   return JSON.stringify(value === undefined ? null : value) ?? "null";
 }
 
+// What a result lost on its way to the model. `value` and `message` are cut by the thread at the
+// budget; `output` is the console block cut to what the main line leaves, and `output_dropped` is
+// that block left out entirely, the one cut nothing in the text marks.
+export type SandboxCut = "value" | "message" | "output" | "output_dropped";
+
 // The text the model reads for a value, and the text the operator reads for a failure. A value
-// puts the output first (it was produced first) and `Result:` last, where the model reads it; a
-// failure puts the reason FIRST, because the flow log keeps the first line of a failure as its
-// cause, and the output after it.
-//
-// The result or the reason is what the tool exists to deliver, so it is never the part that gets
-// cut: the output block is given whatever budget the main line leaves, and clipped on its own. A
-// single head-first clip over the whole text (the first version of this) let 4,000 characters of
-// `console.log` push the `Result:` line off the end (PR #485, round 1).
+// puts the output first and `Result:` last, where the model reads it; a failure puts the reason
+// FIRST, because the flow log keeps a failure's first line as its cause. The result or reason is
+// never cut: the output block gets whatever budget the main line leaves, so a flood of
+// `console.log` cannot push `Result:` off the end, as a single clip over the whole text would.
 export function formatSandboxResult(
   out: Exclude<SandboxOutcome, { kind: "unavailable" }>,
   opts: { timeoutMs?: number; memoryBytes?: number; maxChars?: number } = {},
 ): string {
+  return renderSandboxResult(out, opts).text;
+}
+
+// The same text, with what was cut from it on the way: the caller reports the cuts, since the model
+// reads `…[truncated]` as the end of the data.
+export function renderSandboxResult(
+  out: Exclude<SandboxOutcome, { kind: "unavailable" }>,
+  opts: { timeoutMs?: number; memoryBytes?: number; maxChars?: number } = {},
+): { text: string; cut: SandboxCut[]; chars?: number } {
   const timeoutMs = opts.timeoutMs ?? SANDBOX_TIMEOUT_MS;
   const memoryMb = Math.round(
     (opts.memoryBytes ?? SANDBOX_MEMORY_BYTES) / (1024 * 1024),
   );
   const maxChars = opts.maxChars ?? MODEL_RESPONSE_CHAR_LIMIT;
+  const cut: SandboxCut[] = [];
+  let chars: number | undefined;
   let main: string;
   switch (out.kind) {
     case "value":
       main = `Result: ${clipToModelLimit(out.value, maxChars).text}`;
+      if (out.clippedFrom !== undefined) {
+        cut.push("value");
+        chars = out.clippedFrom;
+      }
       break;
     case "error":
       main = `Error: ${clipText(out.name, 100)}: ${clipToModelLimit(out.message, maxChars).text}`;
+      if (out.clippedFrom !== undefined) {
+        cut.push("message");
+        chars = out.clippedFrom;
+      }
       break;
     case "limit":
       switch (out.limit) {
@@ -334,18 +342,29 @@ export function formatSandboxResult(
           break;
       }
   }
-  if (out.logs.length === 0) return main;
+  const done = (text: string) => ({
+    text,
+    cut,
+    ...(chars !== undefined ? { chars } : {}),
+  });
+  if (out.logs.length === 0) return done(main);
   const joined = out.logs.join("\n");
   const frame = "Output:\n\n\n".length + OUTPUT_TRUNCATED.length;
   const budget = maxChars - main.length - frame;
-  if (budget < 40) return main;
-  const body =
-    joined.length <= budget
-      ? joined
-      : `${clipText(joined, budget)}${OUTPUT_TRUNCATED}`;
-  return out.kind === "value"
-    ? `Output:\n${body}\n\n${main}`
-    : `${main}\n\nOutput:\n${body}`;
+  if (budget < 40) {
+    cut.push("output_dropped");
+    return done(main);
+  }
+  let body = joined;
+  if (joined.length > budget) {
+    cut.push("output");
+    body = `${clipText(joined, budget)}${OUTPUT_TRUNCATED}`;
+  }
+  return done(
+    out.kind === "value"
+      ? `Output:\n${body}\n\n${main}`
+      : `${main}\n\nOutput:\n${body}`,
+  );
 }
 
 const OUTPUT_TRUNCATED = "…[output truncated]";

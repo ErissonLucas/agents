@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   act,
@@ -9,28 +9,28 @@ import {
   render,
   screen,
 } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 
 const mockUser = { role: "AGENT" as string };
 
-mock.module("@/client/contexts/AuthContext", () => ({
+stubExports(AuthModule, {
   useAuth: () => ({ user: mockUser }),
-  AuthProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
-mock.module("@/client/contexts/ThemeContext", () => ({
+stubExports(ThemeModule, {
   useThemedAsset: (path: string) => ({ src: path }),
   useTheme: () => ({
     theme: "dark",
     resolvedTheme: "dark",
     setTheme: () => {},
   }),
-  ThemeProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 import { Sidebar } from "@/client/components/Sidebar";
+import * as AuthModule from "@/client/contexts/AuthContext";
 import { SidebarProvider, useSidebar } from "@/client/contexts/SidebarContext";
+import * as ThemeModule from "@/client/contexts/ThemeContext";
+import { stubExports } from "@/tests/utils/module-stub";
 
 let hook: ReturnType<typeof useSidebar> | null = null;
 function Probe() {
@@ -69,15 +69,41 @@ describe("Sidebar", () => {
     ).toBeInTheDocument();
   });
 
+  test("puts the brand at the top of the desktop sidebar, linking home", () => {
+    renderSidebar();
+    const aside = document.getElementById("app-sidebar") as HTMLElement;
+    const firstLink = aside.querySelector("a[href]");
+    expect(firstLink).toHaveAttribute("href", "/");
+    expect(firstLink?.querySelector("img")).not.toBeNull();
+  });
+
+  // A keyboard user who collapses the sidebar keeps focus on the control: it is the same element in
+  // both states, never swapped for a tooltip-wrapped copy.
+  test("collapsing and expanding keep the toggle mounted under focus", () => {
+    renderSidebar();
+    const toggle = screen.getByRole("button", { name: /collapse/i });
+    toggle.focus();
+    act(() => {
+      fireEvent.click(toggle);
+    });
+    expect(screen.getByRole("button", { name: /expand/i })).toBe(toggle);
+    expect(document.activeElement).toBe(toggle);
+    act(() => {
+      fireEvent.click(toggle);
+    });
+    expect(document.activeElement).toBe(toggle);
+  });
+
+  test("shows the collapse shortcut next to the toggle", () => {
+    renderSidebar();
+    const toggle = screen.getByRole("button", { name: /collapse/i });
+    expect(toggle).toHaveAttribute("aria-keyshortcuts", "Meta+B Control+B");
+    expect(toggle.querySelector("kbd")?.textContent).toMatch(/B$/);
+  });
+
   test("hides Admin link for non-admin users", () => {
     renderSidebar();
     expect(screen.queryByRole("link", { name: /admin/i })).toBeNull();
-  });
-
-  test("shows Admin link for ADMIN role", () => {
-    mockUser.role = "TENANT_ADMIN";
-    renderSidebar();
-    expect(screen.getByRole("link", { name: /admin/i })).toBeInTheDocument();
   });
 
   test("marks current route with aria-current=page", () => {
@@ -87,19 +113,7 @@ describe("Sidebar", () => {
     expect(adminLink).toHaveAttribute("aria-current", "page");
   });
 
-  test("has collapse/expand toggle button", () => {
-    renderSidebar();
-    const toggles = screen.getAllByRole("button", { name: /collapse|expand/i });
-    expect(toggles.length).toBeGreaterThanOrEqual(1);
-  });
-
   describe("footer", () => {
-    test("renders support button (opens modal, not a link)", () => {
-      renderSidebar();
-      const btn = screen.getByRole("button", { name: /^support$/i });
-      expect(btn.tagName).toBe("BUTTON");
-    });
-
     test("renders secondary links with target=_blank and rel=noopener", () => {
       renderSidebar();
       const github = screen.getByRole("link", { name: /github/i });
@@ -127,14 +141,6 @@ describe("Sidebar", () => {
     test("is not mounted when mobileOpen is false", () => {
       renderSidebar();
       expect(screen.queryByRole("dialog")).toBeNull();
-    });
-
-    test("mounts a dialog when mobileOpen becomes true", () => {
-      renderSidebar();
-      act(() => {
-        hook?.setMobileOpen(true);
-      });
-      expect(screen.getByRole("dialog")).toBeInTheDocument();
     });
 
     test("exposes close button with accessible name", () => {

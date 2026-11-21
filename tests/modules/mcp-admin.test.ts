@@ -21,11 +21,11 @@ import {
   scopesForRole,
   verifyAccessToken,
 } from "@/modules/mcp/oauth/tokens";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
-// The fleet principal these SUPER_ADMIN-only functions now take. It is what names the actor on the
-// row each of them appends (#400); the rows themselves are asserted in
-// `tests/modules/audit-actor-family.test.ts`.
+// The fleet principal these SUPER_ADMIN-only functions take. It names the actor on the row each of
+// them appends; the rows themselves are asserted in `tests/modules/audit-actor-family.test.ts`.
 const su9400: TenantContext = {
   tenantId: null,
   userId: 9400n,
@@ -74,8 +74,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

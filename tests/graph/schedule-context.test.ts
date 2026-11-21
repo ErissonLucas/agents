@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { loadAgentConfig } from "@/graph/prepare";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // NOTE: End-to-end wiring of the schedule variables: the agent's BusinessHours row → the system
@@ -28,8 +29,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -201,8 +202,8 @@ describe.skipIf(!dbUp)("schedule variables in the system prompt", () => {
   test("an unresolvable draft id falls through to always-on", async () => {
     // Console input. A row this tenant cannot read (or an id that is not one) must not silently fall
     // back to the saved schedule: the answer would then describe a config nobody selected.
-    // "99999999999999999999" is the one that used to reach the database: digits, so the old regex
-    // passed it, and past 2^63-1, so the query failed at BIND and took the whole turn with it.
+    // NOTE: "99999999999999999999" is digits, so a digits-only check passes it, and past 2^63-1, so
+    // reaching the database fails the query at BIND and takes the whole turn with it.
     for (const bogus of [
       "999999999",
       "../etc",

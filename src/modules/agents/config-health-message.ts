@@ -1,13 +1,8 @@
 import type { ConfigIssue } from "@/modules/agents/config-health";
 
-// The sentence for one configuration warning, in one place, because there are now two readers of it
-// and they are not both a browser. The copy itself stays in the locale catalogs — this decides WHICH
-// entry a given issue reads and what gets interpolated into it, which is the half that used to live
-// inside the editor component and could not be called from anywhere else.
-//
-// Translation is injected rather than imported: the console holds a live i18next instance bound to
-// the operator's language, and the server answers per request from the same catalogs with no
-// instance at all. A module that picked one of the two would make the other one wrong.
+// The sentence for one configuration warning, for the console and the server alike: which catalog
+// entry an issue reads and what is interpolated into it. Translation is injected, since the console has
+// a live i18next instance and the server resolves the same catalogs without one.
 
 export interface ConfigIssueMessageDeps {
   // (key, English fallback, interpolation values) → the sentence. Matches i18next's `t`, so the
@@ -25,6 +20,52 @@ export interface ConfigIssueMessageDeps {
   // How a timestamp is rendered for this reader. The console says "3 hours ago" in the operator's
   // language; a caller reading JSON wants the instant. Absent → the raw value.
   formatWhen?: (iso: string) => string;
+  // A monitoring agent answers no one, so what a broken chat model stops is its reading of the
+  // conversations it observes, and the sentence says that instead of "cannot reply".
+  watcher?: boolean;
+}
+
+function watcherModelMessage(
+  issue: ConfigIssue,
+  t: ConfigIssueMessageDeps["translate"],
+): string | null {
+  if (issue.key === "model" && issue.unresolved) {
+    return t(
+      "editor.configIssueWatcherModelUnresolved",
+      "The model credential no longer exists, so this agent cannot analyze the conversations it observes. Pick another one.",
+    );
+  }
+  if (issue.key === "model" && issue.wrongKind) {
+    return t(
+      "editor.configIssueWatcherModelWrongKind",
+      "The model credential is a type that cannot be used as an API key, so this agent cannot analyze the conversations it observes. Pick a credential that holds a single key.",
+    );
+  }
+  if (issue.pending) return null;
+  switch (issue.key) {
+    case "model":
+      return t(
+        "editor.configIssueWatcherModel",
+        "The model has no API key set, so this agent cannot analyze the conversations it observes.",
+      );
+    case "modelNotRunnable":
+      return t(
+        "editor.configIssueWatcherModelNotRunnable",
+        "This model configuration cannot be built, so this agent cannot analyze the conversations it observes. Check the provider and the model.",
+      );
+    case "modelNoEndpoint":
+      return t(
+        "editor.configIssueWatcherModelNoEndpoint",
+        "This model needs a base URL and has none, so it cannot be reached and this agent cannot analyze the conversations it observes.",
+      );
+    case "modelBadEndpoint":
+      return t(
+        "editor.configIssueWatcherModelBadEndpoint",
+        "The model's base URL is not an http(s) address, so every request goes nowhere and this agent cannot analyze the conversations it observes.",
+      );
+    default:
+      return null;
+  }
 }
 
 export function configIssueMessage(
@@ -63,7 +104,7 @@ export function configIssueMessage(
   }
   // A guardrail that HAS its credential and still could not run. The count is the whole point: the
   // panel's other lines describe a state ("no key set"), this one describes what already happened,
-  // and an operator has to be told that those turns went out unscreened rather than blocked.
+  // and an operator has to be told that those turns were not judged (let through, or held under hold).
   if (issue.key === "guardrailsFailing") {
     const params = {
       failures: issue.failures ?? 0,
@@ -73,25 +114,18 @@ export function configIssueMessage(
         : "-",
       error: deps.guardrailLastError ?? "",
     };
-    // The vendor's own words when they survived the write, generic advice when they did not. They
-    // are what separates "look at this" from "fix this": "400 temperature is not supported" names
-    // the setting, while a list of three things to check makes the operator try all of them.
-    //
-    // The line stops at what a failure row proves, which is less than it looks. It does not say
-    // the message went out unscreened: a failed input check leaves the output check free to screen
-    // the reply, and a split output analysis merges both halves, so it can carry an error from one
-    // and a violation from the other and still replace or suppress the send. All that is certain
-    // is fail-open, and it applies to the failed check alone: that one caught nothing and held
-    // nothing back.
+    // NOTE: The vendor's own words when they survived the write, since they name the setting. The
+    // sentence claims only what a failure row proves: that one check judged nothing. What happened to
+    // the message is `onFailure`'s, and the other check may still have screened it.
     return params.error
       ? t(
           "editor.configIssueGuardrailsFailingCause",
-          "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run caught nothing and held nothing back. The last one said: {{error}}",
+          "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run judged nothing: the message went on unchecked, or was held if “When a check cannot run” is set to hold. The last one said: {{error}}",
           params,
         )
       : t(
           "editor.configIssueGuardrailsFailing",
-          "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run caught nothing and held nothing back. Check “Guardrails model”, “Base URL” and “API key”.",
+          "Guardrails are on, but {{failures}} of the Checks could not run in the last {{hours}} hours (the most recent {{when}}). A check that could not run judged nothing: the message went on unchecked, or was held if “When a check cannot run” is set to hold. Check “Guardrails model”, “Base URL” and “API key”.",
           params,
         );
   }
@@ -112,6 +146,10 @@ export function configIssueMessage(
           { inboxes },
         );
   }
+  if (deps.watcher) {
+    const said = watcherModelMessage(issue, t);
+    if (said !== null) return said;
+  }
   if (issue.pending) {
     return t(
       `editor.configIssuePending.${issue.key}`,
@@ -124,9 +162,8 @@ export function configIssueMessage(
       "This credential no longer exists. Pick another one.",
     );
   }
-  // The credential is there and filled, and its TYPE cannot serve this field. Worth its own sentence
-  // because the other three all end in "fill it in" or "it is gone", and the move here is neither:
-  // the entry is fine, it just belongs somewhere else. Issue #471.
+  // NOTE: The credential is there and filled, but its TYPE cannot serve this field: the fix is to pick
+  // another entry, not to fill this one in.
   if (issue.wrongKind) {
     return t(
       `editor.configIssueWrongKind.${issue.key}`,

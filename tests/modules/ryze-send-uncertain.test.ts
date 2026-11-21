@@ -43,6 +43,7 @@ import {
   deliverReply,
   SPLIT_DEFAULTS,
 } from "@/modules/split/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { outboundUrl } from "../utils/outbound";
 import { burnSchedulerJobId } from "../utils/scheduler";
 import { ResolveThenReplyModel } from "../utils/scripted-models";
@@ -68,8 +69,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -484,6 +485,8 @@ describe.skipIf(!dbUp)(
         undefined,
         null,
         null,
+        true,
+        undefined,
         [
           { id: "b1", title: "Quero" },
           { id: "b2", title: "Depois" },
@@ -517,6 +520,8 @@ describe.skipIf(!dbUp)(
         undefined,
         null,
         null,
+        true,
+        undefined,
         null,
         [card(1), card(2)],
       );
@@ -1013,7 +1018,7 @@ describe.skipIf(!dbUp)(
           new ChatwootApiError(422, "POST"),
           undefined,
         ),
-      ).toEqual({ known: true, id: null });
+      ).toEqual({ known: true, id: null, refused: true });
       await expect(native.getRyzeSendState(77, "nativo-1")).rejects.toThrow(
         "not a RyzeAPI emulator client",
       );
@@ -1524,6 +1529,10 @@ describe.skipIf(!dbUp)(
         where: { tenantId, threadId },
         data: { lastFollowUpAt: new Date(Date.now() - 10 * 60_000) },
       });
+      // The delay also counts from the reply the read-back finds, so the emulator's rows move back too.
+      await suDb.$executeRaw`
+        UPDATE ryze_messages SET created_at = created_at - interval '10 minutes'
+         WHERE gateway_id = ${gatewayId} AND conversation_id = ${conversationId}`;
       await sweep();
       const job2 = await claimFollowUp();
       if (!job2) throw new Error("a new inbound should open a new episode");

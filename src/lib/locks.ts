@@ -26,10 +26,16 @@ export async function withEntityLock<T>(
 // runs with Promise.all in a SINGLE process (see setContactCustomAttributes in
 // src/modules/chatwoot/client.ts). A write racing in from another process is not covered.
 const keyedChains = new Map<string, Promise<unknown>>();
+// The entry at the TAIL of each queue that a later caller may join instead of queueing behind it,
+// when the entry said so by passing a `tail` token. Any call queued without one takes the tail away,
+// so a joiner is only ever merged with the entries that arrived right before it, never pulled ahead
+// of something queued in between.
+const keyedTails = new Map<string, object>();
 
 export function withKeyedQueue<T>(
   key: string,
   fn: () => Promise<T>,
+  tail?: object,
 ): Promise<T> {
   const prev = keyedChains.get(key) ?? Promise.resolve();
   const run = prev.then(fn);
@@ -40,12 +46,27 @@ export function withKeyedQueue<T>(
     () => {},
   );
   keyedChains.set(key, link);
+  if (tail === undefined) keyedTails.delete(key);
+  else keyedTails.set(key, tail);
   void link.then(() => {
     // Only the tail clears the entry, so the map does not accumulate one promise per entity for the
     // lifetime of the process.
-    if (keyedChains.get(key) === link) keyedChains.delete(key);
+    if (keyedChains.get(key) === link) {
+      keyedChains.delete(key);
+      keyedTails.delete(key);
+    }
   });
   return run;
+}
+
+// The joinable entry at the tail of `key`'s queue, if the last call queued there offered one.
+export function keyedQueueTail(key: string): object | undefined {
+  return keyedTails.get(key);
+}
+
+// An entry that can no longer be joined (its work has started) stops being offered.
+export function closeKeyedQueueTail(key: string, tail: object): void {
+  if (keyedTails.get(key) === tail) keyedTails.delete(key);
 }
 
 // The number of keys with work still queued. Exported for the test that pins the cleanup above.
@@ -67,4 +88,78 @@ export function shareInFlight<T>(
   const run = fn().finally(() => sharedFlights.delete(key));
   sharedFlights.set(key, run);
   return run;
+}
+
+// `shareInFlight` for work a caller may stop waiting for. Each caller waits under its own signal and
+// is let go when it aborts; the shared run gets its own signal, aborted only once every caller that
+// joined it has given up, so one caller's deadline never cuts the read another is still waiting on.
+// A caller with no signal waits to the end and keeps the run alive. A run being torn down is not
+// joined: the next caller starts a fresh one.
+interface AbortableFlight {
+  run: Promise<unknown>;
+  controller: AbortController;
+  waiting: number;
+  pinned: boolean;
+}
+const abortableFlights = new Map<string, AbortableFlight>();
+
+export function shareAbortableInFlight<T>(
+  key: string,
+  fn: (signal: AbortSignal) => Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  let flight = abortableFlights.get(key);
+  if (!flight) {
+    const controller = new AbortController();
+    const entry: AbortableFlight = {
+      run: Promise.resolve(),
+      controller,
+      waiting: 0,
+      pinned: false,
+    };
+    entry.run = fn(controller.signal).finally(() => {
+      if (abortableFlights.get(key) === entry) abortableFlights.delete(key);
+    });
+    // A run every caller left still settles; its rejection is nobody's to handle.
+    entry.run.catch(() => {});
+    abortableFlights.set(key, entry);
+    flight = entry;
+  }
+  const entry = flight;
+  const run = entry.run as Promise<T>;
+  const leave = (reason: unknown) => {
+    entry.waiting--;
+    if (entry.waiting === 0 && !entry.pinned) {
+      if (abortableFlights.get(key) === entry) abortableFlights.delete(key);
+      entry.controller.abort(reason);
+    }
+  };
+  if (!signal) {
+    entry.pinned = true;
+    return run;
+  }
+  entry.waiting++;
+  if (signal.aborted) {
+    leave(signal.reason);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      leave(signal.reason);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    run.then(
+      (v) => {
+        signal.removeEventListener("abort", onAbort);
+        entry.waiting--;
+        resolve(v);
+      },
+      (e) => {
+        signal.removeEventListener("abort", onAbort);
+        entry.waiting--;
+        reject(e);
+      },
+    );
+  });
 }

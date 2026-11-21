@@ -15,13 +15,35 @@ export interface SttRequest {
   apiKey: string;
   baseURL: string | null;
   fetchImpl: typeof fetch;
+  // The caller's deadline, on top of the provider timeout: a caller with a budget of its own (the
+  // snoozed reminder's media reads) stops a transcription that would outlast it.
+  signal?: AbortSignal;
+}
+
+// What the provider's own confidence said about the text, for the providers that report one, and
+// whether it withheld the text: silence and noise come back as fluent text in any language and
+// script, and the confidence is what tells them apart (docs/stt.md has the measurement).
+export type SttConfidence =
+  | { signal: "token_logprob" | "word_logprob"; meanLogprob: number }
+  | { signal: "segments"; segments: number; droppedSegments: number };
+
+export interface SttResult {
+  text: string;
+  confidence?: SttConfidence;
+  // None of the text is the customer's; `text` is empty.
+  withheld?: true;
 }
 
 export interface SttProvider {
   defaultModel: string;
   // openai-compatible requires an explicit baseURL (no public default endpoint).
   requiresBaseURL?: boolean;
-  transcribe(req: SttRequest): Promise<string>;
+  transcribe(req: SttRequest): Promise<SttResult>;
+}
+
+function sttSignal(req: SttRequest): AbortSignal {
+  const own = AbortSignal.timeout(STT_TIMEOUT_MS);
+  return req.signal ? AbortSignal.any([own, req.signal]) : own;
 }
 
 export class SttError extends Error {
@@ -56,27 +78,146 @@ function audioBlob(req: SttRequest): Blob {
   return new Blob([req.audio], { type: req.mimeType ?? "audio/ogg" });
 }
 
+// Below these the text is not taken as speech. Measured live (docs/stt.md): on gpt-4o-transcribe,
+// silence, noise and speech buried under noise averaged -1.39 or lower per token, clear speech -0.16
+// or higher; on Whisper, a segment of silence or noise reported a no-speech probability of 0.82 or
+// more, speech 0.69 or less. Scribe's word logprobs share the first floor: clear speech averaged
+// -0.65 or higher there, and speech buried under noise came back as fluent text between -0.46 and
+// -1.19, so on Scribe the floor catches only part of that.
+const MIN_MEAN_TOKEN_LOGPROB = -1.0;
+const MAX_SEGMENT_NO_SPEECH_PROB = 0.7;
+const MIN_SEGMENT_AVG_LOGPROB = -1.0;
+
+// The confidence each model family can report through the OpenAI shape: gpt-4o transcription models
+// return token logprobs on request, Whisper models per-segment probabilities in `verbose_json`. Any
+// other model is asked exactly as before, since a server may not know either parameter.
+function confidenceShapeFor(model: string): "logprobs" | "segments" | null {
+  const m = model.toLowerCase();
+  if (m.startsWith("gpt-4o") && m.includes("transcribe")) return "logprobs";
+  if (m.includes("whisper")) return "segments";
+  return null;
+}
+
+interface OpenAiTranscription {
+  text?: string;
+  logprobs?: Array<{ logprob?: number }>;
+  segments?: Array<{
+    text?: string;
+    no_speech_prob?: number;
+    avg_logprob?: number;
+  }>;
+}
+
+function judgeTranscription(json: OpenAiTranscription): SttResult {
+  const text = (json.text ?? "").trim();
+  const lps = (json.logprobs ?? [])
+    .map((t) => t.logprob)
+    .filter((lp): lp is number => typeof lp === "number");
+  if (lps.length > 0) {
+    const mean = lps.reduce((a, b) => a + b, 0) / lps.length;
+    const confidence: SttConfidence = {
+      signal: "token_logprob",
+      meanLogprob: Math.round(mean * 100) / 100,
+    };
+    if (mean < MIN_MEAN_TOKEN_LOGPROB) {
+      return { text: "", confidence, withheld: true };
+    }
+    return { text, confidence };
+  }
+  const segments = json.segments ?? [];
+  if (segments.length === 0) return { text };
+  const spoken = segments.filter(
+    (s) =>
+      !(
+        (s.no_speech_prob ?? 0) > MAX_SEGMENT_NO_SPEECH_PROB ||
+        (s.avg_logprob ?? 0) < MIN_SEGMENT_AVG_LOGPROB
+      ),
+  );
+  const confidence: SttConfidence = {
+    signal: "segments",
+    segments: segments.length,
+    droppedSegments: segments.length - spoken.length,
+  };
+  // Nothing dropped: the provider's own text, which carries its spacing. A compatible server may trim
+  // each segment, so a rebuilt text puts one space between them.
+  if (spoken.length === segments.length) return { text, confidence };
+  if (spoken.length === 0) return { text: "", confidence, withheld: true };
+  return {
+    text: spoken
+      .map((s) => (s.text ?? "").trim())
+      .filter(Boolean)
+      .join(" "),
+    confidence,
+  };
+}
+
 // OpenAI Whisper + any OpenAI-compatible endpoint (Groq, self-hosted faster-whisper, …).
-async function openaiTranscribe(req: SttRequest): Promise<string> {
+async function openaiTranscribe(req: SttRequest): Promise<SttResult> {
   const base = (req.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
-  const form = new FormData();
-  form.append("file", audioBlob(req), fileNameFor(req.mimeType));
-  form.append("model", req.model);
-  if (req.language) form.append("language", req.language);
-  const res = await req.fetchImpl(`${base}/audio/transcriptions`, {
-    method: "POST",
-    headers: { authorization: `Bearer ${req.apiKey}` },
-    body: form,
-    redirect: "error",
-    signal: AbortSignal.timeout(STT_TIMEOUT_MS),
-  });
+  const post = (shape: "logprobs" | "segments" | null) => {
+    const form = new FormData();
+    form.append("file", audioBlob(req), fileNameFor(req.mimeType));
+    form.append("model", req.model);
+    if (req.language) form.append("language", req.language);
+    if (shape === "logprobs") {
+      form.append("response_format", "json");
+      form.append("include[]", "logprobs");
+    } else if (shape === "segments") {
+      form.append("response_format", "verbose_json");
+    }
+    return req.fetchImpl(`${base}/audio/transcriptions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${req.apiKey}` },
+      body: form,
+      redirect: "error",
+      signal: sttSignal(req),
+    });
+  };
+  const shape = confidenceShapeFor(req.model);
+  let res = await post(shape);
+  // A compatible server that does not know the confidence parameters may refuse them; the
+  // transcription matters more than the confidence, so it is asked again the way it always was.
+  if (shape && res.status === 400) res = await post(null);
   if (!res.ok) throw new SttError("openai", res.status);
-  const json = (await res.json()) as { text?: string };
-  return (json.text ?? "").trim();
+  return judgeTranscription((await res.json()) as OpenAiTranscription);
+}
+
+interface ScribeTranscription {
+  text?: string;
+  words?: Array<{ type?: string; text?: string; logprob?: number | null }>;
+}
+
+// Scribe's transcript, judged. Audio events ("[silêncio]", "[ruído]", "[risos]") are not asked for,
+// and any that still come are dropped from the words: none of them is something the customer said,
+// and a note with no speech comes back as one alone. The words' mean logprob decides like the OpenAI
+// token logprob, under the same floor.
+function judgeScribe(json: ScribeTranscription): SttResult {
+  const words = json.words ?? [];
+  if (words.length === 0) return { text: (json.text ?? "").trim() };
+  const text = words
+    .filter((w) => w.type !== "audio_event")
+    .map((w) => w.text ?? "")
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim();
+  const lps = words
+    .filter((w) => w.type === "word")
+    .map((w) => w.logprob)
+    .filter((lp): lp is number => typeof lp === "number");
+  if (lps.length === 0) return { text };
+  const mean = lps.reduce((a, b) => a + b, 0) / lps.length;
+  const confidence: SttConfidence = {
+    signal: "word_logprob",
+    meanLogprob: Math.round(mean * 100) / 100,
+  };
+  if (mean < MIN_MEAN_TOKEN_LOGPROB) {
+    return { text: "", confidence, withheld: true };
+  }
+  return { text, confidence };
 }
 
 // ElevenLabs Scribe.
-async function elevenlabsTranscribe(req: SttRequest): Promise<string> {
+async function elevenlabsTranscribe(req: SttRequest): Promise<SttResult> {
   const base = (req.baseURL ?? "https://api.elevenlabs.io/v1").replace(
     /\/+$/,
     "",
@@ -85,21 +226,21 @@ async function elevenlabsTranscribe(req: SttRequest): Promise<string> {
   form.append("file", audioBlob(req), fileNameFor(req.mimeType));
   form.append("model_id", req.model);
   if (req.language) form.append("language_code", req.language);
+  form.append("tag_audio_events", "false");
   const res = await req.fetchImpl(`${base}/speech-to-text`, {
     method: "POST",
     headers: { "xi-api-key": req.apiKey },
     body: form,
     redirect: "error",
-    signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+    signal: sttSignal(req),
   });
   if (!res.ok) throw new SttError("elevenlabs", res.status);
-  const json = (await res.json()) as { text?: string };
-  return (json.text ?? "").trim();
+  return judgeScribe((await res.json()) as ScribeTranscription);
 }
 
 // Google Gemini: transcription via generateContent with the audio inlined as base64. The key goes in
 // the x-goog-api-key header (not the URL) to keep it out of logs.
-async function geminiTranscribe(req: SttRequest): Promise<string> {
+async function geminiTranscribe(req: SttRequest): Promise<SttResult> {
   const base = (
     req.baseURL ?? "https://generativelanguage.googleapis.com/v1beta"
   ).replace(/\/+$/, "");
@@ -132,7 +273,7 @@ async function geminiTranscribe(req: SttRequest): Promise<string> {
       },
       body: JSON.stringify(body),
       redirect: "error",
-      signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+      signal: sttSignal(req),
     },
   );
   if (!res.ok) throw new SttError("gemini", res.status);
@@ -140,10 +281,12 @@ async function geminiTranscribe(req: SttRequest): Promise<string> {
     candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
   };
   const parts = json.candidates?.[0]?.content?.parts ?? [];
-  return parts
-    .map((p) => p.text ?? "")
-    .join("")
-    .trim();
+  return {
+    text: parts
+      .map((p) => p.text ?? "")
+      .join("")
+      .trim(),
+  };
 }
 
 // OpenRouter transcription: dedicated audio API (launched 2026-05-01), JSON + base64 — NOT the
@@ -160,7 +303,7 @@ function audioFormatFor(mimeType: string | null): string {
   return "ogg";
 }
 
-async function openrouterTranscribe(req: SttRequest): Promise<string> {
+async function openrouterTranscribe(req: SttRequest): Promise<SttResult> {
   const base = (req.baseURL ?? "https://openrouter.ai/api/v1").replace(
     /\/+$/,
     "",
@@ -181,11 +324,11 @@ async function openrouterTranscribe(req: SttRequest): Promise<string> {
     },
     body: JSON.stringify(body),
     redirect: "error",
-    signal: AbortSignal.timeout(STT_TIMEOUT_MS),
+    signal: sttSignal(req),
   });
   if (!res.ok) throw new SttError("openrouter", res.status);
   const json = (await res.json()) as { text?: string };
-  return (json.text ?? "").trim();
+  return { text: (json.text ?? "").trim() };
 }
 
 // AssemblyAI: upload the raw bytes, submit a transcript job for the returned URL, then poll the job
@@ -195,7 +338,7 @@ async function openrouterTranscribe(req: SttRequest): Promise<string> {
 export function makeAssemblyaiTranscribe(opts: {
   budgetMs: number;
   pollDelaysMs: readonly number[];
-}): (req: SttRequest) => Promise<string> {
+}): (req: SttRequest) => Promise<SttResult> {
   return async (req) => {
     const base = (req.baseURL ?? "https://api.assemblyai.com/v2").replace(
       /\/+$/,
@@ -248,7 +391,9 @@ export function makeAssemblyaiTranscribe(opts: {
       await Bun.sleep(delay);
       const state = await call(pollUrl, { method: "GET" });
       if (state.status === "completed")
-        return (typeof state.text === "string" ? state.text : "").trim();
+        return {
+          text: (typeof state.text === "string" ? state.text : "").trim(),
+        };
       if (state.status === "error")
         throw new SttError("assemblyai", 502, "transcript_error");
     }
@@ -277,7 +422,7 @@ export function cleanFishTranscript(text: string): string {
 export function makeFishTranscribe(opts: {
   budgetMs: number;
   retryDelayMs: number;
-}): (req: SttRequest) => Promise<string> {
+}): (req: SttRequest) => Promise<SttResult> {
   return async (req) => {
     const base = (req.baseURL ?? "https://api.fish.audio/v1").replace(
       /\/+$/,
@@ -308,7 +453,9 @@ export function makeFishTranscribe(opts: {
     if (!res.ok)
       throw new SttError("fish", res.status, FISH_ERROR_REASON[res.status]);
     const json = (await res.json()) as { text?: unknown };
-    return cleanFishTranscript(typeof json.text === "string" ? json.text : "");
+    return {
+      text: cleanFishTranscript(typeof json.text === "string" ? json.text : ""),
+    };
   };
 }
 

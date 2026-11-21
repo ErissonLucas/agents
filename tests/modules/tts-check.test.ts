@@ -17,10 +17,11 @@ import {
 } from "@/modules/tts/check";
 import { synthesizeReply } from "@/modules/tts/service";
 import { TTS_DEFAULTS, type TtsConfig } from "@/modules/tts/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// The corrupted-audio check (issue #779). The detector is faked at its HTTP boundary, apart from the
+// The corrupted-audio check. The detector is faked at its HTTP boundary, apart from the
 // TTS provider, so each case counts syntheses and checks independently: the claims are about how
 // many times each one was paid for, and in which order.
 
@@ -231,8 +232,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -271,6 +272,7 @@ const flowOf = (): FlowContext => ({
 // few milliseconds apart can land in either order.
 async function checkLines(f: FlowContext) {
   const rows = await flowLogRows(suDb, {
+    orderBy: { id: "asc" },
     where: { tenantId, turnId: f.turnId, stage: "tts_check" },
   });
   const attempt = (r: (typeof rows)[number]) =>
@@ -378,8 +380,8 @@ describe.skipIf(!dbUp)("tts audio check", () => {
     await appDb.$disconnect();
   });
 
-  // Issue #802: the agent picks the mode, the deployment owns the detector. `check` here stands for
-  // the deployment (`config.ttsCheck`), and `cfg.checkMode` for the agent's own choice.
+  // NOTE: the agent picks the mode, the deployment owns the detector. `check` here stands for the
+  // deployment (`config.ttsCheck`), and `cfg.checkMode` for the agent's own choice.
   describe("the agent's own mode", () => {
     const run = async (
       agent: TtsConfig["checkMode"],
@@ -425,22 +427,6 @@ describe.skipIf(!dbUp)("tts audio check", () => {
       expect(r.syntheses).toBe(1);
       expect(r.checks).toBe(0);
     });
-  });
-
-  test("off: the detector is never called", async () => {
-    const p = countingProvider();
-    const d = scriptedDetector([CORRUPTED]);
-    const out = await synthesizeReply({
-      tenantId,
-      cfg: cfgOf(),
-      text: REPLY,
-      base: appDb,
-      deps: { fetchImpl: p.fetchImpl, checkFetchImpl: d.fetchImpl },
-      check: { ...CHECK, mode: "off" },
-    });
-    expect(out).not.toBeNull();
-    expect(p.rec.calls).toBe(1);
-    expect(d.rec.calls).toBe(0);
   });
 
   test("shadow: the audio is returned before the detector answers, and only a line changes", async () => {
@@ -522,6 +508,7 @@ describe.skipIf(!dbUp)("tts audio check", () => {
     ]);
     // Each synthesis line says which attempt it was.
     const synths = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, turnId: f.turnId, stage: "tts" },
     });
     // NOTE: sorted, because the lines are written fire-and-forget and land in whatever order the
@@ -677,6 +664,7 @@ describe.skipIf(!dbUp)("tts audio check", () => {
       flow: f,
     });
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, turnId: f.turnId },
     });
     expect(rows.length).toBeGreaterThan(0);

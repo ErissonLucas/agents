@@ -2,15 +2,18 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { parseRepriceArgs, UsageError } from "@/../scripts/reprice-usage";
+import { readPriceOverrides } from "@/modules/pricing/overrides";
 import { callCostUsd, priceCall } from "@/modules/pricing/price";
 import {
   capturePricer,
   planReprice,
   runReprice,
+  UNMETERED_PRICE_TABLE,
 } from "@/modules/pricing/reprice";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #867: an operator re-prices ledger rows with the table in the tree now, when the table that
+// An operator re-prices ledger rows with the table in the tree now, when the table that
 // priced them was wrong. Dry run by default; `apply` writes only the rows whose figure changes and
 // stamps them with the current table; a row the table cannot price is left as it was and counted;
 // each row is priced at its own `created_at`; and the tenant, period and `price_table` filters hold.
@@ -31,8 +34,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -68,6 +71,7 @@ async function seed(s: Seed = {}) {
       promptTokens: s.input ?? 10_000,
       cachedReadTokens: s.cached ?? 4_000,
       cacheCreationTokens: s.written ?? 0,
+      cacheCreation1hTokens: 0,
       completionTokens: s.output ?? 2_000,
       costUsd: s.cost === undefined ? WRONG : s.cost,
       priceTable: s.table === undefined ? OLD : s.table,
@@ -95,6 +99,7 @@ const priced = (at: string, provider = "deepseek") =>
         promptTokens: 10_000,
         cachedReadTokens: 4_000,
         cacheCreationTokens: 0,
+        cacheCreation1hTokens: 0,
         completionTokens: 2_000,
       },
       new Date(at),
@@ -136,6 +141,41 @@ describe("arguments", () => {
     ).toThrow(/--model is required/);
   });
 
+  test("the decisions engine's classification API can be overridden and repriced like a model", () => {
+    const block = readPriceOverrides({
+      priceOverrides: {
+        overrides: [
+          { provider: "typesafe", model: "jev-latest", input: 0.03, output: 0 },
+        ],
+      },
+    });
+    expect(block.overrides).toHaveLength(1);
+    const priced = priceCall(
+      "typesafe",
+      "jev-latest",
+      {
+        promptTokens: 1_000_000,
+        cachedReadTokens: 0,
+        cacheCreationTokens: 0,
+        cacheCreation1hTokens: 0,
+        completionTokens: 0,
+      },
+      new Date(),
+      block,
+    );
+    expect(priced.costUsd).toBeCloseTo(0.03, 9);
+    expect(() =>
+      parseRepriceArgs([
+        "--tenant",
+        "1",
+        "--provider",
+        "typesafe",
+        "--model",
+        "jev-latest",
+      ]),
+    ).not.toThrow();
+  });
+
   test("an unknown provider is refused up front", () => {
     expect(() =>
       parseRepriceArgs([
@@ -149,8 +189,8 @@ describe("arguments", () => {
     ).toThrow(/--provider must be one of/);
   });
 
-  // The table has no price for an openai-compatible server, but a tenant's own price does, and
-  // pricing those rows after the price is saved is one of the reasons the command exists (review).
+  // NOTE: the table has no price for an openai-compatible server, but a tenant's own price does, and
+  // pricing those rows after the price is saved is one of the reasons the command exists.
   test("a model only a tenant's own price covers is accepted", () => {
     expect(
       parseRepriceArgs([
@@ -172,6 +212,12 @@ describe("arguments", () => {
       expect(
         parseRepriceArgs([...base, "--price-table", stamp]).priceTable,
       ).toBe(stamp);
+  });
+
+  test("`--price-table unmetered` is refused: those calls reported no tokens", () => {
+    expect(() =>
+      parseRepriceArgs([...base, "--price-table", UNMETERED_PRICE_TABLE]),
+    ).toThrow(UsageError);
   });
 
   test("dry run unless --apply; `none` targets the rows no table priced", () => {
@@ -210,6 +256,7 @@ describe("the plan", () => {
       promptTokens: 10_000,
       cachedReadTokens: 4_000,
       cacheCreationTokens: 0,
+      cacheCreation1hTokens: 0,
       completionTokens: 2_000,
       costUsd: null,
       priceTable: null,
@@ -314,10 +361,10 @@ describe.skipIf(!dbUp)("re-pricing the ledger (issue #867)", () => {
     expect(await read(after)).toEqual({ cost: WRONG, table: OLD });
   });
 
-  // Issues #865 and #866: a figure the table never gave is not the table's to correct.
-  // Issues #865 and #866: each row is priced as the capture would price it now. A tenant's price
-  // saved after the fact comes first, OpenRouter's figure included; without one, what OpenRouter
-  // charged stands and the table re-prices only what it priced.
+  // NOTE: a figure the table never gave is not the table's to correct: each row is priced as the
+  // capture would price it now. A tenant's price saved after the fact comes first, OpenRouter's
+  // figure included; without one, what OpenRouter charged stands and the table re-prices only what
+  // it priced.
   test("a tenant's price saved after the fact re-prices its rows, and OpenRouter's figure stands without one", async () => {
     await clear();
     const block = {
@@ -360,6 +407,7 @@ describe.skipIf(!dbUp)("re-pricing the ledger (issue #867)", () => {
           promptTokens: 10_000,
           cachedReadTokens: 4_000,
           cacheCreationTokens: 0,
+          cacheCreation1hTokens: 0,
           completionTokens: 2_000,
         },
         new Date(PEAK),
@@ -523,6 +571,46 @@ describe.skipIf(!dbUp)("re-pricing the ledger (issue #867)", () => {
     expect(await read(noTable)).toEqual({
       cost: priced(PEAK),
       table: PRICE_TABLE_VERSION,
+    });
+  });
+
+  test("an unmetered row keeps its unknown cost: its zero tokens are no count of the call", async () => {
+    await clear();
+    const metered = await seed();
+    const unmetered = await seed({
+      table: UNMETERED_PRICE_TABLE,
+      cost: null,
+      input: 0,
+      cached: 0,
+      output: 0,
+    });
+    const report = await runReprice(suDb, {
+      tenant: tA,
+      provider: "deepseek",
+      model: MODEL,
+      apply: true,
+    });
+    expect(report.groups[0]?.matched).toBe(1);
+    expect(await read(metered)).toEqual({
+      cost: priced(PEAK),
+      table: PRICE_TABLE_VERSION,
+    });
+    expect(await read(unmetered)).toEqual({
+      cost: null,
+      table: UNMETERED_PRICE_TABLE,
+    });
+    await expect(
+      runReprice(suDb, {
+        tenant: tA,
+        provider: "deepseek",
+        model: MODEL,
+        priceTable: UNMETERED_PRICE_TABLE,
+        apply: true,
+      }),
+    ).rejects.toThrow("no tokens to price");
+    expect(await read(unmetered)).toEqual({
+      cost: null,
+      table: UNMETERED_PRICE_TABLE,
     });
   });
 

@@ -1,16 +1,20 @@
 import { describe, expect, test } from "bun:test";
-import { asProviderFailure, providerFailure } from "@/lib/provider-failure";
+import {
+  asProviderFailure,
+  failsUntilAccountFixed,
+  failsUntilAccountFixedAt,
+  providerFailure,
+} from "@/lib/provider-failure";
+import { ChatwootApiError } from "@/modules/chatwoot/client";
 
 // The decision table for what a provider failure may say once it leaves the call that made it. It
-// lives beside the rule rather than beside any one caller, which is the whole point of the move: the
-// same question is asked at every provider boundary in the tree, and a rule written once per call
-// site is a rule the next call site is born without.
+// lives beside the rule, not beside a caller: every provider boundary asks the same question, and a
+// rule written once per call site is one the next call site is born without.
 describe("providerFailure", () => {
-  // NOTHING THE SERVER AUTHORED reaches the line — which is a stronger rule than "no prose", and the
-  // weaker one is what an earlier revision shipped. `code` and `type` are vendor error identifiers by
-  // convention only; the value is chosen by the server, this product accepts an arbitrary
-  // OpenAI-compatible endpoint, and a bare token is exactly the shape of a phone number, a CPF or a
-  // first name. So the fields are gone, not filtered.
+  // NOTE: NOTHING THE SERVER AUTHORED reaches the line, a stronger rule than "no prose". `code` and `type`
+  // are vendor identifiers by convention only: the server chooses the value, the product accepts any
+  // OpenAI-compatible endpoint, and a bare token is the shape of a phone number, a CPF or a first
+  // name. So the fields are dropped, not filtered.
   test("nothing the provider authored reaches the line, however clean it looks", () => {
     const marker = "carambola-com-manjericao-8812";
     // A single bare token in `code`: no whitespace, no prose, and it would have passed a shape test.
@@ -26,30 +30,27 @@ describe("providerFailure", () => {
     expect(tokenised).not.toContain("invalid_request_error");
     expect(tokenised).toBe("HTTP 400");
 
-    // The status is read from the client's NUMBER field and nowhere else. Digging it out of the text
-    // was an earlier revision, and the digits were never the point: a 4xx-shaped number in a message
-    // that echoes the transcript is the customer's PIN or their invoice total far more often than it is
-    // a transport status, and naming a status the provider never returned sends the operator to the
-    // wrong thing to fix.
+    // The status is read from the client's NUMBER field only, never from the text: a 4xx-shaped
+    // number in a message that echoes the transcript is more often the customer's PIN or invoice
+    // total, and naming a status the provider never returned sends the operator to the wrong fix.
     const rethrown = providerFailure(
       new Error(`Request failed with status 429 while processing "${marker}"`),
     );
     expect(rethrown).not.toContain(marker);
     expect(rethrown).toBe("provider error");
 
-    // `name` reads like the SDK's class and is a plain writable property, so a wrapper can assign a
-    // transcript-derived token to it — and a BARE one is exactly what would have survived a shape test.
-    // The field is not read at all now, which is the same answer `code` and `type` got.
+    // `name` reads like the SDK's class but is a plain writable property, so a wrapper can put a
+    // BARE transcript-derived token in it that a shape test would pass. Like `code` and `type`, it is
+    // not read.
     const wrapped = providerFailure(
       Object.assign(new Error("boom"), { name: marker, status: 500 }),
     );
     expect(wrapped).not.toContain(marker);
     expect(wrapped).toBe("HTTP 500");
 
-    // `status` is admissible because the client PARSED it into a number, and a number cannot carry a
-    // transcript — so the type check is the whole of the guarantee, not a tidiness. It is not
-    // hypothetical either: Google's error body puts a string in `status` (`INVALID_ARGUMENT`), so a
-    // wrapper copying that field across lands a server-authored string in it.
+    // `status` is admissible because the client PARSED it into a number, which cannot carry a
+    // transcript, so the type check is the whole guarantee. Google's error body puts a string in
+    // `status` (`INVALID_ARGUMENT`), so a wrapper copying that field lands server text in it.
     const stringStatus = providerFailure(
       Object.assign(new Error("boom"), { status: `REJECTED_${marker}` }),
     );
@@ -65,11 +66,9 @@ describe("providerFailure", () => {
       providerFailure(Object.assign(new Error("boom"), { statusCode: 503 })),
     ).toBe("HTTP 503");
 
-    // A number is admissible because it cannot carry a transcript — which covers a number that IS a
-    // status and nothing else. `HTTP NaN` was never in the vocabulary this promises, and 0 (never
-    // connected) and a figure lifted out of the body are not statuses either.
-    // 429.5 is the one that isolates the integer check: every other value here is already refused by
-    // the range, so without it the list passes and `HTTP 429.5` ships.
+    // NOTE: Only an integer in the HTTP status range is a status: not NaN, not 0 (never connected),
+    // not a figure lifted out of the body. 429.5 isolates the integer check: every other value here
+    // fails the range, so without it the list passes and `HTTP 429.5` ships.
     for (const notAStatus of [0, Number.NaN, 429.5, 3.7, 4500, -1, 99]) {
       expect(
         providerFailure(
@@ -91,9 +90,9 @@ describe("providerFailure", () => {
     expect(opaque).toBe("provider error");
   });
 
-  // The one reading of "it timed out" that the other side does not write. `AbortSignal.timeout` rejects
-  // with a DOMException whose name is "TimeoutError" — a tell living in the same writable field the
-  // rule above stopped trusting — so the signal itself is what decides, and the summariser holds it.
+  // NOTE: the one reading of "it timed out" that the other side does not write. `AbortSignal.timeout` rejects
+  // with a DOMException named "TimeoutError", a tell in the same writable field the rule above does
+  // not trust, so the signal itself decides, and the summariser holds it.
   test("a summariser that ran out of time says so, from our own signal", () => {
     const marker = "carambola-com-manjericao-8812";
     const controller = new AbortController();
@@ -119,9 +118,9 @@ describe("providerFailure", () => {
       ).toBe("timeout");
     }
 
-    // The SDKs raise a CLASS and leave `name` at "Error", with no status either, so reading `name`
-    // alone reported a real timeout as "provider error" (round 5). Measured against both clients:
-    // `APIConnectionTimeoutError` on each. Matched by suffix, so the next client needs no entry.
+    // Both SDKs raise a CLASS (`APIConnectionTimeoutError`) and leave `name` at "Error" with no
+    // status, so reading `name` alone reports a real timeout as "provider error". Matched by suffix,
+    // so the next client needs no entry.
     class APIConnectionTimeoutError extends Error {}
     const sdkTimeout = new APIConnectionTimeoutError(
       `Request timed out while sending ${marker}`,
@@ -150,10 +149,9 @@ describe("providerFailure", () => {
     expect(lying).toBe("provider error");
   });
 
-  // What the boundaries actually throw. The message is the vocabulary above; the original survives as
-  // `cause`, which is what keeps this a RELOCATION rather than a deletion — the process log makes no
-  // PII promise and is not exported by any product surface, so the vendor's own words stay readable
-  // exactly where they are allowed to be.
+  // NOTE: what the boundaries throw. The message is the vocabulary above; the original survives as `cause`,
+  // a RELOCATION rather than a deletion: the process log makes no PII promise and no product surface
+  // exports it, so the vendor's words stay readable where they are allowed to be.
   test("the thrown error carries our words, and keeps the provider's as the cause", () => {
     const marker = "carambola-com-manjericao-8812";
     const original = Object.assign(
@@ -166,10 +164,9 @@ describe("providerFailure", () => {
     expect(thrown.cause).toBe(original);
   });
 
-  // Idempotence is not a tidiness here: the compaction job reduces a second time because it holds a
-  // better reading of "it timed out", and without the status riding along that second pass would
-  // downgrade `HTTP 429` to "provider error" — losing the one distinction an operator acts on, on the
-  // lane that motivated the whole rule.
+  // NOTE: the compaction job reduces a second time because it holds a better reading of "it timed out";
+  // without the status riding along, that pass would downgrade `HTTP 429` to "provider error", losing
+  // the one distinction an operator acts on.
   test("reducing an already-reduced failure keeps the status", () => {
     const once = asProviderFailure(
       Object.assign(new Error("rate limited"), { status: 429 }),
@@ -178,11 +175,121 @@ describe("providerFailure", () => {
     expect(asProviderFailure(once).message).toBe("HTTP 429");
   });
 
+  // And a timeout: the wrapper's name is plain "Error", so a second reading (the stage around a model
+  // call) would otherwise call it a "provider error", and a provider timing out would never be a rate.
+  test("reducing an already-reduced timeout keeps the timeout", () => {
+    const once = asProviderFailure(
+      Object.assign(new Error("deadline"), { name: "TimeoutError" }),
+    );
+    expect(once.name).toBe("Error");
+    expect(providerFailure(once)).toBe("timeout");
+    expect(asProviderFailure(once).message).toBe("timeout");
+    // Only the wrapper built for a timeout: an error that merely says the word is not one.
+    expect(providerFailure(new Error("timeout"))).toBe("provider error");
+  });
+
   // A failure with no status at all stays anonymous through the wrapper, so nothing downstream can
   // read a status that never existed.
   test("a connection that never opened carries no status", () => {
     const thrown = asProviderFailure(new Error("ECONNREFUSED"));
     expect(thrown.message).toBe("provider error");
     expect((thrown as unknown as { status?: unknown }).status).toBeUndefined();
+  });
+});
+
+// Which provider failures the scheduler stops retrying: the ones the provider will repeat until a
+// person acts on the account. Everything else keeps its retries, a quota that clears on its own first.
+describe("failsUntilAccountFixed", () => {
+  const err = (message: string, fields: Record<string, unknown>) =>
+    Object.assign(new Error(message), fields);
+  const cases: Array<[string, Error, boolean]> = [
+    [
+      "OpenAI out of credit",
+      err("You exceeded your current quota", {
+        status: 429,
+        code: "insufficient_quota",
+      }),
+      true,
+    ],
+    [
+      "an OpenAI-compatible body carrying the code",
+      err("quota", { status: 429, error: { code: "insufficient_quota" } }),
+      true,
+    ],
+    [
+      "Anthropic out of credit",
+      err(
+        "400 Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing",
+        { status: 400 },
+      ),
+      true,
+    ],
+    [
+      "OpenRouter out of credit",
+      err("Insufficient credits", { status: 402 }),
+      true,
+    ],
+    [
+      "OpenRouter's in-flight budget, with Retry-After",
+      err("Insufficient credits", {
+        status: 402,
+        headers: new Headers({ "retry-after": "5" }),
+      }),
+      false,
+    ],
+    [
+      "the same, with the headers as a plain object",
+      err("Insufficient credits", {
+        status: 402,
+        headers: { "retry-after": "5" },
+      }),
+      false,
+    ],
+    ["an invalid key", err("Incorrect API key", { status: 401 }), true],
+    ["a key without access", err("forbidden", { status: 403 }), true],
+    [
+      "Gemini's quota, daily or per minute alike",
+      err("You exceeded your current quota, please check your plan", {
+        status: 429,
+        code: "RESOURCE_EXHAUSTED",
+      }),
+      false,
+    ],
+    ["a rate limit", err("Rate limit reached", { status: 429 }), false],
+    [
+      "another 400",
+      err("400 messages: field required", { status: 400 }),
+      false,
+    ],
+    ["an overload", err("overloaded", { status: 529 }), false],
+    ["no status at all", err("socket hang up", {}), false],
+  ];
+  test("the provider's own error, row by row", () => {
+    for (const [name, e, expected] of cases)
+      expect([name, failsUntilAccountFixedAt(e)]).toEqual([name, expected]);
+  });
+
+  test("downstream, only through the wrapper the provider boundary built", () => {
+    for (const [name, e, expected] of cases) {
+      const wrapped = asProviderFailure(e);
+      expect([name, failsUntilAccountFixed(wrapped)]).toEqual([name, expected]);
+      // Further up, under another error that keeps it as its cause.
+      const outer = new Error("turn failed", { cause: wrapped });
+      expect([name, failsUntilAccountFixed(outer)]).toEqual([name, expected]);
+      // A second pass over the wrapper (a caller that reduces again) keeps the answer, though the
+      // provider's `code` is not copied onto the wrapper.
+      expect([
+        name,
+        failsUntilAccountFixed(asProviderFailure(wrapped)),
+      ]).toEqual([name, expected]);
+    }
+  });
+
+  test("a failure that did not come out of a model call is never one", () => {
+    expect(failsUntilAccountFixed(err("bad key", { status: 401 }))).toBe(false);
+    expect(
+      failsUntilAccountFixed(new ChatwootApiError(401, "GET /conversations/1")),
+    ).toBe(false);
+    expect(failsUntilAccountFixed("HTTP 401")).toBe(false);
   });
 });

@@ -2,7 +2,8 @@ import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { parseDbId } from "@/lib/db-id";
-import { AppError, NotFoundError } from "@/lib/errors";
+import { AppError, NotFoundError, quotingReason } from "@/lib/errors";
+import { isUniqueViolation } from "@/lib/pg-error";
 import { sanitizeErrorMessage } from "@/lib/redact";
 import { assertSafeOutboundUrl, SsrfError } from "@/lib/ssrf";
 import {
@@ -32,16 +33,12 @@ import {
   type SourceFence,
   updateDocument,
 } from "./documents";
+import { SYNC_INTERVAL_MINUTES } from "./ranges";
 
-// A knowledge base that mirrors a Chatwoot help center portal (issue #794).
-//
-// The platform owns the link between an article and its document: `KnowledgeDocument.externalId`
-// is the article id, unique per base. Nothing outside keeps a map, so nothing can lose it, and a
-// reconcile is a set comparison by id — never by title, which is what produced duplicates when two
-// articles shared one, and copies of the whole base when an outside map went missing.
-//
-// Only documents that carry an external id are the sync's. Everything else in the base (a curated
-// note, an approved suggestion) is never read, compared, or touched by it.
+// A knowledge base that mirrors a Chatwoot help center portal. The platform owns the link between an
+// article and its document: `KnowledgeDocument.externalId` is the article id, unique per base, so a
+// reconcile is a set comparison by id, never by title (two articles may share one). Only documents
+// with an external id are the sync's; everything else in the base is never read or touched by it.
 
 export const SOURCE_KINDS = ["chatwoot_portal"] as const;
 export type SourceKind = (typeof SOURCE_KINDS)[number];
@@ -72,15 +69,14 @@ export interface SourceState {
   lastSyncAt: Date | null;
   lastStatus: string | null;
   lastMessage: string | null;
-  // The last run stopped at its write budget and the next one, a few seconds away, continues it
-  // (issue #798). A reader watching a sync land needs this to know the landed run is not the end;
-  // the scheduled row is the only place it is written, so it is read from there.
+  // The last run stopped at its write budget and the next one, a few seconds away, continues it. Only
+  // the scheduled row records this, so a reader watching a sync land reads it from there.
   continuing: boolean;
 }
 
 const DEFAULT_INTERVAL_MINUTES = 10;
-const MIN_INTERVAL_MINUTES = 5;
-const MAX_INTERVAL_MINUTES = 24 * 60;
+const MIN_INTERVAL_MINUTES = SYNC_INTERVAL_MINUTES.min;
+const MAX_INTERVAL_MINUTES = SYNC_INTERVAL_MINUTES.max;
 
 // A portal with more articles than this is not a help center the agent should be reading whole, and
 // the listing arrives in one body, so its size is bounded too.
@@ -199,13 +195,17 @@ export async function parseSourceInput(
     // (`EAI_AGAIN`) is the infrastructure's, and reporting it as an invalid field would tell the
     // operator to change a URL that is fine.
     if (err instanceof SsrfError) {
-      throw new AppError(
+      const refusal = new AppError(
         `baseUrl is not allowed: ${err.message}`,
         400,
         "errors.sourceUrlNotAllowed",
         { reason: err.message },
         "baseUrl",
       );
+      // The guard's reason without its English frame, in the caller's language like the sentence.
+      throw typeof err.reason === "string"
+        ? refusal
+        : quotingReason(refusal, err.reason);
     }
     throw err;
   }
@@ -520,15 +520,11 @@ interface RawArticle {
   link?: unknown;
 }
 
-// Every published article of the portal, in ONE request, or a throw.
-//
-// Without `per_page` the public listing is not paginated at all: `limit_results` only pages when the
-// parameter is present, and the answer is every published article of the locale. That is the only
-// complete answer it has. Paging it is not: the listing orders by `position` alone, which each
-// category numbers on its own, so ties across categories straddle page boundaries and an offset page
-// repeats one article and skips another with nothing changing on the portal. A missing article reads
-// as deleted, so the listing is taken whole, checked against the count the portal declares, and a
-// mismatch is an error that deletes nothing.
+// Every published article of the portal, in ONE request, or a throw. Without `per_page` the public
+// listing returns every published article of the locale. Paging is not safe: it orders by `position`,
+// which each category numbers on its own, so an offset page can repeat one article and skip another.
+// A missing article reads as deleted, so the listing is checked against the portal's declared count
+// and a mismatch is an error that deletes nothing.
 export async function fetchPortalArticles(
   config: PortalConfig,
   fetchImpl: typeof fetch = fetch,
@@ -691,13 +687,29 @@ interface SyncedRow {
   ingestStranded: boolean;
 }
 
+// The documents a portal sync already holds, as the statement it runs, so a test can read the plan the
+// database gives it under the tenant policy (tests/modules/scoped-index-plans.test.ts).
+export function syncedDocumentsSql(knowledgeBaseId: bigint): Prisma.Sql {
+  return Prisma.sql`
+      SELECT d.id, d.external_id AS "externalId", d.title, d.source_url AS "sourceUrl",
+             md5(d.content) AS "contentMd5",
+             (d.status = 'PENDING' AND NOT EXISTS (
+               SELECT 1 FROM scheduler_jobs j
+                WHERE j.kind = 'RAG_INGEST' AND j.dedupe_key = k.dedupe_key
+                  AND j.status IN ('PENDING', 'CLAIMED', 'FAILED')
+             )) AS "ingestStranded"
+        FROM knowledge_documents d
+        -- The key beside the row and compared bare, as the follow-up sweep does (docs/tenancy.md).
+        CROSS JOIN LATERAL (SELECT 'doc:' || d.id AS dedupe_key OFFSET 0) k
+       WHERE d.knowledge_base_id = ${knowledgeBaseId} AND d.external_id IS NOT NULL`;
+}
+
 const md5 = (text: string) =>
   new Bun.CryptoHasher("md5").update(text).digest("hex");
 
 // One reconcile of a base against its portal. Writes go through the document functions, so every
-// change is audited and re-embedded exactly as an operator's would be, and only when something moved:
-// an unchanged article costs a comparison, not a write, and never an embedding. A changed title
-// re-embeds too, since the title is part of every chunk's vector (issue #857); a moved URL does not.
+// change is audited and re-embedded as an operator's would be, and only when something moved. A
+// changed title re-embeds too (it is part of every chunk's vector); a moved URL does not.
 export async function syncKnowledgeSource(
   tenantId: bigint,
   knowledgeBaseId: bigint,
@@ -744,20 +756,8 @@ export async function syncKnowledgeSource(
   const wanted = new Map(
     articles.filter((a) => !excluded.has(a.id)).map((a) => [String(a.id), a]),
   );
-  const existing = await runScopedOn(
-    base,
-    ctx,
-    (db) =>
-      db.$queryRaw<SyncedRow[]>`
-      SELECT d.id, d.external_id AS "externalId", d.title, d.source_url AS "sourceUrl",
-             md5(d.content) AS "contentMd5",
-             (d.status = 'PENDING' AND NOT EXISTS (
-               SELECT 1 FROM scheduler_jobs j
-                WHERE j.kind = 'RAG_INGEST' AND j.dedupe_key = 'doc:' || d.id
-                  AND j.status IN ('PENDING', 'CLAIMED', 'FAILED')
-             )) AS "ingestStranded"
-        FROM knowledge_documents d
-       WHERE d.knowledge_base_id = ${knowledgeBaseId} AND d.external_id IS NOT NULL`,
+  const existing = await runScopedOn(base, ctx, (db) =>
+    db.$queryRaw<SyncedRow[]>(syncedDocumentsSql(knowledgeBaseId)),
   );
   const have = new Map(existing.map((r) => [r.externalId, r]));
   const result: SyncResult = {
@@ -912,12 +912,6 @@ async function reconcile(
       result.deleted++;
     }
   }
-}
-
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002"
-  );
 }
 
 // A document another run already deleted is the outcome this one wanted.

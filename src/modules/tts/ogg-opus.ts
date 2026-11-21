@@ -5,7 +5,7 @@
 
 const FRAME_MS = 20;
 const OPUS_BITRATE = 32_000;
-// NOTE: libopus' encoder lookahead at 48 kHz (2.5 ms + 4 ms of delay compensation), the value RFC 7845
+// Libopus' encoder lookahead at 48 kHz (2.5 ms + 4 ms of delay compensation), the value RFC 7845
 // recommends for pre-skip. Measured on this encoder: the decoded signal lags the input by 152 samples
 // at 24 kHz, i.e. 304 at 48 kHz, so 312 trims the delay without eating speech.
 const PRE_SKIP_48K = 312;
@@ -112,7 +112,7 @@ export async function pcmToOggOpus(
     const frameSamples = (sampleRate * FRAME_MS) / 1000;
     const toGranule = 48_000 / sampleRate;
     const inputSamples = Math.floor(pcm.byteLength / 2);
-    // NOTE: the encoder holds back pre-skip worth of audio, so the input is padded by that much
+    // The encoder holds back pre-skip worth of audio, so the input is padded by that much
     // silence (then to a whole frame) or the last syllable never leaves it.
     const padded = inputSamples + Math.ceil(PRE_SKIP_48K / toGranule);
     const frames = Math.max(1, Math.ceil(padded / frameSamples));

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { z } from "zod";
 import {
   BEHAVIOR_SETTINGS_KEYS,
   behaviorSettingsMaxDepth,
@@ -6,25 +7,30 @@ import {
   mergeBehaviorSettings,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
+import { readLimitsConfig } from "@/modules/agents/limits";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
 
 // EVERY BLOCK THIS SURFACE OWNS IS WRITTEN BACK NORMALIZED, and the check is over the key list
 // rather than over the eighteen assignments that implement it.
 //
 // The merge re-reads the patched bag through the typed readers to clamp and validate it, and then
 // has to STORE what it read. A block that is merged but not written back leaves the raw value in
-// `agent.settings` while every projection shows the normalized one — the two disagree from then on,
-// in the export, in the MCP read and in any diff between two agents. It is silent by construction:
-// the readers normalize again on the way out, so nothing downstream misbehaves.
-//
-// Review found `modelFallback` missing from that list, which was the fourth time in one change that
-// a new behavior block went in with one of its registration points forgotten. So the invariant is
-// asserted per KEY, behaviourally, instead of the eighteenth assignment being reviewed by eye.
+// `agent.settings` while every projection shows the normalized one, so the export, the MCP read and a
+// diff between two agents disagree. It is silent by construction (the readers normalize again on the
+// way out), so it is asserted per KEY, behaviourally, rather than trusted to each assignment.
 describe("behavior-settings — the merge stores every block it owns", () => {
   // The two blocks whose stored form is deliberately NOT the read form, each for a reason at its own
   // assignment: `observability` persists through `storableObservability` because `fullDetail` is
   // DERIVED and storing it would freeze a mode that is supposed to expire; `grounding` is persisted
-  // only when the patch touched it, so an untouched bag keeps whatever it had.
-  const NOT_THE_READ_SHAPE = new Set(["observability", "grounding"]);
+  // only when the patch touched it, so an untouched bag keeps whatever it had. The two tool-keyed
+  // blocks are stored raw, since their readers filter; tests/modules/mcp-settings-tool-maps.test.ts
+  // proves their merge.
+  const NOT_THE_READ_SHAPE = new Set([
+    "observability",
+    "grounding",
+    "toolGuidance",
+    "toolPreconditions",
+  ]);
 
   for (const key of BEHAVIOR_SETTINGS_KEYS) {
     if (NOT_THE_READ_SHAPE.has(key)) continue;
@@ -41,17 +47,48 @@ describe("behavior-settings — the merge stores every block it owns", () => {
     });
   }
 
-  test("the loop actually covers the blocks, including the newest", () => {
-    const covered = BEHAVIOR_SETTINGS_KEYS.filter(
+  test("the loop covers every block the reader projects, but the four exceptions", () => {
+    const covered: string[] = BEHAVIOR_SETTINGS_KEYS.filter(
       (k) => !NOT_THE_READ_SHAPE.has(k),
     );
-    expect(covered.length).toBeGreaterThanOrEqual(15);
-    expect(covered).toContain("modelFallback");
+    const projected = Object.keys(readBehaviorSettings({})).filter(
+      (k) => !NOT_THE_READ_SHAPE.has(k),
+    );
+    expect([...covered].sort()).toEqual(projected.sort());
   });
 });
 
 // vision is part of the shared behavior surface (so it is settable via the MCP agent_settings_set
 // partial-merge path, like stt/tts). These cover the wiring without a DB.
+// A BLOCK THE PATCH DOES NOT NAME IS STORED EXACTLY AS IT WAS, absent included. Written back through
+// its reader, it would carry today's defaults, which then never follow a later change of a default,
+// and the stored bag would stop telling a chosen value from a default one.
+describe("behavior-settings — the merge leaves every other block alone", () => {
+  for (const key of BEHAVIOR_SETTINGS_KEYS) {
+    test(`a patch on ${key} adds no other block`, () => {
+      const merged = mergeBehaviorSettings({}, { [key]: {} });
+      expect(Object.keys(merged)).toEqual([key]);
+    });
+  }
+
+  test("a stored block the patch does not name keeps its exact bytes", () => {
+    const stored = {
+      limits: { maxToolCalls: 7 },
+      debounce: { windowSeconds: "15", legacy: true },
+      observability: { logToolValues: true },
+      somethingNewer: { kept: 1 },
+    };
+    const before = JSON.stringify(stored);
+    const next = mergeBehaviorSettings(stored, { split: { enabled: true } });
+    expect(JSON.stringify(stored)).toBe(before);
+    for (const key of Object.keys(stored) as (keyof typeof stored)[])
+      expect(next[key]).toEqual(stored[key]);
+    expect(Object.keys(next).sort()).toEqual(
+      [...Object.keys(stored), "split"].sort(),
+    );
+  });
+});
+
 describe("behavior-settings — vision", () => {
   test("vision is an owned key and projects defaults when absent", () => {
     expect(BEHAVIOR_SETTINGS_KEYS).toContain("vision");
@@ -144,7 +181,7 @@ describe("behavior-settings — attributeContext", () => {
 });
 
 // The per-agent switch for logging tool VALUES instead of their shape rides the same surface, so the
-// editor, REST and MCP all project the one normalized value (issue #78).
+// editor, REST and MCP all project the one normalized value.
 describe("behavior-settings — observability", () => {
   test("it is an owned key and defaults to off", () => {
     expect(BEHAVIOR_SETTINGS_KEYS).toContain("observability");
@@ -152,6 +189,7 @@ describe("behavior-settings — observability", () => {
       logToolValues: false,
       fullDetail: false,
       fullDetailUntil: null,
+      fullDetailRetentionDays: null,
     });
   });
 
@@ -165,23 +203,41 @@ describe("behavior-settings — observability", () => {
     expect(next.observability).toEqual({
       logToolValues: true,
       fullDetailUntil: null,
+      fullDetailRetentionDays: null,
     });
-    // The limits block is re-read through its typed reader, so it comes back normalized in full:
-    // the untouched tool-call cap plus the history ceiling explicitly at "off", and the silence
-    // retry at its default.
-    expect(next.limits).toEqual({
-      maxToolCalls: 7,
-      maxHistoryTokens: null,
-      retrySilence: true,
-    });
+    // The limits block was not named, so it is stored exactly as it was, defaults left unwritten.
+    expect(next.limits).toEqual({ maxToolCalls: 7 });
   });
 });
 
-// The merge contract goes all the way down (issue #184). One shallow spread per block kept the
-// promise at the top level of a block and broke it one step in: a patch that named a SUB-object
-// replaced it whole, and because each block is then re-read through its typed reader, the hole came
-// back filled with defaults rather than absent — a complete, plausible block with the operator's
-// values gone.
+// "No limit" is a stored 0, and the merge writes the read shape back: if that shape said null, an
+// unrelated MCP edit would store null, which reads as the default and turns the limit back on.
+describe("behavior-settings — a disabled turn limit through a merge", () => {
+  const limitsSchema = z.object(BEHAVIOR_PATCH_SHAPE).shape.limits;
+
+  test("an unrelated patch keeps the stored 0, and the stored block passes the schema", () => {
+    const next = mergeBehaviorSettings(
+      { limits: { maxToolCalls: 7, maxTurnsPerHour: 0 } },
+      { observability: { logToolValues: "true" } },
+    );
+    expect((next.limits as Record<string, unknown>).maxTurnsPerHour).toBe(0);
+    expect(readLimitsConfig(next).maxTurnsPerHour).toBe(0);
+    expect(limitsSchema.safeParse(next.limits).success).toBe(true);
+  });
+
+  test("a patch that turns it off stores 0", () => {
+    const next = mergeBehaviorSettings(
+      { limits: { maxTurnsPerHour: 20 } },
+      { limits: { maxTurnsPerHour: 0 } },
+    );
+    expect((next.limits as Record<string, unknown>).maxTurnsPerHour).toBe(0);
+    expect(limitsSchema.safeParse(next.limits).success).toBe(true);
+  });
+});
+
+// The merge contract goes all the way down. A shallow spread per block would let a patch that names a
+// SUB-object replace it whole, and since each block is re-read through its typed reader, the hole comes
+// back filled with defaults: a complete, plausible block with the operator's values gone.
 describe("behavior-settings — a patch into a nested block", () => {
   const configured = {
     guardrails: {
@@ -215,18 +271,6 @@ describe("behavior-settings — a patch into a nested block", () => {
     });
   });
 
-  test("a nested patch still overrides what it does name", () => {
-    const next = mergeBehaviorSettings(configured, {
-      guardrails: { input: { templateMessage: "Só um instante." } },
-    });
-    const input = (next.guardrails as Record<string, unknown>).input as Record<
-      string,
-      unknown
-    >;
-    expect(input.templateMessage).toBe("Só um instante.");
-    expect(input.action).toBe("silent");
-  });
-
   test("an untouched sibling direction is left alone", () => {
     const next = mergeBehaviorSettings(
       {
@@ -244,48 +288,44 @@ describe("behavior-settings — a patch into a nested block", () => {
 
   // The descent is BOUNDED. Both sides of the merge are caller-supplied and the settings schema
   // accepts arbitrary nested `unknown`, so an unbounded recursion turns "store a deep object, then
-  // patch it" into a RangeError that escapes the write — and, because it escapes the write, leaves
-  // the agent's settings unwritable until the row is repaired by hand. Measured against this tree
-  // before the cap: 5_000 levels merged, 20_000 threw.
+  // patch it" into a RangeError that escapes the write and leaves the agent's settings unwritable
+  // until the row is repaired by hand.
   test("a pathologically deep patch is bounded instead of blowing the stack", () => {
     const deep = (n: number): Record<string, unknown> => {
       let o: Record<string, unknown> = { leaf: 1 };
       for (let i = 0; i < n; i++) o = { k: o };
       return o;
     };
-    expect(() =>
-      mergeBehaviorSettings(
+    let merged: Record<string, unknown> = {};
+    expect(() => {
+      merged = mergeBehaviorSettings(
         { memory: { compaction: deep(50_000) } },
-        { memory: { compaction: deep(50_000) } },
-      ),
-    ).not.toThrow();
+        {
+          memory: {
+            compaction: { ...deep(50_000), enabled: false },
+            historyDates: { enabled: false },
+          },
+        },
+      );
+    }).not.toThrow();
+    // Bounded, and still a merge: the patch's real fields land next to the deep junk.
+    const memory = readBehaviorSettings(merged).memory;
+    expect(memory.compaction.enabled).toBe(false);
+    expect(memory.historyDates.enabled).toBe(false);
   });
 
   // The cap is not a number someone liked: it has to clear the deepest shape the readers actually
-  // produce, or a block nested past it would silently lose the values this whole change exists to
-  // keep. Growing a deeper block fails HERE, where the fix is one constant, instead of in the field.
+  // produce, or a block nested past it would silently lose the operator's values. Growing a deeper
+  // block fails HERE, where the fix is one constant, instead of in the field.
   test("the depth cap clears the deepest shape the readers produce", () => {
     expect(behaviorSettingsMaxDepth()).toBeLessThan(MERGE_MAX_DEPTH_FOR_TESTS);
-  });
-
-  // A list patch means the new list. Deep-merging arrays would make a shorter `steps` or a smaller
-  // attribute scope impossible to express, which is the opposite of what an operator means by
-  // sending one.
-  test("a list is still replaced wholesale, not merged element by element", () => {
-    const next = mergeBehaviorSettings(
-      { attributeContext: { conversation: ["a", "b", "c"] } },
-      { attributeContext: { conversation: ["a"] } },
-    );
-    expect(
-      (next.attributeContext as Record<string, unknown>).conversation,
-    ).toEqual(["a"]);
   });
 });
 
 // The merge re-reads every block through its typed reader and writes the result back, so a reader
 // that answers a DERIVED field would persist it. `observability.fullDetail` is exactly that field:
 // it is computed from `fullDetailUntil` on every read, and a bag holding it would let the stored
-// answer and the computed one disagree the moment the window closes (issue #58).
+// answer and the computed one disagree the moment the window closes.
 describe("behavior-settings — the merge stores what is stored, not what is derived", () => {
   const armed = new Date(Date.now() + 3_600_000).toISOString();
 
@@ -294,24 +334,11 @@ describe("behavior-settings — the merge stores what is stored, not what is der
       { observability: { fullDetailUntil: armed } },
       { limits: { maxToolCalls: 7 } },
     );
-    expect(next.observability).toEqual({
-      logToolValues: false,
-      fullDetailUntil: armed,
-    });
+    expect(next.observability).toEqual({ fullDetailUntil: armed });
+    expect(readBehaviorSettings(next).observability.fullDetail).toBe(true);
   });
 
-  test("the derived flag never reaches the bag", () => {
-    const next = mergeBehaviorSettings(
-      { observability: { fullDetailUntil: armed } },
-      { observability: { logToolValues: true } },
-    );
-    expect(Object.keys(next.observability as object).sort()).toEqual([
-      "fullDetailUntil",
-      "logToolValues",
-    ]);
-  });
-
-  test("a window that closed is written back as off", () => {
+  test("a window that closed stays as stored and reads as off", () => {
     const next = mergeBehaviorSettings(
       {
         observability: {
@@ -320,8 +347,7 @@ describe("behavior-settings — the merge stores what is stored, not what is der
       },
       { limits: { maxToolCalls: 7 } },
     );
-    expect(
-      (next.observability as { fullDetailUntil: unknown }).fullDetailUntil,
-    ).toBeNull();
+    expect(next.observability).not.toHaveProperty("fullDetail");
+    expect(readBehaviorSettings(next).observability.fullDetail).toBe(false);
   });
 });

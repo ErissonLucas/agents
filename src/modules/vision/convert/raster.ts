@@ -34,22 +34,15 @@ export function fitRgba(src: Rgba, maxEdge: number): Rgba {
   const fx = sw / dw;
   const fy = sh / dh;
   const s = src.data;
-  // NO GUARD ON THE BOXES, neither against an empty one nor against one running past the edge,
-  // because neither can happen and a branch for an impossible case is code no test can kill. The
-  // early return above means this only ever downscales, so `dw <= sw` and `fx = sw / dw >= 1`, and
-  // from that:
-  //
-  //   non-empty   for fx >= 1, floor((x + 1) * fx) >= floor(x * fx + 1) > floor(x * fx), so every
-  //               box holds at least one pixel and `n` is never zero
-  //   in bounds   the last box ends at floor(dw * fx) = floor(dw * (sw / dw)) = sw, and the float
-  //               error in that product is ~1e-12, twelve orders of magnitude short of the whole
-  //               pixel it would take to read past the buffer
+  // NOTE: no guard on the boxes: this only downscales, so `fx = sw / dw >= 1` and every box holds at
+  // least one pixel. The last box ends at the edge by construction and not at floor(dw * fx), which
+  // float error can land one short of it (7101 / 1568 * 1568 = 7100.999...), dropping the last column.
   for (let y = 0; y < dh; y++) {
     const y0 = Math.floor(y * fy);
-    const y1 = Math.floor((y + 1) * fy);
+    const y1 = boxEnd(y, dh, fy, sh);
     for (let x = 0; x < dw; x++) {
       const x0 = Math.floor(x * fx);
-      const x1 = Math.floor((x + 1) * fx);
+      const x1 = boxEnd(x, dw, fx, sw);
       let r = 0;
       let g = 0;
       let b = 0;
@@ -75,18 +68,112 @@ export function fitRgba(src: Rgba, maxEdge: number): Rgba {
   return { data: out, width: dw, height: dh };
 }
 
-// JPEG HAS NO ALPHA, and the decoders hand us some: measured on a HEIC made by iOS's own "remove
-// background" (`sips -s format heic` from an RGBA PNG), the transparent half comes back with a = 0
-// and whatever RGB happened to be under it, which jpeg-js writes verbatim — a cutout would reach the
-// model as a black rectangle. White is the composite every viewer uses for a cutout and the neutral
-// for a photographed document.
-//
-// BEFORE the resize, not after, because the area average has no notion of alpha: averaging a box
-// that straddles a cutout's edge would mix transparent pixels' RGB into the visible ones and leave a
-// dark fringe. Flattening first means `fitRgba` only ever averages real colour.
-//
-// Returns the INPUT untouched when every pixel is opaque, which is every camera photo, so the common
-// case pays one comparison per pixel and no allocation.
+// Where box `d` of `outLength` ends in a source of `sourceLength`, shared by `fitRgba` and
+// `FitAccumulator` so the two cut the same boxes.
+function boxEnd(
+  d: number,
+  outLength: number,
+  f: number,
+  sourceLength: number,
+): number {
+  return d === outLength - 1 ? sourceLength : Math.floor((d + 1) * f);
+}
+
+// THE SAME AREA AVERAGE AS `fitRgba`, fed a piece at a time. A tiled source is decoded one tile after
+// another and never exists whole, so the average is accumulated straight into the output: the memory
+// is the output's sums plus the tile in hand, whatever the source size. The boxes are `fitRgba`'s own
+// (source column `sx` falls in the box `x` with floor(x * fx) <= sx < floor((x + 1) * fx)) and the
+// division truncates the same way, so the result is byte for byte what fitting the whole image gives.
+export class FitAccumulator {
+  readonly width: number;
+  readonly height: number;
+  private readonly sourceWidth: number;
+  private readonly sourceHeight: number;
+  private readonly sums: Uint32Array;
+  private readonly counts: Uint32Array;
+
+  constructor(sourceWidth: number, sourceHeight: number, maxEdge: number) {
+    const scale = Math.min(1, maxEdge / Math.max(sourceWidth, sourceHeight));
+    this.width =
+      scale < 1 ? Math.max(1, Math.round(sourceWidth * scale)) : sourceWidth;
+    this.height =
+      scale < 1 ? Math.max(1, Math.round(sourceHeight * scale)) : sourceHeight;
+    this.sourceWidth = sourceWidth;
+    this.sourceHeight = sourceHeight;
+    this.sums = new Uint32Array(this.width * this.height * 4);
+    this.counts = new Uint32Array(this.width * this.height);
+  }
+
+  // `piece` is opaque and sits at (left, top) of the source. The caller clips it to the source: a
+  // grid's edge tiles are padded past the image, and that padding is not part of it.
+  add(piece: Rgba, left: number, top: number): void {
+    // Out of range, a box lookup would land past the output and every write on a NaN index, which a
+    // typed array silently drops: a misplaced piece would vanish instead of failing.
+    if (
+      left < 0 ||
+      top < 0 ||
+      left + piece.width > this.sourceWidth ||
+      top + piece.height > this.sourceHeight
+    )
+      throw new Error(
+        `piece ${piece.width}x${piece.height} at ${left},${top} is outside the ${this.sourceWidth}x${this.sourceHeight} source`,
+      );
+    // Sized by the piece, never by the source: the source's size is what the FILE declares.
+    const colOf = boxesOf(left, piece.width, this.sourceWidth, this.width);
+    const rowOf = boxesOf(top, piece.height, this.sourceHeight, this.height);
+    const s = piece.data;
+    for (let y = 0; y < piece.height; y++) {
+      const row = (rowOf[y] as number) * this.width;
+      let i = y * piece.width * 4;
+      for (let x = 0; x < piece.width; x++, i += 4) {
+        const o = row + (colOf[x] as number);
+        const k = o * 4;
+        this.sums[k] = (this.sums[k] as number) + (s[i] as number);
+        this.sums[k + 1] = (this.sums[k + 1] as number) + (s[i + 1] as number);
+        this.sums[k + 2] = (this.sums[k + 2] as number) + (s[i + 2] as number);
+        this.sums[k + 3] = (this.sums[k + 3] as number) + (s[i + 3] as number);
+        this.counts[o] = (this.counts[o] as number) + 1;
+      }
+    }
+  }
+
+  result(): Rgba {
+    const out = new Uint8Array(this.width * this.height * 4);
+    for (let o = 0; o < this.counts.length; o++) {
+      const n = this.counts[o] as number;
+      const k = o * 4;
+      out[k] = (this.sums[k] as number) / n;
+      out[k + 1] = (this.sums[k + 1] as number) / n;
+      out[k + 2] = (this.sums[k + 2] as number) / n;
+      out[k + 3] = (this.sums[k + 3] as number) / n;
+    }
+    return { data: out, width: this.width, height: this.height };
+  }
+}
+
+// For source coordinates `start` .. `start + length - 1`, the output box each averages into, by the
+// same bounds `fitRgba` iterates: box d holds floor(d * f) <= s < boxEnd(d).
+function boxesOf(
+  start: number,
+  length: number,
+  sourceLength: number,
+  outLength: number,
+): Int32Array {
+  const f = sourceLength / outLength;
+  const map = new Int32Array(length);
+  let d = Math.min(outLength - 1, Math.floor(start / f));
+  for (let i = 0; i < length; i++) {
+    // The last box is never walked past, so its end, the one `boxEnd` special-cases, is not needed.
+    while (d < outLength - 1 && Math.floor((d + 1) * f) <= start + i) d++;
+    map[i] = d;
+  }
+  return map;
+}
+
+// JPEG has no alpha, and decoders hand some back (an iOS background-removed HEIC): jpeg-js writes the
+// RGB under a = 0 verbatim, so a cutout would reach the model as a black rectangle. White, as every
+// viewer composites a cutout. BEFORE the resize, since the area average ignores alpha and would leave
+// a dark fringe. Returns the INPUT untouched when every pixel is opaque (every camera photo).
 export function flattenOntoWhite(src: Rgba): Rgba {
   const s = src.data;
   let transparent = false;
@@ -97,21 +184,12 @@ export function flattenOntoWhite(src: Rgba): Rgba {
     }
   }
   if (!transparent) return src;
-  // CLAMPED, not wrapping. Premultiplied colour is supposed to be at most its alpha, and lossy HEVC
-  // does not have to honour that: a decoded pixel of [129, 129, 129, 128] composites to 256, which a
-  // plain Uint8Array stores as 0 — a BLACK pixel where the arithmetic asked for white. Saturating is
-  // the correct answer and costs nothing (PR #707 review round 11).
+  // Clamped, not wrapping: lossy HEVC can decode premultiplied colour above its alpha
+  // ([129, 129, 129, 128] composites to 256), which a plain Uint8Array stores as a BLACK 0.
   const out = new Uint8ClampedArray(s.length);
-  // Premultiplied colour is ALREADY scaled by its alpha, so multiplying again darkens everything
-  // translucent: a pixel of (100, 0, 0, 128) over white comes out 177 instead of 227 (PR #707 review
-  // round 10).
-  //
-  // THE FLAG IS THE ONLY THING THAT SAYS WHICH FORMULA APPLIES, and that is measured rather than
-  // assumed: the same PNG encoded twice, with and without `heif-enc --premultiplied-alpha`, decodes
-  // to the IDENTICAL bytes `[100, 0, 0, 128]` and differs only in what
-  // `is_premultiplied_alpha()` answers. So ignoring it is not a worse guess, it is having no
-  // information at all — which is also why the defect is invisible from both sides: the output does
-  // not look broken, and the pixels do not say which formula was owed.
+  // Premultiplied colour is ALREADY scaled by its alpha, so multiplying again darkens anything
+  // translucent. Only the flag says which formula applies: the same image with and without
+  // premultiplied alpha decodes to IDENTICAL bytes.
   const premultiplied = src.premultiplied === true;
   for (let i = 0; i < s.length; i += 4) {
     const a = (s[i + 3] as number) / 255;
@@ -125,7 +203,7 @@ export function flattenOntoWhite(src: Rgba): Rgba {
   return { data: out, width: src.width, height: src.height };
 }
 
-// NOTE: jpeg-js indexes the array rather than requiring a Buffer, so the RGBA a decoder handed us
+// Jpeg-js indexes the array rather than requiring a Buffer, so the RGBA a decoder handed us
 // goes in as it came — a `Buffer.from` here would copy 48 MB per 12 MP photo to change nothing.
 export function encodeJpeg(src: Rgba, quality: number): ArrayBuffer {
   const out = jpeg.encode(
@@ -146,12 +224,65 @@ export function encodeJpeg(src: Rgba, quality: number): ArrayBuffer {
 // THE WHOLE TAIL OF A RASTER CONVERSION, in one place and in this order. Every decoder that produces
 // RGBA ends here, and the ORDER is the part worth naming: flatten, then fit, then encode. Flattening
 // after the fit averages colour and alpha together and composites the result, which darkens every
-// box that straddles a cutout's edge — 54 levels of red on the measured case, invisible in a green
-// test. Keeping the sequence in a named step is what lets a test assert it; spelled out at each call
-// site, the order was a mutation nothing could kill.
+// box that straddles a cutout's edge, a shift a green test does not see. The sequence lives in this
+// named step so a test can assert it; spelled out at each call site, no test would catch a swap.
 export function rasterToJpeg(
   raw: Rgba,
   opts: { maxEdge: number; quality: number },
 ): ArrayBuffer {
   return encodeJpeg(fitRgba(flattenOntoWhite(raw), opts.maxEdge), opts.quality);
+}
+
+// The Exif Orientation transform (1-8), applied to pixels because re-encoding drops the tag. Run on
+// the FITTED raster, so the copy it makes is of a 1568 px image and not of the 36 MP original.
+// 5-8 swap the axes: the pixel at (x, y) of the output is read from the stored image.
+export function orientRgba(src: Rgba, orientation: number): Rgba {
+  if (orientation < 2 || orientation > 8) return src;
+  const { width: w, height: h } = src;
+  const swap = orientation >= 5;
+  const ow = swap ? h : w;
+  const oh = swap ? w : h;
+  const out = new Uint8ClampedArray(ow * oh * 4);
+  for (let y = 0; y < oh; y++) {
+    for (let x = 0; x < ow; x++) {
+      let sx: number;
+      let sy: number;
+      switch (orientation) {
+        case 2:
+          sx = w - 1 - x;
+          sy = y;
+          break;
+        case 3:
+          sx = w - 1 - x;
+          sy = h - 1 - y;
+          break;
+        case 4:
+          sx = x;
+          sy = h - 1 - y;
+          break;
+        case 5:
+          sx = y;
+          sy = x;
+          break;
+        case 6:
+          sx = y;
+          sy = h - 1 - x;
+          break;
+        case 7:
+          sx = w - 1 - y;
+          sy = h - 1 - x;
+          break;
+        default:
+          sx = w - 1 - y;
+          sy = x;
+      }
+      const s = (sy * w + sx) * 4;
+      const d = (y * ow + x) * 4;
+      out[d] = src.data[s] as number;
+      out[d + 1] = src.data[s + 1] as number;
+      out[d + 2] = src.data[s + 2] as number;
+      out[d + 3] = src.data[s + 3] as number;
+    }
+  }
+  return { data: out, width: ow, height: oh };
 }

@@ -9,22 +9,20 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
+import { fetchTracker } from "@/tests/utils/fetch-settle";
 
-// THE GUARD, WHERE IT ACTUALLY LIVES.
-//
-// `company-save-session.test.tsx` proves the card reports which OPENING a save belongs to, and it
-// proves that a parent which checks that number keeps the right modal open. Neither proves THIS
-// panel checks it: the first asserts the card's half, and the second asserts a harness written in
-// the test file. Removing the guard from `DocumentsPanel` left the whole suite green.
-//
-// So this drives the real panel. The letterhead is a modal, which means the card is UNMOUNTED while
-// it is closed and a new one is mounted on reopen — the stale card's request is still out, holding a
-// callback closed over the previous generation. Reading that generation off a ref is what lets the
-// stale closure see the current value; reading it off state would hand it the frozen one.
+// The guard, where it actually lives. `company-save-session.test.tsx` proves the card reports which
+// opening a save belongs to, against a harness parent; this drives the real `DocumentsPanel`. The
+// letterhead is a modal, so the card UNMOUNTS on close and a new one mounts on reopen while the
+// stale card's request is still out. The generation is read off a ref so the stale closure sees the
+// current value; state would hand it the frozen one.
 
 (globalThis as { happyDOM?: { setURL(u: string): void } }).happyDOM?.setURL(
   "http://localhost/recursos/documentos",
 );
+
+// Every answer released so far is delivered and read before a "nothing happened" assertion.
+const fetches = fetchTracker();
 
 const { DocumentsPanel } = await import(
   "@/client/pages/resources/documents/DocumentsPanel"
@@ -52,7 +50,7 @@ const json = (body: unknown) =>
 let releasePut: () => void = () => {};
 let puts = 0;
 
-globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+const answer = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(String(input), "http://localhost");
   const method = (init?.method ?? "GET").toUpperCase();
   if (method === "PUT" && url.pathname.endsWith("/tenant-settings/company")) {
@@ -69,18 +67,22 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     return json({ templates: [] });
   if (url.pathname.endsWith("/documents")) return json({ documents: [] });
   if (url.pathname.endsWith("/tenant-settings"))
-    return json({ company: EMPTY_COMPANY });
+    return json({
+      approvalLink: { mode: "console", urlTemplate: "" },
+      company: EMPTY_COMPANY,
+    });
   return json({});
-}) as unknown as typeof fetch;
+};
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  fetches.track(answer(input, init))) as unknown as typeof fetch;
 
 afterEach(cleanup);
 afterAll(() => {
   globalThis.fetch = realFetch;
 });
 
-// By its TITLE, so the discard confirm cannot be mistaken for it. Measured rather than guessed: the
-// first version matched on "timbre", which is the word in the CONFIRM dialog's message and not in
-// this modal at all, so it reported the wrong dialog as the letterhead.
+// By its TITLE, so the discard confirm cannot be mistaken for it: the word "timbre" appears in the
+// CONFIRM dialog's message and not in this modal.
 function letterheadOpen(): boolean {
   return screen
     .queryAllByRole("dialog")
@@ -119,8 +121,8 @@ test("a letterhead save from a previous opening does not close the reopened edit
     expect(puts).toBe(1);
   });
 
-  // Closed while the request is out. The form still holds unsaved text, so this goes through the
-  // discard confirm — which is the path the operator actually takes.
+  // NOTE: closed while the request is out. The form still holds unsaved text, so this goes through
+  // the discard confirm, the path the operator actually takes.
   fireEvent.keyDown(document.body, { key: "Escape" });
   // The confirm appears; the letterhead is already hidden behind it, so it is the Discard button
   // that says the dismissal reached the guard, not a dialog count.
@@ -135,7 +137,7 @@ test("a letterhead save from a previous opening does not close the reopened edit
   // Reopened: a NEW card, a new generation, and the first card's request still in flight.
   await open();
   releasePut();
-  await new Promise((r) => setTimeout(r, 60));
+  await fetches.settled();
 
   // Still on screen. Without the guard the older save announces itself and the panel closes the
   // editor the operator is looking at.

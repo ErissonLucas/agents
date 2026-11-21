@@ -1,16 +1,18 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
+import { modelPermitReading, runModelCall } from "@/graph/model-limit";
 import {
   type DebounceTickDeps,
+  debounceLaneFullMs,
   type LaneWait,
   runDebounceTick,
 } from "@/modules/debounce/worker";
 import type { ClaimedJob } from "@/modules/scheduler/service";
 
-// Issue #812: a due flush that waits for a slot because the lane is full is announced ONCE, while it
-// is still waiting, and only when the wait is the lane's doing. The clock, the claim, the query for
-// waiting rows and the announcement are injected, so this runs without a DB; the DB-backed half is
+// A due flush that waits for a slot because the lane is full is announced ONCE, while it is still
+// waiting, and only when the wait is the lane's doing. The clock, the claim, the query for waiting
+// rows and the announcement are injected, so this runs without a DB; the DB-backed half is
 // tests/modules/debounce-lane-wait-db.test.ts.
 
 const base = {} as PrismaClient;
@@ -111,6 +113,41 @@ const row = (id: number, runAtMs: number, tenantId = 1n): Row => ({
   dedupeKey: `debounce:t:${id}`,
 });
 
+describe("how long the lane has been full, for the instance sampler", () => {
+  beforeEach(emptyLane);
+
+  test("counts while every slot runs a job, and drops to zero once one finishes between ticks (catches saturation reported with nothing in flight)", async () => {
+    const w = world();
+    w.claimable.push(job(1), job(2));
+    const out = await tick(2, w.deps);
+    expect(out.claimed).toBe(2);
+    expect(debounceLaneFullMs(Date.now() + 10_000)).toBeGreaterThan(0);
+    for (const release of hung.splice(0)) release();
+    await out.settled;
+    expect(debounceLaneFullMs(Date.now() + 10_000)).toBe(0);
+  });
+});
+
+describe("how long the lane has been full, counted from when it filled", () => {
+  beforeEach(emptyLane);
+
+  test("a slow claim is not counted as time full (catches a premature lane-full alert)", async () => {
+    const w = world();
+    w.claimable.push(job(1));
+    const claim = w.deps.claim;
+    const deps: DebounceTickDeps = {
+      ...w.deps,
+      claim: async (...args) => {
+        // The claim itself takes 20 s, with the slot free the whole time.
+        w.set(20_000);
+        return claim ? claim(...args) : [];
+      },
+    };
+    await tick(1, deps);
+    expect(debounceLaneFullMs(T0 + 25_000)).toBe(5_000);
+  });
+});
+
 describe("a flush waiting for a slot of a full lane", () => {
   beforeEach(emptyLane);
 
@@ -192,6 +229,86 @@ describe("a flush waiting for a slot of a full lane", () => {
     w.set(31_000);
     await tick(1, w.deps);
     expect(w.asked.at(-1)?.exclude).toContain(1n);
+  });
+});
+
+// The line says which of the two limits held the reply: a lane full of turns that are
+// not on the model is the slots' doing, and more of them would help; a lane full while the model has
+// no free permit is the permits' doing, and more slots would only queue on the semaphore.
+describe("a lane wait names the limit that is binding", () => {
+  beforeEach(emptyLane);
+
+  async function fullLaneOfTwo() {
+    const w = world();
+    w.claimable.push(job(1), job(2));
+    await tick(2, w.deps);
+    w.waitingRows.push(row(3, 0));
+    w.set(31_000);
+    await tick(2, w.deps);
+    return w;
+  }
+
+  test("turns off the model: the slots bind, with the lane and the semaphore read", async () => {
+    const w = await fullLaneOfTwo();
+    expect(w.announced).toHaveLength(1);
+    expect(w.announced[0]?.occupancy).toEqual({
+      limit: "DEBOUNCE_TURN_SLOTS",
+      laneInFlight: 2,
+      laneSlots: 2,
+      modelInFlight: 0,
+      modelPermits: modelPermitReading().permits,
+      modelWaiting: 0,
+    });
+  });
+
+  // NOTE: a turn that ends while the lane asks who is waiting has freed its slot by the time the line
+  // is written, and the line describes the lane then.
+  test("the lane is read when the line is written", async () => {
+    const w = world();
+    const ask = w.deps.waiting;
+    w.deps.waiting = async (dueBefore, exclude, b) => {
+      hung.shift()?.();
+      await new Promise((r) => setTimeout(r, 0));
+      return ask ? ask(dueBefore, exclude, b) : [];
+    };
+    w.claimable.push(job(1), job(2));
+    await tick(2, w.deps);
+    w.waitingRows.push(row(3, 0));
+    w.set(31_000);
+    await tick(2, w.deps);
+    expect(w.announced[0]?.occupancy).toMatchObject({
+      laneInFlight: 1,
+      laneSlots: 2,
+    });
+  });
+
+  test("every permit taken: the permits bind", async () => {
+    const { permits } = modelPermitReading();
+    const releases: Array<() => void> = [];
+    for (let i = 0; i < permits + 1; i++) {
+      void runModelCall(
+        () =>
+          new Promise<void>((resolve) => {
+            releases.push(resolve);
+          }),
+      ).catch(() => {});
+    }
+    try {
+      while (releases.length < permits)
+        await new Promise((r) => setTimeout(r, 1));
+      const w = await fullLaneOfTwo();
+      expect(w.announced[0]?.occupancy).toMatchObject({
+        limit: "AGENT_MODEL_CONCURRENCY",
+        modelInFlight: permits,
+        modelPermits: permits,
+        modelWaiting: 1,
+      });
+    } finally {
+      for (let i = 0; i < 4 && releases.length > 0; i++) {
+        for (const r of releases.splice(0)) r();
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
   });
 });
 
@@ -424,5 +541,17 @@ describe("a failing announcement never costs the drain", () => {
       },
     });
     expect(out.claimed).toBe(0);
+    // The failure is absorbed, and the next full tick asks again.
+    await expect(out.reported).resolves.toBeUndefined();
+    const askedBefore = w.asked.length;
+    await tick(1, w.deps);
+    expect(w.asked).toHaveLength(askedBefore + 1);
+    // And the drain goes on: a freed slot is claimed and its job runs.
+    for (const release of hung.splice(0)) release();
+    await new Promise((r) => setTimeout(r, 0));
+    w.claimable.push(job(2));
+    const next = await tick(1, w.deps);
+    expect(next.claimed).toBe(1);
+    expect(hung).toHaveLength(1);
   });
 });

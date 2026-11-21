@@ -2,30 +2,19 @@ import logger from "@/api/lib/logger";
 import { clipText } from "@/lib/text";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
+import { assignPinnedTarget } from "@/modules/handoff/assign-pinned";
+import type { HandoffConfig } from "@/modules/handoff/settings";
 import type { SkipReplyReason } from "./silence";
 import { RESOLVE_DONE } from "./tools/catalog";
 
-// A SILENCE THAT A PERSON HAS TO SEE (issue #659).
-//
-// Nothing in this repo takes a conversation out of `pending` once the agent has stayed out of it, and
-// Chatwoot's own auto-resolve cannot either, because both of its scopes are `open`. So a silence that
-// means "not mine" or "I cannot" used to park the conversation where nobody looks: bot-owned,
-// `pending`, forever. This hands those to `open`, where a person sees them, with a private note
-// saying why.
-//
-// Three ways in, and only three:
-//
-//   not_for_us / needs_human   the model said so, through `skip_reply`'s reason.
-//   unanswered                 the DETERMINISTIC FLOOR: nobody on our side has ever spoken in this
-//                              conversation, and this turn said nothing either. Whatever the reason
-//                              was, and whether or not the silence was chosen at all, a conversation
-//                              nobody ever answered must not stay `pending`. It does not trust the
-//                              model on purpose: #652 measured an instruction to stay quiet
-//                              disobeyed 19 times out of 19.
-//
-// `acknowledged` on a conversation we already answered is the ordinary end of a good conversation, and
-// it changes nothing: no status, no note. That path is the highest-frequency one in the product, and a
-// note on it would teach the operator to ignore the two that matter.
+// A silence a person has to see. Nothing takes a conversation out of `pending` once the agent stayed
+// out of it (Chatwoot's auto-resolve only scopes `open`), so these silences move it to `open` with a
+// private note: `not_for_us` / `needs_human` (the model's `skip_reply` reason), and `unanswered`, the
+// deterministic floor for a conversation nobody on our side ever spoke in. The floor does not trust
+// the model, which disobeys an instruction to stay quiet. `acknowledged` on an answered conversation
+// changes nothing: it is the most frequent path, and a note there would teach operators to ignore
+// the two that matter.
+
 // WHETHER THIS TURN ALREADY CLOSED THE CONVERSATION, on the path where the close happens inside the
 // tool (every proactive turn: no `turnState`, so `resolve_conversation` toggles on the spot). Read off
 // the tool's own result under its name, which the assembly reserves for the native, and bounded at
@@ -125,20 +114,20 @@ export function skipHandoverNote(
   return line ? `${NOTE[kind]}\n\nNas palavras do agente: ${line}` : NOTE[kind];
 }
 
-// The status first and the note after, and the order is chosen by which half can fail alone. A note
-// with no status change says "it was opened" about a conversation still parked; a status change with
-// no note is a conversation in the queue with nothing explaining it, which is where this started, but
-// at least it is SEEN. The private note is inert on every axis that could bite (fork
-// `app/models/message.rb`): it reopens nothing, changes no status, and never stamps
-// `first_reply_created_at`, so it cannot make the conversation read as answered.
-//
-// Best-effort and never throws: the turn is over, nothing reached the customer, and a failure here
-// leaves the conversation where it was, with a warn line the operator can find.
+// Status first, then the operator's pinned target, note last: a note without the status change claims
+// "opened" about a parked conversation, while a status without the note is at least SEEN. The target
+// is the agent's own handoff setting, the one `handoff_to_human` uses, so a skip lands in the same
+// queue as an explicit transfer. The private note is inert (fork
+// `app/models/message.rb`): it reopens nothing and never stamps `first_reply_created_at`. Best-effort
+// and never throws: a failure leaves the conversation where it was, with a warn line.
 export async function applySkipHandover(params: {
   client: ChatwootClient;
   conversationId: number;
   kind: SkipHandoverKind;
   detail: string | null;
+  // Required, so a caller cannot hand over without deciding where to.
+  handoff: HandoffConfig;
+  instanceId: bigint;
   flow: FlowContext;
   // The caller's withdrawal fence, asked immediately before EACH write: a `/reset` or a superseding
   // run can land during the status change, and the note must not follow it into a conversation the
@@ -164,12 +153,20 @@ export async function applySkipHandover(params: {
     });
     return false;
   }
+  const assigned = await assignPinnedTarget({
+    client,
+    conversationId,
+    instanceId: params.instanceId,
+    handoff: params.handoff,
+    stillWanted: async () => !(await withdrawn()),
+    logLabel: "skip handover",
+  });
   let noted = false;
   if (await withdrawn()) {
     emitFlowEvent(flow, {
       stage: "handoff",
       status: "ok",
-      detail: { outcome: "opened_after_skip", reason: kind, noted },
+      detail: { outcome: "opened_after_skip", reason: kind, noted, assigned },
     });
     return true;
   }
@@ -189,7 +186,7 @@ export async function applySkipHandover(params: {
   emitFlowEvent(flow, {
     stage: "handoff",
     status: "ok",
-    detail: { outcome: "opened_after_skip", reason: kind, noted },
+    detail: { outcome: "opened_after_skip", reason: kind, noted, assigned },
   });
   return true;
 }

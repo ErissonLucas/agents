@@ -52,26 +52,31 @@ export interface HandoffUiState {
   instructions: string;
 }
 
-// One row of the tool-precondition editor. The stored shape is a map keyed by tool name; the editor
-// holds a list so a row survives the operator clearing the tool name to pick another one.
-export interface ToolPreconditionRow {
-  tool: string;
+// One condition of a tool's rule, as the editor holds it.
+export interface ToolPreconditionCondition {
+  // Absent is "attribute", the kind every condition had before the customer's choice existed.
+  kind?: "attribute" | "customer_choice";
   scope: "conversation" | "contact";
   key: string;
   equals: string;
+  // Whether the condition asks for any value or for `equals`. Absent, it follows `equals`: a typed
+  // value means "equals". Kept apart so "equals" with the value still blank stays chosen while it is
+  // typed, and a value hidden by "any" is kept on screen state but never saved.
+  match?: "any" | "equals";
 }
 
-// THE MARKS THE EDITOR HANDS ITS TABS.
-//
-// One object per tab and not one prop per input, and the shape is forced rather than chosen. The
-// fence in `tests/client/field-refusal-fence.test.ts` asks that every name a form DECLARES be read
-// back by an `at(…)` call in the SAME file, so the readings have to stay in `AgentEditorPage` and
-// only their answers travel. Handing a tab a `refusalAt` callback instead would move the readings
-// into the tab and leave the declaration answered by nothing — which is the exact shape that rule
-// exists to catch, since a declared name with no control behind it makes `placeRefusal` report a
-// placement and the caller then keeps the toast quiet.
-//
-// Null is the normal value of every one of these: at most one input is refused at a time.
+// One tool of the tool-precondition editor, with every condition its rule requires. The stored shape
+// is a map keyed by tool name; the editor holds a list so a row survives the operator clearing the
+// tool name to pick another one.
+export interface ToolPreconditionRow {
+  tool: string;
+  conditions: ToolPreconditionCondition[];
+}
+
+// The refusal marks the editor hands its tabs, one object per tab. The readings stay in
+// `AgentEditorPage` because `tests/client/field-refusal-fence.test.ts` requires every name a form
+// declares to be read by an `at(…)` call in that same file; a `refusalAt` callback here would leave
+// the declaration unanswered. Null is the normal value: at most one input is refused at a time.
 export interface BehaviorRefusals {
   sttCredential: string | null;
   ttsCredential: string | null;
@@ -79,9 +84,10 @@ export interface BehaviorRefusals {
   ttsVoice: string | null;
   ttsModel: string | null;
   ttsNormalizeCredential: string | null;
+  ttsFallbackCredential: string | null;
   visionCredential: string | null;
   visionExtractionPrompt: string | null;
-  // Issue #859: the spoken-reply notice and the reply_as_text note.
+  // The spoken-reply notice and the reply_as_text note.
   ttsSpokenNoticeText: string | null;
   ttsTextChoiceNote: string | null;
   contactAuthCredential: string | null;
@@ -92,16 +98,22 @@ export interface BehaviorRefusals {
   // By index, because the server refuses a follow-up note as `followUp.steps[2].instructions` and the
   // step it names is the one that has to carry the mark.
   followUpSteps: readonly (string | null)[];
+  // By cadence, then by step: `snoozedFollowUp.cadences[1].steps[0].instructions`.
+  snoozedFollowUpSteps: readonly (readonly (string | null)[])[];
 }
 
 export interface GuardrailsRefusals {
   credential: string | null;
+  decisionsCredential: string | null;
   customPolicy: string | null;
   inputTemplateMessage: string | null;
   outputTemplateMessage: string | null;
   outputGenerationPrompt: string | null;
   inputHandoffMessage: string | null;
   outputHandoffMessage: string | null;
+  externalUrl: string | null;
+  externalSecret: string | null;
+  groundingCredential: string | null;
 }
 
 export interface ToolRefusals {

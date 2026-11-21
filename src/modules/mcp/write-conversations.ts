@@ -11,6 +11,7 @@ import {
   returnConversationToAgent,
   setConversationStatus,
 } from "@/modules/conversations/service";
+import { tryDecisionsAgent } from "@/modules/decisions/try";
 import type { VerifiedToken } from "./oauth/tokens";
 import {
   err,
@@ -21,14 +22,9 @@ import {
   type WriteResult,
 } from "./write";
 
-// MCP conversation-control write tools. These have EXTERNAL effect: they post real messages
-// to / change the state of a live customer conversation in Chatwoot. dry-run by default previews the
-// action; applying is NOT reversible —
-// the trade-off is the MCP client's per-call approval plus an audit row on every apply.
-//
-// The row is no longer written HERE (#398). Each service records its own, so the same guard covers
-// the console and the REST API, which had none: this file only reads the conversation for the
-// dry-run preview and hands the apply down.
+// MCP conversation-control write tools. These have EXTERNAL effect on a live customer conversation
+// in Chatwoot; applying is NOT reversible, guarded by the MCP client's per-call approval plus the
+// audit row each service records itself. This file only reads for the preview and hands down.
 
 function failOf(e: unknown): WriteResult {
   if (e instanceof AppError) return err(e.message);
@@ -85,13 +81,10 @@ export async function conversationReturn(
   try {
     const current = await getConversationDetail(ctx, id, base);
     if (args.dry_run !== false) {
-      // THE PREVIEW REFUSES WHAT THE APPLY REFUSES (issue #495 review, round 1). Without this the
-      // dry run answered "this returns the conversation" for an inbox with no responder — unbound,
-      // switched off, only observing, or with no bot on this Chatwoot — and the approved apply then
-      // failed with a 409, which is the incoherence docs/mcp.md rules out.
-      // The INJECTED factory, not a fresh one (issue #495 review, round 5): this preview now makes a
-      // Chatwoot call, so discarding `deps.makeClient` would send a test or an embedded caller at the
-      // real instance behind the operator's back.
+      // NOTE: the preview refuses what the apply refuses (an inbox with no responder: unbound,
+      // switched off, only observing, or with no bot on this Chatwoot). It calls Chatwoot, so it
+      // uses the INJECTED `deps.makeClient`, never a fresh one that would reach the real instance
+      // from a test.
       await assertConversationReturnable(
         ctx,
         id,
@@ -103,14 +96,10 @@ export async function conversationReturn(
         action: "return",
         target,
         currentStatus: current.status,
-        note: "Returns the conversation to the bot (unassigns human, status pending). Calls Chatwoot.",
+        note: "Returns the conversation to the bot (hands it to the inbox's Agent Bot, which removes the human and sets status pending). Calls Chatwoot.",
       });
     }
-    // The INJECTED factory here too (issue #495 review, round 7). The preview was given it in round
-    // 5 and the apply beside it kept `{}`, which went unnoticed only because the refusal it is
-    // usually asked for happened before any client was built; now that both halves read the
-    // conversation from Chatwoot first, a caller that passes a factory had it honoured on the
-    // preview and discarded on the apply — the two halves talking to different Chatwoots.
+    // The INJECTED factory here too, so both halves read the same Chatwoot.
     const outcome = await returnConversationToAgent(
       ctx,
       id,
@@ -173,9 +162,8 @@ export async function conversationReengage(
   try {
     const current = await getConversationDetail(ctx, id, base);
     if (args.dry_run !== false) {
-      // NOTE: the core's own second refusal, past the existence check this `getConversationDetail`
-      // already made. An inbox with no agent bound has nothing to run the turn, and the preview
-      // promised a proactive message that could never be sent (#510).
+      // NOTE: the core's own refusal past the existence check: an inbox with no agent bound has
+      // nothing to run the turn.
       await assertConversationReengageable(ctx, id, base);
       return ok({
         dryRun: true,
@@ -191,6 +179,29 @@ export async function conversationReengage(
       applied: true,
       target,
       outcome: result.outcome,
+    });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// The conversation page's test of a decisions agent: paid, so behind the write scope, and nothing
+// is written (modules/decisions/try.ts).
+export async function conversationDecisionsTest(
+  principal: VerifiedToken,
+  args: { conversation_id: string; agent_id: string },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const conversationId = parseMcpId(args.conversation_id, "conversation_id");
+  if (typeof conversationId !== "bigint") return conversationId;
+  const agentId = parseMcpId(args.agent_id, "agent_id");
+  if (typeof agentId !== "bigint") return agentId;
+  try {
+    return ok({
+      tick: await tryDecisionsAgent(ctx, agentId, conversationId, {}, base),
     });
   } catch (e) {
     return failOf(e);

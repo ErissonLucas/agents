@@ -1,15 +1,31 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { BaseMessage } from "@langchain/core/messages";
 import { MemorySaver } from "@langchain/langgraph-checkpoint";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
-import { contactInboxThreadId } from "@/graph/checkpointer";
+import { contactInboxThreadId, getCheckpointer } from "@/graph/checkpointer";
 import { clearTurnInFlight, markTurnInFlight } from "@/graph/inflight";
-import { drainPendingIngest } from "@/graph/ingest-drain";
-import { armIngest, ingestDedupeKey, ingestHandler } from "@/graph/ingest-job";
+import { INGEST_ID_WINDOW } from "@/graph/ingest-dedup";
+import { byMessageId, drainPendingIngest } from "@/graph/ingest-drain";
+import {
+  armIngest,
+  fallbackHandler,
+  ingestDedupeKey,
+  ingestFallbackKey,
+  ingestFallbackKeyPrefix,
+  ingestHandler,
+  ingestKeyPrefix,
+  retireCoveredFallbacks,
+} from "@/graph/ingest-job";
 import { stampedSentAt } from "@/graph/markers";
+import {
+  currentPoolClass,
+  type PoolClass,
+  runInPoolClass,
+} from "@/lib/pool-class";
 import { runScopedOn } from "@/lib/tenancy";
+import * as scheduler from "@/modules/scheduler/service";
 import {
   type ClaimedJob,
   claimDueTrafficJobs,
@@ -17,15 +33,19 @@ import {
   rescheduleJob,
   revokeJobsByKeyPrefixOn,
 } from "@/modules/scheduler/service";
-import { runClaimed } from "@/modules/scheduler/worker";
+import {
+  getJobHandler,
+  registerJobHandler,
+  runClaimed,
+} from "@/modules/scheduler/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogRows } from "../utils/flowlog";
 
-// Issue #194, hazard 1, and the reason continuous ingestion became a job at all.
-//
-// A LangGraph invoke is a read-modify-write of the WHOLE message channel, so a message appended
-// beside a running turn is undone when that turn saves. On the inline path the append happened
-// anyway and the thread's own record advanced with it, which is what made the loss permanent: the
-// message was gone AND marked handled. What the job buys is a third answer — put it down, come back.
+// Continuous ingestion is a job because a LangGraph invoke is a read-modify-write of the WHOLE
+// message channel: a message appended beside a running turn is undone when that turn saves. Appended
+// inline, the thread's own record would advance anyway, leaving the message gone AND marked handled.
+// The job adds a third answer: put it down, come back.
 
 let appDb: PrismaClient;
 let suDb: PrismaClient;
@@ -48,8 +68,8 @@ if (!process.env.TEST_APP_DATABASE_URL) {
   });
   try {
     await suDb.$queryRaw`SELECT 1`;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -72,6 +92,7 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     if (tenantId) {
       for (const table of [
         "scheduler_jobs",
+        "chatwoot_webhook_deliveries",
         "agent_threads",
         "chatwoot_instances",
       ]) {
@@ -88,9 +109,9 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
   });
 
   // A REAL row, claimed the way the tick claims it, rather than a hand-built `ClaimedJob`. The
-  // handler now re-reads its own row under the lock to see whether it was revoked while it waited
-  // (a /reset does exactly that), so a synthetic job with no row behind it is a job that has already
-  // been cancelled — and every test built that way would pass for the wrong reason.
+  // handler re-reads its own row under the lock to see whether it was revoked while it waited (a
+  // /reset does exactly that), so a synthetic job with no row behind it is a job already cancelled,
+  // and every test built that way would pass for the wrong reason.
   async function armAndClaim(
     contactInboxId: number,
     conversationId: number,
@@ -159,8 +180,9 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     // would dead-letter a contact's own message in a long conversation.
     expect(deferred.outcome).toBe("reschedule");
 
-    // The observable half. Nothing was appended, and — the part that made the inline loss permanent
-    // — the thread has no record claiming this message was handled, so the retry still ingests it.
+    // NOTE: The observable half. Nothing was appended, and the thread has no record claiming this
+    // message was handled (the record whose advance would make the loss permanent), so the retry
+    // still ingests it.
     expect(await contents()).toEqual([]);
     const owed = await suDb.agentThread.findUnique({
       where: {
@@ -182,12 +204,11 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ]);
   });
 
-  // Round-11 review finding (P2). `encryptJson` returns a base64 blob and this repository's rule is
-  // that such a blob lives in a plain String column, never in a Prisma `Json` one: a Json payload is
-  // what gets logged or serialized whole, and it would carry a contact's own words with it. The
-  // ciphertext therefore has its own column, and what stays in the JSON must be metadata only.
-  // Issue #755: the instant Chatwoot recorded crosses the queue with the message, so a message folded
-  // in while nobody answered is still shown to the model with the date it was sent.
+  // `encryptJson` returns a base64 blob, which lives in a plain String column, never a Prisma `Json`
+  // one: a Json payload is what gets logged or serialized whole, and it would carry a contact's own
+  // words with it. The ciphertext has its own column, and the JSON holds metadata only. The instant
+  // Chatwoot recorded crosses the queue with the message, so a message folded in while nobody
+  // answered is still shown to the model with the date it was sent.
   test("the message's instant crosses the queue and lands on the message", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12555;
@@ -269,15 +290,12 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ).rejects.toThrow(/no message body/);
   });
 
-  // Round-9 review finding (P1). /reset clears this thread's summaries, its AgentThread row and its
-  // checkpoint, all under the `ingest:<thread>` lock — and it cancels the pending COMPACTION job,
-  // because that is the only queued writer of this memory it knew about. Continuous ingestion is one
-  // now, and the worst shape of it is a job already CLAIMED and blocked on that very lock: it lands
-  // the instant the reset releases and rebuilds the thread from text the operator was told had been
-  // cleared, with the reset reported as successful.
-  //
-  // Staged the way it actually happens: the job is claimed FIRST (it is in memory, past every check
-  // a cancellation could reach), and the revocation runs while it waits.
+  // /reset clears this thread's summaries, AgentThread row and checkpoint under the `ingest:<thread>`
+  // lock, and revokes queued ingestion with them. The worst shape is a job already CLAIMED and blocked
+  // on that lock: it would land the instant the reset releases and rebuild the thread from text the
+  // operator was told had been cleared, with the reset reported as successful. Staged the way it
+  // happens: the job is claimed FIRST (past every check a cancellation could reach), and the
+  // revocation runs while it waits.
   test("a job revoked by a reset while it waited writes nothing", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12508;
@@ -320,11 +338,11 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ).toBe(0);
   });
 
-  // THE REVOKE ORDERS ROWS AGAINST THE COMMAND (issue #736). `/reset` is not instantaneous: it waits
-  // for `withKeyedQueue('ingest:<thread>')` behind whatever ingestion is in flight, and `armIngest`
-  // does not take that queue, so a customer message landing in that stretch arms its own ingestion
-  // and is above the command by id. Unqualified, the revoke deleted it — and deleted, not retired,
-  // because INGEST_MESSAGE is JOB_DELETE_ON_DONE, so nothing afterwards says it ever existed.
+  // THE REVOKE ORDERS ROWS AGAINST THE COMMAND. `/reset` waits for `withKeyedQueue('ingest:<thread>')`
+  // behind whatever ingestion is in flight, and `armIngest` does not take that queue, so a customer
+  // message landing in that stretch arms its own ingestion and is above the command by id. An
+  // unqualified revoke would delete it, and delete rather than retire, because INGEST_MESSAGE is
+  // JOB_DELETE_ON_DONE, so nothing afterwards would say it ever existed.
   test("revoking up to a message spares the rows above it, in every status", async () => {
     const contactInboxId = 12_520;
     const graphThreadId = contactInboxThreadId(
@@ -392,29 +410,23 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
       `ingest:${graphThreadId}:901=CLAIMED`,
       `ingest:${graphThreadId}:902=DEAD`,
     ]);
-    // A FRONTEIRA MUDA QUANTAS MORTES VOLTAM, e é aqui que ela encontra a #739: o revoke devolve
-    // a morte que ele apagou para que o anúncio dela não se perca junto com a linha, e a fronteira
-    // apaga menos linhas, logo menos mortes voltam. A 702 morreu abaixo do comando e volta; a 902
-    // morreu acima, continua DEAD na tabela e continua DEVENDO o anúncio dela pelo caminho normal
-    // do dead-letter — o que seria errado é a fronteira poupar a linha e ainda assim anunciá-la
-    // como apagada, porque o anúncio afirma uma deleção que o Postgres não fez.
+    // NOTE: The boundary changes how many deaths come back: the revoke returns each death it erased,
+    // so its announcement is not lost with the row, and the boundary erases fewer rows. 702 died
+    // below the command and comes back; 902 died above, stays DEAD and still owes its announcement
+    // through the normal dead-letter path. Announcing a spared row as erased would claim a deletion
+    // Postgres never made.
     expect(apagadas.erasedDeaths.map((d) => d.dedupeKey)).toEqual([
       `ingest:${graphThreadId}:702`,
     ]);
   });
 
-  // THE KEY DECIDES, NOT THE PAYLOAD, and the two fabricated rows below are why. `payload` is a
-  // convenience copy that a row could be missing; the key cannot be, because `ingestDedupeKey`
-  // builds it and the prefix is everything up to the message id. Deciding by the payload gets one
-  // of the two sides wrong whichever way it is written: "delete what is at or below" leaves the
-  // undecidable row BELOW the boundary holding text the reset was asked to erase, and "delete what
-  // is not provably above" deletes the undecidable row ABOVE it, which is the customer message this
-  // fence exists to save. The blind scenario set of #736 asked for both clauses in one scenario,
-  // and only the key answers both.
-  //
-  // These rows are fabricated: `armIngest` writes key and payload from the same variable, so no
-  // route produces a disagreement. What is pinned is the direction the code fails in if a second
-  // writer ever appears.
+  // THE KEY DECIDES, NOT THE PAYLOAD. `payload` is a convenience copy a row could be missing; the key
+  // cannot be, because `ingestDedupeKey` builds it and the prefix is everything up to the message id.
+  // A payload-driven fence gets one side wrong either way: "delete what is at or below" leaves the
+  // undecidable row BELOW the boundary holding text the reset must erase, and "delete what is not
+  // provably above" deletes the undecidable row ABOVE it, the customer message this fence saves.
+  // The rows are fabricated (`armIngest` writes key and payload from the same variable): what is
+  // pinned is the direction the code fails in if a second writer ever appears.
   test("the key decides, so a payload that names no message spares nothing and loses nothing", async () => {
     const contactInboxId = 12_522;
     const graphThreadId = contactInboxThreadId(
@@ -507,18 +519,13 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ]);
   });
 
-  // ONE STATEMENT, AND THAT IS THE ASSERTION (PR review round 1). The first version of this fence
-  // read the ids with `findMany` and deleted by id, which reads correctly and is still wrong: the
-  // caller's transaction runs at READ COMMITTED and `armIngest` takes neither the thread's queue
-  // nor its conversation row, so a delayed pre-reset delivery arming BETWEEN the two statements is
-  // absent from the id list and survives the reset, free to put pre-reset text back into the
-  // cleared thread. One statement sees rows committed up to its own start, which is the window the
-  // unqualified sweep always had rather than a wider one.
-  //
-  // Asserted structurally because the race itself is not reachable from a test: it needs a second
-  // connection committing at a controlled instant inside the reset. What IS checkable is the shape
-  // the review asked for, and the shape is what the fix is. A count alone would not catch a form
-  // that reads once and deletes once under a different name, so the kind is asserted too.
+  // ONE STATEMENT, AND THAT IS THE ASSERTION. Reading the ids with `findMany` and deleting by id
+  // reads correctly and is still wrong: the caller's transaction runs at READ COMMITTED and
+  // `armIngest` takes neither the thread's queue nor its conversation row, so a delayed pre-reset
+  // delivery arming BETWEEN the two statements would survive the reset. One statement sees rows
+  // committed up to its own start. Asserted structurally because the race needs a second connection
+  // committing inside the reset; the kind is asserted with the count, since a count alone would pass
+  // a form that reads once and deletes once under another name.
   test("the bounded revoke is a single DELETE, not a read followed by a delete", async () => {
     const contactInboxId = 12_523;
     const graphThreadId = contactInboxThreadId(
@@ -637,11 +644,10 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ).toBe(0);
   });
 
-  // The other half of that fence, which a mutation run caught as untested: `claimSeq`, not just the
-  // status. A duplicate delivery re-arms the row back to PENDING without touching claimSeq, so the
-  // status alone covers that — but the tick can then CLAIM it again, which bumps the sequence and
-  // starts a second run while the first is still waiting on the thread lock. Two runs of one key at
-  // once is what the scheduler avoids everywhere else; here the first one stands down and the row
+  // The other half of that fence: `claimSeq`, not just the status. A duplicate delivery re-arms the
+  // row to PENDING without touching claimSeq, and the tick can then CLAIM it again, which bumps the
+  // sequence and starts a second run while the first still waits on the thread lock. Two runs of one
+  // key at once is what the scheduler avoids everywhere else; the first one stands down and the row
   // belongs to the claim that holds it.
   test("a job whose row was claimed again stands down for the newer run", async () => {
     const saver = new MemorySaver();
@@ -700,11 +706,10 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     ).toBe(1);
   });
 
-  // The dedupe key, which a mutation run caught as an untested rule. `enqueueJob` keeps ONE live row
-  // per (tenant, kind, dedupeKey) and a re-enqueue REPLACES the payload, so a key scoped to the
-  // thread would let the second message of a burst overwrite the first before either ran — the same
-  // message loss this job exists to stop, moved one layer out and much harder to see, because the
-  // thread would look healthy and only one of the two messages would ever have existed as work.
+  // The dedupe key. `enqueueJob` keeps ONE live row per (tenant, kind, dedupeKey) and a re-enqueue
+  // REPLACES the payload, so a key scoped to the thread would let the second message of a burst
+  // overwrite the first before either ran: the loss this job exists to stop, one layer out and
+  // harder to see, because the thread would look healthy.
   test("two messages queued on one thread are two jobs, not one", async () => {
     const contactInboxId = 12503;
     const graphThreadId = contactInboxThreadId(
@@ -730,8 +735,8 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     await arm(400, "primeira da rajada");
     await arm(401, "segunda da rajada");
 
-    // Claimed from the traffic-proportional half of the shared lane: ingestion no longer competes
-    // with the fixed-rate kinds for the same batch (src/modules/scheduler/lanes.ts).
+    // Claimed from the traffic-proportional half of the shared lane, so ingestion does not
+    // compete with the fixed-rate kinds for the same batch (src/modules/scheduler/lanes.ts).
     const claimed = await claimDueTrafficJobs(50, appDb, new Date(), tenantId);
     // Read from the dedicated column, not from the JSON: the ciphertext of a contact's own words
     // does not live in `payload` (CLAUDE.md, Encryption).
@@ -742,19 +747,13 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     for (const job of claimed) await runClaimed(job, appDb);
   });
 
-  // THE BARRIER (round 2 review). Queuing the append cost synchronous ordering: a turn can start
-  // while a message meant for its context is still a row, and answer without it. The turn drains its
-  // own thread first, and the subtle half is that the drain ignores `run_at` — a job DEFERRED for a
-  // previous turn sits a minute in the future, and those are exactly the messages a starting turn is
-  // missing. A drain that only took due rows would skip them and look correct doing it.
-  // Issue #203, and the failure the in-process registry cannot see. The turn runs on whichever
-  // replica the Chatwoot webhook landed on and this job runs on the leader, so the Map that used to
-  // answer "is a turn reading this thread" is empty here and the append went in anyway, erased by
-  // that turn's save, and recorded as ingested, which is the loss #194 exists to close.
-  //
-  // The other replica is personified by what it actually leaves behind: the row, and nothing else.
-  // Marking through the module instead would mark THIS process's Map and the test would pass on the
-  // registry that is being replaced.
+  // THE BARRIER. A queued append gives up synchronous ordering: a turn can start while a message meant
+  // for its context is still a row. The turn drains its own thread first, and the drain ignores
+  // `run_at`: a job DEFERRED for a previous turn sits a minute in the future, and those are exactly
+  // the messages a due-only drain would skip. The turn runs on whichever replica the webhook landed
+  // on and this job on the leader, so an in-process registry of reading turns is empty here. The
+  // other replica is personified by what it leaves behind, the row; marking through the module would
+  // mark THIS process's registry and pass on a mechanism that cannot see the other replica.
   test("a turn held on another replica defers the append", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12561;
@@ -810,6 +809,46 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
           []) as BaseMessage[]
       ).map((m) => String(m.content)),
     ).toContain("ficou pronto?");
+  });
+
+  // INGEST_MESSAGE is a background kind, but a turn that drains its thread waits on the drain, so the
+  // drain runs on the turn's pool: behind a held background pool the turn would answer without the
+  // messages it was waiting for.
+  test("a turn's drain runs the ingestion on the turn's own pool", async () => {
+    const contactInboxId = 12510;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 990,
+      contactInboxId,
+      graphThreadId,
+      messageId: 900,
+      text: "e mais uma coisa",
+      role: "customer",
+      agentId: 1n,
+      compactionEnabled: false,
+      base: appDb,
+    });
+    const real = getJobHandler("INGEST_MESSAGE");
+    const seen: PoolClass[] = [];
+    registerJobHandler("INGEST_MESSAGE", (job, base, ctl) => {
+      seen.push(currentPoolClass());
+      return (real as NonNullable<typeof real>)(job, base, ctl);
+    });
+    try {
+      await runInPoolClass("main", () =>
+        drainPendingIngest(tenantId, graphThreadId, appDb),
+      );
+    } finally {
+      registerJobHandler("INGEST_MESSAGE", real as NonNullable<typeof real>);
+    }
+    expect(seen.length).toBeGreaterThan(0);
+    expect(new Set(seen)).toEqual(new Set(["main"]));
   });
 
   test("a turn drains its thread first, deferred rows included", async () => {
@@ -873,12 +912,11 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     expect(left).toBe(0);
   });
 
-  // Round-8 review finding (P2). A CLAIMED row counts as OWED, which is what lets compaction refuse
-  // to summarise an attendance whose messages are still coming — and it is also how one crash turns
-  // into a permanent stall. Ingestion has no tick of its own: these readers are its only path, and
-  // the drain claims PENDING rows only, so a row left CLAIMED by a process that died mid-job is
-  // invisible to the drain and owed forever. Every later compaction on that thread would reschedule
-  // and never run again.
+  // A CLAIMED row counts as OWED, which lets compaction refuse to summarise an attendance whose
+  // messages are still coming, and would also turn one crash into a permanent stall. Ingestion has no
+  // tick of its own: these readers are its only path, and the drain claims PENDING rows only, so a
+  // row left CLAIMED by a dead process would be owed forever and every later compaction on that
+  // thread would reschedule and never run.
   test("a claim left behind by a dead process is reaped, not owed forever", async () => {
     const contactInboxId = 12506;
     const graphThreadId = contactInboxThreadId(
@@ -1020,10 +1058,10 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     expect(row.status).toBe("PENDING");
   });
 
-  // What the drain's exclusion list still guards, after the claim itself learned to honour backoff:
-  // the DEFERRAL loop. A job that stands down for a turn keeps `attempts` at zero, so it stays
-  // claimable — and the drain makes five passes. Without the list it would claim and defer the same
-  // row once per pass, five times over, inside a customer's turn.
+  // What the drain's exclusion list guards, with the claim itself honouring backoff: the DEFERRAL
+  // loop. A job that stands down for a turn keeps `attempts` at zero, so it stays claimable, and the
+  // drain makes five passes. Without the list it would claim and defer the same row once per pass,
+  // five times over, inside a customer's turn.
   test("one drain claims a deferring row once, not once per pass", async () => {
     const contactInboxId = 12513;
     const graphThreadId = contactInboxThreadId(
@@ -1066,14 +1104,12 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     expect(row.status).toBe("PENDING");
   });
 
-  // Round-14 review finding (P1), and the same question the test above answers inside ONE drain,
-  // asked across several. Each turn on a thread opens its own drain with an empty exclusion list, so
-  // the run_at waiver that lets the barrier see a DEFERRED job also made a failed row due again
-  // immediately for the next turn: a burst with debounce off, or a turn and a nudge, spends all five
-  // attempts within seconds and dead-letters a customer's message over a database blip.
-  //
-  // The two are told apart by `attempts`, because that is what actually separates them:
-  // `rescheduleJob` leaves it untouched, `failJob` increments it.
+  // The question the test above answers inside ONE drain, asked across several. Each turn opens its
+  // own drain with an empty exclusion list, so the run_at waiver that lets the barrier see a DEFERRED
+  // job would make a failed row due again immediately for the next turn: a burst with debounce off,
+  // or a turn and a nudge, would spend all five attempts within seconds and dead-letter a customer's
+  // message over a database blip. A failed row carries `last_error` and a deferred one does not
+  // (the next test).
   test("a failed row keeps its backoff across drains, and is still owed", async () => {
     const contactInboxId = 12512;
     const graphThreadId = contactInboxThreadId(
@@ -1122,20 +1158,12 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
     // owes a message, so compaction will not summarise the attendance without it.
   });
 
-  // Round-16 review finding (P2), and the other half of the one above. The barrier has to tell a row
-  // that is BACKING OFF from one that merely STOOD DOWN, and the first version asked `attempts`,
-  // which answers a different question — a row can carry a spent budget while carrying no error, and
-  // reading the budget made the barrier skip the very message it exists to fold in.
-  //
-  // `last_error` is the state itself, and a reschedule clears it because the row has left it.
-  //
-  // The state is built with the REAPER, and that is a consequence of issue #287 rather than a
-  // preference: a reschedule now clears the budget too, so fail-then-defer (what this test used to
-  // do) leaves `attempts` at zero and no longer constructs the divergence at all. A crashed claim
-  // still does, and more honestly — `reapStaleJobs` increments `attempts` and never writes
-  // `last_error`, because a claim that died has no message to record. Rebuilt rather than deleted:
-  // the guarantee is the barrier's, not the reschedule's, and a test that stopped being able to
-  // build its own offending state would have gone on passing while guarding nothing.
+  // The barrier tells a row that is BACKING OFF from one that merely STOOD DOWN by `last_error`, the
+  // state itself, which a reschedule clears. `attempts` answers a different question: a row can carry
+  // a spent budget with no error, and reading it would skip the very message the barrier folds in.
+  // The state is built with the REAPER because a reschedule clears the budget too, so fail-then-defer
+  // cannot construct the divergence; `reapStaleJobs` increments `attempts` and never writes
+  // `last_error`. A test that could not build its own offending state would pass guarding nothing.
   test("a job whose claim died and then deferred is still drained", async () => {
     const saver = new MemorySaver();
     const contactInboxId = 12514;
@@ -1234,5 +1262,1171 @@ describe.skipIf(!dbUp)("the ingestion job defers to a turn in flight", () => {
 
     clearTurnInFlight(graphThreadId);
     expect((await ingestHandler(job, appDb, saver)).outcome).toBe("done");
+  });
+
+  // A watcher that left the append to the memory owner arms a fallback of its own kind: no memory line
+  // while it waits, and when it runs it arms the ordinary append only where the message has none.
+  async function armFallbackAndClaim(
+    contactInboxId: number,
+    messageId: number,
+    text: string,
+  ): Promise<{ job: ClaimedJob; graphThreadId: string }> {
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 990,
+      contactInboxId,
+      graphThreadId,
+      messageId,
+      text,
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      base: appDb,
+    });
+    const notYet = await claimDueTrafficJobs(50, appDb, new Date(), tenantId);
+    expect(notYet.some((j) => j.kind === "INGEST_FALLBACK")).toBe(false);
+    const job = (
+      await claimDueTrafficJobs(
+        50,
+        appDb,
+        new Date(Date.now() + 11 * 60_000),
+        tenantId,
+      )
+    ).find(
+      (j) =>
+        j.kind === "INGEST_FALLBACK" &&
+        j.dedupeKey === ingestFallbackKey(graphThreadId, messageId),
+    );
+    if (!job) throw new Error("the fallback was not claimed once due");
+    return { job, graphThreadId };
+  }
+
+  // What a fallback's own run wrote into the thread, read off the checkpointer it was given.
+  async function appendedTexts(saver: MemorySaver, graphThreadId: string) {
+    const saved = await saver.get({
+      configurable: { thread_id: graphThreadId },
+    });
+    return (
+      (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+    )
+      .filter((m) => !String(m.id).endsWith(":divider"))
+      .map((m) => String(m.content));
+  }
+
+  test("a fallback that comes due with no append queued appends its message itself, with the same body", async () => {
+    const { job, graphThreadId } = await armFallbackAndClaim(
+      12601,
+      820,
+      "o dono não gravou",
+    );
+    // The deferring watcher's own claim, which stated it leaves the append: no statement that anyone
+    // queued it.
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `ij-watcher-${process.pid}-820`,
+        event: "message_created",
+        conversationId: 990,
+        inboundMessageId: 820,
+        routeRemembers: false,
+        status: "PROCESSED",
+      },
+    });
+    // Armed, the fallback wrote no append of its own.
+    expect(
+      await suDb.schedulerJob.findFirst({
+        where: {
+          tenantId,
+          kind: "INGEST_MESSAGE",
+          dedupeKey: ingestDedupeKey(graphThreadId, 820),
+        },
+      }),
+    ).toBeNull();
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(
+      (await appendedTexts(saver, graphThreadId)).some((t) =>
+        t.includes("o dono não gravou"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a fallback that comes due beside the owner's queued append leaves that append as it was", async () => {
+    const contactInboxId = 12602;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    // The owner's own append, with its own rendering of the message.
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 990,
+      contactInboxId,
+      graphThreadId,
+      messageId: 821,
+      text: "a transcrição do dono",
+      role: "customer",
+      agentId: 1n,
+      compactionEnabled: false,
+      base: appDb,
+    });
+    await suDb.schedulerJob.updateMany({
+      where: {
+        tenantId,
+        kind: "INGEST_MESSAGE",
+        dedupeKey: ingestDedupeKey(graphThreadId, 821),
+      },
+      data: { runAt: new Date(Date.now() + 60 * 60_000) },
+    });
+    const { job } = await armFallbackAndClaim(
+      contactInboxId,
+      821,
+      "[áudio não lido]",
+    );
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    // Nothing of its own written either: the owner's queued append is the one that writes.
+    expect(
+      await appendedTexts(
+        saver,
+        contactInboxThreadId(tenantId, instanceId, 12602),
+      ),
+    ).toEqual([]);
+    const rows = await suDb.schedulerJob.findMany({
+      where: {
+        tenantId,
+        kind: "INGEST_MESSAGE",
+        dedupeKey: ingestDedupeKey(graphThreadId, 821),
+      },
+      select: { payload: true, payloadSecret: true },
+    });
+    expect(rows).toHaveLength(1);
+    expect(decryptJson<string>(String(rows[0]?.payloadSecret))).toBe(
+      "a transcrição do dono",
+    );
+    expect(
+      (rows[0]?.payload as { agentId?: string } | undefined)?.agentId,
+    ).toBe("1");
+  });
+
+  test("a later arm of a waiting fallback refreshes its body and leaves its run time as it was", async () => {
+    const contactInboxId = 12603;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (text: string) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 990,
+        contactInboxId,
+        graphThreadId,
+        messageId: 822,
+        text,
+        role: "customer",
+        agentId: 2n,
+        compactionEnabled: false,
+        fallbackAfterMs: 10 * 60_000,
+        base: appDb,
+      });
+    await arm("[áudio não lido]");
+    const due = new Date(Date.now() + 60_000);
+    await suDb.schedulerJob.updateMany({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 822),
+      },
+      data: { runAt: due },
+    });
+    // The transcription arrives as an update while the fallback still waits.
+    await arm("a transcrição que chegou depois");
+    const row = await suDb.schedulerJob.findFirstOrThrow({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 822),
+      },
+      select: { runAt: true, payloadSecret: true },
+    });
+    expect(row.runAt.getTime()).toBe(due.getTime());
+    expect(decryptJson<string>(String(row.payloadSecret))).toBe(
+      "a transcrição que chegou depois",
+    );
+  });
+
+  // The barrier and the fallback. A fallback still waiting may be the thread's only copy of a
+  // message, so compaction must not read past it; one whose time has come is folded in by the drain
+  // itself, which with the shared scheduler off is the only thing that would ever run it.
+  async function fallbackFixture(contactInboxId: number, messageId: number) {
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 991,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: "a mensagem que só a reserva guarda",
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    const synced = async () =>
+      (
+        await suDb.agentThread.findUnique({
+          where: {
+            tenantId_chatwootInstanceId_contactInboxId: {
+              tenantId,
+              chatwootInstanceId: instanceId,
+              contactInboxId,
+            },
+          },
+          select: { recentSyncedMessageIds: true },
+        })
+      )?.recentSyncedMessageIds ?? [];
+    const fallbackLeft = () =>
+      suDb.schedulerJob.count({
+        where: {
+          tenantId,
+          kind: "INGEST_FALLBACK",
+          dedupeKey: ingestFallbackKey(graphThreadId, messageId),
+        },
+      });
+    return { graphThreadId, arm, synced, fallbackLeft };
+  }
+
+  test("a waiting fallback holds the barrier open, and is not run early", async () => {
+    const f = await fallbackFixture(12604, 830);
+    await f.arm(10 * 60_000);
+    expect(await drainPendingIngest(tenantId, f.graphThreadId, appDb)).toBe(
+      "incomplete",
+    );
+    expect(await f.synced()).toEqual([]);
+    expect(await f.fallbackLeft()).toBe(1);
+  });
+
+  test("a fallback whose time has come is folded in by the drain", async () => {
+    const f = await fallbackFixture(12605, 831);
+    await f.arm(10 * 60_000);
+    await suDb.schedulerJob.updateMany({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(f.graphThreadId, 831),
+      },
+      data: { runAt: new Date(Date.now() - 1000) },
+    });
+    expect(await drainPendingIngest(tenantId, f.graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    expect(await f.synced()).toEqual([831]);
+    expect(await f.fallbackLeft()).toBe(0);
+  });
+
+  test("the owner's append, once in memory, retires the fallback still waiting for it", async () => {
+    const f = await fallbackFixture(12606, 832);
+    await f.arm(10 * 60_000);
+    await f.arm();
+    expect(await drainPendingIngest(tenantId, f.graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    expect(await f.synced()).toEqual([832]);
+    expect(await f.fallbackLeft()).toBe(0);
+  });
+
+  // The owner's statement on the ledger, which outlives the dedup window: a delivery that stated it
+  // appends the message and settled, which it does only once the append is queued.
+  async function ownerStatedAppend(conversationId: number, messageId: number) {
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `ij-owner-${process.pid}-${messageId}`,
+        event: "message_updated",
+        conversationId,
+        inboundMessageId: messageId,
+        routeRemembers: true,
+        status: "PROCESSED",
+      },
+    });
+  }
+
+  test("a fallback that comes due for a message the owner queued writes nothing", async () => {
+    const { job, graphThreadId } = await armFallbackAndClaim(
+      12607,
+      833,
+      "o dono já gravou, a janela já esqueceu",
+    );
+    await ownerStatedAppend(990, 833);
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(await appendedTexts(saver, graphThreadId)).toEqual([]);
+  });
+
+  test("a waiting fallback for a message the owner stated it appends does not hold the barrier", async () => {
+    const f = await fallbackFixture(12608, 834);
+    await f.arm(10 * 60_000);
+    await ownerStatedAppend(991, 834);
+    expect(await drainPendingIngest(tenantId, f.graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    expect(await f.fallbackLeft()).toBe(0);
+    expect(await f.synced()).toEqual([]);
+  });
+
+  test("a later arm while the fallback is already claimed re-arms it with the newer text, and the claimed run stands down", async () => {
+    const { job, graphThreadId } = await armFallbackAndClaim(
+      12609,
+      835,
+      "[áudio não lido]",
+    );
+    // The transcription arrives while the claimed run has not appended yet.
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 990,
+      contactInboxId: 12609,
+      graphThreadId,
+      messageId: 835,
+      text: "a transcrição que chegou no meio",
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      base: appDb,
+    });
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(await appendedTexts(saver, graphThreadId)).toEqual([]);
+    const again = (
+      await claimDueTrafficJobs(50, appDb, new Date(), tenantId)
+    ).find((j) => j.dedupeKey === ingestFallbackKey(graphThreadId, 835));
+    if (!again) throw new Error("the re-armed fallback was not claimed");
+    expect((await fallbackHandler(again, appDb, saver)).outcome).toBe("done");
+    const texts = await appendedTexts(saver, graphThreadId);
+    expect(
+      texts.some((t) => t.includes("a transcrição que chegou no meio")),
+    ).toBe(true);
+    expect(texts.some((t) => t.includes("[áudio não lido]"))).toBe(false);
+  });
+
+  test("a later arm while the fallback is claimed re-arms nothing where the owner queued the message", async () => {
+    const { graphThreadId } = await armFallbackAndClaim(
+      12610,
+      836,
+      "[áudio não lido]",
+    );
+    await ownerStatedAppend(990, 836);
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 990,
+      contactInboxId: 12610,
+      graphThreadId,
+      messageId: 836,
+      text: "a transcrição deste watcher",
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      base: appDb,
+    });
+    const row = await suDb.schedulerJob.findFirstOrThrow({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 836),
+      },
+      select: { status: true, payloadSecret: true },
+    });
+    expect(row.status).toBe("CLAIMED");
+    expect(decryptJson<string>(String(row.payloadSecret))).toBe(
+      "[áudio não lido]",
+    );
+  });
+
+  test("an owner that stated it appends but never settled does not stand in for the fallback", async () => {
+    const { job, graphThreadId } = await armFallbackAndClaim(
+      12611,
+      837,
+      "o dono caiu antes de enfileirar",
+    );
+    // The flag is written just before the owner arms its append; a crash there leaves the row here.
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `ij-owner-crashed-${process.pid}-837`,
+        event: "message_created",
+        conversationId: 990,
+        inboundMessageId: 837,
+        routeRemembers: true,
+        status: "PROCESSING",
+      },
+    });
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(
+      (await appendedTexts(saver, graphThreadId)).some((t) =>
+        t.includes("o dono caiu antes de enfileirar"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a newer message folded in brings an older waiting fallback due at once, and leaves a newer one waiting", async () => {
+    const contactInboxId = 12612;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 992,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    await arm(840, 10 * 60_000);
+    await arm(842, 10 * 60_000);
+    await arm(841);
+    const job = (
+      await claimDueTrafficJobs(50, appDb, new Date(), tenantId)
+    ).find((j) => j.dedupeKey === ingestDedupeKey(graphThreadId, 841));
+    if (!job) throw new Error("the append was not claimed");
+    expect((await ingestHandler(job, appDb, new MemorySaver())).outcome).toBe(
+      "done",
+    );
+    const runAt = async (messageId: number) =>
+      (
+        await suDb.schedulerJob.findFirstOrThrow({
+          where: {
+            tenantId,
+            kind: "INGEST_FALLBACK",
+            dedupeKey: ingestFallbackKey(graphThreadId, messageId),
+          },
+          select: { runAt: true },
+        })
+      ).runAt.getTime();
+    expect(await runAt(840)).toBeLessThanOrEqual(Date.now());
+    expect(await runAt(842)).toBeGreaterThan(Date.now() + 60_000);
+  });
+
+  // With the shared scheduler off, the barrier is the only thing that runs either kind. More newer
+  // appends queued than the dedup window holds must not push a waiting fallback's message out of it.
+  test("a barrier draining more newer appends than the dedup window holds still folds in the older fallback", async () => {
+    const contactInboxId = 12613;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, sentAt: Date, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 993,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        sentAt,
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    const t0 = Date.now() - 60 * 60_000;
+    await arm(1000, new Date(t0), 10 * 60_000);
+    for (let i = 1; i <= INGEST_ID_WINDOW + 6; i++)
+      await arm(1000 + i, new Date(t0 + i * 1000));
+    expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    const saved = await (await getCheckpointer()).get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const ids = (
+      (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+    ).map((m) => m.id);
+    expect(ids).toContain("ingest:1000");
+    expect(ids).toHaveLength(INGEST_ID_WINDOW + 7);
+  }, 180_000);
+
+  test("a barrier draining more newer appends than the dedup window holds still folds in an older fallback with no send time", async () => {
+    const contactInboxId = 12614;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (
+      messageId: number,
+      sentAt: Date | null,
+      fallbackAfterMs?: number,
+    ) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 994,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        ...(sentAt === null ? {} : { sentAt }),
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    const t0 = Date.now() - 60 * 60_000;
+    await arm(1000, null, 10 * 60_000);
+    for (let i = 1; i <= INGEST_ID_WINDOW + 6; i++)
+      await arm(1000 + i, new Date(t0 + i * 1000));
+    expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    const saved = await (await getCheckpointer()).get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const ids = (
+      (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+    ).map((m) => m.id);
+    expect(ids).toContain("ingest:1000");
+    expect(ids).toHaveLength(INGEST_ID_WINDOW + 7);
+  }, 180_000);
+
+  // The shared tick claims by rank and creation, not by run time. A fallback appends in its own run,
+  // so its row, created when the message arrived, is reached before the newer appends queued after it.
+  test("the shared tick draining more newer appends than the dedup window holds still folds in the older fallback", async () => {
+    const contactInboxId = 12615;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 995,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    await arm(3000, 10 * 60_000);
+    for (let i = 1; i <= INGEST_ID_WINDOW + 6; i++) await arm(3000 + i);
+    const ours = (key: string) =>
+      key.startsWith(ingestKeyPrefix(graphThreadId)) ||
+      key.startsWith(ingestFallbackKeyPrefix(graphThreadId));
+    const saver = new MemorySaver();
+    for (let tick = 0; tick < 20; tick++) {
+      // The claim is tenant-wide, and earlier cases leave rows of their own: stop on an empty claim,
+      // not on one with nothing of this thread in it.
+      const all = await claimDueTrafficJobs(50, appDb, new Date(), tenantId);
+      if (all.length === 0) break;
+      const claimed = all.filter((j) => ours(j.dedupeKey ?? ""));
+      for (const job of claimed) {
+        if (job.kind === "INGEST_FALLBACK")
+          await fallbackHandler(job, appDb, saver);
+        else await ingestHandler(job, appDb, saver);
+      }
+    }
+    const saved = await saver.get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const ids = (
+      (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+    ).map((m) => m.id);
+    expect(ids).toContain("ingest:3000");
+  }, 180_000);
+
+  test("a barrier with more due fallbacks than one batch folds them all in before the newer appends move on", async () => {
+    const contactInboxId = 12616;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 996,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    for (let i = 0; i < 60; i++) await arm(4000 + i, 10 * 60_000);
+    for (let i = 0; i < INGEST_ID_WINDOW + 6; i++) await arm(4100 + i);
+    expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    const saved = await (await getCheckpointer()).get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const ids = new Set(
+      (
+        (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+      ).map((m) => m.id),
+    );
+    const missing = Array.from(
+      { length: 60 },
+      (_, i) => `ingest:${4000 + i}`,
+    ).filter((id) => !ids.has(id));
+    expect(missing).toEqual([]);
+  }, 180_000);
+
+  // The fallbacks come due with their run times in the OPPOSITE order of their ids, and each claimed
+  // batch comes back reversed, as `UPDATE ... RETURNING` is free to. The window starts with 50 ids, so
+  // 14 free slots decide it: run by run time, everything after the first 14 falls below the floor;
+  // sorted only within a batch of 50, the ten oldest land in the second batch, below the floor the
+  // first one moved. The ids are read in the order they were folded in.
+  test("due fallbacks across more than one batch are folded in by message id, not by run time", async () => {
+    const contactInboxId = 12640;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 997,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    for (let i = 0; i < 50; i++) await arm(6100 + i);
+    expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    for (let i = 59; i >= 0; i--) await arm(6000 + i, 10 * 60_000);
+    const longAgo = Date.now() - 3_600_000;
+    for (let i = 0; i < 60; i++)
+      await suDb.schedulerJob.updateMany({
+        where: {
+          tenantId,
+          kind: "INGEST_FALLBACK",
+          dedupeKey: ingestFallbackKey(graphThreadId, 6000 + i),
+        },
+        data: { runAt: new Date(longAgo - i * 1000) },
+      });
+    const claimDue = scheduler.claimDueByKeyPrefix;
+    const reversed = spyOn(scheduler, "claimDueByKeyPrefix").mockImplementation(
+      async (...args) => (await claimDue(...args)).reverse(),
+    );
+    try {
+      expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+        "drained",
+      );
+    } finally {
+      reversed.mockRestore();
+    }
+    const saved = await (await getCheckpointer()).get({
+      configurable: { thread_id: graphThreadId },
+    });
+    const ids = (
+      (saved?.channel_values as { messages?: BaseMessage[] })?.messages ?? []
+    )
+      .map((m) => m.id ?? "")
+      .filter((id) => /^ingest:60\d\d$/.test(id));
+    expect(ids).toEqual(
+      Array.from({ length: 60 }, (_, i) => `ingest:${6000 + i}`),
+    );
+  }, 180_000);
+
+  test("a fallback the owner covered, for a message already below the window's floor, stands down without reporting a lost append", async () => {
+    const contactInboxId = 12617;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    for (let i = 1; i <= INGEST_ID_WINDOW + 6; i++)
+      await armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 990,
+        contactInboxId,
+        graphThreadId,
+        messageId: 5000 + i,
+        text: `mensagem ${5000 + i}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        base: appDb,
+      });
+    expect(await drainPendingIngest(tenantId, graphThreadId, appDb)).toBe(
+      "drained",
+    );
+    const { job } = await armFallbackAndClaim(
+      contactInboxId,
+      5000,
+      "o dono gravou esta há muito tempo",
+    );
+    await ownerStatedAppend(990, 5000);
+    expect((await fallbackHandler(job, appDb)).outcome).toBe("done");
+    const undecidable = (
+      await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        // flowlog-scope: tenant-wide. The line names the message in its detail.
+        where: { tenantId, stage: "memory" },
+      })
+    ).filter((l) => {
+      const detail = JSON.stringify(l.detail ?? {});
+      return (
+        detail.includes("ingest_append_undecidable") &&
+        detail.includes(`"messageId":5000,`)
+      );
+    });
+    expect(undecidable).toEqual([]);
+  }, 180_000);
+
+  test("a newer message folded in leaves a fallback in failure backoff at its retry time", async () => {
+    const contactInboxId = 12618;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (messageId: number, fallbackAfterMs?: number) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 997,
+        contactInboxId,
+        graphThreadId,
+        messageId,
+        text: `mensagem ${messageId}`,
+        role: "customer",
+        agentId: 1n,
+        compactionEnabled: false,
+        ...(fallbackAfterMs === undefined ? {} : { fallbackAfterMs }),
+        base: appDb,
+      });
+    await arm(6000, 10 * 60_000);
+    const retryAt = new Date(Date.now() + 5 * 60_000);
+    await suDb.schedulerJob.updateMany({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 6000),
+      },
+      data: { runAt: retryAt, attempts: 1 },
+    });
+    await arm(6001);
+    const job = (
+      await claimDueTrafficJobs(50, appDb, new Date(), tenantId)
+    ).find((j) => j.dedupeKey === ingestDedupeKey(graphThreadId, 6001));
+    if (!job) throw new Error("the append was not claimed");
+    expect((await ingestHandler(job, appDb, new MemorySaver())).outcome).toBe(
+      "done",
+    );
+    const row = await suDb.schedulerJob.findFirstOrThrow({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 6000),
+      },
+      select: { runAt: true },
+    });
+    expect(row.runAt.getTime()).toBe(retryAt.getTime());
+  });
+
+  test("an owner's creation settled with nothing to append does not stand in for a fallback armed by the update that brought the audio", async () => {
+    const contactInboxId = 12620;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 998,
+      contactInboxId,
+      graphThreadId,
+      messageId: 839,
+      text: "a transcrição do áudio anexado depois",
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      event: "message_updated",
+      base: appDb,
+    });
+    // The owner settled the empty creation; its update delivery never came.
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `ij-owner-empty-${process.pid}-839`,
+        event: "message_created",
+        conversationId: 998,
+        inboundMessageId: 839,
+        routeRemembers: true,
+        status: "PROCESSED",
+      },
+    });
+    const job = (
+      await claimDueTrafficJobs(
+        50,
+        appDb,
+        new Date(Date.now() + 11 * 60_000),
+        tenantId,
+      )
+    ).find((j) => j.dedupeKey === ingestFallbackKey(graphThreadId, 839));
+    if (!job) throw new Error("the fallback was not claimed once due");
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(
+      (await appendedTexts(saver, graphThreadId)).some((t) =>
+        t.includes("a transcrição do áudio anexado depois"),
+      ),
+    ).toBe(true);
+  });
+
+  // Two `message_updated` of one voice note, each delivered on both routes: the first carried no words
+  // and the owner settled it remembering, the second carried them. `ownerSettled` says how many of the
+  // owner's two it settled; the watcher settled both, the second by arming the fallback.
+  async function twoUpdatesFallback(
+    contactInboxId: number,
+    messageId: number,
+    text: string,
+    ownerSettled: 1 | 2,
+  ) {
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 999,
+      contactInboxId,
+      graphThreadId,
+      messageId,
+      text,
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      event: "message_updated",
+      routes: { owner: 71, watcher: 72 },
+      base: appDb,
+    });
+    for (const [n, route, settled] of [
+      [1, 71, true],
+      [2, 71, ownerSettled === 2],
+      [1, 72, true],
+      [2, 72, true],
+    ] as const) {
+      await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `ij-upd-${process.pid}-${messageId}-${route}-${n}`,
+          event: "message_updated",
+          conversationId: 999,
+          inboundMessageId: messageId,
+          routeAgentBotId: route,
+          routeRemembers: route === 71 ? (settled ? true : null) : false,
+          status: settled ? "PROCESSED" : "PENDING",
+        },
+      });
+    }
+    const job = (
+      await claimDueTrafficJobs(
+        50,
+        appDb,
+        new Date(Date.now() + 11 * 60_000),
+        tenantId,
+      )
+    ).find((j) => j.dedupeKey === ingestFallbackKey(graphThreadId, messageId));
+    if (!job) throw new Error("the fallback was not claimed once due");
+    return { job, graphThreadId };
+  }
+
+  test("an owner's earlier update settled with nothing to append does not stand in for the later update that brought the words", async () => {
+    const { job, graphThreadId } = await twoUpdatesFallback(
+      12631,
+      851,
+      "as palavras do segundo update",
+      1,
+    );
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(
+      (await appendedTexts(saver, graphThreadId)).some((t) =>
+        t.includes("as palavras do segundo update"),
+      ),
+    ).toBe(true);
+  });
+
+  test("with neither route's delivery in the ledger, a fallback that names its routes appends its message", async () => {
+    const contactInboxId = 12633;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    await armIngest({
+      tenantId,
+      instanceId,
+      conversationId: 999,
+      contactInboxId,
+      graphThreadId,
+      messageId: 853,
+      text: "nenhuma entrega registrada",
+      role: "customer",
+      agentId: 2n,
+      compactionEnabled: false,
+      fallbackAfterMs: 10 * 60_000,
+      event: "message_updated",
+      routes: { owner: 71, watcher: 72 },
+      base: appDb,
+    });
+    const job = (
+      await claimDueTrafficJobs(
+        50,
+        appDb,
+        new Date(Date.now() + 11 * 60_000),
+        tenantId,
+      )
+    ).find((j) => j.dedupeKey === ingestFallbackKey(graphThreadId, 853));
+    if (!job) throw new Error("the fallback was not claimed once due");
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(
+      (await appendedTexts(saver, graphThreadId)).some((t) =>
+        t.includes("nenhuma entrega registrada"),
+      ),
+    ).toBe(true);
+  });
+
+  test("an owner that settled every update this route received stands in for the fallback", async () => {
+    const { job, graphThreadId } = await twoUpdatesFallback(
+      12632,
+      852,
+      "o dono já gravou as duas",
+      2,
+    );
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, appDb, saver)).outcome).toBe("done");
+    expect(await appendedTexts(saver, graphThreadId)).toEqual([]);
+  });
+
+  // A client that runs `before` ahead of every call on one model, inside transactions too, so a test
+  // can land a concurrent write at the exact point a function reads.
+  function onModel(
+    real: PrismaClient,
+    model: string,
+    before: () => Promise<void>,
+  ): PrismaClient {
+    const wrap = (c: Record<string, unknown>): never =>
+      new Proxy(c, {
+        get(t, p: string) {
+          if (p === "$transaction")
+            return (fn: unknown, opts?: unknown) =>
+              typeof fn === "function"
+                ? (t.$transaction as (f: unknown, o?: unknown) => unknown).call(
+                    t,
+                    (tx: Record<string, unknown>) =>
+                      (fn as (x: unknown) => unknown)(wrap(tx)),
+                    opts,
+                  )
+                : (t.$transaction as (f: unknown, o?: unknown) => unknown).call(
+                    t,
+                    fn,
+                    opts,
+                  );
+          if (p === "$extends")
+            return (...a: unknown[]) =>
+              wrap(
+                (
+                  t.$extends as (...x: unknown[]) => Record<string, unknown>
+                ).apply(t, a),
+              );
+          const v = Reflect.get(t, p);
+          if (p === model && v && typeof v === "object")
+            return new Proxy(v as Record<string, unknown>, {
+              get(d, op: string) {
+                const f = Reflect.get(d, op);
+                if (typeof f !== "function") return f;
+                return async (...a: unknown[]) => {
+                  await before();
+                  return (f as (...x: unknown[]) => unknown).apply(d, a);
+                };
+              },
+            });
+          return typeof v === "function"
+            ? (v as (...x: unknown[]) => unknown).bind(t)
+            : v;
+        },
+      }) as never;
+    return wrap(real as unknown as Record<string, unknown>);
+  }
+
+  test("a fallback refreshed while the barrier asks the ledger about its older body is not retired", async () => {
+    const contactInboxId = 12621;
+    const graphThreadId = contactInboxThreadId(
+      tenantId,
+      instanceId,
+      contactInboxId,
+    );
+    const arm = (text: string, event: string) =>
+      armIngest({
+        tenantId,
+        instanceId,
+        conversationId: 999,
+        contactInboxId,
+        graphThreadId,
+        messageId: 840,
+        text,
+        role: "customer",
+        agentId: 2n,
+        compactionEnabled: false,
+        fallbackAfterMs: 10 * 60_000,
+        event,
+        base: appDb,
+      });
+    await arm("[áudio não lido]", "message_created");
+    // The owner settled the creation; the update that brings the words has no owner delivery.
+    await suDb.chatwootWebhookDelivery.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        deliveryId: `ij-owner-creation-${process.pid}-840`,
+        event: "message_created",
+        conversationId: 999,
+        inboundMessageId: 840,
+        routeRemembers: true,
+        status: "PROCESSED",
+      },
+    });
+    let refreshed = false;
+    const racing = onModel(appDb, "chatwootWebhookDelivery", async () => {
+      if (refreshed) return;
+      refreshed = true;
+      await arm("as palavras que chegaram no update", "message_updated");
+    });
+    await retireCoveredFallbacks(tenantId, graphThreadId, racing);
+    const row = await suDb.schedulerJob.findFirst({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(graphThreadId, 840),
+      },
+      select: { payloadSecret: true },
+    });
+    expect(refreshed).toBe(true);
+    expect(row).not.toBeNull();
+    expect(decryptJson<string>(String(row?.payloadSecret))).toBe(
+      "as palavras que chegaram no update",
+    );
+  });
+
+  test("a fallback asks whether the owner queued its message once it holds the thread, not before", async () => {
+    const { job, graphThreadId } = await armFallbackAndClaim(
+      12622,
+      841,
+      "o dono enfileirou enquanto a reserva esperava a vez",
+    );
+    // The owner's delivery settles exactly when the fallback's append re-reads its own claim, inside
+    // the critical section: a check made before entering it would have missed it.
+    let settled = false;
+    const racing = onModel(appDb, "schedulerJob", async () => {
+      if (settled) return;
+      settled = true;
+      await ownerStatedAppend(990, 841);
+    });
+    const saver = new MemorySaver();
+    expect((await fallbackHandler(job, racing, saver)).outcome).toBe("done");
+    expect(settled).toBe(true);
+    expect(await appendedTexts(saver, graphThreadId)).toEqual([]);
+  });
+});
+
+// What the drain's sort does with a payload the claim's SQL also has to rank: a missing or non-numeric
+// id goes last, and equal ids keep the row order.
+describe("a claimed batch of fallbacks runs in message id order", () => {
+  test("lowest id first, a row without a numeric id last, ties by row", () => {
+    const job = (id: bigint, messageId: unknown): ClaimedJob => ({
+      id,
+      tenantId: 1n,
+      kind: "INGEST_FALLBACK",
+      payload: { messageId },
+      attempts: 0,
+      claimSeq: 1,
+    });
+    const batch = [
+      job(1n, 7002),
+      job(2n, "7000"),
+      job(3n, 7000),
+      job(4n, 6999),
+      job(5n, 7001),
+      job(6n, undefined),
+      job(7n, 7000),
+    ];
+    expect(batch.sort(byMessageId).map((j) => j.id)).toEqual([
+      4n,
+      3n,
+      7n,
+      5n,
+      1n,
+      2n,
+      6n,
+    ]);
   });
 });

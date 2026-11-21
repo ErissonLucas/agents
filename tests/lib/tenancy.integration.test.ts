@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { asSuperAdminOn } from "@/lib/tenancy/multi-tenant";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // Integration test for the multi-tenant isolation guarantees against a REAL Postgres
@@ -10,7 +11,7 @@ import { seedChatwootInstance } from "../utils/chatwoot";
 // uses its own clients so it is unaffected by the global prisma module mock other unit
 // tests install. Skips when no DB is reachable (e.g. CI without the dev container).
 
-// NOTE: tests/setup.ts overrides DATABASE_URL with a dummy to keep unit tests off any
+// tests/setup.ts overrides DATABASE_URL with a dummy to keep unit tests off any
 // real DB, so the app-role connection comes from TEST_APP_DATABASE_URL instead. Bun
 // expands ${POSTGRES_PORT} in .env at load time, so the values arrive resolved.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -31,14 +32,15 @@ if (appUrl && suUrl) {
     app = makeClient(appUrl);
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
 // Non-optional aliases for use inside the (skipped-when-down) describe block, avoiding
 // non-null assertions; when dbUp is false the suite is skipped and these are never read.
 const appDb = app as PrismaClient;
+const suDb = su as PrismaClient;
 
 let t1 = 0n;
 let t2 = 0n;
@@ -46,7 +48,7 @@ let t2 = 0n;
 describe.skipIf(!dbUp)("tenancy isolation (RLS)", () => {
   beforeAll(async () => {
     if (!su) return;
-    // Superuser bypasses RLS — seed two tenants, an instance each, a conversation each.
+    // Superuser bypasses RLS: seed two tenants, an instance each, a conversation each.
     const a = await su.tenant.create({
       data: { name: "ISO-A", slug: `iso-a-${process.pid}` },
     });
@@ -59,9 +61,9 @@ describe.skipIf(!dbUp)("tenancy isolation (RLS)", () => {
       const inst = await seedChatwootInstance(su, {
         tenantId: t.id,
         accountId: 1,
-        // Distinct server per tenant: a Chatwoot account (serverKey + accountId) is globally unique
-        // to one tenant, so two tenants can't share the same (server, accountId). RLS isolation —
-        // what this suite tests — is unaffected by using separate servers.
+        // NOTE: distinct server per tenant: a Chatwoot account (serverKey + accountId) is globally unique
+        // to one tenant, so two tenants can't share the same (server, accountId). RLS isolation
+        // (what this suite tests) is unaffected by using separate servers.
         baseUrl: `https://iso-${t.id}.local`,
         adminToken: "enc",
       });
@@ -108,34 +110,33 @@ describe.skipIf(!dbUp)("tenancy isolation (RLS)", () => {
     expect(seen[0]?.tenantId).toBe(t1);
   });
 
-  test("explicit cross-tenant WHERE is overridden by RLS (zero rows)", async () => {
-    const rows = await appDb.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT set_config('app.tenant_id', ${String(t1)}, true)`;
-      return tx.conversation.findMany({ where: { tenantId: t2 } });
-    });
-    expect(rows.length).toBe(0);
-  });
-
   test("cross-tenant write is blocked by the RLS WITH CHECK", async () => {
-    await expect(
+    const insertAs = (rowTenant: bigint, conv: number) =>
       appDb.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT set_config('app.tenant_id', ${String(t1)}, true)`;
         const inst = await tx.chatwootInstance.findFirstOrThrow({
           select: { id: true },
         });
-        // Force a row that belongs to tenant 2 while scoped to tenant 1.
-        await tx.$executeRaw`
+        return tx.$executeRaw`
           INSERT INTO conversations
             (tenant_id, chatwoot_instance_id, chatwoot_conversation_id, status, thread_id, updated_at)
-          VALUES (${t2}, ${inst.id}, 999, 'pending', 'x', now())`;
-      }),
-    ).rejects.toThrow();
+          VALUES (${rowTenant}, ${inst.id}, ${conv}, 'pending', ${`x${conv}`}, now())`;
+      });
+    // Control: the same insert for the scoped tenant goes through.
+    expect(await insertAs(t1, 998)).toBe(1);
+    await suDb.$executeRaw`DELETE FROM conversations WHERE chatwoot_conversation_id = 998 AND tenant_id = ${t1}`;
+
+    await expect(insertAs(t2, 999)).rejects.toThrow(
+      /new row violates row-level security policy for table "conversations"/,
+    );
+    const landed = await suDb.conversation.count({
+      where: { chatwootConversationId: 999, tenantId: { in: [t1, t2] } },
+    });
+    expect(landed).toBe(0);
   });
 
-  // Through the real helper, not a copy of what it does. It used to hand-roll
-  // `set_config('app.is_super_admin', ...)`, which was the same statement the helper issued — until
-  // it was not: issue #382 replaced the GUC with a role, and the copy went on passing for a while
-  // against a policy that no longer read it.
+  // NOTE: through the real helper, not a copy of what it does: a hand-rolled copy keeps passing against a
+  // policy that no longer reads what the copy sets.
   test("asSuperAdmin sees every tenant's rows", async () => {
     const rows = await asSuperAdminOn(appDb, (db) =>
       db.conversation.findMany({

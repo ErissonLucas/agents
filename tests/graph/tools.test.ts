@@ -1,6 +1,7 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, setSystemTime, test } from "bun:test";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import type { PrismaClient } from "@/../generated/prisma/client";
+import { type CallReport, withFenceReporter } from "@/graph/tools/fence-report";
 import { modelVisibleLabels, SHOWN_LABELS_MAX } from "@/graph/tools/label-view";
 import {
   applyLabelDelta,
@@ -10,8 +11,14 @@ import {
   NATIVE_TOOL_NAMES,
 } from "@/graph/tools/native";
 import { applyToolPreconditions } from "@/graph/tools/precondition";
-import type { ChatwootClient } from "@/modules/chatwoot/client";
+import {
+  type ChatwootClient,
+  createChatwootClient,
+} from "@/modules/chatwoot/client";
+import { withConversationLabels } from "@/modules/chatwoot/labels";
 import { CROSS_INBOX_CASE_DEFAULTS } from "@/modules/cross-inbox-case/settings";
+import { until } from "@/tests/utils/poll";
+import { fakeChatwootAttributeStore } from "../utils/chatwoot-attribute-store";
 
 function recordingClient() {
   const calls: Array<[string, unknown[]]> = [];
@@ -55,14 +62,16 @@ function fakeContactDb(chatwootContactId: number): PrismaClient {
 describe("native tools", () => {
   test("exposes all tools by default; the allowlist filters (fail-closed)", () => {
     const { client } = recordingClient();
-    // `open_case_in_inbox` is the one native that needs its config to exist: with no destination
-    // inbox there is nothing it could do, so it is not offered (issue #700).
+    // NOTE: `open_case_in_inbox` and `update_contact` are the natives that need their config to
+    // exist: with no destination inbox, or no writable contact field, there is nothing they could do.
     expect(
       buildNativeTools({ client, conversationId: 1 })
         .map((t) => t.name)
         .sort(),
     ).toEqual(
-      NATIVE_TOOL_NAMES.filter((n) => n !== "open_case_in_inbox").sort(),
+      NATIVE_TOOL_NAMES.filter(
+        (n) => n !== "open_case_in_inbox" && n !== "update_contact",
+      ).sort(),
     );
     expect(
       buildNativeTools({
@@ -72,6 +81,7 @@ describe("native tools", () => {
           config: { ...CROSS_INBOX_CASE_DEFAULTS, targetInboxId: 9 },
           contactId: 55,
         },
+        contactFields: { context: ["name"], writable: ["name"] },
       })
         .map((t) => t.name)
         .sort(),
@@ -83,17 +93,11 @@ describe("native tools", () => {
     expect(only.map((t) => t.name)).toEqual(["private_note"]);
   });
 
-  // ISSUE #662. The tool used to accept a transfer with nothing to say AND tell the model, in the
-  // same breath, that the bot would stay silent now. So the one case the runtime's own fallback
-  // exists for — `handoffAnsweredTheTurn` requires a line AND a completed transfer, precisely so the
-  // model's next hop can speak when there is no line — was the case where the tool told the model
-  // not to speak. Measured by the reporter on an email inbox: 2 of 130 turns ended with the
-  // conversation transferred, a note filed, and nothing at all for the customer.
-  //
-  // Two halves, and the second is what makes the first provable: the argument is REQUIRED, so
-  // forgetting it is not a way to reach silence, and an empty string is how silence is DECLARED —
-  // which is also the only way an operator can tell a decision from an oversight, since the tool's
-  // log line reports `string(0)` for a declared empty and nothing at all for an omitted argument.
+  // NOTE: `handoffAnsweredTheTurn` requires a line AND a completed transfer so the model's next hop
+  // can speak when there is no line; a tool that told the model to stay silent there would leave the
+  // customer with nothing. The argument is REQUIRED, so forgetting it is not a way to reach silence,
+  // and an empty string is how silence is DECLARED: the log line reports `string(0)` for a declared
+  // empty and nothing for an omitted argument, which is how an operator tells the two apart.
   test("a transfer cannot be silent by omission, and says what it will do in each case", async () => {
     const { client } = recordingClient();
     const speaking = byName(
@@ -112,13 +116,17 @@ describe("native tools", () => {
     const declaredSilent = String(
       await speaking.invoke({ customerMessage: "" }),
     );
-    // Neither branch may carry an instruction to stay silent: that sentence is what the model obeyed.
+    // NOTE: neither branch may carry an instruction to stay silent: the model obeys that sentence.
     for (const out of [withLine, declaredSilent])
       expect(out.toLowerCase()).not.toContain("stay silent");
     // And each says what actually happens to the customer, so the model does not have to guess
     // whether its own next line is wanted.
     expect(withLine).toContain("will be delivered to the customer");
     expect(declaredSilent).toContain("No message will be sent");
+    // A placeholder is no line: the model is told nothing goes out, not that its "EMPTY" will.
+    expect(
+      String(await speaking.invoke({ customerMessage: "EMPTY" })),
+    ).toContain("No message will be sent");
 
     // The muted branch has no argument at all, so its note is not about a decision the model made:
     // it states the topology. Same requirement, though, that it does not read as an instruction.
@@ -133,9 +141,8 @@ describe("native tools", () => {
     expect(silentTurn.toLowerCase()).not.toContain("stay silent");
     expect(silentTurn).toContain("nothing is sent to them");
 
-    // And on the OTHER shape, the one that carries `assignTo`. The field is defined once for both,
-    // but it was written twice first, and a mutation restoring `.optional()` on this copy survived
-    // the whole suite because nothing exercised this branch.
+    // And on the OTHER shape, the one that carries `assignTo`, so a mutation making the field
+    // optional on this branch alone cannot survive the suite.
     const routing = byName(
       buildNativeTools({
         client,
@@ -159,10 +166,9 @@ describe("native tools", () => {
   });
 
   test("a MUTED turn is not told to write a message the transfer will not send", () => {
-    // The line is RECORDED on `handoffState` for the caller to deliver, and an observation has no
-    // `handoffState` and throws its final output away: the transfer happens and the customer hears
-    // nothing. Promising otherwise makes the model hand over believing they were answered
-    // (review round 35).
+    // The line is RECORDED on `handoffState` for the caller to deliver, and an observation
+    // has no `handoffState` and throws its final output away: the transfer happens and the customer
+    // hears nothing. Promising otherwise makes the model hand over believing they were answered.
     const { client } = recordingClient();
     const speaking = byName(
       buildNativeTools({ client, conversationId: 1 }),
@@ -188,9 +194,9 @@ describe("native tools", () => {
 
   test("the delta names the scope's own labels, not the conversation's", () => {
     // The delta applies to the SCOPE the call chooses, so a description that always named the
-    // conversation's labels would show a `contact` call the wrong list — and copying them onto the
-    // contact is the move that invites (review round 35). Under #695 the listing is per scope and
-    // labelled with it, and the prose around it never says "conversation".
+    // conversation's labels would show a `contact` call the wrong list, and invite copying them onto
+    // the contact. The listing is per scope and labelled with it, and the prose never says
+    // "conversation".
     const { client } = recordingClient();
     const tool = byName(
       buildNativeTools({
@@ -220,10 +226,9 @@ describe("native tools", () => {
   });
 
   test("a ONE-SHOT allowlist grants what it names, not what the first candidate leaves", () => {
-    // The parameter is an `Iterable<string>`, and a generator is spent by whoever reads it first.
-    // Read once per candidate, it would be exhausted while testing a tool nobody granted, and the
-    // agent would come up with an empty toolset — silently, with every grant in place
-    // (review round 30).
+    // The parameter is an `Iterable<string>`, and a generator is spent by whoever reads it
+    // first. Read once per candidate, it would be exhausted while testing a tool nobody granted,
+    // and the agent would come up with an empty toolset, silently, with every grant in place.
     const { client } = recordingClient();
     function* granted(): Generator<string> {
       yield "private_note";
@@ -282,7 +287,7 @@ describe("native tools", () => {
     expect(String(out)).toContain("human");
   });
 
-  // #160: the tool writes NOTHING to the customer. The closing line is recorded for the caller, which
+  // NOTE: the tool writes NOTHING to the customer. The closing line is recorded for the caller, which
   // is what puts it through the output guardrail and the shared delivery path.
   test("handoff with customerMessage sends only the note and the transfer", async () => {
     const { client, calls } = recordingClient();
@@ -380,23 +385,6 @@ describe("native tools", () => {
       customerMessage: "",
     });
     expect(calls).toEqual([["toggleStatus", [42, "open"]]]);
-  });
-
-  test("transferWithSummary:true (explicit) still posts the note", async () => {
-    const { client, calls } = recordingClient();
-    const tools = buildNativeTools({
-      client,
-      conversationId: 42,
-      transferWithSummary: true,
-    });
-    await byName(tools, "handoff_to_human").invoke({
-      reason: "summary text",
-      customerMessage: "",
-    });
-    expect(calls).toEqual([
-      ["sendPrivateNote", [42, "summary text"]],
-      ["toggleStatus", [42, "open"]],
-    ]);
   });
 
   const kanbanCtx = {
@@ -521,27 +509,64 @@ describe("native tools", () => {
     );
   });
 
-  test("set_custom_attribute task scope writes to the linked card", async () => {
-    const calls: Array<[string, unknown[]]> = [];
-    const client = {
-      setKanbanTaskCustomAttributes: async (...args: unknown[]) => {
-        calls.push(["setKanbanTaskCustomAttributes", args]);
-        return {};
+  test("set_custom_attribute task scope adds to the linked card's attributes", async () => {
+    // tasks#update assigns the whole jsonb, so a write that sent only its own key would leave the
+    // card with nothing but the last key written.
+    const cw = fakeChatwootAttributeStore(5, {
+      tasks: { 11: { faturamento_mensal: "15 mil" } },
+    });
+    const client = await createChatwootClient(
+      {
+        baseUrl: "https://chat.example.com",
+        accountId: 5,
+        adminToken: "ADMIN_TOK",
+        botToken: "BOT_TOK",
       },
-    } as unknown as ChatwootClient;
+      { fetchImpl: cw.fetchImpl, assertSafe: async (u: string) => new URL(u) },
+    );
     const tools = buildNativeTools({
       client,
       conversationId: 7,
       kanban: kanbanCtx,
     });
-    await byName(tools, "set_custom_attribute").invoke({
-      key: "ticket_size",
-      value: "5000",
+    const out = await byName(tools, "set_custom_attribute").invoke({
+      key: "servico_interesse",
+      value: "Abertura de empresa",
       scope: "task",
     });
-    expect(calls).toEqual([
-      ["setKanbanTaskCustomAttributes", [11, { ticket_size: "5000" }]],
-    ]);
+    expect(String(out)).toBe("Task attribute servico_interesse set.");
+    expect(cw.tasks.get(11)).toEqual({
+      faturamento_mensal: "15 mil",
+      servico_interesse: "Abertura de empresa",
+    });
+  });
+
+  test("a task attribute write called off while the card was read answers without writing", async () => {
+    const cw = fakeChatwootAttributeStore(5, { tasks: { 11: { a: "1" } } });
+    const client = await createChatwootClient(
+      {
+        baseUrl: "https://chat.example.com",
+        accountId: 5,
+        adminToken: "ADMIN_TOK",
+        botToken: "BOT_TOK",
+      },
+      { fetchImpl: cw.fetchImpl, assertSafe: async (u: string) => new URL(u) },
+    );
+    let asked = 0;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      kanban: kanbanCtx,
+      stillWanted: async () => ++asked === 0,
+    });
+    const out = await byName(tools, "set_custom_attribute").invoke({
+      key: "b",
+      value: "2",
+      scope: "task",
+    });
+    expect(String(out)).toContain("called off");
+    expect(cw.requests.map((r) => r.method)).toEqual(["GET"]);
+    expect(cw.tasks.get(11)).toEqual({ a: "1" });
   });
 
   test("private_note / set_custom_attribute / resolve call the right client methods", async () => {
@@ -555,7 +580,7 @@ describe("native tools", () => {
     await byName(tools, "resolve_conversation").invoke({});
     expect(calls).toEqual([
       ["sendPrivateNote", [7, "nota interna"]],
-      // The third argument carries the fence the client asks INSIDE its queue (round 25); this ctx
+      // NOTE: the third argument carries the fence the client asks INSIDE its queue; this ctx
       // has none to offer, so it arrives undefined and the write proceeds.
       [
         "setConversationCustomAttributes",
@@ -565,11 +590,36 @@ describe("native tools", () => {
     ]);
   });
 
+  // Chatwoot renders a private note as Liquid too, so the model's text goes escaped (the
+  // wire shape is pinned in chatwoot-liquid.test.ts). Without it `{{contact.phone_number}}` in a note
+  // comes out as the contact's phone number.
+  test("private_note and the handoff note carry the model's text literally", async () => {
+    const { client, calls } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    await byName(tools, "private_note").invoke({
+      content: "cliente pediu {{contact.phone_number}} e {{foo}}",
+    });
+    await byName(tools, "handoff_to_human").invoke({
+      reason: "motivo {% if true %}x{% endif %}",
+      customerMessage: "",
+    });
+    expect(calls.filter((c) => c[0] === "sendPrivateNote")).toEqual([
+      [
+        "sendPrivateNote",
+        [7, "cliente pediu {{ '{{' }}contact.phone_number}} e {{ '{{' }}foo}}"],
+      ],
+      [
+        "sendPrivateNote",
+        [7, "motivo {{ '{%' }} if true %}x{{ '{%' }} endif %}"],
+      ],
+    ]);
+  });
+
   test("a /reset landing while resolve_conversation reads does NOT close the conversation", async () => {
-    // The close reads the live status first (a WAIT), and the graph's ask at the tool boundary
-    // happened before it. An observation holds no thread claim, so `/reset` can land in that window
-    // — and a close is not something a later turn undoes. Same rule set_labels applies inside its
-    // queue, asked in the one other place that waits before writing (round 17).
+    // The close reads the live status first (a WAIT), and the graph's ask at the tool
+    // boundary happened before it. An observation holds no thread claim, so `/reset` can land in
+    // that window, and a close is not something a later turn undoes. Same rule set_labels applies
+    // in its queue.
     const { client, calls } = recordingClient();
     let asked = 0;
     const tools = buildNativeTools({
@@ -613,7 +663,7 @@ describe("native tools", () => {
 
   test("without a note there is no wait, so the handoff is unchanged", async () => {
     // The fence is asked only where a wait happened. A handoff with no summary writes straight
-    // through, exactly as before.
+    // through.
     const { client, calls } = recordingClient();
     const tools = buildNativeTools({
       client,
@@ -637,16 +687,12 @@ describe("native tools", () => {
     expect(calls.map((c) => c[0])).toContain("toggleStatus");
   });
 
-  // ISSUE #671. The tool has two modes and the rule was written in only one of them: with a
-  // `turnState` the intent is deferred and the reactive runtime drops it when a transfer completed
-  // ("a conversation the human queue now owns is not ours to close", #159), and WITHOUT one the tool
-  // closes inside the call, which is every proactive turn and every observation. Asked here, on the
-  // tool, because that is the one place both modes pass through, and because the observer builds its
-  // own toolset: a guard written in either runtime would leave it out.
-  //
-  // Both directions matter. A transfer that completed blocks the close AND says so, so the model
-  // reads what happened; a turn with no transfer at all still closes, which is the ordinary case and
-  // what a guard written too wide would break.
+  // NOTE: a conversation the human queue now owns is not ours to close. With a `turnState` the
+  // intent is deferred and the reactive runtime drops it; WITHOUT one (every proactive turn and every
+  // observation) the tool closes inside the call. Asked on the tool because both modes pass through
+  // it and the observer builds its own toolset, so a guard in either runtime would miss it. A
+  // completed transfer blocks the close AND says so; a turn with no transfer still closes, which a
+  // guard written too wide would break.
   test("resolve_conversation refuses to close what this turn transferred", async () => {
     const { client, calls } = recordingClient();
     const handoffState = {
@@ -655,7 +701,7 @@ describe("native tools", () => {
       declinedToSpeak: false,
     };
     const tools = buildNativeTools({ client, conversationId: 7, handoffState });
-    // No transfer yet: the legacy immediate close is untouched.
+    // NOTE: no transfer yet: the immediate close is untouched.
     await byName(tools, "resolve_conversation").invoke({});
     expect(calls.map((c) => c[0])).toContain("toggleStatus");
 
@@ -687,13 +733,350 @@ describe("native tools", () => {
     expect(out).toContain("after your final reply");
   });
 
-  // REWRITTEN, NOT DELETED (issue #695). Every case below is the counterpart of one that proved the
-  // replace contract: what each of those proved about a diff against `shown`, its counterpart proves
-  // about a delta the model names. Two of them INVERT, and those are the ones worth reading.
+  // The operator's fixed labels ride the close the agent asked for, whatever the model
+  // did with set_labels.
+  test("resolve_conversation with turnState hands the configured labels to the deferred close", async () => {
+    const { client, calls } = recordingClient();
+    const turnState: {
+      resolveRequested: boolean;
+      resolveLabels?: string[];
+      pendingAttachments: never[];
+      imagesInFlight: number;
+      documentsInFlight: number;
+      attachmentsSeq: number;
+    } = {
+      resolveRequested: false,
+      pendingAttachments: [],
+      imagesInFlight: 0,
+      documentsInFlight: 0,
+      attachmentsSeq: 0,
+    };
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      turnState,
+      resolveLabels: ["resolvido-pela-ia"],
+    });
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(calls).toEqual([]);
+    expect(turnState.resolveRequested).toBe(true);
+    expect(turnState.resolveLabels).toEqual(["resolvido-pela-ia"]);
+  });
+
+  test("resolve_conversation on a proactive turn writes the configured labels, then closes", async () => {
+    const calls: Array<[string, unknown[]]> = [];
+    let current: string[] = ["vip"];
+    const client = {
+      listLabels: async () => {
+        calls.push(["listLabels", []]);
+        return ["vip", "resolvido-pela-ia"];
+      },
+      getConversationLabels: async (id: number) => {
+        calls.push(["getConversationLabels", [id]]);
+        return [...current];
+      },
+      setConversationLabels: async (id: number, labels: string[]) => {
+        calls.push(["setConversationLabels", [id, labels]]);
+        current = [...labels];
+        return {};
+      },
+      toggleStatus: async (...args: unknown[]) => {
+        calls.push(["toggleStatus", args]);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      resolveLabels: ["resolvido-pela-ia"],
+    });
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(calls.map((c) => c[0])).toEqual([
+      "listLabels",
+      "getConversationLabels",
+      "setConversationLabels",
+      "toggleStatus",
+    ]);
+    expect([...current].sort()).toEqual(["resolvido-pela-ia", "vip"]);
+  });
+
+  // A contact still waiting on a case in the agent's case inbox gets the close and not the labels a
+  // survey keys on.
+  test("resolve_conversation on a proactive turn closes without the labels while the contact waits on a case", async () => {
+    const calls: string[] = [];
+    const client = {
+      listLabels: async () => ["resolvido-pela-ia"],
+      getConversation: async (id: number) => ({ id, inbox_id: 1 }),
+      listContactConversations: async () => [
+        { id: 80, inboxId: 9, status: "pending", canReply: true },
+      ],
+      getConversationLabels: async () => [],
+      setConversationLabels: async () => {
+        calls.push("setConversationLabels");
+        return {};
+      },
+      toggleStatus: async () => {
+        calls.push("toggleStatus");
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      resolveLabels: ["resolvido-pela-ia"],
+      resolveCaseHold: {
+        targetInboxId: 9,
+        caseAttributeKey: CROSS_INBOX_CASE_DEFAULTS.caseAttributeKey,
+        contactId: 55,
+      },
+    });
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(calls).toEqual(["toggleStatus"]);
+  });
+
+  test("what the close could not do with the labels reaches the operator, not the model", async () => {
+    const reported: Array<{ phase: string; detail?: unknown; level?: string }> =
+      [];
+    const client = {
+      listLabels: async () => ["resolvido-pela-ia"],
+      getConversation: async () => {
+        throw new Error("503");
+      },
+      listContactConversations: async () => [],
+      getConversationLabels: async () => [],
+      setConversationLabels: async () => ({}),
+      toggleStatus: async () => ({}),
+    } as unknown as ChatwootClient;
+    const build = (cic: boolean, labels: string[]) =>
+      buildNativeTools({
+        client,
+        conversationId: 7,
+        resolveLabels: labels,
+        onSideEffectError: (e) =>
+          reported.push({ phase: e.phase, detail: e.detail, level: e.level }),
+        ...(cic
+          ? {
+              resolveCaseHold: {
+                targetInboxId: 9,
+                caseAttributeKey: CROSS_INBOX_CASE_DEFAULTS.caseAttributeKey,
+                contactId: 55,
+              },
+            }
+          : {}),
+      });
+    await byName(
+      build(false, ["resolvido-pela-ia", "nao-existe"]),
+      "resolve_conversation",
+    ).invoke({});
+    await byName(
+      build(true, ["resolvido-pela-ia"]),
+      "resolve_conversation",
+    ).invoke({});
+    // NOTE: Labels held back because the case could not be read are `info` (the conversation
+    // closed, the customer was answered); a label write that failed keeps the default `warn`.
+    expect(reported).toEqual([
+      {
+        phase: "resolve_labels_unknown",
+        detail: { labels: ["nao-existe"] },
+        level: undefined,
+      },
+      { phase: "resolve_labels", detail: undefined, level: "info" },
+    ]);
+    reported.length = 0;
+    (client as unknown as Record<string, unknown>).setConversationLabels =
+      async () => {
+        throw new Error("Chatwoot answered 500");
+      };
+    await byName(
+      build(false, ["resolvido-pela-ia"]),
+      "resolve_conversation",
+    ).invoke({});
+    expect(reported).toEqual([
+      { phase: "resolve_labels", detail: undefined, level: undefined },
+    ]);
+  });
+
+  test("resolve_conversation with turnState hands the case inbox to the deferred close", async () => {
+    const { client } = recordingClient();
+    const turnState: Record<string, unknown> & {
+      resolveRequested: boolean;
+      pendingAttachments: never[];
+      imagesInFlight: number;
+      documentsInFlight: number;
+      attachmentsSeq: number;
+    } = {
+      resolveRequested: false,
+      pendingAttachments: [],
+      imagesInFlight: 0,
+      documentsInFlight: 0,
+      attachmentsSeq: 0,
+    };
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      turnState,
+      resolveLabels: ["resolvido-pela-ia"],
+      resolveCaseHold: {
+        targetInboxId: 9,
+        caseAttributeKey: CROSS_INBOX_CASE_DEFAULTS.caseAttributeKey,
+        contactId: 55,
+      },
+    });
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(turnState.resolveCaseHold).toEqual({
+      targetInboxId: 9,
+      caseAttributeKey: CROSS_INBOX_CASE_DEFAULTS.caseAttributeKey,
+      contactId: 55,
+    });
+  });
+
+  // A conversation someone else already closed is not the agent's close: the toggle is a no-op, and a
+  // label written anyway would mark a human's resolution as the AI's.
+  test("resolve_conversation on a conversation already resolved writes no resolve label", async () => {
+    const calls: string[] = [];
+    const client = {
+      getConversation: async (id: number) => ({
+        id,
+        status: "resolved",
+        updated_at: 1_700_000_000,
+        meta: { assignee_type: null, assignee: null },
+      }),
+      listLabels: async () => ["resolvido-pela-ia"],
+      getConversationLabels: async () => [],
+      setConversationLabels: async () => {
+        calls.push("setConversationLabels");
+        return {};
+      },
+      toggleStatus: async () => {
+        calls.push("toggleStatus");
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      tenantId: 1n,
+      conversationDbId: 1n,
+      resolveLabels: ["resolvido-pela-ia"],
+    } as never);
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(calls).not.toContain("setConversationLabels");
+  });
+
+  // Whatever the labels came to, the close asks the fence again right before it: a withdrawal during
+  // a held label, an all-unknown catalog or the label POST itself must not still close.
+  test.each([
+    ["held by an open case", "held"],
+    ["all unknown", "unknown"],
+    ["written, then withdrawn during the POST", "written"],
+    ["sent, the POST's answer lost, then withdrawn", "lost"],
+  ])(
+    "a run called off while the labels were %s does not close",
+    async (_n, kind) => {
+      const calls: string[] = [];
+      const noEffect: string[] = [];
+      let wanted = true;
+      const client = {
+        listLabels: async () =>
+          kind === "unknown" ? [] : ["resolvido-pela-ia"],
+        getConversation: async (id: number) => ({ id, inbox_id: 1 }),
+        listContactConversations: async () => {
+          wanted = false;
+          return [{ id: 80, inboxId: 9, status: "pending", canReply: true }];
+        },
+        getConversationLabels: async () => [],
+        setConversationLabels: async () => {
+          calls.push("setConversationLabels");
+          wanted = false;
+          if (kind === "lost") throw new Error("timeout");
+          return {};
+        },
+        toggleStatus: async () => {
+          calls.push("toggleStatus");
+          return {};
+        },
+      } as unknown as ChatwootClient;
+      if (kind === "unknown") {
+        (client as unknown as Record<string, unknown>).listLabels =
+          async () => {
+            wanted = false;
+            return [];
+          };
+      }
+      const tools = buildNativeTools({
+        client,
+        conversationId: 7,
+        resolveLabels: ["resolvido-pela-ia"],
+        stillWanted: async () => wanted,
+        onNoEffect: (t: string) => noEffect.push(t),
+        ...(kind === "held"
+          ? {
+              resolveCaseHold: {
+                targetInboxId: 9,
+                caseAttributeKey: CROSS_INBOX_CASE_DEFAULTS.caseAttributeKey,
+                contactId: 55,
+              },
+            }
+          : {}),
+      });
+      const out = await byName(tools, "resolve_conversation").invoke({});
+      expect(calls).not.toContain("toggleStatus");
+      expect(String(out)).toContain("Did not resolve");
+      // A POST that went out may have landed, answer or not: only a close that sent no label
+      // reports no effect.
+      expect(noEffect).toEqual(
+        kind === "written" || kind === "lost" ? [] : ["resolve_conversation"],
+      );
+    },
+  );
+
+  // The label read is one more wait before the close: a /reset landing in it withdraws the close
+  // too, not just the label.
+  test("a run called off while the resolve labels were read does not close", async () => {
+    const calls: string[] = [];
+    let asked = 0;
+    const client = {
+      listLabels: async () => ["resolvido-pela-ia"],
+      getConversationLabels: async () => {
+        calls.push("getConversationLabels");
+        return [];
+      },
+      setConversationLabels: async () => {
+        calls.push("setConversationLabels");
+        return {};
+      },
+      toggleStatus: async () => {
+        calls.push("toggleStatus");
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      resolveLabels: ["resolvido-pela-ia"],
+      stillWanted: async () => ++asked < 2,
+    });
+    const out = await byName(tools, "resolve_conversation").invoke({});
+    expect(calls).toEqual(["getConversationLabels"]);
+    expect(String(out)).toContain("Did not resolve");
+  });
+
+  test("a close this turn's transfer refused writes no resolve label either", async () => {
+    const { client, calls } = recordingClient();
+    const tools = buildNativeTools({
+      client,
+      conversationId: 7,
+      handoffState: { completed: true } as never,
+      resolveLabels: ["resolvido-pela-ia"],
+    });
+    await byName(tools, "resolve_conversation").invoke({});
+    expect(calls).toEqual([]);
+  });
+
+  // NOTE: the call names a delta; nothing is diffed against what the model was `shown`.
   describe("applyLabelDelta", () => {
     test("only what is NAMED in remove is removed", () => {
-      // The counterpart of "only what was SHOWN and left out is removed". `c` survives here for a
-      // stronger reason than it did there: not because it was unseen, but because nobody named it.
+      // NOTE: `c` survives because nobody named it, not because it was unseen.
       expect(applyLabelDelta([], ["b"], ["a", "b", "c"])).toEqual({
         next: ["a", "c"],
         added: [],
@@ -730,29 +1113,9 @@ describe("native tools", () => {
       });
     });
 
-    test("INVERTED: naming a label in add DOES put it back after somebody removed it", () => {
-      // The case that flips. Under the replace contract the model repeated `vip` only because
-      // leaving it out would delete it, so treating the repeat as an addition undid an operator who
-      // had just peeled it off — and the tool deliberately did not. Under the delta contract nothing
-      // forces the model to mention a label it does not mean, so naming one in `add` IS a request to
-      // have it, and honouring that is correct. The cost moved to the operator's prose: a prompt
-      // that still says "repeat the labels that are already there" now asks for exactly this
-      // (holdout s14), which is why the old shape is refused by name rather than best-effort.
-      expect(applyLabelDelta(["vip", "lead"], [], [])).toEqual({
-        next: ["vip", "lead"],
-        added: ["vip", "lead"],
-        removed: [],
-        refusedAdd: [],
-        refusedRemove: [],
-        heldRemove: [],
-      });
-    });
-
     test("naming nothing changes nothing, whatever is standing", () => {
-      // The counterpart of "an empty desired list with nothing shown writes nothing at all". There
-      // the clear-everything call and the never-read case had to be told apart, because `[]` could
-      // mean either; here `[]` can only mean "I name nothing", and wiping a conversation requires
-      // naming every label on it.
+      // NOTE: `[]` can only mean "I name nothing", and wiping a conversation requires naming every
+      // label on it.
       expect(applyLabelDelta([], [], ["a", "b"])).toEqual({
         next: ["a", "b"],
         added: [],
@@ -764,10 +1127,7 @@ describe("native tools", () => {
     });
 
     test("INVERTED: a guarded label is no longer removed by silence, because silence removes nothing", () => {
-      // The defect the guard was built for does not exist under this contract. Measured on a live
-      // fork under the old one: asked for `["compra-de-ingresso"]`, the tool answered
-      // `removed "cancelamento", "agente-off", "vip"` — three labels the model never mentioned. Here
-      // the same intent leaves every one of them standing without the guard doing anything at all,
+      // NOTE: labels the call does not name stay standing without the guard doing anything at all,
       // which is why the guard's remaining job is the two directions below.
       expect(
         applyLabelDelta(
@@ -786,9 +1146,9 @@ describe("native tools", () => {
     });
 
     test("a guarded label the model ASKS FOR is not added, and the refusal is named", () => {
-      // The half the issue's own first draft dropped. A model that learned the name from the
-      // operator's prompt could otherwise switch the agent off by naming the label, which is the
-      // authority the guard denies — and now that it can SEE the label, it will ask.
+      // NOTE: a model that learned the name from the operator's prompt could otherwise switch the
+      // agent off by naming the label, which is the authority the guard denies; and since it SEES the
+      // label, it will ask.
       expect(
         applyLabelDelta(["agente-off", "vip"], [], [], ["agente-off"]),
       ).toEqual({
@@ -820,8 +1180,8 @@ describe("native tools", () => {
     });
 
     test("a guarded label standing on the scope is KEPT in next, and is no longer hidden", () => {
-      // `next` carries it because it is on the conversation; there is no `visible` projection any
-      // more, because the model is shown everything. That is the change: one list, not two.
+      // `next` carries it because it is on the conversation. There is no separate `visible`
+      // projection: the model is shown everything, one list.
       const out = applyLabelDelta(
         ["lead"],
         [],
@@ -831,36 +1191,6 @@ describe("native tools", () => {
       expect(out.next).toEqual(["vip", "testando-agente", "lead"]);
       expect(out.removed).toEqual([]);
     });
-
-    test("an empty guard list is the behaviour before the guard", () => {
-      expect(applyLabelDelta([], ["b"], ["a", "b"], [])).toEqual({
-        next: ["a"],
-        added: [],
-        removed: ["b"],
-        refusedAdd: [],
-        refusedRemove: [],
-        heldRemove: [],
-      });
-    });
-  });
-
-  test("an add-only call never removes anything", async () => {
-    const setCalls: unknown[][] = [];
-    const client = {
-      getConversationLabels: async () => ["vip"],
-      setConversationLabels: async (...args: unknown[]) => {
-        setCalls.push(args);
-        return {};
-      },
-    } as unknown as ChatwootClient;
-    // Under the delta there is nothing to leave out: `vip` is not named, so it is not touched,
-    // and no snapshot of what the model saw has to be consulted to know that.
-    const tools = buildNativeTools({ client, conversationId: 9 });
-    const out = String(
-      await byName(tools, "set_labels").invoke({ add: ["lead"] }),
-    );
-    expect(setCalls).toEqual([[9, ["vip", "lead"]]]);
-    expect(out).toContain("lead");
   });
 
   test("set_labels removes exactly what `remove` names", async () => {
@@ -911,10 +1241,10 @@ describe("native tools", () => {
   });
 
   test("set_labels refuses to remove a guarded label, and names the refusal", async () => {
-    // The case above protects a label the model never named. This one it names explicitly, and only
-    // the guard keeps it. Under the delta the model SEES the guarded label, so it will ask; an
-    // answer that stayed silent would be a false statement the model reads back out of its own
-    // transcript one call later, which is why the report says which one it refused.
+    // The case above protects a label the model never named. This one it names explicitly,
+    // and only the guard keeps it. The model SEES the guarded label, so it will ask; an answer that
+    // stayed silent would be a false statement the model reads back out of its own transcript one
+    // call later, which is why the report says which one it refused.
     const setCalls: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["dúvidas-evento", "agente-off"],
@@ -936,16 +1266,15 @@ describe("native tools", () => {
       }),
     );
     expect(setCalls).toEqual([[9, ["agente-off", "cancelamento"]]]);
-    // Told, by name, which one did not move and why — the opposite of the old contract, where the
-    // label was hidden and the silence is what made a fenced agent invent a name for it.
+    // NOTE: told, by name, which one did not move and why. Hiding the label instead is what makes a
+    // fenced agent invent a name for it.
     expect(out).toContain('cannot be removed: "agente-off"');
     expect(out).toContain('removed "dúvidas-evento"');
   });
 
   test("a call that names neither side is refused, and writes nothing", async () => {
-    // Under the replace contract an empty list was a MEANING — "clear the scope" — so it had to be
-    // honoured. Under the delta it is the absence of a request, and honouring it would be inventing
-    // one. The refusal is what tells the model to name what it wants.
+    // An empty delta is the absence of a request, and honouring it would be inventing one.
+    // The refusal is what tells the model to name what it wants.
     const setCalls: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["vip", "agente-off"],
@@ -967,8 +1296,8 @@ describe("native tools", () => {
   });
 
   test("the retired `labels` list is refused BY NAME, not silently dropped", async () => {
-    // Operator prose in five free-text fields still describes the replace contract on every tenant
-    // that has not rewritten it, and a model following that prose sends `{labels: [...]}`. A strict
+    // Operator prose in five free-text fields can still describe the retired full-list shape,
+    // and a model following that prose sends `{labels: [...]}`. A strict
     // schema would strip the key and leave an empty delta, so the call would answer "already as
     // requested" and the model would record a classification that was never written.
     const setCalls: unknown[][] = [];
@@ -1051,10 +1380,8 @@ describe("native tools", () => {
   });
 
   test("a label the model was never shown is removable the moment it names it", async () => {
-    // `urgente` lands between the turn's read and the first call. Under the replace contract it had
-    // to survive one write and be handed over by the report before it could be dropped, because
-    // "shown" was what licensed a removal. Naming the delta retires that ceremony: not naming it
-    // keeps it, naming it removes it, and neither answer depends on what the model was shown.
+    // `urgente` lands between the turn's read and the first call. Not naming it keeps it,
+    // naming it removes it, and neither answer depends on what the model was shown.
     let current: string[] = ["urgente"];
     const setCalls: unknown[][] = [];
     const client = {
@@ -1082,9 +1409,9 @@ describe("native tools", () => {
 
   test("two calls in ONE batch do not read each other's writes", async () => {
     // LangGraph dispatches a tool-call batch concurrently, and the write is still a full PUT of the
-    // resulting list, so the queue is what makes the second call read the first one's result. Drop
-    // the serialisation and both read the empty scope, both PUT a one-item list, and `["a"]` beside
-    // `["b"]` ends as whichever landed last.
+    // resulting list. The calls that arrive together are applied to ONE read, one delta after the
+    // other, and go out as one PUT of the set they add up to. Drop that and both read the empty
+    // scope, both PUT a one-item list, and `["a"]` beside `["b"]` ends as whichever landed last.
     let current: string[] = [];
     const setCalls: unknown[][] = [];
     const client = {
@@ -1101,12 +1428,300 @@ describe("native tools", () => {
       shownLabels: { conversation: [] },
     });
     const tool = byName(tools, "set_labels");
+    const reports = await Promise.all([
+      tool.invoke({ add: ["a"] }),
+      tool.invoke({ add: ["b"] }),
+    ]);
+    expect(setCalls).toEqual([[9, ["a", "b"]]]);
+    expect([...current].sort()).toEqual(["a", "b"]);
+    // Each call still answers for its own delta, with the set as it stood after it.
+    expect(String(reports[0])).toContain('Now set: "a"');
+    expect(String(reports[0])).not.toContain('"b"');
+    expect(String(reports[1])).toContain('Now set: "a", "b"');
+  });
+
+  test("calls of a caller whose writes go out alone are one write each, in order", async () => {
+    let current: string[] = [];
+    const setCalls: unknown[][] = [];
+    const client = {
+      getConversationLabels: async () => [...current],
+      setConversationLabels: async (...args: unknown[]) => {
+        setCalls.push(args);
+        current = [...(args[1] as string[])];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 9,
+      shownLabels: { conversation: [] },
+      writesAlone: () => true,
+    });
+    const tool = byName(tools, "set_labels");
     await Promise.all([
       tool.invoke({ add: ["a"] }),
       tool.invoke({ add: ["b"] }),
     ]);
-    expect(setCalls).toHaveLength(2);
-    expect([...current].sort()).toEqual(["a", "b"]);
+    expect(setCalls).toEqual([
+      [9, ["a"]],
+      [9, ["a", "b"]],
+    ]);
+  });
+
+  test("calls that joined before the fence asked them to go alone are split, in order", async () => {
+    let current: string[] = [];
+    const setCalls: unknown[][] = [];
+    let alone = false;
+    let fences = 0;
+    const client = {
+      getConversationLabels: async () => [...current],
+      setConversationLabels: async (...args: unknown[]) => {
+        setCalls.push(args);
+        current = [...(args[1] as string[])];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 9,
+      shownLabels: { conversation: [] },
+      writesAlone: () => alone,
+      stillWanted: async () => {
+        fences++;
+        alone = true;
+        return true;
+      },
+    });
+    const tool = byName(tools, "set_labels");
+    const reports = await Promise.all([
+      tool.invoke({ add: ["a"] }),
+      tool.invoke({ add: ["b"] }),
+    ]);
+    expect(setCalls).toEqual([
+      [9, ["a"]],
+      [9, ["a", "b"]],
+    ]);
+    expect(fences).toBe(2);
+    expect(String(reports[1])).toContain('Now set: "a", "b"');
+  });
+
+  test("a call that arrives after the write has gone out reads what it left", async () => {
+    let current: string[] = [];
+    const setCalls: unknown[][] = [];
+    let release!: () => void;
+    const client = {
+      getConversationLabels: async () => [...current],
+      setConversationLabels: async (...args: unknown[]) => {
+        setCalls.push(args);
+        current = [...(args[1] as string[])];
+        // Held, so the second call joins the queue while this write is out.
+        if (setCalls.length === 1)
+          await new Promise<void>((r) => (release = r));
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 9,
+      shownLabels: { conversation: [] },
+    });
+    const tool = byName(tools, "set_labels");
+    const first = tool.invoke({ add: ["a"] });
+    while (setCalls.length === 0) await new Promise((r) => setTimeout(r, 1));
+    const second = tool.invoke({ add: ["b"] });
+    await new Promise((r) => setTimeout(r, 5));
+    release();
+    await Promise.all([first, second]);
+    expect(setCalls).toEqual([
+      [9, ["a"]],
+      [9, ["a", "b"]],
+    ]);
+  });
+
+  test("a call asked after another writer joined the queue is not merged ahead of it", async () => {
+    // The reset's clear, the nudge's merge and the close's labels all write in this queue. A call
+    // merged with an earlier one across such a writer would land before it.
+    let current: string[] = [];
+    const setCalls: string[][] = [];
+    let reads = 0;
+    let releaseRead!: () => void;
+    const client = {
+      getConversationLabels: async () => {
+        reads += 1;
+        // The first read is held, so what follows is queued while the first entry is still joinable.
+        if (reads === 1) await new Promise<void>((r) => (releaseRead = r));
+        return [...current];
+      },
+      setConversationLabels: async (_id: number, next: string[]) => {
+        setCalls.push(next);
+        current = [...next];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 9,
+      tenantId: 77n,
+      shownLabels: { conversation: [] },
+    });
+    const tool = byName(tools, "set_labels");
+    const first = tool.invoke({ add: ["a"] });
+    while (reads === 0) await new Promise((r) => setTimeout(r, 1));
+    const cleared = withConversationLabels(77n, 9, async () => {
+      setCalls.push([]);
+      current = [];
+    });
+    const second = tool.invoke({ add: ["b"] });
+    await new Promise((r) => setTimeout(r, 5));
+    releaseRead();
+    await Promise.all([first, cleared, second]);
+    expect(setCalls).toEqual([["a"], [], ["b"]]);
+    expect(current).toEqual(["b"]);
+  });
+
+  test("two turns writing one conversation's labels do not ride together", async () => {
+    let current: string[] = [];
+    const setCalls: string[][] = [];
+    const client = {
+      getConversationLabels: async () => [...current],
+      setConversationLabels: async (_id: number, next: string[]) => {
+        setCalls.push(next);
+        current = [...next];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const turn = () =>
+      byName(
+        buildNativeTools({
+          client,
+          conversationId: 9,
+          tenantId: 77n,
+          shownLabels: { conversation: [] },
+        }),
+        "set_labels",
+      );
+    await Promise.all([
+      turn().invoke({ add: ["a"] }),
+      turn().invoke({ add: ["b"] }),
+    ]);
+    expect(setCalls).toEqual([["a"], ["a", "b"]]);
+  });
+
+  // A caller that read the labels moments before its writes hands the read over, and the tool
+  // applies its delta to it instead of asking Chatwoot again.
+  function countingLabels(initial: string[]) {
+    let current = [...initial];
+    const calls = { reads: 0, writes: [] as string[][], fail: false };
+    const client = {
+      getConversationLabels: async () => {
+        calls.reads += 1;
+        return [...current];
+      },
+      setConversationLabels: async (_id: number, next: string[]) => {
+        if (calls.fail) throw new Error("chatwoot down");
+        calls.writes.push(next);
+        current = [...next];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    return { client, calls };
+  }
+
+  test("a read the caller just made is the one the write applies to, for every call of the batch", async () => {
+    const { client, calls } = countingLabels(["vip"]);
+    const tool = byName(
+      buildNativeTools({
+        client,
+        conversationId: 9,
+        shownLabels: { conversation: ["vip"] },
+        conversationLabelsRead: { labels: ["vip"], at: Date.now() },
+      }),
+      "set_labels",
+    );
+    await Promise.all([
+      tool.invoke({ add: ["a"] }),
+      tool.invoke({ add: ["b"], remove: ["vip"] }),
+    ]);
+    expect(calls.reads).toBe(0);
+    expect(calls.writes).toEqual([["a", "b"]]);
+    // The next write of the same turn applies to the set this one left, still without a read.
+    await tool.invoke({ add: ["c"] });
+    expect(calls.reads).toBe(0);
+    expect(calls.writes[1]).toEqual(["a", "b", "c"]);
+  });
+
+  test("a read that is no longer fresh is not trusted, and neither is one a failed write left", async () => {
+    const stale = countingLabels(["vip", "novo"]);
+    await byName(
+      buildNativeTools({
+        client: stale.client,
+        conversationId: 9,
+        shownLabels: { conversation: ["vip"] },
+        conversationLabelsRead: { labels: ["vip"], at: Date.now() - 60_000 },
+      }),
+      "set_labels",
+    ).invoke({ add: ["a"] });
+    expect(stale.calls.reads).toBe(1);
+    expect(stale.calls.writes).toEqual([["vip", "novo", "a"]]);
+
+    const failed = countingLabels(["vip"]);
+    const tool = byName(
+      buildNativeTools({
+        client: failed.client,
+        conversationId: 9,
+        shownLabels: { conversation: ["vip"] },
+        conversationLabelsRead: { labels: ["vip"], at: Date.now() },
+      }),
+      "set_labels",
+    );
+    failed.calls.fail = true;
+    await expect(tool.invoke({ add: ["a"] })).rejects.toThrow();
+    failed.calls.fail = false;
+    await tool.invoke({ add: ["b"] });
+    expect(failed.calls.reads).toBe(1);
+    expect(failed.calls.writes).toEqual([["vip", "b"]]);
+  });
+
+  test("without a read handed over the tool reads, as a model's turn needs", async () => {
+    const { client, calls } = countingLabels(["vip"]);
+    const tool = byName(
+      buildNativeTools({
+        client,
+        conversationId: 9,
+        shownLabels: { conversation: ["vip"] },
+      }),
+      "set_labels",
+    );
+    await tool.invoke({ add: ["a"] });
+    await tool.invoke({ add: ["b"] });
+    expect(calls.reads).toBe(2);
+  });
+
+  test("a failed write fails every call that rode on it, and the next call starts clean", async () => {
+    let current: string[] = [];
+    let fail = true;
+    const client = {
+      getConversationLabels: async () => [...current],
+      setConversationLabels: async (...args: unknown[]) => {
+        if (fail) throw new Error("chatwoot down");
+        current = [...(args[1] as string[])];
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    const tools = buildNativeTools({
+      client,
+      conversationId: 9,
+      shownLabels: { conversation: [] },
+    });
+    const tool = byName(tools, "set_labels");
+    const settled = await Promise.allSettled([
+      tool.invoke({ add: ["a"] }),
+      tool.invoke({ add: ["b"] }),
+    ]);
+    expect(settled.map((r) => r.status)).toEqual(["rejected", "rejected"]);
+    fail = false;
+    await tool.invoke({ add: ["c"] });
+    expect(current).toEqual(["c"]);
   });
 
   test("a guarded batch shares its baseline, whatever the state reads do", async () => {
@@ -1128,16 +1743,18 @@ describe("native tools", () => {
       conversationId: 9,
       shownLabels: { conversation: [] },
     });
-    // One slow state read and one fast one, so the second call lands after the first has finished.
+    // The second call's state read holds until the first call has written, so it lands after the
+    // first has finished, on every machine.
     let reads = 0;
     const guarded = applyToolPreconditions(
       tools,
       {
-        set_labels: { kind: "attribute", scope: "conversation", key: "ok" },
+        set_labels: [{ kind: "attribute", scope: "conversation", key: "ok" }],
       },
       async () => {
         reads++;
-        if (reads === 2) await new Promise((r) => setTimeout(r, 60));
+        if (reads === 2)
+          await until("the first call's write", () => setCalls.length >= 1);
         return {
           conversationAttributes: { ok: "1" },
           contactAttributes: {},
@@ -1145,8 +1762,8 @@ describe("native tools", () => {
       },
     );
     const tool = byName(guarded, "set_labels");
-    // The batch metadata LangGraph itself supplies: one step for both calls (measured — the two
-    // calls of a batch carry the same `langgraph_step`, the next batch a different one).
+    // The batch metadata LangGraph itself supplies: the two calls of a batch carry the same
+    // `langgraph_step`, the next batch a different one.
     const batch = {
       metadata: {
         thread_id: "t",
@@ -1185,36 +1802,10 @@ describe("native tools", () => {
     expect(out).toContain("called off");
   });
 
-  test("set_labels task scope reads the card fresh and writes it", async () => {
-    const setCalls: unknown[][] = [];
-    const client = {
-      getKanbanTask: async () => ({ labels: [] }),
-      setKanbanTaskLabels: async (...args: unknown[]) => {
-        setCalls.push(args);
-        return {};
-      },
-    } as unknown as ChatwootClient;
-    const tools = buildNativeTools({
-      client,
-      conversationId: 9,
-      kanban: kanbanCtx, // card.labels: []
-    });
-    const out = String(
-      await byName(tools, "set_labels").invoke({
-        add: ["quente"],
-        scope: "task",
-      }),
-    );
-    expect(setCalls).toEqual([[11, ["quente"]]]);
-    expect(out.toLowerCase()).toContain("card");
-  });
-
   test("a label added to the card mid-turn survives, like in the other two scopes", async () => {
-    // ISSUE #695 HOLDOUT s6. The card used to be the turn-prep snapshot, so "not named, not
-    // touched" was a statement about that snapshot and not about the card: a label somebody put on
-    // it while the model was generating was erased by the next write. It is the one scope where the
-    // promise the whole change is built on was false, and one GET by id closes it — the id is in
-    // hand here, unlike at prep, where the card has to be resolved from the conversation.
+    // "not named, not touched" has to hold for the card itself, not for a turn-prep snapshot
+    // of it, or a label put on it while the model was generating is erased by the next write. One
+    // GET by id at write time covers it: the id is in hand here, unlike at prep.
     const setCalls: unknown[][] = [];
     const client = {
       // The card moved after prep: `externa` is on it now and the snapshot never saw it.
@@ -1237,7 +1828,7 @@ describe("native tools", () => {
   });
 
   test("a card that cannot be read refuses the write instead of using the snapshot", async () => {
-    // Falling back to the snapshot would reintroduce the erasure silently, on the one path where
+    // Falling back to the snapshot would erase such a label silently, on the one path where
     // nobody is looking. The conversation scope answers an unreadable state the same way.
     let setCount = 0;
     const client = {
@@ -1265,10 +1856,9 @@ describe("native tools", () => {
   });
 
   test("a card write withdrawn during the fresh read does not land", async () => {
-    // The fresh read this PR added to the task scope is a WAIT, exactly like the GET the other two
-    // scopes do: `/reset` can retire the run while it is in flight, and until this recheck the
-    // task scope was the only one that wrote anyway, because the graph's dispatch check was the
-    // last word before its POST. The fence is asked AFTER the read, not before it.
+    // The task scope's fresh read is a WAIT, exactly like the GET the other two scopes do:
+    // `/reset` can retire the run while it is in flight, so the graph's dispatch check cannot be the
+    // last word before the POST. The fence is asked AFTER the read, not before it.
     let setCount = 0;
     let asked = 0;
     const client = {
@@ -1326,17 +1916,11 @@ describe("native tools", () => {
   });
 
   test("a swap whose add is guarded writes NOTHING, and says the removal was held", async () => {
-    // Issue #712, and the decision it asked for: A REMOVAL IS NOT APPLIED WHEN THE GUARD REFUSED
-    // ANY ADDITION OF THE SAME CALL. Until this commit the removal landed alone, so a mutually
-    // exclusive taxonomy ended the turn with NO category — measured identical on 5ae9af39, so the
-    // delta contract did not introduce it, it made it routine by showing the model the guarded
-    // label it now asks for.
-    //
-    // ONLY REMOVALS ARE HELD, never additions, which is what keeps this compatible with the two
-    // sealed scenarios of #695 that a fully atomic call would have reversed: s8 (`add:
-    // ["cancelamento", "reembolso"]` with `cancelamento` guarded must still write `reembolso`) and
-    // s9 (a guarded REMOVE must still let its addition through, so the "both categories" direction
-    // stays on purpose — see the sibling test below, which is not a bug this issue closes).
+    // A REMOVAL IS NOT APPLIED WHEN THE GUARD REFUSED ANY ADDITION OF THE SAME CALL, or a
+    // mutually exclusive taxonomy ends the turn with NO category. ONLY REMOVALS ARE HELD: a fully
+    // atomic call would stop `add: ["cancelamento", "reembolso"]` (with `cancelamento` guarded) from
+    // writing `reembolso`, and a guarded REMOVE from letting its addition through. So the "both
+    // categories" direction stays on purpose (the sibling test below).
     const posts: unknown[][] = [];
     const client = {
       getConversationLabels: async () => [
@@ -1373,7 +1957,7 @@ describe("native tools", () => {
 
   test("a swap whose remove is guarded lands the addition alone, and says so", async () => {
     // The mirror, and the other state the single write exists to prevent: both categories at
-    // once. Also identical on 5ae9af39 (POST carried all four).
+    // once.
     const posts: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["compra-de-ingresso", "agente-off"],
@@ -1401,9 +1985,9 @@ describe("native tools", () => {
   });
 
   test("a guard that holds the whole taxonomy refuses both halves and writes nothing", async () => {
-    // The configuration that is actually correct: every mutually-exclusive value guarded. Both
-    // halves fall, no POST goes out, and the two refusals are reported. The half-write lives in
-    // the INCOMPLETE list, which is the condition of the 2026-09-17 incident.
+    // The configuration that is actually correct: every mutually-exclusive value guarded.
+    // Both halves fall, no POST goes out, and the two refusals are reported. The half-write lives in
+    // an INCOMPLETE list.
     let posts = 0;
     const client = {
       getConversationLabels: async () => ["compra-de-ingresso", "agente-off"],
@@ -1429,12 +2013,10 @@ describe("native tools", () => {
   });
 
   test("a free addition alongside a refused one lands, and the removal is STILL held", async () => {
-    // The hole the issue's own proposal left open, and the reason this PR states the rule over ANY
-    // refused addition rather than over a wholly refused `add`. "Classify it and mark it urgent"
-    // is how an instruction produces `add: [category, "urgente"]`, and under the narrow rule the
-    // guard would catch only the category, the `add` would not have fallen ENTIRELY, and the
-    // removal would land alone — the same conversation with no category, reached by a call the
-    // issue's table does not contain.
+    // The rule is over ANY refused addition, not a wholly refused `add`. "Classify it and
+    // mark it urgent" produces `add: [category, "urgente"]`; under the narrow rule the guard would
+    // catch only the category, the `add` would not fall ENTIRELY, and the removal would land alone,
+    // leaving the conversation with no category.
     const posts: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["compra-de-ingresso", "agente-off"],
@@ -1464,8 +2046,8 @@ describe("native tools", () => {
   });
 
   test("a call with no refused addition removes normally, including when it has no `add` at all", async () => {
-    // THE CHEAPEST REGRESSION TO CAUSE AND THE MOST EXPENSIVE TO FIND. Written as "every label in
-    // `add` was refused", the rule fires on an empty `add` — `[].every(…)` is true — and swallows
+    // NOTE: the cheapest regression to cause and the most expensive to find. Written as "every label
+    // in `add` was refused", the rule fires on an empty `add` (`[].every(…)` is true) and swallows
     // the removal of every remove-only call, which is the most common use of the tool and the one
     // an operator's prompt uses to take a wrong label off. The rule is over what the guard
     // REFUSED, so an empty `add` refuses nothing and holds nothing.
@@ -1525,10 +2107,10 @@ describe("native tools", () => {
   });
 
   test("the rule is about the guard REFUSING an addition, not about the addition having no effect", async () => {
-    // `add: ["a"]` where `a` is already standing asks for something and moves nothing, and #695's
-    // s14 settled that naming a label already present is a legitimate request. Conditioning the
-    // hold on "nothing was actually added" instead of "the guard refused an addition" would turn
-    // that redundant request into a block on every removal beside it.
+    // `add: ["a"]` where `a` is already standing asks for something and moves nothing, and
+    // naming a label already present is a legitimate request. Conditioning the hold on "nothing was
+    // actually added" instead of "the guard refused an addition" would turn that redundant request
+    // into a block on every removal beside it.
     const posts: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["a", "compra-de-ingresso"],
@@ -1549,11 +2131,10 @@ describe("native tools", () => {
   });
 
   test("a held call holds its WHOLE removal, guarded half and free half alike", async () => {
-    // The edge the issue raises and leaves open, decided here: the free half goes nowhere either.
-    // The removal was asked for as one request, and applying the part of it the guard happens not
-    // to cover would leave the conversation in a state nobody asked for — which is the thing the
-    // rule exists to stop, not a smaller version of it. Both labels are named back, because the
-    // model wrote both and cannot guess where either ended up.
+    // The free half goes nowhere either. The removal was asked for as one request, and
+    // applying the part the guard happens not to cover would leave the conversation in a state
+    // nobody asked for, which is what the rule exists to stop. Both labels are named back, because
+    // the model wrote both and cannot guess where either ended up.
     let posts = 0;
     const client = {
       getConversationLabels: async () => [
@@ -1640,14 +2221,10 @@ describe("native tools", () => {
   });
 
   test("reaffirming a guarded label that is already there does not hold the swap", async () => {
-    // Found by the holdout verifier on the head this rule first shipped in. `agente-off` guarded
-    // AND standing is the real observer's configuration, and a model that reaffirms it — which it
-    // can now do, because #695 made guarded labels visible — beside a perfectly ordinary swap
-    // would otherwise end the turn with BOTH categories, which is the state the single write
-    // exists to prevent and which the same call did NOT produce before the hold existed.
-    //
-    // The refused addition asked for nothing: naming a present label moves nothing under the
-    // delta, so there was no exchange for the removal to be in service of.
+    // A guarded label that is already standing (an observer's `agente-off`) is visible, so a
+    // model may reaffirm it beside an ordinary swap. Holding the removal there would end the turn
+    // with BOTH categories. The refused addition asked for nothing: naming a present label moves
+    // nothing under the delta, so there is no exchange for the removal to be in service of.
     const posts: unknown[][] = [];
     const client = {
       getConversationLabels: async () => ["compra-de-ingresso", "agente-off"],
@@ -1672,34 +2249,6 @@ describe("native tools", () => {
     expect(out).not.toContain("stays");
     // The refusal is still reported: the model asked for something it may not have.
     expect(out).toContain("cannot be added");
-  });
-
-  test("a guarded label that is NOT standing still holds the swap", async () => {
-    // The other side of the same line, so the refinement above cannot be widened into "a refused
-    // addition never holds anything". Same call, same guard, and the only difference is that the
-    // guarded label the model named is not on the conversation, so asking for it was a real
-    // request and the removal did come with it.
-    let posts = 0;
-    const client = {
-      getConversationLabels: async () => ["compra-de-ingresso"],
-      setConversationLabels: async () => {
-        posts++;
-        return {};
-      },
-    } as unknown as ChatwootClient;
-    const tools = buildNativeTools({
-      client,
-      conversationId: 9,
-      protectedLabels: ["agente-off"],
-    });
-    const out = String(
-      await byName(tools, "set_labels").invoke({
-        add: ["agente-off"],
-        remove: ["compra-de-ingresso"],
-      }),
-    );
-    expect(posts).toBe(0);
-    expect(out).toContain('"compra-de-ingresso" stays');
   });
 
   test("a hold names only what was actually standing", async () => {
@@ -1727,10 +2276,9 @@ describe("native tools", () => {
   });
 
   test("a held call does not hold the OTHER call of the same batch", async () => {
-    // The hold is a property of the call that carried the refused addition, and the queue is what
-    // makes the other call of the batch read a world the first one did not change. Ten runs,
-    // because a result that oscillates between runs means the serialisation stopped closing and
-    // would read here as a flaky test rather than as the defect it is.
+    // NOTE: the hold is a property of the call that carried the refused addition, and the queue is
+    // what makes the other call of the batch read a world the first one did not change. Ten runs,
+    // because a result that oscillates between runs means the serialisation stopped closing.
     for (let i = 0; i < 10; i++) {
       let current = ["compra-de-ingresso", "base"];
       const client = {
@@ -1857,10 +2405,10 @@ describe("native tools", () => {
   });
 
   test("a /reset landing while the contact labels are read stops the contact write", async () => {
-    // The FOURTH handler that waits before writing: the GET above is a wait exactly like the queue
-    // the conversation scope waits on, and this scope has no queue to ask inside. A contact label
-    // outlives the conversation it was written from, so a write admitted at the tool boundary and
-    // landing after `/reset` is the one that survives longest (round 21).
+    // The GET above is a wait exactly like the queue the conversation scope waits on, and
+    // this scope has no queue to ask inside. A contact label outlives the conversation it was
+    // written from, so a write admitted at the tool boundary and landing after `/reset` is the one
+    // that survives longest.
     let setCount = 0;
     let asked = 0;
     const client = {
@@ -1983,6 +2531,8 @@ describe("native tools", () => {
           model: "conversation_attribute",
           displayType: "list",
           values: ["new", "qualified"],
+          regexPattern: null,
+          regexCue: null,
         },
         {
           key: "plano",
@@ -1990,6 +2540,8 @@ describe("native tools", () => {
           model: "contact_attribute",
           displayType: "text",
           values: [],
+          regexPattern: null,
+          regexCue: null,
         },
       ],
     };
@@ -2019,6 +2571,86 @@ describe("native tools", () => {
     expect(out.toLowerCase()).toContain("no contact in scope");
     // Nothing was written (no base/contact wired in this pure ctx).
     expect(calls).toEqual([]);
+  });
+
+  // The decisions engine reads what a call did off its own config (fence-report.ts), not the sentence.
+  test("set_custom_attribute with no contact in scope tells the call it wrote nothing", async () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await byName(tools, "set_custom_attribute").invoke(
+      { key: "plano", value: "Pro", scope: "contact" },
+      withFenceReporter({}, (r) => reports.push(r)),
+    );
+    expect(reports).toEqual([{ noEffect: true }]);
+  });
+
+  test("private_note tells the call its note stays as soon as it is filed", async () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await byName(tools, "private_note").invoke(
+      { content: "Pediu reembolso" },
+      withFenceReporter({}, (r) => reports.push(r)),
+    );
+    expect(reports).toEqual([{ committed: true }]);
+  });
+
+  test("set_custom_attribute tells the call its write stays before it mirrors it", async () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await byName(tools, "set_custom_attribute").invoke(
+      { key: "plano", value: "Pro" },
+      withFenceReporter({}, (r) => reports.push(r)),
+    );
+    expect(reports).toEqual([{ committed: true }]);
+  });
+
+  test("set_labels on a contact that is not in scope tells the call it wrote nothing", async () => {
+    const { client } = recordingClient();
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await byName(tools, "set_labels").invoke(
+      { add: ["vip"], scope: "contact" },
+      withFenceReporter({}, (r) => reports.push(r)),
+    );
+    expect(reports).toEqual([{ noEffect: true }]);
+  });
+
+  test("a handoff whose status change throws after its note was filed tells the call the note stays", async () => {
+    const { client, calls } = recordingClient();
+    (client as unknown as { toggleStatus: () => Promise<never> }).toggleStatus =
+      async () => {
+        throw new Error("chatwoot down");
+      };
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await expect(
+      byName(tools, "handoff_to_human").invoke(
+        { reason: "Pediu reembolso", customerMessage: "" },
+        withFenceReporter({}, (r) => reports.push(r)),
+      ),
+    ).rejects.toThrow("chatwoot down");
+    expect(calls.map(([name]) => name)).toEqual(["sendPrivateNote"]);
+    expect(reports).toEqual([{ committed: true }]);
+  });
+
+  test("a handoff that throws before filing anything reports nothing", async () => {
+    const { client } = recordingClient();
+    (client as unknown as { toggleStatus: () => Promise<never> }).toggleStatus =
+      async () => {
+        throw new Error("chatwoot down");
+      };
+    const tools = buildNativeTools({ client, conversationId: 7 });
+    const reports: CallReport[] = [];
+    await expect(
+      byName(tools, "handoff_to_human").invoke(
+        { customerMessage: "" },
+        withFenceReporter({}, (r) => reports.push(r)),
+      ),
+    ).rejects.toThrow("chatwoot down");
+    expect(reports).toEqual([]);
   });
 });
 
@@ -2117,6 +2749,32 @@ describe("handoff targeting", () => {
       customerMessage: "",
     });
     expect(calls).toContainEqual(["assignToAgent", [5, 9]]);
+  });
+
+  // The name the model asked for is quoted in a note, which Chatwoot renders as Liquid.
+  test("agent_choice with no match quotes the model's name literally", async () => {
+    const { client, calls } = targetingClient([], []);
+    const tools = buildNativeTools({
+      client,
+      conversationId: 5,
+      handoff: {
+        mode: "agent_choice",
+        targetAgentId: null,
+        targetTeamId: null,
+        targetInstanceId: null,
+        instructions: null,
+      },
+    });
+    await byName(tools, "handoff_to_human").invoke({
+      assignTo: "{{contact.name}}",
+      customerMessage: "",
+    });
+    const notes = calls
+      .filter((c) => c[0] === "sendPrivateNote")
+      .map((c) => String(c[1][1]));
+    expect(notes.some((n) => n.includes("\"{{ '{{' }}contact.name}}\""))).toBe(
+      true,
+    );
   });
 
   test("agent_choice resolves the model's name to a team", async () => {
@@ -2323,9 +2981,9 @@ describe("handoff targeting", () => {
   });
 });
 
-// NOTE: A side effect that fails INSIDE a tool that still returns success (issue #46) must reach
-// ctx.onSideEffectError so prepare.ts can surface it as a flowlog warn — while the tool's return
-// value (what the model sees) stays a success.
+// A side effect that fails INSIDE a tool that still returns success must reach
+// ctx.onSideEffectError so src/graph/prepare.ts can surface it as a flowlog warn, while the tool's
+// return value (what the model sees) stays a success.
 describe("swallowed side effects reach onSideEffectError (issue #46)", () => {
   type SideEffect = {
     tool: string;
@@ -2443,11 +3101,9 @@ describe("swallowed side effects reach onSideEffectError (issue #46)", () => {
   });
 });
 
-// Two facts, two fields, and the predicate needs both. They happen to be written in the same block
-// today, which is exactly why the table exists: the block that writes them was MOVED here by review
-// (the line used to be recorded on the way into the tool, so a first attempt that threw left its
-// promise behind for the retry to deliver in place of the recovery text the model wrote instead).
-// A caller that reads only "there is a line" would deliver that promise again.
+// Two facts, two fields, and the predicate needs both, even though one block writes them together.
+// A line recorded by an attempt that threw must not be delivered by the retry in place of the
+// recovery text the model wrote, so a caller that reads only "there is a line" is wrong.
 describe("handoffAnsweredTheTurn", () => {
   const rows: [string, HandoffTurnState | undefined, boolean][] = [
     ["no handoff state at all", undefined, false],
@@ -2480,9 +3136,9 @@ describe("handoffAnsweredTheTurn", () => {
   }
 });
 
-// The design line drawn after PR #485: the model never authors code. Computation it must not redo
-// is an operator-authored code tool (tools/code.ts), so no native tool may take a `code` argument —
-// the shape a "run this snippet" tool has, whatever it is called.
+// The model never authors code. Computation it must not redo is an operator-authored code tool
+// (src/graph/tools/code.ts), so no native tool may take a `code` argument, the shape a "run this
+// snippet" tool has, whatever it is called.
 describe("no native tool takes code from the model", () => {
   test("every native tool's schema is free of a `code` field, and no native is named run_code", () => {
     const tools = buildNativeTools({
@@ -2499,24 +3155,11 @@ describe("no native tool takes code from the model", () => {
   });
 });
 
-// EVERY handler that waits before writing has to ask the fence again, and this battery is what says
-// so — three review rounds found three separate handlers breaking the rule one at a time (17, 21,
-// 22), which is what a rule kept by reading rather than by a test looks like.
-//
-// THE RULE, in the form the trace below can check: the graph asks `stillWanted` at DISPATCH, so the
-// first outward effect of a handler is covered by that ask. Everything after it happened AFTER a
-// wait, and a write there must be fenced. With a fence that says no from the first wait onward, a
-// correct handler makes at most one outward effect and it is never a write that came second.
-//
-// The client is a proxy over a classification rather than a stub: a method that is neither a read
-// nor a write is recorded as UNKNOWN and fails the battery, so a client call added to a handler
-// later cannot join the trace silently. Same for the tool table — it is asked to cover every name in
-// the catalog, so a tool added later arrives with an entry or the suite says which one is missing.
 describe("what the model is shown has a ceiling", () => {
-  // Every other model-facing list in the file is capped; a conversation's own set was not, and it is
-  // the one an automation can grow without an operator looking. Uncapped it lands in the observer's
-  // prompt and TWICE in this tool's description, so a bulk-labelled conversation can push the whole
-  // tick past the provider's context limit — and every retry of it fails the same way.
+  // A conversation's own label set is the one list an automation can grow without an
+  // operator looking. Uncapped it lands in the observer's prompt and TWICE in this tool's
+  // description, so a bulk-labelled conversation can push the whole tick past the provider's
+  // context limit, and every retry of it fails the same way.
   const many = Array.from({ length: 90 }, (_, i) => `etq-${i}`);
 
   test("the description shows the ceiling, not the whole set", () => {
@@ -2536,10 +3179,8 @@ describe("what the model is shown has a ceiling", () => {
   });
 
   test("what falls off the end is untouched, because nothing unnamed is touched", async () => {
-    // Why a ceiling is safe here, and the reason got SIMPLER with the delta (issue #695). It used to
-    // rest on the diff: a label past the cut was not shown, so it could not be "shown and left out",
-    // so it survived. Now it rests on the contract itself — a label the call does not name is not
-    // touched — and the cut is a display decision with no reach into the write at all.
+    // A ceiling is safe because a label the call does not name is not touched: the cut is a
+    // display decision with no reach into the write at all.
     const setCalls: unknown[][] = [];
     const client = {
       getConversationLabels: async () => many,
@@ -2555,8 +3196,7 @@ describe("what the model is shown has a ceiling", () => {
     });
     await byName(tools, "set_labels").invoke({ add: ["resolvido"] });
     const next = (setCalls[0]?.[1] ?? []) as string[];
-    // All 90 stand — the 40 it was shown as much as the 50 it never saw — plus the new one. Under
-    // the replace contract this same call deleted the 40 it had been shown and left out.
+    // NOTE: all 90 stand (the 40 it was shown as much as the 50 it never saw), plus the new one.
     expect(next).toContain("etq-0");
     expect(next).toContain(`etq-${SHOWN_LABELS_MAX}`);
     expect(next).toContain("etq-89");
@@ -2607,7 +3247,7 @@ describe("what the model is shown has a ceiling", () => {
 });
 
 describe("a muted turn is not offered what it cannot complete", () => {
-  // The observer runs the ordinary toolset now (issue #568), and two of those tools are entirely
+  // The observer runs the ordinary toolset, and two of those tools are entirely
   // customer-facing: the reaction's POST is refused at the muted transport, and the image is
   // delivered by a turn an observation does not have. Each costs a model round and answers with a
   // failure the operator reads as a broken integration.
@@ -2622,22 +3262,11 @@ describe("a muted turn is not offered what it cannot complete", () => {
     }).map((t) => t.name);
     expect(names).not.toContain("react_to_message");
     expect(names).not.toContain("send_image");
-    // The private note is the mute's own isention: it is the one thing an observer writes where a
+    // NOTE: The private note is the mute's own exception: it is the one thing an observer writes where a
     // person reads it, so hiding it would take the watcher's voice away entirely.
     expect(names).toContain("private_note");
     expect(names).toContain("set_labels");
     expect(names).toContain("resolve_conversation");
-  });
-
-  test("an ordinary turn keeps both", () => {
-    // The negative above is worth nothing without this: a filter that dropped them always would
-    // pass it and take the two tools away from every responder.
-    const names = buildNativeTools({
-      client: clientWithMute(false),
-      conversationId: 7,
-    }).map((t) => t.name);
-    expect(names).toContain("react_to_message");
-    expect(names).toContain("send_image");
   });
 
   test("the grant is still fail-closed under a mute", () => {
@@ -2651,6 +3280,12 @@ describe("a muted turn is not offered what it cannot complete", () => {
   });
 });
 
+// EVERY handler that waits before writing has to ask the fence again, and a rule kept by reading
+// breaks one handler at a time. The graph asks `stillWanted` at DISPATCH, which covers a handler's
+// first outward effect; with a fence that says no from the first wait onward, a correct handler
+// makes at most one outward effect and never a write that came second. The client is a proxy over a
+// read/write classification (an UNKNOWN method fails), and the tool table must cover every name in
+// the catalog, so a new client call or tool cannot join silently. See docs/chatwoot.md.
 describe("the fence rule, over every native tool", () => {
   const CLIENT_READS = [
     "getInbox",
@@ -2662,6 +3297,7 @@ describe("the fence rule, over every native tool", () => {
     "getConversationLabels",
     "getContactLabels",
     "getLatestIncomingMessage",
+    "getKanbanTask",
   ];
   const CLIENT_WRITES = [
     "updateContact",
@@ -2687,6 +3323,8 @@ describe("the fence rule, over every native tool", () => {
 
   function tracingCtx() {
     const trace: string[] = [];
+    // Every effect with its arguments, for the rows that assert what was written.
+    const calls: Array<[string, unknown[]]> = [];
     // The fence answers TRUE until something has been awaited, and false from then on: that is the
     // operator acting inside the wait, which is the only window the boundary ask cannot cover.
     let waited = false;
@@ -2703,7 +3341,7 @@ describe("the fence rule, over every native tool", () => {
           if (prop === "muted") return false;
           if (typeof prop !== "string") return undefined;
           // Pure string building, not a call to Chatwoot.
-          if (prop === "conversationUrl")
+          if (prop === "conversationKey" || prop === "conversationLink")
             return (id: number) => `https://cw.example/conversations/${id}`;
           const kind = CLIENT_READS.includes(prop)
             ? "read"
@@ -2712,6 +3350,7 @@ describe("the fence rule, over every native tool", () => {
               : "unknown";
           return async (...args: unknown[]) => {
             trace.push(`client:${kind}:${prop}`);
+            calls.push([prop, args]);
             waited = true;
             if (prop === "getLatestIncomingMessage")
               return { id: 99, isReaction: false };
@@ -2721,13 +3360,14 @@ describe("the fence rule, over every native tool", () => {
               return { name: "E-mail", channel_type: "Channel::Api" };
             if (prop === "getConversationLabels" || prop === "getContactLabels")
               return ["ja-existente"];
+            if (prop === "getKanbanTask") return { labels: ["ja-existente"] };
             return args.length >= 0 ? {} : {};
           };
         },
       },
     ) as unknown as ChatwootClient;
-    // The database is a wait like any other — `set_custom_attribute` and `set_labels` reach their
-    // contact scope through one, and it is the wait that round 22 found unfenced.
+    // The database is a wait like any other: `set_custom_attribute` and `set_labels` reach
+    // their contact scope through one.
     const tx = {
       // The scoped transaction opens with a `set_config` of its own; it is plumbing every scoped
       // access pays, not the handler awaiting something, so it neither counts as an effect nor
@@ -2750,17 +3390,27 @@ describe("the fence rule, over every native tool", () => {
           waited = true;
           return { chatwootContactId: 55 };
         },
-        updateMany: async () => {
+        updateMany: async (...args: unknown[]) => {
           trace.push("db:write");
+          calls.push(["db:contact.updateMany", args]);
           waited = true;
           return { count: 1 };
         },
       },
-      outboundEvent: {
-        create: async () => {
-          trace.push("db:write");
+      // The event a move emits: one subscription listens, so a delivery row is written.
+      webhookSubscription: {
+        findMany: async () => {
+          trace.push("db:read");
           waited = true;
-          return {};
+          return [{ id: 9n }];
+        },
+      },
+      outboundWebhookDelivery: {
+        createMany: async (...args: unknown[]) => {
+          trace.push("db:write");
+          calls.push(["db:outboundWebhookDelivery.createMany", args]);
+          waited = true;
+          return { count: 1 };
         },
       },
     };
@@ -2824,8 +3474,9 @@ describe("the fence rule, over every native tool", () => {
       assertSafe: async () => {},
       stillWantedFlip,
     };
-    return { ctx, trace };
+    return { ctx, trace, calls };
   }
+  type Traced = ReturnType<typeof tracingCtx>;
 
   // One entry per native tool, and where a tool takes a scope, one per scope: the arguments that
   // make it actually try to write. A name missing here fails the coverage test below.
@@ -2834,6 +3485,12 @@ describe("the fence rule, over every native tool", () => {
     label: string;
     args: object;
     ctx?: Record<string, unknown>;
+    // Overrides built per run, for a row whose fence lives inside the real client.
+    setup?: (
+      t: Traced,
+    ) => Promise<{ ctx: Record<string, unknown>; state: unknown }>;
+    // What the call must answer and leave behind, beyond "no write after a wait".
+    verify?: (r: Traced & { out: unknown; state: unknown }) => void;
   }> = [
     {
       tool: "handoff_to_human",
@@ -2845,6 +3502,40 @@ describe("the fence rule, over every native tool", () => {
       tool: "set_custom_attribute",
       label: "conversa",
       args: { key: "stage", value: "lead" },
+      setup: async (t) => {
+        const cw = fakeChatwootAttributeStore(5, {
+          conversations: { 7: { stage: "antiga" } },
+        });
+        const client = await createChatwootClient(
+          {
+            baseUrl: "https://chat.example.com",
+            accountId: 5,
+            adminToken: "A",
+            botToken: "B",
+          },
+          {
+            // The read is the wait: the operator acts while it is out.
+            fetchImpl: (async (url: string, init?: RequestInit) => {
+              t.ctx.stillWantedFlip();
+              return cw.fetchImpl(url, init);
+            }) as unknown as typeof fetch,
+            assertSafe: async (u: string) => new URL(u),
+          },
+        );
+        return { ctx: { client }, state: cw };
+      },
+      verify: ({ out, trace, state }) => {
+        const cw = state as ReturnType<typeof fakeChatwootAttributeStore>;
+        expect(out).toBe(
+          "Could not set the attribute (the run was called off while this write waited its turn).",
+        );
+        expect(cw.requests.map((r) => `${r.method} ${r.path}`)).toEqual([
+          "GET /conversations/7",
+        ]);
+        expect(cw.conversations.get(7)).toEqual({ stage: "antiga" });
+        // No mirror write either.
+        expect(trace).toEqual([]);
+      },
     },
     {
       tool: "set_custom_attribute",
@@ -2856,16 +3547,42 @@ describe("the fence rule, over every native tool", () => {
       label: "card",
       args: { key: "stage", value: "lead", scope: "task" },
     },
-    { tool: "set_labels", label: "conversa", args: { labels: ["nova"] } },
+    {
+      tool: "set_labels",
+      label: "conversa",
+      args: { add: ["nova"] },
+      verify: ({ out, trace }) => {
+        expect(trace).toEqual(["client:read:getConversationLabels"]);
+        expect(out).toBe(
+          "Could not set the labels (the run was called off while this write waited its turn).",
+        );
+      },
+    },
     {
       tool: "set_labels",
       label: "contato",
-      args: { labels: ["nova"], scope: "contact" },
+      args: { add: ["nova"], scope: "contact" },
+      verify: ({ out, trace }) => {
+        expect(trace).toEqual([
+          "db:scope",
+          "db:read",
+          "client:read:getContactLabels",
+        ]);
+        expect(out).toBe(
+          "Could not set the contact labels (the run was called off while this write waited).",
+        );
+      },
     },
     {
       tool: "set_labels",
       label: "card",
-      args: { labels: ["nova"], scope: "task" },
+      args: { add: ["nova"], scope: "task" },
+      verify: ({ out, trace }) => {
+        expect(trace).toEqual(["client:read:getKanbanTask"]);
+        expect(out).toBe(
+          "Could not set the card labels (the run was called off while this write waited).",
+        );
+      },
     },
     {
       tool: "resolve_conversation",
@@ -2876,14 +3593,88 @@ describe("the fence rule, over every native tool", () => {
       // be watching a handler that writes nothing.
       ctx: { turnState: undefined },
     },
-    { tool: "kanban_move_card", label: "", args: { targetStep: "Ganho" } },
+    {
+      tool: "kanban_move_card",
+      label: "",
+      args: { targetStep: "Ganho" },
+      // The move is the first effect, covered by the ask at dispatch; the event records a move
+      // that landed, so it follows it even after the wait.
+      verify: ({ out, trace, calls }) => {
+        expect(out).toBe('Moved the card to "Ganho".');
+        expect(trace).toEqual([
+          "client:write:moveKanbanTask",
+          "db:scope",
+          "db:read",
+          "db:write",
+        ]);
+        expect(calls[0]).toEqual(["moveKanbanTask", [11, 22]]);
+        const [kind, [arg]] = calls[1] as [
+          string,
+          [{ data: Array<Record<string, unknown>> }],
+        ];
+        expect(kind).toBe("db:outboundWebhookDelivery.createMany");
+        expect(
+          arg.data.map((d) => [d.subscriptionId, d.event, d.status]),
+        ).toEqual([[9n, "kanban.card_moved", "PENDING"]]);
+        expect(
+          arg.data.map((d) => (d.payload as { data: unknown }).data),
+        ).toEqual([{ card_id: "11", to_step: "22", conversation_id: "7" }]);
+      },
+    },
     { tool: "update_kanban_task", label: "", args: { title: "outro" } },
-    { tool: "set_voice_preference", label: "", args: { preference: "audio" } },
+    {
+      tool: "set_voice_preference",
+      label: "",
+      args: { preference: "audio" },
+      // One database write and no wait before it, so the ask at dispatch is its cover.
+      verify: ({ out, trace, calls }) => {
+        expect(out).toBe(
+          "Voice preference saved: the customer prefers audio replies.",
+        );
+        expect(trace).toEqual(["db:scope", "db:write"]);
+        expect(calls).toEqual([
+          [
+            "db:contact.updateMany",
+            [{ where: { id: 3n }, data: { voiceReply: true } }],
+          ],
+        ]);
+      },
+    },
+    {
+      tool: "update_contact",
+      label: "",
+      args: { name: "Mariana Almeida" },
+      ctx: { contactFields: { context: ["name"], writable: ["name"] } },
+    },
     { tool: "react_to_message", label: "", args: { emoji: "👍" } },
     {
       tool: "send_image",
       label: "",
       args: { url: "https://imgs.example/x.png" },
+      // Queued, not sent: delivery waits for the turn's gates, which the run being called off fails.
+      verify: ({ out, trace, ctx }) => {
+        expect(out).toBe(
+          "Imagem pronta para envio; ela vai junto com a sua resposta deste turno.",
+        );
+        expect(trace).toEqual(["fetch"]);
+        const ts = ctx.turnState;
+        expect({
+          queued: ts.pendingAttachments.map(
+            (a: {
+              kind: string;
+              mime: string;
+              order: number;
+              tool: string;
+            }) => [a.kind, a.mime, a.order, a.tool],
+          ),
+          imagesInFlight: ts.imagesInFlight,
+          attachmentsSeq: ts.attachmentsSeq,
+        }).toEqual({
+          queued: [["image", "image/png", 0, "send_image"]],
+          imagesInFlight: 0,
+          attachmentsSeq: 1,
+        });
+      },
     },
     // Writes nothing through the client: the buttons wait in TurnState for the reply.
     {
@@ -2921,9 +3712,42 @@ describe("the fence rule, over every native tool", () => {
         },
       },
     },
-    { tool: "skip_reply", label: "", args: { reason: "acknowledged" } },
-    { tool: "calculator", label: "", args: { expression: "1+1" } },
-    { tool: "get_current_time", label: "", args: {} },
+    {
+      tool: "skip_reply",
+      label: "",
+      args: { reason: "acknowledged" },
+      verify: ({ out, trace }) => {
+        expect(out).toBe(
+          "Acknowledged: not replying this turn (acknowledged). Produce no message now.",
+        );
+        expect(trace).toEqual([]);
+      },
+    },
+    {
+      tool: "calculator",
+      label: "",
+      args: { expression: "1+1" },
+      verify: ({ out, trace }) => {
+        expect(out).toBe("1+1 = 2");
+        expect(trace).toEqual([]);
+      },
+    },
+    {
+      tool: "get_current_time",
+      label: "",
+      args: {},
+      setup: async () => {
+        setSystemTime(new Date("2026-03-10T15:04:30Z"));
+        return { ctx: {}, state: undefined };
+      },
+      verify: ({ out, trace }) => {
+        setSystemTime();
+        expect(out).toBe(
+          "terça-feira, 10 de março de 2026 às 12:04 (2026-03-10 12:04, America/Sao_Paulo)",
+        );
+        expect(trace).toEqual([]);
+      },
+    },
   ];
 
   test("the table covers every native tool", () => {
@@ -2934,11 +3758,10 @@ describe("the fence rule, over every native tool", () => {
     );
   });
 
-  // THE SAME RULE THROUGH THE PRECONDITION WRAPPER, which is where round 24 found it broken. A
-  // configured precondition puts a database read between the graph's ask at dispatch and the call it
-  // authorises, so a handler whose FIRST act is a write — a private note, a status toggle — loses
-  // the cover that ask gave it. Here the fence is already withdrawn when the tool is invoked, so a
-  // correct wrapper lets NOTHING through: not even the first effect.
+  // NOTE: the same rule through the precondition wrapper. A configured precondition puts a database
+  // read between the graph's ask at dispatch and the call it authorises, so a handler whose FIRST
+  // act is a write (a private note, a status toggle) loses the cover that ask gave it. Here the
+  // fence is already withdrawn when the tool is invoked, so a correct wrapper lets NOTHING through.
   for (const c of CASES) {
     const name = c.label ? `${c.tool} (${c.label})` : c.tool;
     test(`${name}: a precondition read is a wait, and nothing runs after it`, async () => {
@@ -2946,12 +3769,14 @@ describe("the fence rule, over every native tool", () => {
       const tools = applyToolPreconditions(
         buildNativeTools({ ...ctx, ...(c.ctx ?? {}) } as never),
         {
-          [c.tool]: {
-            kind: "attribute" as const,
-            scope: "conversation" as const,
-            key: "vip",
-            equals: "sim",
-          },
+          [c.tool]: [
+            {
+              kind: "attribute" as const,
+              scope: "conversation" as const,
+              key: "vip",
+              equals: "sim",
+            },
+          ],
         },
         async () => {
           // The read itself is the wait: the operator acts inside it. The condition is MET, so what
@@ -2974,9 +3799,16 @@ describe("the fence rule, over every native tool", () => {
   for (const c of CASES) {
     const name = c.label ? `${c.tool} (${c.label})` : c.tool;
     test(`${name}: no write lands after a wait once the run is called off`, async () => {
-      const { ctx, trace } = tracingCtx();
-      const tools = buildNativeTools({ ...ctx, ...(c.ctx ?? {}) } as never);
-      await byName(tools, c.tool).invoke(c.args as never);
+      const traced = tracingCtx();
+      const { ctx, trace } = traced;
+      const built = c.setup ? await c.setup(traced) : undefined;
+      const tools = buildNativeTools({
+        ...ctx,
+        ...(c.ctx ?? {}),
+        ...(built?.ctx ?? {}),
+      } as never);
+      const out = await byName(tools, c.tool).invoke(c.args as never);
+      c.verify?.({ ...traced, out, state: built?.state });
       const offenders = trace
         .map((e, i) => ({ e, i }))
         .filter(({ e, i }) => i > 0 && e.startsWith("client:write"));

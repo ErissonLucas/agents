@@ -1,7 +1,10 @@
 import { PostgresSaver } from "@langchain/langgraph-checkpoint-postgres";
 import { Pool } from "pg";
+import { runtimePoolOptions } from "@/api/lib/pool-options";
 import config from "@/config";
 import { parseDbId } from "@/lib/db-id";
+import { instrumentPool } from "@/lib/pool-stats";
+import { checkpointTypes } from "./checkpoint-bytea";
 
 // LangGraph checkpointer: a PostgresSaver in the dedicated `langgraph` schema (created by
 // scripts/db-bootstrap.sql, owned by the non-superuser runtime role). The thread_id prefix
@@ -13,6 +16,9 @@ const KEY = Symbol.for("fazerai.langgraph.checkpointer");
 
 interface Holder {
   promise?: Promise<PostgresSaver>;
+  // The saver's own pool, which it keeps private: the teardowns delete whole sets of threads
+  // (checkpoint-sweep.ts), which `deleteThread` would do one round trip per table and thread.
+  pools?: WeakMap<PostgresSaver, Pool>;
 }
 
 function holder(): Holder {
@@ -21,25 +27,65 @@ function holder(): Holder {
   return g[KEY];
 }
 
+// The runtime pool's options, with the blobs parsed by ./checkpoint-bytea.ts, which keeps a long
+// thread's load off the event loop.
+function checkpointPoolOptions() {
+  return {
+    ...runtimePoolOptions(
+      config.langgraphDatabaseUrl ?? "",
+      config.langgraphPoolMax,
+    ),
+    types: checkpointTypes,
+  };
+}
+
 async function init(): Promise<PostgresSaver> {
-  // NOTE: build the pool ourselves (mirrors PostgresSaver.fromConnString) so we can set `max` — the
-  // checkpointer is touched during every graph.invoke, so it needs the same headroom as the main
-  // Prisma pool (config.dbPoolMax) or it becomes the bottleneck under concurrent turns.
-  const saver = new PostgresSaver(
-    new Pool({
-      connectionString: config.langgraphDatabaseUrl ?? "",
-      max: config.dbPoolMax,
-    }),
-    undefined,
-    { schema: "langgraph" },
+  // Build the pool ourselves (mirrors PostgresSaver.fromConnString) so we can set `max` and the
+  // lock timeout. The checkpointer is touched during every graph.invoke, so it needs about the
+  // headroom of the main pool or it becomes the bottleneck under concurrent turns
+  // (config.langgraphPoolMax, which follows DB_POOL_MAX unless set).
+  const pool = instrumentPool(
+    "checkpointer",
+    new Pool(checkpointPoolOptions()),
   );
-  await saver.setup();
+  const saver = new PostgresSaver(pool, undefined, { schema: "langgraph" });
+  try {
+    await saver.setup();
+  } catch (error) {
+    // The next call builds a pool of its own, so this one is closed rather than left holding
+    // whatever it opened.
+    await pool.end().catch(() => {});
+    throw error;
+  }
+  const h = holder();
+  h.pools ??= new WeakMap();
+  h.pools.set(saver, pool);
   return saver;
+}
+
+// The pool behind `getCheckpointer()`, for statements over many threads at once. A saver set up
+// before the registry existed (a `bun --hot` reload keeps the holder) is read for the pool it keeps.
+export async function getCheckpointPool(): Promise<Pool> {
+  const saver = await getCheckpointer();
+  const pool =
+    holder().pools?.get(saver) ?? (saver as unknown as { pool?: Pool }).pool;
+  if (!pool || typeof pool.connect !== "function") {
+    throw new Error("the checkpointer has no pool of its own");
+  }
+  return pool;
 }
 
 export function getCheckpointer(): Promise<PostgresSaver> {
   const h = holder();
-  h.promise ??= init();
+  if (!h.promise) {
+    const pending = init();
+    h.promise = pending;
+    // A setup that failed (a connect past its bound, the database down for a moment) is not kept:
+    // the next turn asks again, instead of every turn inheriting this failure until a restart.
+    pending.catch(() => {
+      if (h.promise === pending) h.promise = undefined;
+    });
+  }
   return h.promise;
 }
 

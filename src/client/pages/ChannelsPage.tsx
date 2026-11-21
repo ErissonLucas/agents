@@ -45,9 +45,15 @@ import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { chatwootInboxNewUrl } from "@/client/lib/chatwootLinks";
+import {
+  foreignAgentBotRefusal,
+  replaceForeignBotConfirm,
+} from "@/client/lib/foreignAgentBot";
 import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
 import { RyzeSection } from "@/client/pages/channels/RyzeSection";
+import { takesCalls } from "@/modules/voice-call/channel";
+import { AdvancedAddresses } from "./channels/AdvancedAddresses";
 
 type DeploymentData = Awaited<
   ReturnType<typeof api.api.v1.chatwoot.deployment.get>
@@ -65,15 +71,13 @@ type ReachableData = Awaited<
 >["data"];
 type ReachableAccount = NonNullable<ReachableData>["accounts"][number];
 
-// NOTE: Static keys so the skeleton rows don't key off the array index.
+// Static keys so the skeleton rows don't key off the array index.
 const CHANNELS_ACCOUNT_KEYS = ["acct-0", "acct-1"];
 const CHANNELS_INBOX_KEYS = ["inbox-0", "inbox-1", "inbox-2"];
 
-// EVERY agent, not the first page (issue #476 review, round 4). This page does not list agents, it
-// RESOLVES them: an id bound to an inbox or observing one is rendered by looking it up here, so an
-// agent past the first page reads as no agent at all — a responder the picker cannot show, an
-// observer whose chip and remove button vanish. `/agents` answers 20 at a time and caps a page at
-// 100, so the pages are walked to the total the first one reports.
+// EVERY agent, not the first page: this page resolves the ids bound to or observing an inbox, so an
+// agent past the first page would read as no agent at all. `/agents` caps a page at 100, so the pages
+// are walked to the total the first one reports.
 const AGENTS_PAGE_SIZE = 100;
 
 // The reconcile answers `${inboxId}:${agentId}`; the strip asks by agent, for one inbox.
@@ -106,12 +110,9 @@ async function walkAgentsOnce(): Promise<
   const agents: AgentLite[] = [...first.data.agents];
   const seen = new Set(agents.map((a) => a.id));
   const total = first.data.total;
-  // The freshest count the walk saw. Offsets are computed against the roster as it stands at each
-  // request, so a DELETION on an already-read page slides every later row one place forward and the
-  // walk steps straight over one of them (issue #476 review, round 37): after reading 100 of 150,
-  // deleting one of those 100 makes page 2 return the 49 rows from offset 100 of a 149-row roster,
-  // and the row that WAS 101 is never read. The counts still add up — 149 held against a total of
-  // 149 — so the shortfall cannot detect it; the total MOVING is what does.
+  // The freshest total the walk saw. A deletion on an already-read page slides every later row
+  // one offset forward, so the walk skips one while the counts still add up; only the total moving
+  // detects it.
   let latestTotal = total;
   for (
     let page = 2;
@@ -156,11 +157,9 @@ async function loadAllAgents(): Promise<AgentLite[] | null> {
 const pickerItemCls =
   "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary";
 
-// The inbox's OBSERVERS (issue #476): monitoring agents attached to the inbox on Chatwoot as
-// observers, receiving every event and answering nothing. Chips for the current ones, each with
-// its remove, and a dropdown over the monitoring agents not yet observing. Both calls go to
-// Chatwoot, so the strip shows a spinner while one is in flight and the list is controlled by the
-// row's own `observerAgentIds`, which only moves on success.
+// The inbox's OBSERVERS: monitoring agents attached on Chatwoot that receive every event and answer
+// nothing. Both calls reach Chatwoot, so the list is controlled by the row's `observerAgentIds`,
+// which only moves on success.
 function InboxObserversStrip({
   observerAgentIds,
   responderAgentId,
@@ -191,14 +190,14 @@ function InboxObserversStrip({
   const observing = observerAgentIds
     .map((id) => agents.find((a) => a.id === id))
     .filter((a): a is AgentLite => a !== undefined);
-  // An inbox has ONE watcher (the memory thread is the contact-inbox's, not the agent's), so the
-  // menu offers nothing while one is bound: the write would refuse it.
-  const candidates =
-    observerAgentIds.length > 0
-      ? []
-      : agents.filter(
-          (a) => a.mode === "monitoring" && a.id !== responderAgentId,
-        );
+  // An inbox carries several watchers: the menu offers every monitoring agent not already on it,
+  // in either role.
+  const candidates = agents.filter(
+    (a) =>
+      a.mode === "monitoring" &&
+      a.id !== responderAgentId &&
+      !observerAgentIds.includes(a.id),
+  );
 
   async function run(action: () => Promise<void>) {
     setPending(true);
@@ -239,7 +238,7 @@ function InboxObserversStrip({
                   "Reconnect observer {{name}}: its bot no longer exists on Chatwoot, so it receives nothing",
                   { name: a.name },
                 )}
-                className="rounded text-text-muted hover:text-text-primary disabled:opacity-60"
+                className="text-text-muted hover:text-text-primary rounded disabled:opacity-60"
                 onClick={() => run(() => onObserve(a.id))}
               >
                 <RefreshCw className="h-3 w-3" aria-hidden="true" />
@@ -255,7 +254,7 @@ function InboxObserversStrip({
                   name: a.name,
                 },
               )}
-              className="rounded text-text-muted hover:text-text-primary disabled:opacity-60"
+              className="text-text-muted hover:text-text-primary rounded disabled:opacity-60"
               onClick={() => run(() => onUnobserve(a.id))}
             >
               <X className="h-3 w-3" aria-hidden="true" />
@@ -270,7 +269,7 @@ function InboxObserversStrip({
               type="button"
               disabled={pending || candidates.length === 0}
               aria-label={t("channels.addObserver", "Add observer")}
-              className="flex items-center gap-1 rounded-md border border-border border-dashed px-2 py-1 text-text-muted text-xs hover:text-text-primary disabled:opacity-60"
+              className="border-border text-text-muted hover:text-text-primary flex items-center gap-1 rounded-md border border-dashed px-2 py-1 text-xs disabled:opacity-60"
             >
               {pending ? (
                 <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
@@ -284,7 +283,7 @@ function InboxObserversStrip({
             <DropdownMenuPrimitive.Content
               align="end"
               sideOffset={4}
-              className="z-50 max-h-72 w-56 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg"
+              className="border-border bg-bg-secondary z-50 max-h-72 w-56 overflow-y-auto rounded-lg border p-1 shadow-lg"
             >
               {candidates.map((a) => (
                 <DropdownMenuPrimitive.Item
@@ -341,19 +340,19 @@ function InboxAgentPicker({
           type="button"
           disabled={pending}
           aria-label={label}
-          className="flex w-56 shrink-0 items-center justify-between gap-2 rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary focus:border-border-focus focus:outline-none disabled:opacity-60"
+          className="border-border-hover bg-bg-tertiary text-text-primary focus:border-border-focus focus:ring-accent-soft flex min-h-8 w-56 shrink-0 items-center justify-between gap-2 rounded-md border px-2.5 py-1 text-sm transition-colors focus:ring-2 focus:outline-none disabled:opacity-60"
         >
           <span className={cn("truncate", { "text-text-muted": !current })}>
             {current ? current.name : t("channels.noAgent", "No agent")}
           </span>
           {pending ? (
             <Loader2
-              className="h-4 w-4 shrink-0 animate-spin text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0 animate-spin"
               aria-hidden="true"
             />
           ) : (
             <ChevronDown
-              className="h-4 w-4 shrink-0 text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0"
               aria-hidden="true"
             />
           )}
@@ -363,7 +362,7 @@ function InboxAgentPicker({
         <DropdownMenuPrimitive.Content
           align="end"
           sideOffset={4}
-          className="z-50 max-h-72 w-56 overflow-y-auto rounded-lg border border-border bg-bg-secondary p-1 shadow-lg"
+          className="border-border bg-bg-secondary z-50 max-h-72 w-56 overflow-y-auto rounded-lg border p-1 shadow-lg"
         >
           <DropdownMenuPrimitive.Item
             className={pickerItemCls}
@@ -374,7 +373,7 @@ function InboxAgentPicker({
             </span>
             {value === null && (
               <Check
-                className="h-4 w-4 shrink-0 text-accent"
+                className="text-accent h-4 w-4 shrink-0"
                 aria-hidden="true"
               />
             )}
@@ -388,7 +387,7 @@ function InboxAgentPicker({
               <span className="flex-1 truncate">{a.name}</span>
               {value === a.id && (
                 <Check
-                  className="h-4 w-4 shrink-0 text-accent"
+                  className="text-accent h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
               )}
@@ -427,7 +426,7 @@ function ChannelsSkeleton() {
             {CHANNELS_INBOX_KEYS.map((key) => (
               <li
                 key={key}
-                className="flex items-center justify-between gap-4 border-border border-b px-4 py-3 last:border-b-0"
+                className="border-border flex items-center justify-between gap-4 border-b px-4 py-3 last:border-b-0"
               >
                 <div className="flex min-w-0 flex-col gap-1.5">
                   <Skeleton className="h-4 w-40" />
@@ -445,8 +444,18 @@ function ChannelsSkeleton() {
 
 // Three writes on this page, three forms. The names are the keys of each body, which is what the
 // route refuses by (`refused body.baseUrl`, `refused body.accountIds.0`).
-const CONNECT_FIELDS = ["baseUrl", "adminToken"] as const;
-const TOKEN_FIELDS = ["adminToken"] as const;
+const CONNECT_FIELDS = [
+  "baseUrl",
+  "adminToken",
+  "webhookBaseUrl",
+  "publicUrl",
+] as const;
+const TOKEN_FIELDS = [
+  "baseUrl",
+  "adminToken",
+  "webhookBaseUrl",
+  "publicUrl",
+] as const;
 const ACCOUNTS_FIELDS = ["accountIds"] as const;
 
 export function ChannelsPage() {
@@ -470,10 +479,15 @@ export function ChannelsPage() {
   // SUPER_ADMIN-only actions: tearing down the whole instance, and removing one account (to move it).
   const strongConfirm = useModalController<StrongConfirmPayload>();
   const confirm = useModalController<ConfirmPayload>();
+  const replaceBotConfirm = useModalController<ConfirmPayload>();
 
   // Connect form (base URL + admin token, entered once).
   const [baseUrl, setBaseUrl] = useState("");
   const [adminToken, setAdminToken] = useState("");
+  // The connection's two optional addresses, in both the connect and the edit form: the base this
+  // Chatwoot calls the agents on, and the address people open it on. Empty means the default.
+  const [webhookBaseUrl, setWebhookBaseUrl] = useState("");
+  const [publicUrl, setPublicUrl] = useState("");
   // Three writes, three forms, three holders: the connect modal, the token modal, and the account
   // picker each save on their own, and a refusal about one must not mark another's input.
   const connectRefusal = useFieldRefusal(
@@ -483,8 +497,8 @@ export function ChannelsPage() {
   const accountsRefusal = useFieldRefusal(
     manageModal.isOpen ? ACCOUNTS_FIELDS : [],
   );
-  const connectRef = useRef({ baseUrl, adminToken });
-  connectRef.current = { baseUrl, adminToken };
+  const connectRef = useRef({ baseUrl, adminToken, webhookBaseUrl, publicUrl });
+  connectRef.current = { baseUrl, adminToken, webhookBaseUrl, publicUrl };
   const [connecting, setConnecting] = useState(false);
 
   // Every account the deployment's token can reach (from /profile), listed inline under the instance
@@ -499,6 +513,10 @@ export function ChannelsPage() {
   const [newToken, setNewToken] = useState("");
   const newTokenRef = useRef(newToken);
   newTokenRef.current = newToken;
+  // The base URL as typed in "Edit connection": a new address of the same Chatwoot.
+  const [editBaseUrl, setEditBaseUrl] = useState("");
+  const editBaseUrlRef = useRef(editBaseUrl);
+  editBaseUrlRef.current = editBaseUrl;
   const [savingToken, setSavingToken] = useState(false);
 
   // Per-inbox bot existence on Chatwoot (live reconcile). "missing" = bound here but the persona's
@@ -514,23 +532,11 @@ export function ChannelsPage() {
   const [reconnecting, setReconnecting] = useState<string | null>(null);
   const [removingInbox, setRemovingInbox] = useState<string | null>(null);
 
-  // WHAT A REPAIR ACTUALLY CONFIRMS, and rounds 41 and 49 pull opposite ways on it.
-  //
-  // One bot serves every role its agent holds, so a call that re-provisions a bot that was gone
-  // repairs every inbox this persona answers and every one it observes — round 41 asked the page to
-  // say so, since sibling bindings otherwise keep offering a Reconnect for a bot the backend already
-  // considers active. But that repair is BEST-EFFORT per inbox: `ensureAgentBotAndReattach` logs a
-  // failed sibling attachment at `error` and lets the requested operation succeed anyway, so marking
-  // them all active clears the Reconnect from an inbox that is receiving nothing (round 49). The
-  // reconcile does not catch it either, because it asks whether the BOT exists.
-  //
-  // Between an extra Reconnect that repairs nothing (a no-op click, the call is idempotent) and a
-  // missing one that hides an inbox getting no deliveries, this module's rule picks the first: wrong
-  // and visible over quiet and wrong. So the page marks ONLY the binding the operation itself
-  // attached, which is the one whose success the call actually reports by not throwing.
-  //
-  // Closing it properly is the reconcile asking the ATTACHMENT per binding rather than the bot —
-  // named in docs/chatwoot.md as the real fix, and out of this PR's scope.
+  // Marks ONLY the binding the operation attached. A re-provisioned bot serves every binding of
+  // its agent, but reattaching the siblings is best-effort (a failure is logged and the call still
+  // succeeds), and the reconcile asks whether the bot exists, not the attachment. Marking them all
+  // would hide an inbox receiving nothing; an extra Reconnect is an idempotent no-op click.
+  // TODO: have the reconcile check the attachment per binding rather than the bot.
   const markBindingActive = useCallback(
     (key: string, kind: "responder" | "observer") => {
       const set = kind === "responder" ? setBotStatus : setObserverStatus;
@@ -682,6 +688,8 @@ export function ChannelsPage() {
           : `https://${connectParam}`,
       );
       setAdminToken("");
+      setWebhookBaseUrl("");
+      setPublicUrl("");
       // The component outlives the dialog, so a mark from the last session is still held here.
       connectRefusal.clear();
       connectModal.open();
@@ -696,7 +704,8 @@ export function ChannelsPage() {
     );
   }, [connectParam, loading, isSuperAdmin, deployment]);
 
-  const baseUrl0 = deployment?.baseUrl ?? "";
+  // Links a person follows go to the address people open this Chatwoot on, not to a private base.
+  const baseUrl0 = deployment?.publicUrl || deployment?.baseUrl || "";
   // The host the operator must re-type to confirm a teardown (e.g. "chat.example.com").
   const deploymentHost = (() => {
     if (!deployment) return "";
@@ -710,6 +719,8 @@ export function ChannelsPage() {
   function openConnect() {
     setBaseUrl("");
     setAdminToken("");
+    setWebhookBaseUrl("");
+    setPublicUrl("");
     // Every opening, not just the one driven by `?connect=`. The mark expires by VALUE, so a holder
     // carried across a cancel comes back the moment the operator retypes the URL that was refused —
     // an old server sentence under a box, before anything has been sent.
@@ -727,6 +738,8 @@ export function ChannelsPage() {
       const sent = {
         baseUrl: baseUrl.trim(),
         adminToken: adminToken.trim(),
+        webhookBaseUrl: webhookBaseUrl.trim() || null,
+        publicUrl: publicUrl.trim() || null,
       };
       const { data, error: err } =
         await api.api.v1.chatwoot.deployment.post(sent);
@@ -742,6 +755,8 @@ export function ChannelsPage() {
         const placed = connectRefusal.capture(err, "", sent, {
           baseUrl: connectRef.current.baseUrl.trim(),
           adminToken: connectRef.current.adminToken.trim(),
+          webhookBaseUrl: connectRef.current.webhookBaseUrl.trim() || null,
+          publicUrl: connectRef.current.publicUrl.trim() || null,
         });
         if (placed === null) return;
         showToast(
@@ -872,28 +887,64 @@ export function ChannelsPage() {
 
   function openToken() {
     setNewToken("");
+    setEditBaseUrl(deployment?.baseUrl ?? "");
+    setWebhookBaseUrl(deployment?.webhookBaseUrl ?? "");
+    setPublicUrl(deployment?.publicUrl ?? "");
     // The component outlives the dialog, so a mark from the last session is still held here.
     tokenRefusal.clear();
     tokenModal.open();
   }
 
   async function saveToken() {
-    if (!newToken.trim()) return;
+    if (!connectionDirty) return;
     setSavingToken(true);
+    // Only what changed goes out: an untouched address is not re-sent, and an empty token field keeps
+    // the stored token.
+    const sent = {
+      ...(baseUrlMoved ? { baseUrl: editBaseUrl.trim() } : {}),
+      ...(newToken.trim() ? { adminToken: newToken.trim() } : {}),
+      ...(webhookBaseUrl.trim() !== (deployment?.webhookBaseUrl ?? "")
+        ? { webhookBaseUrl: webhookBaseUrl.trim() || null }
+        : {}),
+      ...(publicUrl.trim() !== (deployment?.publicUrl ?? "")
+        ? { publicUrl: publicUrl.trim() || null }
+        : {}),
+    };
     try {
-      const sent = { adminToken: newToken.trim() };
       const { error: err } = await api.api.v1.chatwoot.deployment.patch(sent);
       if (err) throw err;
       tokenRefusal.clear();
-      showToast(t("channels.tokenSaved", "Token updated."), "success");
+      showToast(
+        t("channels.connectionSaved", "Connection updated."),
+        "success",
+      );
       tokenModal.close();
       void load();
     } catch (e) {
       const toast = tokenRefusal.capture(
         e,
-        t("channels.tokenSaveError", "Could not update the token (check it)."),
-        { adminToken: newToken.trim() },
-        { adminToken: newTokenRef.current.trim() },
+        t(
+          "channels.connectionSaveError",
+          "Could not update the connection (check the token and the addresses).",
+        ),
+        sent,
+        {
+          ...("baseUrl" in sent
+            ? { baseUrl: editBaseUrlRef.current.trim() }
+            : {}),
+          ...(newTokenRef.current.trim()
+            ? { adminToken: newTokenRef.current.trim() }
+            : {}),
+          ...("webhookBaseUrl" in sent
+            ? {
+                webhookBaseUrl:
+                  connectRef.current.webhookBaseUrl.trim() || null,
+              }
+            : {}),
+          ...("publicUrl" in sent
+            ? { publicUrl: connectRef.current.publicUrl.trim() || null }
+            : {}),
+        },
       );
       if (toast) showToast(toast, "error");
     } finally {
@@ -1026,11 +1077,24 @@ export function ChannelsPage() {
   // Binding an inbox to an agent lazily provisions + connects the Chatwoot bot; unbinding (null)
   // disconnects it. Non-optimistic: update local state only on success, rethrow on failure so the
   // row's picker stops its spinner without changing the displayed value.
-  async function bindInbox(inboxId: string, agentId: string | null) {
+  async function bindInbox(
+    inboxId: string,
+    agentId: string | null,
+    replaceForeignBot = false,
+  ) {
     const { error: err } = await api.api.v1.chatwoot
       .inboxes({ id: inboxId })
-      .patch({ agentId });
+      .patch({ agentId, ...(replaceForeignBot && { replaceForeignBot }) });
     if (err) {
+      const foreignBot = replaceForeignBot ? null : foreignAgentBotRefusal(err);
+      if (foreignBot) {
+        replaceBotConfirm.open(
+          replaceForeignBotConfirm(t, foreignBot, () =>
+            bindInbox(inboxId, agentId, true),
+          ),
+        );
+        return;
+      }
       showToast(
         apiErrorMessage(err) ||
           t("channels.bindError", "Could not update the inbox."),
@@ -1051,8 +1115,32 @@ export function ChannelsPage() {
     showToast(t("channels.bound", "Inbox updated."), "success");
   }
 
-  // The observer binding (issue #476): both calls reach Chatwoot, and the row's list moves only on
-  // success, like the responder binding above.
+  // The voice binding: which voice agent answers the inbox's calls, beside the responder.
+  async function bindVoiceAgent(inboxId: string, agentId: string | null) {
+    const { data, error: err } = await api.api.v1.chatwoot
+      .inboxes({ id: inboxId })
+      ["voice-agent"].put({ agentId });
+    if (err || !data) {
+      // A 502 saved the binding and only missed Chatwoot: the row shows what is stored, so the
+      // previous agent can be picked again to put it back.
+      void refreshInboxes();
+      showToast(
+        apiErrorMessage(err) ||
+          t("channels.voiceBindError", "Could not change the inbox's calls."),
+        "error",
+      );
+      throw err;
+    }
+    setInboxes((prev) =>
+      prev.map((i) =>
+        i.id === inboxId ? { ...i, voiceAgentId: data.voiceAgentId } : i,
+      ),
+    );
+    showToast(t("channels.bound", "Inbox updated."), "success");
+  }
+
+  // The observer binding: both calls reach Chatwoot, and the row's list moves only on success, like
+  // the responder binding above.
   async function observeInbox(inboxId: string, agentId: string) {
     const { data, error: err } = await api.api.v1.chatwoot
       .inboxes({ id: inboxId })
@@ -1071,10 +1159,9 @@ export function ChannelsPage() {
         i.id === inboxId ? { ...i, observerAgentIds: next } : i,
       ),
     );
-    // The call attaches on Chatwoot and re-provisions a bot that was gone, so it is also the
-    // reconnect for an observer the reconcile reported missing: the pair is active again, and the
-    // chip has to stop asking to be reconnected without waiting for the next status read. And the
-    // repair is the PERSONA's, not this binding's — see `markAgentBotActive`.
+    // NOTE: The call also re-provisions a missing bot, so it is the reconnect for an observer the
+    // reconcile reported missing; the chip clears without waiting for the next status read. Only this
+    // binding is marked, see `markBindingActive`.
     setObserverStatus((prev) => ({
       ...prev,
       [`${inboxId}:${agentId}`]: "active",
@@ -1175,7 +1262,27 @@ export function ChannelsPage() {
   }
 
   const baseUrlInvalid = !isValidHttpUrl(baseUrl);
-  const connectDirty = baseUrl.trim() !== "" || adminToken.trim() !== "";
+  // The two optional addresses: empty is fine (the default), anything else must be a clean http(s)
+  // base, the same rule the server applies.
+  const optionalUrlInvalid = (v: string) =>
+    v.trim() !== "" && (!isValidHttpUrl(v) || /[?#]/.test(v));
+  const webhookBaseUrlInvalid = optionalUrlInvalid(webhookBaseUrl);
+  const publicUrlInvalid = optionalUrlInvalid(publicUrl);
+  // Compared the way the server stores it, so a trailing slash alone is not a move.
+  const baseUrlMoved =
+    editBaseUrl.trim().replace(/\/+$/, "") !==
+    (deployment?.baseUrl ?? "").replace(/\/+$/, "");
+  const editBaseUrlInvalid = !isValidHttpUrl(editBaseUrl);
+  const connectionDirty =
+    baseUrlMoved ||
+    newToken.trim() !== "" ||
+    webhookBaseUrl.trim() !== (deployment?.webhookBaseUrl ?? "") ||
+    publicUrl.trim() !== (deployment?.publicUrl ?? "");
+  const connectDirty =
+    baseUrl.trim() !== "" ||
+    adminToken.trim() !== "" ||
+    webhookBaseUrl.trim() !== "" ||
+    publicUrl.trim() !== "";
 
   // Accounts are ordered alphabetically by name (the #id breaks ties / orders the unnamed), so the
   // page list and the manage modal show the same, stable order regardless of connection order.
@@ -1232,12 +1339,12 @@ export function ChannelsPage() {
   return (
     <PageContainer className="flex flex-col gap-6">
       <header className="flex items-center gap-3">
-        <RadioTower className="h-6 w-6 text-accent" aria-hidden="true" />
+        <RadioTower className="text-accent h-6 w-6" aria-hidden="true" />
         <div>
-          <h1 className="font-semibold text-text-primary text-xl">
+          <h1 className="text-text-primary text-xl font-semibold">
             {t("channels.title", "Channels")}
           </h1>
-          <p className="mt-0.5 text-sm text-text-muted">
+          <p className="text-text-muted mt-0.5 text-sm">
             {t(
               "channels.subtitle",
               "Connect Chatwoot accounts and decide which agent answers each inbox.",
@@ -1258,7 +1365,7 @@ export function ChannelsPage() {
           renderAgentPicker={(inboxId, agentId, onBound) => (
             <InboxAgentPicker
               value={agentId}
-              agents={agents}
+              agents={agents.filter((a) => a.kind !== "voice")}
               label={t("channels.bindLabel", "Answering agent")}
               onChange={async (next) => {
                 await bindInbox(inboxId, next);
@@ -1268,8 +1375,8 @@ export function ChannelsPage() {
           )}
         />
         <section className="flex flex-col gap-3">
-          <h2 className="flex items-center gap-2 font-medium text-text-primary">
-            <Plug className="h-4 w-4 text-accent" aria-hidden="true" />
+          <h2 className="text-text-primary flex items-center gap-2 font-medium">
+            <Plug className="text-accent h-4 w-4" aria-hidden="true" />
             {t("channels.instance", "Chatwoot instance")}
           </h2>
 
@@ -1303,27 +1410,27 @@ export function ChannelsPage() {
             // The deployment is the section container; its accounts are nested sub-rows inside the
             // same card so they read as belonging to this one Chatwoot instance.
             <Card className="overflow-hidden p-0">
-              <div className="flex flex-wrap items-center justify-between gap-3 border-border border-b bg-bg-tertiary/40 px-4 py-3">
+              <div className="border-border bg-bg-tertiary/40 flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">
                 <div className="flex min-w-0 items-center gap-2">
                   <ServiceLogo
                     service="chatwoot"
-                    className="h-5 w-5 shrink-0 text-text-secondary"
+                    className="text-text-secondary h-5 w-5 shrink-0"
                   />
-                  <span className="truncate font-medium text-text-primary">
+                  <span className="text-text-primary truncate font-medium">
                     {deployment.baseUrl}
                   </span>
                   <Tooltip
                     content={t("channels.openInChatwoot", "Open in Chatwoot")}
                   >
                     <a
-                      href={deployment.baseUrl.replace(/\/+$/, "")}
+                      href={baseUrl0.replace(/\/+$/, "")}
                       target="_blank"
                       rel="noopener noreferrer"
                       aria-label={t(
                         "channels.openInChatwoot",
                         "Open in Chatwoot",
                       )}
-                      className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                      className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors"
                     >
                       <ExternalLink
                         className="h-3.5 w-3.5"
@@ -1343,7 +1450,7 @@ export function ChannelsPage() {
                     </Button>
                     <Button variant="secondary" size="sm" onClick={openToken}>
                       <KeyRound className="h-4 w-4" aria-hidden="true" />
-                      {t("channels.editToken", "Edit token")}
+                      {t("channels.editConnection", "Edit connection")}
                     </Button>
                     <Button
                       variant="danger"
@@ -1362,7 +1469,7 @@ export function ChannelsPage() {
 
               {activeAccounts.length === 0 ? (
                 <div className="flex flex-col items-center gap-3 px-4 py-8 text-center">
-                  <p className="text-sm text-text-muted">
+                  <p className="text-text-muted text-sm">
                     {isSuperAdmin
                       ? t(
                           "channels.noActiveAccounts",
@@ -1388,10 +1495,10 @@ export function ChannelsPage() {
                   {activeAccounts.map((acct) => (
                     <li
                       key={acct.id}
-                      className="flex items-center justify-between gap-4 border-border border-b py-3 pr-4 pl-8 last:border-b-0"
+                      className="border-border flex items-center justify-between gap-4 border-b py-3 pr-4 pl-8 last:border-b-0"
                     >
                       <div className="flex min-w-0 flex-wrap items-center gap-2">
-                        <span className="truncate text-sm text-text-primary">
+                        <span className="text-text-primary truncate text-sm">
                           {accountLabel(acct.accountName, acct.accountId)}
                         </span>
                         <Badge variant="secondary">{`#${acct.accountId}`}</Badge>
@@ -1409,7 +1516,7 @@ export function ChannelsPage() {
                               "channels.openDashboard",
                               "Open dashboard in Chatwoot",
                             )}
-                            className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                            className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors"
                           >
                             <ExternalLink
                               className="h-3.5 w-3.5"
@@ -1431,7 +1538,7 @@ export function ChannelsPage() {
                               "channels.createInbox",
                               "Create inbox in Chatwoot",
                             )}
-                            className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                            className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors"
                           >
                             <Plus className="h-3.5 w-3.5" aria-hidden="true" />
                           </a>
@@ -1449,7 +1556,7 @@ export function ChannelsPage() {
                               "channels.syncInboxes",
                               "Sync inboxes",
                             )}
-                            className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary disabled:opacity-50"
+                            className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors disabled:opacity-50"
                           >
                             <RefreshCw className="h-4 w-4" aria-hidden="true" />
                           </button>
@@ -1469,7 +1576,7 @@ export function ChannelsPage() {
                                 "channels.removeAccountTitle",
                                 "Remove account",
                               )}
-                              className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-error/10 hover:text-error disabled:opacity-50"
+                              className="text-text-muted hover:bg-error/10 hover:text-error inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors disabled:opacity-50"
                             >
                               <Trash2 className="h-4 w-4" aria-hidden="true" />
                             </button>
@@ -1486,11 +1593,11 @@ export function ChannelsPage() {
 
         <section className="flex flex-col gap-3">
           <div>
-            <h2 className="flex items-center gap-2 font-medium text-text-primary">
-              <InboxIcon className="h-4 w-4 text-accent" aria-hidden="true" />
+            <h2 className="text-text-primary flex items-center gap-2 font-medium">
+              <InboxIcon className="text-accent h-4 w-4" aria-hidden="true" />
               {t("channels.inboxes", "Inboxes")}
             </h2>
-            <p className="mt-0.5 text-text-muted text-xs">
+            <p className="text-text-muted mt-0.5 text-xs">
               {t(
                 "channels.inboxesHelp",
                 'Assigning an agent connects the bot to that inbox; "No agent" leaves it silent.',
@@ -1516,7 +1623,7 @@ export function ChannelsPage() {
               return (
                 <div key={acct.id} className="flex flex-col gap-1.5">
                   {showAccountHeaders && (
-                    <div className="flex items-center gap-1.5 px-1 text-text-muted text-xs">
+                    <div className="text-text-muted flex items-center gap-1.5 px-1 text-xs">
                       <ServiceLogo
                         service="chatwoot"
                         className="h-3.5 w-3.5 shrink-0"
@@ -1563,7 +1670,7 @@ export function ChannelsPage() {
                             // rows are gone. So the chips and their remove buttons stay here;
                             // only adding, which needs the account, does not.
                             <div className="flex flex-col items-end gap-1.5">
-                              <span className="shrink-0 text-text-muted text-xs">
+                              <span className="text-text-muted shrink-0 text-xs">
                                 {t(
                                   "channels.accountDisconnectedOff",
                                   "Account disconnected",
@@ -1592,15 +1699,14 @@ export function ChannelsPage() {
                             <div className="flex flex-col items-end gap-1.5">
                               <InboxAgentPicker
                                 value={ib.agentId}
-                                // WITHOUT THIS INBOX'S OBSERVERS (issue #476 review, round 48). The
-                                // two bindings are exclusive per (inbox, agent), so `bindInbox`
-                                // refuses an agent that already observes this inbox — offered here,
-                                // the option is one the request is certain to reject, and the
-                                // operator learns that from an error toast. The CURRENT responder
-                                // is never among them (the same exclusivity), so nothing selectable
-                                // is lost.
+                                // NOTE: Without this inbox's observers: the two bindings are exclusive per (inbox, agent), so
+                                // `bindInbox` refuses an agent that already observes it. The current responder is never among
+                                // them, so nothing selectable is lost.
+                                // A voice agent answers calls, through its own picker below.
                                 agents={agents.filter(
-                                  (a) => !ib.observerAgentIds.includes(a.id),
+                                  (a) =>
+                                    a.kind !== "voice" &&
+                                    !ib.observerAgentIds.includes(a.id),
                                 )}
                                 label={t(
                                   "channels.bindLabel",
@@ -1610,6 +1716,27 @@ export function ChannelsPage() {
                                   bindInbox(ib.id, agentId)
                                 }
                               />
+                              {/* An inbox that takes no calls keeps a picker only while a voice
+                                  agent is still bound, offering just that agent, to unbind it. */}
+                              {(ib.voiceAgentId !== null ||
+                                (takesCalls(ib) &&
+                                  agents.some((a) => a.kind === "voice"))) && (
+                                <InboxAgentPicker
+                                  value={ib.voiceAgentId}
+                                  agents={agents.filter((a) =>
+                                    takesCalls(ib)
+                                      ? a.kind === "voice"
+                                      : a.id === ib.voiceAgentId,
+                                  )}
+                                  label={t(
+                                    "channels.voiceBindLabel",
+                                    "Calls agent",
+                                  )}
+                                  onChange={(agentId) =>
+                                    bindVoiceAgent(ib.id, agentId)
+                                  }
+                                />
+                              )}
                               <InboxObserversStrip
                                 observerAgentIds={ib.observerAgentIds}
                                 responderAgentId={ib.agentId}
@@ -1654,7 +1781,13 @@ export function ChannelsPage() {
             <Button
               onClick={connectDeployment}
               loading={connecting}
-              disabled={!baseUrl.trim() || baseUrlInvalid || !adminToken.trim()}
+              disabled={
+                !baseUrl.trim() ||
+                baseUrlInvalid ||
+                !adminToken.trim() ||
+                webhookBaseUrlInvalid ||
+                publicUrlInvalid
+              }
             >
               {t("common.connect", "Connect")}
             </Button>
@@ -1665,10 +1798,10 @@ export function ChannelsPage() {
           <div className="flex justify-center">
             <ServiceLogo
               service="chatwoot"
-              className="h-8 w-8 text-text-secondary"
+              className="text-text-secondary h-8 w-8"
             />
           </div>
-          <p className="text-center text-sm text-text-muted">
+          <p className="text-text-muted text-center text-sm">
             {t(
               "channels.connectDesc",
               "Enter your Chatwoot URL and admin token once. We validate them and then let you pick which accounts to answer.",
@@ -1701,17 +1834,43 @@ export function ChannelsPage() {
             <Input
               type="password"
               showPasswordToggle
+              secret
               value={adminToken}
               onChange={(e) => setAdminToken(e.target.value)}
             />
           </FormField>
+          <AdvancedAddresses
+            webhookBaseUrl={webhookBaseUrl}
+            publicUrl={publicUrl}
+            onWebhookBaseUrl={setWebhookBaseUrl}
+            onPublicUrl={setPublicUrl}
+            webhookBaseUrlError={
+              webhookBaseUrlInvalid
+                ? t(
+                    "channels.addressInvalid",
+                    "Must be an http(s) address with no query or fragment.",
+                  )
+                : connectRefusal.at(
+                    "webhookBaseUrl",
+                    webhookBaseUrl.trim() || null,
+                  )
+            }
+            publicUrlError={
+              publicUrlInvalid
+                ? t(
+                    "channels.addressInvalid",
+                    "Must be an http(s) address with no query or fragment.",
+                  )
+                : connectRefusal.at("publicUrl", publicUrl.trim() || null)
+            }
+          />
         </div>
       </Modal>
 
       <Modal
         modal={tokenModal}
-        unsavedChanges={newToken.trim() !== ""}
-        title={t("channels.editTokenTitle", "Edit admin token")}
+        unsavedChanges={connectionDirty}
+        title={t("channels.editConnectionTitle", "Edit Chatwoot connection")}
         footer={
           <div className="flex justify-end gap-2">
             <Button
@@ -1724,7 +1883,12 @@ export function ChannelsPage() {
             <Button
               onClick={saveToken}
               loading={savingToken}
-              disabled={!newToken.trim()}
+              disabled={
+                !connectionDirty ||
+                editBaseUrlInvalid ||
+                webhookBaseUrlInvalid ||
+                publicUrlInvalid
+              }
             >
               {t("common.save", "Save")}
             </Button>
@@ -1732,15 +1896,32 @@ export function ChannelsPage() {
         }
       >
         <div className="flex flex-col gap-4">
-          <p className="text-sm text-text-muted">
+          <p className="text-text-muted text-sm">
             {t(
-              "channels.editTokenDesc",
-              "Paste a new admin token. It is validated against your Chatwoot and shared by every account.",
+              "channels.editConnectionDesc",
+              "A new admin token is validated against your Chatwoot and shared by every account. Leave it empty to keep the current one.",
             )}
           </p>
           <FormField
+            label={t("channels.baseUrl", "Base URL")}
+            description={t(
+              "channels.editBaseUrlHint",
+              "For a new address of this same Chatwoot (same token user and accounts). To use another Chatwoot, create a new connection.",
+            )}
+            error={
+              editBaseUrlInvalid
+                ? t("common.invalidUrl", "Must be a valid http(s) URL.")
+                : tokenRefusal.at("baseUrl", editBaseUrl.trim())
+            }
+          >
+            <Input
+              value={editBaseUrl}
+              onChange={(e) => setEditBaseUrl(e.target.value)}
+              placeholder="https://chat.example.com"
+            />
+          </FormField>
+          <FormField
             label={t("channels.adminToken", "Admin access token")}
-            required
             description={t(
               "channels.adminTokenHint",
               "Stored encrypted, never shown again.",
@@ -1750,10 +1931,36 @@ export function ChannelsPage() {
             <Input
               type="password"
               showPasswordToggle
+              secret
               value={newToken}
               onChange={(e) => setNewToken(e.target.value)}
             />
           </FormField>
+          <AdvancedAddresses
+            webhookBaseUrl={webhookBaseUrl}
+            publicUrl={publicUrl}
+            onWebhookBaseUrl={setWebhookBaseUrl}
+            onPublicUrl={setPublicUrl}
+            webhookBaseUrlError={
+              webhookBaseUrlInvalid
+                ? t(
+                    "channels.addressInvalid",
+                    "Must be an http(s) address with no query or fragment.",
+                  )
+                : tokenRefusal.at(
+                    "webhookBaseUrl",
+                    webhookBaseUrl.trim() || null,
+                  )
+            }
+            publicUrlError={
+              publicUrlInvalid
+                ? t(
+                    "channels.addressInvalid",
+                    "Must be an http(s) address with no query or fragment.",
+                  )
+                : tokenRefusal.at("publicUrl", publicUrl.trim() || null)
+            }
+          />
         </div>
       </Modal>
 
@@ -1783,7 +1990,7 @@ export function ChannelsPage() {
       >
         <div className="flex flex-col gap-3">
           <div className="flex items-start justify-between gap-3">
-            <p className="text-sm text-text-muted">
+            <p className="text-text-muted text-sm">
               {t(
                 "channels.manageDesc",
                 "Pick which of this Chatwoot's accounts this workspace answers. Active ones are managed from the list; removing one there frees it for another workspace.",
@@ -1805,7 +2012,7 @@ export function ChannelsPage() {
             </p>
           )}
           {manageRows.length === 0 ? (
-            <p className="py-6 text-center text-sm text-text-muted">
+            <p className="text-text-muted py-6 text-center text-sm">
               {t(
                 "channels.noAccounts",
                 "No accounts found. Make sure your Chatwoot user is a member of the account.",
@@ -1829,7 +2036,7 @@ export function ChannelsPage() {
                       className={cn(
                         "flex w-full items-center gap-3 rounded-lg border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed",
                         checked
-                          ? "border-accent bg-accent/5"
+                          ? "border-accent bg-accent-soft"
                           : "border-border bg-bg-tertiary hover:bg-bg-hover",
                         { "opacity-60": disabled },
                       )}
@@ -1838,7 +2045,7 @@ export function ChannelsPage() {
                         className={cn(
                           "flex h-5 w-5 shrink-0 items-center justify-center rounded border",
                           checked
-                            ? "border-accent bg-accent text-accent-foreground"
+                            ? "border-accent-solid bg-accent-solid text-accent-foreground"
                             : "border-border",
                         )}
                       >
@@ -1846,12 +2053,12 @@ export function ChannelsPage() {
                           <Check className="h-3.5 w-3.5" aria-hidden="true" />
                         )}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-sm text-text-primary">
+                      <span className="text-text-primary min-w-0 flex-1 truncate text-sm">
                         {row.name}
                       </span>
                       <Badge variant="secondary">{`#${row.id}`}</Badge>
                       {active && (
-                        <span className="shrink-0 text-text-muted text-xs">
+                        <span className="text-text-muted shrink-0 text-xs">
                           {t("channels.statusActive", "Active")}
                         </span>
                       )}
@@ -1880,6 +2087,7 @@ export function ChannelsPage() {
 
       <StrongConfirmModal modal={strongConfirm} />
       <ConfirmDialog modal={confirm} />
+      <ConfirmDialog modal={replaceBotConfirm} />
     </PageContainer>
   );
 }

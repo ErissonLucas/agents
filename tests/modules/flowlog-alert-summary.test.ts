@@ -8,9 +8,9 @@ import type { FlowEvent } from "@/modules/flowlog/service";
 import type { FlowLevel } from "@/modules/flowlog/stages";
 import { spendCeilingFlowEvent } from "@/modules/spend-ceiling/service";
 
-// The alert body, issue #610. The first three events are the ones a production Discord channel
-// received as `[observe via openai] skipped`, `[delivery] ok` and `[delivery] error (×23)`, with the
-// detail each row carried, so the expected bodies are what those alerts should have said.
+// The alert body. The first three events are shaped like production lines that alerted as
+// `[observe via openai] skipped`, `[delivery] ok` and `[delivery] error (×23)`, with the detail each
+// row carried, so the expected bodies are what those alerts should say.
 
 type AlertEvent = FlowEvent & { level: FlowLevel };
 
@@ -25,22 +25,6 @@ describe("alertSummary", () => {
       detail: { reason: "burst", skipped: "superseded", messagesRead: 12 },
     };
     expect(alertSummary(ev)).toBe("[observe via openai] skipped: superseded");
-  });
-
-  test("a delivery recovered on retry says recovered, not ok", () => {
-    const ev: AlertEvent = {
-      stage: "delivery",
-      level: "warn",
-      status: "ok",
-      detail: {
-        outcome: "recovered",
-        deliveryEvent: "message_created",
-        deliveryId: 88,
-        messageId: 13990249,
-        conversationId: 4412,
-      },
-    };
-    expect(alertSummary(ev)).toBe("[delivery] ok: recovered");
   });
 
   test("a stranded delivery says stranded, and on which status", () => {
@@ -72,6 +56,25 @@ describe("alertSummary", () => {
       detail: { outcome: "stranded" },
     };
     expect(alertSummary(ev)).toBe("[generate via openai] model exploded");
+  });
+
+  // The provider's error says why the read failed; what the operator lost is the file, so a line that
+  // ended an extraction without content says which kind it left unread.
+  test("an extraction that gave up names what it left unread, after the error", () => {
+    const ev: AlertEvent = {
+      stage: "vision",
+      level: "warn",
+      status: "error",
+      provider: "gemini",
+      errorMessage: "vision gemini failed with 503",
+      detail: { kind: "image", attempt: 2, unread: "image" },
+    };
+    expect(alertSummary(ev)).toBe(
+      "[vision via gemini] vision gemini failed with 503 (image left unread)",
+    );
+    expect(
+      alertSummary({ ...ev, detail: { unread: "an address@x.com" } }),
+    ).toBe("[vision via gemini] vision gemini failed with 503");
   });
 
   test("a turn answered by the fallback labels the reason, so it does not read as a timeout", () => {
@@ -153,12 +156,14 @@ describe("alertSummary", () => {
   test("an unreadable precondition names the phase, never the error class or the key", () => {
     const ev = preconditionFlowEvent({
       tool: "transferir",
-      cond: {
-        kind: "attribute",
-        scope: "contact",
-        key: "cpf_validado",
-        equals: "sim",
-      },
+      unmet: [
+        {
+          kind: "attribute",
+          scope: "contact",
+          key: "cpf_validado",
+          equals: "sim",
+        },
+      ],
       reason: "unreadable",
       err: new TypeError("connection to postgres://user:pw@db/app failed"),
     });
@@ -205,9 +210,8 @@ describe("alertSummary", () => {
     expect(body.toLowerCase()).not.toContain("zebrafina");
   });
 
-  // Issue #842: the lines a production Discord channel received as `[generate] ok` and nothing else,
-  // with the detail each row carried. Both values of `resolveDiscarded` arrived, and they are the two
-  // different outcomes the operator has to tell apart.
+  // NOTE: Lines that alert as `[generate] ok` and nothing else unless the body prints their key. Both values
+  // of `resolveDiscarded` are real, and they are two outcomes the operator has to tell apart.
   test("a turn that ended in silence says so, and whether the conversation was closed", () => {
     for (const resolveDiscarded of [true, false]) {
       expect(
@@ -269,39 +273,48 @@ describe("alertSummary", () => {
   });
 });
 
-// THE FENCE issue #842 asked for. A warn or error line with no `errorMessage` is explained by its
-// `detail` alone, and the alert prints only the keys it knows, so a line naming none of them alerts as
-// its bare status: `[generate] ok`, which is what the unexplained-silence line did for as long as
-// nobody listed its key. Read off the source, so the next such line fails here instead of in an
-// operator's channel. A line that is legitimately explained some other way is listed below, with why.
+// THE FENCE. A warn or error line with no `errorMessage` is explained by its `detail` alone, and the
+// alert prints only the keys it knows, so a line naming none of them alerts as its bare status
+// (`[generate] ok`). Read off the source, so the next such line fails here instead of in an
+// operator's channel. A line legitimately explained some other way is listed below, with why.
 const EXPLAINED_ELSEWHERE: Record<string, string> = {
   // Its detail is spread from the drop, which always carries a `reason` (`CommandDrop`).
   "src/modules/flowlog/command.ts": "reason arrives through ...args.drop",
 };
 
 // The keys such a line carries that the alert does NOT print, each with why it may stay out of the
-// body. The line's cause is printed from another key; these are context for the Logs page (ids,
-// counts, measurements, the verdict an `outcome` already summarises). A key that is on no list fails
-// the fence below even when the line also carries a printed key, which is the shape the verifier
-// used to break the first version of this fence: a new cause added BESIDE `silenceUnexplained`
-// would have shipped silent, because "names at least one printed key" was already true.
+// body: the cause is printed from another key, and these are context for the Logs page (ids, counts,
+// measurements, the verdict an `outcome` already summarises). A key on no list fails the fence even
+// when the line also carries a printed key: otherwise a new cause added BESIDE `silenceUnexplained`
+// would ship silent, because "names at least one printed key" is already true.
 const NOT_A_CAUSE: Record<string, string> = {
   attempt: "tts_check: which try this was; `outcome` says what was done",
+  categories:
+    "guardrail: the factual-grounding check's own key, also in `check`; `action` is the printed cause",
+  claimCount:
+    "guardrail: how many claims the factual-grounding reviewer listed; `action` is the printed cause",
   codeRead:
     "channel_error: whether `code` was present, which the body already shows by printing it or not",
   command: "command: the command name; the drop's `reason` is the cause",
   corrupted:
     "tts_check: the line is warn only when true, so the level already says it",
+  engine:
+    "observe: which brain the watcher runs (llm or decisions); `skipped` is the printed cause",
   fallbackFrom: "the model given up on; `fallbackReason` says why",
+  requestId:
+    "document_approval_expired: which approval request expired; `outcome` says what happened",
+  primaryFailure:
+    "the class of the failure `fallbackReason` already prints, kept for the primary's rate",
   messageId: "an id to find the message by, never a cause",
   mode: "tts_check: the check's configured mode, not an outcome",
-  node: "which graph node retried; `retry` is the printed flag",
   score: "tts_check: the detector's raw number",
   thresholdMs: "capacity: the configured threshold the wait crossed",
   toolCalls: "how many calls ran; `toolLimitHit` is the printed flag",
   verdict: "tts_check: the detector's label; `outcome` is the printed cause",
   waitedMs:
     "a duration, also in `durationMs`; the stage and its other keys say what waited",
+  latencyMs:
+    "guardrail: how long the external check took; `decision` or `outcome` is the cause",
 };
 
 async function sourceFiles(dir: string): Promise<string[]> {

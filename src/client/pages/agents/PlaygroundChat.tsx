@@ -45,6 +45,7 @@ import {
 import { useModalController } from "@/client/components/Modal";
 import { UsageFigure } from "@/client/components/TokenUsage";
 import { useMediaObjectUrl } from "@/client/components/useMediaObjectUrl";
+import { toolResultSizeLabel } from "@/client/lib/flowLabels";
 import { cn } from "@/client/lib/utils";
 import { useKnowledgeManager } from "@/client/pages/resources/useKnowledgeManager";
 import type {
@@ -151,7 +152,7 @@ export function PlaygroundChat({
           bare
             ? "h-full"
             : cn(
-                "rounded-lg border border-border bg-bg-secondary",
+                "border-border bg-bg-secondary rounded-lg border",
                 heightClass,
               ),
         )}
@@ -179,7 +180,7 @@ export function PlaygroundChat({
         )}
 
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex flex-wrap items-center justify-between gap-2 border-border border-b px-3 py-2">
+          <div className="border-border flex flex-wrap items-center justify-between gap-2 border-b px-3 py-2">
             <div className="flex min-w-0 flex-col">
               <p className="text-text-secondary text-xs">
                 {t("playground.hint", "Tests your live (unsaved) edits.")}
@@ -251,8 +252,8 @@ export function PlaygroundChat({
           </div>
 
           {notReady && (
-            <div className="m-3 flex flex-col items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm">
-              <span className="flex items-center gap-1.5 font-medium text-warning">
+            <div className="border-warning/40 bg-warning/10 m-3 flex flex-col items-start gap-2 rounded-md border p-3 text-sm">
+              <span className="text-warning flex items-center gap-1.5 font-medium">
                 <AlertTriangle
                   className="h-4 w-4 shrink-0"
                   aria-hidden="true"
@@ -265,7 +266,7 @@ export function PlaygroundChat({
                   "Set up the model before testing this agent:",
                 )}
               </p>
-              <ul className="list-inside list-disc text-text-secondary">
+              <ul className="text-text-secondary list-inside list-disc">
                 {missingConfig.map((m) => (
                   <li key={m}>
                     {/* biome-ignore lint/plugin/no-dynamic-i18n-key: fixed set in MISSING_LABEL_KEYS */}
@@ -285,7 +286,7 @@ export function PlaygroundChat({
           )}
 
           {!notReady && toolsDirty && (
-            <div className="mx-3 mt-3 flex items-center gap-1.5 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-text-muted text-xs">
+            <div className="border-border bg-bg-tertiary text-text-muted mx-3 mt-3 flex items-center gap-1.5 rounded-md border px-3 py-2 text-xs">
               <Info className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               {t(
                 "playground.toolsDirtyNote",
@@ -308,7 +309,7 @@ export function PlaygroundChat({
             ) : (
               <>
                 {chat.turns.length === 0 && !chat.busy && (
-                  <p className="m-auto text-sm text-text-muted">
+                  <p className="text-text-muted m-auto text-sm">
                     {t(
                       "playground.placeholder",
                       "Send a message to start testing.",
@@ -367,17 +368,17 @@ function ToolMockRow({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-secondary/50 p-2">
+    <div className="border-border bg-bg-secondary/50 flex flex-col gap-1 rounded-md border p-2">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="font-medium font-mono text-text-primary">
+        <span className="text-text-primary font-mono font-medium">
           {tool.name}
         </span>
-        <span className="rounded bg-bg-tertiary px-1.5 py-0.5 text-[10px] text-text-muted">
+        <span className="bg-bg-tertiary text-text-muted rounded px-1.5 py-0.5 text-[10px]">
           {/* biome-ignore lint/plugin/no-dynamic-i18n-key: category is a fixed set declared above. */}
           {t(`playground.toolsim.cat.${tool.category}`, tool.category)}
         </span>
         {tool.simulated && (
-          <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] text-accent">
+          <span className="bg-accent-soft text-accent rounded px-1.5 py-0.5 text-[10px]">
             {t("playground.toolsim.auto", "auto-simulated")}
           </span>
         )}
@@ -433,19 +434,19 @@ function ToolSimPanel({ chat }: { chat: Chat }) {
 
   return (
     <details
-      className="mx-3 mt-3 rounded-md border border-border bg-bg-tertiary text-xs"
+      className="border-border bg-bg-tertiary mx-3 mt-3 rounded-md border text-xs"
       onToggle={onToggle}
     >
-      <summary className="flex select-none items-center gap-1.5 px-3 py-2 text-text-secondary">
+      <summary className="text-text-secondary flex items-center gap-1.5 px-3 py-2 select-none">
         <FlaskConical className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         {t("playground.toolsim.title", "Tool simulation")}
         {count > 0 && (
-          <span className="rounded-full bg-accent/20 px-1.5 text-[10px] text-accent">
+          <span className="bg-accent-soft text-accent rounded-full px-1.5 text-[10px]">
             {count}
           </span>
         )}
       </summary>
-      <div className="flex flex-col gap-2 border-border border-t p-3">
+      <div className="border-border flex flex-col gap-2 border-t p-3">
         <div className="flex items-start justify-between gap-2">
           <p className="text-text-muted">
             {t(
@@ -458,7 +459,7 @@ function ToolSimPanel({ chat }: { chat: Chat }) {
               <button
                 type="button"
                 onClick={chat.clearSimulation}
-                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:text-text-primary"
+                className="text-text-muted hover:text-text-primary flex items-center gap-1 rounded px-1.5 py-0.5"
               >
                 <Eraser className="h-3 w-3" aria-hidden="true" />
                 {t("playground.toolsim.clear", "Clear simulation")}
@@ -468,7 +469,7 @@ function ToolSimPanel({ chat }: { chat: Chat }) {
               type="button"
               onClick={() => void chat.loadTools()}
               disabled={chat.toolsLoading}
-              className="flex items-center gap-1 rounded px-1.5 py-0.5 text-text-muted hover:text-text-primary disabled:opacity-50"
+              className="text-text-muted hover:text-text-primary flex items-center gap-1 rounded px-1.5 py-0.5 disabled:opacity-50"
             >
               <RefreshCw
                 className={cn("h-3 w-3", { "animate-spin": chat.toolsLoading })}
@@ -543,22 +544,22 @@ function PromptVarsPanel({ chat }: { chat: Chat }) {
     Object.values(chat.promptVars).filter((v) => v.trim() !== "").length +
     (chat.promptNow.trim() ? 1 : 0);
   return (
-    <details className="mx-3 mt-3 rounded-md border border-border bg-bg-tertiary text-xs">
-      <summary className="flex select-none items-center gap-1.5 px-3 py-2 text-text-secondary">
+    <details className="border-border bg-bg-tertiary mx-3 mt-3 rounded-md border text-xs">
+      <summary className="text-text-secondary flex items-center gap-1.5 px-3 py-2 select-none">
         <Braces className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
         {t("playground.promptvars.title", "Prompt variables")}
         {count > 0 && (
-          <span className="rounded-full bg-accent/20 px-1.5 text-[10px] text-accent">
+          <span className="bg-accent-soft text-accent rounded-full px-1.5 text-[10px]">
             {count}
           </span>
         )}
       </summary>
-      <div className="flex flex-col gap-2 border-border border-t p-3">
+      <div className="border-border flex flex-col gap-2 border-t p-3">
         {/* Special field: a single simulated "current time" that drives the whole {{hora_atual}}
             family. Kept above (and outside) the scrollable context-var list so it stays visible. */}
-        <div className="flex flex-col gap-1 rounded-md border border-border bg-bg-secondary/50 p-2">
+        <div className="border-border bg-bg-secondary/50 flex flex-col gap-1 rounded-md border p-2">
           <div className="flex items-center justify-between gap-2">
-            <span className="flex items-center gap-1.5 font-medium text-text-secondary">
+            <span className="text-text-secondary flex items-center gap-1.5 font-medium">
               <Clock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
               {t("playground.promptvars.timeTitle", "Simulated current time")}
             </span>
@@ -566,7 +567,7 @@ function PromptVarsPanel({ chat }: { chat: Chat }) {
               <button
                 type="button"
                 onClick={() => chat.setPromptNow("")}
-                className="shrink-0 rounded px-1.5 py-0.5 text-text-muted hover:text-text-primary"
+                className="text-text-muted hover:text-text-primary shrink-0 rounded px-1.5 py-0.5"
               >
                 {t("playground.promptvars.timeReset", "Use real time")}
               </button>
@@ -598,7 +599,7 @@ function PromptVarsPanel({ chat }: { chat: Chat }) {
         <div className="flex max-h-[40dvh] flex-col gap-2 overflow-y-auto overscroll-contain pr-0.5">
           {PROMPT_VAR_FIELDS.map((name) => (
             <div key={name} className="flex items-center gap-2">
-              <span className="w-36 shrink-0 truncate font-mono text-text-muted">
+              <span className="text-text-muted w-36 shrink-0 truncate font-mono">
                 {`{{${name}}}`}
               </span>
               <Input
@@ -624,13 +625,13 @@ function TypingIndicator() {
   const { t } = useTranslation();
   return (
     <div
-      className="typing-dots flex items-center gap-1 self-start rounded-lg bg-bg-tertiary px-3.5 py-3"
+      className="typing-dots bg-bg-tertiary flex items-center gap-1 self-start rounded-lg px-3.5 py-3"
       role="status"
       aria-label={t("playground.thinking", "Thinking…")}
     >
-      <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
-      <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
-      <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
+      <span className="bg-text-muted h-1.5 w-1.5 rounded-full" />
+      <span className="bg-text-muted h-1.5 w-1.5 rounded-full" />
+      <span className="bg-text-muted h-1.5 w-1.5 rounded-full" />
     </div>
   );
 }
@@ -676,7 +677,7 @@ function TurnBubble({
     const verdicts = (turn.trace ?? []).filter((e) => e.type === "guardrail");
     return (
       <div className="flex w-full flex-col items-center gap-1">
-        <p className="self-center px-2 text-center text-text-muted text-xs italic">
+        <p className="text-text-muted self-center px-2 text-center text-xs italic">
           {turn.text}
         </p>
         {verdicts.length > 0 && (
@@ -702,7 +703,7 @@ function TurnBubble({
       )}
     >
       {turn.role === "assistant" && turn.followup && (
-        <span className="flex items-center gap-1 text-text-muted text-xs">
+        <span className="text-text-muted flex items-center gap-1 text-xs">
           <Bell className="h-3 w-3" aria-hidden="true" />
           {t("playground.followup.badge", "Simulated follow-up")}
         </span>
@@ -712,9 +713,9 @@ function TurnBubble({
       ) : (
         <div
           className={cn("rounded-lg px-3 py-2 text-sm", {
-            "bg-accent text-accent-foreground": turn.role === "user",
+            "bg-accent-solid text-accent-foreground": turn.role === "user",
             "bg-bg-tertiary text-text-primary": turn.role === "assistant",
-            "border border-error/40 bg-error/10 text-error":
+            "border-error/40 bg-error/10 text-error border":
               turn.role === "error",
           })}
         >
@@ -728,7 +729,7 @@ function TurnBubble({
             <>
               {turn.text ? <Markdown>{turn.text}</Markdown> : null}
               {/* What the turn spent, at the foot of the reply it produced, as on the conversation
-                  screen (issue #858). */}
+                  screen. */}
               {turn.usage && turn.usage.calls > 0 && (
                 <div className="mt-1 flex justify-end">
                   <UsageFigure usage={turn.usage} timing={turn.timing} />
@@ -771,8 +772,8 @@ function TurnBubble({
   );
 }
 
-// Where the cause of a failed turn is when the bubble cannot say it (issue #841): the turn's lines on
-// the Logs page, and the id the server log files the failure under.
+// Where the cause of a failed turn is when the bubble cannot say it: the turn's lines on the Logs
+// page, and the id the server log files the failure under.
 export function ErrorLogsLink({ turnId }: { turnId: string }) {
   const { t } = useTranslation();
   return (
@@ -839,7 +840,7 @@ function UserFileChip({ src, fileName }: { src: string; fileName?: string }) {
     <>
       <FileTypeIcon
         name={fileName}
-        className="h-4 w-4 shrink-0 text-text-secondary"
+        className="text-text-secondary h-4 w-4 shrink-0"
       />
       <span className="truncate">
         {fileName || t("playground.attachedFile", "Attached file")}
@@ -883,11 +884,11 @@ function FileExtraction({
   }
   if (!turn.extracted) return null;
   return (
-    <div className="w-full max-w-full rounded-md border border-border bg-bg-secondary/50 text-xs">
-      <p className="select-none px-2 pt-1.5 font-medium text-text-muted">
+    <div className="border-border bg-bg-secondary/50 w-full max-w-full rounded-md border text-xs">
+      <p className="text-text-muted px-2 pt-1.5 font-medium select-none">
         {t("playground.file.extracted", "Extracted content")}
       </p>
-      <pre className="max-h-48 overflow-y-auto whitespace-pre-wrap px-2 pb-1.5 text-text-secondary">
+      <pre className="text-text-secondary max-h-48 overflow-y-auto px-2 pb-1.5 whitespace-pre-wrap">
         {turn.extracted}
       </pre>
     </div>
@@ -938,7 +939,7 @@ function Composer({
     );
   }
   return (
-    <div className="flex items-center gap-2 border-border border-t p-3">
+    <div className="border-border flex items-center gap-2 border-t p-3">
       <input
         ref={fileInputRef}
         type="file"
@@ -1023,26 +1024,26 @@ function RecordingBar({
   const ss = String(elapsed % 60).padStart(2, "0");
 
   return (
-    <div className="flex items-center gap-2 rounded-md border border-border bg-bg-tertiary px-3 py-2">
+    <div className="border-border bg-bg-tertiary flex items-center gap-2 rounded-md border px-3 py-2">
       <Tooltip content={t("playground.audio.cancel", "Cancel recording")}>
         <button
           type="button"
           onClick={onCancel}
           aria-label={t("playground.audio.cancel", "Cancel recording")}
-          className="shrink-0 rounded p-1 text-text-muted hover:text-error"
+          className="text-text-muted hover:text-error shrink-0 rounded p-1"
         >
           <X className="h-4 w-4" aria-hidden="true" />
         </button>
       </Tooltip>
       <span
         className={cn(
-          "inline-block h-2.5 w-2.5 shrink-0 rounded-full bg-error",
+          "bg-error inline-block h-2.5 w-2.5 shrink-0 rounded-full",
           recordState === "recording" && "animate-pulse",
         )}
         aria-hidden="true"
       />
       <MovingWaveform stream={stream} active={recordState === "recording"} />
-      <span className="shrink-0 text-sm text-text-secondary tabular-nums">{`${mm}:${ss}`}</span>
+      <span className="text-text-secondary shrink-0 text-sm tabular-nums">{`${mm}:${ss}`}</span>
       <Tooltip
         content={
           recordState === "recording"
@@ -1058,7 +1059,7 @@ function RecordingBar({
               ? t("playground.audio.pause", "Pause")
               : t("playground.audio.resume", "Resume")
           }
-          className="shrink-0 rounded p-1 text-text-secondary hover:text-text-primary"
+          className="text-text-secondary hover:text-text-primary shrink-0 rounded p-1"
         >
           {recordState === "recording" ? (
             <Pause className="h-4 w-4" aria-hidden="true" />
@@ -1112,8 +1113,8 @@ function MovingWaveform({
     const color = canvas
       ? getComputedStyle(canvas).color || "#3b82f6"
       : "#3b82f6";
-    // Fixed spacing between bars (in CSS px) so each bar stays the SAME thickness at any width — a
-    // wider panel shows MORE bars, not fatter ones (the FAB looked right, the wide tab didn't).
+    // Fixed spacing between bars (in CSS px) so each bar stays the SAME thickness at any width:
+    // a wider panel shows MORE bars, not fatter ones.
     const PITCH = 7;
     let peaks: number[] = [];
     let raf = 0;
@@ -1174,7 +1175,7 @@ function MovingWaveform({
     <canvas
       ref={canvasRef}
       height={32}
-      className="h-8 min-w-0 flex-1 text-accent"
+      className="text-accent h-8 min-w-0 flex-1"
     />
   );
 }
@@ -1201,7 +1202,7 @@ function PlaygroundSessionsSidebar({
   const { t } = useTranslation();
   const isNew = currentThreadId === undefined;
   return (
-    <aside className="hidden w-56 shrink-0 flex-col border-border border-r md:flex">
+    <aside className="border-border hidden w-56 shrink-0 flex-col border-r md:flex">
       <div className="p-2">
         <Button
           variant="secondary"
@@ -1216,12 +1217,12 @@ function PlaygroundSessionsSidebar({
       </div>
       <div className="flex flex-1 flex-col gap-0.5 overflow-y-auto px-2 pb-2">
         {isNew && (
-          <div className="rounded-md bg-bg-hover px-2 py-1.5 text-sm text-text-primary">
+          <div className="bg-bg-hover text-text-primary rounded-md px-2 py-1.5 text-sm">
             {t("playground.newSessionActive", "New session")}
           </div>
         )}
         {sessions.length === 0 && !isNew && (
-          <p className="px-2 py-1.5 text-text-muted text-xs">
+          <p className="text-text-muted px-2 py-1.5 text-xs">
             {t("playground.historyEmpty", "No saved sessions yet.")}
           </p>
         )}
@@ -1231,7 +1232,7 @@ function PlaygroundSessionsSidebar({
             <div
               key={s.threadId}
               className={cn(
-                "group flex items-center gap-1 rounded-md transition-colors hover:bg-bg-hover",
+                "group hover:bg-bg-hover flex items-center gap-1 rounded-md transition-colors",
                 { "bg-bg-hover": active },
               )}
             >
@@ -1249,7 +1250,7 @@ function PlaygroundSessionsSidebar({
               <button
                 type="button"
                 aria-label={t("common.delete", "Delete")}
-                className="shrink-0 rounded p-1 text-text-muted opacity-0 transition-opacity hover:text-error group-hover:opacity-100"
+                className="text-text-muted hover:text-error shrink-0 rounded p-1 opacity-0 transition-opacity group-hover:opacity-100"
                 onClick={() => onDelete(s.threadId)}
               >
                 <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
@@ -1275,19 +1276,19 @@ function TracePanel({
   if (turn.trace.length === 0 && turn.sources.length === 0) return null;
 
   return (
-    <details className="w-full rounded-md border border-border bg-bg-secondary/50 text-xs">
-      <summary className="select-none px-2 py-1 text-text-muted">
+    <details className="border-border bg-bg-secondary/50 w-full rounded-md border text-xs">
+      <summary className="text-text-muted px-2 py-1 select-none">
         {t("playground.trace.toggle", "Execution details")}{" "}
         {`(${turn.trace.length})`}
       </summary>
-      <div className="flex flex-col gap-2 border-border border-t p-2">
+      <div className="border-border flex flex-col gap-2 border-t p-2">
         {turn.trace.map((entry, i) => (
           // biome-ignore lint/suspicious/noArrayIndexKey: ordered, immutable trace
           <TraceRow key={i} entry={entry} />
         ))}
         {turn.sources.length > 0 && (
-          <div className="flex flex-col gap-1 border-border border-t pt-2">
-            <span className="flex items-center gap-1 font-medium text-text-secondary">
+          <div className="border-border flex flex-col gap-1 border-t pt-2">
+            <span className="text-text-secondary flex items-center gap-1 font-medium">
               <BookText className="h-3.5 w-3.5" aria-hidden="true" />
               {t("playground.trace.sources", "Sources")}
             </span>
@@ -1296,7 +1297,7 @@ function TracePanel({
               return (
                 <div
                   key={`${s.kb}-${s.documentId ?? s.chunkId}`}
-                  className="flex flex-wrap items-center gap-1 text-text-muted"
+                  className="text-text-muted flex flex-wrap items-center gap-1"
                 >
                   {s.knowledgeBaseId ? (
                     <button
@@ -1326,7 +1327,7 @@ function TracePanel({
                               title: docTitle,
                             })
                           }
-                          className="text-left text-accent hover:underline"
+                          className="text-accent text-left hover:underline"
                         >
                           {docTitle}
                         </button>
@@ -1346,16 +1347,87 @@ function TracePanel({
 }
 
 // What one guardrail row SAYS. A table rather than a chain of ternaries, because two independent
-// fields decide it and the chain grew a wrong arm for each: one sentence for both directions said
-// the REPLY went out unscreened, on rows where the reply was screened and approved a line below;
-// and every trip said "the configured reply", on text the judge itself had written.
+// fields (direction and action) decide it: a screened-and-approved reply must not read as
+// unscreened, and text the judge wrote must not read as "the configured reply".
 export function guardrailTraceLabel(
   t: (key: string, fallback: string) => string,
   entry: Pick<
     Extract<TraceEntry, { type: "guardrail" }>,
-    "direction" | "outcome" | "action"
+    "direction" | "outcome" | "action" | "held" | "external" | "check"
   >,
 ): string {
+  // The factual-grounding check names what it found, and under `revise` that the agent rewrote it.
+  if (entry.check) {
+    if (entry.outcome === "revised")
+      return t(
+        "playground.trace.groundingRevised",
+        "claims the tool results do not support; the agent wrote the reply again",
+      );
+    if (entry.outcome === "observed")
+      return t(
+        "playground.trace.groundingObserved",
+        "claims the tool results do not support; only recorded, the reply went out as written",
+      );
+    if (entry.outcome === "clean")
+      return t(
+        "playground.trace.groundingClean",
+        "every claim is supported by the tool results",
+      );
+  }
+  // Only recorded: whatever the judge or the endpoint decided, nothing it decided was carried out.
+  if (entry.outcome === "observed")
+    return entry.external
+      ? entry.external.decision === "replace"
+        ? t(
+            "playground.trace.externalObservedReplace",
+            "the endpoint would have replaced it; only recorded, the reply went out as written",
+          )
+        : t(
+            "playground.trace.externalObservedBlock",
+            "the endpoint would have blocked it; only recorded, the reply went out as written",
+          )
+      : entry.direction === "input"
+        ? t(
+            "playground.trace.guardrailObservedInput",
+            "would have tripped; only recorded, the message reached the agent",
+          )
+        : t(
+            "playground.trace.guardrailObserved",
+            "would have tripped; only recorded, the reply went out as written",
+          );
+  // The operator's endpoint answered (or failed): say what it decided, not what a judge found.
+  if (entry.external?.decision === "allow")
+    return t("playground.trace.externalAllow", "allowed by the endpoint");
+  if (entry.external?.decision === "replace")
+    return t(
+      "playground.trace.externalReplace",
+      "replaced by the endpoint's text",
+    );
+  if (entry.external?.decision === "block")
+    return entry.outcome === "suppressed"
+      ? t(
+          "playground.trace.externalBlockSilent",
+          "blocked by the endpoint, nothing would be sent",
+        )
+      : entry.outcome === "handed-off"
+        ? t(
+            "playground.trace.externalBlockHandoff",
+            "blocked by the endpoint, the case would go to the team",
+          )
+        : t(
+            "playground.trace.externalBlockTemplate",
+            "blocked by the endpoint, the configured reply would be sent",
+          );
+  if (entry.held)
+    return entry.direction === "input"
+      ? t(
+          "playground.trace.guardrailHeldInput",
+          "could not be checked, so the message was held and the case would go to the team",
+        )
+      : t(
+          "playground.trace.guardrailHeldOutput",
+          "could not be checked, so the reply was held and the case would go to the team",
+        );
   switch (entry.outcome) {
     case "clean":
       return t("playground.trace.guardrailClean", "approved");
@@ -1379,6 +1451,11 @@ export function guardrailTraceLabel(
         "playground.trace.guardrailHandedOff",
         "blocked, the case would go to the team",
       );
+    case "revised":
+      return t(
+        "playground.trace.groundingRevised",
+        "claims the tool results do not support; the agent wrote the reply again",
+      );
     case "replaced":
       // `generated` reaches here only when the judge actually handed text back: the gate reports
       // `template` when the action was `generated` and no reply came with it, so this reads the
@@ -1395,21 +1472,21 @@ export function guardrailTraceLabel(
   }
 }
 
-function TraceRow({ entry }: { entry: TraceEntry }) {
-  const { t } = useTranslation();
+export function TraceRow({ entry }: { entry: TraceEntry }) {
+  const { t, i18n } = useTranslation();
   if (entry.type === "assistant") {
     return (
-      <p className="whitespace-pre-wrap text-text-muted italic">{entry.text}</p>
+      <p className="text-text-muted whitespace-pre-wrap italic">{entry.text}</p>
     );
   }
   if (entry.type === "tool_call") {
     return (
       <div className="flex flex-col gap-0.5">
-        <span className="flex items-center gap-1 font-medium text-text-secondary">
+        <span className="text-text-secondary flex items-center gap-1 font-medium">
           <Wrench className="h-3.5 w-3.5" aria-hidden="true" />
           {entry.name}
         </span>
-        <pre className="overflow-x-auto rounded bg-bg-tertiary px-2 py-1 text-text-muted">
+        <pre className="bg-bg-tertiary text-text-muted overflow-x-auto rounded px-2 py-1">
           {JSON.stringify(entry.args, null, 2)}
         </pre>
       </div>
@@ -1424,24 +1501,123 @@ function TraceRow({ entry }: { entry: TraceEntry }) {
       <div className="flex flex-col gap-0.5">
         <span
           className={cn("flex items-center gap-1 font-medium", {
-            "text-warning": tripped || entry.outcome === "unavailable",
+            "text-warning":
+              tripped ||
+              entry.outcome === "unavailable" ||
+              entry.outcome === "observed" ||
+              entry.outcome === "revised",
             "text-text-secondary": entry.outcome === "clean",
           })}
         >
           <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
-          {entry.direction === "input"
-            ? t("playground.trace.guardrailInput", "Guardrail on the message")
-            : t("playground.trace.guardrailOutput", "Guardrail on the reply")}
-          <span className="font-normal text-text-muted">
+          {entry.external
+            ? t("playground.trace.externalCheck", "External check on the reply")
+            : entry.check
+              ? t(
+                  "playground.trace.groundingCheck",
+                  "Factual grounding of the reply",
+                )
+              : entry.direction === "input"
+                ? t(
+                    "playground.trace.guardrailInput",
+                    "Guardrail on the message",
+                  )
+                : t(
+                    "playground.trace.guardrailOutput",
+                    "Guardrail on the reply",
+                  )}
+          <span className="text-text-muted font-normal">
             {guardrailTraceLabel(t, entry)}
           </span>
         </span>
-        {tripped && (
-          <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-bg-tertiary px-2 py-1 text-text-muted">
-            {[entry.categories?.join(", "), entry.rationale]
+        {entry.external && (
+          <p
+            className="bg-bg-tertiary text-text-muted rounded px-2 py-1 whitespace-pre-wrap"
+            data-testid="guardrail-external"
+          >
+            {[
+              t("playground.trace.externalLatency", {
+                defaultValue: "took {{ms}} ms",
+                ms: entry.external.latencyMs,
+              }),
+              entry.external.cause &&
+                t("playground.trace.externalCause", {
+                  defaultValue: "failure: {{cause}}",
+                  cause: entry.external.status
+                    ? `${entry.external.cause} (${entry.external.status})`
+                    : entry.external.cause,
+                }),
+              entry.external.reason &&
+                t("playground.trace.externalReason", {
+                  defaultValue: "reason: {{reason}}",
+                  reason: entry.external.reason,
+                }),
+            ]
               .filter(Boolean)
-              .join(" — ")}
-          </pre>
+              .join(" · ")}
+          </p>
+        )}
+        {entry.claims && entry.claims.length > 0 && (
+          <ul
+            className="bg-bg-tertiary text-text-muted flex flex-col gap-1 rounded px-2 py-1"
+            data-testid="guardrail-claims"
+          >
+            {entry.claims.map((c) => (
+              <li key={`${c.type}:${c.claim}`} className="whitespace-pre-wrap">
+                {t("playground.trace.groundingClaim", {
+                  defaultValue:
+                    "“{{claim}}” · the tool results say: {{evidence}}",
+                  claim: c.claim,
+                  evidence: c.evidence || "-",
+                })}
+              </li>
+            ))}
+          </ul>
+        )}
+        {(tripped || entry.outcome === "observed") &&
+          !entry.scores &&
+          !entry.claims &&
+          !entry.external && (
+            <pre className="bg-bg-tertiary text-text-muted overflow-x-auto rounded px-2 py-1 whitespace-pre-wrap">
+              {[entry.categories?.join(", "), entry.rationale]
+                .filter(Boolean)
+                .join(" — ")}
+            </pre>
+          )}
+        {/* A classification API's screening (guardrails.classifier = decisions): every question with
+            what it answered and the threshold it was held to, clean screenings included, since
+            "approved at 0.12 against 0.8" is what tells whether a threshold is right. */}
+        {entry.scores && entry.scores.length > 0 && (
+          <ul
+            className="bg-bg-tertiary text-text-muted flex flex-col gap-0.5 rounded px-2 py-1"
+            data-testid="guardrail-scores"
+          >
+            {entry.scores.map((s) => {
+              const missing = t(
+                "playground.trace.guardrailScoreMissing",
+                "no answer",
+              );
+              const hit =
+                s.probability !== null && s.probability >= s.threshold;
+              return (
+                <li
+                  key={s.category}
+                  className={cn("font-mono", { "text-warning": hit })}
+                >
+                  {t("playground.trace.guardrailScore", {
+                    defaultValue:
+                      "{{category}}: {{probability}} (threshold {{threshold}})",
+                    category: s.category,
+                    probability:
+                      s.probability === null
+                        ? missing
+                        : s.probability.toFixed(2),
+                    threshold: s.threshold.toFixed(2),
+                  })}
+                </li>
+              );
+            })}
+          </ul>
         )}
       </div>
     );
@@ -1449,17 +1625,17 @@ function TraceRow({ entry }: { entry: TraceEntry }) {
   if (entry.type === "media") {
     return (
       <div className="flex flex-col gap-0.5">
-        <span className="flex items-center gap-1 font-medium text-text-secondary">
+        <span className="text-text-secondary flex items-center gap-1 font-medium">
           <Eye className="h-3.5 w-3.5" aria-hidden="true" />
           {entry.mediaKind === "document"
             ? t("playground.trace.visionDocument", "Document reading")
             : t("playground.trace.visionImage", "Image reading")}
-          <span className="font-normal text-text-muted">
+          <span className="text-text-muted font-normal">
             {entry.provider}
             {entry.model ? ` · ${entry.model}` : ""}
           </span>
         </span>
-        <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-bg-tertiary px-2 py-1 text-text-muted">
+        <pre className="bg-bg-tertiary text-text-muted overflow-x-auto rounded px-2 py-1 whitespace-pre-wrap">
           {entry.output}
         </pre>
       </div>
@@ -1478,17 +1654,25 @@ function TraceRow({ entry }: { entry: TraceEntry }) {
         )}
         {`→ ${entry.name || t("playground.trace.result", "result")}`}
         {entry.mocked && (
-          <span className="rounded bg-accent/20 px-1 text-[10px] text-accent uppercase">
+          <span className="bg-accent-soft text-accent rounded px-1 text-[10px] uppercase">
             {t("playground.trace.mocked", "mocked")}
           </span>
         )}
         {entry.simulated && (
-          <span className="rounded bg-bg-tertiary px-1 text-[10px] text-text-muted uppercase">
+          <span className="bg-bg-tertiary text-text-muted rounded px-1 text-[10px] uppercase">
             {t("playground.trace.simulated", "simulated")}
           </span>
         )}
+        {entry.size && (
+          <span
+            className="text-text-muted font-normal"
+            data-testid="trace-result-size"
+          >
+            {toolResultSizeLabel(entry.size, t, i18n.language)}
+          </span>
+        )}
       </span>
-      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-bg-tertiary px-2 py-1 text-text-muted">
+      <pre className="bg-bg-tertiary text-text-muted overflow-x-auto rounded px-2 py-1 whitespace-pre-wrap">
         {entry.output}
       </pre>
     </div>

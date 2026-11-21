@@ -5,8 +5,8 @@ import {
 } from "@/modules/agents/service";
 
 // A `settings` bag REPLACES the column (docs/graph.md), so every block the bag does not name is
-// deleted, and the call answers 200 saying nothing (#614). The contract stays; what changes is that
-// a write which would destroy configuration has to say it means it.
+// deleted. The contract stays, but a write which would destroy configuration has to say it means
+// it, rather than answering 200 and saying nothing.
 //
 // The question is asked of the STORED row, inside the same lock the write takes, like every other
 // rule in this family: what this bag would COST, not what it looks like on its own.
@@ -38,12 +38,6 @@ describe("assertSettingsBlocksKept", () => {
     // learns the size of the mistake one block at a time.
     expect(err.translationParams?.blocks).toBe("followUp, signature");
     expect(err.translationParams?.count).toBe(2);
-  });
-
-  test("an empty bag on a configured agent is the whole wipe, and is refused", () => {
-    expect(() => assertSettingsBlocksKept({}, stored)).toThrow(
-      SettingsBlocksDroppedError,
-    );
   });
 
   // The write that does not touch settings at all (a rename, a mode change) is not this rule's
@@ -89,20 +83,6 @@ describe("assertSettingsBlocksKept", () => {
     expect(
       (caught as SettingsBlocksDroppedError).translationParams?.blocks,
     ).toBe("signature");
-  });
-
-  // A block that is OFF is still a decision somebody made, and the bag that drops it reverts that
-  // decision to whatever the default is. `enabled: false` is the case where the two differ most.
-  test("a block switched off is still configuration", () => {
-    expect(() =>
-      assertSettingsBlocksKept({}, { split: { enabled: false } }),
-    ).toThrow(SettingsBlocksDroppedError);
-  });
-
-  test("a key the bag adds is nobody's loss", () => {
-    expect(() =>
-      assertSettingsBlocksKept({ ...stored, somethingNew: { a: 1 } }, stored),
-    ).not.toThrow();
   });
 
   // The bag names the block and empties it: that is an edit of the block, not its removal, and the

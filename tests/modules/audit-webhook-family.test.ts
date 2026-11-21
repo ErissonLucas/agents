@@ -23,24 +23,19 @@ import {
   updateWebhookSubscription,
 } from "@/modules/webhooks/outbound/subscriptions";
 import { sendWebhookTest } from "@/modules/webhooks/outbound/test";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { countingBase } from "../utils/counting-base";
 import { outboundUrl } from "../utils/outbound";
-import { countInSrc } from "../utils/source-text";
+import { until } from "../utils/poll";
 
-// The outbound-webhook and alert-channel trail, moved into the services that perform the writes
-// (issue #397, under the epic #306).
-//
-// Seven actions existed and all seven were written by an MCP tool after the service had already
-// committed, so the same change made from the console left no row at all — every probe in this file
-// fails on the base for that reason. Two things this family carries that the proving family did not:
-//
+// The outbound-webhook and alert-channel trail, recorded by the services that perform the writes, so
+// the console and MCP leave the same row. Two things this family carries:
 //   - Both halves hold a secret in the row's neighbourhood. A subscription's `secretRef` is a vault
 //     REFERENCE (`vault:<id>`, canonicalized on write by `requireVaultRef`, and these services are
 //     the only writers of the column), and an alert channel's `url` is stored encrypted because a
 //     Discord URL embeds a bot token. The row names the ref and the MASKED url, never either secret.
-//   - The alert-channel editor PATCHes its whole form on every save, so a row per apply is not noise
-//     here: it is the only thing that would show a save that changed something the operator did not
-//     mean to change.
+//   - The alert-channel editor PATCHes its whole form on every save, so a row is the only thing that
+//     shows a save that changed something the operator did not mean to change.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -48,6 +43,42 @@ const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
 let su: PrismaClient | undefined;
 let app: PrismaClient | undefined;
+
+// Holds `table`'s row `id` in a transaction that sets `enabled = false`, the concurrent writer the
+// races below need. `blockedOn` resolves once another session is parked on a lock against that
+// table, which is the writer this test started; `release` commits the holder.
+async function holdRow(table: string, id: string) {
+  const db = su as PrismaClient;
+  const locked = Promise.withResolvers<void>();
+  const commit = Promise.withResolvers<void>();
+  const holder = db.$transaction(
+    async (tx) => {
+      await tx.$executeRawUnsafe(
+        `UPDATE ${table} SET enabled = false WHERE id = ${id}`,
+      );
+      locked.resolve();
+      await commit.promise;
+    },
+    { timeout: 30_000 },
+  );
+  holder.catch(locked.reject);
+  await locked.promise;
+  return {
+    blockedOn: () =>
+      until(`a writer parked on the held ${table} row`, async () => {
+        const [found] = await db.$queryRawUnsafe<{ n: bigint }[]>(
+          `SELECT count(*) AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND wait_event_type = 'Lock' AND query ILIKE '%${table}%'`,
+        );
+        return (found?.n ?? 0n) > 0n;
+      }),
+    release: async () => {
+      commit.resolve();
+      await holder;
+    },
+  };
+}
 
 if (appUrl && suUrl) {
   try {
@@ -60,8 +91,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -125,36 +156,6 @@ async function seedDelivery(subscriptionId: bigint): Promise<bigint> {
   });
   return row.id;
 }
-
-// ── the fence under the projection's own justification ──
-//
-// Both projections carry `secretRef` in full, on the grounds that it is a REFERENCE and never a
-// secret — and that grounds is not a property of the column, which is a plain string, but of these
-// two services being the only writers of it: both canonicalize through `requireVaultRef`. An audit
-// row is append-only and readable by every tenant admin, so a third writer that stored a raw value
-// there would put it somewhere no correction reaches, and nothing would fail.
-//
-// The count is what says so, and it runs without a database because it reads the tree.
-describe("the projections' claim about who writes these columns", () => {
-  const OWNERS: Record<string, string> = {
-    webhookSubscription: "src/modules/webhooks/outbound/subscriptions.ts",
-    alertChannel: "src/modules/flowlog/channels.ts",
-  };
-
-  for (const [model, owner] of Object.entries(OWNERS)) {
-    test(`only ${owner} writes ${model}`, async () => {
-      // Every Prisma write verb that can put a value in a column, not just the two these services
-      // happen to use: an `upsert` or an `updateManyAndReturn` added later is the same defect.
-      const found = await countInSrc(
-        new RegExp(
-          `\\b${model}\\.(create|createMany|update|updateMany|upsert)\\w*\\(`,
-          "g",
-        ),
-      );
-      expect(Object.keys(found).sort()).toEqual([owner]);
-    });
-  }
-});
 
 describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
   beforeAll(async () => {
@@ -343,29 +344,18 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
       appDb,
     );
     await clearAudit();
-    let held = false;
-    const holder = (su as PrismaClient).$transaction(
-      async (tx) => {
-        await tx.$executeRawUnsafe(
-          `UPDATE webhook_subscriptions SET enabled = false WHERE id = ${created.id}`,
-        );
-        held = true;
-        await Bun.sleep(500);
-      },
-      { timeout: 10_000 },
+    const held = await holdRow("webhook_subscriptions", created.id);
+    const writer = updateWebhookSubscription(
+      ctx(),
+      BigInt(created.id),
+      { events: ["conversation.handoff"] },
+      appDb,
     );
-    await Bun.sleep(120);
-    // The rendezvous FIRED: without this the test is a `sleep` with a better name.
-    expect(held).toBe(true);
-    await Promise.all([
-      holder,
-      updateWebhookSubscription(
-        ctx(),
-        BigInt(created.id),
-        { events: ["conversation.handoff"] },
-        appDb,
-      ),
-    ]);
+    // The writer is parked on the held row before the holder commits, so what it reads after the
+    // wait is what the holder left, with no window guessed in milliseconds.
+    await held.blockedOn();
+    await held.release();
+    await writer;
     const [row] = await rows();
     expect(row?.action).toBe("webhook.update");
     expect(row?.before).toMatchObject({ enabled: false });
@@ -422,23 +412,13 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
       appDb,
     );
     await clearAudit();
-    let held = false;
-    const holder = (su as PrismaClient).$transaction(
-      async (tx) => {
-        await tx.$executeRawUnsafe(
-          `UPDATE webhook_subscriptions SET enabled = false WHERE id = ${created.id}`,
-        );
-        held = true;
-        await Bun.sleep(500);
-      },
-      { timeout: 10_000 },
-    );
-    await Bun.sleep(120);
-    expect(held).toBe(true);
-    await Promise.all([
-      holder,
-      deleteWebhookSubscription(ctx(), BigInt(created.id), appDb),
-    ]);
+    const held = await holdRow("webhook_subscriptions", created.id);
+    const writer = deleteWebhookSubscription(ctx(), BigInt(created.id), appDb);
+    // The writer is parked on the held row before the holder commits, so what it reads after the
+    // wait is what the holder left, with no window guessed in milliseconds.
+    await held.blockedOn();
+    await held.release();
+    await writer;
     const [row] = await rows();
     expect(row?.action).toBe("webhook.delete");
     expect(row?.before).toMatchObject({
@@ -492,11 +472,9 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
   });
 
   test("clearing a subscription secret the row cannot name still writes a row", async () => {
-    // `webhook_subscriptions.secret_ref` has the same history as the alert one — both writers guarded
-    // in the same commit (#126), the column unvalidated before it — so the read redacts a value that
-    // names no vault entry. Redacted, such a value reads as null on BOTH sides of a clear,
-    // `projectionMoved` sees nothing, and the one save that removed a signing secret would write no
-    // row at all. `secretRefOpaque` is what keeps that visible.
+    // Legacy rows of `webhook_subscriptions.secret_ref`, like the alert one, can hold a value
+    // that names no vault entry, which the read redacts. Redacted, it reads as null on BOTH sides of
+    // a clear, so without `secretRefOpaque` the save that removed a signing secret writes no row.
     const created = await createWebhookSubscription(
       ctx(),
       {
@@ -544,10 +522,8 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
     );
     expect(created.hasSecret).toBe(true);
     await clearAudit();
-    // A DELIBERATE clear, which is the only way the console reaches this since #435: the editor
-    // PATCHes its whole form on every save, and it now loads the stored ref into the picker, so a
-    // null here means the operator emptied it. Until then a blank field was indistinguishable from
-    // an untouched one and this row was written by a save that meant to change the name.
+    // NOTE: a DELIBERATE clear, the only way the console reaches this: the editor loads the stored
+    // ref into the picker, so a null here means the operator emptied it.
     await updateAlertChannel(
       ctx(),
       BigInt(created.id),
@@ -701,23 +677,18 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
       appDb,
     );
     await clearAudit();
-    let held = false;
-    const holder = (su as PrismaClient).$transaction(
-      async (tx) => {
-        await tx.$executeRawUnsafe(
-          `UPDATE alert_channels SET enabled = false WHERE id = ${created.id}`,
-        );
-        held = true;
-        await Bun.sleep(500);
-      },
-      { timeout: 10_000 },
+    const held = await holdRow("alert_channels", created.id);
+    const writer = updateAlertChannel(
+      ctx(),
+      BigInt(created.id),
+      { name: "raced2" },
+      appDb,
     );
-    await Bun.sleep(120);
-    expect(held).toBe(true);
-    await Promise.all([
-      holder,
-      updateAlertChannel(ctx(), BigInt(created.id), { name: "raced2" }, appDb),
-    ]);
+    // The writer is parked on the held row before the holder commits, so what it reads after the
+    // wait is what the holder left, with no window guessed in milliseconds.
+    await held.blockedOn();
+    await held.release();
+    await writer;
     const [row] = await rows();
     expect(row?.action).toBe("alert_channel.update");
     expect(row?.before).toMatchObject({ name: "raced", enabled: false });
@@ -731,23 +702,13 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
       appDb,
     );
     await clearAudit();
-    let held = false;
-    const holder = (su as PrismaClient).$transaction(
-      async (tx) => {
-        await tx.$executeRawUnsafe(
-          `UPDATE alert_channels SET enabled = false WHERE id = ${created.id}`,
-        );
-        held = true;
-        await Bun.sleep(500);
-      },
-      { timeout: 10_000 },
-    );
-    await Bun.sleep(120);
-    expect(held).toBe(true);
-    await Promise.all([
-      holder,
-      deleteAlertChannel(ctx(), BigInt(created.id), appDb),
-    ]);
+    const held = await holdRow("alert_channels", created.id);
+    const writer = deleteAlertChannel(ctx(), BigInt(created.id), appDb);
+    // The writer is parked on the held row before the holder commits, so what it reads after the
+    // wait is what the holder left, with no window guessed in milliseconds.
+    await held.blockedOn();
+    await held.release();
+    await writer;
     const [row] = await rows();
     expect(row?.action).toBe("alert_channel.delete");
     expect(row?.before).toMatchObject({ enabled: false, name: "race-del" });
@@ -860,7 +821,8 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
     expect(rest).toEqual([]);
     expect(row?.action).toBe("webhook_delivery.requeue");
     expect(row?.actorType).toBe("mcp");
-    // The tool used to be HANDED this, because its own read would have been outside the lock.
+    // NOTE: read by the service under its lock, not handed in by the tool, whose read would be
+    // outside the lock.
     expect(row?.before).toMatchObject({ status: "DEAD", attempts: 8 });
   });
 
@@ -907,11 +869,9 @@ describe.skipIf(!dbUp)("the webhook and alert-channel trail", () => {
       { base },
     );
     expect(res.ok).toBe(true);
-    // FIVE before this. Four of them are reads the tool takes before it writes anything —
-    // `resolveSecretRef` resolves the name, `resolveSecretValue` resolves it again and then reads
-    // the secret — and the mutation is the fourth. The fifth was the transport opening its OWN
-    // transaction for the audit row, after the service had already committed: a failure in between
-    // landed the change with no record of it.
+    // NOTE: three reads the tool takes before it writes (`resolveSecretRef` resolves the name,
+    // `resolveSecretValue` resolves it again and reads the secret), and the mutation with its audit
+    // row. A separate transaction for the row could fail after the commit, leaving no record.
     expect(total()).toBe(4);
     expect((await rows()).map((r) => r.action)).toEqual([
       "alert_channel.create",

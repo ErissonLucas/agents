@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import {
   cleanup,
   fireEvent,
@@ -9,13 +9,15 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import * as AuthModule from "@/client/contexts/AuthContext";
 import { withI18n } from "@/tests/utils/i18n";
+import { stubExports } from "@/tests/utils/module-stub";
 
-// Review round 4 on #756: an invitation to an account that signs in with Google has no password to
-// enter on the accept page. It offers signing in instead, and the invitation waits in the tab (never
-// back on a URL) until the invitee returns to the page signed in.
+// An invitation to an account that signs in with Google has no password to enter on the accept
+// page. It offers signing in instead, and the invitation waits in the tab (never back on a URL)
+// until the invitee returns to the page signed in.
 //
-// NOTE: assertions reduce to strings/booleans before expect; a DOM node in a failing expectation
+// Assertions reduce to strings/booleans before expect; a DOM node in a failing expectation
 // serializes a cyclic happy-dom tree and stalls the runner.
 
 const PARKED = "@app:parked-invite";
@@ -31,7 +33,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     );
     return new Response(
       JSON.stringify({
-        invite: { email: "g@x.test", role: "AGENT", existingAccount: true },
+        invite: { email: "g@x.test", role: "AGENT", existingAccount },
       }),
       { status: 200, headers: { "content-type": "application/json" } },
     );
@@ -54,10 +56,11 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
   return realFetch(input as RequestInfo | URL, init);
 }) as typeof fetch;
 
+let existingAccount = true;
 let signedInAs: { email: string } | null = null;
 let logoutAnswer = true;
 let logouts = 0;
-mock.module("@/client/contexts/AuthContext", () => ({
+stubExports(AuthModule, {
   useAuth: () => ({
     user: signedInAs,
     login: () => {},
@@ -67,7 +70,7 @@ mock.module("@/client/contexts/AuthContext", () => ({
       return logoutAnswer;
     },
   }),
-}));
+});
 
 const { AcceptInvitePage } = await import("@/client/pages/AcceptInvitePage");
 // Accepting from a running session reloads onto the joined tenant; the test only needs it not to.
@@ -108,6 +111,7 @@ describe("accepting an invitation by signing in", () => {
     inviteQueries.length = 0;
     accepted.length = 0;
     signedInAs = null;
+    existingAccount = true;
     logoutAnswer = true;
     logouts = 0;
   });
@@ -117,6 +121,29 @@ describe("accepting an invitation by signing in", () => {
       configurable: true,
       value: realLocation,
     });
+  });
+
+  // What the password manager is told each box holds: the account's password to fill when the
+  // invitee already has one, a new one to generate and save when the invitation creates it.
+  const passwordBoxes = () =>
+    [...document.querySelectorAll("input[type=password]")].map(
+      (el) => `${el.id}:${el.getAttribute("autocomplete")}`,
+    );
+
+  test("an existing account's password box asks for the saved password", async () => {
+    renderAt("/accept-invite?token=tok-1685");
+    await screen.findByText("Current password");
+    expect(passwordBoxes()).toEqual(["password:current-password"]);
+  });
+
+  test("a new account's password boxes ask for a new password", async () => {
+    existingAccount = false;
+    renderAt("/accept-invite?token=tok-1685");
+    await screen.findByText("Confirm Password");
+    expect(passwordBoxes()).toEqual([
+      "password:new-password",
+      "confirmPassword:new-password",
+    ]);
   });
 
   test("parks the invitation in the tab and goes to sign in, with no token on the URL", async () => {
@@ -133,7 +160,7 @@ describe("accepting an invitation by signing in", () => {
     expect(sessionStorage.getItem(PARKED)).toBe("tok-756");
   });
 
-  // Review round 7: it stays parked through whatever reloads the sign-in takes, and goes only once the
+  // NOTE: it stays parked through whatever reloads the sign-in takes, and goes only once the
   // invitation is accepted.
   test("back on the page, the parked invitation is read and kept until it is accepted", async () => {
     sessionStorage.setItem(PARKED, "tok-756");

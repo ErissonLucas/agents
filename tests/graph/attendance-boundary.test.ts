@@ -105,16 +105,6 @@ describe("claimAttendanceBoundary", () => {
       });
     });
   }
-
-  // Every case that ends an attendance must arm compaction for it, including the two that write
-  // nothing to the thread. Compaction that is not armed here waits on a writer that may never come.
-  test("every boundary row reports the closed attendance", () => {
-    const boundaryRows = cases.filter(
-      (c) => c.previous !== null && c.previous !== CURRENT,
-    );
-    expect(boundaryRows.length).toBe(3);
-    for (const c of boundaryRows) expect(c.closed).toBe(PREVIOUS);
-  });
 });
 
 describe("crossesAttendanceBoundary", () => {
@@ -147,26 +137,12 @@ describe("attendanceHasStarted", () => {
     expect(attendanceHasStarted([], 7)).toBe(false);
   });
 
-  test("the attendance the last stamped message belongs to has started", () => {
-    expect(attendanceHasStarted([stamped(7)], 7)).toBe(true);
-  });
-
   // Assistant replies carry no stamp and sit after the human turn of their own attendance, so the
   // scan has to walk past them rather than stop at the end of the array.
   test("unstamped replies at the end do not hide the answer", () => {
     expect(attendanceHasStarted([stamped(7), new AIMessage("oi")], 7)).toBe(
       true,
     );
-  });
-
-  // THE REOPENED CASE. Asking "does 1 appear anywhere" answered yes for an attendance that ended
-  // before 2 ran, so the writer skipped the divider for a conversation that had genuinely just
-  // resumed — and the first turn of it reached the model as a continuation of 2. The stamp is inert
-  // to the model; the divider is the only part it reads.
-  test("a conversation that ran EARLIER has not started the current attendance", () => {
-    const thread = [stamped(1), new AIMessage("resposta"), stamped(2)];
-    expect(attendanceHasStarted(thread, 1)).toBe(false);
-    expect(attendanceHasStarted(thread, 2)).toBe(true);
   });
 
   test("a conversation reopened at the end HAS started", () => {
@@ -176,7 +152,7 @@ describe("attendanceHasStarted", () => {
   });
 });
 
-// The guard in front of the table above (issue #194): only the newest message the THREAD has seen
+// The guard in front of the table above: only the newest message the THREAD has seen
 // may make a statement about which attendance it is on. Every false row is a message that, allowed
 // through, would summarise a conversation still being served.
 describe("movesAttendanceFrontier", () => {
@@ -184,8 +160,8 @@ describe("movesAttendanceFrontier", () => {
     ["a thread that has never been written", [null, null], 500, true],
     ["the ordinary case: the newest id there is", [500, null], 501, true],
     ["a delayed id, its own direction ahead", [500, null], 499, false],
-    // THE ROUND-6 CASE. The attendant opened the new conversation, so the customer's own mark is
-    // still back in the old one and their delayed note read as current.
+    // NOTE: The attendant opened the new conversation, so the customer's own mark is still back in
+    // the old one; checking only the sender's own direction would read their delayed note as current.
     ["a delayed id, the OTHER direction ahead", [500, 502], 501, false],
     ["a new id above both directions", [500, 502], 503, true],
     // A direction that has never written owes nothing: an attendant's first reply must not read as

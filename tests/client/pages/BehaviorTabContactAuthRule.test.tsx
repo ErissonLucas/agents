@@ -8,25 +8,46 @@ import {
   expect,
   test,
 } from "bun:test";
-import { readFileSync } from "node:fs";
-import { cleanup, render, screen } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { BehaviorTab } from "@/client/pages/agents/BehaviorTab";
 import {
+  type ContactAuthConditionForm,
   type ContactAuthRuleForm,
   contactAuthRuleInvalid,
   contactAuthRulePayload,
   contactAuthRuleToSave,
+  EMPTY_CONTACT_AUTH_CONDITION_FORM,
   EMPTY_CONTACT_AUTH_RULE_FORM,
   readContactAuthRuleForm,
 } from "@/client/pages/agents/contactAuthRuleForm";
+import {
+  lastSavedSettings,
+  renderEditor,
+  stubEditorApi,
+} from "../../utils/agent-editor";
 import { behaviorTabProps } from "./behaviorTabProps";
 
-// Issue #646: the contact gate can decide from a list or an attribute instead of an endpoint. The
-// editor is where that choice is made, and the endpoint's fields are about a request that is then
-// never sent.
+// The contact gate can decide from a list or an attribute instead of an endpoint. The editor is
+// where that choice is made, and the endpoint's fields are then about a request that is never sent.
 //
-// NOTE: every assertion reduces to a number or a boolean BEFORE expect (a failing expectation holding
-// a DOM node serializes a cyclic happy-dom tree and stalls the runner).
+// Every assertion reduces to a number or a boolean BEFORE expect (a failing expectation holding a
+// DOM node serializes a cyclic happy-dom tree and stalls the runner).
+
+const one = (
+  ruleKind: string,
+  patch: Partial<ContactAuthConditionForm> = {},
+): ContactAuthRuleForm => ({
+  ...EMPTY_CONTACT_AUTH_RULE_FORM,
+  ruleConditions: [
+    { ...EMPTY_CONTACT_AUTH_CONDITION_FORM, ruleKind, ...patch },
+  ],
+});
 
 describe("the rule's form state", () => {
   test("a stored list reads as one entry per line and saves back as the same rule", () => {
@@ -35,8 +56,8 @@ describe("the rule's form state", () => {
       phones: ["+55 (11) 98888-7777"],
       identifiers: ["cli-42"],
     });
-    expect(form.ruleKind).toBe("allowlist");
-    expect(form.rulePhones).toBe("5511988887777");
+    expect(form.ruleConditions[0]?.ruleKind).toBe("allowlist");
+    expect(form.ruleConditions[0]?.rulePhones).toBe("5511988887777");
     expect(contactAuthRulePayload(form)).toEqual({
       kind: "allowlist",
       phones: ["5511988887777"],
@@ -45,11 +66,7 @@ describe("the rule's form state", () => {
   });
 
   test("blank lines are dropped and an attribute keeps its scope and value", () => {
-    const list: ContactAuthRuleForm = {
-      ...EMPTY_CONTACT_AUTH_RULE_FORM,
-      ruleKind: "allowlist",
-      rulePhones: "\n+55 11 98888-7777\n\n",
-    };
+    const list = one("allowlist", { rulePhones: "\n+55 11 98888-7777\n\n" });
     expect(contactAuthRulePayload(list)).toEqual({
       kind: "allowlist",
       phones: ["+55 11 98888-7777"],
@@ -71,11 +88,11 @@ describe("the rule's form state", () => {
 
   test("no rule saves as null, which clears a stored one", () => {
     expect(contactAuthRulePayload(EMPTY_CONTACT_AUTH_RULE_FORM)).toBeNull();
-    expect(readContactAuthRuleForm(undefined).ruleKind).toBe("");
+    expect(readContactAuthRuleForm(undefined).ruleConditions.length).toBe(0);
   });
 
   test("switching the gate off never sends an invalid draft", () => {
-    const emptied = { ...EMPTY_CONTACT_AUTH_RULE_FORM, ruleKind: "allowlist" };
+    const emptied = one("allowlist");
     // Off: the draft the server would refuse is cleared, so the switch-off itself goes through.
     expect(contactAuthRuleToSave(emptied, false)).toBeNull();
     // On: sent as it is, and the save is blocked before it gets there.
@@ -85,37 +102,23 @@ describe("the rule's form state", () => {
       identifiers: [],
     });
     // Off with a valid rule: kept, so turning the gate back on later finds it.
-    const valid = { ...emptied, rulePhones: "+55 11 98888-7777" };
+    const valid = one("allowlist", { rulePhones: "+55 11 98888-7777" });
     expect(contactAuthRuleToSave(valid, false)).toEqual(
       contactAuthRulePayload(valid),
     );
   });
 
-  // Checked on the source for the reason tests/client/contact-auth-ttl-zero.test.ts gives: rendering
-  // the whole editor page pulls auth, theme, toast and a live catalog.
-  test("and the Behavior save is the one that goes through it", () => {
-    const src = readFileSync(
-      "src/client/pages/agents/AgentEditorPage.tsx",
-      "utf8",
-    );
-    expect(src).toContain(
-      "rule: contactAuthRuleToSave(contactAuth, contactAuth.enabled)",
-    );
-  });
-
   test("the editor refuses exactly what the server refuses", () => {
-    const base = { ...EMPTY_CONTACT_AUTH_RULE_FORM, ruleKind: "allowlist" };
-    expect(contactAuthRuleInvalid(base)).toBe(true);
-    expect(contactAuthRuleInvalid({ ...base, rulePhones: "123" })).toBe(true);
+    expect(contactAuthRuleInvalid(one("allowlist"))).toBe(true);
     expect(
-      contactAuthRuleInvalid({ ...base, rulePhones: "+55 11 98888-7777" }),
-    ).toBe(false);
-    expect(
-      contactAuthRuleInvalid({
-        ...EMPTY_CONTACT_AUTH_RULE_FORM,
-        ruleKind: "attribute",
-      }),
+      contactAuthRuleInvalid(one("allowlist", { rulePhones: "123" })),
     ).toBe(true);
+    expect(
+      contactAuthRuleInvalid(
+        one("allowlist", { rulePhones: "+55 11 98888-7777" }),
+      ),
+    ).toBe(false);
+    expect(contactAuthRuleInvalid(one("attribute"))).toBe(true);
     expect(contactAuthRuleInvalid(EMPTY_CONTACT_AUTH_RULE_FORM)).toBe(false);
   });
 });
@@ -126,7 +129,9 @@ const stubFetch = (async () =>
     headers: { "content-type": "application/json" },
   })) as unknown as typeof globalThis.fetch;
 
-function renderGate(rule: Partial<ContactAuthRuleForm>): void {
+function renderGate(
+  rule: Partial<ContactAuthRuleForm> & { endpointEnabled?: boolean },
+): void {
   const props = behaviorTabProps({});
   render(
     <BehaviorTab
@@ -160,14 +165,14 @@ describe("the gate's section in the editor", () => {
     globalThis.fetch = realFetch;
   });
 
-  test("the endpoint is the default, and its URL field is on screen", () => {
-    renderGate({});
+  test("the endpoint switched on with no conditions shows its URL field", () => {
+    renderGate({ endpointEnabled: true });
     expect(urlField() > 0).toBe(true);
     expect(phonesField()).toBe(0);
   });
 
   test("a list hides the endpoint's fields and shows the list", () => {
-    renderGate({ ruleKind: "allowlist", rulePhones: "+55 11 98888-7777" });
+    renderGate(one("allowlist", { rulePhones: "+55 11 98888-7777" }));
     expect(phonesField() > 0).toBe(true);
     expect(urlField()).toBe(0);
     expect(listError()).toBe(0);
@@ -175,20 +180,59 @@ describe("the gate's section in the editor", () => {
     expect(saveBlocked()).toBe(false);
   });
 
-  test("without a rule, the missing URL still blocks the save", () => {
-    renderGate({});
+  test("the endpoint alone, the missing URL still blocks the save", () => {
+    renderGate({ endpointEnabled: true });
     expect(saveBlocked()).toBe(true);
   });
 
   test("an empty list says why it cannot be saved", () => {
-    renderGate({ ruleKind: "allowlist" });
+    renderGate(one("allowlist"));
     expect(listError() > 0).toBe(true);
     expect(saveBlocked()).toBe(true);
   });
 
   test("an attribute shows its key field", () => {
-    renderGate({ ruleKind: "attribute", ruleKey: "plano" });
+    renderGate(one("attribute", { ruleKey: "plano" }));
     expect(keyField() > 0).toBe(true);
     expect(urlField()).toBe(0);
+  });
+});
+
+// The rendered editor: switching the gate off with a draft the server would refuse saves no rule, so
+// the switch-off itself goes through; a valid rule is kept for when the gate comes back on.
+describe("the Behavior save goes through the same rule", () => {
+  afterEach(() => {
+    cleanup();
+    globalThis.fetch = realFetch;
+  });
+
+  async function switchOffAndSave(label: string) {
+    const stub = stubEditorApi({
+      settings: {
+        contactAuth: { enabled: true, rule: { kind: "label", label: "vip" } },
+      },
+    });
+    await renderEditor(stub, "behavior");
+    fireEvent.change(screen.getByDisplayValue("vip"), {
+      target: { value: label },
+    });
+    fireEvent.click(
+      screen.getByRole("switch", { name: /^Only answer authorized contacts/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(lastSavedSettings(stub)).toBeDefined());
+    const ca = lastSavedSettings(stub)?.contactAuth as Record<string, unknown>;
+    return { enabled: ca.enabled, rule: ca.rule };
+  }
+
+  test("an emptied draft is dropped when the gate goes off", async () => {
+    expect(await switchOffAndSave("")).toEqual({ enabled: false, rule: null });
+  });
+
+  test("a valid rule is kept when the gate goes off", async () => {
+    expect(await switchOffAndSave("vip2")).toEqual({
+      enabled: false,
+      rule: { kind: "label", label: "vip2" },
+    });
   });
 });

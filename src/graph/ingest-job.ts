@@ -1,10 +1,16 @@
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import type { PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
+import basePrisma from "@/api/lib/prisma";
+import { parseDbId } from "@/lib/db-id";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { armCompaction } from "@/modules/memory/compact";
-import { type ClaimedJob, enqueueJob } from "@/modules/scheduler/service";
+import {
+  type ClaimedJob,
+  dedupeKeyStartsWith,
+  enqueueJob,
+} from "@/modules/scheduler/service";
 import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
 import { type IngestRole, ingestMessageIntoThread } from "./ingest";
 
@@ -12,45 +18,22 @@ function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Continuous ingestion as a scheduler job, instead of an append made inline while the webhook is
-// being acked (issue #194).
-//
-// The reason is NOT retries, which is what a queue usually buys. It is that appending on arrival has
-// nowhere to defer TO. A graph invoke is a read-modify-write of the whole message channel, so a
-// message appended while a turn is in flight is erased when that turn saves — and on the inline path
-// the only alternatives were to append anyway (the message is lost, and the thread's own record says
-// it was handled) or to block the webhook until the turn finished, which is an ack we do not have
-// the time budget for. With a row to come back to, the third answer exists: put it down and try
-// again in a minute.
-//
-// THE TEXT IS ENCRYPTED AT REST. The receiver deliberately keeps message bodies out of our database
-// — the delivery ledger stores status and never the payload, "which is PII" (docs/chatwoot.md) — and
-// a durable job row is exactly the thing that would have quietly walked one back in, transcriptions
-// and quoted context included. `encryptJson` is the same treatment every other secret at rest gets.
-// It does not restore the stronger property the receiver has (the body never lands here at all);
-// that would mean carrying only a reference and re-reading Chatwoot at run time, which is a provider
-// round-trip on every ingestion and a credential this job does not otherwise need.
-//
-// WHAT THE PAYLOAD CARRIES, and why it is the rendered text rather than the raw message. Rendering
-// folds in the eager media pass — transcription, image description, extracted text, quoted context —
-// which has already run by the time the webhook reaches ingestion and which the job has no way to
-// re-derive. Re-rendering later would also read a Chatwoot that has moved on. So the webhook renders
-// and the job stores words, exactly as ../modules/chatwoot/render.ts produced them.
+// Continuous ingestion as a scheduler job rather than an append inline with the webhook ack. Not for
+// retries: an inline append has nowhere to defer TO. An invoke is a read-modify-write of the whole
+// channel, so a message appended mid-turn is erased when the turn saves, and blocking the ack until
+// the turn ends does not fit its time budget; a row can be put down and retried in a minute. The text
+// is encrypted at rest (`encryptJson`), since the receiver keeps message bodies, which are PII, out of
+// the database (docs/chatwoot.md); carrying only a reference would cost a Chatwoot round-trip and a
+// credential per ingestion. It is the RENDERED text (../modules/chatwoot/render.ts): it folds in the
+// eager media pass, which the job cannot re-derive from a Chatwoot that has moved on.
 
 const DEFER_ON_TURN_MS = 60_000;
 
-// One row per MESSAGE, and this is the field the dedupe key cannot leave out. `enqueueJob` keeps one
-// live row per (tenant, kind, dedupeKey) and a re-enqueue REPLACES the payload, so a key scoped to
-// the thread would let the second message of a burst overwrite the first — the same message loss
-// this job exists to stop, moved one layer out. Chatwoot message ids are unique per account, so the
-// thread and the id together name exactly one append.
-// A CHAVE NOMEIA UMA MENSAGEM, e é exportada porque isso é um fato que os testes precisam PERGUNTAR
-// e não reconstruir (issue #723). Quarenta e cinco lugares afirmavam "nenhuma ingestão foi armada
-// para esta mensagem" contando a população de linhas do tenant, uma quantidade que este módulo move
-// de propósito: a linha é apagada ao concluir (JOB_DELETE_ON_DONE) e `drainPendingIngest` drena as
-// pendentes de uma thread. Os dezessete do seam saíram na #723 e os vinte e oito do observer-route
-// na #731. Um teste que remonta o formato à mão fica igualmente certo e igualmente frágil, porque o
-// formato passa a viver em dois lugares; exportar é o que mantém um só.
+// One row per MESSAGE: `enqueueJob` keeps one live row per (tenant, kind, dedupeKey) and a re-enqueue
+// REPLACES the payload, so a key scoped to the thread would let a burst's second message overwrite
+// the first. Chatwoot message ids are unique per account, so thread and id name exactly one append.
+// Exported so tests ask for the key instead of rebuilding its format or counting the tenant's rows,
+// which this module deletes on DONE and `drainPendingIngest` drains.
 export function ingestDedupeKey(
   graphThreadId: string,
   messageId: number,
@@ -58,18 +41,24 @@ export function ingestDedupeKey(
   return `${ingestKeyPrefix(graphThreadId)}${messageId}`;
 }
 
-// EVERYTHING UP TO THE MESSAGE ID, and it exists so the two ends of that sentence cannot drift
-// (issue #736). Three places need the prefix rather than one key: the drain scans it, the `/reset`
-// revoke sweeps it, and that revoke now READS the id back off the key to decide which rows are
-// after the command. Written by hand in each of them, a change to the key's shape (a suffix, an
-// episode, a version marker) would leave the reader unable to parse any key on the thread — and the
-// reader's unreadable case deletes, so the whole thread's queued ingestion would be revoked in
-// silence, which is the exact loss #736 exists to close, coming back through a change nobody would
-// connect to this revoke. Built from one function, the same change breaks compilation or a test
-// instead.
-//
-// The trailing colon is load-bearing: without it thread `…:ci:10`'s prefix also matches
-// `…:ci:100`'s rows, and a reset on one thread would sweep another's.
+// The fallback's own key, one per message like the append's.
+export function ingestFallbackKey(
+  graphThreadId: string,
+  messageId: number,
+): string {
+  return `${ingestFallbackKeyPrefix(graphThreadId)}${messageId}`;
+}
+
+// The fallback holds the message body too, so `/reset` sweeps this prefix beside the append's.
+export function ingestFallbackKeyPrefix(graphThreadId: string): string {
+  return `ingest-fallback:${graphThreadId}:`;
+}
+
+// Everything up to the message id, built in one place because three readers need the prefix: the
+// drain scans it, and the `/reset` revoke sweeps it and READS the id back off the key. A hand-written
+// copy that drifted from the key's shape would leave the revoke unable to parse any key, and its
+// unreadable case deletes, silently revoking the thread's whole queue. The trailing colon is
+// load-bearing: without it thread `…:ci:10`'s prefix also matches `…:ci:100`'s rows.
 export function ingestKeyPrefix(graphThreadId: string): string {
   return `ingest:${graphThreadId}:`;
 }
@@ -83,43 +72,104 @@ export interface ArmIngestParams {
   messageId: number;
   text: string;
   role: IngestRole;
-  // When Chatwoot recorded the message (issue #755). Optional because a caller that does not know
-  // must say nothing rather than "now"; a job armed by an older build carries none either.
+  // When Chatwoot recorded the message. Optional because a caller that does not know
+  // must say nothing rather than "now", and a row armed without one carries none.
   sentAt?: Date | null;
   agentId: bigint;
   compactionEnabled: boolean;
+  // A FALLBACK for the append, due this far in the future: a watcher that left the append to the
+  // memory owner keeps the message recoverable without writing a memory line of its own. Absent, the
+  // ordinary arm.
+  fallbackAfterMs?: number;
+  // The webhook event that armed the fallback: only a settled delivery of the SAME event stands in for
+  // it, since a creation the owner settled with nothing to append (an empty message whose audio comes
+  // in a `message_updated`) says nothing about the content that came later.
+  event?: string;
+  // The Chatwoot bot routes of the owner and of the watcher that armed the fallback. A message can
+  // take several `message_updated`, and the owner settles the ones with nothing to append just as it
+  // settles the one with the words, so one settled delivery of the event proves nothing about the
+  // later update: the fallback stands down only once the owner settled as many as this route received.
+  routes?: { owner: number; watcher: number };
   base?: PrismaClient;
 }
 
 export async function armIngest(params: ArmIngestParams): Promise<void> {
+  const fallback = params.fallbackAfterMs !== undefined;
+  const payloadSecret = encryptJson(params.text);
+  const payload = {
+    instanceId: String(params.instanceId),
+    conversationId: params.conversationId,
+    contactInboxId: params.contactInboxId,
+    graphThreadId: params.graphThreadId,
+    messageId: params.messageId,
+    role: params.role,
+    ...(params.sentAt && Number.isFinite(params.sentAt.getTime())
+      ? { sentAt: params.sentAt.toISOString() }
+      : {}),
+    agentId: String(params.agentId),
+    compactionEnabled: params.compactionEnabled,
+    ...(fallback && params.event !== undefined ? { event: params.event } : {}),
+    ...(fallback && params.routes !== undefined
+      ? {
+          ownerBotId: params.routes.owner,
+          watcherBotId: params.routes.watcher,
+        }
+      : {}),
+  };
   await enqueueJob({
     tenantId: params.tenantId,
-    kind: "INGEST_MESSAGE",
-    dedupeKey: ingestDedupeKey(params.graphThreadId, params.messageId),
+    // NOTE: A fallback is a kind of its own and not a deferred append: it is no memory line until it
+    // runs, and then it only arms the ordinary append if none exists (`fallbackHandler`).
+    kind: fallback ? "INGEST_FALLBACK" : "INGEST_MESSAGE",
+    dedupeKey: fallback
+      ? ingestFallbackKey(params.graphThreadId, params.messageId)
+      : ingestDedupeKey(params.graphThreadId, params.messageId),
     // NOTE: The key names ONE message, so a re-arm is that same append being armed again, never a
     // second one. The row is also deleted on DONE (JOB_DELETE_ON_DONE), so a completed ingest
     // leaves nothing for a later arm to inherit in the first place.
+    // A redelivery of the deferring watcher leaves its fallback's run time as it was, rather than
+    // pushing it later each time; its body is refreshed below.
+    rearm: fallback ? "once" : "same-work",
+    // NOTE: now: the fast tick drains this lane, and what waits behind a queued ingestion is the next
+    // turn's context rather than a customer reading a reply. A fallback waits for the owner's own.
+    runAt: new Date(Date.now() + (params.fallbackAfterMs ?? 0)),
+    // NOTE: the ciphertext travels in its OWN column, never in `payload`: that is a Prisma `Json`
+    // column, and an `encryptJson` blob does not go in one (CLAUDE.md, Encryption). A Json payload is
+    // the thing that gets logged or serialized whole, and it would carry a contact's own words with it.
+    payloadSecret,
+    payload,
+    base: params.base,
+  });
+  if (!fallback) return;
+  // A later arm of a fallback still waiting (a transcription update after the unread marker) carries
+  // the newer text: the body is refreshed and the run time is left as it was.
+  const key = {
+    tenantId: params.tenantId,
+    kind: "INGEST_FALLBACK" as const,
+    dedupeKey: ingestFallbackKey(params.graphThreadId, params.messageId),
+  };
+  const db = params.base ?? basePrisma;
+  const refreshed = await runScopedOn(db, sysCtx(params.tenantId), (tx) =>
+    tx.schedulerJob.updateMany({
+      where: { ...key, status: "PENDING" },
+      data: { payload, payloadSecret },
+    }),
+  );
+  if (refreshed.count > 0) return;
+  // No fallback left waiting: one already claimed carries the older body to the append it is about to
+  // write. Re-armed as the same work, its row goes back to pending with the newer text and the claimed
+  // run stands down at the append's fence (`stillWanted`, on the row's status and claim). One already
+  // run is re-armed the same way, and its append then refuses an id already folded in. Not where the
+  // ledger says some route queued the message.
+  if (await fallbackCovered(params.tenantId, payload, db)) return;
+  await enqueueJob({
+    tenantId: params.tenantId,
+    kind: "INGEST_FALLBACK",
+    dedupeKey: key.dedupeKey,
     rearm: "same-work",
-    // Now: the fast tick drains this lane, and what waits behind a queued ingestion is the next
-    // turn's context rather than a customer reading a reply.
     runAt: new Date(),
-    // The ciphertext travels in its OWN column, never in `payload`: that is a Prisma `Json` column,
-    // and an `encryptJson` blob does not go in one (CLAUDE.md, Encryption). A Json payload is the
-    // thing that gets logged or serialized whole, and it would carry a contact's own words with it.
-    payloadSecret: encryptJson(params.text),
-    payload: {
-      instanceId: String(params.instanceId),
-      conversationId: params.conversationId,
-      contactInboxId: params.contactInboxId,
-      graphThreadId: params.graphThreadId,
-      messageId: params.messageId,
-      role: params.role,
-      ...(params.sentAt && Number.isFinite(params.sentAt.getTime())
-        ? { sentAt: params.sentAt.toISOString() }
-        : {}),
-      agentId: String(params.agentId),
-      compactionEnabled: params.compactionEnabled,
-    },
+    payloadSecret,
+    payload,
     base: params.base,
   });
 }
@@ -142,12 +192,10 @@ function parsePayload(
   const instanceId = s("instanceId");
   const agentId = s("agentId");
   const graphThreadId = s("graphThreadId");
-  // THROWS on a missing secret, and that is the guard for the column being optional on ClaimedJob:
-  // a query that forgot to select it produces a loud failure here rather than an empty message
-  // folded into a contact's permanent memory. Decryption is deliberately outside the shape check
-  // below for the same reason — a body we cannot read is a real failure (a rotated key), so it
-  // throws and the job retries and then dead-letters visibly, instead of being dropped as an
-  // unreadable payload.
+  // NOTE: THROWS on a missing secret, the guard for the column being optional on ClaimedJob: a query
+  // that forgot to select it fails loudly instead of folding an empty message into a contact's
+  // permanent memory. Decryption sits outside the shape check for the same reason: an unreadable body
+  // is a real failure (a rotated key), so the job retries and dead-letters visibly.
   if (payloadSecret == null) {
     throw new Error("ingest: the job carries no message body");
   }
@@ -170,6 +218,7 @@ function parsePayload(
     return null;
   }
   return {
+    // biome-ignore lint/plugin/no-bigint-cast: a scheduler job payload this app enqueued; the shape is guarded above the cast.
     instanceId: BigInt(instanceId),
     conversationId,
     contactInboxId,
@@ -178,6 +227,7 @@ function parsePayload(
     text,
     role,
     sentAt: sentAt && Number.isFinite(sentAt.getTime()) ? sentAt : null,
+    // biome-ignore lint/plugin/no-bigint-cast: same payload, same guard.
     agentId: BigInt(agentId),
     compactionEnabled: payload.compactionEnabled === true,
   };
@@ -190,34 +240,26 @@ export async function ingestHandler(
   // to `JobHandler`, so the registration below is unchanged and production still resolves the real
   // PostgresSaver.
   checkpointer?: BaseCheckpointSaver,
+  // A further condition asked with the claim's, inside the append's critical section: the fallback's
+  // "nobody queued this message", so it is answered in the thread's own order (`fallbackHandler`).
+  alsoWanted?: () => Promise<boolean>,
 ): Promise<JobResult> {
   const p = parsePayload(job.payload, job.payloadSecret);
   if (!p) return { outcome: "done" };
   const tenantId = job.tenantId;
 
-  // THE DEFERRAL THIS JOB EXISTS FOR, asked for with a flag rather than checked here. The decision
-  // has to be taken under the `ingest:<thread>` lock to be exclusive with a turn marking itself, and
-  // that lock lives inside ./ingest.ts — a check made out here would only be staggered: the turn can
-  // take the lock, mark itself and release it between our check and the append.
+  // The deferral this job exists for, asked for with a flag rather than checked here. It has to
+  // be decided under the `ingest:<thread>` lock inside ./ingest.ts to be exclusive with a turn marking
+  // itself; a check out here would only be staggered, since the turn can take the lock, mark itself
+  // and release it between our check and the append.
   const outcome = await ingestMessageIntoThread({
     deferIfTurnInFlight: true,
-    // THE GENERATION FENCE THIS JOB LACKED (round-9 review). Compaction has two defenses against a
-    // memory reset overtaking it — the reset cancels its pending row, and a claimed one finds the
-    // AgentThread row gone and drops the summary. Ingestion inherited neither, and it is the worse
-    // of the two to get wrong: a claimed ingestion waiting on the reset's own lock appends pre-reset
-    // text the moment that lock is released, recreating both the thread row and the checkpoint, with
-    // the operator having been told the reset succeeded.
-    //
-    // The token is the row itself, read under the lock: a revoked job is no longer CLAIMED by this
-    // run. `claimSeq` is in the comparison because a re-enqueue (a duplicate delivery) re-arms the
-    // row and bumps it — the later enqueue wins, and standing down here is what lets it, since that
-    // re-armed row carries the same message and will run again.
-    //
-    // Its own short transaction. This used to have to run on the ingestion transaction's connection,
-    // because that transaction stayed open across the whole critical section and a second one here
-    // could deadlock a busy shared lane against its own pool. The section holds no transaction while
-    // this runs any more (issue #225), so the read stands on its own; what still matters is that it
-    // happens INSIDE the critical section, which is what makes it exclusive with the reset.
+    // NOTE: the generation fence. A claimed ingestion waiting on a memory reset's own lock would
+    // append pre-reset text once it is released, recreating the thread row and the checkpoint after
+    // the operator was told the reset succeeded. The token is the row, read under the lock: a revoked
+    // job is no longer CLAIMED by this run, and `claimSeq` catches a re-enqueue (a duplicate delivery)
+    // that re-armed the row, whose later run carries the same message. Its own short transaction, since
+    // the section holds none while this runs; what matters is that it runs INSIDE the critical section.
     stillWanted: async () => {
       const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
         db.schedulerJob.findUnique({
@@ -225,7 +267,9 @@ export async function ingestHandler(
           select: { status: true, claimSeq: true },
         }),
       );
-      return row?.status === "CLAIMED" && row.claimSeq === job.claimSeq;
+      if (row?.status !== "CLAIMED" || row.claimSeq !== job.claimSeq)
+        return false;
+      return alsoWanted === undefined || (await alsoWanted());
     },
     tenantId,
     instanceId: p.instanceId,
@@ -251,7 +295,7 @@ export async function ingestHandler(
       }).then(() => undefined),
   });
 
-  // `reschedule` rather than `fail`: waiting on a turn is not an error and must not consume an
+  // NOTE: `reschedule` rather than `fail`: waiting on a turn is not an error and must not consume an
   // attempt, or a contact in a long conversation would dead-letter their own message.
   if (outcome === "deferred") {
     logger.info(
@@ -264,7 +308,225 @@ export async function ingestHandler(
       runAt: new Date(Date.now() + DEFER_ON_TURN_MS),
     };
   }
+  // The message is in memory now, so a watcher's fallback still waiting for it has nothing left to
+  // do. Left there, it would arm a second append ten minutes on, which a thread that moved past the
+  // dedup window could no longer tell apart from a lost one. One already running arms an append the
+  // dedup still refuses.
+  if (outcome === "ingested") {
+    await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.schedulerJob.deleteMany({
+        where: {
+          tenantId,
+          kind: "INGEST_FALLBACK",
+          dedupeKey: ingestFallbackKey(p.graphThreadId, p.messageId),
+          status: "PENDING",
+        },
+      }),
+    );
+    await dueOlderFallbacks(tenantId, p.graphThreadId, p.messageId, base);
+  }
   return { outcome: "done" };
+}
+
+// A watcher's fallback for the memory owner's append (../modules/chatwoot/webhook.ts): appends the
+// message itself, in its own run, only where no route queued it. The owner's append wins: a settled
+// owner delivery on the ledger, or the owner's append still queued, and the fallback does nothing.
+// Appending here rather than arming a new append keeps the fallback's place in the queue: its row was
+// created when the message arrived, so a claim that takes the oldest first reaches it before the newer
+// appends queued meanwhile, which could otherwise push its id past the dedup window's floor. The
+// append's own fences apply as for any ingestion: the claim (`stillWanted`), the reset boundary, the
+// dedup window.
+export async function fallbackHandler(
+  job: ClaimedJob,
+  base: PrismaClient,
+  checkpointer?: BaseCheckpointSaver,
+): Promise<JobResult> {
+  const p = job.payload as Record<string, unknown>;
+  const graphThreadId =
+    typeof p.graphThreadId === "string" ? p.graphThreadId : null;
+  const messageId = typeof p.messageId === "number" ? p.messageId : null;
+  if (graphThreadId === null || messageId === null || job.payloadSecret == null)
+    return { outcome: "done" };
+  // Asked inside the append's critical section, not before it: awaited out here, a newer append
+  // started in the same tick would take the thread's queue first, and enough of them would push this
+  // message past the dedup window's floor.
+  const nobodyQueuedIt = async () => {
+    if (await fallbackCovered(job.tenantId, p, base)) return false;
+    const queued = await runScopedOn(base, sysCtx(job.tenantId), (db) =>
+      db.schedulerJob.findFirst({
+        where: {
+          tenantId: job.tenantId,
+          kind: "INGEST_MESSAGE",
+          dedupeKey: ingestDedupeKey(graphThreadId, messageId),
+          status: { in: ["PENDING", "CLAIMED"] },
+        },
+        select: { id: true },
+      }),
+    );
+    return queued === null;
+  };
+  return ingestHandler(job, base, checkpointer, nobodyQueuedIt);
+}
+
+// Whether some route already queued this message: a settled delivery of it, on the fallback's event, whose
+// claim records `route_remembers = true`. That statement is written just before the append is armed
+// and moved back to `false` when the append fails, so with the delivery settled it is the durable
+// answer to "did the owner write it", where the dedup window is not: a thread that took more messages since has forgotten the
+// id, and an append of it would be reported as one that cannot be decided.
+async function fallbackCovered(
+  tenantId: bigint,
+  p: Record<string, unknown>,
+  base: PrismaClient,
+): Promise<boolean> {
+  const instanceId = parseDbId(
+    typeof p.instanceId === "string" ? p.instanceId : null,
+  );
+  const conversationId =
+    typeof p.conversationId === "number" ? p.conversationId : null;
+  const messageId = typeof p.messageId === "number" ? p.messageId : null;
+  if (instanceId === null || conversationId === null || messageId === null)
+    return false;
+  const ofMessage = {
+    tenantId,
+    chatwootInstanceId: instanceId,
+    conversationId,
+    inboundMessageId: messageId,
+    ...(typeof p.event === "string" ? { event: p.event } : {}),
+  };
+  // Settled, not just claimed: the flag is written just before the append is armed, and a delivery
+  // settles only once its message is queued. A crash in between leaves PROCESSING.
+  const settledRemembering = {
+    routeRemembers: true,
+    status: "PROCESSED" as const,
+  };
+  if (typeof p.ownerBotId === "number" && typeof p.watcherBotId === "number") {
+    const ownerBotId = p.ownerBotId;
+    const watcherBotId = p.watcherBotId;
+    // Counted per route, one row per Chatwoot delivery: an owner that settled the update without the
+    // words and stranded the one carrying them has settled fewer than this route received.
+    const [settled, received] = await runScopedOn(
+      base,
+      sysCtx(tenantId),
+      (db) =>
+        Promise.all([
+          db.chatwootWebhookDelivery.count({
+            where: {
+              ...ofMessage,
+              routeAgentBotId: ownerBotId,
+              ...settledRemembering,
+            },
+          }),
+          db.chatwootWebhookDelivery.count({
+            where: { ...ofMessage, routeAgentBotId: watcherBotId },
+          }),
+        ]),
+    );
+    return settled > 0 && settled >= received;
+  }
+  const stated = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.chatwootWebhookDelivery.findFirst({
+      where: { ...ofMessage, ...settledRemembering },
+      select: { id: true },
+    }),
+  );
+  return stated !== null;
+}
+
+// A thread's PENDING fallbacks, by the key prefix the tenant policy lets reach an index
+// (`dedupeKeyStartsWith`). Exported so the plan test reads the statement the barrier runs.
+export function pendingFallbacksSql(
+  tenantId: bigint,
+  graphThreadId: string,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT id, payload, payload_secret AS "payloadSecret"
+      FROM scheduler_jobs
+     WHERE tenant_id = ${tenantId}
+       AND ${dedupeKeyStartsWith(ingestFallbackKeyPrefix(graphThreadId))}
+       AND kind = 'INGEST_FALLBACK' AND status = 'PENDING'`;
+}
+
+// The ones still waiting for the owner: one that already failed is in backoff and keeps its retry time.
+export function waitingFallbacksSql(
+  tenantId: bigint,
+  graphThreadId: string,
+  now: Date,
+): Prisma.Sql {
+  return Prisma.sql`
+    SELECT id, dedupe_key AS "dedupeKey"
+      FROM scheduler_jobs
+     WHERE tenant_id = ${tenantId}
+       AND ${dedupeKeyStartsWith(ingestFallbackKeyPrefix(graphThreadId))}
+       AND kind = 'INGEST_FALLBACK' AND status = 'PENDING'
+       AND run_at > ${now} AND attempts = 0`;
+}
+
+// A newer message on the thread is in memory, so the dedup window moved on: a fallback still waiting
+// for an OLDER one comes due now rather than ten minutes on, when enough newer appends could have
+// pushed its id below the window's floor and made its append read as `ancient`. Its handler still
+// asks the ledger first, so one the owner did queue arms nothing.
+async function dueOlderFallbacks(
+  tenantId: bigint,
+  graphThreadId: string,
+  messageId: number,
+  base: PrismaClient,
+): Promise<void> {
+  const prefix = ingestFallbackKeyPrefix(graphThreadId);
+  const waiting = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.$queryRaw<{ id: bigint; dedupeKey: string }[]>(
+      waitingFallbacksSql(tenantId, graphThreadId, new Date()),
+    ),
+  );
+  const older = waiting
+    .filter((row) => {
+      const id = Number(row.dedupeKey.slice(prefix.length));
+      return Number.isSafeInteger(id) && id < messageId;
+    })
+    .map((row) => row.id);
+  if (older.length === 0) return;
+  await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.schedulerJob.updateMany({
+      where: { id: { in: older }, status: "PENDING" },
+      data: { runAt: new Date() },
+    }),
+  );
+}
+
+// The barrier's half of the same question (./ingest-drain.ts): a fallback still waiting whose message
+// some route already stated it appends is deleted rather than counted as owed, so a redundant one
+// does not hold compaction open until it comes due.
+export async function retireCoveredFallbacks(
+  tenantId: bigint,
+  graphThreadId: string,
+  base: PrismaClient,
+): Promise<void> {
+  const waiting = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.$queryRaw<
+      { id: bigint; payload: unknown; payloadSecret: string | null }[]
+    >(pendingFallbacksSql(tenantId, graphThreadId)),
+  );
+  for (const row of waiting) {
+    if (
+      !(await fallbackCovered(
+        tenantId,
+        (row.payload ?? {}) as Record<string, unknown>,
+        base,
+      ))
+    )
+      continue;
+    // NOTE: only the body that was checked: a later arm refreshes the row in place (a transcription
+    // update, another event), and the ledger answered about the event read above. Each arm encrypts
+    // anew, so the ciphertext names the version.
+    await runScopedOn(base, sysCtx(tenantId), (db) =>
+      db.schedulerJob.deleteMany({
+        where: {
+          id: row.id,
+          status: "PENDING",
+          payloadSecret: row.payloadSecret,
+        },
+      }),
+    );
+  }
 }
 
 let registered = false;
@@ -273,6 +535,9 @@ export function registerIngestJob(): void {
   registered = true;
   // NOTE: wrapped, because the handler's third parameter is a test seam and not the JobContext.
   registerJobHandler("INGEST_MESSAGE", (job, base) => ingestHandler(job, base));
+  registerJobHandler("INGEST_FALLBACK", (job, base) =>
+    fallbackHandler(job, base),
+  );
 }
 
 registerIngestJob();

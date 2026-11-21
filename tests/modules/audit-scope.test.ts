@@ -4,24 +4,17 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { ForbiddenError } from "@/lib/errors";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { listAudit, recordAudit } from "@/modules/audit/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { syntheticAction } from "../utils/audit-action";
 
-// WHICH TRAIL THE READ ANSWERS FOR (issue #520).
+// WHICH TRAIL THE READ ANSWERS FOR. Rows keyed to no tenant (`tenant.create`, `mcp_token.revoke`,
+// `mcp_client.*`, `mcp_approval.revoke`, `branding.set`, which must OUTLIVE a tenant) are UNREACHABLE
+// through the tenant read: RLS compares `tenant_id`, and NULL satisfies no comparison.
 //
-// The rows keyed to no tenant are not filtered out of the console, they are UNREACHABLE from it: the
-// policy is `tenant_id = current_setting('app.tenant_id')` and NULL satisfies no comparison.
-// Measured on a dev deployment before this: six rows written by six families -- `tenant.create`,
-// `mcp_token.revoke`, `mcp_client.*`, `mcp_approval.revoke`, `branding.set` -- none of them on any
-// page. The families that write them are the ones whose record must OUTLIVE a tenant, which is why
-// they are keyed to none: an audit row is `ON DELETE CASCADE` on its tenant, so a `tenant.delete`
-// filed under the tenant it deletes is erased by the same statement.
-//
-// So the scope is a question the caller asks, and the three answers are different QUERIES rather
-// than three filters over one: `tenant` keeps the RLS read, `fleet` and `all` enter the fleet role,
-// which is the only role the `fleet_super_admin` policy (`USING true`) admits.
-//
-// The refusal is asserted per scope and not once, because a scope that quietly degraded to the
-// caller's own tenant would be the same silent omission this issue is about, wearing a new name.
+// So the scope is three different QUERIES, not three filters over one: `tenant` keeps the RLS read,
+// `fleet` and `all` enter the fleet role, the only one the `fleet_super_admin` policy admits. The
+// refusal is asserted per scope, because a scope that quietly degraded to the caller's own tenant
+// would be the same silent omission, wearing a new name.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -41,8 +34,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -181,13 +174,6 @@ describe.skipIf(!dbUp)("which trail the read answers for", () => {
       ).rejects.toBeInstanceOf(ForbiddenError);
     });
   }
-
-  test("a tenant admin may still ask for its own tenant", async () => {
-    const page = await listAudit(ctx(), { scope: "tenant", limit: 500 }, appDb);
-    expect(page.entries.map((e) => e.target ?? "").filter(OURS)).toEqual([
-      `${TAG}:mine`,
-    ]);
-  });
 
   // `latestAt` is documented as the newest row of the trail past any filter, and the TRAIL is now
   // whichever one the scope named. Reporting the tenant's newest row on a fleet read would describe

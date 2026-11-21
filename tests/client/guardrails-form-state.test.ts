@@ -1,5 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { readGuardrailsFormState } from "@/client/pages/agents/guardrailsFormState";
+import {
+  playgroundGuardrailsUsable,
+  readGuardrailsFormState,
+} from "@/client/pages/agents/guardrailsFormState";
 import {
   CUSTOM_POLICY_MAX,
   GENERATION_PROMPT_MAX,
@@ -99,5 +102,96 @@ describe("guardrails form state", () => {
         guardrails: { input: { templateMessage: null } },
       }).input.templateMessage.length,
     ).toBeGreaterThan(0);
+  });
+});
+
+describe("playgroundGuardrailsUsable", () => {
+  // The bug it catches: a grounding reviewer with its own key bills playground turns while the toggle
+  // that would skip it reads disabled.
+  test("is usable when only the factual-grounding reviewer has a key", () => {
+    const on = readGuardrailsFormState({ guardrails: { enabled: true } });
+    const fg = {
+      ...on.factualGrounding,
+      enabled: true,
+      sourceTools: ["catalogo"],
+      provider: "anthropic" as const,
+      credentialRef: "vault:9",
+    };
+    expect([
+      playgroundGuardrailsUsable({
+        ...on,
+        credentialRef: null,
+        factualGrounding: fg,
+      }),
+      playgroundGuardrailsUsable({
+        ...on,
+        credentialRef: null,
+        factualGrounding: { ...fg, sourceTools: [] },
+      }),
+      playgroundGuardrailsUsable({
+        ...on,
+        credentialRef: null,
+        factualGrounding: {
+          ...fg,
+          provider: "openai-compatible" as const,
+          credentialRef: null,
+          baseURL: "http://revisor.local/v1",
+        },
+      }),
+    ]).toEqual([true, false, true]);
+  });
+
+  // The bug it catches: a reviewer whose compatible endpoint lives on its credential read as
+  // unusable, so the playground toggle was disabled while every turn still billed a review.
+  test("reads the reviewer's endpoint from its credential, as the runtime does", () => {
+    const on = readGuardrailsFormState({ guardrails: { enabled: true } });
+    const g = {
+      ...on,
+      credentialRef: null,
+      factualGrounding: {
+        ...on.factualGrounding,
+        enabled: true,
+        sourceTools: ["catalogo"],
+        provider: "openai-compatible" as const,
+        credentialRef: "vault:9",
+        baseURL: null,
+      },
+    };
+    expect([
+      playgroundGuardrailsUsable(g),
+      playgroundGuardrailsUsable(g, {
+        guardrails: null,
+        grounding: "http://revisor.local/v1",
+      }),
+    ]).toEqual([false, true]);
+  });
+
+  // The bug it catches: under hold with no credential every playground turn is held, while the
+  // toggle that would switch moderation off reads disabled.
+  test("is usable with a credential, or with none under hold, and never when off", () => {
+    const on = readGuardrailsFormState({ guardrails: { enabled: true } });
+    expect([
+      playgroundGuardrailsUsable({ ...on, credentialRef: "vault:1" }),
+      playgroundGuardrailsUsable({ ...on, credentialRef: null }),
+      playgroundGuardrailsUsable({
+        ...on,
+        credentialRef: null,
+        onFailure: "hold",
+      }),
+      playgroundGuardrailsUsable({
+        ...on,
+        enabled: false,
+        onFailure: "hold",
+      }),
+      playgroundGuardrailsUsable({
+        ...on,
+        credentialRef: null,
+        external: {
+          url: "https://x.example/h",
+          credentialRef: null,
+          sendToolValues: true,
+        },
+      }),
+    ]).toEqual([true, false, true, false, true]);
   });
 });

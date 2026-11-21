@@ -1,65 +1,13 @@
 import { describe, expect, test } from "bun:test";
 
-// EVERY TEST THAT READS THE FLOW LOG, AND WHAT SCOPES IT.
-//
-// `emitFlowEvent` is fire-and-forget by design (src/modules/flowlog/service.ts): the hot WhatsApp
-// path must not pay write latency for six log lines. A test that asserts on those lines therefore
-// has two obligations, and the readers honoured them unevenly (issue #258).
-//
-//   SCOPE  a reader filtered only by `tenantId` returns rows of whatever else ran in the file. Every
-//          DB-backed test file seeds ONE tenant (`slug: <prefix>-${process.pid}`), so the tenant
-//          fences the FILE and nothing inside it: the neighbour a reader answers with is another
-//          test of the same file, never another file.
-//   WAIT   even a correctly scoped reader can run before the row lands, because nothing awaits the
-//          write.
-//   CLEAR  a test that EMPTIES the table empties it of the rows that exist. A write the previous case
-//          only scheduled lands after the DELETE, into a table this case believes it owns, and
-//          `orderBy: { id: "asc" }` hands that row back FIRST (issue #375).
-//
-// This file guards all three, and the second only since #419. It used to say the second "cannot be
-// read off the source", because "is there a wait" is a question about control flow, which was true
-// of the wait it had. The wait was a POLL LOOP, and a loop is a shape rather than a name, so there
-// was nothing to grep for. The observation underneath it was also right and is worth keeping: a poll
-// is only correct when the assertion is that a line EXISTS, since polling for an absence just spends
-// the timeout before answering the empty read it opened with.
-//
-// What changed is not the analysis, it is the wait. `flowLogRows` / `flowLogRow` / `flowLogCount`
-// settle the scheduled writes and then read, which makes the obligation checkable the same way the
-// third already was: by having ONE SPELLING. It also answers the objection rather than working
-// around it, because a settle is exact in both directions where a poll could only do presence.
-//
-// The argument for spending that is that the comments this obligation was left to did not hold.
-// chatwoot-command-dropped.test.ts polled for its `command` row and read its `route` row raw, three
-// lines apart, under a comment explaining the hazard for the first one, and the raw read turned CI
-// red on a branch touching no server file (#419). An obligation spelled out per site is one a new
-// site is written without, which is the reason tests/utils/flowlog.ts gives for the clear helper
-// existing at all.
-//
-// The third is checkable for the same reason: `clearFlowLog` (tests/utils/flowlog.ts) settles the
-// scheduled writes and then deletes. A raw DELETE is the defect, so the guard is that there are no
-// raw ones rather than a per-site judgement.
-//
-// WHAT IT DOES NOT COVER, said out loud rather than left to be discovered: 29 files end with a loop
-// over a table list, `execution_logs` among the entries and the name interpolated into
-// `DELETE FROM ${table}`, so the literal never sits next to the verb and no widening of the pattern
-// below reaches it. Those are TEARDOWNS — nothing reads the table after them — so they cannot produce
-// the failure this obligation is about. What they can produce is a log line arriving after its tenant
-// was deleted, and that was measured on both sides rather than argued: ONE swallowed
-// `execution_logs_tenant_id_fkey` per full-suite run, in 8 of 8 runs of the base, and converting all
-// 29 loops to a settling helper left it at exactly one. A guard for them would be enforcing a rule
-// with no measured effect, so this file does not pretend to have one.
-//
-// The ledger is per file with a count, following tests/lib/storable-write-sweep.test.ts: a NEW
-// reader in an already-listed file trips this too, not only a new file. The classification is the
-// point of the ledger. `tenant-wide` is a real answer for a reader whose subject is the TABLE rather
-// than one turn's trail, and it is written down so it stays a decision instead of an omission.
-//
-// NOTE: the price of a ledger over the whole test tree is that ANY branch adding a reader anywhere
-// has to touch this file, and it will find out from this test rather than from review. That is the
-// intended cost — it is the same trade tests/lib/storable-write-sweep.test.ts makes over `src/` —
-// but it has one edge the other does not: an entry in a file the derivation drops from an edition
-// would make this red in that edition and green here. Every file listed below survives into both
-// today, and a reader added inside a `@full-only` test file is the case to watch for.
+// EVERY TEST THAT READS THE FLOW LOG, AND WHAT SCOPES IT. `emitFlowEvent` is fire-and-forget
+// (src/modules/flowlog/service.ts), so a test asserting on its lines has three obligations: SCOPE (a
+// tenant-only filter answers with another test of the same file), WAIT (read through `flowLogRows` /
+// `flowLogRow` / `flowLogCount`, which settle first) and CLEAR (`clearFlowLog` settles, then
+// deletes). SCOPE is checked here; WAIT and CLEAR are biome-plugins/no-raw-flowlog-read.grit and
+// no-raw-flowlog-clear.grit. The ledger is per file with a
+// count, and `tenant-wide` is a decision written down, not an omission. What it does not cover, and
+// the cost of a tree-wide ledger: docs/logs.md, "Testing the flow log".
 
 type Reader = {
   /** 1-indexed line of the `executionLog.<method>(` that opens the call. */
@@ -110,13 +58,11 @@ function splitTopLevel(s: string): string[] {
 }
 
 // The exemption is declared AT the reader, never at a position in the ledger. A per-file exemption
-// travels to readers written later, and a per-INDEX one is worse than it looks: inserting a reader
-// above an exempt one silently hands it the exemption, which is what the array version did when a
-// `{ tenantId, stage }` reader was added at the top of guardrail-health and the suite stayed green.
-// A marker on the call site moves with the call site.
+// travels to readers written later, and a per-INDEX one is worse: inserting a reader above an exempt
+// one silently hands it the exemption. A marker on the call site moves with the call site.
 const MARKER = /\/\/\s*flowlog-scope:\s*(turn|agent|seeded|tenant-wide)\b/;
 
-// NOTE: the marker is looked for in the comment block IMMEDIATELY above the call — consecutive
+// The marker is looked for in the comment block IMMEDIATELY above the call — consecutive
 // comment/blank lines and nothing else — so it cannot be inherited from a neighbouring reader's
 // explanation several statements up.
 function markerAbove(source: string, line: number): Scoping | null {
@@ -131,18 +77,16 @@ function markerAbove(source: string, line: number): Scoping | null {
   return null;
 }
 
-// NOTE: written against the delimiters rather than as one regex on purpose. The first version of
-// this scan matched `where` keys with `/(?:^|,|\{)\s*(\w+)\s*[,:}]/g`, which reads correctly and is
-// wrong: `findall` cannot overlap, so the comma that ends one key is consumed and the key after it
-// never matches. It reported `{ tenantId, stage, threadId }` as `[tenantId]` and put 21 readers on
-// the list instead of 9 — a scan that is generous in the direction that creates work nobody needs.
+// Written against the delimiters rather than as one regex on purpose. A regex like
+// `/(?:^|,|\{)\s*(\w+)\s*[,:}]/g` reads correctly and is wrong: matches cannot overlap, so the comma
+// that ends one key is consumed and the key after it never matches (`{ tenantId, stage, threadId }`
+// reads as `[tenantId]`), flagging readers that are in fact scoped.
 export function flowlogReaders(source: string): Reader[] {
   const out: Reader[] = [];
-  // Both spellings, because the WAIT obligation (#419) moved every reader onto `flowLogRows` and
-  // friends and this scan would otherwise go blind on the day that landed, reporting a tree with no
-  // readers at all as a tree with nothing to check. The helper takes the client and then the SAME
-  // args object, so `where` still sits at the call site and everything below reads it unchanged;
-  // that is why the helper passes its args through instead of wrapping them away.
+  // Both spellings, because the WAIT obligation puts readers on `flowLogRows` and friends, and a scan
+  // of the raw client alone would report a tree with no readers as a tree with nothing to check. The
+  // helper takes the client and then the SAME args object, so `where` still sits at the call site; that
+  // is why the helper passes its args through instead of wrapping them away.
   const call =
     /(?:executionLog\.(?:findMany|findFirst|findFirstOrThrow|findUnique|findUniqueOrThrow|count|aggregate|groupBy)|\bflowLog(?:Rows|Row|Count))\s*\(/g;
   for (const m of source.matchAll(call)) {
@@ -162,9 +106,9 @@ export function flowlogReaders(source: string): Reader[] {
       }
     }
     const line = source.slice(0, m.index).split("\n").length;
-    // Inside the call OR in the comment block above it. The first is what survives the formatter:
-    // it moved a marker off `await suDb.executionLog.findFirst({` onto the `(` the wrapper opened,
-    // and a marker the formatter can detach is a marker that silently stops applying.
+    // Inside the call OR in the comment block above it. The first is what survives the formatter, which
+    // can move a marker off `await suDb.executionLog.findFirst({` onto the `(` the wrapper opened; a
+    // marker the formatter can detach is a marker that silently stops applying.
     const inside = MARKER.exec(args);
     out.push({
       line,
@@ -180,14 +124,9 @@ export function flowlogReaders(source: string): Reader[] {
 //               but not one agent (playground-guardrails spells out why at the call site)
 //   seeded      reads rows the test itself INSERTED with `executionLog.create`, awaited: there is no
 //               emit in the path, so neither obligation applies
-//   tenant-wide the subject is the table, not a turn. Scoping would defeat the assertion: the
-//               retention sweep proves WHICH rows survived it, which only an exhaustive read of the
-//               tenant can say. This entry USED to justify itself with "the file holds a single
-//               test", which was true of one of the four files carrying it — the others hold 7, 18
-//               and 23, and all four empty the table between cases. What makes it safe is the CLEAR
-//               obligation above, not the file being short: a tenant-wide reader answers with
-//               whatever is in the tenant, so it is exactly the reader that cannot survive a clear
-//               that left a neighbour's row behind.
+//   tenant-wide the subject is the table, not a turn (the retention sweep proves WHICH rows survive).
+//               Safe because of the CLEAR obligation, not because a file is short: it answers with
+//               whatever is in the tenant, so it cannot survive a clear that left a neighbour's row.
 type Scoping = "turn" | "agent" | "seeded" | "tenant-wide";
 
 export function isScoped(reader: Reader, scoping: Scoping): boolean {
@@ -197,110 +136,162 @@ export function isScoped(reader: Reader, scoping: Scoping): boolean {
 }
 
 const FLOWLOG_READERS: Record<string, number> = {
-  // #812: the capacity lines one conversation produced, read by its conversation.
+  "tests/modules/alert-cause.test.ts": 2,
+  "tests/modules/alert-rate.test.ts": 1,
+  // NOTE: The capacity lines one conversation produced, read by its conversation.
   "tests/modules/capacity-wait-db.test.ts": 1,
+  // NOTE: The lines a message on the bot token wrote, read by its conversation.
+  "tests/modules/foreign-send.test.ts": 1,
+  // NOTE: The window-note line the redirect follow-up wrote, which hangs on no conversation of ours.
+  "tests/modules/channel-redirect-followup.test.ts": 1,
+  // NOTE: The repair line of one conversation's turn, read by its conversation.
+  "tests/modules/turn-attempt-residue.test.ts": 1,
+  // NOTE: How many window-note lines a run of notes wrote, on the file's own tenant.
+  "tests/modules/window-note-alert.test.ts": 1,
+  // NOTE: The dead_letter lines of retention threads skipped twice (and their source), read by the
+  // threads they name.
+  "tests/graph/checkpoint-retention.test.ts": 3,
+  // NOTE: The clip line a code tool's call wrote, read by the turn that made it.
+  "tests/graph/code-tool-clip.test.ts": 1,
   "tests/graph/duplicate-tool-name-visible.test.ts": 1,
   "tests/graph/history-ceiling-turn.test.ts": 1,
+  "tests/graph/ingest-job.test.ts": 1,
   "tests/graph/ingest.test.ts": 2,
   "tests/graph/jev-turn.test.ts": 1,
-  "tests/graph/label-allowed-wiring.test.ts": 1,
-  // #855, review round 2: a turn a gate stopped writes no closing line, which only a read can show.
-  "tests/graph/nudge.test.ts": 6,
+  // NOTE: Type checks only: the function holding these reads is never called.
+  "tests/utils/flowlog-order-type.test.ts": 4,
+  "tests/graph/label-allowed-wiring.test.ts": 2,
+  // NOTE: A turn a gate stopped writes no closing line, which only a read can show.
+  "tests/graph/nudge.test.ts": 10,
   "tests/graph/nudge-waits-for-turn.test.ts": 2,
-  // #855, review round 2: a withdrawn turn closes on no line.
+  // NOTE: A withdrawn turn closes on no line.
+  "tests/graph/proactive-breaker.test.ts": 1,
+  "tests/graph/proactive-limit.test.ts": 1,
   "tests/graph/read-receipt-turn.test.ts": 1,
-  // #726: dois leitores novos, o carimbo provisorio da linha de `skip_reply` e a ausencia do fato do
-  // turno num turno que nao decidiu silencio. #856: mais um, a linha `tts` da resposta que foi como
-  // texto em vez de audio, escopada por tenant e conversa.
-  // #859: every line of one conversation, to prove the reply the model chose to send as text is in
-  // none of them. #886: two more, the `replyRecovered` line of a turn whose reply was written beside a
-  // tool call, and the `silenceUnexplained` warn that must not fire on it, both scoped by thread.
-  // #885: two more, the `silenceRetry` line of a retried silence and the warn's detail that says the
-  // retry ran, both scoped by thread. Three more: the lines of a turn whose recovered reply a
-  // takeover refused, a guardrail replaced, and an ordinary delivered turn, each scoped by thread.
-  "tests/graph/runtime.test.ts": 34,
+  // NOTE: Scoped by thread or conversation: the provisional stamp of the `skip_reply` line, the turn fact
+  // absent from a turn that did not decide silence, the `tts` line of a reply sent as text, every line
+  // of one conversation (the text reply is in none), `replyRecovered` and the `silenceUnexplained` warn
+  // that must not fire on it, `silenceRetry` and the warn's detail, and the lines of a turn whose
+  // recovered reply a takeover refused, a guardrail replaced, or that was delivered.
+  "tests/graph/runtime.test.ts": 45,
   "tests/graph/side-effect-flowlog.test.ts": 1,
-  // Up from 1: the `skip_handover_off` line of an agent with `skipReply.handoff: false`.
+  // NOTE: Includes the `skip_handover_off` line of an agent with `skipReply.handoff: false`.
   "tests/graph/skip-handover.test.ts": 2,
-  // #726: the helper that runs one tool call end to end, plus the case that asks WHEN the turn's
-  // delivery is read — that one drives the callback by hand, so it cannot go through the helper.
+  "tests/graph/skip-reply-reason-logged.test.ts": 1,
+  // NOTE: The helper that runs one tool call end to end, plus the case that asks WHEN the turn's delivery is
+  // read: that one drives the callback by hand, so it cannot go through the helper.
   "tests/graph/skip-reply-turn-delivered.test.ts": 2,
   "tests/graph/tool-flowlog.test.ts": 1,
+  // NOTE: The clip lines two code tools wrote in one turn, one silenced and one not, read by that turn.
+  "tests/graph/tool-silence-truncation-alert.test.ts": 1,
+  "tests/graph/tools-used-note.test.ts": 1,
+  "tests/graph/turn-errors-message.test.ts": 1,
+  "tests/graph/turn-limit-turn.test.ts": 1,
   "tests/graph/tool-schema-refusal.test.ts": 2,
-  // #605: two readers in one test, and the second is the first one's control. The alert-channel test
-  // send must write no line the alerting path would itself route, and the tenant is minutes old, so
-  // the zero and the one have to come off the same query.
+  // NOTE: Two readers in one test, and the second is the first one's control. The alert-channel test send
+  // must write no line the alerting path would itself route, and the tenant is minutes old, so the zero
+  // and the one have to come off the same query.
   "tests/modules/alert-channel-exclude-agents.test.ts": 1,
+  "tests/modules/alert-channel-events.test.ts": 1,
   "tests/modules/alert-channel-test.test.ts": 2,
   "tests/modules/channel-failure.test.ts": 1,
-  // #841: the line a playground turn that failed unhandled leaves, read by the turn's own id.
+  // NOTE: The line a playground turn that failed unhandled leaves, read by the turn's own id.
   "tests/modules/playground-turn-failure.test.ts": 1,
-  // #859: the lines of one playground thread, read by its threadId.
+  // NOTE: The lines of one playground thread, read by its threadId.
   "tests/modules/playground.test.ts": 1,
   "tests/modules/chatwoot-command-dropped.test.ts": 2,
   "tests/modules/chatwoot-gate-trail.test.ts": 1,
   "tests/modules/chatwoot-human-reply-takeover.test.ts": 1,
   "tests/modules/chatwoot-inbox-remove.test.ts": 1,
   "tests/modules/chatwoot-monitoring-seam.test.ts": 4,
-  "tests/modules/chatwoot-observer-route.test.ts": 1,
-  "tests/modules/chatwoot-recover-delivery.test.ts": 2,
+  "tests/modules/chatwoot-observer-route.test.ts": 2,
+  "tests/modules/chatwoot-reconcile-sweep.test.ts": 1,
+  "tests/modules/chatwoot-recover-delivery.test.ts": 7,
   "tests/modules/chatwoot-recover-takeover.test.ts": 1,
+  "tests/modules/chatwoot-reset.test.ts": 1,
   "tests/modules/chatwoot-unbound-inbox.test.ts": 1,
+  "tests/modules/contact-auth-exclude-e2e.test.ts": 1,
   "tests/modules/contact-auth-gate-e2e.test.ts": 3,
-  "tests/modules/debounce.test.ts": 9,
-  "tests/modules/delivery-sweep.test.ts": 5,
+  "tests/modules/contact-auth-observer.test.ts": 2,
+  "tests/modules/contact-auth-stages-e2e.test.ts": 1,
+  "tests/modules/dangling-tool-call-thread.test.ts": 1,
+  "tests/modules/debounce-late-visual.test.ts": 1,
+  "tests/modules/debounce.test.ts": 11,
+  "tests/modules/decisions-try.test.ts": 1,
+  "tests/modules/delivery-sweep.test.ts": 7,
+  // NOTE: The expiry line one request's conversation wrote, read by that conversation.
+  "tests/modules/document-approval-outcome.test.ts": 3,
+  // NOTE: The line a new request wrote, read by its conversation.
+  "tests/modules/document-approval-page.test.ts": 1,
   "tests/modules/eager-media-flow-context.test.ts": 6,
+  "tests/modules/failure-note.test.ts": 4,
+  "tests/modules/flowlog-alert-source.test.ts": 1,
   "tests/modules/flowlog-astral-detail.test.ts": 1,
   "tests/modules/flowlog-debug-mode-e2e.test.ts": 2,
   "tests/modules/flowlog-detail-pii.test.ts": 1,
+  "tests/modules/flowlog-full-detail.test.ts": 3,
   "tests/modules/flowlog-retention.test.ts": 1,
   "tests/modules/flowlog-settle.test.ts": 1,
   "tests/modules/flowlog.test.ts": 1,
-  // #896: two reads, tenant-wide on purpose. Their subject is HOW MANY lines a lost follow-up sequence
-  // wrote (one), and a one-step ladder re-run (none); each case empties this file's tenant first.
+  // NOTE: Two reads, tenant-wide on purpose: their subject is HOW MANY lines a lost follow-up sequence wrote
+  // (one) and a one-step ladder re-run wrote (none); each case empties this file's tenant first.
   "tests/modules/followup-sweep-later-step.test.ts": 2,
+  "tests/modules/followup-sweep-snoozed-isolated.test.ts": 1,
+  "tests/modules/guardrail-grounding-gate.test.ts": 1,
+  "tests/modules/guardrail-grounding-reference.test.ts": 1,
   "tests/modules/guardrail-health.test.ts": 1,
-  // #720: one reader, and it answers both directions on the same query — the line that names a
-  // colleague's reply nobody remembered, and its absence on the customer's own lost ingestion, which
-  // is what keeps the widened report from naming the wrong message.
+  "tests/modules/guardrail-observe.test.ts": 1,
+  "tests/modules/guardrail-on-failure.test.ts": 1,
+  "tests/modules/guardrail-unchecked-line.test.ts": 1,
+  // NOTE: One reader answering both directions on the same query: the line that names a colleague's reply
+  // nobody remembered, and its absence on the customer's own lost ingestion, which keeps the report
+  // from naming the wrong message.
   "tests/modules/human-agent-ingest.test.ts": 1,
   "tests/modules/inbound-sweep.test.ts": 1,
-  // A recuperação da resposta de um colega lê a linha que diz que ela NÃO volta mais
-  // (`human_reply_recovery_gone`), que é o único registro durável daquele desfecho (issue #728).
+  // NOTE: The `human_reply_recovery_gone` line, the only durable record that a colleague's reply will not be
+  // recovered.
   "tests/modules/chatwoot-recover-human-reply.test.ts": 1,
   "tests/modules/memory-compaction.test.ts": 3,
   "tests/modules/memory-dead-letter.test.ts": 1,
-  "tests/modules/observe-job.test.ts": 1,
+  "tests/modules/observe-decisions.test.ts": 1,
+  "tests/modules/observe-job.test.ts": 2,
+  "tests/modules/playground-fallback-log.test.ts": 1,
   "tests/modules/playground-guardrails.test.ts": 1,
-  // #757: um leitor, e é ele que conta a TENTATIVA de extração no turno do religar — a linha de
-  // estágio `vision` é a única prova de que o anexo foi aberto, já que o texto da resposta não
-  // distingue "leu e resumiu" de "inventou".
+  "tests/modules/playground-hidden-notes.test.ts": 1,
+  // NOTE: The `vision` stage line of the reengage turn is the only proof the attachment was opened: the reply
+  // text cannot tell "read and summarised" from "made up".
   "tests/modules/reengage-vision.test.ts": 1,
   "tests/modules/reengage.test.ts": 3,
   "tests/modules/model-fallback-turn.test.ts": 1,
-  // #895: the close line of one conversation, read by that conversation.
+  // NOTE: The close line of one conversation, read by that conversation.
   "tests/modules/nothing-to-answer.test.ts": 1,
-  // Livare F2.1: the reply gate's line of one conversation, read by that conversation.
+  // NOTE: The reply gate's line of one conversation, read by that conversation.
   "tests/modules/ryze-reply-gate.test.ts": 1,
-  // #737: duas leituras, e as duas são tenant-wide de propósito. O sujeito de uma é QUANTAS linhas
-  // uma morte escreveu, e o da outra é sob QUAL tenant a linha caiu; nenhuma das unidades que morrem
-  // ali tem turno para uma leitura mais estreita se prender.
+  // NOTE: Two reads, tenant-wide on purpose: one counts HOW MANY lines a death wrote, the other asks under
+  // WHICH tenant the line landed, and none of the units that die there has a turn to scope by.
   "tests/modules/scheduler-dead-letter-erased.test.ts": 2,
-  // #896: one reader, tenant-wide on purpose: its subject is HOW MANY lines a discarded outcome wrote,
-  // and each case empties this file's tenant first.
+  // NOTE: One reader, tenant-wide on purpose: its subject is HOW MANY lines a discarded outcome wrote, and
+  // each case empties this file's tenant first.
   "tests/modules/scheduler-discard-announced.test.ts": 1,
+  "tests/modules/scheduler-never-dead.test.ts": 1,
+  "tests/modules/snoozed-followup.test.ts": 1,
   "tests/modules/spend-ceiling-gate-e2e.test.ts": 1,
   "tests/modules/spend-ceiling-paths-e2e.test.ts": 4,
-  "tests/modules/spend-ceiling-poll.test.ts": 6,
-  "tests/modules/stt.test.ts": 1,
+  "tests/modules/spend-ceiling-poll.test.ts": 3,
+  "tests/modules/stranded-conversation-event.test.ts": 1,
+  "tests/modules/stt.test.ts": 4,
   "tests/modules/tts-check.test.ts": 3,
+  "tests/modules/tts-fallback.test.ts": 1,
   "tests/modules/tts-normalize-observability.test.ts": 1,
   "tests/modules/terminal-failure-announces.test.ts": 1,
   "tests/modules/tool-precondition-alerting.test.ts": 1,
   "tests/modules/tts.test.ts": 2,
+  "tests/modules/unpriced-model-alert.test.ts": 1,
   "tests/modules/vision-email-body.test.ts": 1,
   "tests/modules/vision-every-attachment.test.ts": 1,
-  "tests/modules/vision-retry.test.ts": 1,
+  "tests/modules/vision-oversize-anthropic.test.ts": 2,
+  "tests/modules/vision-retry.test.ts": 7,
+  "tests/modules/vision-unread-reason.test.ts": 1,
   "tests/modules/webhooks-outbound-dead-alert.test.ts": 1,
   "tests/modules/webhooks-outbound-deliveries.test.ts": 1,
 };
@@ -312,74 +303,9 @@ const FLOWLOG_READERS: Record<string, number> = {
 // The one file the scan skips, because its fixtures below are unscoped reads written on purpose.
 const SELF = "tests/modules/flowlog-reader-scope.test.ts";
 
-// The helper file, skipped by BOTH scans below and for the same reason each time: it is where the
-// one correct spelling is DEFINED, so it holds the raw clear and the raw reads that every other file
-// is forbidden. Exempting it is not a hole: nothing in it asserts on a row, so neither obligation
-// has anything to be about.
+// The helper file, skipped by the scan below: it is where the settling readers are DEFINED, and
+// nothing in it asserts on a row.
 const HELPER = "tests/utils/flowlog.ts";
-
-// A clear of `execution_logs` written by hand, in any spelling a test has reached for. `TRUNCATE` is
-// listed because it is the same act under a different verb, and a guard that only knew `DELETE`
-// would wave it through. `\s` inside the pattern rather than a literal space for the same reason
-// the scan below is whole-file: `executionLog\n  .deleteMany(…)` and a `DELETE\nFROM execution_logs`
-// inside a template literal are what the formatter produces on a long enough line, and a predicate
-// run per line would report the file as clean.
-const RAW_CLEAR =
-  /executionLog\s*\.\s*deleteMany\s*\(|(?:DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?)\s+"?execution_logs"?/gi;
-
-// A READ of `execution_logs` written against the client instead of the settling helper. Same shape
-// as RAW_CLEAR above and for the same reason: `\s` rather than a literal space, because
-// `executionLog\n  .findMany(…)` is what the formatter produces on a long enough line and a
-// per-line predicate would call that file clean.
-//
-// Only the READING methods. `deleteMany` has its own guard above, and `create` is how a test SEEDS
-// rows it then reads, awaited, with no emit in the path, so the wait obligation has nothing to be about.
-const RAW_READ =
-  /executionLog\s*\.\s*(?:findMany|findFirst|findFirstOrThrow|findUnique|findUniqueOrThrow|count|aggregate|groupBy)\s*\(/g;
-
-export function rawReadLines(src: string): number[] {
-  const out: number[] = [];
-  const re = new RegExp(RAW_READ.source, "gi");
-  for (;;) {
-    const hit = re.exec(src);
-    if (!hit) return out;
-    out.push(src.slice(0, hit.index).split("\n").length);
-  }
-}
-
-export function rawClearLines(src: string): number[] {
-  const out: number[] = [];
-  // A fresh regex per call: a `g` pattern carries `lastIndex` between calls, so a shared instance
-  // would start the second file mid-way through and miss whatever sits before that offset.
-  const re = new RegExp(RAW_CLEAR.source, "gi");
-  for (;;) {
-    const hit = re.exec(src);
-    if (!hit) return out;
-    // The line the match STARTS on, counted from the offset rather than from a per-line loop, which
-    // is what lets the match itself span lines.
-    out.push(src.slice(0, hit.index).split("\n").length);
-  }
-}
-
-// `clearFlowLog` is the one correct spelling. Three files are exempt and each for its own reason:
-// the helper IS the spelling; the settle file's subject is what a clear that does not settle leaves
-// behind, so it has to write the wrong one to assert what it costs; and this file, like the reader
-// scan above it, holds fixtures of the very thing it flags.
-const CLEAR_EXEMPT = new Set([
-  HELPER,
-  "tests/modules/flowlog-settle.test.ts",
-  SELF,
-]);
-
-// `flowLogRows` / `flowLogRow` / `flowLogCount` are the correct spellings. The same three files are
-// exempt as for the clear, and the middle one for a sharper reason than there: flowlog-settle's
-// SUBJECT is that the row is not there when the emit returns, so it has to read without settling to
-// assert what settling buys. A guard that forced it to settle would delete its premise.
-const READ_EXEMPT = new Set([
-  HELPER,
-  "tests/modules/flowlog-settle.test.ts",
-  SELF,
-]);
 
 async function scanTests(): Promise<Map<string, Reader[]>> {
   const { Glob } = await import("bun");
@@ -395,8 +321,8 @@ async function scanTests(): Promise<Map<string, Reader[]>> {
 
 // The positive control, and the reason it is not optional: a sweep that finds nothing passes exactly
 // like a sweep that finds everything, so without an offender the parser could return `[]` for every
-// file and this suite would stay green while guarding nothing (#266). These fixtures are the
-// offender, held as strings so the scan above cannot see them.
+// file and this suite would stay green while guarding nothing. These fixtures are the offender, held
+// as strings so the scan above cannot see them.
 describe("the scan can actually tell a scoped reader from an unscoped one", () => {
   const UNSCOPED = `
     const rows = await suDb.executionLog.findMany({
@@ -438,16 +364,16 @@ describe("the scan can actually tell a scoped reader from an unscoped one", () =
   });
 
   test("a shorthand key AFTER a value is still seen", () => {
-    // The bug the first version of this parser had, pinned: `stage: "memory"` sits between the two
-    // keys, and a regex that consumes the separator loses everything after the first pair.
+    // `stage: "memory"` sits between the two keys, and a regex that consumes the separator loses
+    // everything after the first pair.
     const [r] = flowlogReaders(SHORTHAND_AFTER_A_VALUE);
     expect(r?.keys).toEqual(["tenantId", "stage", "threadId"]);
   });
 
   test("agentId counts only where the ledger says the tests own an agent each", () => {
-    // The hole this closes: accepting `agentId` for every entry let a reader in a file where all 74
-    // tests drive ONE agent pass the guard while still answering with a neighbour's rows. The key is
-    // sufficient in playground-guardrails and nowhere else, so the ledger decides, not the key.
+    // `agentId` accepted for every entry would let a reader in a file where every test drives ONE agent
+    // pass the guard while answering with a neighbour's rows. The key is sufficient in
+    // playground-guardrails and nowhere else, so the ledger decides, not the key.
     const [r] = flowlogReaders(BY_AGENT);
     expect(r?.keys).toEqual(["tenantId", "agentId"]);
     expect(r ? isScoped(r, "agent") : false).toBe(true);
@@ -501,143 +427,5 @@ describe("every flow-log reader in the suite is accounted for", () => {
       }
     }
     expect(unscoped).toEqual([]);
-  });
-});
-
-describe("nothing empties the flow log by hand", () => {
-  test("it flags a raw deleteMany and a raw DELETE, and both spellings of TRUNCATE", () => {
-    expect(
-      rawClearLines("await db.executionLog.deleteMany({ where });"),
-    ).toEqual([1]);
-    expect(
-      rawClearLines(
-        "await db.$executeRawUnsafe(`DELETE FROM execution_logs WHERE x`);",
-      ),
-    ).toEqual([1]);
-    expect(
-      rawClearLines('await db.$executeRawUnsafe("TRUNCATE execution_logs");'),
-    ).toEqual([1]);
-    expect(
-      rawClearLines(
-        'await db.$executeRawUnsafe(`TRUNCATE TABLE "execution_logs"`);',
-      ),
-    ).toEqual([1]);
-  });
-
-  test("the spellings the formatter produces do not escape it", () => {
-    // The hole round 1 of review found, pinned. The predicate was applied per line, so any clear the
-    // formatter had broken across lines read as clean — and these are not exotic spellings, they are
-    // what Biome emits once the chain or the template is long enough.
-    expect(
-      rawClearLines("await suDb.executionLog\n  .deleteMany({ where });"),
-    ).toEqual([1]);
-    expect(
-      rawClearLines(
-        "await db.$executeRawUnsafe(`DELETE\n  FROM execution_logs\n  WHERE x`);",
-      ),
-    ).toEqual([1]);
-    expect(
-      rawClearLines(
-        "const a = 1;\nconst b = 2;\nawait db.executionLog.deleteMany({ w });",
-      ),
-    ).toEqual([3]);
-    // Two of them, so the scan cannot stop at the first and call the rest of the file clean.
-    expect(
-      rawClearLines(
-        "await db.executionLog.deleteMany({ a });\nawait db.executionLog.deleteMany({ b });",
-      ),
-    ).toEqual([1, 2]);
-  });
-
-  test("it does not flag the helper call, nor another table's clear", () => {
-    // The positive control above is what makes this line mean something: a predicate that flagged
-    // nothing would pass this test and the sweep below without reading anything.
-    expect(rawClearLines("await clearFlowLog(suDb, { tenantId });")).toEqual(
-      [],
-    );
-    expect(
-      rawClearLines("await suDb.alertDelivery.deleteMany({ where });"),
-    ).toEqual([]);
-    expect(
-      rawClearLines(
-        "await suDb.$executeRawUnsafe(`DELETE FROM alert_deliveries WHERE x`);",
-      ),
-    ).toEqual([]);
-  });
-
-  test("every clear in the suite goes through clearFlowLog", async () => {
-    const { Glob } = await import("bun");
-    const offenders: string[] = [];
-    for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
-      const path = `tests/${rel}`;
-      if (CLEAR_EXEMPT.has(path)) continue;
-      for (const line of rawClearLines(await Bun.file(path).text())) {
-        offenders.push(`${path}:${line}`);
-      }
-    }
-    // A raw clear empties the table of the rows that exist and of nothing else, so the case that runs
-    // next inherits whatever the case before it had only scheduled. `clearFlowLog` settles first.
-    expect(offenders).toEqual([]);
-  });
-});
-
-describe("nothing reads the flow log without waiting for the write", () => {
-  test("it flags a raw read in each of its methods, and across a line break", () => {
-    expect(
-      rawReadLines("const r = await db.executionLog.findMany({ w });"),
-    ).toEqual([1]);
-    expect(rawReadLines("await db.executionLog.findFirst({ w });")).toEqual([
-      1,
-    ]);
-    expect(rawReadLines("await db.executionLog.count({ w });")).toEqual([1]);
-    // What Biome emits once the chain is long enough, and the shape a per-line predicate misses.
-    expect(
-      rawReadLines("await suDb.executionLog\n  .findMany({ w });"),
-    ).toEqual([1]);
-    // Two of them, so the scan cannot stop at the first and call the rest of the file clean.
-    expect(
-      rawReadLines(
-        "await db.executionLog.findMany({ a });\nawait db.executionLog.count({ b });",
-      ),
-    ).toEqual([1, 2]);
-  });
-
-  test("it does not flag the helper calls, a seeding create, nor another table", () => {
-    // The positive control above is what makes this line mean something: a predicate that flagged
-    // nothing would pass this test and the sweep below without reading anything.
-    expect(
-      rawReadLines("const r = await flowLogRows(suDb, { where });"),
-    ).toEqual([]);
-    expect(
-      rawReadLines("const r = await flowLogRow(suDb, { where });"),
-    ).toEqual([]);
-    expect(
-      rawReadLines("const n = await flowLogCount(suDb, { where });"),
-    ).toEqual([]);
-    // A test that INSERTS its own rows awaits the write, so there is no emit to outrun.
-    expect(rawReadLines("await suDb.executionLog.create({ data });")).toEqual(
-      [],
-    );
-    expect(
-      rawReadLines("await suDb.alertDelivery.findMany({ where });"),
-    ).toEqual([]);
-  });
-
-  test("every read in the suite goes through the settling helper", async () => {
-    const { Glob } = await import("bun");
-    const offenders: string[] = [];
-    for await (const rel of new Glob("**/*.{ts,tsx}").scan("tests")) {
-      const path = `tests/${rel}`;
-      if (READ_EXEMPT.has(path)) continue;
-      for (const line of rawReadLines(await Bun.file(path).text())) {
-        offenders.push(`${path}:${line}`);
-      }
-    }
-    // A read that does not settle answers before the row lands. For an assertion that a line EXISTS
-    // that is a flake; for one that a line does NOT exist it is worse, because the read passes for
-    // exactly the reason that makes it wrong. Measured on chatwoot-command-dropped with the write
-    // delayed 200ms: seven of its nine cases fail without the settle, and the two that pass are the
-    // two asserting an absence.
-    expect(offenders).toEqual([]);
   });
 });

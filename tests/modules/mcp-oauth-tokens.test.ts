@@ -9,6 +9,7 @@ import {
   revokeAccessToken,
   verifyAccessToken,
 } from "@/modules/mcp/oauth/tokens";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -21,8 +22,8 @@ if (suUrl) {
     });
     await su.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -148,34 +149,39 @@ describe.skipIf(!dbUp)("mcp oauth access tokens", () => {
     expect(await verifyAccessToken(foreign, suDb)).toBeNull();
   });
 
-  test("a token bound to a different audience is rejected (RFC 8707)", async () => {
-    // Signed with OUR mcp secret, correct issuer/alg, but a foreign aud → must not verify.
-    const forged = await new SignJWT({
+  // A forged token for a REAL, live jti, so the only thing wrong with it is the property under test;
+  // the same claims with the right audience and secret verify, which is the control.
+  const forge = async (jti: string, audience: string, secret: string) =>
+    new SignJWT({
       tenant_id: tenantId.toString(),
       role: "TENANT_ADMIN",
       scopes: ["mcp:read"],
     })
       .setProtectedHeader({ alg: "HS256" })
       .setSubject(String(userId))
-      .setJti("forged-aud")
+      .setJti(jti)
       .setIssuer("fazerai:mcp")
-      .setAudience("https://evil.example.com/api/v1/mcp")
+      .setAudience(audience)
       .setExpirationTime("15m")
-      .sign(new TextEncoder().encode(config.mcpJwtSecret));
+      .sign(new TextEncoder().encode(secret));
+
+  test("a token bound to a different audience is rejected (RFC 8707)", async () => {
+    const { jti } = await issue(["mcp:read"]);
+    const ours = await forge(jti, mcpResourceId(), config.mcpJwtSecret);
+    expect((await verifyAccessToken(ours, suDb))?.jti).toBe(jti);
+    const forged = await forge(
+      jti,
+      "https://evil.example.com/api/v1/mcp",
+      config.mcpJwtSecret,
+    );
     expect(await verifyAccessToken(forged, suDb)).toBeNull();
   });
 
   test("a token signed with the APP secret does not validate in the MCP realm", async () => {
-    const appToken = await new SignJWT({
-      role: "SUPER_ADMIN",
-      scopes: ["mcp:admin"],
-    })
-      .setProtectedHeader({ alg: "HS256" })
-      .setSubject(String(userId))
-      .setJti("forged")
-      .setIssuer("fazerai:mcp")
-      .setExpirationTime("15m")
-      .sign(new TextEncoder().encode(config.jwtSecret));
+    const { jti } = await issue(["mcp:read"]);
+    const ours = await forge(jti, mcpResourceId(), config.mcpJwtSecret);
+    expect((await verifyAccessToken(ours, suDb))?.jti).toBe(jti);
+    const appToken = await forge(jti, mcpResourceId(), config.jwtSecret);
     expect(await verifyAccessToken(appToken, suDb)).toBeNull();
   });
 
@@ -192,9 +198,8 @@ describe.skipIf(!dbUp)("mcp oauth access tokens", () => {
     );
   });
 
-  // Issue #756: the token was issued for ONE tenant, and the role it carries is the one held there.
-  // Leaving that tenant invalidates it even while the person keeps a membership elsewhere with the
-  // same role.
+  // NOTE: The token was issued for ONE tenant, and the role it carries is the one held there. Leaving that
+  // tenant invalidates it even while the person keeps a membership elsewhere with the same role.
   test("leaving the token's tenant invalidates it, whatever the person holds elsewhere", async () => {
     const other = await suDb.tenant.create({
       data: { name: "McpT2", slug: `mcp2-${process.pid}` },

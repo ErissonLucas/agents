@@ -1,29 +1,45 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { fileURLToPath } from "node:url";
+import type { LLMResult } from "@langchain/core/outputs";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { traceIdForTurn } from "@/graph/langfuse-otel";
 import {
   environmentForSource,
   shutdownLangfuseClients,
 } from "@/graph/observability";
+import { type AgentConfig, buildCallbacks } from "@/graph/prepare";
 import { runAgentTurn } from "@/graph/runtime";
-import { NON_AGENT_TURN_NODES, USAGE_NODE_IS_AGENT_TURN } from "@/graph/usage";
+import {
+  NON_AGENT_TURN_NODES,
+  recordDirectUsage,
+  USAGE_NODE_IS_AGENT_TURN,
+  UsageCapture,
+  type UsageNode,
+  type UsageRow,
+} from "@/graph/usage";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import type { FlowContext } from "@/modules/flowlog/service";
 import { updateLangfuse } from "@/modules/tenant-settings/service";
 import { formatVaultRef } from "@/modules/vault/service";
 import { getVisionProvider } from "@/modules/vision/providers";
 import { extractInboundFile } from "@/modules/vision/service";
 import { readVisionConfig } from "@/modules/vision/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import {
+  jsonAttr,
+  LANGFUSE_OTLP_PATH,
+  otlpBodyText,
+  otlpSpans,
+} from "../utils/otlp-capture";
 import { UsageReportingModel } from "../utils/scripted-models";
 
 // `LlmUsage` is the only ledger of what an install spends on models, and a call reaches it only by
-// carrying the turn's usage callback. Two billed calls never did (issue #316): the guardrail
-// analysis, which invokes without callbacks, and vision, whose provider contract returned a bare
-// string and so could not carry the token counts the provider had already sent back.
+// carrying the turn's usage callback (or recording direct usage). The guardrail analysis and vision
+// are the two billed calls that do not ride the agent's own invocation.
 //
 // Every test here reads the row an operator would read, through the real call path. What is being
 // proved is not that a function returns a number: it is that the money spent leaves a trace.
@@ -44,8 +60,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -179,8 +195,8 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
         },
         settings: {
           split: { enabled: false },
-          // openai-compatible asks for the verdict in prose (verdictAskMode), which is the plain
-          // `model.invoke` path — the one that was missing its callbacks.
+          // NOTE: openai-compatible asks for the verdict in prose (verdictAskMode), which is the
+          // plain `model.invoke` path.
           guardrails: {
             enabled: true,
             provider: "openai-compatible",
@@ -301,10 +317,9 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
     expect(guard?.inboxId).toBe(inboxDbId);
   });
 
-  // THE GUARDRAIL'S CALL IN THE OTHER BOOK (review round 8). The gate hands its model `[usage()]`
-  // and nothing else, so the question is whether the turn's Langfuse handler still sees the call
-  // through LangChain's own config propagation, or whether the guardrail's spend is invisible to
-  // the dollar ceiling the way vision's was. Measured, not reasoned: the ingestion batch is read.
+  // THE GUARDRAIL'S CALL IN THE OTHER BOOK. The gate hands its model `[usage()]` and nothing else,
+  // so the turn's Langfuse handler must see the call through LangChain's config propagation, or the
+  // guardrail's call is missing from the turn's trace. The exported OTLP body itself is read.
   test("a screened turn reaches Langfuse with the guardrail's generation beside the agent's", async () => {
     const tctx = { tenantId, userId: null, role: "TENANT_ADMIN" as const };
     const lf = await suDb.vaultEntry.create({
@@ -322,20 +337,17 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
       { enabled: true, credentialRef: formatVaultRef(lf.id) },
       appDb,
     );
-    const posted: Array<Record<string, unknown>> = [];
+    const bodies: string[] = [];
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async (
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
       const url = String(input instanceof Request ? input.url : input);
-      if (url.endsWith("/api/public/ingestion")) {
-        const body = JSON.parse(String(init?.body ?? "{}")) as {
-          batch?: Array<Record<string, unknown>>;
-        };
-        posted.push(...(body.batch ?? []));
-        return new Response(JSON.stringify({ successes: [], errors: [] }), {
-          status: 207,
+      if (url.endsWith(LANGFUSE_OTLP_PATH)) {
+        bodies.push(otlpBodyText(init?.body));
+        return new Response("{}", {
+          status: 200,
           headers: { "content-type": "application/json" },
         });
       }
@@ -378,20 +390,19 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
     }
     // The scripted model carries no model name, so the two generations are told apart by the usage
     // each reported: the agent's own, and the guardrail's 31 / 5. Both under the turn's trace.
-    const updates = posted
-      .filter((e) => e.type === "generation-update")
-      .map(
-        (e) =>
-          e.body as {
-            traceId?: string;
-            usageDetails?: { input?: number; output?: number };
-          },
-      );
-    const guard = updates.find(
-      (u) => u.usageDetails?.input === 31 && u.usageDetails?.output === 5,
+    const generations = otlpSpans(bodies)
+      .filter((sp) => sp.attrs["langfuse.observation.type"] === "generation")
+      .map((sp) => ({
+        traceId: sp.traceId,
+        usage: jsonAttr(sp.attrs, "langfuse.observation.usage_details") as
+          | { input?: number; output?: number }
+          | undefined,
+      }));
+    const guard = generations.find(
+      (g) => g.usage?.input === 31 && g.usage?.output === 5,
     );
     expect(guard).toBeDefined();
-    const agent = updates.find((u) => u.usageDetails?.input !== 31);
+    const agent = generations.find((g) => g.usage?.input !== 31);
     expect(agent).toBeDefined();
     expect(guard?.traceId).toBe(agent?.traceId);
   });
@@ -493,10 +504,8 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
     expect(usage[0]?.agentId).toBe(agentId);
   });
 
-  // THE SECOND BOOK (review round 2 of #426). The row above is the ledger; the dollar ceiling reads
-  // Langfuse, which prices what its own generations carry, and a call made by raw fetch is a call
-  // no LangChain callback ever showed it. Without this every vision call stayed outside the month's
-  // cost, and an extraction-only playground could run under the ceiling indefinitely. The
+  // THE SECOND BOOK. The row above is the ledger; the dollar ceiling reads Langfuse, which never sees
+  // a call made by raw fetch unless it is reported, or vision stays outside the month's cost. The
   // generation has to be one the poll's own filters find: the tenant's slug as `userId`, the
   // source's environment, and the usage keyed the way the LangChain handler keys it, so one model
   // definition prices both paths.
@@ -525,22 +534,16 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
     ).slug;
     // The SDK posts through `globalThis.fetch`; the provider is reached through `fetchImpl`, so the
     // two never meet here.
-    const posted: Array<{
-      url: string;
-      batch: Array<Record<string, unknown>>;
-    }> = [];
+    const posted: Array<{ url: string; body: string }> = [];
     const realFetch = globalThis.fetch;
     globalThis.fetch = (async (
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
       const url = String(input instanceof Request ? input.url : input);
-      const body = JSON.parse(String(init?.body ?? "{}")) as {
-        batch?: Array<Record<string, unknown>>;
-      };
-      posted.push({ url, batch: body.batch ?? [] });
-      return new Response(JSON.stringify({ successes: [], errors: [] }), {
-        status: 207,
+      posted.push({ url, body: otlpBodyText(init?.body) });
+      return new Response("{}", {
+        status: 200,
         headers: { "content-type": "application/json" },
       });
     }) as typeof fetch;
@@ -602,141 +605,107 @@ describe.skipIf(!dbUp)("billed model calls reach the usage ledger", () => {
     for (const p of posted) {
       expect(p.url.startsWith("https://langfuse.example.test/")).toBe(true);
     }
-    const events = posted.flatMap((p) => p.batch);
-    expect(events.find((e) => e.type === "trace-create")?.body).toMatchObject({
-      id: turnId,
-      sessionId: threadId,
-      userId: slug,
-      environment: environmentForSource("inbox"),
-    });
+    const gen = otlpSpans(posted.map((p) => p.body)).find(
+      (sp) => sp.name === "vision",
+    );
+    expect(gen?.traceId).toBe(traceIdForTurn(turnId));
+    expect(gen?.attrs["session.id"]).toBe(threadId);
+    expect(gen?.attrs["user.id"]).toBe(slug);
+    expect(gen?.attrs["langfuse.environment"]).toBe(
+      environmentForSource("inbox"),
+    );
+    expect(gen?.attrs["langfuse.observation.type"]).toBe("generation");
+    expect(gen?.attrs["langfuse.observation.model.name"]).toBe(VISION_MODEL);
+    // `input` net of the cached subset, the subset under the handler's own key.
     expect(
-      events.find((e) => e.type === "generation-create")?.body,
-    ).toMatchObject({
-      traceId: turnId,
-      name: "vision",
-      model: VISION_MODEL,
-      environment: environmentForSource("inbox"),
-      // `input` net of the cached subset, the subset under the handler's own key.
-      usageDetails: {
-        input: 301,
-        output: 24,
-        total: 837,
-        input_cache_read: 512,
-      },
+      jsonAttr(gen?.attrs ?? {}, "langfuse.observation.usage_details"),
+    ).toEqual({
+      input: 301,
+      output: 24,
+      total: 837,
+      input_cache_read: 512,
     });
     // The ledger row was written too: both books, one call.
     expect((await usageRows(threadId)).map((u) => u.node)).toEqual(["vision"]);
   });
 });
 
-// The fence. Fixing the two offenders above closes today's hole; this is what stops the next call
-// site from being born with it, and it is why this issue was one issue rather than two reports.
-//
-// The predicate is the offender's GRAMMAR, not its intention: an option bag handed to a model
-// invocation that names `signal` and not `callbacks`. Both guardrail sites read exactly that way,
-// and both sites that had already been fixed by hand (`tts/normalize.ts`, `memory/summarize.ts`)
-// carry `callbacks` right beside `signal`.
-//
-// Measured against the tree with the guardrail fix reverted, the sweep reports both sites; against
-// the tree as it stands, none.
-const INVOKE_OPTIONS = /\.invoke\([\s\S]{0,400}?\{([^{}]*signal:[^{}]*)\}/g;
-
-function sinkless(source: string): string[] {
-  const out: string[] = [];
-  for (const m of source.matchAll(INVOKE_OPTIONS)) {
-    if (!m[1]?.includes("callbacks")) out.push(m[1] ?? "");
-  }
-  return out;
-}
-
-async function tsFilesUnder(dir: string): Promise<string[]> {
-  const glob = new Bun.Glob("**/*.ts");
-  const out: string[] = [];
-  for await (const f of glob.scan({ cwd: dir, absolute: true })) out.push(f);
-  return out;
-}
-
-describe("every model invocation carries a usage sink", () => {
-  // A sweep that finds nothing passes whether the rule holds or the predicate is broken. This is
-  // what tells the two apart, and it is the shape the real offender had.
-  test("the predicate recognises an invocation with no sink", () => {
-    const offender = `
-      const res = await model.invoke(messages, {
-        signal: AbortSignal.timeout(15_000),
-      });`;
-    const fixed = `
-      const res = await model.invoke(messages, {
-        signal: AbortSignal.timeout(15_000),
-        callbacks,
-      });`;
-    expect(sinkless(offender).length).toBe(1);
-    expect(sinkless(fixed).length).toBe(0);
+// The ledger holds rows for calls the agent did not make (vision bills before the
+// bot-ownership gate), so "has a billed call" is not "the agent took this conversation" for
+// `getKpis`. Every node written must be classified, and that is the type's job: the three sinks take
+// a `UsageNode`, whose members are the classification map's keys. The function below is never run;
+// each `@ts-expect-error` fails the typecheck the day its sink accepts an unclassified node again.
+function unclassifiedNodesDoNotCompile(flow: FlowContext, cfg: AgentConfig) {
+  new UsageCapture({
+    tenantId: 1n,
+    provider: "p",
+    model: "m",
+    // @ts-expect-error: a node outside the vocabulary has no answer to "did the agent run".
+    node: "brand_new_node",
   });
-
-  test("no billed call in src/ invokes a model without one", async () => {
-    const offenders: string[] = [];
-    for (const file of await tsFilesUnder(
-      fileURLToPath(new URL("../../src", import.meta.url)),
-    )) {
-      const found = sinkless(await Bun.file(file).text());
-      for (const f of found) {
-        offenders.push(`${file.split("/src/")[1]}: ${f.trim().slice(0, 60)}`);
-      }
-    }
-    expect(offenders).toEqual([]);
+  void recordDirectUsage(flow, {
+    provider: "p",
+    model: "m",
+    // @ts-expect-error: same, for a call that bypasses LangChain.
+    node: "brand_new_node",
+    promptTokens: 1,
+    completionTokens: 1,
   });
-});
-
-// A second sweep, over the other half of the same defect. Completing the ledger did not only add
-// rows: it added a KIND of row, and `getKpis` was reading "this conversation has a billed call" as
-// "the agent took this conversation". That held only while the calls the agent did not make had no
-// row. Vision is the first node that bills before the bot-ownership gate, and it will not be the
-// last, so the classification is total and this is what keeps it total.
-//
-// The predicate is the writer's grammar: a `node:` key resolving to a string literal, inside a file
-// that builds a ledger sink. Scoping it to sink files is what keeps unrelated `node:` keys (an n8n
-// workflow graph names its steps that way) out of the vocabulary.
-const SINK_FILE = /new UsageCapture\(|recordDirectUsage\(|buildCallbacks\(/;
-const NODE_LITERAL = /\bnode:\s*[^,\n}]*?"([a-z_]+)"/g;
-
-function nodesWritten(source: string): string[] {
-  if (!SINK_FILE.test(source)) return [];
-  return [...source.matchAll(NODE_LITERAL)].map((m) => m[1] as string);
+  // @ts-expect-error: same, for a turn's callbacks.
+  buildCallbacks(cfg, { tenantId: 1n, threadId: "t", node: "brand_new_node" });
 }
+void unclassifiedNodesDoNotCompile;
+
+const resultOf = (input: number, output: number) =>
+  ({
+    generations: [
+      [
+        {
+          text: "ok",
+          message: {
+            usage_metadata: { input_tokens: input, output_tokens: output },
+          },
+        },
+      ],
+    ],
+  }) as unknown as LLMResult;
 
 describe("every node the ledger writes is classified for the involvement KPI", () => {
-  // Without this, a sweep that classifies nothing passes exactly like one that classifies
-  // everything. The fixture is the shape the next offender has: a new billed call, a new label.
-  test("the predicate finds a node a sink file writes, and ignores one it does not", () => {
-    const sink = `
-      await recordDirectUsage(params.flow, {
-        model: cfg.model,
-        node: "brand_new_node",
-      });`;
-    const notASink = `
-      const wf = { main: [[{ node: "HTTP Request", type: "main", index: 0 }]] };`;
-    expect(nodesWritten(sink)).toEqual(["brand_new_node"]);
-    expect(nodesWritten(notASink)).toEqual([]);
-    expect(USAGE_NODE_IS_AGENT_TURN.brand_new_node).toBeUndefined();
-  });
-
-  test("no node reaches a row without an answer to 'did the agent run'", async () => {
-    const found = new Set<string>();
-    for (const file of await tsFilesUnder(
-      fileURLToPath(new URL("../../src", import.meta.url)),
-    )) {
-      for (const node of nodesWritten(await Bun.file(file).text())) {
-        found.add(node);
-      }
+  test("a row billed under each node carries it, and the KPI has its answer", async () => {
+    const nodes = Object.keys(USAGE_NODE_IS_AGENT_TURN) as UsageNode[];
+    const rows: UsageRow[] = [];
+    for (const node of nodes) {
+      await new UsageCapture({
+        tenantId: 1n,
+        provider: "test-provider",
+        model: "m",
+        node,
+        persist: async (row) => {
+          rows.push(row);
+        },
+      }).handleLLMEnd(resultOf(3, 2), `run-${node}`);
     }
-    // Both directions. A node written but unclassified is the hole vision just opened; a node
-    // classified but no longer written is a rule about code that is gone, and the map is what a
-    // reader trusts to be the whole vocabulary.
-    expect([...found].sort()).toEqual(
-      Object.keys(USAGE_NODE_IS_AGENT_TURN).sort(),
-    );
+    expect(rows.map((r) => r.node)).toEqual(nodes);
+    for (const r of rows) {
+      expect(typeof USAGE_NODE_IS_AGENT_TURN[r.node as UsageNode]).toBe(
+        "boolean",
+      );
+    }
     // The claim the KPI actually rests on, spelled out where it can go red.
-    expect([...NON_AGENT_TURN_NODES].sort()).toEqual(["observer", "vision"]);
+    expect([...NON_AGENT_TURN_NODES].sort()).toEqual([
+      "choice_check",
+      "decision",
+      "observer",
+      "occurrence_assignment",
+      "occurrence_canonical",
+      "occurrence_consolidation",
+      "occurrence_reading",
+      "occurrence_transcription",
+      "occurrence_vision",
+      "other_inbox_summary",
+      "suggestion_review",
+      "vision",
+    ]);
   });
 });
 

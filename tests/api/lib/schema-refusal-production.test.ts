@@ -1,25 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 
-// The whole reason src/api/lib/schema-refusal.ts exists is what the app answered under
-// NODE_ENV=production, and that is the one environment this suite cannot enter: tests/setup.ts pins
-// NODE_ENV=test, and Elysia reads `isProduction` ONCE, at module load of elysia/dist/error.js, so no
-// amount of setting the variable inside a test reaches it. So the production side runs for real, in
-// a subprocess, the way tests/scripts/db-bootstrap.test.ts runs the bootstrap script.
-//
-// Two claims live only here. The first is that the leak is not something the environment already
-// fixes: production trims `property`, `message` and `expected` out of the JSON Elysia builds, but it
-// keeps `found`, so the submitted value is still sitting on the error when our handler receives it.
-// The second is the contract this fix depends on: `valueError` is populated in production too. That
-// is worth pinning rather than assuming, because the SAME constructor already gates `expected`
-// behind `isProduction` — a future Elysia gating `valueError` the same way would drop `field` from
-// every refusal in production while every other test in this directory stayed green.
+// Runs NODE_ENV=production in a subprocess (like tests/scripts/db-bootstrap.test.ts): tests/setup.ts
+// pins NODE_ENV=test, and Elysia reads `isProduction` once, at module load of elysia/dist/error.js.
+// Two claims live only here. Production trims `property`, `message` and `expected` from Elysia's JSON
+// but keeps `found`, so the submitted value still reaches our handler. And `valueError` is populated
+// in production too: the same constructor gates `expected` behind `isProduction`, and gating
+// `valueError` the same way would drop `field` from every production refusal with every other test
+// in this directory still green.
 const SECRET = "sk-live-PRODUCTION-PROBE-9f3a";
 const REPO_ROOT = fileURLToPath(new URL("../../../", import.meta.url));
+// The module under test, resolved by this process so the subprocess imports the same file.
+const SCHEMA_REFUSAL = Bun.resolveSync(
+  "@/api/lib/schema-refusal",
+  import.meta.dir,
+);
 
 const PROGRAM = `
 import { t, ValidationError } from "elysia";
-const { schemaRefusal } = await import("./src/api/lib/schema-refusal.ts");
+const { schemaRefusal } = await import(${JSON.stringify(SCHEMA_REFUSAL)});
 const schema = t.Object({
   name: t.String({ minLength: 1 }),
   value: t.Object({ api_key: t.String() }),

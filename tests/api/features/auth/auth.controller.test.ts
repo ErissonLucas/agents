@@ -20,7 +20,7 @@ import {
 
 setupPrismaMock();
 
-// NOTE: Drive the real setup state machine via its exported helpers instead of
+// Drive the real setup state machine via its exported helpers instead of
 // mocking it: Bun's mock.module is process-global, so a partial mock here would
 // leak into setup.service.test.ts (which needs the real module).
 const { authController } = await import("@/api/features/auth/auth.controller");
@@ -34,7 +34,7 @@ const createTestClient = () => {
 };
 
 describe("authController", () => {
-  // NOTE: `config` is a process-global singleton imported across test files in
+  // `config` is a process-global singleton imported across test files in
   // a single Bun process, so any mutation that escapes this file would leak to
   // others (order-dependent contamination). Snapshot once and restore on exit.
   const originalSignupEnabled = config.signupEnabled;
@@ -168,9 +168,8 @@ describe("authController", () => {
         "error",
         "Email already in use",
       );
-      // And the input it is about. The signup form has two boxes and only one of them can be fixed,
-      // so a sentence with no name sends the operator to guess (#320). Built by hand in the
-      // controller rather than raised as an AppError, which is why `refusalBody` never sees it.
+      // NOTE: the refusal names the input: the signup form has two boxes and only one can be fixed.
+      // Built by hand in the controller rather than raised as an AppError, so `refusalBody` never sees it.
       expect(response.error?.value).toHaveProperty("field", "email");
     });
 
@@ -308,7 +307,7 @@ describe("authController", () => {
     });
 
     test("returns default flag values when setup is complete and signup is open", async () => {
-      // NOTE: beforeEach already left us in this state (signupEnabled=true,
+      // beforeEach already left us in this state (signupEnabled=true,
       // setupTokenRequired=false, completeSetup()); the assertion guards
       // against a future regression that ties the flags to the request user
       // or otherwise breaks the boot-state plumbing.
@@ -323,8 +322,8 @@ describe("authController", () => {
       });
     });
 
-    // Issue #802: the editor needs to know whether the per-agent audio check can do anything, and
-    // what "the instance default" means. The address and the token never leave the server.
+    // The editor needs to know whether the per-agent audio check can do anything, and what "the
+    // instance default" means. The address and the token never leave the server.
     test("says whether the audio detector runs, and its default mode, and nothing else about it", async () => {
       const original = { ...config.ttsCheck };
       try {
@@ -365,12 +364,30 @@ describe("authController", () => {
   });
 
   describe("POST /auth/logout", () => {
-    test("logs out successfully", async () => {
-      const api = createTestClient();
-      const response = await api.auth.logout.post();
+    test("logs out by expiring the current and the legacy session cookie", async () => {
+      // Happy-dom drops `Cookie` from its Request and `Set-Cookie` from its Response, so the
+      // request is Bun's and the cookies are read off the jar Elysia serializes.
+      let jar: Record<string, unknown> | undefined;
+      const app = new Elysia()
+        .onAfterHandle(({ set }) => {
+          jar = structuredClone(set.cookie);
+        })
+        .use(authController);
+      const BunReq = (globalThis as unknown as { BunRequest: typeof Request })
+        .BunRequest;
+      const response = await app.handle(
+        new BunReq("http://localhost/auth/logout", {
+          method: "POST",
+          headers: {
+            cookie: "fazerai_auth_token=a; secretaria_v4_auth_token=b",
+          },
+        }),
+      );
 
       expect(response.status).toBe(200);
-      expect(response.data).toHaveProperty("success", true);
+      const expired = { value: "", maxAge: 0 };
+      expect(jar?.fazerai_auth_token).toMatchObject(expired);
+      expect(jar?.secretaria_v4_auth_token).toMatchObject(expired);
     });
   });
 });

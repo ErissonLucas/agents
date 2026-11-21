@@ -1,0 +1,501 @@
+import { ChevronDown, ChevronRight, ExternalLink } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Badge, Button, Card, Skeleton } from "@/client/components";
+import { api } from "@/client/lib/api";
+import { cn, formatRelativeTime } from "@/client/lib/utils";
+import { THEMES_LIMIT_RANGE } from "@/modules/occurrences/settings";
+import { OccurrencePager } from "./OccurrencePager";
+import { heldPhrase } from "./occurrenceWords";
+
+type Theme = NonNullable<
+  Awaited<ReturnType<typeof api.api.v1.occurrences.themes.get>>["data"]
+>["themes"][number];
+type ThemeDetail = NonNullable<
+  Awaited<
+    ReturnType<ReturnType<typeof api.api.v1.occurrences.themes>["get"]>
+  >["data"]
+>["theme"];
+
+// Themes shown per page.
+export const THEMES_PAGE = 20;
+
+// The monitor's open themes, flagged first, a page at a time. The list is read once and paged here,
+// so a round that reorders the themes while the operator pages never repeats or skips one; Refresh
+// reads it again. Opening one shows its conversations, each with the sentence its customer's
+// conversation produced, verbatim, and a link to it in Chatwoot.
+// Two names that differ only in case, accents or spacing say the same thing.
+function sameWords(a: string, b: string): boolean {
+  const norm = (x: string) =>
+    x
+      .normalize("NFD")
+      .replace(/\p{M}/gu, "")
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, " ");
+  return norm(a) === norm(b);
+}
+
+type ThemeEvent = ThemeDetail["events"][number];
+
+// The fields a consolidation event's detail may carry (docs/occurrences.md, "Themes"); anything else
+// in it is ignored, so an older event without a reason shows the decision alone.
+function eventDetail(e: ThemeEvent): {
+  from?: string;
+  to?: string;
+  titles?: string[];
+  reason?: string;
+} {
+  const d = e.detail;
+  if (d === null || typeof d !== "object" || Array.isArray(d)) return {};
+  const o = d as Record<string, unknown>;
+  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+  return {
+    from: str(o.from),
+    to: str(o.to),
+    titles: Array.isArray(o.titles)
+      ? o.titles.filter((x): x is string => typeof x === "string")
+      : undefined,
+    reason: str(o.reason),
+  };
+}
+
+export function OccurrenceThemes({
+  monitorId,
+  active = true,
+  focus = null,
+}: {
+  monitorId: string;
+  active?: boolean;
+  // A theme to open, from the flag history: its page is shown and it is expanded, once per `seq`.
+  // `title` names it when the list read after the request does not have it.
+  focus?: { id: string; seq: number; title: string } | null;
+}) {
+  const { t, i18n } = useTranslation();
+  const [themes, setThemes] = useState<Theme[] | null>(null);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
+  const [readAt, setReadAt] = useState<Date | null>(null);
+  const [failed, setFailed] = useState(false);
+  const [open, setOpen] = useState<string | null>(null);
+  // Keyed by the theme it answers for, so a slow answer for a theme closed since never shows under
+  // another one; `seq` drops every answer but the latest request's.
+  const [detail, setDetail] = useState<
+    { id: string; theme: ThemeDetail } | { id: string; failed: true } | null
+  >(null);
+  const seq = useRef(0);
+  const when = (iso: string | null) =>
+    iso
+      ? new Date(iso).toLocaleString(i18n.language, {
+          dateStyle: "short",
+          timeStyle: "short",
+        })
+      : "";
+  // One history line per event, in the theme's own words: what happened, then the model's reason.
+  const eventLine = (e: ThemeEvent, themeId: string): string => {
+    const d = eventDetail(e);
+    if (e.kind === "merge")
+      return e.intoId === themeId
+        ? t(
+            "occurrences.eventMergedHere",
+            "“{{theme}}” joined into this theme",
+            {
+              theme: e.themeTitle,
+            },
+          )
+        : t(
+            "occurrences.eventMerged",
+            "“{{theme}}” joined into another theme",
+            {
+              theme: e.themeTitle,
+            },
+          );
+    if (e.kind === "split")
+      return t("occurrences.eventSplit", "“{{theme}}” split into {{parts}}", {
+        theme: e.themeTitle,
+        parts: (d.titles ?? []).map((p) => `“${p}”`).join(", "),
+      });
+    if (e.kind === "rename")
+      return t(
+        "occurrences.eventRenamed",
+        "Renamed from “{{from}}” to “{{to}}”",
+        { from: d.from ?? "", to: d.to ?? e.themeTitle },
+      );
+    return e.kind;
+  };
+  const flagLabel = (f: string) =>
+    f === "new"
+      ? t("occurrences.flagNew", "new")
+      : f === "above_usual"
+        ? t("occurrences.flagAboveUsual", "above its usual")
+        : f === "concentrated"
+          ? t(
+              "occurrences.flagConcentratedReference",
+              "concentrated on one reference",
+            )
+          : f;
+
+  // Each list read is numbered, and only the latest one's answer is kept: two reads on the wire at once
+  // (opening the tab and a focus request) never let the older one replace the newer.
+  const loadSeq = useRef(0);
+  const reads = useRef(0);
+  const [listReads, setListReads] = useState(0);
+  const load = useCallback(async () => {
+    const mine = ++loadSeq.current;
+    setFailed(false);
+    const res = await api.api.v1.occurrences
+      .monitors({ id: monitorId })
+      .themes.get({ query: { limit: THEMES_LIMIT_RANGE.max } });
+    if (mine !== loadSeq.current) return;
+    if (res.error || !res.data) {
+      setFailed(true);
+      return;
+    }
+    const list = res.data.themes;
+    reads.current += 1;
+    setListReads(reads.current);
+    setThemes(list);
+    setTotal(res.data.total);
+    setReadAt(new Date());
+    // The page stays where it was while it still has themes.
+    setPage((p) =>
+      Math.min(p, Math.max(0, Math.ceil(list.length / THEMES_PAGE) - 1)),
+    );
+  }, [monitorId]);
+
+  // Read again each time the tab is opened, so the themes a round just placed are there.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: opening the tab is the trigger; refresh reads the open theme too.
+  useEffect(() => {
+    if (active) void refresh();
+  }, [active]);
+
+  // A focus request reads the list again and is applied once, against a list read after it, never one
+  // cached from before: the theme is then on the page that list puts it on, or, when that list does not
+  // have it (past the 500 listed, or none of its conversations in a monitored inbox now), named as
+  // missing.
+  const appliedFocus = useRef(0);
+  const focusAsked = useRef<{ seq: number; at: number } | null>(null);
+  const [missing, setMissing] = useState<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new request (its seq) is the trigger.
+  useEffect(() => {
+    if (!focus) return;
+    focusAsked.current = { seq: focus.seq, at: reads.current };
+    void load();
+  }, [focus?.seq]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new focus or a new list is the trigger.
+  useEffect(() => {
+    if (!focus || themes === null || appliedFocus.current === focus.seq) return;
+    if (focusAsked.current?.seq !== focus.seq) return;
+    if (listReads <= focusAsked.current.at) return;
+    appliedFocus.current = focus.seq;
+    const i = themes.findIndex((th) => th.id === focus.id);
+    if (i < 0) {
+      setMissing(focus.title);
+      return;
+    }
+    setMissing(null);
+    setPage(Math.floor(i / THEMES_PAGE));
+    setOpen(focus.id);
+    void loadDetail(focus.id);
+  }, [focus?.seq, themes, listReads]);
+
+  // Refresh reads the expanded theme's conversations too, so its evidence never lags its totals.
+  async function refresh() {
+    await Promise.all([load(), ...(open === null ? [] : [loadDetail(open)])]);
+  }
+
+  async function toggle(id: string) {
+    if (open === id) {
+      setOpen(null);
+      return;
+    }
+    setOpen(id);
+    await loadDetail(id);
+  }
+
+  async function loadDetail(id: string) {
+    const mine = ++seq.current;
+    setDetail(null);
+    const res = await api.api.v1.occurrences
+      .monitors({ id: monitorId })
+      .themes({ themeId: id })
+      .get();
+    if (mine !== seq.current) return;
+    setDetail(
+      !res.error && res.data
+        ? { id, theme: res.data.theme }
+        : { id, failed: true },
+    );
+  }
+
+  return (
+    <Card className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-text-primary font-medium">
+            {t("occurrences.themes", "Open themes")}
+          </h2>
+          <p className="text-text-muted text-xs">
+            {t(
+              "occurrences.themesIntro",
+              "Flagged first, then the most recently seen. {{size}} per page.",
+              { size: THEMES_PAGE },
+            )}
+            {readAt &&
+              ` ${t("occurrences.themesReadAt", "Read at {{time}}.", {
+                time: readAt.toLocaleTimeString(i18n.language, {
+                  timeStyle: "short",
+                }),
+              })}`}
+          </p>
+        </div>
+        <Button size="sm" variant="secondary" onClick={refresh}>
+          {t("common.refresh", "Refresh")}
+        </Button>
+      </div>
+      {missing !== null && (
+        <p data-focus-missing className="text-text-muted text-sm">
+          {t(
+            "occurrences.focusMissing",
+            "“{{theme}}” is not in this list now: none of its conversations is in a monitored inbox, or it is past the themes listed.",
+            { theme: missing },
+          )}
+        </p>
+      )}
+      {failed ? (
+        <p className="text-text-muted text-sm">
+          {t("occurrences.themesError", "Could not read the themes.")}
+        </p>
+      ) : themes === null ? (
+        <div role="status" className="flex flex-col gap-2">
+          <span className="sr-only">{t("common.loading", "Loading…")}</span>
+          <Skeleton className="h-6 w-full" />
+          <Skeleton className="h-6 w-full" />
+        </div>
+      ) : themes.length === 0 ? (
+        <p className="text-text-muted text-sm">
+          {t("occurrences.themesEmpty", "No open theme yet.")}
+        </p>
+      ) : (
+        <ul className="divide-border flex flex-col divide-y">
+          {themes
+            .slice(page * THEMES_PAGE, (page + 1) * THEMES_PAGE)
+            .map((th) => (
+              <li
+                key={th.id}
+                className={cn("py-2", th.heldSince && "opacity-60")}
+                data-held={th.heldSince ? "true" : undefined}
+              >
+                <button
+                  type="button"
+                  className="flex w-full items-start gap-2 text-left"
+                  aria-expanded={open === th.id}
+                  onClick={() => toggle(th.id)}
+                >
+                  {open === th.id ? (
+                    <ChevronDown
+                      className="mt-0.5 h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    />
+                  ) : (
+                    <ChevronRight
+                      className="mt-0.5 h-4 w-4 shrink-0"
+                      aria-hidden="true"
+                    />
+                  )}
+                  <span className="flex min-w-0 flex-1 flex-col gap-1">
+                    <span className="text-text-primary text-sm font-medium">
+                      {th.title}
+                    </span>
+                    <span className="text-text-muted flex flex-wrap items-center gap-2 text-xs">
+                      <span>
+                        {t(
+                          "occurrences.themeConversationCount",
+                          "{{count}} conversations",
+                          { count: th.conversations },
+                        )}
+                      </span>
+                      {/* The main reference, named, and only when it says more than the title. */}
+                      {th.reference && !sameWords(th.reference, th.title) && (
+                        <span>
+                          {t(
+                            "occurrences.themeReference",
+                            "Reference: {{reference}}",
+                            { reference: th.reference },
+                          )}
+                        </span>
+                      )}
+                      {th.lastSeenAt && (
+                        <time dateTime={th.lastSeenAt}>
+                          {t(
+                            "occurrences.themeLastSeen",
+                            "last seen {{when}}",
+                            {
+                              when: formatRelativeTime(
+                                th.lastSeenAt,
+                                i18n.language,
+                              ),
+                            },
+                          )}
+                        </time>
+                      )}
+                      {th.critical && (
+                        <span data-critical-badge className="contents">
+                          <Badge variant="error">
+                            {t("dashboards.themes.critical", "Critical")}
+                          </Badge>
+                        </span>
+                      )}
+                      {th.flags.map((f) => (
+                        <Badge
+                          key={f}
+                          variant={th.heldSince ? "secondary" : "warning"}
+                        >
+                          {flagLabel(f)}
+                        </Badge>
+                      ))}
+                      {/* Held: flagged, but cooling down since then; drawn muted in its place. */}
+                      {th.heldSince && (
+                        <span data-held-since>
+                          {heldPhrase(t, i18n.language, th.flags, th.heldSince)}
+                        </span>
+                      )}
+                    </span>
+                  </span>
+                </button>
+                {open === th.id && (
+                  <div className="mt-2 ml-6 flex flex-col gap-1">
+                    {/* The exact times, where touch and keyboard reach them: the row says them
+                        relatively. */}
+                    {th.lastSeenAt && (
+                      <p className="text-text-muted text-xs">
+                        {th.firstSeenAt === th.lastSeenAt
+                          ? t("occurrences.themeSeenAt", "Seen at {{when}}.", {
+                              when: when(th.lastSeenAt),
+                            })
+                          : t(
+                              "occurrences.themeSeenRange",
+                              "Seen from {{first}} to {{last}}.",
+                              {
+                                first: when(th.firstSeenAt),
+                                last: when(th.lastSeenAt),
+                              },
+                            )}
+                      </p>
+                    )}
+                    {detail === null || detail.id !== th.id ? (
+                      <Skeleton className="h-6 w-full" />
+                    ) : "failed" in detail ? (
+                      <div className="text-text-muted flex flex-wrap items-center gap-2 text-sm">
+                        <span role="alert">
+                          {t(
+                            "occurrences.themeDetailError",
+                            "Could not read this theme's conversations.",
+                          )}
+                        </span>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          onClick={() => loadDetail(th.id)}
+                        >
+                          {t("common.retry", "Retry")}
+                        </Button>
+                      </div>
+                    ) : (
+                      <ul className="flex flex-col gap-1">
+                        {detail.theme.conversationsShown.map((c) => (
+                          <li
+                            key={c.conversationId}
+                            className="flex flex-wrap items-baseline gap-2 text-sm"
+                          >
+                            <a
+                              href={c.url}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-accent inline-flex items-center gap-1"
+                            >
+                              {`#${c.chatwootConversationId}`}
+                              <ExternalLink
+                                className="h-3 w-3"
+                                aria-hidden="true"
+                              />
+                            </a>
+                            <span className="text-text-primary">
+                              {c.sentence}
+                            </span>
+                            {c.reference && (
+                              <span className="text-text-muted text-xs">
+                                {c.reference}
+                              </span>
+                            )}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {detail !== null &&
+                      detail.id === th.id &&
+                      !("failed" in detail) &&
+                      detail.theme.events.length > 0 && (
+                        <div className="mt-2 flex flex-col gap-1">
+                          <h3 className="text-text-muted text-xs font-medium">
+                            {t("occurrences.themeHistory", "History")}
+                          </h3>
+                          <ul className="flex flex-col gap-1.5">
+                            {detail.theme.events.map((e) => {
+                              const reason = eventDetail(e).reason;
+                              return (
+                                <li
+                                  key={`${e.kind}-${e.themeId}-${e.at}`}
+                                  className="flex flex-col text-sm"
+                                >
+                                  <span className="text-text-primary">
+                                    {eventLine(e, th.id)}
+                                    <time
+                                      dateTime={e.at}
+                                      className="text-text-muted ml-2 text-xs"
+                                    >
+                                      {when(e.at)}
+                                    </time>
+                                  </span>
+                                  {reason && (
+                                    <span className="text-text-muted text-xs">
+                                      {reason}
+                                    </span>
+                                  )}
+                                </li>
+                              );
+                            })}
+                          </ul>
+                        </div>
+                      )}
+                  </div>
+                )}
+              </li>
+            ))}
+        </ul>
+      )}
+      {themes !== null && themes.length > 0 && (
+        <>
+          <OccurrencePager
+            label={t("occurrences.themesPages", "Theme pages")}
+            first={page * THEMES_PAGE + 1}
+            shown={Math.min(THEMES_PAGE, themes.length - page * THEMES_PAGE)}
+            total={themes.length}
+            onPrevious={page > 0 ? () => setPage((p) => p - 1) : null}
+            onNext={() => setPage((p) => p + 1)}
+            hasNext={(page + 1) * THEMES_PAGE < themes.length}
+          />
+          {total > themes.length && (
+            <p className="text-text-muted text-xs">
+              {t(
+                "occurrences.themesTruncated",
+                "Showing the first {{shown}} of {{total}} open themes.",
+                { shown: themes.length, total },
+              )}
+            </p>
+          )}
+        </>
+      )}
+    </Card>
+  );
+}

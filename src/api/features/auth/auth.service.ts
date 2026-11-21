@@ -10,7 +10,7 @@ function emailDomainMatches(email: string, domains: string[]): boolean {
   if (domains.length === 0) return false;
   const domain = email.trim().toLowerCase().split("@")[1];
   if (!domain) return false;
-  // NOTE: Defensive normalization in case the configured list is mutated
+  // Defensive normalization in case the configured list is mutated
   // outside of parseDomainList (e.g. tests).
   const normalized = new Set(
     domains
@@ -25,7 +25,7 @@ export function isEmailDomainAllowed(email: string): boolean {
   return emailDomainMatches(email, config.allowedSignupDomains);
 }
 
-// NOTE: `emailVerified` gates elevation: password signups never count as verified, so
+// `emailVerified` gates elevation: password signups never count as verified, so
 // anyone holding an admin-domain address still needs a verified channel (e.g. Google)
 // before being elevated to TENANT_ADMIN. SUPER_ADMIN is never granted via signup — only
 // through the first-run /setup flow.
@@ -39,8 +39,8 @@ export function getSignupRoleForEmail(
     : "AGENT";
 }
 
-// A person and the tenants they belong to (issue #756): one user per email, a membership per tenant.
-const AUTH_USER_SELECT = {
+// A person and the tenants they belong to: one user per email, a membership per tenant.
+export const AUTH_USER_SELECT = {
   id: true,
   email: true,
   name: true,
@@ -51,7 +51,7 @@ const AUTH_USER_SELECT = {
   },
 } as const;
 
-type PersonRow = {
+export type PersonRow = {
   id: bigint;
   email: string;
   name: string | null;
@@ -103,9 +103,7 @@ export function isAdminAnywhere(row: {
 
 export async function getUserByEmail(email: string) {
   // NOTE: `findFirst` over a case-insensitive match is still exact: the email is unique across the
-  // install, case folded (`users_email_key` on lower(email), issue #756), and `emailEquals` keeps
-  // `_`/`%` literal. Before, it was unique per tenant and this read picked one of a person's rows with
-  // no order at all.
+  // install, case folded (`users_email_key` on lower(email)), and `emailEquals` keeps `_`/`%` literal.
   return prisma.user.findFirst({
     where: { email: emailEquals(email) },
     select: {
@@ -132,7 +130,7 @@ export async function getUserByGoogleId(googleId: string) {
   });
 }
 
-// NOTE: public signup users are always AGENT and must belong to a tenant; the caller
+// Public signup users are always AGENT and must belong to a tenant; the caller
 // resolves which tenant (see resolveDefaultTenantId). The person and their membership are created
 // together, so a signup never leaves a user with nowhere to enter.
 export async function createUser(
@@ -160,7 +158,7 @@ export class SetupAlreadyCompleteError extends Error {
   }
 }
 
-// NOTE: Arbitrary fixed key for the transaction-scoped advisory lock that
+// Arbitrary fixed key for the transaction-scoped advisory lock that
 // serializes first-run setup. Any concurrent POST /auth/setup waits on the lock,
 // then sees a non-empty users table and aborts, so exactly one SUPER_ADMIN is created
 // even with the setup token disabled. xact-scoped lock auto-releases on
@@ -180,11 +178,10 @@ export function slugifyCompany(name: string): string {
   return slug || "default";
 }
 
-// NOTE: First-run bootstrap. Creates the SUPER_ADMIN (no membership — fleet-level) and the initial
-// Tenant (named after the operator's company, Chatwoot-style onboarding — no more hardcoded
-// "Default"), inside one transaction under asSuperAdmin (the Tenant INSERT needs the fleet role so
-// RLS WITH CHECK passes). The advisory lock + count re-check make it idempotent across replicas.
-// Returns the SUPER_ADMIN user AND the new tenant id (so the client can auto-select it). Throws
+// First-run bootstrap: the SUPER_ADMIN (fleet-level, no membership) and the initial tenant, named
+// after the operator's company, in one transaction under asSuperAdmin (the tenant INSERT needs the
+// fleet role to pass RLS WITH CHECK). The advisory lock plus count re-check make it idempotent across
+// replicas. Returns the user and the new tenant id so the client can auto-select it; throws
 // SetupAlreadyCompleteError if a user exists.
 export async function createInitialAdmin(params: {
   email: string;
@@ -225,7 +222,7 @@ export async function createInitialAdmin(params: {
   });
 }
 
-// NOTE: tenant a public/Google self-signup user joins. Single-tenant deployments have
+// Tenant a public/Google self-signup user joins. Single-tenant deployments have
 // exactly one; multi-tenant onboarding via tenant-scoped invites is a later phase.
 export async function resolveDefaultTenantId(): Promise<bigint | null> {
   return asSuperAdmin(async (tx) => {
@@ -260,7 +257,7 @@ export async function createGoogleUser(params: {
   return sessionUserOf(row) as AuthUser;
 }
 
-// NOTE: Conditional update on `googleId: null` closes a TOCTOU race where two
+// Conditional update on `googleId: null` closes a TOCTOU race where two
 // parallel sign-ins for the same email but different Google identities both
 // observe googleId as null and the second write would silently overwrite the
 // first. The loser refetches and either fast-paths an idempotent retry of the
@@ -287,7 +284,7 @@ export async function linkGoogleIdToUser(
   return linked ? sessionUserOf(linked) : null;
 }
 
-// NOTE: a password change was attempted on an account that has no local password (e.g. a
+// A password change was attempted on an account that has no local password (e.g. a
 // Google-only user). The UI shows a "you sign in with Google" note instead of the form.
 export class NoPasswordSetError extends Error {
   constructor() {
@@ -296,7 +293,7 @@ export class NoPasswordSetError extends Error {
   }
 }
 
-// NOTE: the supplied current password did not match. Surfaced as a 400 (not 401) so it does not
+// The supplied current password did not match. Surfaced as a 400 (not 401) so it does not
 // trip the client's unauthorized-session handling — the session is valid, only the field is wrong.
 export class IncorrectPasswordError extends Error {
   constructor() {
@@ -315,13 +312,49 @@ export async function getUserHasPassword(userId: bigint): Promise<boolean> {
   return Boolean(u?.passwordHash);
 }
 
-// Change a user's own password: verify the current one, then store the new hash. Throws
-// NoPasswordSetError (Google-only account) or IncorrectPasswordError (wrong current password).
+// The account facts the Settings pages show: when it was created and which sign-in methods it has.
+export async function getAccountDetails(userId: bigint) {
+  const row = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { createdAt: true, passwordHash: true, googleId: true },
+  });
+  if (!row) return null;
+  return {
+    createdAt: row.createdAt,
+    hasPassword: Boolean(row.passwordHash),
+    googleLinked: row.googleId !== null,
+  };
+}
+
+// The display name is the one profile field a person edits about themselves; null clears it, and
+// the UI shows the email instead. The role is not on the person row (it lives in the memberships),
+// so the caller answers with the one it already resolved.
+export async function updateUserName(userId: bigint, name: string | null) {
+  return prisma.user.update({
+    where: { id: userId },
+    data: { name },
+    select: { id: true, email: true, name: true },
+  });
+}
+
+// Another write changed the password between the verification and the update, so this change did not
+// land and must not be reported as done.
+export class PasswordChangedConcurrentlyError extends Error {
+  constructor() {
+    super("The password was changed by another request");
+    this.name = "PasswordChangedConcurrentlyError";
+  }
+}
+
+// Change a user's own password: verify the current one, then store the new hash, and return it so the
+// caller can re-sign its own session. The new hash revokes every session signed under the old one
+// (`passwordFingerprint` in lib/auth). Throws NoPasswordSetError (Google-only account),
+// IncorrectPasswordError (wrong current password) or PasswordChangedConcurrentlyError.
 export async function changeUserPassword(
   userId: bigint,
   currentPassword: string,
   newPassword: string,
-): Promise<void> {
+): Promise<string> {
   const u = await prisma.user.findUnique({
     where: { id: userId },
     select: { passwordHash: true },
@@ -330,7 +363,23 @@ export async function changeUserPassword(
   const ok = await verifyPassword(currentPassword, u.passwordHash);
   if (!ok) throw new IncorrectPasswordError();
   const passwordHash = await hashPassword(newPassword);
-  await prisma.user.update({ where: { id: userId }, data: { passwordHash } });
+  // Compare-and-swap on the verified hash, so two changes racing on the same current password cannot
+  // both succeed.
+  const { count } = await prisma.user.updateMany({
+    where: { id: userId, passwordHash: u.passwordHash },
+    data: { passwordHash },
+  });
+  if (count !== 1) throw new PasswordChangedConcurrentlyError();
+  return passwordHash;
+}
+
+// The hash a session is signed under when its proof was not a password (Google), read from the row.
+export async function getPasswordHash(userId: bigint): Promise<string | null> {
+  const row = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { passwordHash: true },
+  });
+  return row?.passwordHash ?? null;
 }
 
 export async function hashPassword(password: string): Promise<string> {

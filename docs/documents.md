@@ -24,6 +24,8 @@ A document is an ordered list of blocks, from a **closed** vocabulary
 Every block carries an `id` (so the console can edit one across a reorder made from the API) and an
 optional `spaceAfter`.
 
+**Across a page break**, a `lineItems` row moves to the next page whole instead of splitting its description from its numbers, and the table head prints again at the top of every page the table continues on (it is `fixed` inside the table, so it does not follow the table past its end). A row taller than the page body is the exception: kept whole it would be clipped, so `rowKeepsWhole` (`render.tsx`) measures its description in the page's font and lets it break when it would take more than four fifths of the page. A block's `spaceAfter` is a spacer drawn between it and the next block, not a bottom margin on it, and the last block gets none (a spacer that alone overflowed would open a page with nothing but the footer): with a margin, a block whose content fits the rest of the page but whose margin does not is moved whole to the next page, leaving the page it started on nearly empty.
+
 The set is closed because every block is something the renderer knows how to lay out. What it does
 not cover goes into a `text` block as prose — that is the escape hatch, and it is why there is no
 `html` or `raw` block. `text` understands a small markdown: `**bold**`, `*italic*` / `_italic_`,
@@ -35,6 +37,12 @@ keeps.
 for a sum: it will eventually get one wrong in front of a customer, and the number it got wrong is a
 price. A discount larger than the subtotal is clamped, and the CLAMPED value is what is printed — so
 the three numbers on the page always add up to each other.
+
+**The minimum is one block that prints** (`header`, `text`, `fields`, `lineItems` or `totals`), and no
+fields at all. A template with nothing printable is refused, because every document it issued would
+be a numbered blank page. The `blank` starter is exactly that minimum: one `header` with
+`{{doc_title}} {{doc_number}}`, no fields, the default style and no number prefix, so a template
+built from scratch starts with nothing to delete.
 
 ## Fields and tokens
 
@@ -67,6 +75,17 @@ that is legitimately several lines.
 
 `font` (`sans`/`serif`/`mono`), `baseFontSize`, `accentColor`, `margin`, `pageSize`, `locale`,
 `currency`, `footerText`, `showPageNumbers`.
+
+**A new template starts from one object, `NEW_DOCUMENT_STYLE`**: sans at 10pt, a navy accent
+(`#1e3a8a`), normal margins, A4, page numbers on, and the `{{company_name}} · {{doc_number}}` footer.
+Every starter, the blank one included, spreads it and sets only `locale` and `currency`, and a create
+that names no `footerText` gets the footer too (`newTemplateStyle`; an empty `footerText` is how a
+template has none), so the look changes in one place. A stored template keeps its stored values: on
+read, `DOCUMENT_STYLE_DEFAULTS` (the same object without the footer) fills only a key the row never
+had, since a row saved without a footer would otherwise grow one it never asked for. The accent
+colours the title, the rule under the header, the table head (over a 90% tint of itself) and the
+grand total. No line height is set on the page: inherited by the fixed footer, it pushes the footer
+off the page whenever page numbers are on.
 
 The three families are `@react-pdf/renderer`'s built-ins. There is no `Font.register` and no bundled
 TTF: a face resolves from a path that differs between the dev tree and the container, the registry it
@@ -101,10 +120,15 @@ update that only changes the wording is validated against the stored blocks but 
 them, and the columns it does not address are not rewritten — otherwise the tolerant read (which
 drops what this version does not know) would be written back, and an ordinary console save would
 permanently delete layout a newer build wrote. A stored block whose TYPE this version cannot read at
-all cannot be saved around, so that save is refused and says why.
+all cannot be saved around, so a save that touches the content (`blocks`, `blockText`, `fields` or
+`style`) is refused with 409 `documentTemplateUnreadable` and nothing in it is stored, the other
+fields of the same request included. A save that touches none of those (the name, the slug, the
+switch, numbering, approval) is accepted: it never writes the content columns, so the unknown block
+survives it byte for byte. The console's save always sends the style and the block texts, so on such a
+template the console refuses every save, and a rename goes through REST or MCP.
 
-Sizes stay clamped rather than refused (`baseFontSize`), because a clamp changes a value and never a
-key: "type and choice, never size" (`docs/mcp.md`).
+`baseFontSize` is refused outside 8-14 on every surface (`BASE_FONT_SIZE_RANGE`, agents#1524); the
+reader still clamps a template stored before the refusal existed.
 
 `footerText` goes through the **same token resolver** the block texts do, and it prints on every
 page, so its tokens are validated with them: a template is refused as a whole, style included. That
@@ -131,15 +155,21 @@ and idempotent:
 3. Render the STORED snapshot outside any transaction, write it to a path derived from numeric ids,
    CAS to READY.
 
+The rendered PDF is written to a unique temporary name beside its final path and published with `link`, before the row is CAS'd to READY. `link` fails with EEXIST when the final name exists, so the first publisher wins the file and any later render of the same idempotency key adopts it instead of replacing it (renders share a frozen snapshot, but the logo is read live, so a second render could differ from the one already declared final). Publishing before the CAS means a row is never READY without its bytes, and a crash anywhere in between leaves a PENDING row and at most an unreferenced temporary, both recovered by the next call. Writing straight to the final path would let a second render truncate a file a download is already serving.
+
 Steps 2 and 3 are separate scoped calls rather than one transaction, and the insert is on its own:
 a `P2002` **aborts the PostgreSQL transaction it was raised in**, so the re-read that recovers the
 winner of an idempotency race cannot happen inside the transaction that lost it. Catching the
 conflict and re-reading in the same one turns a benign race — the very thing the key exists to make
 benign — into `current transaction is aborted` and a 500 for whoever arrived second.
 
-The number comes from `UPDATE document_templates SET last_number = last_number + 1 … RETURNING`, so
+The number comes from `UPDATE document_templates SET last_number = GREATEST(last_number, <highest>) + 1 … RETURNING`, so
 the row lock makes it atomic. It is bumped AFTER the insert, so losing a race on the key does not
 consume one. Monotonic, not gapless.
+
+**A printed number names one document in the tenant, and is never issued twice** (`numbering.ts`, issue #1230). The counter is the template's, but a printed number is not: two templates can share a prefix, a prefix can move to one another template already used, a new template can be created on a prefix that already has documents, and two different prefixes can print the same text (`INV-` with 10001 and `INV-1` with 0001 both print `INV-10001`). So the next number is the first one, from one above the larger of the template's counter and the highest number issued in the tenant under its prefix, whose printed text no document of the tenant already carries, by any template, deleted or revoked ones included, since a printed number stays taken. No prefix and an empty one print the same and are one sequence. An advisory lock on `doc-number:<tenant>`, per tenant because two prefixes can collide, is taken after the template and document row locks; numbering is its own short transaction (the render is outside it), so serializing a tenant's numbering costs little. No index serves these reads: they run over one tenant's documents through the `tenant_id`-led indexes.
+
+**Where numbering continues** is the template's `nextNumber` (REST, MCP `document_template_list`, the console editor, which shows it as it will print, and the template list): the number the rule above gives now. `GET /v1/document-templates/:id/next-number?prefix=` answers the same for another prefix, for an editor or an MCP dry run that moves the prefix before saving (the counter stays with the template across the move). An operator sets it with `nextNumber` on `POST`/`PATCH /v1/document-templates` (MCP `next_number`, the console's "Next number" field), to continue a sequence started elsewhere. It may go up (the gap is fine) or down to one above the highest number issued under the prefix the template will have after the write, and no lower; a number at or below that, or whose printed text is already a document's, is refused with 409 (`errors.documentNumberAlreadyUsed`), checked under the same lock, and the refusal names the number in the way and says a new prefix starts a new sequence. The dry run asks the same without the lock. Setting it is an edit and is audited (`lastNumber` is in the projection); issuance moves the counter without an audit row.
 
 That last property is also why the **document row is claimed first**, with `SELECT … FOR UPDATE`,
 before the counter is touched: a row exists unnumbered for a moment by design, and in that window a
@@ -221,6 +251,96 @@ tenant's list that were never sent and that nobody can account for. The reservat
 `finally`, so a refused call does not burn the turn: the model is told what to fix and its corrected
 call arrives in the same turn, by which point the queue carries the claim instead.
 
+## Approval
+
+A template can ask for a person to approve each document an agent issues from it
+(`requiresApproval`, off by default), with a validity of `approvalTtlHours` (24 by default, 1 to 168,
+a CHECK on the column). The switch is on the TEMPLATE and not on the grant: what the reviewer
+protects is the price and the wording, whichever agent emits it. It applies to the agent's tool
+only; `POST /v1/documents` is already a person or a system deciding, and issues as before.
+
+The tool reads the switch when it is CALLED (`issueOrRequestApproval` in `approval.ts`), so turning it
+on takes effect on the next call. A key that already names a request or a document is answered with
+it before the template is read, the retry rule issuance follows. Otherwise the document is frozen
+(`freezeDocumentSnapshot`: the same validation, blank check and dated snapshot an issuance freezes)
+and stored on a `DocumentApprovalRequest` instead of issued. Nothing is queued for delivery, no row
+is written to `issued_documents`, and **no number is taken**: a rejected or expired request burns
+none. The request keys on the tool's own key, so a retried turn lands on the request it already made, and
+the tool's answer follows what became of it: pending, approved, rejected or lapsed.
+
+The **preview** (`GET /v1/document-approvals/:id/preview`) renders the frozen snapshot with a text
+placeholder where the number goes, never a believable number: the counter may have moved by the time
+someone approves, and a reviewer shown ORC-0042 would expect that number on the document.
+
+**Approval issues the frozen snapshot**, under the key `approval:<request id>:<digest>` rather than
+the calendar-day key the tool uses, so an approval landing tomorrow keeps the date the reviewer saw;
+only the number is taken then. The digest is of what only the request holds (its own key and creation
+instant), so no row written before the request existed can carry the key, and `issueDocument` refuses
+to write a new document under a caller key with the `approval:` prefix (a row older builds already
+stored under one still answers its retry). The status is claimed first, `PENDING → APPROVED` while unexpired, in one
+conditional UPDATE: a rejection or the expiry racing it cannot both win, and a second approval, in
+parallel or later, finds `APPROVED` and lands on the same issued row through the key. A failure after
+the claim (the template deleted, so nothing can number the document) leaves an `APPROVED` request with
+no document, which approving again completes.
+
+**Expiry** is armed when the request is created: one `DOCUMENT_APPROVAL_EXPIRY` job at `expiresAt`,
+whose handler moves every overdue `PENDING` request of the tenant to `EXPIRED`. The rule does not
+depend on the job running on time: approval and rejection refuse a request past its `expiresAt`
+whatever its status says, and move it to `EXPIRED` themselves.
+
+**While a request is pending** the agent stays on the conversation and is told so twice. The tool's
+answer says the document went to the team, that the agent may say the team is preparing it, and that
+it promises no time. And every later turn of the conversation, reactive or proactive, carries one line
+naming the documents still waiting (`pendingApprovalNotice`): `PENDING` and not past `expiresAt`, read
+by the conversation row, or by the thread when the turn has none. The line is read once per turn and
+travels where the spoken notice does, after the history (docs/graph.md, the tool budget's wrap-up), so
+the cached prefix survives and a customer cannot forge it. It names no time: the validity is how long
+the team may take, not when the customer will receive anything. It is what keeps the agent from
+offering the document again once the tool's answer has left the history window, and it tells the
+agent to bring it up only when the customer asks. A failed read costs the line, never the turn.
+
+**What a decision says in the conversation** is one `DOCUMENT_APPROVAL_OUTCOME` job per request
+(`approval-outcome.ts`), armed in the same transaction as the transition that decided it: the claim
+of a rejection, the expiry's UPDATE, and for an approval the write that LINKS the issued document,
+so approving again, in parallel or later, finds it linked and arms nothing. The job answers:
+
+- **Approved:** a proactive turn (`runAgentNudge` with `approvedDocument`) sends the issued PDF as the
+  attachment of the agent's message, with every gate a proactive turn has. Over a person, or outside
+  the 24h window, it leaves a fixed private note before any model call, and no approved template is
+  sent in the document's place; the same note covers a person taking over, or the window closing,
+  while the agent writes. An agent that writes nothing still sends the PDF, with a default caption.
+  The turn binds no tool: its one job is the line the PDF rides on, and with the agent's tools bound
+  a real model tried to attach the file itself, wrote notes and handed the conversation over. An
+  output guardrail trip on that line drops the PDF, as a trip drops every attachment of a turn: a
+  transfer leaves the document to the person, a replaced reply goes alone and a note asks a person
+  to send it. The PDF's own values are not screened again: the team read them and approved them.
+  A revoked or missing PDF, or a turn that could not speak (the spend ceiling, an agent switched
+  off), leaves a note saying a person has to send it. Right before the turn, while the bot owns the
+  conversation, a note says the document is approved and the agent is sending it (`O agente está
+  enviando ao cliente`), so a person watching Chatwoot hears of the approval at once rather than when
+  the PDF lands. It is claimed on `approvedNoteAt` before the send, so a retried outcome never repeats
+  it, and it is best effort: a Chatwoot that fails it does not hold the PDF back.
+- **Rejected:** nothing to the customer, a private note carrying the reviewer's note, and, while the
+  bot owns the conversation, the hand-over the guardrail uses (status `open` plus the agent's pinned
+  target).
+- **Expired:** nothing to the customer, a private note, and a `warn` line (`tool`,
+  `document_approval_expired`), which the alert channels pick up.
+
+A request also leaves a private note the moment it opens (`Pedido de aprovação aberto: <title>`), so a person watching Chatwoot knows the document is waiting on the team. It runs on the outcome kind under its own key (`doc-approval-opened:<id>`), armed with the request: sharing the decision's row would let a claim taken before the decision deliver it, and the decision's re-arm deliver it again. The opening reads the status again right before the send, so a decision taken while it waited on Chatwoot leaves it unwritten, and the decision's run reschedules itself while the opening is claimed, so the conversation always reads "open" before it reads the outcome. Every private note the approval flow leaves ends on the request's page, as a Markdown link (`[Ver aprovação](<console>/document-approvals/<id>?switchTenant=<tenant>)`) that Chatwoot and the console's conversation view both render, so the person the conversation falls to opens the decision, or asks an expired one again, from Chatwoot. Where that link points is the tenant's `approvalLink` setting (`src/modules/documents/approval-link.ts`): `console` (the default above), `custom` (a URL template with `{id}`, for a team that reviews in its own app; it must parse as an `https://` or `http://` address, a `custom` saved empty is stored as `console`, and `(`, `)`, `<`, `>` and spaces are percent-encoded so the Markdown link keeps the whole address), or `none` (the note is still written, without the link). It is read when each note is written, so a change applies to the next note, including one about a request opened before it. It is set on Resources → Documents (the "Link in approval notes" card), by `PUT /v1/tenant-settings/approval-link`, and by MCP `tenant_settings_update`'s `approval_link`, and read back by `GET /v1/tenant-settings` and `tenant_settings_get`. Every note a decision leaves names who decided (`Documento aprovado por <name>`, `Documento não aprovado por <name>`; the user's name, or their email when they have none), read from `users` by the request's `reviewerUserId`.
+
+**What a decision came to** is recorded on the request when its outcome job ends (`outcome`, `outcomeAt`): `DELIVERED` (the PDF reached the customer), `NOTED` (a private note says why it did not, or a rejection found the conversation was no longer the bot's, so nothing was handed over), `NOT_SENT` (the customer got a replacement line without the PDF and the note saying why could not be posted), `HANDED` (rejected and handed to a person), `NO_AGENT` (no bot left to write in the conversation). The first run to finish writes it, and a run retried after it was written (a worker that died before completing the job) writes nothing to the conversation again; it stays null while the outcome is on its way and for a request with no conversation. Opening a request and deciding one wake the scheduler's traffic drain (`wakeScheduler`; both kinds are traffic-proportional) rather than leaving the job to its 15-second interval, because a person is watching for the note: measured locally, the approved note took 11 seconds from the click on the tick alone.
+
+Any user of the tenant decides a request (`requireRole: "AGENT"`): approving is reading a document and
+saying yes, not configuring anything.
+
+**The team hears of a request through the alert channels.** A new request writes an `info` `tool` line `{outcome: "document_approval_requested", requestId}`, and the expiry's `warn` line carries the same `requestId`; both are cause alerts (`document_approval_requested:<id>`, `document_approval_expired:<id>`, see [`logs.md`](logs.md)), so they reach every channel whatever its `minLevel`, once per request and event. Their link is the request's console page, `/document-approvals/:id` with the tenant selector and nothing else: the console session is the only credential, and the link carries no token. The generic webhook body carries it as `documentApproval` `{requestId, url}`. A retried tool call that lands on the same request writes nothing.
+
+**The page** reads the request, the preview, and `GET /v1/document-approvals/:id/context`: who the customer is, from the contact mirror, and the conversation's last ten public messages, read live from Chatwoot, page by page back until ten are found or five pages are read (a voice note or a file with no caption shows as its transcription, or as its kind when there is none; private notes are left out, and a Chatwoot that does not answer, or whose client cannot be built, leaves the page with the customer and without the messages). The page is one instance per request id, so moving to another request (request again, the browser's back) shows nothing of the previous one. An approved request with no document (the failure after the claim) offers to approve again, which completes it. A decided request says who decided and what it came to, shows the issued document (`GET /v1/documents/:id/pdf`, with its number) instead of the draft, and is read again every three seconds for two minutes after the decision until its outcome is recorded; its way back leads to the history. The context loads apart from the request, so a slow Chatwoot never holds back the document and the decision; validity is judged on the server's clock (`serverNow`), and a pending request is read again when its time runs out, and every three seconds until the expiry closes it, so the page moves to request again without a reload. The audit of a request asked again is written in the transaction that creates it, by the one call that did. A pending request offers approve and reject with an optional note; an expired one offers **request again** (`POST /v1/document-approvals/:id/request-again`), which freezes the same values again from the template as it is now, dated today in the agent's business-hours timezone, as a new request for the same conversation. The expired request stays `EXPIRED`; the key is `approval:again:<expired id>:<digest>`, in the reserved namespace so no document issued through the REST route can already hold it, and asking twice opens one request, and the new one raises its own alert. The replacement is looked up before the template is read, so a retry still answers after the template was switched off or changed.
+
+**The queue** is the console's one approvals queue (`/approvals`, a sidebar entry for every role): the documents waiting on the team (`GET /v1/document-approvals/pending`: `PENDING` and not past `expiresAt`, which the sweep may not have reached, oldest first, with the conversation and the customer's name, fifty per page with `after` as the cursor and `total` counting every page), and for an admin the knowledge-base suggestions, through the same queue component the Knowledge tab shows. Each document opens its page. The sidebar badge (`ApprovalsContext`) reads `total`, so it counts past the first page, and counts both for an admin and the documents alone for any other role, who cannot review a suggestion; the Knowledge tab keeps a badge of its own suggestions. A **History** tab (`?tab=history`) lists every request no longer waiting (`GET /v1/document-approvals/decided`: approved, rejected, expired and cancelled, the latest decision first, fifty per page with `cursor` as the last id of the previous page), with who decided, when, and what it came to. In the conversation's timeline, the message that carries an approved document is badged "Approved document" (the turn records its origin as `approval`, from the nudge source `document_approval`), not as an external event. An issued document goes by its own number in the history, on its page and in the conversation (`issuedNumber` on the request, `ORC-0003`, joined to the title as the PDF heading prints it). It runs by decision, not by request, so a request asked long ago and decided now sits at the top; while a decision has no outcome yet, the tab reads its first page again every five seconds, keeps the rows of later pages already loaded, and reads by id an unresolved row the first page no longer carries.
+
+**The conversation's page** in the console shows the conversation's requests (`GET /v1/document-approvals?conversationId=<id>`, with `waiting=true` for the ones waiting on the team now: pending and inside their validity, filtered before the limit): every one still waiting, or else the latest, with its decision and what it came to, and the way to its page. It is read again when the conversation's messages change, and every three seconds for two minutes after a decision until the outcome is recorded.
+
 ## Granting
 
 `AgentToolSelection` with `source = DOCUMENT` and a `documentTemplateId`. **Fail-closed**, like
@@ -273,18 +393,28 @@ the one place that sees every name at once, so `dropDuplicateToolNames` decides 
 wins, which puts the built-ins first, the loser is dropped rather than fatal (one bad name must not
 take a whole agent down), and the names that lost are logged for the operator who can rename them.
 
+### What the model reads, and the choice it has not been given
+
+The tool's description opens with a fixed sentence before the template's own description: issue the document **for exactly what the customer chose**, every line is **summed into one total**, so alternatives the customer has not chosen between are never listed, and when the customer has not chosen the model asks in text and calls after the answer. The second half is there because the totals are computed by the renderer (above): a model that writes the catalog's three packages as three line items is not offering a menu, it is issuing a quote for all three.
+
+The sentence alone does not hold it. Measured with `gpt-5.4-mini` on a request for "the quote for the sessions" with three packages in the catalog, a single request was answered with the document 10 of 10 times before the change and 3 of 10 after it; across a five-turn conversation where the customer chooses on the fourth, the document still went out before the choice in 10 of 10 conversations with or without it. A rule in the system prompt, a stronger template description and an attribute precondition the model writes itself all lost to the same turn. What holds is the `customer_choice` precondition on `send_<slug>` (docs/graph.md, Tool preconditions): the runtime refuses a call whose values the customer did not say or confirm, the model is told to ask, and nothing reaches the approval queue.
+
 ## Transports
 
 - **Console** — Components → Document templates. Create from a ready-made starter (quote, proposal,
-  receipt), edit the letterhead, edit the **wording** of `text` blocks, and watch a live PDF preview.
+  receipt, or blank), edit the letterhead, edit the **wording** of `text` blocks, and watch a live PDF preview.
   Adding, removing and reordering blocks is API/MCP only. The panel is split in two: **Templates**
   (the letterhead as a one-line summary that opens an editor, then the templates) and **Issued** (the
   documents that went out, with the template each came from — and the only place a document can be
-  revoked). The same modal opens
+  revoked). The Issued list is searched on the server by part of the printed number (prefix and padded
+  counter, as frozen on the document, so a renamed prefix still finds the old ones) or the title, pages
+  by id (`before`, with `nextBefore` on the REST answer read one row past the page), and links each row
+  to its conversation and, when it went through approval, to its approval request
+  (`approvalRequestId`). The same modal opens
   from the **agent's Tools tab**, on the document card being granted: it is the one grant whose target
   has a picture, and "what does this print?" is the question being answered at that moment.
 - **REST** — `/v1/document-templates` (CRUD, `POST /preview`, `/starters`), `/v1/documents` (issue,
-  list, PDF, revoke), `/v1/tenant-settings/company` (+ `/logo`).
+  list with `q` and `before`, PDF, revoke), `/v1/tenant-settings/company` (+ `/logo`).
 - **MCP** — `document_template_list/get/create/update/delete`, `document_template_schema`,
   `document_starters_list`, `issued_document_list`. `document_template_schema` serves the block
   vocabulary as JSON Schema generated from the validator; see `docs/mcp.md` for why it is not

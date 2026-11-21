@@ -14,16 +14,19 @@ import {
   type DebounceTickDeps,
   runDebounceTick,
 } from "@/modules/debounce/worker";
+import { emitCapacityWait } from "@/modules/flowlog/capacity";
 import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import {
   claimDueDebounceJobs,
   enqueueJob,
   findWaitingDebounceJobs,
 } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
+import { until } from "../utils/poll";
 
-// Issue #812, through the production writers: a reply that waited for capacity leaves one `capacity`
+// Through the production writers: a reply that waited for capacity leaves one `capacity`
 // warn on the delayed conversation's own tenant, naming which limit held it, and the alert bus
 // receives it like any other warn. Two roads, both real: a due DEBOUNCE row stuck behind a full lane
 // (the real waiting query, the real announcement), and a flush whose model call queues on the
@@ -45,8 +48,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -58,7 +61,6 @@ let inboxDbId = 0n;
 let channelId = 0n;
 
 const THRESHOLD_MS = 400;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const threadOf = (convId: number) => `${tenantId}:${instanceId}:${convId}`;
 
 async function seedConversation(convId: number) {
@@ -139,7 +141,7 @@ async function holdEveryPermit(): Promise<() => void> {
         }),
     );
   }
-  while (releases.length < cap) await sleep(1);
+  while (releases.length < cap) await Bun.sleep(1);
   return () => {
     for (const r of releases.splice(0)) r();
   };
@@ -153,17 +155,21 @@ async function capacityLines(conversationId: bigint) {
   });
 }
 
+// The alert dispatch runs inside the flow write it belongs to, so once the scheduled writes have
+// settled every delivery a line asked for is in the table: none there then is none at all.
 async function deliveriesFor() {
   await settleFlowEvents();
-  for (let i = 0; i < 40; i++) {
-    const rows = await suDb.alertDelivery.findMany({
-      where: { channelId },
-      select: { stage: true, level: true, summary: true, count: true },
-    });
-    if (rows.length > 0) return rows;
-    await sleep(50);
-  }
-  return [];
+  return suDb.alertDelivery.findMany({
+    where: { channelId },
+    select: { stage: true, level: true, summary: true, count: true },
+  });
+}
+
+async function someDeliveries() {
+  return until("an alert delivery written", async () => {
+    const rows = await deliveriesFor();
+    return rows.length > 0 ? rows : null;
+  });
 }
 
 describe.skipIf(!dbUp)("a reply waiting for capacity (issue #812)", () => {
@@ -308,25 +314,71 @@ describe.skipIf(!dbUp)("a reply waiting for capacity (issue #812)", () => {
       expect(line?.source).toBe("inbox");
       expect(line?.conversationId).toBe(waiter.id);
       expect(line?.conversationId).not.toBe(holder.id);
+      // The lane's own reading rides on the line, so it says which limit bound.
       expect(line?.detail).toMatchObject({
         waitedOn: "debounce_lane",
         thresholdMs: THRESHOLD_MS,
+        limit: "DEBOUNCE_TURN_SLOTS",
+        laneInFlight: 1,
+        laneSlots: 1,
+        modelInFlight: 0,
+        modelWaiting: 0,
       });
       expect(
         (line?.detail as { waitedMs?: number } | undefined)?.waitedMs ?? 0,
       ).toBeGreaterThanOrEqual(THRESHOLD_MS);
-      const deliveries = await deliveriesFor();
+      const deliveries = await someDeliveries();
       expect(deliveries).toHaveLength(1);
       expect(deliveries[0]?.summary).toContain("waitedOn=debounce_lane");
     } finally {
       for (const r of hung.splice(0)) r();
-      await sleep(0);
+      await Bun.sleep(0);
       await runDebounceTick(appDb, 1, { claim: async () => [] });
       await clearFlowLog(suDb, { tenantId });
       await suDb.alertDelivery.deleteMany({ where: { channelId } });
       // NOTE: the waiting row is still PENDING, and the next case's FIFO claim would take it.
       await suDb.schedulerJob.deleteMany({ where: { tenantId } });
     }
+  });
+
+  // A background call that waited is the design under a peak of replies: the line shows it in the
+  // Logs, at info, and a channel subscribed at warn is not paged for it.
+  test("a background call's wait is written at info, naming its class", async () => {
+    const conv = await seedConversation(4301);
+    emitCapacityWait(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: conv.id,
+        base: appDb,
+      },
+      "model_semaphore",
+      {
+        waitedMs: THRESHOLD_MS + 5,
+        thresholdMs: THRESHOLD_MS,
+        occupancy: {
+          limit: "AGENT_MODEL_CONCURRENCY",
+          class: "background",
+          modelInFlight: 2,
+          modelPermits: 2,
+          modelWaiting: 3,
+          modelWaitingReply: 2,
+          modelWaitingBackground: 1,
+        },
+      },
+    );
+    await settleFlowEvents();
+    const lines = await capacityLines(conv.id);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]?.level).toBe("info");
+    expect(lines[0]?.detail).toMatchObject({
+      waitedOn: "model_semaphore",
+      class: "background",
+      modelWaitingBackground: 1,
+    });
+    expect(await deliveriesFor()).toEqual([]);
+    await clearFlowLog(suDb, { tenantId });
   });
 
   test("a flush whose model call queues on the semaphore is announced on its conversation, naming the semaphore", async () => {
@@ -347,13 +399,12 @@ describe.skipIf(!dbUp)("a reply waiting for capacity (issue #812)", () => {
           checkpointer: new MemorySaver(),
         },
       });
-      // NOTE: waits for the line rather than for a fixed time: under a loaded suite the flush can take
+      // Waits for the line rather than for a fixed time: under a loaded suite the flush can take
       // longer than the threshold to reach the queue at all.
-      let lines = await capacityLines(conv.id);
-      for (let i = 0; i < 100 && lines.length === 0; i++) {
-        await sleep(50);
-        lines = await capacityLines(conv.id);
-      }
+      const lines = await until("the capacity line written", async () => {
+        const rows = await capacityLines(conv.id);
+        return rows.length > 0 ? rows : null;
+      });
       // Written while the reply is still waiting, before any permit came free.
       expect(sent).toEqual([]);
       expect(lines).toHaveLength(1);
@@ -363,13 +414,16 @@ describe.skipIf(!dbUp)("a reply waiting for capacity (issue #812)", () => {
       expect(lines[0]?.detail).toMatchObject({
         waitedOn: "model_semaphore",
         thresholdMs: THRESHOLD_MS,
+        limit: "AGENT_MODEL_CONCURRENCY",
+        modelInFlight: config.agent.modelConcurrency,
+        modelWaiting: 1,
       });
       release();
       await flush;
       // The line does not change the delivery: one reply, once the permit arrived.
       expect(sent).toHaveLength(1);
       expect(await capacityLines(conv.id)).toHaveLength(1);
-      const deliveries = await deliveriesFor();
+      const deliveries = await someDeliveries();
       expect(deliveries[0]?.summary).toContain("waitedOn=model_semaphore");
     } finally {
       release();

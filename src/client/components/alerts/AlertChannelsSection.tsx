@@ -1,3 +1,4 @@
+import type { TFunction } from "i18next";
 import { BellRing, Pencil, Plus, Send, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -23,10 +24,15 @@ import {
 import { useFieldRefusal } from "@/client/hooks/useFieldRefusal";
 import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
-import { flowStageLabel } from "@/client/lib/flowLabels";
+import { alertEventLabel, flowStageLabel } from "@/client/lib/flowLabels";
 import { cn, formatDate } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
-import { FLOW_STAGES } from "@/modules/flowlog/stages";
+import {
+  ALERT_EVENTS,
+  isAlertEvent,
+  WARN_ONLY_EVENTS,
+} from "@/modules/flowlog/events";
+import { SELECTABLE_STAGES } from "@/modules/flowlog/stages";
 
 // Alert channel manager (external sinks for execution-flow warnings/errors). Lives on the Webhooks
 // page (operationally adjacent). The token-bearing URL never comes back from the API — when editing,
@@ -39,7 +45,7 @@ type AlertChannel = NonNullable<ChannelsResponse>["channels"][number];
 
 const labelCls = "mb-1 block font-medium text-sm text-text-primary";
 const selectCls =
-  "w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary focus:border-border-focus focus:outline-none";
+  "w-full rounded-md border border-border-hover bg-bg-tertiary h-8 px-2.5 text-sm text-text-primary transition-colors focus:border-border-focus focus:outline-none focus:ring-2 focus:ring-accent-soft";
 
 type AgentOption = { id: string; name: string };
 
@@ -78,19 +84,20 @@ function AlertChannelModal({
   const [url, setUrl] = useState("");
   const [minLevel, setMinLevel] = useState<"warn" | "error">("error");
   const [stages, setStages] = useState<Set<string>>(new Set());
-  // Agents whose lines never alert here (issue #843). Sent whole on every save: the server accepts
-  // an id the channel already held even when its agent is gone, so an untouched list always saves.
+  // Agents whose lines never alert here. Sent whole on every save: the server accepts an id the
+  // channel already held even when its agent is gone, so an untouched list always saves.
   const [excluded, setExcluded] = useState<Set<string>>(new Set());
+  // Events this channel leaves out; every event is received until it is unchecked here.
+  const [leftOut, setLeftOut] = useState<Set<string>>(new Set());
   const [agentOptions, setAgentOptions] = useState<AgentOption[] | null>(null);
   const [agentsFailed, setAgentsFailed] = useState(false);
   const [secretRef, setSecretRef] = useState("");
-  // Whether the operator touched the picker at all. The wire needs to tell "left this alone" apart
-  // from "chose this", because an untouched field is OMITTED and a sent one is obeyed — and the
-  // difference cannot be read off the VALUE. A channel whose stored ref names no vault entry arrives
-  // as `hasSecret` with no ref to show (`readableVaultRef` hides it rather than publish whatever text
-  // the column held before #126), so its picker opens empty and choosing "None" moves nothing.
-  // Comparing values would call that unchanged and leave the operator unable to clear a secret the
-  // list is calling Signed.
+  // Whether the operator touched the picker at all. The wire tells "left this alone" from "chose
+  // this" (an untouched field is OMITTED, a sent one is obeyed), and the VALUE cannot: a channel whose
+  // stored ref names no vault entry arrives as `hasSecret` with no ref to show (`readableVaultRef` hides
+  // it rather than publish whatever the column holds), so its picker opens empty and choosing "None"
+  // moves nothing. Comparing values would leave the operator unable to clear a secret the list calls
+  // Signed.
   const [secretTouched, setSecretTouched] = useState(false);
   const [enabled, setEnabled] = useState(true);
   const [error, setError] = useState("");
@@ -116,12 +123,15 @@ function AlertChannelModal({
     // pre-checks exactly that subset. The operator then narrows from "everything" instead of an empty
     // set that silently meant "all".
     setStages(
-      new Set(ch?.stages && ch.stages.length > 0 ? ch.stages : FLOW_STAGES),
+      new Set(
+        ch?.stages && ch.stages.length > 0 ? ch.stages : SELECTABLE_STAGES,
+      ),
     );
     // Loaded, not blanked: the save below sends `secretRef` unconditionally and the service reads a
     // null there as "clear it", so a blank field here unsigns the channel on a save that meant to
     // change the name. The URL above CAN start blank because the PATCH omits it when it is.
     setExcluded(new Set(ch?.excludeAgentIds ?? []));
+    setLeftOut(new Set(ch?.excludeEvents ?? []));
     setAgentOptions(null);
     setAgentsFailed(false);
     void loadAgentOptions().then((opts) => {
@@ -142,6 +152,20 @@ function AlertChannelModal({
       return next;
     });
 
+  const toggleEvent = (e: string) =>
+    setLeftOut((prev) => {
+      const next = new Set(prev);
+      if (next.has(e)) next.delete(e);
+      else next.add(e);
+      return next;
+    });
+  // A left-out event the vocabulary no longer lists: shown unchecked, so the operator can drop it.
+  const staleEvents = [...leftOut].filter((e) => !isAlertEvent(e));
+  // On errors only, the warn-only events never reach the channel: their chips are held as they are
+  // (a saved choice is kept for when the level goes back to warnings) and say why.
+  const inertEvents: readonly string[] =
+    minLevel === "error" ? WARN_ONLY_EVENTS : [];
+
   const toggleExcluded = (id: string) =>
     setExcluded((prev) => {
       const next = new Set(prev);
@@ -154,9 +178,9 @@ function AlertChannelModal({
     ? [...excluded].filter((id) => !agentOptions.some((a) => a.id === id))
     : [];
 
-  const allStagesChecked = stages.size === FLOW_STAGES.length;
+  const allStagesChecked = stages.size === SELECTABLE_STAGES.length;
   const toggleAllStages = () =>
-    setStages(allStagesChecked ? new Set() : new Set(FLOW_STAGES));
+    setStages(allStagesChecked ? new Set() : new Set(SELECTABLE_STAGES));
 
   const urlInvalid = url.trim().length > 0 && !isValidHttpUrl(url);
   // Creating needs a URL; editing keeps the existing one when left blank. At least one stage must be
@@ -183,6 +207,7 @@ function AlertChannelModal({
       type,
       minLevel,
       stages: allStagesChecked ? [] : [...stages],
+      excludeEvents: [...leftOut],
       excludeAgentIds: [...excluded],
       enabled,
     };
@@ -216,6 +241,7 @@ function AlertChannelModal({
           type,
           minLevel,
           stages: stagesArr,
+          excludeEvents: [...leftOut],
           excludeAgentIds: [...excluded],
           enabled,
         };
@@ -232,6 +258,7 @@ function AlertChannelModal({
             url: url.trim(),
             minLevel,
             stages: stagesArr,
+            excludeEvents: [...leftOut],
             excludeAgentIds: [...excluded],
             secretRef: ref,
             enabled,
@@ -274,7 +301,7 @@ function AlertChannelModal({
         }}
       >
         {error && (
-          <div className="rounded-lg border border-error bg-error-soft px-4 py-2 text-error text-sm">
+          <div className="border-error bg-error-soft text-error rounded-lg border px-4 py-2 text-sm">
             {error}
           </div>
         )}
@@ -314,7 +341,7 @@ function AlertChannelModal({
             </option>
           </select>
           {refusal.at("type", type) && (
-            <p className="mt-1 text-error text-xs">
+            <p className="text-error mt-1 text-xs">
               {refusal.at("type", type)}
             </p>
           )}
@@ -350,7 +377,7 @@ function AlertChannelModal({
             }
           />
           {urlInvalid && (
-            <p className="mt-1 text-error text-xs">
+            <p className="text-error mt-1 text-xs">
               {t("common.invalidUrl", "Must be a valid http(s) URL.")}
             </p>
           )}
@@ -385,7 +412,7 @@ function AlertChannelModal({
               type="button"
               disabled={loading}
               onClick={toggleAllStages}
-              className="font-normal text-accent text-xs hover:underline"
+              className="text-accent text-xs font-normal hover:underline"
             >
               {allStagesChecked
                 ? t("alerts.clearAll", "Clear")
@@ -393,7 +420,7 @@ function AlertChannelModal({
             </button>
           </legend>
           <div className="flex flex-wrap gap-1.5">
-            {FLOW_STAGES.map((s) => {
+            {SELECTABLE_STAGES.map((s) => {
               const checked = stages.has(s);
               return (
                 <button
@@ -418,10 +445,55 @@ function AlertChannelModal({
         </fieldset>
 
         <fieldset>
+          <legend className={labelCls}>{t("alerts.events", "Events")}</legend>
+          <p className="text-text-muted mb-2 text-xs">
+            {t(
+              "alerts.eventsHint",
+              "Uncheck an event to stop it alerting here. A warning that is none of these follows only the stages above. Left-out lines still appear in Logs.",
+            )}
+          </p>
+          <div className="flex flex-wrap gap-1.5">
+            {[...ALERT_EVENTS, ...staleEvents].map((e) => {
+              const checked = !leftOut.has(e);
+              const inert = inertEvents.includes(e);
+              return (
+                <button
+                  key={e}
+                  type="button"
+                  disabled={loading || inert}
+                  aria-pressed={checked}
+                  aria-describedby={inert ? "ac-events-inert" : undefined}
+                  onClick={() => toggleEvent(e)}
+                  className={cn(
+                    "rounded-full border px-2.5 py-1 text-xs transition-colors",
+                    {
+                      "border-accent bg-accent-soft text-text-primary": checked,
+                      "border-border text-text-secondary": !checked,
+                      "hover:bg-bg-hover": !checked && !inert,
+                      "cursor-not-allowed opacity-50": inert,
+                    },
+                  )}
+                >
+                  {alertEventLabel(e, t)}
+                </button>
+              );
+            })}
+          </div>
+          {inertEvents.length > 0 && (
+            <p id="ac-events-inert" className="text-text-muted mt-2 text-xs">
+              {t(
+                "alerts.eventsInert",
+                "The dimmed events only ever come as warnings, so with Errors only they never reach this channel. They count again with Warnings and errors.",
+              )}
+            </p>
+          )}
+        </fieldset>
+
+        <fieldset>
           <legend className={labelCls}>
             {t("alerts.excludeAgents", "Agents that never alert here")}
           </legend>
-          <p className="mb-2 text-text-muted text-xs">
+          <p className="text-text-muted mb-2 text-xs">
             {t(
               "alerts.excludeAgentsHint",
               "Their warnings and errors still appear in Logs; only this channel skips them. Use it for test agents that share the instance with production.",
@@ -474,7 +546,7 @@ function AlertChannelModal({
                   disabled={loading}
                   aria-pressed={true}
                   onClick={() => toggleExcluded(id)}
-                  className="rounded-full border border-accent bg-accent-soft px-2.5 py-1 text-text-primary text-xs"
+                  className="border-accent bg-accent-soft text-text-primary rounded-full border px-2.5 py-1 text-xs"
                 >
                   {t("alerts.excludedDeletedAgent", "Deleted agent #{{id}}", {
                     id,
@@ -514,10 +586,10 @@ function AlertChannelModal({
           </FormField>
         )}
 
-        <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
+        <div className="border-border flex items-center justify-between rounded-lg border px-3 py-2">
           <label
             htmlFor={enabledId}
-            className="font-medium text-sm text-text-primary"
+            className="text-text-primary text-sm font-medium"
           >
             {t("common.enabled", "Enabled")}
           </label>
@@ -544,16 +616,12 @@ function AlertChannelModal({
   );
 }
 
-// What the channel DOES, never what the column holds. This used to rebuild the worker's rule out of
-// `type` + `hasSecret` + `secretRef`, and got three of the four cases right; the server now answers
-// the whole question in one field (issue #724), because the fourth needs the VAULT and no per-row
-// projection can grow that. A well-formed ref whose entry was deleted, or created and never filled,
-// resolves to nothing in `alert-send.ts` and the alert goes out unsigned — and this line said
-// "Signed" for it, which is worse than saying nothing: it is the screen an operator checks precisely
-// when they suspect the receiver is dropping deliveries.
-//
-// The last three read the same on the wire and differ only in the errand, so they get three
-// sentences rather than one: a vault page to visit, a credential to recreate, a value to fill in.
+// What the channel DOES, never what the column holds. The server answers it whole (`signingState`),
+// because a ref whose entry was deleted, or created and never filled, needs the VAULT to tell: it
+// resolves to nothing in `alert-send.ts` and the alert goes out unsigned, so calling it "Signed"
+// would mislead the operator checking why a receiver drops deliveries. The last three read the same
+// on the wire and differ only in the errand (a vault page to visit, a credential to recreate, a
+// value to fill in), so they get three sentences.
 function signingLabel(
   ch: { signingState: string },
   t: (k: string, d: string) => string,
@@ -583,6 +651,62 @@ const ALERT_FIELDS = ["name", "type", "url"] as const;
 // touched is omitted instead, so switching type leaves the stored one alone rather than clearing it.
 const ALERT_WEBHOOK_FIELDS = [...ALERT_FIELDS, "secretRef"] as const;
 
+// What a channel test answered, as one toast: the destination's refusal, a delivery that went out
+// unsigned, or a delivery, saying whether the channel is enabled. Shared with the instance's own
+// channels (pages/admin/instance-health), whose test answers the same shape.
+export function toastAlertTestResult(
+  result: {
+    ok: boolean;
+    status: number | null;
+    error: string | null;
+    enabled: boolean;
+    warning: string | null;
+  },
+  showToast: (
+    message: string,
+    type: "success" | "error" | "warning" | "info",
+  ) => void,
+  t: TFunction,
+): void {
+  if (!result.ok) {
+    // NOTE: a 200 carrying the DESTINATION's refusal, not a refusal of ours: the caller already handled
+    // `err`, and `result.error` is the reason. Saying only "failed" here would leave the operator unable
+    // to tell a bad URL from a dead endpoint.
+    showToast(
+      t("alerts.testFailedReason", "Test failed: {{reason}}", {
+        reason: result.error ?? String(result.status ?? "unknown"),
+      }),
+      "error",
+    );
+    return;
+  }
+  // Delivered, and then the two things a bare success would let the operator believe wrongly:
+  // that the channel is already watching, and that it is signing.
+  if (result.warning) {
+    showToast(
+      t(
+        "alerts.testDeliveredUnsigned",
+        "Delivered ({{status}}), but UNSIGNED: the configured signing secret did not resolve",
+        { status: result.status ?? 200 },
+      ),
+      "warning",
+    );
+    return;
+  }
+  showToast(
+    result.enabled
+      ? t("alerts.testDelivered", "Test alert delivered ({{status}})", {
+          status: result.status ?? 200,
+        })
+      : t(
+          "alerts.testDeliveredDisabled",
+          "Test alert delivered ({{status}}), but this channel is still disabled",
+          { status: result.status ?? 200 },
+        ),
+    result.enabled ? "success" : "info",
+  );
+}
+
 export function AlertChannelsSection() {
   const { t } = useTranslation();
   const { showToast } = useToast();
@@ -591,13 +715,11 @@ export function AlertChannelsSection() {
   const [error, setError] = useState(false);
   const modal = useModalController<ChannelModalPayload>();
   const confirm = useModalController<ConfirmPayload>();
-  // A SET, not the one id the webhooks list next door holds, and the reason is this feature's own
-  // subject (review round 1 of #605). With a single id, testing channel B while A is still in flight
-  // re-enables A's button, and whichever request finishes FIRST clears the spinner on the other while
-  // it is still running. Both halves cost a real external send: an enabled button invites a second
-  // POST to a destination that has not answered the first, and a button that says idle while it is
-  // working is a console lying about a delivery — which is the exact failure this PR exists to stop,
-  // one screen up.
+  // A SET, not the one id the webhooks list next door holds. With a single id, testing channel B
+  // while A is in flight re-enables A's button, and whichever request finishes first clears the
+  // other's spinner while it still runs. Both cost a real external send: an enabled button invites a
+  // second POST to a destination that has not answered the first, and an idle-looking button
+  // misreports a delivery.
   const [testing, setTesting] = useState<ReadonlySet<string>>(new Set());
   const startTesting = (id: string) =>
     setTesting((prev) => new Set(prev).add(id));
@@ -649,8 +771,8 @@ export function AlertChannelsSection() {
     }
   };
 
-  // The button the issue is named after (#605): before it, the only way to learn whether a channel
-  // was wired correctly was to wait for an incident and watch it not arrive.
+  // Short of this test send, the only way to learn whether a channel is wired correctly is to
+  // wait for an incident and watch it not arrive.
   const runTest = async (ch: AlertChannel) => {
     startTesting(ch.id);
     try {
@@ -665,43 +787,7 @@ export function AlertChannelsSection() {
         );
         return;
       }
-      if (!result.ok) {
-        // A 200 carrying the DESTINATION's refusal, not a refusal of ours: `err` is null by the
-        // guard above, and `result.error` is the reason. Saying only "failed" here would reproduce
-        // the issue one level up, with the operator unable to tell a bad URL from a dead endpoint.
-        showToast(
-          t("alerts.testFailedReason", "Test failed: {{reason}}", {
-            reason: result.error ?? String(result.status ?? "unknown"),
-          }),
-          "error",
-        );
-        return;
-      }
-      // Delivered, and then the two things a bare success would let the operator believe wrongly:
-      // that the channel is already watching, and that it is signing.
-      if (result.warning) {
-        showToast(
-          t(
-            "alerts.testDeliveredUnsigned",
-            "Delivered ({{status}}), but UNSIGNED: the configured signing secret did not resolve",
-            { status: result.status ?? 200 },
-          ),
-          "warning",
-        );
-        return;
-      }
-      showToast(
-        result.enabled
-          ? t("alerts.testDelivered", "Test alert delivered ({{status}})", {
-              status: result.status ?? 200,
-            })
-          : t(
-              "alerts.testDeliveredDisabled",
-              "Test alert delivered ({{status}}), but this channel is still disabled",
-              { status: result.status ?? 200 },
-            ),
-        result.enabled ? "success" : "info",
-      );
+      toastAlertTestResult(result, showToast, t);
     } catch {
       showToast(t("alerts.testFailed", "Test alert failed"), "error");
     } finally {
@@ -740,10 +826,10 @@ export function AlertChannelsSection() {
     <section className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="font-semibold text-text-primary text-xl">
+          <h2 className="text-text-primary text-xl font-semibold">
             {t("alerts.title", "Alert channels")}
           </h2>
-          <p className="mt-1 text-sm text-text-secondary">
+          <p className="text-text-secondary mt-1 text-sm">
             {t(
               "alerts.subtitle",
               "Get notified on Discord or your own endpoint when an agent step warns or fails.",
@@ -789,7 +875,7 @@ export function AlertChannelsSection() {
             >
               <div className="flex min-w-0 flex-col gap-2">
                 <div className="flex items-center gap-2">
-                  <span className="truncate font-medium text-sm text-text-primary">
+                  <span className="text-text-primary truncate text-sm font-medium">
                     {ch.name}
                   </span>
                   <Badge variant="secondary">{ch.type}</Badge>
@@ -799,7 +885,7 @@ export function AlertChannelsSection() {
                     </Badge>
                   )}
                 </div>
-                <span className="truncate font-mono text-text-muted text-xs">
+                <span className="text-text-muted truncate font-mono text-xs">
                   {ch.urlMasked}
                 </span>
                 <span className="text-text-muted text-xs">
@@ -810,6 +896,12 @@ export function AlertChannelsSection() {
                   {ch.stages.length > 0
                     ? ch.stages.map((s) => flowStageLabel(s, t)).join(", ")
                     : t("alerts.allStages", "All stages")}
+                  {ch.excludeEvents.length > 0 &&
+                    ` · ${t("alerts.leftOutEvents", "Except: {{events}}", {
+                      events: ch.excludeEvents
+                        .map((e) => alertEventLabel(e, t))
+                        .join(", "),
+                    })}`}
                   {ch.excludeAgentIds.length > 0 && " · "}
                   {ch.excludeAgentIds.length > 0 &&
                     t("alerts.excludedCount", "{{count}} agents excluded", {

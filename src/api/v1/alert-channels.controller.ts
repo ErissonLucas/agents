@@ -14,18 +14,18 @@ import {
   listAlertChannels,
   updateAlertChannel,
 } from "@/modules/flowlog/channels";
-import { FLOW_STAGES } from "@/modules/flowlog/stages";
+import { ALERT_EVENTS } from "@/modules/flowlog/events";
+import { SELECTABLE_STAGES } from "@/modules/flowlog/stages";
 
 // Alert channel CRUD (external sinks for execution-flow warnings/errors). TENANT_ADMIN; RLS-scoped.
-// The token-bearing `url` never crosses this surface in the clear — it goes IN on write and comes
-// back only as a masked preview. GET /stages lists the closed stage vocabulary for the UI.
-//
-// NOTE: the channels service throws these AppError translationKeys; declared here (under src/api/**)
-// so the API i18n extractor keeps them (its glob does not reach src/modules).
+// The token-bearing `url` goes IN on write and comes back only as a masked preview.
+// The channels service throws these translationKeys; they are declared here because the API i18n
+// extractor's glob does not reach src/modules.
 // translate('errors.unknownFlowStage', 'Unknown flow stage: {{stage}}')
 // translate('errors.alertChannelNotFound', 'Alert channel not found')
 // translate('errors.noUpdatableFields', 'No updatable fields provided')
 // translate('errors.alertChannelUnknownAgent', 'Unknown agent: {{id}}')
+// translate('errors.unknownAlertEvent', 'Unknown alert event: {{event}}')
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
@@ -38,14 +38,22 @@ export const alertChannelsController = new Elysia({
   tags: ["Logs"],
 })
   .use(tenancyPlugin)
-  .get("/stages", () => ({ instance: instanceIdentity, stages: FLOW_STAGES }), {
-    requireRole: "TENANT_ADMIN",
-    detail: doc(
-      "List flow stages",
-      "Returns the closed execution-flow stage vocabulary that an alert channel can filter on.",
-    ),
-    response: errors(401, 403),
-  })
+  .get(
+    "/stages",
+    () => ({
+      instance: instanceIdentity,
+      stages: SELECTABLE_STAGES,
+      events: ALERT_EVENTS,
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "List flow stages and alert events",
+        "Returns the closed execution-flow stage vocabulary and the alert events an alert channel can leave out.",
+      ),
+      response: errors(401, 403),
+    },
+  )
   .get(
     "/",
     async ({ tenantContext }) => ({
@@ -102,6 +110,13 @@ export const alertChannelsController = new Elysia({
           t.Array(t.String(), {
             description:
               "Flow stages to filter on, from GET /stages; empty matches all stages.",
+          }),
+        ),
+        excludeEvents: t.Optional(
+          t.Array(t.String(), {
+            maxItems: 100,
+            description:
+              "Alert events to leave out, from GET /stages (`events`); empty leaves none out. A line of any of them is not alerted here and stays in the log; a line of none of them is never left out by this list.",
           }),
         ),
         excludeAgentIds: t.Optional(
@@ -185,6 +200,13 @@ export const alertChannelsController = new Elysia({
               "New flow stages to filter on, from GET /stages; empty matches all stages.",
           }),
         ),
+        excludeEvents: t.Optional(
+          t.Array(t.String(), {
+            maxItems: 100,
+            description:
+              "Replaces the alert events to leave out; [] leaves none out. Omitted keeps the stored list.",
+          }),
+        ),
         excludeAgentIds: t.Optional(
           t.Array(t.String(), {
             maxItems: 200,
@@ -233,7 +255,7 @@ export const alertChannelsController = new Elysia({
   )
   // Synchronously POSTs a sample alert to the channel's destination, through the SAME send a queued
   // alert takes, and returns what happened. Never enqueues a delivery and never writes a flow-log
-  // line, so the test cannot show up in the destination's history as an incident (issue #605).
+  // line, so the test cannot show up in the destination's history as an incident.
   .post(
     "/:id/test",
     async ({ tenantContext, params }) => ({

@@ -13,6 +13,7 @@ import {
 import { listExecutionLogs } from "@/modules/flowlog/read";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { withFlowStage } from "@/modules/flowlog/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRow } from "../utils/flowlog";
 import { outboundUrl } from "../utils/outbound";
 
@@ -48,8 +49,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -192,8 +193,8 @@ describe.skipIf(!dbUp)("flowlog", () => {
     expect(after2[0]?.count).toBe(2);
   });
 
-  // Issue #610: the ledger row is what the worker posts, so the body has to be right THERE, not only
-  // in the function that builds it.
+  // NOTE: The ledger row is what the worker posts, so the body has to be right THERE, not only in the
+  // function that builds it.
   test("a delivery for a line with no error text carries why it was raised", async () => {
     const ch = await createAlertChannel(
       ctx(tenantB),
@@ -298,6 +299,7 @@ describe.skipIf(!dbUp)("flowlog", () => {
     let row: { level: string; status: string | null } | null = null;
     for (let i = 0; i < 100 && !row; i++) {
       row = await flowLogRow(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId: tenantA, turnId: "b8-warn", stage: "tts" },
         select: { level: true, status: true },
       });

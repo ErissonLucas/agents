@@ -1,16 +1,20 @@
 import { clipText } from "@/lib/text";
+import {
+  composeForChatwoot,
+  markValue,
+  replaceInOperatorText,
+} from "@/modules/chatwoot/liquid";
+import {
+  CARRY_ATTACHMENTS_DEFAULTS,
+  type CarryAttachmentsConfig,
+  readCarryAttachments,
+} from "./carry-attachments-settings";
 
 // Per-agent config for the `open_case_in_inbox` native tool, read from `agent.settings.crossInboxCase`.
-//
-// WHERE the case goes is an operator decision and lives here, never in a tool argument: the model
-// decides WHETHER to open the case, not which inbox receives it (issue #700). A tool argument could
-// be steered by the customer's own words into an inbox the operator never meant to expose.
-//
-// `mergeContacts` is off by default on purpose. The address a customer types in a chat is only a
-// claim, and when it already belongs to another contact a merge is irreversible (Chatwoot has no
-// unmerge) and pulls that other contact's attributes into the prompt of the agent talking to whoever
-// typed it. Off, the case opens on the contact that already holds the address and the two link notes
-// join the halves; an operator who accepts the risk turns the merge on.
+// WHERE the case goes lives here, never in a tool argument, which the customer's words could steer
+// into an inbox the operator never meant to expose. `mergeContacts` is off by default: a typed address
+// is only a claim, and a merge is irreversible in Chatwoot and pulls the other contact's attributes
+// into the prompt. Off, the case opens on the contact holding the address and link notes join them.
 
 export interface CrossInboxCaseConfig {
   // The Chatwoot inbox id (chatwootInboxId) the case is opened in. Null ⇒ the tool is not offered.
@@ -21,9 +25,9 @@ export interface CrossInboxCaseConfig {
   targetInstanceId: number | null;
   // A label written on the ORIGIN conversation once the case is open. Null ⇒ none.
   originLabel: string | null;
-  // Labels written on every CASE this tool opens or continues, on top of the model's `labels`
-  // (issue #901). The model's choice varies per call; a team whose queue is a folder filtered by
-  // label needs one the operator controls, or the cases the agent opens never reach that folder.
+  // Labels written on every CASE this tool opens or continues, on top of the model's `labels`. A team
+  // whose queue is a label-filtered folder needs one the operator controls, or the agent's cases never
+  // reach it.
   caseLabels: string[];
   // The origin conversation's custom attribute that receives the case's conversation number.
   caseAttributeKey: string;
@@ -35,6 +39,19 @@ export interface CrossInboxCaseConfig {
   // The subject of a case opened in an EMAIL inbox: the operator's template, with the prompt's context
   // variables and `{{resumo}}`/`{{summary}}`, which the model writes. Null ⇒ Chatwoot's generic one.
   subjectTemplate: string | null;
+  // The opening message of a NEW case, written by the operator: the prompt's context variables,
+  // `{{numero_caso}}`/`{{case_number}}` and `{{mensagem}}`/`{{message}}`, the part the model writes.
+  // Without the message placeholder the opening is fixed and the model is not asked for one. Null ⇒
+  // the model's message, signed, as the whole opening.
+  openingTemplate: string | null;
+  // The one private note on the case, written by the operator: `{{assunto}}`/`{{subject}}`,
+  // `{{motivo}}`/`{{reason}}`, `{{link_origem}}`/`{{origin_url}}` and the context variables. Null ⇒
+  // the default layout (`renderCaseNote`).
+  noteTemplate: string | null;
+  // The customer's files carried from the origin into the case, as one private note after the case's
+  // own (./carry-attachments.ts). Off by default: it copies identity documents and receipts into
+  // another inbox, which the operator decides knowingly.
+  carryAttachments: CarryAttachmentsConfig;
 }
 
 export const CROSS_INBOX_CASE_DEFAULT_ATTRIBUTE = "case_conversation_id";
@@ -53,6 +70,9 @@ export const CROSS_INBOX_CASE_DEFAULTS: CrossInboxCaseConfig = {
   mergeContacts: false,
   resolveOrigin: false,
   subjectTemplate: null,
+  openingTemplate: null,
+  noteTemplate: null,
+  carryAttachments: CARRY_ATTACHMENTS_DEFAULTS,
 };
 
 // An email header: one line, and short enough to read in a list.
@@ -78,6 +98,82 @@ export function renderCaseSubject(
     .replace(/\s+/g, " ")
     .trim();
   return line ? clipText(line, CROSS_INBOX_CASE_SUBJECT_MAX).trim() : null;
+}
+
+export const CROSS_INBOX_CASE_OPENING_TEMPLATE_MAX = 4000;
+export const CROSS_INBOX_CASE_NOTE_TEMPLATE_MAX = 2000;
+const MESSAGE_PLACEHOLDER = /\{\{\s*(?:mensagem|message)\s*\}\}/;
+const OPENING_PLACEHOLDERS =
+  /\{\{\s*(mensagem|message|numero_caso|case_number)\s*\}\}/g;
+const NOTE_PLACEHOLDERS =
+  /\{\{\s*(assunto|subject|motivo|reason|link_origem|origin_url)\s*\}\}/g;
+
+// Whether the model is asked for its part of the opening: always without a template (the message IS
+// the opening), and with one only when it has the placeholder.
+export function openingAsksMessage(template: string | null): boolean {
+  return template === null || MESSAGE_PLACEHOLDER.test(template);
+}
+
+// Context variables first, then the case number and the model's message in ONE pass, so text the
+// model wrote is never interpolated, and the placeholders are filled in the operator's text only, never
+// inside a value already filled in. `interpolate` fences the values it fills in (`markValue`), the
+// model's message is fenced here, and `composeForChatwoot` escapes every fenced value for Chatwoot's
+// Liquid while the operator's own keeps rendering: the result is the wire. Empty ⇒ null, nothing sent.
+export function renderCaseOpening(
+  template: string,
+  message: string | null,
+  caseNumber: number,
+  interpolate: (template: string) => string,
+): string | null {
+  const text = composeForChatwoot(
+    replaceInOperatorText(
+      interpolate(template),
+      OPENING_PLACEHOLDERS,
+      (_, key) =>
+        key === "mensagem" || key === "message"
+          ? markValue(message ?? "")
+          : String(caseNumber),
+    ),
+  ).trim();
+  return text || null;
+}
+
+// The one private note on the case, in markdown: the subject as its title, a link back to the
+// conversation the case came from, and the model's reason. PT-BR, like the other system notes. The
+// operator's template replaces the layout, filled the same way as the opening: the subject and the
+// reason carry the model's words and are fenced values, the link is ours.
+export function renderCaseNote(
+  template: string | null,
+  parts: { subject: string | null; reason: string; originUrl: string },
+  interpolate: (template: string) => string,
+): string {
+  const subject = parts.subject ? markValue(parts.subject) : "";
+  const reason = markValue(parts.reason);
+  if (!template) {
+    const title = subject ? `### ${subject}\n\n` : "";
+    return composeForChatwoot(
+      `${title}**Caso aberto a partir de outra conversa:** [ver conversa de origem](${parts.originUrl})\n\n**Motivo:**\n${reason}`,
+    );
+  }
+  return composeForChatwoot(
+    replaceInOperatorText(
+      interpolate(template),
+      NOTE_PLACEHOLDERS,
+      (_, key) => {
+        if (key === "assunto" || key === "subject") return subject;
+        if (key === "motivo" || key === "reason") return reason;
+        return parts.originUrl;
+      },
+    ),
+  ).trim();
+}
+
+// The note a case gets when the customer adds something after it opened. Its own layout, never the
+// operator's `noteTemplate`, which describes a case being opened.
+export function renderCaseAddition(reason: string, originUrl: string): string {
+  return composeForChatwoot(
+    `**Informação adicional do cliente** ([ver conversa](${originUrl})):\n\n${markValue(reason)}`,
+  );
 }
 
 // Chatwoot attribute keys are lowercase snake case; anything else would be written under a key the
@@ -114,7 +210,10 @@ export function readCrossInboxCaseConfig(
       ? (settings as Record<string, unknown>).crossInboxCase
       : undefined;
   if (!s || typeof s !== "object" || Array.isArray(s)) {
-    return { ...CROSS_INBOX_CASE_DEFAULTS };
+    return {
+      ...CROSS_INBOX_CASE_DEFAULTS,
+      carryAttachments: readCarryAttachments(undefined),
+    };
   }
   const o = s as Record<string, unknown>;
   const label = typeof o.originLabel === "string" ? o.originLabel.trim() : "";
@@ -127,6 +226,8 @@ export function readCrossInboxCaseConfig(
           CROSS_INBOX_CASE_SUBJECT_TEMPLATE_MAX,
         )
       : "";
+  const template = (v: unknown, max: number) =>
+    typeof v === "string" ? clipText(v.trim(), max).trim() || null : null;
   return {
     targetInboxId: positiveInt(o.targetInboxId),
     targetInstanceId: positiveInt(o.targetInstanceId),
@@ -138,6 +239,12 @@ export function readCrossInboxCaseConfig(
     mergeContacts: o.mergeContacts === true,
     resolveOrigin: o.resolveOrigin === true,
     subjectTemplate: subject || null,
+    openingTemplate: template(
+      o.openingTemplate,
+      CROSS_INBOX_CASE_OPENING_TEMPLATE_MAX,
+    ),
+    noteTemplate: template(o.noteTemplate, CROSS_INBOX_CASE_NOTE_TEMPLATE_MAX),
+    carryAttachments: readCarryAttachments(o.carryAttachments),
   };
 }
 
@@ -158,6 +265,32 @@ export function destinationIdentity(
     case "Channel::Api":
     case "Channel::WebWidget":
       return "none";
+    default:
+      return null;
+  }
+}
+
+// The channel the team answers the case on, named in what the model tells the customer. A Twilio
+// inbox carries WhatsApp or SMS, which its `medium` says.
+export type ReplyChannel = "email" | "whatsapp" | "sms" | "web_widget" | "api";
+
+export function replyChannel(
+  channelType: string | null,
+  medium: string | null = null,
+): ReplyChannel | null {
+  switch (channelType) {
+    case "Channel::Email":
+      return "email";
+    case "Channel::Whatsapp":
+      return "whatsapp";
+    case "Channel::TwilioSms":
+      return medium === "whatsapp" ? "whatsapp" : "sms";
+    case "Channel::Sms":
+      return "sms";
+    case "Channel::WebWidget":
+      return "web_widget";
+    case "Channel::Api":
+      return "api";
     default:
       return null;
   }

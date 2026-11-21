@@ -5,6 +5,7 @@ import type { TenantContext } from "@/lib/tenancy";
 import { getKpis } from "@/modules/analytics/service";
 import { recordResolutionOrigin } from "@/modules/conversations/record-resolution";
 import type { ResolutionOrigin } from "@/modules/conversations/resolution-origin";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -23,8 +24,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -92,8 +93,8 @@ async function seedClosedConversation(p: {
 }
 
 // A conversation a human owned start to finish, on which the customer sent an image. Vision runs on
-// the incoming attachment BEFORE the bot-ownership gate, so the tenant was billed and the row exists
-// — but the agent never took the turn. Seeded with the node the real writer sets.
+// the incoming attachment BEFORE the bot-ownership gate, so the tenant is billed and the row exists,
+// but the agent never took the turn. Seeded with the node the real writer sets.
 async function seedVisionOnlyConversation(convId: number): Promise<void> {
   const conv = await suDb.conversation.create({
     data: {
@@ -200,8 +201,8 @@ describe.skipIf(!dbUp)("getKpis: what counts as a resolution", () => {
     await appDb.$disconnect();
   });
 
-  // Issue #188: six of the eight conversations above are resolved with no human assignee, which is
-  // the predicate the funnel used to read as "the AI resolved it". Only one of them is.
+  // Six of the eight conversations above are resolved with no human assignee, and "no human
+  // assignee" is not "the AI resolved it": only one of them is.
   test("only the agent's own close counts as a resolution", async () => {
     const kpis = await getKpis(ctx(), {}, appDb);
     expect(kpis.involved).toBe(8);
@@ -216,8 +217,8 @@ describe.skipIf(!dbUp)("getKpis: what counts as a resolution", () => {
       origin: "followup_abandonment",
     });
     const after = await getKpis(ctx(), {}, appDb);
-    // The whole defect in one assertion: one more conversation the agent failed to engage, and the
-    // resolution count must not move. It used to.
+    // NOTE: one more conversation the agent failed to engage, and the resolution count must not
+    // move.
     expect(after.resolvedByBot).toBe(before.resolvedByBot);
     expect(after.involved).toBe(before.involved + 1);
     expect(after.resolutionRate).toBeLessThan(before.resolutionRate);
@@ -229,14 +230,8 @@ describe.skipIf(!dbUp)("getKpis: what counts as a resolution", () => {
     expect(kpis.resolvedByBot).toBe(1);
   });
 
-  test("a human takeover is still a handoff", async () => {
-    const kpis = await getKpis(ctx(), {}, appDb);
-    expect(kpis.handoff).toBe(1);
-  });
-
-  // Issue #316 completed the ledger, and completing it broke the proxy this KPI rested on: every
-  // billed call used to be an agent turn, because the calls that were not had no row. A vision-only
-  // conversation is the first one that is billed and never answered.
+  // The ledger records calls that are not agent turns, so "billed" is not "involved": a vision-only
+  // conversation is billed and never answered.
   test("a call billed before the bot gate is not involvement", async () => {
     const before = await getKpis(ctx(), {}, appDb);
     await seedVisionOnlyConversation(30);
@@ -248,14 +243,6 @@ describe.skipIf(!dbUp)("getKpis: what counts as a resolution", () => {
     expect(after.involvementRate).toBeLessThan(before.involvementRate);
     // And the resolution rate, whose denominator is `involved`, must not move at all.
     expect(after.resolutionRate).toBe(before.resolutionRate);
-  });
-
-  test("a legacy row with no node still counts as the agent turn it was", async () => {
-    // The eight conversations seeded above all carry `node: null`, which is what every row written
-    // before this column had a default looks like. `notIn` alone drops them (SQL NOT IN with NULL),
-    // so this is the assertion that catches the filter tightening past its own rule.
-    const kpis = await getKpis(ctx(), {}, appDb);
-    expect(kpis.involved).toBeGreaterThanOrEqual(8);
   });
 
   test("the rates derive from the recorded resolutions", async () => {

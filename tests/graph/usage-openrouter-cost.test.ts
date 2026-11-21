@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import type { LLMResult } from "@langchain/core/outputs";
 import { tool } from "@langchain/core/tools";
@@ -25,15 +25,16 @@ import {
 import { callCostUsd } from "@/modules/pricing/price";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
 import { getVisionProvider } from "@/modules/vision/providers";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// WHAT OPENROUTER SAID A CALL COST, recorded instead of the table's estimate (issue #866).
+// WHAT OPENROUTER SAID A CALL COST, recorded instead of the table's estimate.
 //
 // Driven through the real `ChatOpenAI` against a server answering in OpenRouter's own response shape,
 // for the same reason as tests/graph/usage-provider-counts.test.ts: whether the adapter hands the
 // field over at all is the question, and a hand-written `response_metadata` fixture would answer it
 // by assumption.
 
-// NOTE: happy-dom's `fetch` enforces same-origin and its `Response` is not Bun's. Same workarounds as
+// happy-dom's `fetch` enforces same-origin and its `Response` is not Bun's. Same workarounds as
 // tests/graph/usage-provider-counts.test.ts.
 const CORS = {
   "access-control-allow-origin": "*",
@@ -54,6 +55,7 @@ const TABLE_COST = callCostUsd(
     promptTokens: PROMPT,
     cachedReadTokens: 0,
     cacheCreationTokens: 0,
+    cacheCreation1hTokens: 0,
     completionTokens: COMPLETION,
   },
   new Date(),
@@ -125,6 +127,7 @@ afterAll(() => {
 
 function serving(respond: (streamed: boolean) => Response) {
   const s = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       if (req.method === "OPTIONS")
@@ -135,7 +138,7 @@ function serving(respond: (streamed: boolean) => Response) {
     },
   });
   servers.push(s);
-  return `http://localhost:${s.port}/api/v1`;
+  return `http://127.0.0.1:${s.port}/api/v1`;
 }
 
 function answering(usage: unknown, toolCall = false) {
@@ -197,8 +200,8 @@ describe("an OpenRouter call records the cost OpenRouter reported", () => {
     expect(row.priceTable).toBe(OPENROUTER_REPORTED_PRICE_TABLE);
   });
 
-  // Issue #865: a price the tenant wrote for the model is what the account says it pays, and it
-  // comes before OpenRouter's figure as it comes before the table.
+  // NOTE: a price the tenant wrote for the model is what the account says it pays, and it comes
+  // before OpenRouter's figure as it comes before the table.
   test("a tenant's own price for the model wins over the reported cost", async () => {
     const tenant = 866_865n;
     await cachedPriceOverrides(tenant, async () => ({
@@ -238,6 +241,7 @@ describe("an OpenRouter call records the cost OpenRouter reported", () => {
       promptTokens: 0,
       cachedReadTokens: 0,
       cacheCreationTokens: 0,
+      cacheCreation1hTokens: 0,
       completionTokens: 0,
       costUsd: 0.01,
       pricedCalls: 2,
@@ -364,6 +368,7 @@ describe("another provider's `cost` field is not read", () => {
           promptTokens: PROMPT,
           cachedReadTokens: 0,
           cacheCreationTokens: 0,
+          cacheCreation1hTokens: 0,
           completionTokens: COMPLETION,
         },
         new Date(),
@@ -392,8 +397,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -444,6 +449,15 @@ describe.skipIf(!dbUp)(
     const appDb = app as PrismaClient;
     let tenantId = 0n;
 
+    // Created here and not in the first test: under `bun test --randomize` the second can run first,
+    // and it would write its row for tenant 0.
+    beforeAll(async () => {
+      const t = await suDb.tenant.create({
+        data: { name: "OR-COST", slug: `or-cost-${process.pid}` },
+      });
+      tenantId = t.id;
+    });
+
     afterAll(async () => {
       if (tenantId) {
         await suDb.$executeRawUnsafe(
@@ -458,10 +472,6 @@ describe.skipIf(!dbUp)(
     });
 
     test("reported and table rows are stamped apart", async () => {
-      const t = await suDb.tenant.create({
-        data: { name: "OR-COST", slug: `or-cost-${process.pid}` },
-      });
-      tenantId = t.id;
       const persist = defaultUsagePersist(appDb);
       const base = {
         tenantId,
@@ -476,6 +486,7 @@ describe.skipIf(!dbUp)(
         completionTokens: COMPLETION,
         cachedReadTokens: 0,
         cacheCreationTokens: 0,
+        cacheCreation1hTokens: 0,
         durationMs: null,
       };
       await persist({
@@ -491,7 +502,8 @@ describe.skipIf(!dbUp)(
         priceTable: PRICE_TABLE_VERSION,
       });
       const rows = await suDb.llmUsage.findMany({
-        where: { tenantId },
+        // Its own two threads: the tenant is the describe's, and the other test's row may be there.
+        where: { tenantId, threadId: { in: ["or-reported", "or-table"] } },
         select: { threadId: true, costUsd: true, priceTable: true },
         orderBy: { id: "asc" },
       });

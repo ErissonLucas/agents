@@ -67,11 +67,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
 
   # NOTE: arm64 hosted runners are free only on public repos. fazer-ai/agents (Free) is public,
-  # so it builds amd64 + arm64 on GitHub-hosted runners. fazer-ai/agents-pro is private, so it
-  # builds amd64 + arm64 on Blacksmith runners (app installed on the fazer-ai org; one native
-  # runner per arch, no QEMU). Any other private repo (this master, forks without Blacksmith)
-  # falls back to amd64-only on GitHub-hosted runners. The matrix follows the repo it runs in,
-  # with no edit needed either way.
+  # so it builds amd64 + arm64 on GitHub-hosted runners; a private fork falls back to amd64-only.
+  # The private copies (agents-master, agents-pro) build on the Forgejo, not here.
   setup:
     runs-on: ubuntu-latest
     outputs:
@@ -81,11 +78,8 @@ jobs:
         id: matrix
         env:
           VISIBILITY: ${{ github.event.repository.visibility }}
-          REPO: ${{ github.repository }}
         run: |
-          if [ "$REPO" = "fazer-ai/agents-pro" ]; then
-            echo 'matrix={"include":[{"platform":"linux/amd64","runner":"blacksmith-4vcpu-ubuntu-2404","builder":"blacksmith"},{"platform":"linux/arm64","runner":"blacksmith-4vcpu-ubuntu-2404-arm","builder":"blacksmith"}]}' >> "$GITHUB_OUTPUT"
-          elif [ "$VISIBILITY" = "public" ]; then
+          if [ "$VISIBILITY" = "public" ]; then
             echo 'matrix={"include":[{"platform":"linux/amd64","runner":"ubuntu-latest"},{"platform":"linux/arm64","runner":"ubuntu-22.04-arm"}]}' >> "$GITHUB_OUTPUT"
           else
             echo 'matrix={"include":[{"platform":"linux/amd64","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
@@ -101,14 +95,15 @@ jobs:
     env:
       GIT_REF: ${{ github.head_ref || github.ref_name }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
       - name: Lowercase image name and a tag-safe ref
         env:
           REF_NAME: ${{ github.head_ref || github.ref_name }}
         run: |
           echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
           echo "IMAGE_TAG=${REF_NAME//\//-}" >> "$GITHUB_ENV"
-      - name: Checkout
-        uses: actions/checkout@v7
 
       - name: Update package.json version
         if: startsWith(github.ref, 'refs/tags/')
@@ -123,12 +118,7 @@ jobs:
           echo "PLATFORM_PAIR=${platform//\//-}" >> $GITHUB_ENV
 
       - name: Set up Docker Buildx
-        if: matrix.builder != 'blacksmith'
         uses: docker/setup-buildx-action@v4
-
-      - name: Setup Blacksmith Docker builder
-        if: matrix.builder == 'blacksmith'
-        uses: useblacksmith/setup-docker-builder@v2
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v4
@@ -138,7 +128,6 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push to GitHub Container Registry
-        if: matrix.builder != 'blacksmith'
         id: build-ghcr
         uses: docker/build-push-action@v7
         with:
@@ -153,32 +142,16 @@ jobs:
             ${{ env.GITHUB_REPO }}:latest
             ${{ env.GITHUB_REPO }}:${{ github.sha }}
             ${{ env.GITHUB_REPO }}:${{ env.IMAGE_TAG }}
-          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
-          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
-
-      # NOTE: same build, Blacksmith flavor — layer cache is persisted by Blacksmith itself
-      # (sticky disks), so the gha cache-from/to pair is intentionally absent here.
-      - name: Build and push to GitHub Container Registry (Blacksmith)
-        if: matrix.builder == 'blacksmith'
-        id: build-ghcr-blacksmith
-        uses: useblacksmith/build-push-action@v2
-        with:
-          context: .
-          file: Dockerfile
-          platforms: ${{ matrix.platform }}
-          push: true
-          build-args: |
-            BUN_PUBLIC_CDN_URL=${{ secrets.BUN_PUBLIC_CDN_URL }}
-            BUN_PUBLIC_EDITION=${{ vars.BUN_PUBLIC_EDITION || 'full' }}
-          tags: |
-            ${{ env.GITHUB_REPO }}:latest
-            ${{ env.GITHUB_REPO }}:${{ github.sha }}
-            ${{ env.GITHUB_REPO }}:${{ env.IMAGE_TAG }}
+          # NOTE: registry cache, not gha: this workflow runs on a release, so on a tag ref, and a
+          # GitHub Actions cache written from a tag is visible only to that tag and the default
+          # branch. With gha every release started cold and shipped every layer again.
+          cache-from: type=registry,ref=${{ env.GITHUB_REPO }}:buildcache-${{ env.PLATFORM_PAIR }}
+          cache-to: type=registry,ref=${{ env.GITHUB_REPO }}:buildcache-${{ env.PLATFORM_PAIR }},mode=max,ignore-error=true
 
       - name: Export digest
         run: |
           mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build-ghcr.outputs.digest || steps.build-ghcr-blacksmith.outputs.digest }}"
+          digest="${{ steps.build-ghcr.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
@@ -198,12 +171,6 @@ jobs:
     # explicitly on build so the manifest is assembled whenever the build succeeded, R2 or not.
     if: always() && needs.build.result == 'success'
     steps:
-      - name: Lowercase image name and a tag-safe ref
-        env:
-          REF_NAME: ${{ github.head_ref || github.ref_name }}
-        run: |
-          echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
-          echo "IMAGE_TAG=${REF_NAME//\//-}" >> "$GITHUB_ENV"
       - name: Download digests
         uses: actions/download-artifact@v8
         with:
@@ -220,6 +187,13 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
+
+      - name: Lowercase image name and a tag-safe ref
+        env:
+          REF_NAME: ${{ github.head_ref || github.ref_name }}
+        run: |
+          echo "GITHUB_REPO=${GITHUB_REPO,,}" >> "$GITHUB_ENV"
+          echo "IMAGE_TAG=${REF_NAME//\//-}" >> "$GITHUB_ENV"
 
       - name: Create manifest list and push
         working-directory: ${{ runner.temp }}/digests

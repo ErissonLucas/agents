@@ -1,10 +1,13 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
+import { tRanged } from "@/api/lib/ranged";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
+import { HTTP_STATUS_RANGE, ROW_ID_RANGE } from "@/lib/number-range";
 import type { TenantContext } from "@/lib/tenancy";
+import { MODEL_RESPONSE_CHAR_RANGE } from "@/modules/tool-definitions/response-template";
 import {
   createToolDefinition,
   deleteToolDefinition,
@@ -28,6 +31,7 @@ import {
 // translate('errors.toolConversationRefFieldReserved', 'The field name conversation_ref is reserved for the conversation reference the agent creates. Give the field another name.')
 // translate('errors.toolConversationRefIntegrationRequired', 'This tool sends the conversation reference (conversation_ref), so it has to name the generic webhook integration the reference is for.')
 // translate('errors.toolDefinitionNotFound', 'Tool definition not found.')
+// translate('errors.toolMaxResponseCharsOutOfRange', 'The response limit must be a whole number from {{min}} to {{max}} characters, or empty for the default.')
 // translate('errors.toolNameTaken', 'That tool name is already in use.')
 // translate('errors.toolNameReserved', 'That name belongs to a built-in tool; choose another.')
 // translate('errors.urlTemplateNotAUrl', 'The request URL must be an http(s) URL, or a path starting with / when the credential carries a base URL')
@@ -46,8 +50,7 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
 }
 
 // Exported for the schema-drift guard in tests: every field the service create/update schema accepts
-// must appear here, or Elysia's normalize silently strips it from the request body (this is exactly
-// how `label` once got dropped, leaving the saved label stuck at the backfilled identifier).
+// must appear here, or Elysia's normalize silently strips it from the request body.
 export const writeBody = t.Object({
   name: t.Optional(
     t.String({ description: "Tool name the agent sees when selecting tools." }),
@@ -92,12 +95,10 @@ export const writeBody = t.Object({
         "Static request headers; values may contain {{secret}} placeholders.",
     }),
   ),
-  // `t.Unknown`, not `t.Record`: the record schema REBUILDS the map, and a field named `__proto__`
-  // becomes the object's prototype on the way in — the service's refusal (code-tools/service.ts)
-  // would then judge a schema the caller never sent, and the tool would save with the declared
-  // argument missing. Measured: `t.Record` answers own keys `["cpf"]` for a body that also sent
-  // `__proto__`; `t.Unknown` keeps both. The shape is still described here and validated by the
-  // service's own zod.
+  // `t.Unknown`, not `t.Record`: the record schema REBUILDS the map, so a field named
+  // `__proto__` becomes the object's prototype on the way in, the service's refusal
+  // (code-tools/service.ts) judges a schema the caller never sent, and the tool saves with the
+  // declared argument missing. The shape is still described here and validated by the service's zod.
   inputSchema: t.Optional(
     t.Unknown({
       description:
@@ -116,12 +117,10 @@ export const writeBody = t.Object({
         "Query-string params (any method); values may contain {{param}}/{{context}}/{{secret}} placeholders.",
     }),
   ),
-  // NOTE: deliberately a permissive Record, not a union of the three body modes. Declaring the modes
-  // structurally is the better contract on paper and is worse here: Elysia's `normalize` STRIPS what
-  // a schema does not declare (see the riskTier case in tools-controller.test.ts), so a body in an
-  // unsupported shape came back 200 with `body: {}` — the operator's payload silently emptied, which
-  // is issue #150 itself moved one layer earlier. Passing it through intact is what lets the service
-  // refuse it with a message that says what to write instead.
+  // Deliberately a permissive Record, not a union of the three body modes: Elysia's `normalize`
+  // STRIPS what a schema does not declare (see the riskTier case in tools-controller.test.ts), so a
+  // body in an unsupported shape would come back 200 with `body: {}`, silently emptied. Passing it
+  // through intact lets the service refuse it with a message that says what to write instead.
   body: t.Optional(
     t.Record(t.String(), t.Unknown(), {
       description:
@@ -138,9 +137,9 @@ export const writeBody = t.Object({
     t.Boolean({ description: "Whether the tool is available to agents." }),
   ),
   expectedStatuses: t.Optional(
-    t.Array(t.Integer(), {
+    t.Array(tRanged(HTTP_STATUS_RANGE), {
       description:
-        "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries and values outside 100-599 are dropped on save.",
+        "HTTP statuses this tool treats as ordinary results instead of integration failures (e.g. [404] for a lookup where 'not found' is data). The model receives the same 'HTTP <status>' text either way; only the log level and the alert dispatch change. Empty (the default) keeps every non-2xx a failure. 2xx entries are dropped on save.",
     }),
   ),
   appointment: t.Optional(
@@ -150,7 +149,7 @@ export const writeBody = t.Object({
     }),
   ),
   conversationRefIntegrationId: t.Optional(
-    t.Union([t.String(), t.Integer(), t.Null()], {
+    t.Union([t.String(), tRanged(ROW_ID_RANGE), t.Null()], {
       description:
         "The GENERIC (generic webhook) integration instance this tool hands `{{conversation_ref}}` for: an opaque handle to the current conversation, stable per (instance, conversation), that the operator's own system later sends back to that instance's webhook as `conversation_ref` to make the agent speak into this conversation. Required when any template of the tool uses `{{conversation_ref}}`, refused otherwise; null clears it. A tool using the variable refuses to run where there is no conversation (the playground, the test endpoint).",
     }),
@@ -161,6 +160,18 @@ export const writeBody = t.Object({
         "Whether the tool sends an acknowledgement message before executing.",
     }),
   ),
+  maxResponseChars: t.Optional(
+    t.Union([tRanged(MODEL_RESPONSE_CHAR_RANGE), t.Null()], {
+      description:
+        "How many characters of this tool's response the model receives: the raw body, or the rendered response template, is cut there with `…[truncated]`, and one value inside a template may take all but 2000 of it. Null or absent is the default, 4000.",
+    }),
+  ),
+  silenceTruncationAlert: t.Optional(
+    t.Boolean({
+      description:
+        "Whether a clip of this tool's response stops alerting. A clip is always written to the flow log as `response_clipped`; on, that line is `info` instead of `warn`, so no alert channel is paged for it. For a tool whose response is expected to be cut (a search that returns the first N results). Every other warning of the tool still alerts. Default false.",
+    }),
+  ),
   ackMessage: t.Optional(
     t.Union([t.String(), t.Null()], {
       description:
@@ -169,16 +180,12 @@ export const writeBody = t.Object({
   ),
 });
 
-// The CREATE route's own body. `writeBody` above describes what a PATCH accepts, where every field
-// being optional is correct, and a POST that borrows it lets a request missing a required field
-// through the transport: the refusal then comes from the service's zod schema, whose `ZodError`
-// src/app.ts has no branch for, so the caller is told the server broke about a field they own
-// (issue #301, measured: `POST` with `{}` answered 500 `Something went wrong`).
-//
-// Composed rather than written out, so the descriptions and the field list stay in one place and a
-// field added to `writeBody` cannot be missing here. WHICH fields are required is not written twice
-// either: tests/api/v1/write-body-required.test.ts derives that set from the service's create schema
-// and fails if the two drift.
+// The CREATE route's own body. `writeBody` describes a PATCH, where every field is optional; a POST
+// borrowing it lets a request missing a required field through the transport, and the service's
+// `ZodError` (src/app.ts has no branch for it) answers 500 about a field the caller owns. Composed
+// from `writeBody`, so the descriptions and the field list stay in one place. WHICH fields are
+// required is not written twice: tests/api/v1/write-body-required.test.ts derives that set from the
+// service's create schema and fails if the two drift.
 const CREATE_REQUIRED = [
   "name",
   "label",
@@ -275,8 +282,8 @@ export const toolsController = new Elysia({
       body: createBody,
     },
   )
-  // Run the definition on screen, unsaved, against the real API — the loop that makes a response
-  // template writable (issue #456). It goes out through the same `buildHttpTool` a turn uses, so
+  // Run the definition on screen, unsaved, against the real API: the loop that makes a response
+  // template writable. It goes out through the same `buildHttpTool` a turn uses, so
   // every guard is the same code; see `modules/tool-definitions/test-run.ts` for why that matters
   // and for what is deliberately NOT wired (no appointment registration, no customer ack).
   .post(
@@ -314,8 +321,11 @@ export const toolsController = new Elysia({
           query: t.Optional(t.Record(t.String(), t.Unknown())),
           body: t.Optional(t.Record(t.String(), t.Unknown())),
           credentialRef: t.Optional(t.Union([t.String(), t.Null()])),
-          expectedStatuses: t.Optional(t.Array(t.Number())),
+          expectedStatuses: t.Optional(t.Array(tRanged(HTTP_STATUS_RANGE))),
           outputSchema: t.Optional(t.Record(t.String(), t.Unknown())),
+          maxResponseChars: t.Optional(
+            t.Union([tRanged(MODEL_RESPONSE_CHAR_RANGE), t.Null()]),
+          ),
         }),
         args: t.Optional(
           t.Record(t.String(), t.Unknown(), {

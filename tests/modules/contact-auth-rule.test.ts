@@ -25,15 +25,15 @@ import {
 import { clearContactAuthState } from "@/modules/contact-auth/state";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { agentSettingsGet, agentSettingsSet } from "@/modules/mcp/write";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// ── A VERDICT FROM DATA WE ALREADY HOLD (issue #646) ──
+// ── A VERDICT FROM DATA WE ALREADY HOLD ──
 //
-// The gate had one way to decide: POST the identity to an operator-hosted endpoint. For a pilot list
-// of five numbers, or "serve the contacts whose plan is active", that endpoint is an availability
-// dependency with nothing to add. A local rule decides from the mirror instead, under the same
-// fail-closed contract, and with it the endpoint is never asked. The endpoint double below counts
-// its own calls, so "never asked" is a number.
+// A local rule (a list of numbers, a contact attribute) decides from the mirror instead of POSTing
+// the identity to an operator-hosted endpoint, under the same fail-closed contract, and with it the
+// endpoint is never asked: for a pilot list, an endpoint is an availability dependency with nothing
+// to add. The endpoint double below counts its own calls, so "never asked" is a number.
 
 describe("parsing a rule", () => {
   test("an allowlist keeps phones as digits and identifiers as typed, deduplicated", () => {
@@ -121,7 +121,7 @@ describe("parsing a rule", () => {
     expect(
       parseContactAuthRule({ kind: "attribute", scope: "lead", key: "x" }),
     ).toBeNull();
-    expect(parseContactAuthRule({ kind: "label", label: "vip" })).toBeNull();
+    expect(parseContactAuthRule({ kind: "tag", tag: "vip" })).toBeNull();
   });
 
   test("the config reader carries the rule, and a bad one reads as none", () => {
@@ -195,7 +195,7 @@ describe("the write boundary", () => {
     ).toThrow("contactAuth.rule");
     expect(() =>
       assertSettingsContactAuthRule(
-        { contactAuth: { rule: { kind: "label", label: "vip" } } },
+        { contactAuth: { rule: { kind: "tag", tag: "vip" } } },
         {},
       ),
     ).toThrow("contactAuth.rule");
@@ -262,8 +262,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -324,6 +324,7 @@ async function ask(
     channelType: "Channel::Whatsapp",
     messageText: null,
     requestKey: `rule:${seq}`,
+    stage: "both",
     cfg: config,
     base: appDb,
     fetchImpl,
@@ -518,6 +519,7 @@ describe.skipIf(!dbUp)("a local rule decides without the endpoint", () => {
         messageText: null,
         // The SAME asking key on purpose: the webhook's default when no text is forwarded.
         requestKey: "inbox",
+        stage: "both",
         cfg: cfg(rule),
         base: appDb,
         fetchImpl: ep.fetchImpl,

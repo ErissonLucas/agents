@@ -8,6 +8,7 @@ import {
 } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
+import { runningJobIds } from "@/modules/scheduler/running";
 import {
   type ClaimedJob,
   claimDueDebounceJobs,
@@ -23,14 +24,14 @@ import {
   runClaimed,
   unregisterJobHandler,
 } from "@/modules/scheduler/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
+import { until } from "@/tests/utils/poll";
 
-// A DISCARDED OUTCOME LEAVES A LINE WHERE ALERTS LOOK (issue #896).
-//
-// Two roads discard what a scheduler handler returned: the run passed its deadline, or its claim was
-// superseded. Both used to write to stdout only, so an alert channel never saw a follow-up whose next
-// step was dropped. The deadline road now always writes a `dead_letter` warn; the supersede road does
-// for FOLLOWUP, and stays quiet for DEBOUNCE, where a supersede is every burst that grows mid-run.
+// A discarded outcome leaves a line where alerts look, not only on stdout. Two roads discard what a
+// scheduler handler returned: the run passed its deadline, or its claim was superseded. The deadline
+// road always writes a `dead_letter` warn; the supersede road does for FOLLOWUP, and stays quiet for
+// DEBOUNCE, where a supersede is every burst that grows mid-run.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -47,15 +48,14 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
 let tenantId = 0n;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const past = () => new Date(Date.now() - 60_000);
 
 async function claim(kind: SchedulerJobKind, id: bigint): Promise<ClaimedJob> {
@@ -150,7 +150,12 @@ describe.skipIf(!dbUp)("a discarded scheduler outcome (issue #896)", () => {
     const job = await claim("HEARTBEAT", id);
     await runClaimed(job, appDb, { deadlineMs: 100 });
     release();
-    await sleep(300);
+    // The row leaves the running set once its late outcome is discarded (runClaimed's late chain),
+    // and flowLogRows settles the line that discard emitted.
+    await until(
+      "the late outcome to be discarded",
+      () => !runningJobIds().includes(id),
+    );
     const lines = await discardLines();
     expect(lines).toHaveLength(1);
     expect(lines[0]?.level).toBe("warn");
@@ -185,7 +190,7 @@ describe.skipIf(!dbUp)("a discarded scheduler outcome (issue #896)", () => {
     expect(row.status).toBe("CLAIMED");
   });
 
-  // Review round 1: a command like /reset retires the claimed row on purpose (DONE, `cancelledAt`,
+  // NOTE: a command like /reset retires the claimed row on purpose (DONE, `cancelledAt`,
   // claim_seq bumped). The run's outcome is then fenced by design, and a warn would page an alert
   // channel for a retirement an operator asked for.
   test("a FOLLOWUP retired on purpose while it ran stays off the flow log", async () => {

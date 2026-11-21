@@ -1,15 +1,11 @@
 import { KeyRound } from "lucide-react";
 
-// Official brand marks for credential services, inlined as SVGs (fill currentColor → theme-aware)
-// the same way GithubIcon is inlined. Most are single 24×24 paths from simple-icons (CC0); asaas
-// (absent from simple-icons) is the "a" glyph extracted from the official Asaas wordmark and so
-// carries its own viewBox. Services still without a mark (openai-compatible and the generic
-// mechanisms) fall back to the lucide key glyph. Keyed by the secret type's logical `service` id
-// (see secret-types.ts) or, for integration catalog entries, the per-product service id.
-//
-// A mark can be: a 24×24 single path (string), a single path with a custom viewBox, or a
-// multi-color logo (`paths` with explicit fills) for products whose identity is the color — the
-// Google Calendar/Drive logos render as themselves instead of the generic Google "G".
+// Official brand marks for credential services, inlined as SVGs (fill currentColor, so theme-aware)
+// like GithubIcon. Most are single 24×24 paths from simple-icons (CC0); asaas is the "a" of its
+// official wordmark, with its own viewBox. Services without a mark fall back to the lucide key glyph.
+// Keyed by the secret type's `service` id (secret-types.ts) or an integration's per-product id. A
+// mark is a 24×24 path (string), a path with a custom viewBox, or a multi-color logo (`paths` with
+// explicit fills) for products whose identity is the color, like Google Calendar and Drive.
 type BrandMark =
   | string
   | { path: string; viewBox: string }
@@ -35,6 +31,11 @@ const BRAND_PATHS: Record<string, BrandMark> = {
     "M0 12c0 6.629 5.371 12 12 12s12-5.371 12-12S18.629 0 12 0 0 5.371 0 12m17.008 5.29H11.44a5.57 5.57 0 0 1-5.562-5.567A5.57 5.57 0 0 1 11.44 6.16a5.57 5.57 0 0 1 5.567 5.563Z",
   resend:
     "M14.679 0c4.648 0 7.413 2.765 7.413 6.434s-2.765 6.434-7.413 6.434H12.33L24 24h-8.245l-8.88-8.44c-.636-.588-.93-1.273-.93-1.86 0-.831.587-1.565 1.713-1.883l4.574-1.224c1.737-.465 2.936-1.81 2.936-3.572 0-2.153-1.761-3.4-3.939-3.4H0V0z",
+  // The TypeSafe mark, as served on typesafe.ai (its header logo symbol), with its own viewBox.
+  typesafe: {
+    path: "M 12.756 2.928 L 12.756 7.067 L 16.486 9.487 L 16.487 18.652 L 8.244 24 L 3.732 21.073 L 3.732 16.82 L 0 14.399 L 0 5.35 L 0.355 5.118 L 8.244 0 Z M 5.94 20.65 L 8.242 22.144 L 14.275 18.227 L 11.975 16.735 Z M 9.022 10.332 L 9.022 14.4 L 5.29 16.822 L 5.29 19.216 L 11.197 15.383 L 11.197 8.921 Z M 12.756 15.384 L 14.928 16.794 L 14.928 10.332 L 12.756 8.922 Z M 2.21 13.976 L 4.511 15.47 L 6.812 13.976 L 4.512 12.485 Z M 1.559 6.193 L 1.559 12.544 L 3.731 11.134 L 3.731 7.066 L 7.464 4.643 L 7.464 2.36 L 1.56 6.193 Z M 5.291 11.132 L 7.463 12.542 L 7.463 10.332 L 5.292 8.921 L 5.292 11.132 Z M 5.94 7.487 L 8.244 8.981 L 10.544 7.488 L 8.244 5.994 Z M 9.024 4.643 L 11.196 6.054 L 11.196 3.774 L 9.024 2.359 Z",
+    viewBox: "0 0 16.487 24",
+  },
   // The "a" from the official Asaas wordmark (no square symbol mark is published).
   asaas: {
     path: "M5.98205 10.2322L10.1409 2.69007L14.2997 10.2122C13.1319 9.68231 11.6566 9.41707 10.0791 9.41707C8.60379 9.41707 7.17003 9.6823 5.98144 10.2322M8.05167 2.30256L0 16.6326H2.45848L3.46243 14.7777C4.63023 12.6376 6.6381 11.4757 10.0797 11.4757C13.5214 11.4757 15.6729 12.6376 16.8407 14.7984L17.8239 16.6332H20.3643L11.8009 1.42655C11.3912 0.692898 10.8177 0.386904 9.87491 0.386904H2.97085L4.02493 1.45879C4.66691 2.09755 5.1707 2.30256 6.0652 2.30256H8.05167Z",
@@ -82,6 +83,16 @@ const BRAND_PATHS: Record<string, BrandMark> = {
       {
         d: "M196.25,43.618V12.039c0-8.724-7.066-15.789-15.789-15.789h-31.579v47.368H196.25z",
         fill: "#1967D2",
+      },
+    ],
+  },
+  // simple-icons "googlesheets" (CC0), in the product's green.
+  google_sheets: {
+    viewBox: "0 0 24 24",
+    paths: [
+      {
+        d: "M11.318 12.545H7.91v-1.909h3.41v1.91zM14.728 0v6h6l-6-6zm1.363 10.636h-3.41v1.91h3.41v-1.91zm0 3.273h-3.41v1.91h3.41v-1.91zM20.727 6.5v15.864c0 .904-.732 1.636-1.636 1.636H4.909a1.636 1.636 0 0 1-1.636-1.636V1.636C3.273.732 4.005 0 4.909 0h9.318v6.5h6.5zm-3.273 2.773H6.545v7.909h10.91v-7.91zm-6.136 4.636H7.91v1.91h3.41v-1.91z",
+        fill: "#0F9D58",
       },
     ],
   },

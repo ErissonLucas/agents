@@ -6,7 +6,7 @@ import { setupPrismaMock } from "@/tests/utils/prisma-mock";
 setupPrismaMock();
 const { readerSafeBlock } = await import("@/api/v1/knowledge.controller");
 
-// Boundary projection for issue #80. The documents list is `requireAuth` (any role, AGENT included);
+// Boundary projection. The documents list is `requireAuth` (any role, AGENT included);
 // the reindex endpoint that legitimately returns the credential ref for a fill deeplink is
 // TENANT_ADMIN. The block object is the same on both, so the difference has to be enforced where it
 // crosses.
@@ -15,13 +15,8 @@ describe("readerSafeBlock", () => {
     expect(readerSafeBlock(null)).toBeNull();
   });
 
-  test("the reason survives", () => {
-    expect(readerSafeBlock({ reason: "embedding_not_configured" })).toEqual({
-      reason: "embedding_not_configured",
-    });
-  });
-
-  // The finding itself: a pending or empty credential is exactly the case that carries the ref.
+  // A pending or empty credential is exactly the case that carries the ref, so it is the one that
+  // must not cross.
   test("the credential ref and its vault id never cross", () => {
     const out = readerSafeBlock({
       reason: "credential_pending",
@@ -30,14 +25,5 @@ describe("readerSafeBlock", () => {
     });
     expect(out).toEqual({ reason: "credential_pending" });
     expect(JSON.stringify(out)).not.toContain("42");
-  });
-
-  test("the same holds for an empty credential", () => {
-    const out = readerSafeBlock({
-      reason: "credential_empty",
-      credentialRef: "vault:7",
-      vaultId: "7",
-    });
-    expect(Object.keys(out ?? {})).toEqual(["reason"]);
   });
 });

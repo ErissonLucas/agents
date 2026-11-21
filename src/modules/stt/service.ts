@@ -2,7 +2,7 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { AppError, NotFoundError } from "@/lib/errors";
-import { shareInFlight } from "@/lib/locks";
+import { shareAbortableInFlight } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import {
@@ -12,22 +12,23 @@ import {
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import { cleanTranscription } from "@/modules/chatwoot/render";
+import { readDebugModes } from "@/modules/flowlog/debug-mode";
 import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
+import { assertClientSpendCeiling } from "@/modules/spend-ceiling/service";
 import { tryResolveApiKeyEntry } from "@/modules/vault/service";
-import { getSttProvider } from "./providers";
+import { getSttProvider, type SttResult } from "./providers";
 import { readSttConfig, type SttConfig } from "./settings";
 
 // Speech-to-text orchestration: download the voice note, transcribe via the configured provider
 // (key from the vault), and write the transcription back onto the Chatwoot attachment meta so the
-// debounce re-fetch reads it (and human agents see it too). The meta write-back is a FORK route —
-// on upstream Chatwoot it 404s, so every completed transcription is also stashed in the in-process
-// annotation store (chatwoot/annotations.ts) that the flush overlays (issue #49). We never store
-// the transcription in our own DB — Chatwoot already holds the conversation, consistent with the
-// anti-PII no-body-mirror rule. All network I/O is outside transactions; deps are injectable.
+// debounce re-fetch reads it (and human agents see it too). The meta write-back is a FORK route that
+// 404s on upstream Chatwoot, so every transcription is also stashed in the in-process annotation store
+// (chatwoot/annotations.ts) that the flush overlays. Never stored in our own DB (anti-PII
+// no-body-mirror rule). All network I/O is outside transactions; deps are injectable.
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
@@ -44,10 +45,8 @@ export async function resolveSttConfig(
   instanceId: bigint,
   chatwootInboxId: number,
   base: PrismaClient = basePrisma,
-  // The agent whose settings answer, when the caller already knows it: a delivery on an OBSERVER's
-  // route (issue #476) is read by the observer's runtime, not by whoever `Inbox.agentId` names —
-  // nobody, on an inbox a human team answers — so the inbox read below would answer for the wrong
-  // agent, or for none. Absent, the inbox's responder answers, as before.
+  // The agent whose settings answer, when the caller knows it: an observer's route is read by the
+  // observer's runtime, not by the inbox's responder (`Inbox.agentId`, possibly nobody).
   opts: { agentId?: bigint | null } = {},
 ): Promise<SttConfig | null> {
   const cfg = await runScopedOn(base, sysCtx(tenantId), async (db) => {
@@ -89,6 +88,8 @@ export interface TranscribeInboundParams {
   deps?: { makeClient?: MakeClient; fetchImpl?: typeof fetch };
   // Optional execution-flow context: when present, the transcription is logged as an `stt` stage.
   flow?: FlowContext;
+  // The caller's deadline: it aborts the download and the provider call in flight.
+  signal?: AbortSignal;
 }
 
 // Downloads, transcribes, and writes the transcription back to Chatwoot. Returns the transcription
@@ -101,16 +102,37 @@ export interface TranscribeInboundParams {
 export async function transcribeInboundAudio(
   params: TranscribeInboundParams,
 ): Promise<string | null> {
+  // NOTE: a route whose own STT cannot run takes nothing another route transcribed: the memory owner's
+  // settings decide what memory holds (docs/chatwoot.md, "Observer binding"). Run directly so the
+  // skip still reaches the turn trail.
+  if (!(await sttRunnable(params))) return transcribeOnce(params);
   const stashed = mediaAnnotationFor(
     params.tenantId,
     params.instanceId,
     params.messageId,
-  )?.transcribedText;
-  if (stashed) return stashed;
-  return shareInFlight(
-    `stt:${params.tenantId}:${params.instanceId}:${params.messageId}:${params.attachmentId}`,
-    () => transcribeOnce(params),
   );
+  if (stashed?.transcribedText) return stashed.transcribedText;
+  if (stashed?.transcriptionEmpty) return null;
+  return shareAbortableInFlight(
+    `stt:${params.tenantId}:${params.instanceId}:${params.messageId}:${params.attachmentId}`,
+    (signal) => transcribeOnce({ ...params, signal }),
+    params.signal,
+  );
+}
+
+// The config checks `transcribeOnce` makes before any network call, asked without reporting: whether
+// this route could transcribe at all.
+async function sttRunnable(params: TranscribeInboundParams): Promise<boolean> {
+  const { cfg } = params;
+  const provider = getSttProvider(cfg.provider);
+  if (!provider || !cfg.credentialRef) return false;
+  const entry = await runScopedOn(
+    params.base ?? basePrisma,
+    sysCtx(params.tenantId),
+    (db) => tryResolveApiKeyEntry(db, cfg.credentialRef as string),
+  );
+  if (entry.state !== "ok") return false;
+  return !provider.requiresBaseURL || Boolean(entry.baseUrl ?? cfg.baseURL);
 }
 
 async function transcribeOnce(
@@ -147,9 +169,8 @@ async function transcribeOnce(
     tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
   if (entry.state !== "ok") {
-    // Two reasons the credential cannot serve this, kept apart because the operator's move is not the
-    // same: gone or unfilled is a credential to re-pick, and the wrong KIND is one that belongs on
-    // another field (issue #471).
+    // NOTE: kept apart because the operator's move differs: gone or unfilled is a credential to re-pick,
+    // the wrong KIND belongs on another field.
     if (entry.state === "unusable") {
       logger.warn(
         "stt: credential %s is a %s credential, which cannot be used as an API key — skipping",
@@ -164,7 +185,7 @@ async function transcribeOnce(
     );
     return skip("credential_not_found");
   }
-  // NOTE: credential baseUrl takes precedence over the agent config baseURL (config is a fallback).
+  // Credential baseUrl takes precedence over the agent config baseURL (config is a fallback).
   // The requiresBaseURL check uses the effective value so a credential-stored URL satisfies the guard.
   const effectiveBaseURL = entry.baseUrl ?? cfg.baseURL;
   if (provider.requiresBaseURL && !effectiveBaseURL) {
@@ -176,15 +197,15 @@ async function transcribeOnce(
     base,
     makeClient: params.deps?.makeClient,
   });
-  // NOTE: the download sits OUTSIDE the withFlowStage span below, so a failure here used to leave NO
-  // `stt` line at all — the operator saw a turn that answered "não consegui ouvir" with nothing on the
-  // Logs page to explain it. Emit the stage line, then re-throw (the caller decides; see the contract
+  // The download sits OUTSIDE the withFlowStage span below, so without this a failure leaves no
+  // `stt` line to explain a turn that answered "não consegui ouvir". Emit the stage line, then re-throw (the caller decides; see the contract
   // above). `retryOnMissing` absorbs Chatwoot's write race on a fresh voice note.
   let bytes: ArrayBuffer;
   let contentType: string | null;
   try {
     ({ bytes, contentType } = await client.downloadAttachment(params.dataUrl, {
       retryOnMissing: true,
+      signal: params.signal,
     }));
   } catch (err) {
     if (params.flow) {
@@ -199,10 +220,14 @@ async function transcribeOnce(
     }
     throw err;
   }
-  const raw = await withFlowStage(
+  const result = await withFlowStage(
     params.flow,
     "stt",
-    { provider: cfg.provider, model: cfg.model || provider.defaultModel },
+    {
+      provider: cfg.provider,
+      model: cfg.model || provider.defaultModel,
+      detailOf: confidenceDetail,
+    },
     () =>
       provider.transcribe({
         audio: bytes,
@@ -212,13 +237,24 @@ async function transcribeOnce(
         apiKey: entry.secret,
         baseURL: effectiveBaseURL,
         fetchImpl: params.deps?.fetchImpl ?? fetch,
+        signal: params.signal,
       }),
   );
-  const text = cleanTranscription(raw);
-  if (!text) return null;
+  const text = cleanTranscription(result.text);
+  if (!text) {
+    stashMediaAnnotation(
+      {
+        tenantId: params.tenantId,
+        instanceId: params.instanceId,
+        messageId: params.messageId,
+      },
+      { transcriptionEmpty: true },
+    );
+    return null;
+  }
 
-  // NOTE: Stash BEFORE the write-back: on upstream Chatwoot (no fork meta route) the in-process
-  // overlay is the only reader that will ever see this transcription (issue #49).
+  // NOTE: stash BEFORE the write-back: on upstream Chatwoot (no fork meta route) the in-process
+  // overlay is the only reader that will ever see this transcription.
   stashMediaAnnotation(
     {
       tenantId: params.tenantId,
@@ -260,11 +296,20 @@ async function transcribeOnce(
   return text;
 }
 
+// The stt line's record of the confidence the provider reported and what it decided, numbers only:
+// the transcription itself is never logged, withheld or not.
+// An empty transcription says so too: the provider heard no speech, which is a different answer from
+// one withheld for its confidence and from a provider that reports none.
+function confidenceDetail(r: SttResult): Record<string, unknown> {
+  if (r.withheld) return { ...r.confidence, withheld: "low_confidence" };
+  const empty = r.text.trim() === "" ? { empty: true } : {};
+  return { ...r.confidence, ...empty };
+}
+
 export interface PlaygroundTranscribeParams {
-  // The REQUEST's context, unlike the inbound path above, whose tenant id this process read from a
-  // row. Rebuilding one here would tell the unknown-tenant check at `runScopedOn` that a caller's
-  // stale selector was internal, and the operator would get "agent not found" for a tenant that is
-  // gone rather than a refusal naming the selection they are carrying (issue #268).
+  // The request's context, not a rebuilt one: rebuilding would tell `runScopedOn`'s unknown-tenant
+  // check that a stale selector was internal, answering "agent not found" instead of a refusal naming
+  // the selection.
   ctx: TenantContext;
   agentId: bigint;
   audio: ArrayBuffer;
@@ -274,9 +319,16 @@ export interface PlaygroundTranscribeParams {
   settings?: unknown;
   base?: PrismaClient;
   deps?: { fetchImpl?: typeof fetch };
+  // The playground's flow context: the stt line is what tells the operator a withheld transcription
+  // from silence.
+  flow?: FlowContext;
+  // Asked once the configuration is known to run, immediately before the provider call: the place
+  // a spend ceiling's gate belongs, so an agent whose speech-to-text never runs is told that instead.
+  beforeCall?: () => Promise<unknown>;
 }
 
-// Transcribe an uploaded audio file with the agent's configured STT provider, for the playground.
+// Transcribe an uploaded audio file with the agent's configured STT provider, for the playground and
+// for the SDK widget's microphone (the page has to tell the visitor why the recording went nowhere).
 // Unlike the inbound path (best-effort, silent on misconfig so a real conversation is never stranded),
 // this THROWS a clear AppError when STT is not runnable — the operator is explicitly testing the
 // configuration and needs to know what is wrong. No Chatwoot, no write-back: the transcription is
@@ -334,17 +386,28 @@ export async function transcribePlaygroundAudio(
     );
   }
 
-  let raw: string;
+  await params.beforeCall?.();
+  let result: SttResult;
   try {
-    raw = await provider.transcribe({
-      audio: params.audio,
-      mimeType: params.mimeType,
-      language: cfg.language,
-      model: cfg.model || provider.defaultModel,
-      apiKey: entry.secret,
-      baseURL: effectiveBaseURL,
-      fetchImpl: params.deps?.fetchImpl ?? fetch,
-    });
+    result = await withFlowStage(
+      params.flow,
+      "stt",
+      {
+        provider: cfg.provider,
+        model: cfg.model || provider.defaultModel,
+        detailOf: confidenceDetail,
+      },
+      () =>
+        provider.transcribe({
+          audio: params.audio,
+          mimeType: params.mimeType,
+          language: cfg.language,
+          model: cfg.model || provider.defaultModel,
+          apiKey: entry.secret,
+          baseURL: effectiveBaseURL,
+          fetchImpl: params.deps?.fetchImpl ?? fetch,
+        }),
+    );
   } catch (e) {
     const detail = clipText(e instanceof Error ? e.message : String(e), 300);
     throw new AppError(
@@ -354,5 +417,64 @@ export async function transcribePlaygroundAudio(
       { detail },
     );
   }
-  return cleanTranscription(raw);
+  return cleanTranscription(result.text);
+}
+
+export interface ClientTranscribeParams {
+  // The app's context (`appCtx`): its tenant, no principal.
+  ctx: TenantContext;
+  agentId: bigint;
+  audio: ArrayBuffer;
+  mimeType: string | null;
+  // The client channel's turn says this on its lines; the transcription that precedes it does too.
+  anonymous: boolean;
+  // The stt line's turn id; one of its own when absent, since no thread exists yet.
+  turnId?: string;
+  // The caller's own gate (the app's ceiling), asked right before the channel's.
+  beforeCall?: () => Promise<unknown>;
+  base?: PrismaClient;
+  deps?: { fetchImpl?: typeof fetch };
+}
+
+// The SDK widget's voice message: the app agent's speech-to-text, refusing as the playground's does
+// (the page tells the visitor why), behind the client channel's own ceiling, asked once the
+// configuration is known to run. The agent is read once,
+// for its STT config and its debug mode, and its `stt` line is the client channel's, under a turn id
+// of its own since no thread exists yet.
+export async function transcribeClientAudio(
+  params: ClientTranscribeParams,
+): Promise<string> {
+  const base = params.base ?? basePrisma;
+  const agent = await runScopedOn(base, params.ctx, (db) =>
+    db.agent.findUnique({
+      where: { id: params.agentId },
+      select: { settings: true },
+    }),
+  );
+  if (!agent)
+    throw new NotFoundError("agent not found", "errors.agentNotFound");
+  const tenantId = params.ctx.tenantId as bigint;
+  const flow: FlowContext = {
+    tenantId,
+    turnId: params.turnId ?? crypto.randomUUID(),
+    source: "client",
+    anonymous: params.anonymous,
+    agentId: params.agentId,
+    base,
+    fullDetail: readDebugModes(agent.settings, null).fullDetail,
+  };
+  return transcribePlaygroundAudio({
+    ctx: params.ctx,
+    agentId: params.agentId,
+    audio: params.audio,
+    mimeType: params.mimeType,
+    settings: agent.settings,
+    base,
+    deps: params.deps,
+    flow,
+    beforeCall: async () => {
+      await params.beforeCall?.();
+      await assertClientSpendCeiling({ tenantId, base, flow });
+    },
+  });
 }

@@ -1,9 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
-import { encryptJson } from "@/api/lib/crypto";
 import {
   clearTurnInFlight,
   isTurnInFlight,
@@ -13,8 +11,19 @@ import type { TenantContext } from "@/lib/tenancy";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { reengageConversation } from "@/modules/conversations/reengage";
 import { settleFlowEvents } from "@/modules/flowlog/scheduled";
-import { seedChatwootInstance } from "../utils/chatwoot";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRows } from "../utils/flowlog";
+import {
+  dropReengageWorld,
+  fakeModel,
+  makeStub,
+  page,
+  REPLY,
+  type ReengageWorld,
+  reengageCtx,
+  seedReengageConversation,
+  seedReengageWorld,
+} from "../utils/reengage";
 import { PromptCapturingModel } from "../utils/scripted-models";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -33,199 +42,39 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
 const suDb = su as PrismaClient;
 
+let world: ReengageWorld;
 let tenantId = 0n;
 let instanceId = 0n;
-let inboxDbId = 0n;
 let agentId = 0n;
 
 // A literal address in TEST-NET-3: the SSRF guard vets the final URL for real here, and an IP needs
 // no resolver to be vetted.
 const AUTH_URL = "https://203.0.113.9:9443/check";
 
-const REPLY = "Desculpe a demora, já te ajudo!";
-const fakeModel = () => new FakeListChatModel({ responses: [REPLY] });
-
 function ctx(): TenantContext {
-  return { tenantId, userId: null, role: "TENANT_ADMIN" };
+  return reengageCtx(world);
 }
 
-// `pages` serves a DIFFERENT thread per `getMessages` call, which is how a delivery landing between
-// two reads of the same conversation is told. Without it the stub is a Chatwoot frozen in time, and
-// every re-read in the code under test is answered by the state it already saw.
-function makeStub(opts: {
-  page?: unknown;
-  pages?: unknown[];
-  // What the catch-up read (`?after=`) answers (issue #746).
-  after?: unknown;
-  sent: Array<[number, string]>;
-  // Roda a cada leitura de mensagens, que é o único momento em que o hold do botão e a marca do
-  // turno podem ser distinguidos de fora: o coalesce lê ANTES de o turno se marcar.
-  onGetMessages?: () => void;
-  // A versão que pode ESPERAR, para uma barreira de largada sincronizar duas chamadas no mesmo
-  // ponto. `onGetMessages` é síncrono de propósito (é sonda); esta serve para segurar.
-  onGetMessagesAsync?: () => Promise<void>;
-}) {
-  let i = 0;
-  const client = {
-    getMessages: async (_conv: number, o?: { after?: number }) => {
-      // The catch-up read (`?after=`) is the fork's listing by id, a read of its own that carries
-      // the reactions its default page leaves out (issue #746). It answers from `after`, and does
-      // not advance `pages`: that sequence is the default page as it moves under the code.
-      if (o?.after != null) return opts.after ?? { payload: [] };
-      opts.onGetMessages?.();
-      if (opts.onGetMessagesAsync) await opts.onGetMessagesAsync();
-      if (!opts.pages) return opts.page;
-      const p = opts.pages[Math.min(i, opts.pages.length - 1)];
-      i += 1;
-      return p;
-    },
-    sendMessage: async (conversationId: number, content: string) => {
-      opts.sent.push([conversationId, content]);
-      return {};
-    },
-    toggleTyping: async () => ({}),
-  } as unknown as ChatwootClient;
-  return async () => client;
-}
-
-function page(
-  msgs: Array<{
-    id: number;
-    content: string;
-    type?: number;
-    private?: boolean;
-    // Segundos desde a época, como o Chatwoot manda. Só os testes de idade passam este campo; a
-    // ausência dele é o que todo o resto do arquivo exercita, e ela tem que continuar significando
-    // "esta página não diz quando a mensagem chegou".
-    createdAt?: number;
-  }>,
-) {
-  return {
-    payload: msgs.map((m) => ({
-      id: m.id,
-      content: m.content,
-      message_type: m.type ?? 0,
-      private: m.private ?? false,
-      ...(m.createdAt === undefined ? {} : { created_at: m.createdAt }),
-    })),
-  };
-}
-
-async function seedConversation(
+const seedConversation = (
   convId: number,
-  over: {
-    assigneeType?: string | null;
-    assigneeId?: number | null;
-    lastError?: string | null;
-    contactId?: bigint;
-    lastHandledMessageId?: number;
-    contactInboxId?: number;
-  } = {},
-): Promise<bigint> {
-  const c = await suDb.conversation.create({
-    data: {
-      tenantId,
-      chatwootInstanceId: instanceId,
-      chatwootConversationId: convId,
-      status: "pending",
-      assigneeType: over.assigneeType ?? null,
-      assigneeId: over.assigneeId ?? null,
-      inboxId: inboxDbId,
-      ...(over.contactId ? { contactId: over.contactId } : {}),
-      threadId: `${tenantId}:${instanceId}:${convId}`,
-      lastEventAt: new Date(),
-      lastError: over.lastError ?? null,
-      lastErrorAt: over.lastError ? new Date() : null,
-      lastHandledMessageId: over.lastHandledMessageId ?? null,
-      ...(over.contactInboxId !== undefined
-        ? { contactInboxId: over.contactInboxId }
-        : {}),
-    },
-  });
-  return c.id;
-}
+  over?: Parameters<typeof seedReengageConversation>[3],
+) => seedReengageConversation(suDb, world, convId, over);
 
 describe.skipIf(!dbUp)("reengage", () => {
   beforeAll(async () => {
-    const t = await suDb.tenant.create({
-      data: { name: "RE", slug: `re-${process.pid}` },
-    });
-    tenantId = t.id;
-    const inst = await seedChatwootInstance(suDb, {
-      tenantId,
-      accountId: 9,
-      baseUrl: "https://chat.example.com",
-      adminToken: encryptJson("ADMIN"),
-    });
-    instanceId = inst.id;
-    const llmKey = await suDb.vaultEntry.create({
-      data: { tenantId, name: "llm-key", secret: encryptJson("sk-test") },
-      select: { id: true },
-    });
-    const agent = await suDb.agent.create({
-      data: {
-        tenantId,
-        name: "Atendente",
-        systemPrompt: "Você é prestativa.",
-        modelConfig: {
-          provider: "openai",
-          model: "gpt-4o-mini",
-          credentialRef: `vault:${llmKey.id}`,
-        },
-      },
-    });
-    await suDb.chatwootAgentBot.create({
-      data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        agentId: agent.id,
-        chatwootAgentBotId: 9,
-        accessToken: encryptJson("BOT"),
-        webhookSecret: encryptJson("S"),
-        webhookRouteTokenHash: `re-route-${process.pid}`,
-        name: "Atendente",
-      },
-    });
-    agentId = agent.id;
-    const inbox = await suDb.inbox.create({
-      data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        chatwootInboxId: 7,
-        name: "Suporte",
-        agentId: agent.id,
-      },
-    });
-    inboxDbId = inbox.id;
+    world = await seedReengageWorld(suDb, `re-${process.pid}`);
+    ({ tenantId, instanceId, agentId } = world);
   });
 
   afterAll(async () => {
-    if (tenantId) {
-      for (const table of [
-        "audit_logs",
-        "llm_usage",
-        "conversations",
-        "contacts",
-        "inboxes",
-        "agents",
-        "vault_entries",
-        "chatwoot_instances",
-      ]) {
-        await suDb.$executeRawUnsafe(
-          `DELETE FROM ${table} WHERE tenant_id = ${tenantId}`,
-        );
-      }
-      await suDb.$executeRawUnsafe(
-        `DELETE FROM tenants WHERE id = ${tenantId}`,
-      );
-    }
+    if (tenantId) await dropReengageWorld(suDb, tenantId);
     await suDb.$disconnect();
     await appDb.$disconnect();
   });
@@ -278,7 +127,7 @@ describe.skipIf(!dbUp)("reengage", () => {
     expect(sent).toEqual([]);
   });
 
-  // #398: the re-engage is the one action of the conversation family that does not record every
+  // NOTE: the re-engage is the one action of the conversation family that does not record every
   // apply, because most of its outcomes are the button declining to act. These two pin both sides of
   // that line against the same harness, so the "no row" is measured next to a row that does appear.
   test("a re-engage that reached the customer records itself", async () => {
@@ -380,7 +229,7 @@ describe.skipIf(!dbUp)("reengage", () => {
     expect(sent).toEqual([]);
   });
 
-  // NOTE: The same seat, taken by OUR bot: the gate has to stay open, or the fix would buy silence
+  // NOTE: the same seat, taken by OUR bot: the gate has to stay open, or it would buy silence
   // rather than discrimination.
   test("our own bot holding the conversation keeps the gate open", async () => {
     const id = await seedConversation(911, {
@@ -402,7 +251,7 @@ describe.skipIf(!dbUp)("reengage", () => {
     expect(sent).toEqual([[911, REPLY]]);
   });
 
-  // ISSUE #746: the tail is only a customer's reaction to an older message, which the fork's default
+  // NOTE: the tail is only a customer's reaction to an older message, which the fork's default
   // page leaves out. The click asks the catch-up read from the mark and answers it, instead of
   // reporting an empty tail.
   test("a tail that is only a reaction no page carries is answered, not empty", async () => {
@@ -439,9 +288,8 @@ describe.skipIf(!dbUp)("reengage", () => {
     expect(sent).toEqual([[7466, REPLY]]);
   });
 
-  // PR #821, review round 1: the catch-up read also brings in an OPERATOR's reaction the default page
-  // left out. An emoji on an older message is not a reply, so the request asked before it stays
-  // the tail.
+  // NOTE: the catch-up read also brings in an OPERATOR's reaction the default page left out. An
+  // emoji on an older message is not a reply, so the request asked before it stays the tail.
   test("an operator's reaction the catch-up read brings in does not close the tail", async () => {
     const id = await seedConversation(7470, { lastHandledMessageId: 2 });
     const sent: Array<[number, string]> = [];
@@ -625,18 +473,11 @@ describe.skipIf(!dbUp)("reengage", () => {
       }
     });
 
-    // A CORRIDA, POR CONSTRUÇÃO E NÃO POR SORTE. O teste de clique duplo passava mesmo com um
-    // `await` entre ler os registros e marcar o hold: as duas chamadas nunca chegavam ao portão no
-    // mesmo tick, então era escalonamento, não exclusão. O review da rodada 4 achou a janela e a
-    // primeira tentativa de teste que escrevi para ela também não pegava, porque a barreira ficava
-    // na leitura de mensagens e sobrava caminho demais até o portão.
-    //
-    // A barreira fica no ÚLTIMO ponto injetável antes dele, o endpoint de autorização: as duas são
-    // seguradas ali e liberadas juntas. Com um `await` entre a checagem e a marca, as duas leem
-    // "livre" e as duas seguem; sem ele, uma marca e a outra encontra a marca.
-    //
-    // Duas conversas do MESMO contato, porque a thread de grafo é a do contato-inbox: é a mesma
-    // memória, que é o que a exclusão protege.
+    // NOTE: a barreira fica no ÚLTIMO ponto injetável antes do portão, o endpoint de autorização:
+    // as duas chamadas são seguradas ali e liberadas juntas. Isso não prova a exclusão sozinho (as
+    // idas ao banco depois da barreira re-serializam as duas); a ordem do portão é provada em
+    // `reengage-gate-atomic.test.ts`, com a leitura de posse segurada. Duas conversas do MESMO
+    // contato, porque a thread de grafo é a do contato-inbox: a mesma memória que a exclusão protege.
     test("dois cliques que chegam juntos ao portão não viram dois turnos", async () => {
       const CI = 601;
       const idA = await seedConversation(9601, {
@@ -773,15 +614,13 @@ describe.skipIf(!dbUp)("reengage", () => {
       );
     });
 
-    // A message that arrives and is REFUSED while this re-engage waits on the endpoint has already
-    // had the watermark advanced past it by its own delivery. The tail here is chosen from the last
-    // OUTGOING message, which a refusal never writes, so without a watermark floor that refused
-    // message rides into the very turn the gate exists to prevent.
-    //
-    // The floor is blunt on purpose: the watermark is aggregate, so it covers the older unanswered
-    // tail too and the re-engage comes back "empty". That IS the fail-closed side — what a
-    // concurrent delivery consumed is not this button's to re-answer — and it applies only with the
-    // gate on, so the button keeps its old reach everywhere else.
+    // NOTE: a message REFUSED while this re-engage waits on the endpoint already had the watermark
+    // advanced past it by its own delivery. The tail is chosen from the last OUTGOING message,
+    // which a refusal never writes, so without a watermark floor that message rides into the turn
+    // the gate exists to prevent. The floor is blunt on purpose: the watermark is aggregate, so it
+    // also covers the older unanswered tail and the re-engage comes back "empty". That is the
+    // fail-closed side (what a concurrent delivery consumed is not this button's to re-answer), and
+    // it applies only with the gate on, leaving the button's reach elsewhere untouched.
     test("a message refused during the authorization call is not re-answered", async () => {
       const id = await seedConversation(908, {
         contactId: await seedContact(45),
@@ -823,37 +662,6 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([]);
     });
 
-    // The floor only ever removes what something else handled. With nothing concurrent, the tail is
-    // the tail and the button does its job — which is what stops the guard above from quietly
-    // turning re-engage into a no-op wherever the gate is on.
-    test("with nothing handled concurrently the tail is answered as usual", async () => {
-      const id = await seedConversation(909, {
-        contactId: await seedContact(46),
-      });
-      const sent: Array<[number, string]> = [];
-      const calls = { n: 0 };
-      const res = await reengageConversation(
-        ctx(),
-        id,
-        {
-          makeModel: fakeModel,
-          makeClient: makeStub({
-            page: page([
-              { id: 1, content: "oi" },
-              { id: 2, content: "alguém aí?" },
-            ]),
-            sent,
-          }),
-          checkpointer: new MemorySaver(),
-          contactAuthFetch: answering(true, calls),
-        },
-        appDb,
-      );
-      expect(res.outcome).toBe("posted");
-      expect(calls.n).toBe(1);
-      expect(sent).toEqual([[909, REPLY]]);
-    });
-
     // AND THE FLOOR IS ABOUT THE WINDOW, NOT ABOUT THE PAST. The watermark this call found ON THE
     // WAY IN was left by whatever went before — a human-owned stretch, an out-of-hours skip — and
     // that is precisely the tail the button exists to answer. Only what something else handled
@@ -886,9 +694,9 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([[913, REPLY]]);
     });
 
-    // The assignee gate runs before the authorization round-trip, which has a ten-second ceiling. A
-    // human arriving inside it used to get the turn run on their conversation: the post gate holds
-    // the reply back, and by then the tools have written.
+    // NOTE: the assignee gate runs before the authorization round-trip, which has a ten-second
+    // ceiling, so a human arriving inside it has to close the gate too: the post gate only holds the
+    // reply back after the tools have written.
     test("a human taking over during the authorization call closes the gate", async () => {
       const id = await seedConversation(907, {
         contactId: await seedContact(44),
@@ -954,18 +762,15 @@ describe.skipIf(!dbUp)("reengage", () => {
     });
   });
 
-  // WHAT THE BUTTON IS FOR, and what it could not do (issue #452). A human-owned stretch advances
-  // the watermark without ever writing an outgoing message of ours: every turn in it is a
-  // DELIBERATE skip, and `advanceHandledWatermark` is how a skip is recorded. So the moment the
-  // conversation comes back to the bot, the watermark sits AHEAD of the last outgoing message, and
-  // the tail this button answers — incoming after that outgoing — is entirely at or below it.
-  //
-  // The post gate's CAS then loses, every time, with nothing concurrent anywhere: the target is not
-  // greater than a watermark a skip already moved. Reported as "superseded", which names a race that
-  // did not happen, and permanent — no new inbound, no new target, no way out but /reset.
+  // NOTE: what the button is for. A human-owned stretch advances the watermark without writing an
+  // outgoing message of ours (every turn in it is a DELIBERATE skip, recorded by
+  // `advanceHandledWatermark`), so when the conversation comes back to the bot the watermark sits
+  // AHEAD of the last outgoing message and the tail this button answers is at or below it. A
+  // watermark CAS as the post gate would lose every time with nothing concurrent, reported as
+  // "superseded" (a race that did not happen), with no way out but /reset.
   describe("after a human-owned stretch left the watermark ahead of the tail", () => {
-    // The reported sequence, with the ids of the log excerpt: turns ran, ended without a reply, and
-    // moved the watermark to 291; the two clicks that followed both came back superseded.
+    // NOTE: turns ran, ended without a reply, and moved the watermark to 291; the click still
+    // answers the tail at or below it.
     test("answers the tail the watermark already covers", async () => {
       const id = await seedConversation(930, { lastHandledMessageId: 291 });
       const sent: Array<[number, string]> = [];
@@ -991,8 +796,8 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([[930, REPLY]]);
     });
 
-    // AND AT-MOST-ONCE SURVIVES IT. The watermark CAS was the claim; below the watermark it has
-    // nothing left to win, so the claim has to be a write of its own or a double click posts twice.
+    // NOTE: and at-most-once survives it. Below the watermark a watermark CAS has nothing left to
+    // win, so the claim is a write of its own, or a double click posts twice.
     test("two clicks racing on the same tail post once", async () => {
       const id = await seedConversation(931, { lastHandledMessageId: 291 });
       const sent: Array<[number, string]> = [];
@@ -1013,65 +818,12 @@ describe.skipIf(!dbUp)("reengage", () => {
         reengageConversation(ctx(), id, deps(), appDb),
       ]);
       expect(sent.length).toBe(1);
-      // MUDOU COM A #594, e a metade que importa não mudou: uma resposta só. O perdedor agora é
-      // recusado ANTES de gastar um turno, e não depois de o claim de resposta tirá-lo do caminho,
-      // então ele lê `busy` em vez de `superseded`. É a resposta mais verdadeira no instante em que
-      // é dada, e economiza uma chamada ao modelo por clique duplo.
-      //
-      // `superseded` continua existindo para o caso em que a cauda é consumida ENQUANTO o modelo
-      // roda (o teste do skip logo abaixo): lá o turno chegou a acontecer.
-      //
-      // Determinístico, não corrida: a checagem e o `markFlushHold` são um bloco síncrono só, então
-      // as duas chamadas não podem passar as duas pela checagem.
+      // NOTE: uma resposta só. O perdedor é recusado ANTES de gastar um turno e lê `busy`, a
+      // resposta mais verdadeira no instante em que é dada, economizando uma chamada ao modelo por
+      // clique duplo. `superseded` fica para a cauda consumida ENQUANTO o modelo roda (o teste do
+      // skip logo abaixo), quando o turno chegou a acontecer. Determinístico, não corrida: a
+      // checagem e o `markFlushHold` são um bloco síncrono só.
       expect([a.outcome, b.outcome].sort()).toEqual(["busy", "posted"]);
-    });
-
-    // THE CEILING IS THE MARK THIS CLICK READ ON THE WAY IN, not "no ceiling" (issue #452). What was
-    // already settled when the operator clicked is the tail they are asking about — that is the
-    // whole point of the button. What settles WHILE the model runs belongs to whoever settled it: a
-    // handoff, an out-of-hours skip, another delivery consuming the burst. This click is not
-    // entitled to answer over that, and the watermark CAS it replaced would have refused it.
-    test("a skip that lands while the model runs refuses the click", async () => {
-      const id = await seedConversation(934, { lastHandledMessageId: 291 });
-      const sent: Array<[number, string]> = [];
-      const thread = page([
-        { id: 289, content: "resposta antiga", type: 1 },
-        { id: 290, content: "alguém aí?", type: 0 },
-        { id: 291, content: "?", type: 0 },
-      ]);
-      let fetches = 0;
-      const client = {
-        getMessages: async () => {
-          fetches += 1;
-          // The post gate's supersede re-fetch: the burst is chosen, the model has run, and the
-          // claim is one step away. Another delivery deliberately consumes the burst right here.
-          if (fetches === 3) {
-            await suDb.conversation.update({
-              where: { id },
-              data: { lastHandledMessageId: 295 },
-            });
-          }
-          return thread;
-        },
-        sendMessage: async (conversationId: number, content: string) => {
-          sent.push([conversationId, content]);
-          return {};
-        },
-        toggleTyping: async () => ({}),
-      } as unknown as ChatwootClient;
-
-      const res = await reengageConversation(
-        ctx(),
-        id,
-        {
-          makeModel: fakeModel,
-          makeClient: async () => client,
-          checkpointer: new MemorySaver(),
-        },
-        appDb,
-      );
-      expect(res.outcome).toBe("superseded");
-      expect(sent).toEqual([]);
     });
 
     // NO MARK AT ENTRY IS A CEILING TOO, and it is the one a nullable ceiling loses. A conversation
@@ -1121,18 +873,12 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([]);
     });
 
-    // A CLAIM IS TAKEN BEFORE THE SEND AND NEVER GIVEN BACK, and this pins the trade rather than
-    // leaving it to be rediscovered. A send that fails leaves the burst claimed, so the next click
-    // stands down instead of risking a second copy of a reply Chatwoot may already have accepted.
-    // It is the same trade the watermark's own CAS made before this change, and the operator hears
-    // about it through `lastError` and the console's error badge. The throw is still the right
-    // report here BECAUSE the read-back proves the message is not there (issue #499): a rejection
-    // nobody could check answers `posted-partial` instead, so that the recovery does not re-run the
-    // turn's tools over a reply that may have landed.
-    //
-    // Making a failed send retryable is a real improvement and a change to that trade for every
-    // posting path — the direct turn and the flush included — so it belongs in an issue of its own,
-    // not in the fix for a button that could not answer at all.
+    // NOTE: a claim is taken before the send and never given back. A send that fails leaves the
+    // burst claimed, so the next click stands down instead of risking a second copy of a reply
+    // Chatwoot may have accepted; the operator hears through `lastError` and the error badge. The
+    // throw is right here BECAUSE the read-back proves the message is not there (an unchecked
+    // rejection answers `posted-partial`, below). Making a failed send retryable would change this
+    // trade for every posting path.
     test("a send that fails keeps the claim, and the next click stands down", async () => {
       const id = await seedConversation(933, { lastHandledMessageId: 291 });
       const sent: Array<[number, string]> = [];
@@ -1143,9 +889,9 @@ describe.skipIf(!dbUp)("reengage", () => {
       ]);
       let failing = true;
       const client = {
-        // Pages the way the REST endpoint does, which the read-back after a failed send depends on:
-        // a stub that answers the same rows to every `before` never reaches the top of the history,
-        // so absence can never be proved and every failure reads as "cannot tell" (issue #499).
+        // NOTE: pages the way the REST endpoint does, which the read-back after a failed send
+        // depends on: a stub that answers the same rows to every `before` never reaches the top of
+        // the history, so absence can never be proved and every failure reads as "cannot tell".
         getMessages: async (_c: number, q?: { before?: number }) =>
           q?.before === undefined
             ? thread
@@ -1183,14 +929,12 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([]);
     });
 
-    // THE OTHER HALF OF THAT TRADE (issue #499). The test above throws because the read-back PROVED
-    // the message is not in the conversation. When the read cannot answer at all, the reply may be
-    // sitting there, and a throw is not a louder report — it is what eventually marks the ledger row
-    // DEAD and hands it to the delivery recovery, which re-runs the whole turn, tools included, over
-    // a message that may already have been answered.
-    //
-    // So the click reports `posted-partial` instead: the burst stays claimed, the conversation stays
-    // open, and the badge tells the operator a delivery could not be accounted for.
+    // NOTE: the other half of that trade. The test above throws because the read-back PROVED the
+    // message is not there. When the read cannot answer, the reply may be sitting there, and a
+    // throw would eventually mark the ledger row DEAD and hand it to the delivery recovery, which
+    // re-runs the whole turn, tools included. So the click reports `posted-partial`: the burst
+    // stays claimed, the conversation stays open, and the badge says a delivery could not be
+    // accounted for.
     test("a send nobody could check does not arm a replay of the turn", async () => {
       const id = await seedConversation(936, { lastHandledMessageId: 291 });
       const sent: Array<[number, string]> = [];
@@ -1268,9 +1012,9 @@ describe.skipIf(!dbUp)("reengage", () => {
     });
   });
 
-  // The re-engage button is a billed call like any other, and nothing above it in this path is
-  // (issue #146). Unlike the customer-facing seams it REPORTS rather than going quiet: an operator
-  // is looking at the button, and the reason is one they can act on from the settings page.
+  // NOTE: the re-engage button is a billed call like any other, and nothing above it in this path
+  // is. Unlike the customer-facing seams it REPORTS rather than going quiet: an operator is looking
+  // at the button, and the reason is one they can act on from the settings page.
   describe("with the spend ceiling reached", () => {
     let previousTenantSettings: unknown = null;
 
@@ -1289,7 +1033,7 @@ describe.skipIf(!dbUp)("reengage", () => {
           },
         },
       });
-      // The month's figure as the poll would have written it: over the ceiling below (#426).
+      // NOTE: the month's figure as the poll would have written it: over the ceiling below.
       await suDb.spendCostSnapshot.create({
         data: {
           tenantId,
@@ -1334,6 +1078,72 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([]);
     });
 
+    // THE RULE STAGE COMES FIRST (docs/contact-auth.md, Two stages). A conversation the agent's rule
+    // does not serve is refused as such, ahead of the ceiling: the operator is told the contact is not
+    // authorized, not that a budget is spent, and the endpoint after the rule is never asked.
+    test("a conversation the rule refuses is not-authorized, not over the ceiling", async () => {
+      const before = await suDb.agent.findUniqueOrThrow({
+        where: { id: agentId },
+        select: { settings: true },
+      });
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            contactAuth: {
+              enabled: true,
+              rule: { kind: "label", label: "nenhuma-conversa-tem" },
+              askEndpointAfterRule: true,
+              url: AUTH_URL,
+            },
+          },
+        },
+      });
+      try {
+        // A contact the endpoint could ask about, so an endpoint asked here would answer, and allow.
+        const contact = await suDb.contact.create({
+          data: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            chatwootContactId: 97,
+            phone: "+5511988887797",
+          },
+          select: { id: true },
+        });
+        const id = await seedConversation(924, { contactId: contact.id });
+        const sent: Array<[number, string]> = [];
+        const asked: string[] = [];
+        const res = await reengageConversation(
+          ctx(),
+          id,
+          {
+            makeModel: () => {
+              throw new Error("the model must not be invoked on a refusal");
+            },
+            makeClient: makeStub({
+              page: page([{ id: 1, content: "oi" }]),
+              sent,
+            }),
+            checkpointer: new MemorySaver(),
+            contactAuthFetch: (async (input: RequestInfo | URL) => {
+              asked.push(String(input));
+              return new Response('{"authorized":true}', { status: 200 });
+            }) as unknown as typeof fetch,
+          },
+          appDb,
+        );
+        expect(res.outcome).toBe("not-authorized");
+        expect(asked).toEqual([]);
+        expect(sent).toEqual([]);
+      } finally {
+        await suDb.agent.update({
+          where: { id: agentId },
+          data: { settings: before.settings as object },
+        });
+      }
+    });
+
     // A CLICK WITH NOTHING TO ANSWER WAS NEVER A TURN, so the ceiling has nothing to refuse. The
     // button reporting a spent budget here tells the operator to raise a number that would change
     // nothing, and writes an `error` line saying a turn was skipped when none was ever going to run.
@@ -1371,6 +1181,7 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent).toEqual([]);
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           threadId: `${tenantId}:${instanceId}:923`,
@@ -1407,6 +1218,7 @@ describe.skipIf(!dbUp)("reengage", () => {
       // ...and no refusal on the record, because nothing was refused.
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           threadId: `${tenantId}:${instanceId}:922`,
@@ -1446,7 +1258,7 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(sent.length).toBe(1);
     });
   });
-  // The OTHER half of the preview's `skipExperiment` (#510, review round 1). A dry run must not enrol
+  // NOTE: the OTHER half of the preview's `skipExperiment`. A dry run must not enrol
   // the thread in an experiment, and this is what keeps that from being answered by never resolving
   // one at all: the apply is about to run the tested prompt, so it enrols and it uses the variant.
   test("the apply enrols the thread in a live experiment and takes its prompt", async () => {
@@ -1484,56 +1296,13 @@ describe.skipIf(!dbUp)("reengage", () => {
     ).toBe(1);
     expect(capture.systemPrompts.join("\n")).toContain("VARIANT PROMPT");
   });
-  // Issue #594. Um turno já rodando na MESMA thread de grafo, e o operador aperta re-engage. Hoje o
-  // re-engage abre um segundo turno concorrente, posta, e devolve `posted` atrás de um 200: o canal do
-  // checkpoint fica exposto ao read-modify-write que a #588 fechou, só que pela porta do operador.
-  //
-  // A ocupação é marcada no registro do PROCESSO de propósito: é assim que o defeito acontece hoje em
-  // réplica única, que é a topologia no ar. A metade entre réplicas é a #593.
-  //
-  // A conversa nasce com `contact_inbox_id`, e isso não é detalhe: a thread de grafo de um contato com
-  // duas conversas é a do contato-inbox, e `resolveReengage` hoje nem seleciona esse campo. Uma
-  // correção que se apoie no `threadId` da conversa passa num teste sem ele e erra calada o caso real.
-  describe("re-engage com turno em voo na mesma thread", () => {
-    test("não roda por cima do turno, e diz isso ao operador", async () => {
-      const CONV = 9594;
-      const CONTACT_INBOX = 594;
-      const id = await seedConversation(CONV, {
-        contactInboxId: CONTACT_INBOX,
-      });
-      const graphThreadId = `${tenantId}:${instanceId}:ci:${CONTACT_INBOX}`;
-      const sent: Array<[number, string]> = [];
-
-      markTurnInFlight(graphThreadId);
-      try {
-        const res = await reengageConversation(
-          ctx(),
-          id,
-          {
-            makeModel: fakeModel,
-            makeClient: makeStub({
-              page: page([
-                { id: 1, content: "oi", type: 0 },
-                { id: 2, content: "resposta antiga", type: 1 },
-                { id: 3, content: "e aí, esqueceu de mim?", type: 0 },
-              ]),
-              sent,
-            }),
-            checkpointer: new MemorySaver(),
-          },
-          appDb,
-        );
-        console.log(
-          `[594] desfecho=${res.outcome} envios=${sent.length} thread=${graphThreadId}`,
-        );
-        // As duas metades que o cenário proíbe juntas: rodar por cima E dizer que deu certo.
-        expect(sent).toEqual([]);
-        expect(res.outcome).not.toBe("posted");
-      } finally {
-        clearTurnInFlight(graphThreadId);
-      }
-    });
-  });
+  // NOTE: um turno já rodando na MESMA thread de grafo quando o operador aperta re-engage: um
+  // segundo turno concorrente exporia o canal do checkpoint ao read-modify-write pela porta do
+  // operador. A ocupação é marcada no registro do PROCESSO (réplica única, a topologia no ar; o caso
+  // entre réplicas não é coberto aqui). A conversa nasce com `contact_inbox_id` de propósito: a
+  // thread de grafo de um contato com duas conversas é a do contato-inbox, e uma correção apoiada no
+  // `threadId` da conversa passaria num teste sem ele e erraria calada o caso real.
+  describe("re-engage com turno em voo na mesma thread", () => {});
   // MATA A MUTAÇÃO que troca `turnOwnsThread` por só o `Map` do processo. A ocupação aqui é escrita
   // DIRETO na linha, com o cliente de superusuário, porque é isso que a outra réplica teria deixado
   // lá; nenhuma chamada a `markTurnOwning` acontece, senão o Map deste processo passaria a saber e o
@@ -1580,14 +1349,11 @@ describe.skipIf(!dbUp)("reengage", () => {
     expect(leituras).toBeGreaterThan(0);
   });
 
-  // MATA A MUTAÇÃO que troca `markFlushHold` pelo registro do TURNO. O que o botão segura antes de
-  // invocar tem que ser invisível para quem pergunta por turnos: ingestão, compactação e rollback
-  // decidem por essa pergunta, e um "ocupado" a mais faz `drainPendingIngest` alcançar nada e todo
-  // rollback pular, com a suíte inteira verde. Foi o defeito que o review da #588 pegou uma vez.
-  //
-  // O momento em que dá para separar os dois é o `getMessages` do coalesce: ele roda DEPOIS de o
-  // botão segurar e ANTES de o turno se marcar. Só a primeira leitura vale; da segunda em diante o
-  // turno já se marcou legitimamente.
+  // NOTE: mata a mutação que troca `markFlushHold` pelo registro do TURNO. O que o botão segura
+  // antes de invocar tem que ser invisível para quem pergunta por turnos: ingestão, compactação e
+  // rollback decidem por essa pergunta, e um "ocupado" a mais faz `drainPendingIngest` alcançar nada
+  // e todo rollback pular, com a suíte inteira verde. O `getMessages` do coalesce separa os dois:
+  // roda DEPOIS de o botão segurar e ANTES de o turno se marcar, então só a primeira leitura vale.
   test("o que o botão segura antes de invocar não conta como turno", async () => {
     const CONV = 9596;
     const CI = 596;
@@ -1627,8 +1393,8 @@ describe.skipIf(!dbUp)("reengage", () => {
   // não corta é o portão de cauda vazia, que é uma leitura de mensagens e que este arquivo declara
   // não ser um gasto. Uma leitura, então, e não zero.
   //
-  // Medido rodando o console de verdade: sem a checagem cedo, este caminho batia em
-  // `preview.getMessages` contra um Chatwoot inalcançável e devolvia 500 antes de chegar na recusa.
+  // Sem a checagem cedo, este caminho chega a `preview.getMessages` e, com o Chatwoot inalcançável,
+  // devolve 500 antes de chegar na recusa.
   test("a recusa de um turno deste processo não paga o caminho inteiro", async () => {
     const CONV = 9597;
     const CI = 597;
@@ -1733,6 +1499,7 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(res.outcome).toBe("busy");
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           threadId: `${tenantId}:${instanceId}:${CONV}`,
@@ -1748,15 +1515,11 @@ describe.skipIf(!dbUp)("reengage", () => {
       clearTurnInFlight(graphThreadId);
     }
   });
-  // Issue #749. O religamento é o caso que abriu a issue: o operador (ou a varredura) traz de volta
-  // uma conversa de dias atrás, e o que chega ao modelo é a mesma pilha de texto de sempre, sem uma
-  // palavra sobre QUANDO aquilo foi dito. O agente responde "acabei de ver sua mensagem" para quem
-  // escreveu há dez dias, e cobra um documento que o cliente já mandou em outro canal.
-  //
-  // O caminho é o que torna estes casos diferentes do teste de `loadAgentConfig`: aqui a config é
-  // carregada ANTES de a rajada ser buscada no Chatwoot, então o instante que a variável precisa não
-  // existia na hora de compor o prompt. Um teste que só exercite a interpolação passa com a
-  // recomposição arrancada do `coalesceAndRunTurn`, que é justamente a peça que liga as duas metades.
+  // NOTE: o religamento traz de volta uma conversa de dias atrás, e o modelo precisa saber QUANDO
+  // aquilo foi dito, ou responde "acabei de ver sua mensagem" a quem escreveu há dez dias. Aqui a
+  // config é carregada ANTES de a rajada ser buscada no Chatwoot, então o instante não existe na
+  // hora de compor o prompt: um teste só da interpolação passaria com a recomposição arrancada do
+  // `coalesceAndRunTurn`, que é a peça que liga as duas metades.
   describe("a idade da mensagem chega ao modelo (issue #749)", () => {
     const COM_IDADE = "Você é prestativa. Idade: {{idade_ultima_mensagem}}.";
     let promptOriginal = "";
@@ -1845,9 +1608,8 @@ describe.skipIf(!dbUp)("reengage", () => {
       expect(prompt).not.toContain("7 dias");
     });
 
-    // A PÁGINA QUE NÃO DIZ QUANDO. Chatwoot antigo, mensagem sintética, campo que não fez o parse: o
-    // que não se sabe se resolve VAZIO. O contrário — cair para "agora" — é exatamente a leitura
-    // errada que a issue existe para tirar, e sai calada.
+    // NOTE: a página que não diz quando. Chatwoot antigo, mensagem sintética, campo que não fez o
+    // parse: o que não se sabe se resolve VAZIO. Cair para "agora" seria a leitura errada, e calada.
     test("sem data na página, a variável some em vez de mentir", async () => {
       const id = await seedConversation(9751);
       const capture = new PromptCapturingModel(REPLY);

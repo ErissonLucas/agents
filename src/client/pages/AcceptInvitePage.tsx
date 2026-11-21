@@ -13,8 +13,7 @@ type ValidationState = "validating" | "valid" | "invalid";
 // An invitation waiting in this tab while its invitee signs in (the token never goes back on a URL,
 // for the same history / Referer hygiene the page strips it for). It stays parked until the
 // invitation is accepted or turns out to be invalid: signing in can end in a full reload (the
-// selector recovery after /auth/me), and a token cleared on the first read would be gone by then
-// (review round 7).
+// selector recovery after /auth/me), and a token cleared on the first read would be gone by then.
 const PARKED_INVITE_KEY = "@app:parked-invite";
 
 function parkInviteToken(token: string): void {
@@ -43,7 +42,7 @@ function clearParkedInvite(): void {
 
 // Public invite-acceptance page. Modeled on SetupPage: capture ?token, strip it from the URL, validate
 // it to pre-fill the (read-only) email, then join + auto-login. tenant + role are bound server-side to
-// the invite. Three shapes, because one person is one account across tenants (issue #756):
+// the invite. Three shapes, because one person is one account across tenants:
 //   - the email has no account yet: set a name and a password, and the account is created;
 //   - the email has an account and this browser is signed in as it: one click joins the tenant;
 //   - the email has an account and this browser is not signed in as it: its CURRENT password proves
@@ -61,6 +60,7 @@ export function AcceptInvitePage() {
   const [state, setState] = useState<ValidationState>("validating");
   const [email, setEmail] = useState("");
   const [existingAccount, setExistingAccount] = useState(false);
+  const [fleet, setFleet] = useState(false);
   const [name, setName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -91,6 +91,7 @@ export function AcceptInvitePage() {
         }
         setEmail(data.invite.email);
         setExistingAccount(data.invite.existingAccount);
+        setFleet(data.invite.role === "SUPER_ADMIN");
         setState("valid");
       })
       .catch(() => {
@@ -134,7 +135,9 @@ export function AcceptInvitePage() {
         clearParkedInvite();
         // Open the console on the tenant just joined, which for a person with other tenants is not
         // necessarily their default.
-        setActiveTenantId(data.joinedTenantId);
+        // NOTE: a fleet invitation joins no tenant; the session picks the fleet's default.
+        if (data.joinedTenantId !== null)
+          setActiveTenantId(data.joinedTenantId);
         if (user) {
           // A session was already running, built for another tenant: reload onto the new one.
           window.location.assign("/");
@@ -157,8 +160,8 @@ export function AcceptInvitePage() {
   // the same way, with the invitation parked in this tab until the invitee comes back.
   const switchToSignIn = async () => {
     parkInviteToken(token);
-    // Signed in as somebody else, the login page would bounce straight back here: that
-    // session ends first, and only once the server says it ended (review round 5).
+    // NOTE: signed in as somebody else, the login page would bounce straight back here: that session
+    // ends first, and only once the server says it ended.
     if (user && !(await logout())) {
       setError(
         t("auth.genericError", "Something went wrong. Please try again."),
@@ -169,25 +172,25 @@ export function AcceptInvitePage() {
   };
 
   return (
-    <div className="flex min-h-screen flex-col items-center justify-center bg-bg-primary p-4">
+    <div className="bg-bg-primary flex min-h-screen flex-col items-center justify-center p-4">
       <div className="w-full max-w-md">
         <div className="mb-12 text-center">
           <Logo className="mx-auto h-10" />
         </div>
 
         {state === "validating" ? (
-          <div className="flex items-center justify-center rounded-2xl border border-border bg-bg-secondary p-8">
-            <Loader2 className="h-6 w-6 animate-spin text-text-secondary" />
-            <span className="ml-3 text-sm text-text-secondary">
+          <div className="border-border bg-bg-secondary flex items-center justify-center rounded-2xl border p-8">
+            <Loader2 className="text-text-secondary h-6 w-6 animate-spin" />
+            <span className="text-text-secondary ml-3 text-sm">
               {t("acceptInvite.validating", "Validating invitation…")}
             </span>
           </div>
         ) : state === "invalid" ? (
-          <div className="space-y-4 rounded-2xl border border-border bg-bg-secondary p-8 text-center">
-            <h1 className="font-semibold text-text-primary text-xl">
+          <div className="border-border bg-bg-secondary space-y-4 rounded-2xl border p-8 text-center">
+            <h1 className="text-text-primary text-xl font-semibold">
               {t("acceptInvite.invalidTitle", "Invitation unavailable")}
             </h1>
-            <p className="text-sm text-text-secondary">
+            <p className="text-text-secondary text-sm">
               {t(
                 "acceptInvite.invalid",
                 "This invitation link is invalid or has expired.",
@@ -195,7 +198,7 @@ export function AcceptInvitePage() {
             </p>
             <Link
               to="/login"
-              className="inline-block text-accent text-sm hover:underline"
+              className="text-accent inline-block text-sm hover:underline"
             >
               {t("acceptInvite.toLogin", "Go to login")}
             </Link>
@@ -203,32 +206,45 @@ export function AcceptInvitePage() {
         ) : (
           <form
             onSubmit={handleSubmit}
-            className="space-y-4 rounded-2xl border border-border bg-bg-secondary p-8"
+            className="border-border bg-bg-secondary space-y-4 rounded-2xl border p-8"
           >
             <div className="mb-2 text-center">
-              <h1 className="font-semibold text-2xl text-text-primary">
+              <h1 className="text-text-primary text-2xl font-semibold">
                 {t("acceptInvite.title", "Accept your invitation")}
               </h1>
-              <p className="mt-1 text-sm text-text-secondary">
-                {signedInAsInvitee
+              {fleet && (
+                <p className="text-text-primary mt-2 text-sm">
+                  {t(
+                    "acceptInvite.fleetNotice",
+                    "You are invited as a super admin: you will administer the whole installation.",
+                  )}
+                </p>
+              )}
+              <p className="text-text-secondary mt-1 text-sm">
+                {fleet && joinsExisting
                   ? t(
-                      "acceptInvite.signedInSubtitle",
-                      "You are signed in with this email. Join to add this tenant to your account.",
+                      "acceptInvite.fleetExistingSubtitle",
+                      "This email already has an account. Confirm it to make it a super admin.",
                     )
-                  : existingAccount
+                  : signedInAsInvitee
                     ? t(
-                        "acceptInvite.existingSubtitle",
-                        "This email already has an account. Enter its password to add this tenant to it.",
+                        "acceptInvite.signedInSubtitle",
+                        "You are signed in with this email. Join to add this tenant to your account.",
                       )
-                    : t(
-                        "acceptInvite.subtitle",
-                        "Set a password to activate your account.",
-                      )}
+                    : existingAccount
+                      ? t(
+                          "acceptInvite.existingSubtitle",
+                          "This email already has an account. Enter its password to add this tenant to it.",
+                        )
+                      : t(
+                          "acceptInvite.subtitle",
+                          "Set a password to activate your account.",
+                        )}
               </p>
             </div>
 
             {error && (
-              <div className="rounded-lg border border-error bg-error-soft px-4 py-2 text-error text-sm">
+              <div className="border-error bg-error-soft text-error rounded-lg border px-4 py-2 text-sm">
                 {error}
               </div>
             )}
@@ -236,7 +252,7 @@ export function AcceptInvitePage() {
             <div>
               <label
                 htmlFor="email"
-                className="mb-1 block font-medium text-sm text-text-primary"
+                className="text-text-primary mb-1 block text-sm font-medium"
               >
                 {t("auth.email", "Email")}
               </label>
@@ -248,7 +264,7 @@ export function AcceptInvitePage() {
                 <div>
                   <label
                     htmlFor="name"
-                    className="mb-1 block font-medium text-sm text-text-primary"
+                    className="text-text-primary mb-1 block text-sm font-medium"
                   >
                     {t("common.name", "Name")}
                   </label>
@@ -265,7 +281,7 @@ export function AcceptInvitePage() {
                 <div>
                   <label
                     htmlFor="password"
-                    className="mb-1 block font-medium text-sm text-text-primary"
+                    className="text-text-primary mb-1 block text-sm font-medium"
                   >
                     {t("auth.password", "Password")}
                   </label>
@@ -273,6 +289,7 @@ export function AcceptInvitePage() {
                     id="password"
                     type="password"
                     showPasswordToggle
+                    autoComplete="new-password"
                     value={password}
                     onChange={(e) => setPassword(e.target.value)}
                     required
@@ -289,7 +306,7 @@ export function AcceptInvitePage() {
                 <div>
                   <label
                     htmlFor="confirmPassword"
-                    className="mb-1 block font-medium text-sm text-text-primary"
+                    className="text-text-primary mb-1 block text-sm font-medium"
                   >
                     {t("auth.confirmPassword", "Confirm Password")}
                   </label>
@@ -297,6 +314,7 @@ export function AcceptInvitePage() {
                     id="confirmPassword"
                     type="password"
                     showPasswordToggle
+                    autoComplete="new-password"
                     value={confirmPassword}
                     onChange={(e) => setConfirmPassword(e.target.value)}
                     required
@@ -311,7 +329,7 @@ export function AcceptInvitePage() {
               <div>
                 <label
                   htmlFor="password"
-                  className="mb-1 block font-medium text-sm text-text-primary"
+                  className="text-text-primary mb-1 block text-sm font-medium"
                 >
                   {t("acceptInvite.currentPassword", "Current password")}
                 </label>
@@ -319,6 +337,7 @@ export function AcceptInvitePage() {
                   id="password"
                   type="password"
                   showPasswordToggle
+                  autoComplete="current-password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
@@ -330,7 +349,7 @@ export function AcceptInvitePage() {
                 <button
                   type="button"
                   onClick={switchToSignIn}
-                  className="mt-2 text-accent text-sm hover:underline"
+                  className="text-accent mt-2 text-sm hover:underline"
                 >
                   {user
                     ? t(

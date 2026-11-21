@@ -14,8 +14,9 @@ import { clipText } from "@/lib/text";
 // content-type.
 
 // NOTE: these AppError translationKeys (thrown by branding.admin.service's write path) are localized
-// centrally in `onError` (not via a literal translate() call), so they are declared here — in the
-// shared module present in every edition — for the i18n extractor (keepRemoved: false).
+// centrally in `onError` (not via a literal translate() call), so they are declared here, in the
+// shared module present in every edition, for the i18n extractor (keepRemoved: false).
+
 // translate('errors.invalidColorMode', 'Invalid color mode')
 // translate('errors.invalidColorToken', 'Invalid color value')
 // translate('errors.unsupportedImageType', 'Unsupported image type. Allowed: {{allowed}}')
@@ -26,7 +27,7 @@ import { clipText } from "@/lib/text";
 
 export const SINGLETON_ID = 1;
 
-export type AssetKind = "logo" | "favicon";
+export type AssetKind = "logo" | "favicon" | "mark";
 export type AssetVariant = "dark" | "light";
 export type ColorMode = "SIMPLE" | "ADVANCED";
 
@@ -35,6 +36,7 @@ export type ColorMode = "SIMPLE" | "ADVANCED";
 export const ASSET_MAX_BYTES: Record<AssetKind, number> = {
   logo: 1_048_576, // 1 MB
   favicon: 524_288, // 512 KB
+  mark: 524_288, // 512 KB
 };
 export const EXT_BY_TYPE: Record<string, string> = {
   "image/png": "png",
@@ -72,6 +74,8 @@ export interface GlobalBrandingDto {
   tokensDark: Record<string, string>;
   logo: { dark: boolean; light: boolean };
   favicon: { dark: boolean; light: boolean };
+  // The square symbol the collapsed sidebar shows in place of the logo.
+  mark: { dark: boolean; light: boolean };
   // Sidebar-footer links (white-label): the operator's own site and support inbox, plus the
   // option to drop the GitHub entry. null = use the built-in defaults.
   siteUrl: string | null;
@@ -92,6 +96,8 @@ export interface BrandingRow {
   logoLightKey: string | null;
   faviconDarkKey: string | null;
   faviconLightKey: string | null;
+  markDarkKey: string | null;
+  markLightKey: string | null;
   siteUrl: string | null;
   supportEmail: string | null;
   hideGithubLink: boolean;
@@ -106,6 +112,7 @@ export const DEFAULT_DTO: GlobalBrandingDto = {
   tokensDark: {},
   logo: { dark: false, light: false },
   favicon: { dark: false, light: false },
+  mark: { dark: false, light: false },
   siteUrl: null,
   supportEmail: null,
   hideGithubLink: false,
@@ -166,6 +173,7 @@ export function toDto(row: BrandingRow): GlobalBrandingDto {
       dark: row.faviconDarkKey !== null,
       light: row.faviconLightKey !== null,
     },
+    mark: { dark: row.markDarkKey !== null, light: row.markLightKey !== null },
     siteUrl: sanitizeSiteUrl(row.siteUrl),
     supportEmail: sanitizeSupportEmail(row.supportEmail),
     hideGithubLink: row.hideGithubLink === true,
@@ -186,7 +194,7 @@ export async function getGlobalBranding(
 // two token maps, the footer links, and "did you name anything at all" — before any database is
 // involved. It lives HERE rather than beside the mutation because the Free derivation swaps
 // branding.admin.service for a stub, and the MCP preview has to ask the same question the apply
-// asks in both editions (#490). Returns the sanitized columns the caller goes on to write.
+// asks in both editions. Returns the sanitized columns the caller goes on to write.
 export function assertBrandingColorsUpdatable(
   input: ColorUpdate,
 ): Record<string, unknown> {
@@ -277,9 +285,17 @@ export interface ColorUpdate {
 export function keyColumn(
   kind: AssetKind,
   variant: AssetVariant,
-): "logoDarkKey" | "logoLightKey" | "faviconDarkKey" | "faviconLightKey" {
+):
+  | "logoDarkKey"
+  | "logoLightKey"
+  | "faviconDarkKey"
+  | "faviconLightKey"
+  | "markDarkKey"
+  | "markLightKey" {
   if (kind === "logo")
     return variant === "dark" ? "logoDarkKey" : "logoLightKey";
+  if (kind === "mark")
+    return variant === "dark" ? "markDarkKey" : "markLightKey";
   return variant === "dark" ? "faviconDarkKey" : "faviconLightKey";
 }
 

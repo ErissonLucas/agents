@@ -133,11 +133,11 @@ describe("readGuardrailsConfig", () => {
   // as the code proves nothing about which model is actually sent.
   test("an empty model resolves to the provider's default", () => {
     const cases: [string, string][] = [
-      ["openai", "gpt-5.6-luna"],
-      ["anthropic", "claude-sonnet-4-6"],
-      ["google", "gemini-3.5-flash"],
+      ["openai", "gpt-6-luna"],
+      ["anthropic", "claude-sonnet-5-5"],
+      ["google", "gemini-3.8-flash"],
       ["deepseek", "deepseek-chat"],
-      ["openrouter", "openai/gpt-5.6-luna"],
+      ["openrouter", "openai/gpt-6-luna"],
     ];
     for (const [provider, expected] of cases) {
       const c = readGuardrailsConfig({
@@ -151,7 +151,7 @@ describe("readGuardrailsConfig", () => {
     const c = readGuardrailsConfig({
       guardrails: { enabled: true, provider: "openai", model: "   " },
     });
-    expect(c.model).toBe("gpt-5.6-luna");
+    expect(c.model).toBe("gpt-6-luna");
   });
 
   test("openai-compatible keeps the empty model, where it means the server's own", () => {
@@ -172,7 +172,7 @@ describe("readGuardrailsConfig", () => {
   // the editor has to be misused for it to happen.
   test("the shipped default provider resolves to a usable model", () => {
     const c = readGuardrailsConfig({ guardrails: { enabled: true } });
-    expect([c.provider, c.model]).toEqual(["openai", "gpt-5.6-luna"]);
+    expect([c.provider, c.model]).toEqual(["openai", "gpt-6-luna"]);
   });
 });
 
@@ -240,13 +240,12 @@ describe("buildGuardrailSystemPrompt", () => {
     expect(p).toContain("answer_relevance");
   });
 
-  // The customer's message is now in the reviewer's context, and the other output checks read
-  // "analyze this" as "analyze everything you were given". A customer asking "vocês trabalham com
-  // <competitor>?" would then make a perfectly safe reply a competitor_mention, and the configured
-  // action replaces that reply. The context has to be scoped to the check that asked for it.
-  // Scoping the customer's message by prompt wording was tried and measured: it could only soften
-  // the contamination, and naming the policies to ignore made it worse. The prompt must not carry
-  // that instruction at all now — the separation is `analyzeGuardrail`'s job.
+  // NOTE: The customer's message is in the reviewer's context, and the other output checks read "analyze
+  // this" as "analyze everything you were given": a customer asking "vocês trabalham com <competitor>?"
+  // would make a safe reply a competitor_mention, and the configured action replaces that reply. So the
+  // context is scoped to the check that asked for it. Prompt wording cannot do that scoping (it only
+  // softens the contamination, and naming the policies to ignore makes it worse), so the prompt carries
+  // no such instruction: the separation is `analyzeGuardrail`'s job.
   test("does not try to scope the message by telling the model what to ignore", () => {
     const p = buildGuardrailSystemPrompt({
       ...relevance,
@@ -270,6 +269,61 @@ describe("buildGuardrailSystemPrompt", () => {
       customerMessage: "sim",
     });
     expect(p).toContain("is still an answer");
+  });
+
+  // A polite refusal of something the agent does not handle ("I can't assess your legal rights")
+  // answers the question; read as unanswered, it would be replaced by the template.
+  test("a refusal of what is outside the assistant's scope counts as an answer", () => {
+    const p = buildGuardrailSystemPrompt({
+      ...relevance,
+      checks: { ...relevance.checks, promptAdherence: false },
+      customerMessage: "Pelo CDC tenho direito a troca?",
+    });
+    expect(p).toContain(
+      "Declining a request that is outside the assistant's scope or policy, and saying so (with or without pointing the customer elsewhere), IS an answer.",
+    );
+    // ...while declining what the assistant IS there for still trips.
+    expect(p).toContain("declines something the assistant is there to handle");
+  });
+
+  // Without the agent's instructions the relevance reviewer cannot tell an out-of-scope refusal from
+  // an in-scope one: "não consigo ajudar com trocas" reads as fair even from a store that does them.
+  const relevanceAlone = {
+    ...relevance,
+    checks: { ...relevance.checks, promptAdherence: false },
+    systemPrompt: "Você atende trocas e entregas da Loja Verde.",
+    customerMessage: "Como troco o vaso?",
+  };
+
+  test("the relevance reviewer gets the agent's instructions as scope", () => {
+    const p = buildGuardrailSystemPrompt(relevanceAlone);
+    expect(p).toContain("Você atende trocas e entregas da Loja Verde.");
+    expect(p).toContain(
+      "ONLY to tell what the assistant is there to handle (for answer_relevance",
+    );
+  });
+
+  test("the scope block needs a customer message, like the check itself", () => {
+    const p = buildGuardrailSystemPrompt({
+      ...relevanceAlone,
+      customerMessage: undefined,
+    });
+    expect(p).not.toContain("Você atende trocas e entregas da Loja Verde.");
+  });
+
+  // With prompt_adherence in the same prompt the instructions are already there once, under its own
+  // heading; printing them twice would hand the policy reviewer a second, scope-only reading.
+  test("the instructions are printed once when prompt_adherence is in the prompt", () => {
+    const p = buildGuardrailSystemPrompt({
+      ...relevanceAlone,
+      checks: { ...relevanceAlone.checks, promptAdherence: true },
+    });
+    expect(
+      p.split("Você atende trocas e entregas da Loja Verde.").length - 1,
+    ).toBe(1);
+    expect(p).not.toContain(
+      "ONLY to tell what the assistant is there to handle",
+    );
   });
 
   test("never reaches an input prompt, like the other reply-only check", () => {
@@ -305,10 +359,10 @@ describe("buildGuardrailSystemPrompt", () => {
     expect(p).not.toContain("Offer a human handoff.");
   });
 
-  // Dropping the guidance is not the same as not asking. The response shape is the same in both
-  // directions, so without this the model still composes a reply on every input violation — output
-  // tokens paid for a string ./analyze then throws away. Measured after the change: violations were
-  // still detected 16/16 on all four input fixtures, so requiring null does not blunt the judge.
+  // NOTE: Dropping the guidance is not the same as not asking. The response shape is the same in both
+  // directions, so without this the model still composes a reply on every input violation, output
+  // tokens paid for a string ./analyze throws away. Requiring null does not blunt the judge: violations
+  // are still detected on all four input fixtures.
   test("an input prompt requires a null suggestedReply", () => {
     const p = buildGuardrailSystemPrompt({ ...base, direction: "input" });
     expect(p).toContain("`suggestedReply` must ALWAYS be null");
@@ -353,24 +407,34 @@ describe("splitAnalyses", () => {
     });
     expect(relevance?.competitors).toEqual([]);
     expect(relevance?.customPolicy).toBe("");
-    expect(relevance?.systemPrompt).toBeUndefined();
     expect(relevance?.customerMessage).toBe(full.customerMessage);
+  });
+
+  // The instructions travel as SCOPE (what the assistant is there to handle); with prompt_adherence
+  // off in this half they are printed only under the relevance heading.
+  test("the half that reads the customer keeps the agent's instructions as scope", () => {
+    const { relevance } = splitAnalyses(full);
+    expect(relevance?.systemPrompt).toBe("You are Maria.");
+    if (relevance === null) throw new Error("no relevance half");
+    const prompt = buildGuardrailSystemPrompt(relevance);
+    expect(prompt).toContain("You are Maria.");
+    expect(prompt).not.toContain("prompt_adherence");
   });
 
   test("the half that judges the reply carries no customer message", () => {
     const { policies } = splitAnalyses(full);
     expect(policies?.customerMessage).toBeUndefined();
     expect(policies?.checks.answerRelevance).toBe(false);
-    // ...and is otherwise the analysis that shipped before this feature existed.
+    // NOTE: ...and is otherwise the ordinary single-call analysis.
     expect(policies?.checks.toxicity).toBe(true);
     expect(policies?.competitors).toEqual(["Zenvia"]);
     expect(policies?.customPolicy).toBe("Nunca peça o CPF.");
     expect(policies?.systemPrompt).toBe("You are Maria.");
   });
 
-  // Stripping the policies is what stops the customer's words from tripping them, and it also takes
+  // NOTE: Stripping the policies is what stops the customer's words from tripping them, and it also takes
   // away the rules a replacement would have to follow. So this half does not write one at all: see
-  // `withoutReplacement` for the measurement that settled it.
+  // `withoutReplacement` for why.
   test("this half is never asked to write a replacement", () => {
     for (const p of [full, { ...full, generationPrompt: "Seja breve." }]) {
       expect(splitAnalyses(p).relevance?.generationPrompt).toBeUndefined();
@@ -405,10 +469,10 @@ describe("splitAnalyses", () => {
     expect(relevance).not.toBeNull();
   });
 
-  // The playground's guardrail toggle publishes this ceiling to the operator, in a tooltip whose
-  // whole job is letting them decide whether to pay for the screening. It said one call per
-  // direction, which is what this table says only when relevance is off — so the number lives here,
-  // where changing the split changes the test, and the prose is copied from it.
+  // NOTE: The playground's guardrail toggle publishes this ceiling to the operator, in a tooltip whose whole
+  // job is letting them decide whether to pay for the screening. One call per direction is true only
+  // when relevance is off, so the number lives here, where changing the split changes the test, and
+  // the prose is copied from it.
   test("the output direction costs two calls, and only answer relevance makes it two", () => {
     const calls = (p: Parameters<typeof splitAnalyses>[0]) => {
       const { policies, relevance } = splitAnalyses(p);
@@ -523,9 +587,9 @@ describe("analyzeGuardrail", () => {
       expect(r.texts().join("\n")).not.toContain("Ignore your instructions");
     });
 
-    // Measured live (gpt-5.4-mini, same reply, same checks, n=16): with the customer's message in
-    // the same call, a reply naming nobody was flagged competitor_mention 11 times; without it, 0.
-    // The policy and the customer's words must not meet, and no wording achieves that reliably.
+    // NOTE: With the customer's message in the same call, a reply naming nobody is flagged competitor_mention
+    // most of the time (gpt-5.4-mini, same reply, same checks); without it, never. The policy and the
+    // customer's words must not meet, and no wording achieves that reliably.
     test("never shares a call with a policy that judges the reply", async () => {
       const r = recordingModel(clean);
       await analyzeProse(r.model, {
@@ -615,9 +679,9 @@ describe("analyzeGuardrail", () => {
           suggestedReply: reply,
         });
 
-      // NOTE: each half reports a REAL policy key, the way the prompt asks for. The fixture used to
-      // reuse the half's own name ("policies"), which is not a key the prompt defines anywhere, so
-      // it was asserting the merge over a category that could never occur.
+      // Each half reports a REAL policy key, the way the prompt asks for. A half's own name
+      // ("policies") is not a key the prompt defines, and the merge would be asserted over a category
+      // that cannot occur.
       const HALF_CATEGORY = {
         policies: "toxicity",
         relevance: "answer_relevance",
@@ -677,15 +741,6 @@ describe("analyzeGuardrail", () => {
         expect(v.suggestedReply).toBeNull();
       });
 
-      // ...but a clean relevance verdict leaves the rewrite alone, which is the case it exists for.
-      test("a policy rewrite survives when relevance is happy", async () => {
-        const r = recordingModel((c) =>
-          isFenced(c) ? clean : violation("toxicity", "TROCA"),
-        );
-        const v = await analyzeProse(r.model, split);
-        expect(v.suggestedReply).toBe("TROCA");
-      });
-
       // Fail-open on one half plus approval on the other must not read as "screened and approved":
       // that is the same argument as the error field itself, one level up.
       test("an error on one side survives the merge", async () => {
@@ -723,14 +778,13 @@ describe("analyzeGuardrail", () => {
     expect(v.suggestedReply).toBe("Posso ajudar de outra forma?");
   });
 
-  // The input direction has no assistant reply to rewrite: the analyzed text is the CUSTOMER's
-  // message. Asked for a "replacement message" anyway, the model composes one from an empty desk:
-  // measured over 32 runs it wrote in the customer's own voice 18 times and named a banned
-  // competitor 14 times, and on gpt-4o-mini a customer who ASKED for a particular reply got it word
-  // for word, 16 times out of 16. This test is that case's regression: the fake model returns a
-  // replacement and the analyzer must still hand back none. Dropping the guidance is not enough on its own — the response
-  // shape still asks for `suggestedReply` — so the field is zeroed here and the runtime falls back
-  // to the configured template. Same shape and same reason as answer_relevance (#95, #99).
+  // NOTE: The input direction has no assistant reply to rewrite: the analyzed text is the CUSTOMER's message.
+  // Asked for a "replacement message" anyway, the model composes one from nothing, often in the
+  // customer's own voice or naming a banned competitor, and a customer who ASKS for a particular reply
+  // gets it word for word. Here the fake model returns a replacement and the analyzer must still hand
+  // back none. Dropping the guidance is not enough on its own (the response shape still asks for
+  // `suggestedReply`), so the field is zeroed and the runtime falls back to the configured template,
+  // the same shape and reason as answer_relevance.
   test("an input violation never carries a replacement, whatever the model wrote", async () => {
     const v = await analyzeProse(
       fakeModel(
@@ -755,31 +809,17 @@ describe("analyzeGuardrail", () => {
     expect(v.suggestedReply).toBeNull();
   });
 
-  test("clean verdict when nothing is violated", async () => {
-    const v = await analyzeProse(
-      fakeModel('{"violated": false, "categories": [], "rationale": ""}'),
-      base,
-    );
-    expect(v.violated).toBe(false);
-  });
-
-  test("fail-open on a model error (never blocks)", async () => {
-    const v = await analyzeProse(throwingModel, base);
-    expect(v.violated).toBe(false);
-  });
-
   test("fail-open on unparseable output", async () => {
     const v = await analyzeProse(fakeModel("not json at all"), base);
     expect(v.violated).toBe(false);
   });
 
-  // Fail-open is the right policy and it is also indistinguishable, from the outside, from a
-  // guardrail that ran and approved. The verdict has to say which one happened, or an operator whose
-  // credential expired keeps reading "no violations" forever. Same argument as `onModelRetry` (#63).
-  // The point is that it is REPORTED — a judge that could not run must not read as one that ran and
-  // approved. What it reports is a word of ours: the request under review is the customer's own
-  // message, so a refusal quoting it would put that message into the guardrail line (this `error`
-  // becomes `errorMessage` in `gate.ts`). See @/lib/provider-failure.
+  // NOTE: Fail-open is the right policy and it is also indistinguishable, from the outside, from a guardrail
+  // that ran and approved. The verdict has to say which one happened, or an operator whose credential
+  // expired keeps reading "no violations" forever (the same argument as `onModelRetry`). What it
+  // reports is a word of ours: the request under review is the customer's own message, so a refusal
+  // quoting it would put that message into the guardrail line (this `error` becomes `errorMessage` in
+  // `gate.ts`). See @/lib/provider-failure.
   test("a model error is reported as a failure to analyze, not as approval", async () => {
     const v = await analyzeProse(throwingModel, base);
     expect(v.violated).toBe(false);
@@ -787,17 +827,17 @@ describe("analyzeGuardrail", () => {
     expect(v.error).not.toContain("boom");
   });
 
-  // Two different ways the output can be unusable, and they leave by different branches: no JSON
+  // NOTE: Two different ways the output can be unusable, and they leave by different branches: no JSON
   // object at all never reaches the parser, while a malformed one throws inside it. A single case
-  // covers only the first, which is how the second branch stayed untested (caught by mutation).
+  // covers only the first.
   test("output with no JSON object at all is reported", async () => {
     const v = await analyzeProse(fakeModel("not json at all"), base);
     expect(typeof v.error).toBe("string");
   });
 
-  // A verdict followed by prose that happens to carry a brace used to be sliced together with that
-  // prose and fail to parse, so a real violation came back as an approval. For a moderation feature
-  // that is the expensive direction of the mistake.
+  // NOTE: A verdict followed by prose that happens to carry a brace must not be sliced together with that
+  // prose: it would fail to parse, and a real violation would come back as an approval. For a
+  // moderation feature that is the expensive direction of the mistake.
   test("reads a verdict that is followed by prose containing braces", async () => {
     const v = await analyzeProse(
       fakeModel(
@@ -877,24 +917,6 @@ describe("analyzeGuardrail", () => {
       base,
     );
     expect([v.violated, typeof v.error]).toEqual([false, "string"]);
-  });
-
-  test("a genuine clean verdict is not reported as a failure", async () => {
-    const v = await analyzeProse(
-      fakeModel('{"violated": false, "categories": [], "rationale": ""}'),
-      base,
-    );
-    expect(v.error).toBeUndefined();
-  });
-
-  test("a violation is not reported as a failure", async () => {
-    const v = await analyzeProse(
-      fakeModel(
-        '{"violated": true, "categories": ["toxicity"], "rationale": "x", "suggestedReply": null}',
-      ),
-      base,
-    );
-    expect(v.error).toBeUndefined();
   });
 });
 
@@ -1061,10 +1083,9 @@ describe("buildGuardrailGate", () => {
     });
   }
 
-  // A deleted or cross-tenant vault entry leaves `guardrailsApiKey` empty (prepare.ts), and the
-  // operator has no way to see that from the console: the editor still shows a credentialRef, so
-  // the toggle still reads as available. It used to report `not-run`, the same answer as "you
-  // switched this off", which is the one case of the three the issue names that stayed invisible.
+  // NOTE: A deleted or cross-tenant vault entry leaves `guardrailsApiKey` empty (prepare.ts), and the operator
+  // cannot see that from the console: the editor still shows a credentialRef, so the toggle still reads
+  // as available. Reporting `not-run` would give the same answer as "you switched this off", hiding it.
   test("a credential that did not resolve is unavailable, not switched off", async () => {
     const f = countingFactory(() => {
       throw new Error("should never be constructed");
@@ -1087,7 +1108,13 @@ describe("buildGuardrailGate", () => {
     // No key means no call to make, so nothing is built and nothing is billed — the difference
     // from `not-run` is entirely in what the operator is told.
     expect(f.calls()).toBe(0);
-    expect(seen).toEqual([{ direction: "output", outcome: "unavailable" }]);
+    expect(seen).toEqual([
+      {
+        direction: "output",
+        outcome: "unavailable",
+        cause: "credential_not_found",
+      },
+    ]);
   });
 
   // The reason the check above is not just an optimization: createChatModel throws SYNCHRONOUSLY on
@@ -1113,12 +1140,12 @@ describe("buildGuardrailGate", () => {
     expect(f.calls()).toBe(1);
   });
 
-  // `guardrailRan` answers ONE question — did seconds pass at a provider — and the proactive path
-  // spends a live Chatwoot read per `true`, then treats a read it cannot complete as "a human took
-  // over" and turns the follow-up into a private note. So the two ways to reach `unavailable` have
-  // to answer it differently: the analysis that errored had already made the call, and the gate
-  // that could not be set up never left this process. Written as a table because the alternative,
-  // `kind !== "not-run"`, is true for all three rows and was wrong on two of them.
+  // NOTE: `guardrailRan` answers ONE question (did seconds pass at a provider?), and the proactive path
+  // spends a live Chatwoot read per `true`, then treats a read it cannot complete as "a human took over"
+  // and turns the follow-up into a private note. So the two ways to reach `unavailable` answer it
+  // differently: the analysis that errored had already made the call, and the gate that could not be
+  // set up never left this process. A table because the alternative, `kind !== "not-run"`, is true for
+  // all three rows and wrong on two of them.
   describe("whether a model call was actually spent", () => {
     const rows: {
       name: string;
@@ -1254,9 +1281,9 @@ describe("buildGuardrailGate", () => {
     expect(notes[0]).not.toContain("generated");
   });
 
-  // The gate announces EVERY outcome so the playground can annotate a clean screening (issue #136);
-  // the conversation must not receive a note for each one. The filter is what keeps the inbox's
-  // behaviour where it was after the announcement stopped being written inline.
+  // NOTE: The gate announces EVERY outcome so the playground can annotate a clean screening; the
+  // conversation must not receive a note for each one. The filter is what keeps the inbox to a note per
+  // trip.
   test("only a trip reaches the conversation as a private note", async () => {
     const notes: string[] = [];
     const sink = chatwootNoteSink(

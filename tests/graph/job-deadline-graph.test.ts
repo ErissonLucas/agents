@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import {
   AIMessage,
@@ -12,9 +12,15 @@ import { z } from "zod";
 import { buildAgentGraph } from "@/graph/graph";
 import { CALLED_OFF_TOOL_RESULT } from "@/graph/markers";
 import { contentToText } from "@/graph/message-text";
-import { withoutComments } from "@/tests/utils/source-text";
+import * as reminders from "@/modules/appointments/reminders";
+import * as redirect from "@/modules/channel-redirect/followup";
+import * as debounce from "@/modules/debounce/handler";
+import * as approvalOutcome from "@/modules/documents/approval-outcome";
+import * as followups from "@/modules/followups/handlers";
+import * as snoozed from "@/modules/followups/snoozed";
+import { getJobHandler, type JobContext } from "@/modules/scheduler/worker";
 
-// Issue #811, where a job's deadline meets the graph. The signal is never handed to `graph.invoke`:
+// Where a job's deadline meets the graph. The signal is never handed to `graph.invoke`:
 // aborting an invoke between a checkpointed tool call and its result leaves the thread with a call no
 // `ToolMessage` answers, which the providers reject on every later turn, and the invoke rejects while
 // the tool is still running, so the job would look finished with its work still going. The signal
@@ -22,11 +28,9 @@ import { withoutComments } from "@/tests/utils/source-text";
 // answered, the next model call sees the abort, and a call not yet run is refused like a called-off
 // turn's.
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-// Round 1 calls the writer; round 2 answers. Records whether each round's signal had aborted.
-// `afterCalling` runs as round 1 returns its call, which is where a test puts the deadline to land
-// between the model's answer and the tool.
+// The first model call calls the writer; the second answers. Records whether each call's signal had
+// aborted. `afterCalling` runs as the first returns its call, which is where a test puts the deadline
+// to land between the model's answer and the tool.
 class CallsThenAnswers {
   rounds = 0;
   sawAborted: boolean[] = [];
@@ -53,10 +57,14 @@ class CallsThenAnswers {
   }
 }
 
-function slowWriter(ran: string[], ms: number): StructuredToolInterface {
+// A writer whose work spans a turn of the event loop. `during` runs as the tool starts, which is
+// where a test puts the deadline to land while the tool is running; the write lands only after the
+// abort's own reactions have run, so a graph that stopped waiting for the tool returns without it.
+function writer(ran: string[], during?: () => void): StructuredToolInterface {
   return tool(
     async ({ v }: { v: string }) => {
-      await sleep(ms);
+      during?.();
+      await new Promise((r) => setTimeout(r, 0));
       ran.push(v);
       return `wrote ${v}`;
     },
@@ -94,27 +102,19 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       model: model as unknown as BaseChatModel,
       systemPrompt: "PROMPT",
       checkpointer,
-      tools: [slowWriter(ran, 400)],
+      tools: [
+        writer(ran, () => controller.abort(new Error("deadline exceeded"))),
+      ],
       signal: controller.signal,
     });
-    const timer = setTimeout(
-      () => controller.abort(new Error("deadline exceeded")),
-      100,
-    );
-    const t = performance.now();
-    try {
-      await graph
-        .invoke(
-          { messages: [new HumanMessage("marca como qualificado")] },
-          { configurable: { thread_id: "deadline-mid-tool" } },
-        )
-        .catch(() => undefined);
-    } finally {
-      clearTimeout(timer);
-    }
+    await graph
+      .invoke(
+        { messages: [new HumanMessage("marca como qualificado")] },
+        { configurable: { thread_id: "deadline-mid-tool" } },
+      )
+      .catch(() => undefined);
     // The graph returned only after the tool it was running had finished.
     expect(ran).toEqual(["sim"]);
-    expect(performance.now() - t).toBeGreaterThanOrEqual(390);
     expect(model.sawAborted).toEqual([false]);
     const state = await graph.getState({
       configurable: { thread_id: "deadline-mid-tool" },
@@ -134,7 +134,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       model: model as unknown as BaseChatModel,
       systemPrompt: "PROMPT",
       checkpointer: new MemorySaver(),
-      tools: [slowWriter(ran, 10)],
+      tools: [writer(ran)],
       signal: controller.signal,
     });
     const result = await graph
@@ -167,7 +167,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       model: model as unknown as BaseChatModel,
       systemPrompt: "PROMPT",
       checkpointer: new MemorySaver(),
-      tools: [slowWriter(ran, 10)],
+      tools: [writer(ran)],
       signal: controller.signal,
       stillWanted: async () => {
         controller.abort(new Error("deadline exceeded"));
@@ -189,6 +189,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
   test("a primary ended by the deadline does not hand the turn to the fallback, and the turn fails with the job's own error", async () => {
     // The primary listens and rejects the way the SDKs do on an abort, which the provider layer reads
     // as a timeout, which is what would hand the turn to the fallback.
+    const primaryCalled = Promise.withResolvers<void>();
     const primary = {
       async invoke(_m: BaseMessage[], opts?: { signal?: AbortSignal }) {
         await new Promise<void>((_, reject) => {
@@ -197,6 +198,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
             err.name = "AbortError";
             reject(err);
           });
+          primaryCalled.resolve();
         });
         return new AIMessage("never");
       },
@@ -235,18 +237,16 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       },
       signal: controller.signal,
     });
-    const timer = setTimeout(
-      () => controller.abort(new Error("deadline exceeded after 240s")),
-      100,
-    );
     let thrown: unknown;
-    try {
-      await graph.invoke({ messages: [new HumanMessage("oi")] });
-    } catch (err) {
-      thrown = err;
-    } finally {
-      clearTimeout(timer);
-    }
+    const run = graph
+      .invoke({ messages: [new HumanMessage("oi")] })
+      .catch((err: unknown) => {
+        thrown = err;
+      });
+    // The deadline lands while the primary's call is in flight.
+    await primaryCalled.promise;
+    controller.abort(new Error("deadline exceeded after 240s"));
+    await run;
     expect(fallbackCalls).toBe(0);
     expect(reported).toEqual([]);
     expect((thrown as Error | undefined)?.message).toBe(
@@ -266,6 +266,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       },
     };
     let sawAbort = false;
+    const fallbackCalled = Promise.withResolvers<void>();
     const fallback = {
       async invoke(_m: BaseMessage[], opts?: { signal?: AbortSignal }) {
         await new Promise<void>((_, reject) => {
@@ -275,6 +276,7 @@ describe("a job's deadline inside the graph (issue #811)", () => {
             err.name = "AbortError";
             reject(err);
           });
+          fallbackCalled.resolve();
         });
         return new AIMessage("never");
       },
@@ -294,125 +296,81 @@ describe("a job's deadline inside the graph (issue #811)", () => {
       },
       signal: controller.signal,
     });
-    const timer = setTimeout(
-      () => controller.abort(new Error("deadline exceeded after 240s")),
-      100,
-    );
-    const t = performance.now();
-    try {
-      await graph
-        .invoke({ messages: [new HumanMessage("oi")] })
-        .catch(() => {});
-    } finally {
-      clearTimeout(timer);
-    }
+    const run = graph
+      .invoke({ messages: [new HumanMessage("oi")] })
+      .catch(() => {});
+    // The deadline lands while the fallback's call is in flight, and it is what ends that call.
+    await fallbackCalled.promise;
+    controller.abort(new Error("deadline exceeded after 240s"));
+    await run;
     expect(sawAbort).toBe(true);
-    expect(performance.now() - t).toBeLessThan(2_000);
   });
 
-  test("no graph invoke in the runtime or the nudge is handed a signal", async () => {
-    // The structural half: the two places a job's turn invokes its graph build the invoke's options
-    // next to `recursionLimit`, and none of them may carry `signal`.
-    for (const file of ["src/graph/runtime.ts", "src/graph/nudge.ts"]) {
-      const src = await Bun.file(file).text();
-      const sites = [...src.matchAll(/recursionLimit: recursionLimitFor\(/g)];
-      expect(sites.length).toBeGreaterThan(0);
-      for (const m of sites) {
-        // The rest of the options object: up to the brace that closes it, nested ones included.
-        let depth = 1;
-        let end = m.index;
-        while (depth > 0 && end < src.length) {
-          end++;
-          if (src[end] === "{") depth++;
-          else if (src[end] === "}") depth--;
-        }
-        const options = src.slice(m.index, end);
-        expect({ file, options }).toEqual({
-          file,
-          options: options.replace(/\bsignal\b[^\n]*\n/g, ""),
-        });
+  // The handlers are tested by calling them, which skips the registration, and a registration that
+  // wraps its handler is where the signal is easiest to drop. Each kind whose handler runs a model
+  // turn is driven through its REGISTERED handler with a job context, and the function it delegates
+  // to must receive that context's signal; from there each handler's own deadline tests carry it to
+  // the turn.
+  test.each([
+    {
+      kind: "FOLLOWUP",
+      register: followups.registerFollowUpHandlers,
+      spy: () => spyOn(followups, "followUpHandler"),
+      signalOf: (args: unknown[]) =>
+        (args[3] as JobContext | undefined)?.signal,
+    },
+    {
+      kind: "SNOOZED_FOLLOWUP",
+      register: followups.registerFollowUpHandlers,
+      spy: () => spyOn(snoozed, "snoozedFollowUpHandler"),
+      signalOf: (args: unknown[]) =>
+        (args[3] as JobContext | undefined)?.signal,
+    },
+    {
+      kind: "APPOINTMENT_REMINDER",
+      register: reminders.registerAppointmentReminderHandler,
+      spy: () => spyOn(reminders, "appointmentReminderHandler"),
+      signalOf: (args: unknown[]) =>
+        (args[3] as JobContext | undefined)?.signal,
+    },
+    {
+      kind: "REDIRECT_FOLLOWUP",
+      register: redirect.registerRedirectFollowUpHandlers,
+      spy: () => spyOn(redirect, "redirectFollowUpHandler"),
+      signalOf: (args: unknown[]) =>
+        (args[3] as JobContext | undefined)?.signal,
+    },
+    {
+      kind: "DEBOUNCE",
+      register: debounce.registerDebounceHandler,
+      spy: () => spyOn(debounce, "flushDebounceJob"),
+      signalOf: (args: unknown[]) =>
+        (args[0] as { signal?: AbortSignal } | undefined)?.signal,
+    },
+    {
+      kind: "DOCUMENT_APPROVAL_OUTCOME",
+      register: approvalOutcome.registerDocumentApprovalOutcomeHandler,
+      spy: () => spyOn(approvalOutcome, "runOutcomeJob"),
+      signalOf: (args: unknown[]) =>
+        (args[3] as JobContext | undefined)?.signal,
+    },
+  ])(
+    "the $kind registration hands its job's signal on",
+    async ({ kind, register, spy, signalOf }) => {
+      register();
+      const handler = getJobHandler(kind);
+      if (!handler) throw new Error(`${kind} has no registered handler`);
+      const delegate = spy().mockImplementation((async () => ({
+        outcome: "done",
+      })) as never);
+      const signal = new AbortController().signal;
+      try {
+        await handler({} as never, {} as never, { signal } as JobContext);
+        expect(delegate).toHaveBeenCalledTimes(1);
+        expect(signalOf(delegate.mock.calls[0] as unknown[])).toBe(signal);
+      } finally {
+        delegate.mockRestore();
       }
-    }
-  });
-
-  test("every send of a nudge is marked as delivered before it leaves", async () => {
-    // After a send the step is the run's, and what follows it (labels, resolve) runs past the
-    // deadline; the mark is what tells `stillWanted` so. A send without it would lose those to a
-    // deadline that fired during it, and a new send added later is held to the same line.
-    const src = withoutComments(await Bun.file("src/graph/nudge.ts").text());
-    const lines = src.split("\n");
-    const sends = lines
-      .map((line, i) => ({ line, i }))
-      .filter(({ line }) =>
-        /await client\.send(Message|Template|PrivateNote)\(/.test(line),
-      );
-    expect(sends.length).toBeGreaterThan(0);
-    for (const { line, i } of sends) {
-      expect({ line: line.trim(), marked: lines[i - 1]?.trim() }).toEqual({
-        line: line.trim(),
-        marked: "delivered = true;",
-      });
-    }
-  });
-
-  test("no silent end of a nudge drops a refused post-action", async () => {
-    // A silent end sent nothing, so a post-action the deadline refused leaves the step to the retry;
-    // an end that reported "silent" over it would have the step stamped and committed with its
-    // labels or resolve missing. So a call whose answer is thrown away must be followed by an end
-    // that did send something.
-    const src = withoutComments(await Bun.file("src/graph/nudge.ts").text());
-    const bare = [...src.matchAll(/\n\s*await applyPostActions\(/g)];
-    expect(bare.length).toBeGreaterThan(0);
-    for (const m of bare) {
-      const after = src.slice(m.index);
-      const end = after
-        .slice(after.indexOf(";") + 1)
-        .match(/return [^;]*;/)?.[0];
-      expect({ end, silent: /"silent"/.test(end ?? "") }).toEqual({
-        end,
-        silent: false,
-      });
-    }
-  });
-
-  test("every job kind whose handler runs a model turn hands the turn its job's signal", async () => {
-    // The handlers are tested by calling them, which skips the registration, and a registration that
-    // wraps its handler is where the signal was dropped twice. A kind that starts running a turn has
-    // to be added to the list below, which is the point: it cannot join without being looked at.
-    const turn = /\b(runAgentNudge|runLoadedTurn|runAgentTurn)\(/;
-    const noTurn = new Set(["FOLLOWUP_SWEEP"]);
-    const kinds: string[] = [];
-    for await (const file of new Bun.Glob("src/**/*.ts").scan(".")) {
-      const src = withoutComments(await Bun.file(file).text());
-      if (!turn.test(src)) continue;
-      const sites = src.matchAll(
-        /registerJobHandler\(\s*"([A-Z_]+)",\s*([\s\S]*?)\);\n/g,
-      );
-      for (const [, kind = "", handler = ""] of sites) {
-        if (noTurn.has(kind)) continue;
-        kinds.push(kind);
-        // The call, not the arrow's parameter list, which names `ctx` whether or not it is passed on.
-        let body = handler.includes("=>")
-          ? handler.slice(handler.indexOf("=>"))
-          : handler;
-        const named = handler.trim();
-        if (/^\w+$/.test(named)) {
-          const start = src.indexOf(`function ${named}(`);
-          body = src.slice(start, src.indexOf("\n}\n", start));
-        }
-        // The signal, or the whole context, which also carries `commit`.
-        const forwards = /\bctx\??\.signal\b|[(,]\s*ctx\s*\)/.test(body);
-        expect({ kind, forwards }).toEqual({
-          kind,
-          forwards: true,
-        });
-      }
-    }
-    expect(kinds.sort()).toEqual([
-      "APPOINTMENT_REMINDER",
-      "DEBOUNCE",
-      "FOLLOWUP",
-      "REDIRECT_FOLLOWUP",
-    ]);
-  });
+    },
+  );
 });

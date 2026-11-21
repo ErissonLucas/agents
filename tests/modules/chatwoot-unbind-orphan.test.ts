@@ -13,12 +13,12 @@ import {
   bindInbox,
   unbindNeedsNothingRemote,
 } from "@/modules/chatwoot/management";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// #327: an inbox deleted in Chatwoot WHILE an agent was bound could never be unbound. The unbind
-// calls set_agent_bot on an inbox that is gone, the call 404s, and the local write is fenced behind
-// it — so `Inbox.agentId` keeps naming a persona for an inbox that no longer exists, with no way to
-// correct it through the API. Retrying does not help: the failure is deterministic.
+// An inbox deleted in Chatwoot WHILE an agent is bound: the unbind's set_agent_bot call 404s, and
+// the local write must not stay fenced behind it, or `Inbox.agentId` keeps naming a persona for an
+// inbox that no longer exists. Retrying does not help: the failure is deterministic.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -36,8 +36,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -47,10 +47,11 @@ function ctx(t: bigint): TenantContext {
   return { tenantId: t, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Personifies the fork's Api::V1::Accounts::InboxesController (4.16.0). `set_agent_bot` is reached
-// through a before_action that does `Current.account.inboxes.find(params[:id])`, so an inbox that is
-// gone answers 404 with Rails' own body BEFORE any bot logic runs, and a live one answers `head :ok`
-// (200, empty body). Both were measured against the local fork; see the PR body for the transcript.
+// Personifies the fork's Api::V1::Accounts::InboxesController (4.16.0). `set_agent_bot` and the
+// `agent_bot` read run behind a before_action doing `Current.account.inboxes.find(params[:id])`, so a
+// gone inbox answers 404 with Rails' own body BEFORE any bot logic; a live one answers `head :ok`
+// (200, empty body) to the attach and `{ agent_bot: {} }` to the read. The inbox itself answers 404
+// when gone, which is how the read tells a gone inbox from a missing route.
 function fakeChatwoot(live: number[]) {
   const calls: Array<{ path: string; body: unknown }> = [];
   const fetchImpl = (async (url: string, init?: RequestInit) => {
@@ -59,13 +60,20 @@ function fakeChatwoot(live: number[]) {
       path,
       body: init?.body ? JSON.parse(init.body as string) : undefined,
     });
-    const m = path.match(/\/inboxes\/(\d+)\/set_agent_bot$/);
+    const m = path.match(/\/inboxes\/(\d+)(?:\/(set_agent_bot|agent_bot))?$/);
     if (m && !live.includes(Number(m[1]))) {
       return {
         ok: false,
         status: 404,
         text: async () =>
           JSON.stringify({ error: "Resource could not be found" }),
+      } as unknown as Response;
+    }
+    if (m?.[2] === "agent_bot") {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ agent_bot: {} }),
       } as unknown as Response;
     }
     if (path.endsWith("/agent_bots") && init?.method === "POST") {

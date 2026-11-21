@@ -68,7 +68,7 @@ function FormatHelpTooltipContent() {
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
         {tokens.map(([tok, desc]) => (
           <span key={tok} className="flex gap-1.5">
-            <code className="font-mono text-accent">{tok}</code>
+            <code className="text-accent font-mono">{tok}</code>
             <span className="text-text-secondary">{desc}</span>
           </span>
         ))}
@@ -97,7 +97,7 @@ function FormatHelpTooltipContent() {
         </p>
         {PROMPT_TIME_VARS_DISPLAY.map((name) => (
           <span key={name} className="flex items-center gap-1.5">
-            <code className="font-mono text-accent">{`{{${name}}}`}</code>
+            <code className="text-accent font-mono">{`{{${name}}}`}</code>
             <span className="text-text-secondary">{roundingBadge(name)}</span>
           </span>
         ))}
@@ -189,7 +189,7 @@ export function PromptPanel({
         <div
           role="group"
           aria-label={t("editor.promptViewToggle", "Editor or preview")}
-          className="inline-flex rounded-lg border border-border bg-bg-tertiary p-0.5"
+          className="border-border bg-bg-tertiary inline-flex rounded-lg border p-0.5"
         >
           {(["editor", "preview"] as const).map((p) => (
             <button
@@ -198,9 +198,9 @@ export function PromptPanel({
               onClick={() => setPane(p)}
               aria-pressed={pane === p}
               className={cn(
-                "rounded-md px-2.5 py-1 font-medium text-xs transition-colors",
+                "rounded-md px-2.5 py-1 text-xs font-medium transition-colors",
                 pane === p
-                  ? "bg-accent text-accent-foreground"
+                  ? "bg-accent-solid text-accent-foreground"
                   : "text-text-secondary hover:text-text-primary",
               )}
             >
@@ -214,7 +214,7 @@ export function PromptPanel({
           <button
             type="button"
             onClick={onExpand}
-            className="inline-flex items-center gap-1 rounded border border-border px-1.5 py-0.5 text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary"
+            className="border-border text-text-secondary hover:bg-bg-hover hover:text-text-primary inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-xs"
           >
             <Maximize2 className="h-3 w-3" aria-hidden="true" />
             {t("editor.promptExpand", "Expand")}
@@ -233,15 +233,14 @@ export function PromptPanel({
             aria-label={t("editor.systemPrompt", "Agent instructions")}
           />
           <div className="flex shrink-0 flex-col gap-1.5">
-            <span className="flex items-center gap-1 text-text-muted text-xs">
+            <span className="text-text-muted flex items-center gap-1 text-xs">
               {t(
                 "editor.promptVarsHint",
                 "Insert a variable (dates also accept a :format suffix):",
               )}
-              {/* The same `?` as every other piece of help in the console, and not the Info icon
-                  this used to carry: the affordance is learned once, so a second glyph for the same
-                  job is a second thing to learn. It was also a <Tooltip>, which no phone can open
-                  (Popover.tsx). The box drops to `text-xs`: its default size is set for prose, and
+              {/* The same `?` as every other piece of help in the console, not an Info icon: the
+                  affordance is learned once, so a second glyph for the same job is a second thing
+                  to learn. A popover, not a <Tooltip>, which no phone can open (Popover.tsx). The box drops to `text-xs`: its default size is set for prose, and
                   this content is a two-column reference table that wants to stay dense. */}
               <HelpPopover
                 content={<FormatHelpTooltipContent />}
@@ -262,7 +261,7 @@ export function PromptPanel({
                   key={v}
                   type="button"
                   onClick={() => insertVariable(v)}
-                  className="rounded border border-border bg-bg-tertiary px-1.5 py-0.5 font-mono text-text-secondary text-xs hover:bg-bg-hover hover:text-text-primary"
+                  className="border-border bg-bg-tertiary text-text-secondary hover:bg-bg-hover hover:text-text-primary rounded border px-1.5 py-0.5 font-mono text-xs"
                 >
                   {`{{${v}}}`}
                 </button>
@@ -273,7 +272,7 @@ export function PromptPanel({
                 {exactUsages.map(({ name, suggestion }) => (
                   <span
                     key={name}
-                    className="flex items-start gap-1 text-warning text-xs"
+                    className="text-warning flex items-start gap-1 text-xs"
                   >
                     <Lightbulb
                       className="mt-0.5 h-3 w-3 shrink-0"
@@ -296,7 +295,7 @@ export function PromptPanel({
         <div className={cn("flex flex-col gap-2", fill && "min-h-0")}>
           <div
             className={cn(
-              "w-full overflow-auto break-words rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary",
+              "border-border bg-bg-tertiary text-text-primary w-full overflow-auto rounded-lg border px-3 py-2 text-sm break-words",
               fill ? "min-h-0 flex-1" : "max-h-80 min-h-60",
             )}
           >
@@ -342,7 +341,7 @@ export function PromptPanel({
               </span>
             )}
           </div>
-          <span className="shrink-0 text-text-muted text-xs">
+          <span className="text-text-muted shrink-0 text-xs">
             {t(
               "editor.promptPreviewNote",
               "Time is the current value; contact details are examples.",

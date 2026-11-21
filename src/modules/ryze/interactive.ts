@@ -571,7 +571,7 @@ async function sendAsAgent(
     },
     base,
   );
-  // NOTE: with context, the contact and conversation are committed first so the emulator's own
+  // With context, the contact and conversation are committed first so the emulator's own
   // transactions see them, and the message row is staged only once the context is written.
   let row = staged.row;
   if (!row) {

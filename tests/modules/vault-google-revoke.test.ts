@@ -7,10 +7,9 @@ afterEach(() => {
 });
 
 test("a revoke whose body never ends does not hold the disconnect", async () => {
-  // Review round 2 of #464. Nothing reads Google's answer here, and the disconnect controller AWAITS
-  // this call before removing the local tokens — so draining a body nobody looks at can only add
-  // latency, and a provider that answers its headers and then stalls would hold a user-facing
-  // disconnect for the entire 10s budget.
+  // Nothing reads Google's answer here, and the disconnect controller AWAITS this call before
+  // removing the local tokens, so draining the body only adds latency: a provider that answers its
+  // headers and then stalls would hold a user-facing disconnect for the whole 10s budget.
   const seen = { cancelled: false };
   globalThis.fetch = (async () =>
     new Response(
@@ -35,8 +34,14 @@ test("a revoke whose body never ends does not hold the disconnect", async () => 
 test("a revoke that fails is still swallowed", async () => {
   // The fence on the other side: disconnect must proceed whatever Google says, and the no-body call
   // must not have turned a network failure into a throw.
-  globalThis.fetch = (async () => {
+  const asked: Array<[string, string]> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    asked.push([String(input), String(init?.body ?? "")]);
     throw new Error("connection refused");
   }) as unknown as typeof fetch;
-  await revokeGoogleToken("refresh-token");
+  await expect(revokeGoogleToken("refresh-token")).resolves.toBeUndefined();
+  // The revoke was attempted, for this token, before the failure was swallowed.
+  expect(asked).toEqual([
+    ["https://oauth2.googleapis.com/revoke", "token=refresh-token"],
+  ]);
 });

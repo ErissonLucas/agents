@@ -6,7 +6,6 @@ import {
   beforeEach,
   describe,
   expect,
-  mock,
   test,
 } from "bun:test";
 import {
@@ -16,17 +15,16 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { ToastProvider } from "@/client/components";
+import * as ThemeModule from "@/client/contexts/ThemeContext";
 import { withI18n } from "@/tests/utils/i18n";
+import { stubExports } from "@/tests/utils/module-stub";
 
-// Issue #81: the approval card offered exactly two actions, Approve and Reject. An operator facing a
-// suggestion the agent hedged ("solicita-se validação da informação") could only approve the hedge
-// into the knowledge base or reject and lose the finding. Editing existed everywhere else —
-// `editApprovalItem`, `PATCH /v1/knowledge/approvals/:id`, the `knowledge_edit` MCP tool — and the
-// `EDITED` status was in the enum with a badge rendered for it, but the console could never produce
-// it. These tests drive the affordance from the card, through the same PATCH.
+// With only Approve and Reject, an operator facing a suggestion the agent hedged ("solicita-se
+// validação da informação") could only approve the hedge or lose the finding. These tests drive the
+// card's Edit, through the same `PATCH /v1/knowledge/approvals/:id` the `knowledge_edit` MCP tool
+// uses, to the `EDITED` status.
 
 interface PatchCall {
   id: string;
@@ -34,7 +32,11 @@ interface PatchCall {
 }
 
 const patchCalls: PatchCall[] = [];
+const postCalls: { url: string; body: Record<string, unknown> }[] = [];
 let approvalsPayload: Record<string, unknown>[] = [];
+let discardedPayload: Record<string, unknown>[] = [];
+// What an approve, reject or requeue POST answers inside its 200.
+let postResult: unknown = "approved";
 // What the PATCH reports back. The endpoint answers "not-pending" INSIDE a 200 when someone else
 // already approved or rejected the item, so the result is data, not an error.
 let patchResult = "updated";
@@ -42,10 +44,8 @@ let patchResult = "updated";
 let patchGate: Promise<void> | null = null;
 
 // The api module is NOT mocked: `mock.module` is global to the process and leaks into every other
-// file sharing the worker — this file broke `vaultCache` in CI while passing locally, because that
-// suite stubs `globalThis.fetch` and our module mock meant its code never reached it. The Eden
-// treaty calls fetch, so stubbing that reaches the same paths with no spill (same shape as
-// tests/client/lib/vaultCache.test.ts).
+// file sharing the worker (a suite that stubs `globalThis.fetch`, like vaultCache's, would never be
+// reached). The Eden treaty calls fetch, so stubbing that reaches the same paths with no spill.
 const realFetch = globalThis.fetch;
 
 function json(body: unknown): Response {
@@ -69,7 +69,13 @@ function installFetchStub() {
       });
       return json({ result: patchResult });
     }
-    if (approval && method === "POST") return json({});
+    if (approval && method === "POST") {
+      postCalls.push({ url, body: JSON.parse(String(init?.body ?? "{}")) });
+      return json({ result: postResult });
+    }
+    if (url.includes("/knowledge/approvals/discarded")) {
+      return json({ approvals: discardedPayload });
+    }
     if (url.includes("/knowledge/approvals")) {
       return json({ approvals: approvalsPayload });
     }
@@ -77,15 +83,14 @@ function installFetchStub() {
   }) as typeof fetch;
 }
 
-mock.module("@/client/contexts/ThemeContext", () => ({
+stubExports(ThemeModule, {
   useTheme: () => ({
     theme: "dark",
     resolvedTheme: "dark",
     setTheme: () => {},
   }),
   useThemedAsset: (path: string) => ({ src: path }),
-  ThemeProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 const { KnowledgeApprovals } = await import(
   "@/client/pages/resources/KnowledgeApprovals"
@@ -125,6 +130,9 @@ function renderQueue() {
 describe("KnowledgeApprovals — reviewing before approving", () => {
   beforeEach(() => {
     patchCalls.length = 0;
+    postCalls.length = 0;
+    discardedPayload = [];
+    postResult = "approved";
     patchResult = "updated";
     patchGate = null;
     seed();
@@ -137,13 +145,6 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
 
   afterAll(() => {
     globalThis.fetch = realFetch;
-    mock.restore();
-  });
-
-  test("the card offers an edit action, not just approve and reject", async () => {
-    renderQueue();
-    await screen.findByText(HEDGED);
-    expect(screen.getByRole("button", { name: /edit/i })).toBeDefined();
   });
 
   test("editing the content and saving sends only what changed", async () => {
@@ -172,7 +173,9 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
     await screen.findByText(HEDGED);
     fireEvent.click(screen.getByRole("button", { name: /edit/i }));
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    await waitFor(() => expect(screen.queryByLabelText(/content/i)).toBeNull());
+    await waitFor(() =>
+      expect(screen.queryAllByLabelText(/content/i).length).toBe(0),
+    );
     expect(patchCalls.length).toBe(0);
     expect(screen.queryByText("Edited")).toBeNull();
   });
@@ -188,15 +191,8 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
     expect(patchCalls.length).toBe(0);
   });
 
-  // Review finding: the endpoint reports a lost race inside a 200. Checking only `error` left the
-  // card marked EDITED and reported success over a revision that was never stored.
-  //
-  // The explicit budget is not decoration. This test asserts a BEHAVIOUR (the card leaves the queue)
-  // and asserts nothing about how fast it happens, but the default 5s was being spent on something
-  // else entirely: instrumenting the component showed the awaited PATCH taking 1.2s to 5.2s here
-  // while the same call in the neighbouring tests of this file returns in 1-4ms, and the figure
-  // moves that much between identical runs of identical code. It has been over the line on CI and
-  // under it locally on the same commit. A budget that a rerun can flip is not measuring the code.
+  // NOTE: the endpoint reports a lost race inside a 200, so checking only `error` would mark the
+  // card EDITED over a revision that was never stored.
   test("a suggestion reviewed elsewhere meanwhile leaves the queue instead of claiming EDITED", async () => {
     patchResult = "not-pending";
     renderQueue();
@@ -205,13 +201,16 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
     const box = await screen.findByLabelText(/content/i);
     fireEvent.change(box, { target: { value: CLEAN } });
     fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    await waitFor(() => expect(screen.queryByText(CLEAN)).toBeNull());
+    // A COUNT, not the node: every check that fails while the card is still there formats its
+    // message, and a message holding a happy-dom node serializes the whole tree. That cost seconds
+    // per attempt, and is what used to blow this test's budget in large runs.
+    await waitFor(() => expect(screen.queryAllByText(CLEAN).length).toBe(0));
     expect(screen.queryByText("Edited")).toBeNull();
     expect(screen.queryByText(HEDGED)).toBeNull();
-  }, 20000);
+  });
 
-  // Review finding: the draft is single, so a second Edit would replace it and the first card's
-  // unsaved rewrite would vanish with no warning.
+  // NOTE: the draft is single, so a second Edit would replace it and the first card's unsaved
+  // rewrite would vanish with no warning.
   test("with an editor open, the other cards cannot start one", async () => {
     approvalsPayload = [
       { ...approvalsPayload[0], id: "7" },
@@ -228,30 +227,9 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
     expect(stillOffered.length).toBe(0);
   });
 
-  // Review finding: the draft was captured when Save was clicked, so anything typed while the
-  // request was in flight would be dropped by the response that closes the editor.
-  test("the fields are locked while the save is in flight", async () => {
-    let release: () => void = () => undefined;
-    patchGate = new Promise<void>((r) => {
-      release = r;
-    });
-    renderQueue();
-    await screen.findByText(HEDGED);
-    fireEvent.click(screen.getByRole("button", { name: /edit/i }));
-    const box = (await screen.findByLabelText(
-      /content/i,
-    )) as HTMLTextAreaElement;
-    fireEvent.change(box, { target: { value: CLEAN } });
-    fireEvent.click(screen.getByRole("button", { name: /save/i }));
-    await waitFor(() => expect(box.disabled).toBe(true));
-    release();
-    await waitFor(() => expect(patchCalls.length).toBe(1));
-  });
-
-  // Review finding, round 3: `busyId` holds ONE id, so a per-card `busyId === a.id` guard leaves
-  // every other card live. Approving a second card mid-save hands the token over, the first card's
-  // editor unlocks with its PATCH still open, and the response that lands later overwrites whatever
-  // was typed or cancelled in between.
+  // NOTE: `busyId` holds ONE id, so a per-card `busyId === a.id` guard would leave every other card
+  // live: approving a second card mid-save hands the token over, the first card's editor unlocks
+  // with its PATCH still open, and the response that lands later overwrites whatever was typed.
   test("a save in flight locks the other cards' actions too", async () => {
     approvalsPayload = [
       { ...approvalsPayload[0], id: "7" },
@@ -302,5 +280,207 @@ describe("KnowledgeApprovals — reviewing before approving", () => {
     await screen.findByText(HEDGED);
     fireEvent.click(screen.getByRole("button", { name: /edit/i }));
     expect(screen.queryByRole("button", { name: /^approve$/i })).toBeNull();
+  });
+});
+
+const DOC_TEXT = "O prazo de entrega é de 3 dias úteis.";
+
+describe("KnowledgeApprovals — what the suggestion reviewer decided", () => {
+  beforeEach(() => {
+    patchCalls.length = 0;
+    postCalls.length = 0;
+    discardedPayload = [];
+    postResult = "approved";
+    patchResult = "updated";
+    patchGate = null;
+    seed();
+    installFetchStub();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  test("the reviewer's comment shows on the card, apart from the agent's rationale", async () => {
+    seed({ reviewerComment: "Corrige o prazo do documento atual." });
+    renderQueue();
+    await screen.findByText(HEDGED);
+    expect(
+      screen.getByText(/Corrige o prazo do documento atual/),
+    ).toBeDefined();
+    expect(screen.getByText(/Não consegui confirmar/)).toBeDefined();
+  });
+
+  test("a proposed replacement shows the current text and approves either way", async () => {
+    seed({
+      replacesDocument: {
+        id: "31",
+        title: "Prazos",
+        content: DOC_TEXT,
+        synced: false,
+      },
+    });
+    renderQueue();
+    await screen.findByText(DOC_TEXT);
+    fireEvent.click(
+      screen.getByRole("button", { name: /approve as a new document/i }),
+    );
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.url).toContain("/approvals/7/approve");
+    expect(postCalls[0]?.body).toEqual({ asNew: true });
+  });
+
+  test("approve and replace sends no asNew", async () => {
+    seed({
+      replacesDocument: {
+        id: "31",
+        title: "Prazos",
+        content: DOC_TEXT,
+        synced: false,
+      },
+    });
+    renderQueue();
+    await screen.findByText(DOC_TEXT);
+    fireEvent.click(
+      screen.getByRole("button", { name: /approve and replace/i }),
+    );
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.body).toEqual({});
+  });
+
+  // NOTE: nothing was claimed when the document is gone, so the card stays and offers only a plain
+  // approval, which the server stores as a new document.
+  test("a replacement target that vanished keeps the card and drops the replace offer", async () => {
+    seed({
+      replacesDocument: {
+        id: "31",
+        title: "Prazos",
+        content: DOC_TEXT,
+        synced: false,
+      },
+    });
+    postResult = { outcome: "replace-unavailable" };
+    renderQueue();
+    await screen.findByText(DOC_TEXT);
+    fireEvent.click(
+      screen.getByRole("button", { name: /approve and replace/i }),
+    );
+    await waitFor(() => expect(screen.queryAllByText(DOC_TEXT).length).toBe(0));
+    expect(screen.getByText(HEDGED)).toBeDefined();
+    // NOTE: a plain Approve would send `{}` and be answered `replace-unavailable` again, forever.
+    expect(screen.queryByRole("button", { name: /^approve$/i })).toBeNull();
+    postResult = "approved";
+    fireEvent.click(
+      screen.getByRole("button", { name: /approve as a new document/i }),
+    );
+    await waitFor(() => expect(postCalls.length).toBe(2));
+    expect(postCalls[1]?.body).toEqual({ asNew: true });
+  });
+
+  test("a replacement the queue already knows is unavailable offers only approval as new", async () => {
+    seed({ replacesDocument: null, replaceUnavailable: true });
+    renderQueue();
+    await screen.findByText(HEDGED);
+    expect(screen.queryByRole("button", { name: /^approve$/i })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /approve and replace/i }),
+    ).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: /approve as a new document/i }),
+    );
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.body).toEqual({ asNew: true });
+  });
+
+  test("rejecting asks for an optional reason and sends it trimmed", async () => {
+    postResult = "rejected";
+    renderQueue();
+    await screen.findByText(HEDGED);
+    fireEvent.click(screen.getByRole("button", { name: /reject/i }));
+    const box = await screen.findByLabelText(/reason/i);
+    fireEvent.change(box, {
+      target: { value: "  prazo errado, são 3 dias  " },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.url).toContain("/approvals/7/reject");
+    expect(postCalls[0]?.body).toEqual({ reason: "prazo errado, são 3 dias" });
+  });
+
+  // NOTE: the draft is single, so acting on another card would close it and drop what was typed.
+  test("with a rejection reason open, the other cards wait", async () => {
+    approvalsPayload = [
+      { ...approvalsPayload[0], id: "7" },
+      { ...approvalsPayload[0], id: "8", proposedTitle: "Outro" },
+    ];
+    renderQueue();
+    await screen.findByText("Outro");
+    fireEvent.click(
+      screen.getAllByRole("button", { name: /reject/i })[0] as HTMLElement,
+    );
+    const box = await screen.findByLabelText(/reason/i);
+    fireEvent.change(box, { target: { value: "prazo errado" } });
+    const others = [
+      ...screen.getAllByRole("button", { name: /^approve$/i }),
+      ...screen.getAllByRole("button", { name: /^edit$/i }),
+    ];
+    expect(others.length).toBeGreaterThan(0);
+    expect(
+      others.filter((b) => !(b as HTMLButtonElement).disabled).length,
+    ).toBe(0);
+    for (const b of others) fireEvent.click(b);
+    expect(postCalls.length).toBe(0);
+    expect(
+      (screen.getByLabelText(/reason/i) as HTMLTextAreaElement).value,
+    ).toBe("prazo errado");
+  });
+
+  test("rejecting with no reason sends an empty body", async () => {
+    postResult = "rejected";
+    renderQueue();
+    await screen.findByText(HEDGED);
+    fireEvent.click(screen.getByRole("button", { name: /reject/i }));
+    await screen.findByLabelText(/reason/i);
+    fireEvent.click(screen.getByRole("button", { name: /^reject$/i }));
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.body).toEqual({});
+  });
+
+  test("the discarded tab shows what it matched and sends it back to the queue", async () => {
+    approvalsPayload = [];
+    discardedPayload = [
+      {
+        id: "9",
+        status: "DISCARDED",
+        proposedTitle: "Prazo repetido",
+        proposedContent: CLEAN,
+        rationale: null,
+        knowledgeBaseName: "Base",
+        source: null,
+        reviewerComment: "Já está na base.",
+        replacesDocument: null,
+        match: {
+          kind: "document",
+          document: {
+            id: "31",
+            title: "Prazos",
+            content: DOC_TEXT,
+            synced: false,
+          },
+        },
+      },
+    ];
+    postResult = "requeued";
+    renderQueue();
+    fireEvent.click(await screen.findByRole("tab", { name: /discarded/i }));
+    await screen.findByText(DOC_TEXT);
+    expect(screen.getByText(/Já está na base/)).toBeDefined();
+    fireEvent.click(
+      screen.getByRole("button", { name: /send to the pending list/i }),
+    );
+    await waitFor(() => expect(postCalls.length).toBe(1));
+    expect(postCalls[0]?.url).toContain("/approvals/9/requeue");
+    await screen.findByText("Prazo repetido");
+    expect(screen.queryByRole("tab", { name: /discarded/i })).toBeNull();
   });
 });

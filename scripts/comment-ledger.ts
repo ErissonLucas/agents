@@ -8,6 +8,7 @@ import {
   countFile,
   type FileCounts,
   raisedEntries,
+  renderLedger,
   sweptFiles,
 } from "@/tests/utils/comment-blocks";
 
@@ -19,16 +20,17 @@ async function droppedBy(): Promise<{
 }> {
   const fullOnly = new Set<string>();
   const masterOnly = new Set<string>();
-  const manifestPath = "tooling/derivation/manifest.ts";
-  if (!existsSync(manifestPath)) return { fullOnly, masterOnly };
-  const { MANIFEST } = await import(`${process.cwd()}/${manifestPath}`);
+  const configPath = "tooling/derivation/derivation.config.ts";
+  if (!existsSync(configPath)) return { fullOnly, masterOnly };
+  const { default: config } = await import(`${process.cwd()}/${configPath}`);
+  const { pro, free } = config.editions;
   const within = (drops: string[], path: string) =>
     drops.some((d) => path === d || path.startsWith(`${d}/`));
-  const paired: Array<{ free: string }> = MANIFEST.free.pairedFiles ?? [];
+  const variants: Array<{ by: { free?: string } }> = config.variants ?? [];
   for (const path of await sweptFiles()) {
-    const inPro = within(MANIFEST.pro.drop, path);
+    const inPro = within(pro.drop, path);
     const inFree =
-      within(MANIFEST.free.drop, path) || paired.some((p) => p.free === path);
+      within(free.drop, path) || variants.some((v) => v.by.free === path);
     if (inPro && inFree) masterOnly.add(path);
     else if (inFree) fullOnly.add(path);
   }
@@ -55,30 +57,5 @@ if (raised.length > 0 && !process.argv.includes("--definition-changed")) {
 }
 
 const { fullOnly, masterOnly } = await droppedBy();
-const entry = ([path, [p, l]]: [string, FileCounts]) =>
-  `  ${JSON.stringify(path)}: [${p}, ${l}],`;
-const section = (marker: string, rows: Array<[string, FileCounts]>) =>
-  rows.length === 0
-    ? []
-    : [`  // @${marker}`, ...rows.map(entry), `  // @${marker}-end`];
-
-const lines = [
-  "// Comment blocks each file may still carry, as [provenance, over the line ceiling]. Written by",
-  "// `bun run comments:ledger`; see tests/lib/comment-sweep.test.ts for what counts.",
-  'import type { FileCounts } from "@/tests/utils/comment-blocks";',
-  "",
-  "export const COMMENT_LEDGER: Record<string, FileCounts> = {",
-  ...counted.filter(([p]) => !fullOnly.has(p) && !masterOnly.has(p)).map(entry),
-  ...section(
-    "full-only",
-    counted.filter(([p]) => fullOnly.has(p)),
-  ),
-  ...section(
-    "master-only",
-    counted.filter(([p]) => masterOnly.has(p)),
-  ),
-  "};",
-  "",
-];
-await Bun.write(LEDGER, lines.join("\n"));
+await Bun.write(LEDGER, renderLedger(counted, fullOnly, masterOnly));
 console.log(`${LEDGER}: ${counted.length} files`);

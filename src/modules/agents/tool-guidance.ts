@@ -3,16 +3,9 @@ import { readToolInstructions } from "@/modules/handoff/settings";
 
 const NATIVE_SET = new Set<string>(NATIVE_TOOL_NAMES);
 
-// Operator-authored "when to use this tool" guidance, keyed by native tool name, for tools whose ONLY
-// per-agent config is that note (set_custom_attribute, set_labels, …). It is appended to the tool's
-// model-facing description via withOperatorNote (see ToolCtx.toolInstructions) so the transfer/funnel/
-// attribute logic lives WITH the tool instead of being buried in the system prompt.
-//
-// Stored flat at `settings.toolGuidance = { [toolName]: string }`. handoff_to_human / kanban_move_card
-// keep their guidance in their own grouped config (settings.handoff.instructions /
-// settings.kanban.instructions) because those tools carry other config too; `prepare` folds both
-// sources into one toolInstructions map. Unknown keys and blank values are dropped; each note is
-// trimmed and length-capped (readToolInstructions).
+// Operator-authored "when to use this tool" notes at `settings.toolGuidance = { [toolName]: string }`,
+// appended to the tool's description (withOperatorNote). handoff_to_human and kanban_move_card keep
+// theirs in their own block (`handoff.instructions`, `kanban.instructions`); `prepare` merges both.
 export function readToolGuidance(
   settings: unknown,
 ): Partial<Record<NativeToolName, string>> {
@@ -35,37 +28,18 @@ export function readToolGuidance(
 // could not match anyway — a non-string, a blank, a duplicate — because a guard entry that never
 // equals a real label is a guard that silently protects nothing.
 export const PROTECTED_LABELS_MAX = 50;
-// The allowed list (issue #638) is bounded by the same number, read by the same function.
+// The allowed list is bounded by the same number, read by the same function.
 export const ALLOWED_LABELS_MAX = PROTECTED_LABELS_MAX;
 
-// LABELS `set_labels` MAY NEITHER ADD NOR REMOVE (issue #568 review; issue #695 dropped the third
-// property, "and never sees").
-//
-// The tool names a DELTA: `add` and `remove`, with a label nobody names left as it is. So the guard
-// is no longer what keeps another system's label alive — not naming it is — and what the guard
-// still does is refuse the two verbs, in both directions, because a tenant relies on the add half
-// to keep one agent's taxonomy out of another agent's reach.
-//
-// It stopped HIDING, and that is the point of #695. Under the replace contract a guarded label had
-// to be withdrawn from the model's sight, because being shown one was the first half of being able
-// to delete it by omission; under the delta, seeing it costs nothing and not seeing it costs a
-// fenced agent inventing a synonym for the canonical value (measured 2026-09-11: `duvidas-evento`,
-// outside the catalogue, written by an agent whose fence hid `dúvidas-evento` from it).
-//
-// Per agent rather than per instance because the console's tool panel is where an operator
-// configures this tool, and because two agents on one account can disagree about which labels are
-// theirs. Empty or absent ⇒ the tool reaches everything, which is the behaviour before this list.
+// Labels `set_labels` may neither add nor remove. The model still SEES them: hiding a guarded label
+// makes a fenced agent invent a synonym for it. Per agent, since two agents on one account can
+// disagree about which labels are theirs. Empty or absent: the tool reaches every label.
 export function readProtectedLabels(settings: unknown): string[] {
   return readLabelList(settings, "protected");
 }
 
-// THE LABELS `set_labels` MAY ADD, when the operator declared them (issue #638). The other half of
-// the same block: `protected` is what the tool may not touch, this is what it may use. Without it
-// the model's array is the taxonomy, a title Chatwoot does not have is CREATED there, and nothing
-// can name a label in a log because nothing tells an operator's title from an invented one. Same
-// ceiling and the same reader as `protected`, so the two lists are bounded and cleaned alike.
-// Empty or absent ⇒ no list, which is the behaviour before it existed: an install that classifies
-// without one must not stop classifying on upgrade.
+// The labels `set_labels` may add, when declared; without a list, a title Chatwoot lacks is created
+// there. Empty or absent: no list, so an install that classifies without one keeps classifying.
 export function readAllowedLabels(settings: unknown): string[] {
   return readLabelList(settings, "allowed");
 }
@@ -79,6 +53,15 @@ export function readOutsideAllowedLabels(
 ): OutsideAllowedLabels {
   const block = setLabelsBlock(settings);
   return block?.outsideAllowed === "accept" ? "accept" : "refuse";
+}
+
+// Which labels `set_labels` may REMOVE. `any` (the default) is every label but the protected ones;
+// `allowed` is only the titles in `allowed`, so a label another system owns stays without being
+// listed in `protected`, and an empty list removes nothing. Anything else reads as the default,
+// because turning the fence on is the operator's decision and an unknown value is not one.
+export type LabelRemoval = "any" | "allowed";
+export function readLabelRemoval(settings: unknown): LabelRemoval {
+  return setLabelsBlock(settings)?.removal === "allowed" ? "allowed" : "any";
 }
 
 function setLabelsBlock(settings: unknown): Record<string, unknown> | null {
@@ -103,6 +86,43 @@ function readLabelList(
     if (!label || out.includes(label)) continue;
     out.push(label);
     if (out.length === PROTECTED_LABELS_MAX) break;
+  }
+  return out;
+}
+
+// The attributes `set_custom_attribute` may write, as `{ scope, key }`: a key means one field per
+// scope (a contact's `nome` is not the conversation's), so the pair is the entry. Empty or absent: no
+// list, and the tool writes any key as before. No `protected` twin: with a list, every key outside
+// it is already off limits, and without one there is nothing for a guard to narrow.
+export const WRITABLE_ATTRIBUTES_MAX = 100;
+export type WritableAttributeScope = "conversation" | "contact" | "task";
+export interface WritableAttribute {
+  scope: WritableAttributeScope;
+  key: string;
+}
+const WRITABLE_SCOPES = new Set<string>(["conversation", "contact", "task"]);
+
+export function readWritableAttributes(settings: unknown): WritableAttribute[] {
+  const block =
+    settings && typeof settings === "object"
+      ? (settings as Record<string, unknown>).setCustomAttribute
+      : undefined;
+  if (!block || typeof block !== "object" || Array.isArray(block)) return [];
+  const raw = (block as Record<string, unknown>).allowed;
+  if (!Array.isArray(raw)) return [];
+  const out: WritableAttribute[] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const e = entry as Record<string, unknown>;
+    if (typeof e.scope !== "string" || !WRITABLE_SCOPES.has(e.scope)) continue;
+    if (typeof e.key !== "string") continue;
+    const key = e.key.trim();
+    const id = `${e.scope}:${key}`;
+    if (!key || seen.has(id)) continue;
+    seen.add(id);
+    out.push({ scope: e.scope as WritableAttributeScope, key });
+    if (out.length === WRITABLE_ATTRIBUTES_MAX) break;
   }
   return out;
 }

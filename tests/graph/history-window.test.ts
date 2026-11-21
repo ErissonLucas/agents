@@ -6,7 +6,12 @@ import {
   ToolMessage,
 } from "@langchain/core/messages";
 import { selectHistoryWindow } from "@/graph/history-window";
-import { HUMAN_HANDBACK_NOTE, humanHandbackMessage } from "@/graph/markers";
+import {
+  HUMAN_HANDBACK_NOTE,
+  humanHandbackMessage,
+  UNDELIVERED_REPLY_NOTE,
+  undeliveredReplyNote,
+} from "@/graph/markers";
 
 // Decision table for the history ceiling. The counter is synthetic on purpose: what is under test
 // is the RULE (where the window opens and what it is never allowed to drop), not the tokenizer,
@@ -115,11 +120,11 @@ describe("selectHistoryWindow", () => {
     }
   });
 
-  // INVARIANT 5 (issue #457): a hand-back note sits immediately before the customer's message and is
-  // a human message like any other here, so a turn whose own message eats the budget opens on the
-  // customer and leaves the note behind. That loss is PERMANENT — the note is in the thread, so the
-  // decision that writes it reads it as already announced and never writes another — and the turn
-  // answers from the transfer context, which is the silence the note exists to end.
+  // NOTE: INVARIANT 5: a hand-back note sits immediately before the customer's message and is a
+  // human message like any other, so without the exception a turn whose own message eats the budget
+  // would open on the customer and leave the note behind. That loss is PERMANENT (the note is in the
+  // thread, so the decision reads it as already announced and never writes another), and the turn
+  // would answer from the transfer context, the silence the note exists to end.
   test("a hand-back note before the opener travels with it", () => {
     const history = [
       new HumanMessage("velho"),
@@ -151,14 +156,103 @@ describe("selectHistoryWindow", () => {
     );
   });
 
+  // The note a superseded turn leaves after an act reads "the actions above". Opened on the note, or
+  // with the note left just outside, the window would hand the next turn a fact about nothing.
+  describe("an undelivered-reply note travels with the act it speaks of", () => {
+    const history = () => [
+      new HumanMessage("velho"),
+      new AIMessage("resposta velha"),
+      new HumanMessage("pode ser terça"),
+      new AIMessage({
+        content: "",
+        tool_calls: [{ name: "calendar_create_event", args: {}, id: "c4" }],
+      }),
+      new ToolMessage({ content: "criado", tool_call_id: "c4" }),
+      undeliveredReplyNote(42),
+      new HumanMessage("e o endereço?"),
+    ];
+    const opened = (kept: BaseMessage[]) => kept.map((m) => String(m.content));
+
+    test("when the cut would open on the note", () => {
+      // Two fit: the note and the newer message.
+      const window = selectHistoryWindow(history(), 2 * EACH, count);
+      expect(opened(window.kept)).toEqual([
+        "pode ser terça",
+        "",
+        "criado",
+        UNDELIVERED_REPLY_NOTE,
+        "e o endereço?",
+      ]);
+    });
+
+    test("when the newer message alone takes the whole budget", () => {
+      const window = selectHistoryWindow(history(), EACH, count);
+      expect(opened(window.kept)[0]).toBe("pode ser terça");
+      expect(window.dropped).toBe(2);
+    });
+
+    test("two acts superseded in a row both travel", () => {
+      const twice = [
+        new HumanMessage("velho"),
+        new HumanMessage("pode ser terça"),
+        new AIMessage({
+          content: "",
+          tool_calls: [{ name: "calendar_create_event", args: {}, id: "c2" }],
+        }),
+        new ToolMessage({ content: "criado", tool_call_id: "c2" }),
+        undeliveredReplyNote(42),
+        new HumanMessage("manda o endereço por email"),
+        new AIMessage({
+          content: "",
+          tool_calls: [{ name: "send_email", args: {}, id: "c6" }],
+        }),
+        new ToolMessage({ content: "enviado", tool_call_id: "c6" }),
+        undeliveredReplyNote(42),
+        new HumanMessage("e o horário?"),
+      ];
+      const window = selectHistoryWindow(twice, EACH, count);
+      expect(opened(window.kept)[0]).toBe("pode ser terça");
+      expect(window.dropped).toBe(1);
+    });
+
+    // The edge check looks one message before the opener, and an opener at index 0 has none.
+    test("a lone oversized message still travels", () => {
+      const lone = [new HumanMessage("um texto enorme")];
+      const window = selectHistoryWindow(lone, 1, () => 2);
+      expect(window.kept).toEqual(lone);
+    });
+
+    test("and an older note far from the edge is cut like anything else", () => {
+      const older = [
+        ...history(),
+        new AIMessage("O endereço é Rua X."),
+        new HumanMessage("obrigado"),
+        new AIMessage("Por nada!"),
+        new HumanMessage("até"),
+      ];
+      const window = selectHistoryWindow(older, 2 * EACH, count);
+      expect(opened(window.kept)).toEqual(["até"]);
+    });
+  });
+
   test("counts each message once instead of re-counting the whole prefix", () => {
     const history = build(SHAPE);
     const seen = new Map<BaseMessage, number>();
-    selectHistoryWindow(history, 45, (m) => {
+    const window = selectHistoryWindow(history, 45, (m) => {
       seen.set(m, (seen.get(m) ?? 0) + 1);
       return EACH;
     });
-    // The O(n^2) shape this replaced re-counted the surviving prefix on every step.
-    for (const [, times] of seen) expect(times).toBe(1);
+    // NOTE: Guards against an O(n^2) walk that re-counts the surviving prefix on every step. The
+    // walk visits the four that fit and the one that did not, each once.
+    expect(
+      [...seen.entries()].map(([m, times]) => [history.indexOf(m), times]),
+    ).toEqual([
+      [9, 1],
+      [8, 1],
+      [7, 1],
+      [6, 1],
+      [5, 1],
+    ]);
+    expect(window).toEqual({ kept: history.slice(6), dropped: 6, tokens: 40 });
   });
 });

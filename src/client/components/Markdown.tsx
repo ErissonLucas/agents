@@ -11,6 +11,11 @@ import { cn } from "@/client/lib/utils";
 // `rehypePlugins` is optional and off by default; the prompt preview passes one that wraps resolved
 // variable values in <span class="prompt-var"> so the dynamic text is colored (see promptPreview.ts).
 // Without it, no spans are produced and the `span` renderer below is never invoked.
+export function isConsoleLink(href: string | undefined): boolean {
+  if (!href || typeof window === "undefined") return false;
+  return href.startsWith(`${window.location.origin}/`);
+}
+
 export function Markdown({
   children,
   className,
@@ -29,7 +34,7 @@ export function Markdown({
   return (
     <div
       className={cn(
-        "flex flex-col gap-2 break-words text-sm",
+        "flex flex-col gap-2 text-sm break-words",
         onAccent ? "text-accent-foreground" : "text-text-primary",
         className,
       )}
@@ -40,7 +45,7 @@ export function Markdown({
         components={{
           span: ({ className: spanClass, children }) =>
             spanClass === "prompt-var" ? (
-              <span className="rounded bg-accent-soft px-0.5 text-accent">
+              <span className="bg-accent-soft text-accent rounded px-0.5">
                 {children}
               </span>
             ) : (
@@ -52,8 +57,11 @@ export function Markdown({
           a: ({ children, href }) => (
             <a
               href={href}
-              target="_blank"
-              rel="noopener noreferrer"
+              // A link into the console itself (the approval link a note ends on) opens in place;
+              // anything else opens in a new tab.
+              {...(isConsoleLink(href)
+                ? {}
+                : { target: "_blank", rel: "noopener noreferrer" })}
               className={cn(
                 "underline underline-offset-2",
                 onAccent ? "text-accent-foreground" : "text-accent",
@@ -76,13 +84,13 @@ export function Markdown({
           ),
           em: ({ children }) => <em className="italic">{children}</em>,
           h1: ({ children }) => (
-            <h1 className="font-semibold text-base">{children}</h1>
+            <h1 className="text-base font-semibold">{children}</h1>
           ),
           h2: ({ children }) => (
-            <h2 className="font-semibold text-sm">{children}</h2>
+            <h2 className="text-sm font-semibold">{children}</h2>
           ),
           h3: ({ children }) => (
-            <h3 className="font-semibold text-sm">{children}</h3>
+            <h3 className="text-sm font-semibold">{children}</h3>
           ),
           blockquote: ({ children }) => (
             <blockquote
@@ -129,12 +137,12 @@ export function Markdown({
             </div>
           ),
           th: ({ children }) => (
-            <th className="border border-border px-2 py-1 text-left font-medium">
+            <th className="border-border border px-2 py-1 text-left font-medium">
               {children}
             </th>
           ),
           td: ({ children }) => (
-            <td className="border border-border px-2 py-1">{children}</td>
+            <td className="border-border border px-2 py-1">{children}</td>
           ),
           hr: () => <hr className="border-border" />,
         }}

@@ -4,6 +4,7 @@ import type { ScopedDb } from "@/lib/tenancy";
 import type { DocumentField } from "@/modules/documents/blocks";
 import { parseTemplateContent } from "@/modules/documents/validate";
 import type { IntegrationSelection } from "@/modules/integrations/toolpacks";
+import { readMcpHeaders } from "@/modules/mcp-connections/headers";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
 import {
   dialableBaseUrl,
@@ -42,7 +43,7 @@ export interface LoadedHttpToolDef {
   headers: unknown;
   inputSchema: unknown;
   credentialRef: string | null;
-  // The credential's predefined secret type (item 8), resolved from the vault entry. Drives
+  // The credential's predefined secret type, resolved from the vault entry. Drives
   // automatic auth injection (header/bearer/basic/query) so the operator need not hand-write the
   // header with {{secret}}. null/generic ⇒ no auto-injection (manual {{secret}} still works).
   credentialKind: string | null;
@@ -58,24 +59,27 @@ export interface LoadedHttpToolDef {
   query: unknown;
   // Request body shape: { mode: "kv", rows } | { mode: "raw", raw } | legacy { mode: "fields" }.
   body: unknown;
-  // HTTP statuses this tool declares as results rather than integration failures (issue #59).
-  // Required, unlike on `HttpToolDef`: a turn gets its definitions from `loadToolSelections`, whose
-  // Prisma `select` enumerates its columns, so an optional field here is one a future column can be
-  // forgotten in — silently, since a missing column reads as `undefined` and normalizes to "declare
-  // nothing". Keeping it required makes both the select and the mapping a compile error to skip.
+  // HTTP statuses this tool declares as results rather than integration failures. Required, unlike on
+  // `HttpToolDef`: `loadToolSelections` enumerates columns in its Prisma `select`, and an optional
+  // field lets a forgotten column read as `undefined` ("declare nothing") instead of failing to
+  // compile.
   expectedStatuses: number[];
-  // What this tool's response declares about an appointment, or null when it declares nothing
-  // (issue #352). Required for the same reason `expectedStatuses` above is: a column that can be
-  // forgotten in the `select` reads as `undefined` and normalizes to "declare nothing", which is a
-  // feature going silently missing rather than failing.
+  // What this tool's response declares about an appointment, or null when it declares nothing.
+  // Required for the same reason as `expectedStatuses`.
   appointment: unknown;
-  // What this tool's response should look like by the time it reaches the model (issue #456).
-  // Required for the same reason as the two above.
+  // What this tool's response should look like by the time it reaches the model. Required for the
+  // same reason as the two above.
   outputSchema: unknown;
-  // The GENERIC instance this tool hands `{{conversation_ref}}` for (issue #818), or null. Required
-  // for the same reason as the three above: a forgotten column would read as "names no instance",
-  // and the tool would then refuse every call instead of failing to compile.
+  // The GENERIC instance this tool hands `{{conversation_ref}}` for, or null. Required for the same
+  // reason: a forgotten column would read as "names no instance", and the tool would refuse every
+  // call instead of failing to compile.
   conversationRefIntegrationId: bigint | null;
+  // This tool's ceiling on what the model receives, or null for the default. Required for the same
+  // reason as the fields above.
+  maxResponseChars: number | null;
+  // Whether a clip of this tool's response is written at `info` instead of paging. Required for the
+  // same reason: a forgotten column would read as "alert", which is the default and fails silently.
+  silenceTruncationAlert: boolean;
 }
 
 // An operator-authored code tool, as the turn builds it (tools/code.ts). Required fields for the
@@ -85,6 +89,7 @@ export interface LoadedCodeToolDef {
   description: string;
   inputSchema: unknown;
   code: string;
+  silenceTruncationAlert: boolean;
 }
 
 export interface AgentToolSelections {
@@ -104,56 +109,13 @@ export interface AgentToolSelections {
   documentSelections: DocumentSelection[];
 }
 
-// THE PRECEDENCE WHEN TWO TOOLS CLAIM ONE NAME (#389), anchored on the SOURCE's identity.
-//
-// `namespacedToolName` gives the plain name to whoever asks first and `_2` to the next, and
-// `dropDuplicateToolNames` keeps the first of two toolpack instances that expose the same names. So
-// the order this read comes back in is not cosmetic; it decides which tool the model sees under
-// which name.
-//
-// Unordered, that answer was the physical row order — and `replaceAgentToolSelections` deletes every
-// row and recreates the set on each save, in the order the client sent, which for the editor is the
-// operator's CLICK HISTORY (`toggleMcp` appends on toggle-on). Toggling one of two colliding
-// connections off and back on therefore renamed the other one's tools, mid-conversation, for a
-// change that granted nothing new.
-//
-// Ordering by the grant's `id` looks equivalent and is not: the recreated rows are assigned ids in
-// the order the client sent, so it reproduces exactly the click history it was meant to erase.
-// Measured — grants inserted alphabetically read back as ids 6727…6734, and after a re-save that
-// sent them reversed they read back 6734…6727, with `ORDER BY id` agreeing with the unordered read
-// both times. The connection / instance / definition rows are the thing a grant POINTS AT, and a
-// grant re-save never touches them.
-//
-// AND THE ANCHOR IS THE SOURCE'S NAME, not its id (#412). The id is identity inside one tenant and
-// nothing at all across two: `exportAgent` carries each component by NAME and `importAgent` matches
-// on it, creating a row only where the destination has none — so the destination's ids are whatever
-// that import assigned, in no relation to the source's. When the destination ALREADY has one of two
-// colliding sources, it is reused with its own (lower) id while its partner is created fresh, and
-// ordering by id puts the pair the other way round. Both tools still exist under both names, and each
-// name now reaches the OTHER server. Nothing is missing, so nothing looks wrong.
-//
-// The name is the right anchor because it is what the transfer preserves and what the database
-// already keeps unique (`@@unique([tenantId, name])` on the connection,
-// `@@unique([tenantId, catalogType, name])` on the instance). It is the same anchor a re-save needs,
-// so it replaces the id rather than joining it.
-//
-// BUT NOT `ORDER BY name` — the comparison is done here, in code, by UTF-16 code unit. SQL would
-// compare under the database's collation, and a bundle exported from one deployment is imported into
-// another: measured on the same two names, `en_US.utf8` orders "…connection a" before
-// "…connection B" and `C` orders them the other way round, so the pair inverts on arrival and each
-// name reaches the other server again — the very failure this is fixing, one layer down. A code-unit
-// comparison is the same on every runtime and every database.
-//
-// The instance is ordered by name ALONE, without its catalogType, because the only pair that can
-// contest a name is two instances of ONE catalog type — every toolpack prefixes its tools with its
-// own catalog (`calendar_`, `asaas_`, `drive_`), so no two catalog types expose a common name — and
-// within one catalog type the name is already a total order. Adding the catalogType key first killed
-// no test in the mutation battery, which is what a rule with no observable effect looks like.
-//
-// HTTP, code and document grants stay on the id: their exposed names are the definition's name
-// (unique per tenant across the HTTP and code tables, checked in the services) and `send_<slug>`,
-// so no two of them can contest a name and the order is invisible either way (asserted in
-// tests/graph/tool-grant-order.test.ts).
+// THE PRECEDENCE WHEN TWO TOOLS CLAIM ONE NAME: `namespacedToolName` gives the plain name to the
+// first asker and `_2` to the next, so this order decides which tool the model sees under which name.
+// It is anchored on the SOURCE's NAME, compared in code by UTF-16 code unit (`byContestedName`): row
+// order and the grant `id` both follow the editor's click history (a re-save recreates the rows),
+// the source's id differs across an export/import, and SQL `ORDER BY name` follows the database's
+// collation. Only MCP connections and toolpack instances can contest a name; HTTP, code and document
+// grants stay on the id (tests/graph/tool-grant-order.test.ts). Why: docs/graph.md, "Tool names".
 const GRANT_ORDER: Prisma.AgentToolSelectionOrderByWithRelationInput[] = [
   { source: "asc" },
   { mcpServerConnectionId: "asc" },
@@ -164,17 +126,9 @@ const GRANT_ORDER: Prisma.AgentToolSelectionOrderByWithRelationInput[] = [
 ];
 
 // The grant rows in assembly order: source first, then the source's NAME for the two sources that can
-// contest one, compared by code unit.
-//
-// A TOTAL order, and it has to be: a comparator that answers 0 for the rows without a name while
-// ordering the named ones among themselves is not transitive, and `Array.prototype.sort` is free to
-// return anything for one of those. The `?? ""` is what buys that — a grant whose relation row is
-// missing gets a position instead of tying with every row it meets.
-//
-// The source key on top of it buys the GROUPING, not the totality: it keeps the blocks the read
-// already delivered (`source: "asc"`) instead of interleaving MCP and integration rows by name.
-// Measured, removing it kills no test, because each source is dispatched into its own array below
-// and nothing reads `rows` as blocks. It stays as the cheaper half of a surprise for whoever does.
+// contest one, compared by code unit. A TOTAL order, as `Array.prototype.sort` needs: the `?? ""`
+// gives a grant whose relation row is missing a position instead of tying with every row it meets.
+// The source key only keeps the blocks grouped; nothing reads `rows` as blocks yet.
 function byContestedName(
   a: {
     source: AgentToolSource;
@@ -193,6 +147,87 @@ function byContestedName(
   return an < bn ? -1 : an > bn ? 1 : 0;
 }
 
+// What a grant row carries for assembly, one relation per source.
+const GRANT_SELECT = {
+  source: true,
+  enabledTools: true,
+  knowledgeBaseIds: true,
+  toolDefinition: {
+    select: {
+      name: true,
+      description: true,
+      method: true,
+      urlTemplate: true,
+      allowedHosts: true,
+      headers: true,
+      inputSchema: true,
+      query: true,
+      body: true,
+      credentialRef: true,
+      enabled: true,
+      ackEnabled: true,
+      ackMessage: true,
+      expectedStatuses: true,
+      appointment: true,
+      outputSchema: true,
+      conversationRefIntegrationId: true,
+      maxResponseChars: true,
+      silenceTruncationAlert: true,
+    },
+  },
+  mcpServerConnection: {
+    select: {
+      id: true,
+      name: true,
+      transport: true,
+      url: true,
+      command: true,
+      credentialRef: true,
+      headers: true,
+      enabled: true,
+    },
+  },
+  integrationInstance: {
+    select: {
+      id: true,
+      name: true,
+      catalogType: true,
+      config: true,
+      credentialRef: true,
+      enabled: true,
+    },
+  },
+  codeToolDefinition: {
+    select: {
+      name: true,
+      description: true,
+      inputSchema: true,
+      code: true,
+      enabled: true,
+      silenceTruncationAlert: true,
+    },
+  },
+  documentTemplate: {
+    select: {
+      id: true,
+      name: true,
+      slug: true,
+      description: true,
+      blocks: true,
+      fields: true,
+      // Selected only so the content check sees the whole template: the footer's tokens are
+      // validated with the blocks' (see parseTemplateContent), and the tool itself renders
+      // nothing — issuance loads the template again for that.
+      style: true,
+      enabled: true,
+    },
+  },
+} satisfies Prisma.AgentToolSelectionSelect;
+
+type GrantRow = Prisma.AgentToolSelectionGetPayload<{
+  select: typeof GRANT_SELECT;
+}>;
+
 // Loads every tool grant for an agent in one scoped read (DB only — no network; MCP connect/
 // discover and the toolpack build happen later, outside the tx). Resolves each MCP connection's
 // vault credential here (still a scoped DB read). A grant whose source is disabled
@@ -204,79 +239,86 @@ export async function loadToolSelections(
   const rows = await db.agentToolSelection.findMany({
     where: { agentId },
     orderBy: GRANT_ORDER,
-    select: {
-      source: true,
-      enabledTools: true,
-      knowledgeBaseIds: true,
-      toolDefinition: {
-        select: {
-          name: true,
-          description: true,
-          method: true,
-          urlTemplate: true,
-          allowedHosts: true,
-          headers: true,
-          inputSchema: true,
-          query: true,
-          body: true,
-          credentialRef: true,
-          enabled: true,
-          ackEnabled: true,
-          ackMessage: true,
-          expectedStatuses: true,
-          appointment: true,
-          outputSchema: true,
-          conversationRefIntegrationId: true,
-        },
-      },
-      mcpServerConnection: {
-        select: {
-          id: true,
-          name: true,
-          transport: true,
-          url: true,
-          command: true,
-          credentialRef: true,
-          enabled: true,
-        },
-      },
-      integrationInstance: {
-        select: {
-          id: true,
-          name: true,
-          catalogType: true,
-          config: true,
-          credentialRef: true,
-          enabled: true,
-        },
-      },
-      codeToolDefinition: {
-        select: {
-          name: true,
-          description: true,
-          inputSchema: true,
-          code: true,
-          enabled: true,
-        },
-      },
-      documentTemplate: {
-        select: {
-          id: true,
-          name: true,
-          slug: true,
-          description: true,
-          blocks: true,
-          fields: true,
-          // Selected only so the content check sees the whole template: the footer's tokens are
-          // validated with the blocks' (see parseTemplateContent), and the tool itself renders
-          // nothing — issuance loads the template again for that.
-          style: true,
-          enabled: true,
-        },
-      },
-    },
+    select: GRANT_SELECT,
   });
+  return selectionsFromRows(db, rows);
+}
 
+// A grant as the editor holds it before saving: the ids of what it points at, not the rows.
+export interface GrantRef {
+  source: AgentToolSource;
+  toolDefinitionId: bigint | null;
+  mcpServerConnectionId: bigint | null;
+  integrationInstanceId: bigint | null;
+  documentTemplateId: bigint | null;
+  codeToolDefinitionId: bigint | null;
+  knowledgeBaseIds: bigint[];
+  enabledTools: string[];
+}
+
+// The selections an unsaved grant set would load, for the call-floor estimate of the editor's draft.
+// Each target is read through the scoped client, so an id from another tenant, or one that no longer
+// exists, reads as a missing relation and its grant is skipped, the way a saved one would be.
+export async function selectionsFromGrants(
+  db: ScopedDb,
+  grants: GrantRef[],
+): Promise<AgentToolSelections> {
+  const idsOf = (
+    k: Exclude<keyof GrantRef, "source" | "knowledgeBaseIds" | "enabledTools">,
+  ) => grants.map((g) => g[k]).filter((id): id is bigint => id != null);
+  // One after another: these run on the scoped transaction's single connection.
+  const http = await db.toolDefinition.findMany({
+    where: { id: { in: idsOf("toolDefinitionId") } },
+    select: { id: true, ...GRANT_SELECT.toolDefinition.select },
+  });
+  const mcp = await db.mcpServerConnection.findMany({
+    where: { id: { in: idsOf("mcpServerConnectionId") } },
+    select: GRANT_SELECT.mcpServerConnection.select,
+  });
+  const integration = await db.integrationInstance.findMany({
+    where: { id: { in: idsOf("integrationInstanceId") } },
+    select: GRANT_SELECT.integrationInstance.select,
+  });
+  const code = await db.codeToolDefinition.findMany({
+    where: { id: { in: idsOf("codeToolDefinitionId") } },
+    select: { id: true, ...GRANT_SELECT.codeToolDefinition.select },
+  });
+  const document = await db.documentTemplate.findMany({
+    where: { id: { in: idsOf("documentTemplateId") } },
+    select: GRANT_SELECT.documentTemplate.select,
+  });
+  const byId = <T extends { id: bigint }>(rows: T[]) =>
+    new Map(rows.map((r) => [r.id, r]));
+  const [h, m, i, c, d] = [
+    byId(http),
+    byId(mcp),
+    byId(integration),
+    byId(code),
+    byId(document),
+  ];
+  const pick = <T>(map: Map<bigint, T>, id: bigint | null): T | null =>
+    id == null ? null : (map.get(id) ?? null);
+  return selectionsFromRows(
+    db,
+    grants.map((g) => ({
+      source: g.source,
+      enabledTools: g.enabledTools,
+      knowledgeBaseIds: g.knowledgeBaseIds,
+      toolDefinition: pick(h, g.toolDefinitionId),
+      mcpServerConnection: pick(m, g.mcpServerConnectionId),
+      integrationInstance: pick(i, g.integrationInstanceId),
+      codeToolDefinition: pick(c, g.codeToolDefinitionId),
+      documentTemplate: pick(d, g.documentTemplateId),
+    })),
+  );
+}
+
+// The grants as assembly reads them. Shared by the agent's own grants and the tenant's catalog (what
+// the agent COULD be granted), so a tool is shaped the same way whichever list it came from.
+export async function selectionsFromRows(
+  db: ScopedDb,
+  rows: GrantRow[],
+): Promise<AgentToolSelections> {
   const result: AgentToolSelections = {
     httpToolDefs: [],
     codeToolDefs: [],
@@ -323,6 +365,8 @@ export async function loadToolSelections(
           appointment: td.appointment,
           outputSchema: td.outputSchema,
           conversationRefIntegrationId: td.conversationRefIntegrationId,
+          maxResponseChars: td.maxResponseChars,
+          silenceTruncationAlert: td.silenceTruncationAlert,
         });
         break;
       }
@@ -358,6 +402,7 @@ export async function loadToolSelections(
           credentialKind,
           credentialParamName,
           credentialRef: conn.credentialRef,
+          headers: readMcpHeaders(conn.headers),
           enabledTools: row.enabledTools,
         });
         break;
@@ -382,6 +427,7 @@ export async function loadToolSelections(
           description: cd.description,
           inputSchema: cd.inputSchema,
           code: cd.code,
+          silenceTruncationAlert: cd.silenceTruncationAlert,
         });
         break;
       }
@@ -415,8 +461,8 @@ export async function loadToolSelections(
     });
   }
 
-  // Resolve the predefined secret type (kind) of each HTTP tool's credential in one batch, so the
-  // runtime can auto-inject the auth header/param (item 8) without the operator wiring {{secret}}.
+  // Resolve the predefined secret type (kind) of each HTTP tool's credential in one batch, so
+  // the runtime can auto-inject the auth header/param without the operator wiring {{secret}}.
   const refs = [
     ...new Set(
       result.httpToolDefs
@@ -475,16 +521,17 @@ export interface HttpToolBuildDeps {
   // Conversation/contact context for {{placeholder}} interpolation in fixed fields, headers, URL and
   // the raw body (e.g. {{conversation_id}}, {{contact_name}}). Never a secret.
   context?: Record<string, string>;
-  // Passed straight through to every tool built here, for the ones whose definition declares that
-  // their response describes an appointment (issue #352). Named individually rather than spread from
-  // HttpToolDeps so that adding a dep to the runtime does not silently widen what this layer
-  // forwards.
-  // The agent zone an offset-less start is read in, same reason as the rest of this block.
+  // Passed straight through to every tool built here, for definitions that declare their response
+  // describes an appointment; `timezone` is the zone an offset-less start is read in. Named one by
+  // one rather than spread from HttpToolDeps, so a new runtime dep does not silently widen what this
+  // layer forwards.
   timezone?: HttpToolDeps["timezone"];
+  // A turn that cannot wait the default (a call, whose engine stops waiting at its own deadline).
+  timeoutMs?: HttpToolDeps["timeoutMs"];
   appointmentBooked?: HttpToolDeps["appointmentBooked"];
   cancelAppointment?: HttpToolDeps["cancelAppointment"];
   onSideEffectError?: HttpToolDeps["onSideEffectError"];
-  // Mints this conversation's `{{conversation_ref}}` for a GENERIC instance (issue #818).
+  // Mints this conversation's `{{conversation_ref}}` for a GENERIC instance.
   conversationRef?: HttpToolDeps["conversationRef"];
   // Threaded like the fence: the tool reports a refusal that sent nothing (effect-free.ts).
   onNoEffect?: HttpToolDeps["onNoEffect"];
@@ -522,6 +569,8 @@ export function buildHttpTools(
       appointment: d.appointment,
       outputSchema: d.outputSchema,
       conversationRefIntegrationId: d.conversationRefIntegrationId,
+      maxResponseChars: d.maxResponseChars,
+      silenceTruncationAlert: d.silenceTruncationAlert,
     };
     return buildHttpTool(def, deps);
   });

@@ -4,15 +4,13 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { SignJWT } from "jose";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #756, through the app's own doors: a person is ONE user with a membership per tenant.
-//
-// The issue opened on the symptom: two rows with the same email in two tenants, and the login
-// picking one with no order at all, so the operator saw the empty tenant and nothing said why. What
-// replaced it is asserted here end to end, against real rows: one login, the tenant chosen per
-// request among the person's memberships, a tenant they do not belong to refused (and named, so the
-// console drops it), an invitation that joins the EXISTING account only when the account proves it
-// is theirs, and a tenant administrator who can take a person out of their tenant and nothing more.
+// Through the app's own doors, against real rows: a person is ONE user with a membership per tenant.
+// One login, the tenant chosen per request among the person's memberships, a tenant they do not
+// belong to refused (and named, so the console drops it), an invitation that joins the EXISTING
+// account only when the account proves it is theirs, and a tenant administrator who can take a
+// person out of their tenant and nothing more.
 
 const BunRequest = (globalThis as unknown as { BunRequest: typeof Request })
   .BunRequest;
@@ -33,15 +31,15 @@ if (suUrl && appUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
 
 // The app's own client against the test database, so the session lookup reads real rows (the
 // shared stub answers `user` and `tenant` only). Restored as a fresh literal, the way
-// tests/lib/module-mock-undo.test.ts requires.
+// biome-plugins/no-module-mock-live-namespace.grit requires.
 const originalPrisma = (await import("@/api/lib/prisma")).default;
 mock.module("@/api/lib/prisma", () => ({ default: app }));
 afterAll(() => {
@@ -65,6 +63,7 @@ async function cookieFor(userId: bigint): Promise<string> {
     email: `${tag}@x.test`,
     role: "AGENT",
     tenantId: null,
+    pwd: (await import("@/api/lib/auth")).passwordFingerprint(passwordHash),
   })
     .setProtectedHeader({ alg: "HS256" })
     .setExpirationTime("1h")
@@ -161,8 +160,7 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
     await app?.$disconnect();
   });
 
-  // The symptom the issue was opened on, now with a rule: one login, and it lands on the OLDEST
-  // membership until the console names another.
+  // One login, and it lands on the OLDEST membership until the console names another.
   test("one login, landing on the oldest membership", async () => {
     const res = await server.handle(
       req("/auth/login", {
@@ -263,8 +261,8 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
     );
   });
 
-  // Decision 4 on the issue: a tenant administrator removes a person FROM THEIR TENANT. The account,
-  // and the person's other tenants, are not theirs to delete.
+  // A tenant administrator removes a person FROM THEIR TENANT. The account, and the person's other
+  // tenants, are not theirs to delete.
   test("a tenant administrator removes a member from their tenant, and only from it", async () => {
     const both = await person(`${tag}-both@x.test`, [
       [first, "AGENT"],
@@ -391,6 +389,29 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
       ).toBe(0);
     });
 
+    // The session read before the account row: a password change between the two leaves a proof
+    // made under the old password, which must not sign the account back in.
+    test("a session verified under a password the account no longer holds proves nothing", async () => {
+      const token = await invite();
+      const { acceptInvite, InviteAccountProofError } = await import(
+        "@/api/features/invitations/invitation.service"
+      );
+      await expect(
+        acceptInvite(
+          {
+            token,
+            session: { userId: personId, passwordHash: "$2b$04$stale" },
+          },
+          suDb,
+        ),
+      ).rejects.toBeInstanceOf(InviteAccountProofError);
+      expect(
+        await suDb.tenantUser.count({
+          where: { userId: personId, tenantId: outside },
+        }),
+      ).toBe(0);
+    });
+
     test("signed in as that account, needs no password at all", async () => {
       const token = await invite();
       const res = await server.handle(
@@ -412,8 +433,8 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
     });
   });
 
-  // Review round 5: the session is proof of WHICH person it is, and a tenant selector it carries
-  // that no longer names a membership (removed while the page was open) does not unmake that proof.
+  // The session is proof of WHICH person it is, and a tenant selector it carries that does not name
+  // a membership any more (removed while the page was open) does not unmake that proof.
   test("signed in as the invited account with a stale selector, still joins", async () => {
     const { createInvite } = await import(
       "@/api/features/invitations/invitation.service"
@@ -442,8 +463,8 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
     });
   });
 
-  // Review round 8: a fleet administrator's session has no tenant, and the answer still names the one
-  // the invitation joined, which the console opens on.
+  // A fleet administrator's session has no tenant, and the answer still names the one the invitation
+  // joined, which the console opens on.
   test("a fleet administrator accepting an invitation is told which tenant it joined", async () => {
     const fleetEmail = `${tag}-fleet@x.test`;
     const fleet = await person(fleetEmail, []);
@@ -494,9 +515,9 @@ describe.skipIf(!dbUp)("a person with several tenants", () => {
     ).toBe(0);
   });
 
-  // Review round 1: the email is compared case-insensitively, and Prisma renders that as ILIKE, where
-  // `_` and `%` are wildcards. Unescaped, an invitation to `a_b@` resolved to the account `axb@`, and
-  // its acceptance then added the membership to THAT account; the login matched it too.
+  // The email is compared case-insensitively, which Prisma renders as ILIKE, where `_` and `%` are
+  // wildcards: unescaped, an invitation to `a_b@` would resolve to (and join) the account `axb@`, and
+  // the login would match it too.
   test("an address is matched literally, never as a pattern", async () => {
     const holder = await person(`${tag}-axb@x.test`, [[first, "AGENT"]]);
     const wanted = `${tag}-a_b@x.test`;

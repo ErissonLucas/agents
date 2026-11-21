@@ -1,13 +1,19 @@
 import type { LucideIcon } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useTranslation } from "react-i18next";
-import { Card, HelpPopover } from "@/client/components";
+import { Card, HelpPopover, RangeHoldsSuspended } from "@/client/components";
 import { cn } from "@/client/lib/utils";
 
-// Shared building blocks for the heavy editor tabs (item 9): a titled <Section> card with an anchor
-// id + icon, and a left-rail <SectionNav> index that scrolls to a section on click and highlights the
-// one currently in view (scroll-spy). Lets the operator see WHERE they are across the many sections of
-// the Behavior/Tools tabs instead of scrolling blindly.
+// Shared building blocks for the heavy editor tabs: a titled <Section> card with an anchor id + icon,
+// and a left-rail <SectionNav> index that scrolls to a section on click and highlights the one
+// currently in view (scroll-spy), so the operator sees WHERE they are across the many sections of
+// the Behavior/Tools tabs.
 
 export interface SectionDef {
   id: string;
@@ -25,9 +31,9 @@ export interface SectionProps {
   help?: ReactNode;
   children: ReactNode;
   className?: string;
-  // Drawn but not shown: the form inside keeps its state. A Behavior section that does not apply
-  // to the agent's mode (issue #494) is hidden this way rather than unmounted, so flipping the
-  // mode back shows it again exactly as it was, unsaved edits included.
+  // Drawn but not shown: the form inside keeps its state. A Behavior section that does not apply to
+  // the agent's mode is hidden this way rather than unmounted, so flipping the mode back shows it
+  // again exactly as it was, unsaved edits included.
   hidden?: boolean;
 }
 
@@ -53,11 +59,10 @@ export function Section({
         className,
       )}
     >
-      {/* The icon is 28px and one line of the title is 20px, so how they align depends on whether
-          there is a second line. With a description the text column is the taller of the two and
-          the icon rides its FIRST line (`items-start` + the nudge). Without one, the shape most
-          sections took once their prose moved behind the `?`, the same rule leaves the title
-          sitting 6px above the icon's centre, so the two are centred against each other instead. */}
+      {/* The icon is 28px and one line of the title is 20px, so the alignment depends on whether
+          there is a second line. With a description the icon rides the text column's FIRST line
+          (`items-start` + the nudge); without one, the same rule would leave the title 6px above
+          the icon's centre, so the two are centred against each other instead. */}
       <div
         className={cn(
           "flex gap-2.5",
@@ -66,14 +71,14 @@ export function Section({
       >
         <span
           className={cn(
-            "flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-bg-tertiary text-accent",
+            "bg-bg-tertiary text-accent flex h-7 w-7 shrink-0 items-center justify-center rounded-lg",
             description && "mt-0.5",
           )}
         >
           <Icon className="h-4 w-4" aria-hidden="true" />
         </span>
         <div className="min-w-0">
-          <h3 className="flex items-center gap-1.5 font-medium text-sm text-text-primary">
+          <h3 className="text-text-primary flex items-center gap-1.5 text-sm font-medium">
             {title}
             {help ? <HelpPopover content={help} label={title} /> : null}
           </h3>
@@ -82,54 +87,169 @@ export function Section({
           )}
         </div>
       </div>
-      {children}
+      <RangeHoldsSuspended suspended={!!hidden}>{children}</RangeHoldsSuspended>
     </Card>
   );
 }
 
-// Tracks which section id is currently near the top of the viewport. IntersectionObserver against the
-// viewport fires as the inner scroll container (the app's <main>) scrolls, because the observed
-// section elements translate within the viewport. The rootMargin biases "active" to the upper band so
-// the highlight matches what the operator is reading. Keyed on the joined id list so it re-binds only
-// when the section set changes (the effect reads the ids from `key`, never the array identity).
-function useScrollSpy(ids: string[]): string | null {
+// How long the scroll must stay still before a clicked entry stops holding the highlight.
+const SCROLL_SETTLE_MS = 150;
+
+type Pin = { settled: boolean; timer?: Timer };
+
+const GESTURES = ["wheel", "touchstart", "keydown"] as const;
+
+// The hold ends SCROLL_SETTLE_MS after the last scroll event, or after the click when the section
+// was already in place and nothing scrolled: without its own clock the operator's next scroll would
+// be read as the click's.
+function armSettle(pin: Pin): void {
+  clearTimeout(pin.timer);
+  pin.timer = setTimeout(() => {
+    pin.settled = true;
+  }, SCROLL_SETTLE_MS);
+}
+
+// The nearest ancestor that scrolls (the app's <main>), or the document when none does.
+function scrollBoxOf(el: HTMLElement): Element | null {
+  for (let p = el.parentElement; p; p = p.parentElement) {
+    const { overflowY } = getComputedStyle(p);
+    if (overflowY === "auto" || overflowY === "scroll") return p;
+  }
+  return document.scrollingElement;
+}
+
+// Where the operator is reading: the section whose top has passed a line this far down the scroll
+// container is the current one. A line and not a band, because a tall section covering a band kept
+// the highlight until the page ended, and the section under it was never lit.
+const ACTIVATION_LINE = 0.35;
+
+// Tracks which section is current as the scroll container (the app's <main>) scrolls. Keyed on the
+// joined id list so it re-binds only when the section set changes (the effect reads the ids from
+// `key`, never the array identity).
+function useScrollSpy(ids: string[]): {
+  active: string | null;
+  pin: (id: string) => void;
+} {
   const key = ids.join("|");
   const [active, setActive] = useState<string | null>(null);
+  const pinned = useRef<Pin | null>(null);
   useEffect(() => {
     const order = key ? key.split("|") : [];
     const els = order
       .map((id) => document.getElementById(id))
       .filter((el): el is HTMLElement => el !== null);
     if (els.length === 0) return;
-    const visible = new Set<string>();
-    const obs = new IntersectionObserver(
-      (entries) => {
-        for (const e of entries) {
-          if (e.isIntersecting) visible.add(e.target.id);
-          else visible.delete(e.target.id);
+    const first = els[0] as HTMLElement;
+    const last = els[els.length - 1] as HTMLElement;
+    // The ends of the page decide on their own: at the top the first section is current though a
+    // short one leaves the line in the next (a page that does not scroll is at its top), and at the
+    // bottom the last one is, though a last section shorter than the screen never reaches the line.
+    const decide = (box: Element) => {
+      if (pinned.current) return;
+      const atBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 2;
+      let next = first;
+      if (box.scrollTop > 1 && atBottom) next = last;
+      else if (box.scrollTop > 1) {
+        const top =
+          box === document.scrollingElement
+            ? 0
+            : box.getBoundingClientRect().top;
+        const line = top + box.clientHeight * ACTIVATION_LINE;
+        for (const el of els) {
+          if (el.getBoundingClientRect().top <= line) next = el;
         }
-        const firstVisible = order.find((id) => visible.has(id));
-        if (firstVisible) setActive(firstVisible);
-      },
-      { rootMargin: "-80px 0px -55% 0px", threshold: [0, 0.1] },
-    );
-    for (const el of els) obs.observe(el);
-    return () => obs.disconnect();
+      }
+      setActive(next.id);
+    };
+    // Scroll does not bubble, so it is caught on the way down; only the container holding the
+    // sections counts, not a textarea scrolling inside one of them.
+    const onScroll = (event: Event) => {
+      const box =
+        event.target instanceof Element
+          ? event.target
+          : document.scrollingElement;
+      if (!box?.contains(last)) return;
+      const pin = pinned.current;
+      if (pin && !pin.settled) {
+        armSettle(pin);
+        return;
+      }
+      pinned.current = null;
+      decide(box);
+    };
+    document.addEventListener("scroll", onScroll, {
+      capture: true,
+      passive: true,
+    });
+    // Mounted into a page already scrolled (Back and Forward between the editor's tabs), it answers
+    // for where the page is now instead of waiting for the next scroll.
+    const box = scrollBoxOf(last);
+    if (box) decide(box);
+    // The layout can move with no scroll at all (the window resized, a card grew), so a resize of the
+    // container or of any section decides again.
+    const resizes = new ResizeObserver(() => {
+      if (box) decide(box);
+    });
+    if (box) resizes.observe(box);
+    for (const el of els) resizes.observe(el);
+    // A gesture of the operator's ends the hold at once: taking over mid-animation, their scroll events
+    // come back to back with the animation's, and waiting for a pause would hold through the gesture.
+    const release = () => {
+      clearTimeout(pinned.current?.timer);
+      pinned.current = null;
+    };
+    for (const type of GESTURES) {
+      document.addEventListener(type, release, {
+        capture: true,
+        passive: true,
+      });
+    }
+    return () => {
+      resizes.disconnect();
+      document.removeEventListener("scroll", onScroll, { capture: true });
+      for (const type of GESTURES) {
+        document.removeEventListener(type, release, { capture: true });
+      }
+      clearTimeout(pinned.current?.timer);
+    };
   }, [key]);
-  return active ?? ids[0] ?? null;
+  // An entry clicked holds the highlight until the operator scrolls again: its section may stop too
+  // low to reach the line where the smooth scroll ends.
+  const pin = useCallback((id: string) => {
+    clearTimeout(pinned.current?.timer);
+    const pin: Pin = { settled: false };
+    armSettle(pin);
+    pinned.current = pin;
+    setActive(id);
+  }, []);
+  return { active: active ?? ids[0] ?? null, pin };
 }
 
-// The left-rail index: desktop-only (the tab already stacks vertically on mobile), sticky within the
-// scroll container. Clicking an entry smooth-scrolls to its section; the active section is highlighted.
-export function SectionNav({ sections }: { sections: SectionDef[] }) {
+// The section index, desktop-only (the tab already stacks vertically on mobile). As a left rail it is
+// sticky within the scroll container; as a bar it is a row of entries for a page that cannot spare a
+// column, and the page makes the bar sticky. Clicking an entry smooth-scrolls to its section; the
+// active section is highlighted.
+export function SectionNav({
+  sections,
+  layout = "rail",
+}: {
+  sections: SectionDef[];
+  layout?: "rail" | "bar";
+}) {
   const { t } = useTranslation();
-  const active = useScrollSpy(sections.map((s) => s.id));
+  const { active, pin } = useScrollSpy(sections.map((s) => s.id));
+  const bar = layout === "bar";
   return (
     <nav
-      className="hidden w-56 shrink-0 lg:block"
+      className={cn("hidden lg:block", !bar && "w-56 shrink-0")}
       aria-label={t("editor.sectionsNav", "Sections")}
     >
-      <ul className="sticky top-4 flex flex-col gap-0.5">
+      <ul
+        className={cn(
+          "flex gap-0.5",
+          bar ? "flex-wrap" : "sticky top-4 flex-col",
+        )}
+      >
         {sections.map((s) => {
           const Icon = s.icon;
           const isActive = active === s.id;
@@ -139,6 +259,7 @@ export function SectionNav({ sections }: { sections: SectionDef[] }) {
                 href={`#${s.id}`}
                 onClick={(e) => {
                   e.preventDefault();
+                  pin(s.id);
                   document
                     .getElementById(s.id)
                     ?.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -146,13 +267,17 @@ export function SectionNav({ sections }: { sections: SectionDef[] }) {
                 className={cn(
                   "flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm transition-colors",
                   isActive
-                    ? "bg-bg-tertiary font-medium text-text-primary"
+                    ? "bg-bg-tertiary text-text-primary font-medium"
                     : "text-text-muted hover:bg-bg-hover hover:text-text-secondary",
                 )}
                 aria-current={isActive ? "true" : undefined}
               >
                 <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                <span className="truncate">{s.label}</span>
+                <span
+                  className={cn(!bar && "truncate", bar && "whitespace-nowrap")}
+                >
+                  {s.label}
+                </span>
               </a>
             </li>
           );

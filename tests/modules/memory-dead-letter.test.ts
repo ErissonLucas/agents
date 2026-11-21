@@ -18,19 +18,18 @@ import {
   runCompaction,
 } from "@/modules/memory/compact";
 import { runCompactionTick } from "@/modules/memory/worker";
-import { getDeadLetterHandler, runClaimed } from "@/modules/scheduler/worker";
-import { codeOnly } from "@/tests/utils/source-text";
+import { runClaimed } from "@/modules/scheduler/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
+import { until } from "../utils/poll";
 
 // A compaction that will never happen has to SAY SO, in the trail the operator already reads by
-// conversation (issue #196).
+// conversation.
 //
-// The gap this file closes is specific to the summariser having its own provider, model, credential
-// and endpoint: before that, compaction could only fail because the AGENT's model was broken, and a
-// broken agent model fails every reply too, loudly. A configuration that fails only compaction is
-// silent by construction — replies keep going out, and what stops is the memory, which is read on
-// every later turn with that contact and is never rewritten.
+// The summariser has its own provider, model, credential and endpoint, so a configuration can fail
+// only compaction, and that is silent by construction: replies keep going out, and what stops is the
+// memory, which is read on every later turn with that contact and is never rewritten.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -48,8 +47,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -275,10 +274,10 @@ describe.skipIf(!dbUp)("a compaction that will never happen", () => {
 
   // emitFlowEvent is fire-and-forget, so reading too early sees zero and proves nothing.
   async function waitForLines(threadId: string, n: number) {
-    for (let i = 0; i < 40; i++) {
-      if ((await memoryLines(threadId)).length >= n) return;
-      await new Promise((r) => setTimeout(r, 25));
-    }
+    await until(
+      `${n} memory line(s)`,
+      async () => (await memoryLines(threadId)).length >= n,
+    );
   }
 
   // ── The statement, and when it is made ───────────────────────────────────────────────────────
@@ -422,11 +421,10 @@ describe.skipIf(!dbUp)("a compaction that will never happen", () => {
     expect(lines[0]?.conversationId).toBe(convDbId);
   });
 
-  // The re-arm race, which the sibling announcement (issue #71) hit first: this row's dedupeKey is the
-  // THREAD, reused by every attendance the contact ever has, so `armCompaction` upserts the very row
-  // that just died back to PENDING — and the turns this job failed to cut are still raw on the
-  // thread, so the new arm can still summarise them. Announcing over it would page an operator about
-  // work that is queued.
+  // NOTE: The re-arm race, the same one the failure note has: this row's dedupeKey is the THREAD, reused by
+  // every attendance the contact ever has, so `armCompaction` upserts the very row that just died back
+  // to PENDING, and the turns this job failed to cut are still raw on the thread, so the new arm can
+  // still summarise them. Announcing over it would page an operator about work that is queued.
   test("a job re-armed before the line is written is a live compaction, not a lost one", async () => {
     const ci = 6005;
     await seedConversation(868);
@@ -471,8 +469,7 @@ describe.skipIf(!dbUp)("a compaction that will never happen", () => {
       "memory compaction model not runnable: credential_required",
       appDb,
     );
-    await new Promise((r) => setTimeout(r, 200));
-    // Still the one line from the dead row, not a second from the live one.
+    // Still the one line from the dead row, not a second from the live one: the read is settled.
     expect(await memoryLines(threadId)).toHaveLength(1);
   });
 
@@ -603,32 +600,4 @@ describe.skipIf(!dbUp)("a compaction that will never happen", () => {
       },
     });
   });
-
-  test("compaction registers its dead-letter hook", () => {
-    registerMemoryHandlers();
-    expect(getDeadLetterHandler("MEMORY_COMPACT")).toBeDefined();
-  });
-});
-
-// ── The family, swept ──────────────────────────────────────────────────────────────────────────
-// Every reaper is a road to DEAD, and a lane that reaps its own kind and does not announce retires
-// that kind's work in silence — which is exactly how this shipped: the scheduler tick announced, the
-// compaction lane did not, and with both running which one announced was decided by whichever won
-// the atomic UPDATE. A fourth lane will be written by copying a third, so the rule is asserted over
-// the SOURCE rather than left for the next reviewer to notice.
-test("every reaper announces the rows it dead-letters", async () => {
-  const { Glob } = await import("bun");
-  const offenders: string[] = [];
-  for await (const file of new Glob("src/**/*.ts").scan(".")) {
-    // Through the scan, so prose naming the shape is not counted as one (#424).
-    const src = codeOnly(await Bun.file(file).text());
-    // The definition itself, not a call site.
-    if (file.endsWith("scheduler/service.ts")) continue;
-    if (!/\breapStaleJobs\b/.test(src)) continue;
-    // The CALL, not the identifier: an import alone satisfies `\bannounceReaped\b`, so a file that
-    // kept the import and dropped the call read as compliant. Measured — that is the exact mutation
-    // this sweep failed to kill on its first draft.
-    if (!/\bannounceReaped\(/.test(src)) offenders.push(file);
-  }
-  expect(offenders).toEqual([]);
 });

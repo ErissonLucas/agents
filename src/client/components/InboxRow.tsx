@@ -48,7 +48,7 @@ export function InboxRow({
   const inboxUrl = `${instanceBaseUrl.replace(/\/+$/, "")}/app/accounts/${instanceAccountId}/settings/inboxes/${chatwootInboxId}`;
 
   return (
-    <li className="flex items-center justify-between gap-4 border-border border-b px-4 py-3 last:border-b-0">
+    <li className="border-border flex items-center justify-between gap-4 border-b px-4 py-3 last:border-b-0">
       <div className="flex min-w-0 flex-1 items-center gap-2.5">
         <span
           className={cn("h-2 w-2 shrink-0 rounded-full", {
@@ -60,7 +60,7 @@ export function InboxRow({
         />
         <div className="min-w-0">
           <div className="flex items-center gap-1.5">
-            <span className="truncate font-medium text-text-primary">
+            <span className="text-text-primary truncate font-medium">
               {name}
             </span>
             <Tooltip content={t("channels.inboxId", "Chatwoot inbox ID")}>
@@ -74,51 +74,63 @@ export function InboxRow({
                 target="_blank"
                 rel="noopener noreferrer"
                 aria-label={t("channels.openInChatwoot", "Open in Chatwoot")}
-                className="inline-flex shrink-0 items-center justify-center rounded p-1 text-text-muted transition-colors hover:bg-bg-hover hover:text-text-primary"
+                className="text-text-muted hover:bg-bg-hover hover:text-text-primary inline-flex shrink-0 items-center justify-center rounded p-1 transition-colors"
               >
                 <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
               </a>
             </Tooltip>
           </div>
           {status === "missing" ? (
-            <p className="mt-0.5 text-warning text-xs">
+            <p className="text-warning mt-0.5 text-xs">
               {t("channels.botRemoved", "Bot removed on Chatwoot")}
             </p>
           ) : (
             channelType && (
-              <p className="mt-0.5 text-text-muted text-xs">{channelType}</p>
+              <p className="text-text-muted mt-0.5 text-xs">{channelType}</p>
             )
           )}
         </div>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        {status === "missing" && onReconnect && (
-          <Button
-            variant="secondary"
-            size="sm"
-            loading={reconnecting}
-            onClick={onReconnect}
-          >
-            <RefreshCw className="h-4 w-4" aria-hidden="true" />
-            {t("channels.reconnect", "Reconnect")}
-          </Button>
-        )}
-        {onRemove && (
-          <Tooltip content={t("channels.removeInbox", "Remove inbox mirror")}>
-            {/* `Button` does not forwardRef, so Radix `asChild` needs a real DOM node (CLAUDE.md). */}
-            <span className="inline-flex">
+        {/* Pinned to the top band, one picker tall: the trailing control can wrap a second line
+            (the Channels page's observers under its picker), and centering on the whole column
+            left these buttons between the two lines. */}
+        {((status === "missing" && onReconnect) || onRemove) && (
+          <div className="flex h-8 items-center gap-2 self-start">
+            {status === "missing" && onReconnect && (
               <Button
                 variant="secondary"
                 size="sm"
-                loading={removing}
-                onClick={onRemove}
-                aria-label={t("channels.removeInbox", "Remove inbox mirror")}
-                className="text-text-muted hover:text-error"
+                loading={reconnecting}
+                onClick={onReconnect}
               >
-                <Trash2 className="h-4 w-4" aria-hidden="true" />
+                <RefreshCw className="h-4 w-4" aria-hidden="true" />
+                {t("channels.reconnect", "Reconnect")}
               </Button>
-            </span>
-          </Tooltip>
+            )}
+            {onRemove && (
+              <Tooltip
+                content={t("channels.removeInbox", "Remove inbox mirror")}
+              >
+                {/* `Button` does not forwardRef, so Radix `asChild` needs a real DOM node (CLAUDE.md). */}
+                <span className="inline-flex">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    loading={removing}
+                    onClick={onRemove}
+                    aria-label={t(
+                      "channels.removeInbox",
+                      "Remove inbox mirror",
+                    )}
+                    className="text-text-muted hover:text-error"
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </Button>
+                </span>
+              </Tooltip>
+            )}
+          </div>
         )}
         {children}
       </div>

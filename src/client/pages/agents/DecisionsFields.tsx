@@ -1,0 +1,2695 @@
+import type { TFunction } from "i18next";
+import {
+  ArrowDown,
+  ArrowUp,
+  ChevronRight,
+  Plus,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react";
+import type React from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+import {
+  Badge,
+  Button,
+  ComboBox,
+  CredentialPicker,
+  FormField,
+  Input,
+  NumberInput,
+  Select,
+  Textarea,
+  Tooltip,
+} from "@/client/components";
+import { api } from "@/client/lib/api";
+import { credentialCompat } from "@/client/lib/credentialCompat";
+import { cn } from "@/client/lib/utils";
+import { numberRange } from "@/lib/number-range";
+import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
+import {
+  CHOICE_OPTIONS_MAX,
+  DECISION_ACTION_TOOLS,
+  DECISION_PROVIDERS,
+  DECISION_QUESTION_TYPES,
+  DEFAULT_DECISION_MODEL,
+  type DecisionProvider,
+  type DecisionsIssue,
+  isNativeDecisionTool,
+  QUESTIONS_MAX,
+  RULES_MAX,
+  SCORE_LEVELS_MAX,
+} from "@/modules/decisions/config";
+import {
+  type ArgType,
+  fieldSourceType,
+  parseFieldSource,
+  sourceFits,
+  type ToolArgSpec,
+} from "@/modules/decisions/tool-args";
+import {
+  type DecisionLine,
+  type DecisionsActivity,
+  type RuleActivity,
+  summarizeDecisions,
+} from "./decisionsActivity";
+import {
+  actionGap,
+  actionScope,
+  type CustomToolOffer,
+  type CustomTools,
+  conditionFor,
+  conditionSummary,
+  type DecisionConditionForm,
+  type DecisionOptionForm,
+  type DecisionQuestionForm,
+  type DecisionRuleForm,
+  type DecisionsForm,
+  decisionsFormIssues,
+  decisionTextCap,
+  emptyCondition,
+  freshDecisionKey,
+  issuesUnder,
+  moveItem,
+  ruleIsBroken,
+  ruleToolNotGranted,
+  ruleTriggerShown,
+  withActionScope,
+} from "./decisionsFormState";
+import {
+  DECISIONS_STARTERS,
+  type DecisionsStarter,
+  type StarterNames,
+  starterApplied,
+  starterFits,
+  withStarter,
+} from "./decisionsStarters";
+import { type InboxLabelOption, LabelPicker } from "./LabelPicker";
+
+// A condition's confidence and probability are a 0-1 unit stored, typed here as a percent.
+const DECISION_PERCENT_RANGE = numberRange(0, 100);
+
+// The decisions engine's block in the agent editor (docs/decisions.md, "The console"): which
+// classification API answers, the typed questions it is asked, and the rules that turn the answers
+// into tool calls. Drawn inside the Observation section of a monitoring agent whose engine is
+// `decisions`. Every problem shown is one the write boundary's schema reports for this block, at
+// the field it reports it for, so the screen and the server cannot disagree about what saves.
+
+// A refusal the SERVER answered a save with, about a field of this block. Shown at that field while
+// the block still holds what was sent.
+export interface DecisionsServerRefusal {
+  // Dotted path inside the block (`rules.0.when.0.question`), or "" for the block itself.
+  path: string;
+  message: string;
+}
+
+const HOW_MANY_LINES = "100";
+
+// Product names, the same in every language.
+const PROVIDER_NAMES: Record<DecisionProvider, string> = {
+  openai: "OpenAI Decisions",
+  typesafe: "TypeSafe (Jev)",
+};
+
+// A threshold is typed as a percentage, so its limits are said as one.
+function isThreshold(issue: DecisionsIssue): boolean {
+  const last = issue.path[issue.path.length - 1];
+  return last === "minProbability" || last === "minConfidence";
+}
+
+function issueText(t: TFunction, issue: DecisionsIssue): string {
+  const p = issue.params;
+  switch (issue.code) {
+    case "required":
+      return t("editor.decisionsIssueRequired", "Required.");
+    case "repeated_value":
+      return t(
+        "editor.decisionsIssueRepeatedValue",
+        '"{{value}}" is already used in this list.',
+        { value: p.value },
+      );
+    case "repeated_name":
+      return t(
+        "editor.decisionsIssueRepeatedName",
+        'Another question is already named "{{value}}".',
+        { value: p.value },
+      );
+    case "unknown_question":
+      return t(
+        "editor.decisionsIssueUnknownQuestion",
+        'No question is named "{{value}}" anymore. Pick one of the questions above.',
+        { value: p.value },
+      );
+    case "unknown_option":
+      return t(
+        "editor.decisionsIssueUnknownOption",
+        '"{{value}}" is no longer one of the question\'s options.',
+        { value: p.value },
+      );
+    case "level_out_of_range":
+      return t(
+        "editor.decisionsIssueLevelOutOfRange",
+        "The question now has {{size}} levels, and this rule names one past the last.",
+        { size: p.size },
+      );
+    case "needs_min_probability":
+      return t(
+        "editor.decisionsIssueNeedsProbability",
+        "Set the minimum probability, from 0% to 100%.",
+      );
+    case "needs_equals":
+      return t("editor.decisionsIssueNeedsEquals", "Pick the option.");
+    case "needs_level_range":
+      return t(
+        "editor.decisionsIssueNeedsLevels",
+        "Pick the lowest and the highest level, lowest first.",
+      );
+    case "choice_needs_options":
+    case "score_needs_levels":
+      return t("editor.decisionsIssueNeedsList", "Add at least 2.");
+    case "too_small":
+      if (isThreshold(issue)) {
+        return t(
+          "editor.decisionsIssueTooSmallPercent",
+          "At least {{minimum}}%.",
+          {
+            minimum: Number(p.minimum) * 100,
+          },
+        );
+      }
+      return p.origin === "string"
+        ? t("editor.decisionsIssueRequired", "Required.")
+        : t("editor.decisionsIssueTooSmall", "At least {{minimum}}.", {
+            minimum: p.minimum,
+          });
+    case "too_big":
+      if (isThreshold(issue)) {
+        return t(
+          "editor.decisionsIssueTooBigPercent",
+          "At most {{maximum}}%.",
+          {
+            maximum: Number(p.maximum) * 100,
+          },
+        );
+      }
+      return t("editor.decisionsIssueTooBig", "At most {{maximum}}.", {
+        maximum: p.maximum,
+      });
+    case "invalid_format":
+      return t(
+        "editor.decisionsIssueName",
+        "Lowercase letters, digits and underscores, starting with a letter, up to 64 characters.",
+      );
+    case "invalid_type":
+      return t("editor.decisionsIssueNumber", "Must be a number.");
+    case "invalid_value":
+      return t("editor.decisionsIssueValue", "Not an accepted value.");
+    case "arg_required":
+      return t(
+        "editor.decisionsIssueArgRequired",
+        '"{{arg}}" is required by the tool: give it a fixed value or a field.',
+        { arg: p.key },
+      );
+    case "arg_unknown":
+      return t(
+        "editor.decisionsIssueArgUnknown",
+        'The tool has no argument "{{arg}}". Remove it.',
+        { arg: p.key },
+      );
+    case "arg_type":
+      return t(
+        "editor.decisionsIssueArgType",
+        "Not the type the tool takes here.",
+      );
+    case "arg_source_type":
+      return t(
+        "editor.decisionsIssueArgSourceType",
+        "This field is not of the type the tool takes here.",
+      );
+    case "arg_twice":
+      return t(
+        "editor.decisionsIssueArgTwice",
+        '"{{arg}}" is both fixed and filled. Keep one.',
+        { arg: p.key },
+      );
+    case "unknown_field_source":
+      return t(
+        "editor.decisionsIssueFieldSource",
+        '"{{value}}" is not a field this observation knows.',
+        { value: p.value },
+      );
+    case "fill_question_type":
+      return t(
+        "editor.decisionsIssueFillQuestionType",
+        'The question "{{value}}" does not give this kind of answer anymore.',
+        { value: p.value },
+      );
+    case "fill_on_native":
+      return t(
+        "editor.decisionsIssueFillOnNative",
+        "This action takes its values as written.",
+      );
+    default:
+      return issue.message;
+  }
+}
+
+function IconButton({
+  label,
+  onClick,
+  disabled,
+  danger,
+  children,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  danger?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <Tooltip content={label}>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={disabled}
+        aria-label={label}
+        className={
+          danger
+            ? "text-text-muted hover:text-error flex h-7 w-7 items-center justify-center rounded transition-colors disabled:opacity-40"
+            : "text-text-muted hover:text-text-primary flex h-7 w-7 items-center justify-center rounded transition-colors disabled:opacity-40"
+        }
+      >
+        {children}
+      </button>
+    </Tooltip>
+  );
+}
+
+function ruleActivityText(
+  t: TFunction,
+  a: RuleActivity | undefined,
+  total: number,
+): string {
+  if (!a || a.fired === 0) {
+    return t(
+      "editor.decisionsRuleNeverFired",
+      "Fired in 0 of {{total}} decisions.",
+      { total },
+    );
+  }
+  const parts = [
+    t(
+      "editor.decisionsRuleFired",
+      "Fired in {{fired}} of {{total}} decisions",
+      {
+        fired: a.fired,
+        total,
+      },
+    ),
+  ];
+  if (a.ran > 0) {
+    parts.push(t("editor.decisionsRuleRan", "ran {{n}}", { n: a.ran }));
+  }
+  if (a.merged > 0) {
+    parts.push(
+      t("editor.decisionsRuleMerged", "same action as an earlier rule {{n}}", {
+        n: a.merged,
+      }),
+    );
+  }
+  if (a.held > 0) {
+    parts.push(
+      t("editor.decisionsRuleHeld", "already acted, held back {{n}}", {
+        n: a.held,
+      }),
+    );
+  }
+  for (const [fence, n] of Object.entries(a.refusedBy)) {
+    parts.push(
+      fence === "protected_label"
+        ? t(
+            "editor.decisionsRuleRefusedProtected",
+            "refused by a protected label {{n}}",
+            { n },
+          )
+        : fence === "allowed_labels"
+          ? t(
+              "editor.decisionsRuleRefusedAllowed",
+              "refused by the allowed labels {{n}}",
+              { n },
+            )
+          : fence === "precondition"
+            ? t(
+                "editor.decisionsRuleRefusedPrecondition",
+                "refused by the tool's condition {{n}}",
+                { n },
+              )
+            : t(
+                "editor.decisionsRuleRefused",
+                "refused by a protection {{n}}",
+                { n },
+              ),
+    );
+  }
+  if (a.blocked > 0) {
+    parts.push(
+      t("editor.decisionsRuleBlocked", "could not run {{n}}", {
+        n: a.blocked,
+      }),
+    );
+  }
+  return `${parts.join(", ")}.`;
+}
+
+type CustomAttribute = { key: string; displayName: string; model: string };
+
+// WHERE A CUSTOM TOOL'S ARGUMENTS COME FROM (decisions/tool-args.ts): each one fixed, typed for what
+// the tool takes, or filled from a field of the observation, offered only among the fields of a type
+// the argument takes. The tool's own schema lists the arguments; an MCP tool's live on its server,
+// so its rows are named by hand.
+interface SourceOption {
+  value: string;
+  label: string;
+}
+interface SourceGroup {
+  label: string;
+  options: SourceOption[];
+}
+
+function fieldSourceGroups(
+  t: TFunction,
+  questions: DecisionQuestionForm[],
+  attributes: CustomAttribute[],
+  argType: ArgType | null,
+): SourceGroup[] {
+  const fits = (value: string) => {
+    const source = parseFieldSource(value);
+    return (
+      source !== null &&
+      (argType === null || sourceFits(fieldSourceType(source), argType))
+    );
+  };
+  const keep = (options: SourceOption[]) =>
+    options.filter((o) => fits(o.value));
+  const attrs = (model: string, prefix: string) =>
+    attributes
+      .filter((a) => a.model === model)
+      .map((a) => ({
+        value: `${prefix}.attribute.${a.key}`,
+        label: a.displayName || a.key,
+      }));
+  const groups: SourceGroup[] = [
+    {
+      label: t("editor.decisionsSourceContact", "Contact"),
+      options: keep([
+        {
+          value: "contact.name",
+          label: t("editor.decisionsSourceContactName", "Name"),
+        },
+        {
+          value: "contact.phone",
+          label: t("editor.decisionsSourceContactPhone", "Phone"),
+        },
+        {
+          value: "contact.email",
+          label: t("editor.decisionsSourceContactEmail", "Email"),
+        },
+        {
+          value: "contact.identifier",
+          label: t("editor.decisionsSourceContactIdentifier", "Identifier"),
+        },
+        ...attrs(SCOPE_MODEL.contact, "contact"),
+      ]),
+    },
+    {
+      label: t("editor.decisionsSourceConversation", "Conversation"),
+      options: keep([
+        {
+          value: "conversation.display_id",
+          label: t(
+            "editor.decisionsSourceConversationId",
+            "Conversation number",
+          ),
+        },
+        {
+          value: "conversation.inbox_id",
+          label: t("editor.decisionsSourceInboxId", "Inbox id"),
+        },
+        {
+          value: "conversation.link",
+          label: t("editor.decisionsSourceLink", "Link to the conversation"),
+        },
+        ...attrs(SCOPE_MODEL.conversation, "conversation"),
+      ]),
+    },
+    {
+      label: t("editor.decisionsSourceAnswers", "Answers of this observation"),
+      options: keep(
+        questions
+          .filter((q) => q.name)
+          .flatMap((q): SourceOption[] =>
+            q.type === "yes_no"
+              ? [
+                  {
+                    value: `answer.${q.name}.probability`,
+                    label: t(
+                      "editor.decisionsSourceProbability",
+                      "{{question}}: probability",
+                      { question: q.name },
+                    ),
+                  },
+                ]
+              : q.type === "choice"
+                ? [
+                    {
+                      value: `answer.${q.name}.choice`,
+                      label: t(
+                        "editor.decisionsSourceChoice",
+                        "{{question}}: option",
+                        { question: q.name },
+                      ),
+                    },
+                  ]
+                : q.type === "score"
+                  ? [
+                      {
+                        value: `answer.${q.name}.level`,
+                        label: t(
+                          "editor.decisionsSourceLevel",
+                          "{{question}}: level",
+                          { question: q.name },
+                        ),
+                      },
+                      {
+                        value: `answer.${q.name}.level_index`,
+                        label: t(
+                          "editor.decisionsSourceLevelIndex",
+                          "{{question}}: level number",
+                          { question: q.name },
+                        ),
+                      },
+                    ]
+                  : [],
+          ),
+      ),
+    },
+  ];
+  return groups.filter((g) => g.options.length > 0);
+}
+
+function typeText(t: TFunction, spec: ToolArgSpec): string {
+  switch (spec.type) {
+    case "integer":
+      return t("editor.decisionsArgTypeInteger", "whole number");
+    case "number":
+      return t("editor.decisionsArgTypeNumber", "number");
+    case "boolean":
+      return t("editor.decisionsArgTypeBoolean", "yes or no");
+    case "enum":
+      return t("editor.decisionsArgTypeEnum", "one of a list");
+    case "array":
+      return t("editor.decisionsArgTypeArray", "list");
+    case "object":
+      return t("editor.decisionsArgTypeObject", "object");
+    default:
+      return t("editor.decisionsArgTypeText", "text");
+  }
+}
+
+// A fixed value typed as the argument's type wants it. A number field left mid-typing ("1.") keeps
+// the text, which the check calls the wrong type until it is a number.
+function fixedFromInput(spec: ToolArgSpec | null, raw: string): unknown {
+  if (!spec) return raw;
+  if (spec.type === "integer" || spec.type === "number") {
+    const n = Number(raw);
+    return raw.trim() !== "" && Number.isFinite(n) ? n : raw;
+  }
+  if (spec.type === "boolean") return raw === "true";
+  if (spec.type === "array" || spec.type === "object") {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
+}
+
+// What a hand-named argument's stored value reads as, before the operator picks a type.
+function handTypeOf(v: unknown): ArgType {
+  if (typeof v === "number") return "number";
+  if (typeof v === "boolean") return "boolean";
+  if (v !== null && typeof v === "object") return "object";
+  return "string";
+}
+
+function fixedToInput(spec: ToolArgSpec | null, v: unknown): string {
+  if (v === undefined) return "";
+  if (typeof v === "string") return v;
+  if (spec && (spec.type === "array" || spec.type === "object")) {
+    return JSON.stringify(v);
+  }
+  return String(v);
+}
+
+// A value the bag holds itself: an argument named `constructor` or `toString` is not read off the
+// object's prototype.
+function own<T>(bag: Record<string, T>, key: string): T | undefined {
+  return Object.hasOwn(bag, key) ? bag[key] : undefined;
+}
+
+function CustomToolArgs({
+  ri,
+  rule,
+  offer,
+  questions,
+  attributes,
+  setRule,
+  field,
+}: {
+  ri: number;
+  rule: DecisionRuleForm;
+  offer: CustomToolOffer | undefined;
+  questions: DecisionQuestionForm[];
+  attributes: CustomAttribute[];
+  setRule: (p: Partial<DecisionRuleForm>) => void;
+  field: (path: string) => string | null;
+}) {
+  const { t } = useTranslation();
+  const specs = offer?.args ?? null;
+  // The rows: the schema's arguments in its order, then any the rule holds that the schema lacks
+  // (shown so they can be removed: the save refuses them). Without a schema, the rule's own.
+  const [modes, setModes] = useState<Record<string, "fixed" | "fill">>({});
+  // The text of a fixed value as typed, so a value on its way ("1.", "-") is not rewritten under the
+  // cursor while what is stored is already the number it reads as.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  // The type of a hand-named argument (no schema to say it): what its typed value is stored as.
+  const [handTypes, setHandTypes] = useState<Record<string, ArgType>>({});
+  const names = [
+    ...(specs ?? []).map((s) => s.name),
+    ...[
+      ...Object.keys(rule.args),
+      ...Object.keys(rule.fill),
+      ...(specs === null ? Object.keys(modes) : []),
+    ].filter((n) => !(specs ?? []).some((s) => s.name === n)),
+  ].filter((n, i, all) => all.indexOf(n) === i);
+  // An emptied text is a value ("" is what the tool gets), not an omission: `keepEmpty` keeps it.
+  const setValue = (
+    name: string,
+    mode: "fixed" | "fill",
+    value: unknown,
+    keepEmpty = false,
+  ) => {
+    const args = { ...rule.args };
+    const fill = { ...rule.fill };
+    delete args[name];
+    delete fill[name];
+    if (mode === "fill" && typeof value === "string" && value !== "") {
+      fill[name] = value;
+    } else if (
+      mode === "fixed" &&
+      value !== undefined &&
+      // A row named by hand (no schema) keeps its name while its value is emptied.
+      (value !== "" || keepEmpty || specs === null)
+    ) {
+      args[name] = value;
+    }
+    setRule({ args, fill });
+  };
+  const modeOf = (name: string): "fixed" | "fill" =>
+    Object.hasOwn(rule.fill, name)
+      ? "fill"
+      : Object.hasOwn(rule.args, name)
+        ? "fixed"
+        : (own(modes, name) ?? "fixed");
+  const [newName, setNewName] = useState("");
+  return (
+    <div className="flex flex-col gap-3" data-testid="decisions-custom-args">
+      {specs === null && (
+        <p className="text-text-muted text-xs">
+          {t(
+            "editor.decisionsMcpArgsHint",
+            "This tool's arguments are on its server: name each one as the tool expects it. The tool checks them when the rule fires.",
+          )}
+        </p>
+      )}
+      {specs !== null && specs.length === 0 && (
+        <p className="text-text-muted text-xs">
+          {t("editor.decisionsNoArgs", "This tool takes no arguments.")}
+        </p>
+      )}
+      {names.map((name) => {
+        const handType: ArgType | null =
+          specs === null
+            ? (own(handTypes, name) ?? handTypeOf(own(rule.args, name)))
+            : null;
+        const spec: ToolArgSpec | null =
+          specs?.find((s) => s.name === name) ??
+          (handType ? { name, type: handType, required: false } : null);
+        const mode = modeOf(name);
+        const error =
+          field(`rules.${ri}.action.args.${name}`) ??
+          field(`rules.${ri}.action.fill.${name}`);
+        const groups = fieldSourceGroups(
+          t,
+          questions,
+          attributes,
+          spec?.type ?? null,
+        );
+        const fixed = own(rule.args, name);
+        const numeric = spec?.type === "integer" || spec?.type === "number";
+        // Text a numeric input cannot read ("1e", "-") reaches here as "", flagged bad input, while
+        // the box still shows it. Kept as the empty text, which the check calls the wrong type, so
+        // it is not dropped as if the box were emptied.
+        const typed = (el: HTMLInputElement) => {
+          const raw = el.value;
+          setDrafts((d) => ({ ...d, [name]: raw }));
+          setValue(
+            name,
+            "fixed",
+            fixedFromInput(spec, raw),
+            spec?.type === "string" || el.validity.badInput,
+          );
+        };
+        const label = spec
+          ? `${name} (${typeText(t, spec)}${spec.required ? `, ${t("editor.decisionsArgRequired", "required")}` : ""})`
+          : name;
+        return (
+          <FormField
+            key={name}
+            group
+            label={label}
+            description={spec?.description}
+            error={error}
+          >
+            <div
+              className="flex flex-col gap-2 sm:flex-row sm:items-start"
+              data-testid={`decisions-arg-${name}`}
+            >
+              <Select
+                value={mode}
+                wrapperClassName="sm:max-w-52"
+                aria-label={t(
+                  "editor.decisionsArgMode",
+                  "Where {{arg}} comes from",
+                  { arg: name },
+                )}
+                onChange={(e) => {
+                  const next = e.target.value as "fixed" | "fill";
+                  setModes((m) => ({ ...m, [name]: next }));
+                  setDrafts(({ [name]: _, ...rest }) => rest);
+                  setValue(name, next, undefined);
+                }}
+              >
+                <option value="fixed">
+                  {t("editor.decisionsArgFixed", "Fixed value")}
+                </option>
+                <option value="fill">
+                  {t("editor.decisionsArgFill", "From the observation")}
+                </option>
+              </Select>
+              {mode === "fill" ? (
+                <Select
+                  value={own(rule.fill, name) ?? ""}
+                  data-testid={`decisions-arg-source-${name}`}
+                  aria-label={t(
+                    "editor.decisionsArgSource",
+                    "Field for {{arg}}",
+                    {
+                      arg: name,
+                    },
+                  )}
+                  onChange={(e) => setValue(name, "fill", e.target.value)}
+                >
+                  <option value="">
+                    {t("editor.decisionsArgPickField", "Pick a field…")}
+                  </option>
+                  {own(rule.fill, name) &&
+                    !groups.some((g) =>
+                      g.options.some((o) => o.value === own(rule.fill, name)),
+                    ) && (
+                      <option value={own(rule.fill, name)}>
+                        {own(rule.fill, name)}
+                      </option>
+                    )}
+                  {groups.map((g) => (
+                    <optgroup key={g.label} label={g.label}>
+                      {g.options.map((o) => (
+                        <option key={o.value} value={o.value}>
+                          {o.label}
+                        </option>
+                      ))}
+                    </optgroup>
+                  ))}
+                </Select>
+              ) : spec?.type === "boolean" ? (
+                <Select
+                  value={fixed === undefined ? "" : String(fixed)}
+                  aria-label={name}
+                  onChange={(e) =>
+                    setValue(
+                      name,
+                      "fixed",
+                      e.target.value === ""
+                        ? undefined
+                        : fixedFromInput(spec, e.target.value),
+                    )
+                  }
+                >
+                  <option value="" />
+                  <option value="true">
+                    {t("editor.decisionsArgTrue", "Yes")}
+                  </option>
+                  <option value="false">
+                    {t("editor.decisionsArgFalse", "No")}
+                  </option>
+                </Select>
+              ) : spec?.type === "enum" &&
+                (spec.enumValues ?? []).length > 0 ? (
+                <Select
+                  value={typeof fixed === "string" ? fixed : ""}
+                  aria-label={name}
+                  onChange={(e) => setValue(name, "fixed", e.target.value)}
+                >
+                  <option value="" />
+                  {(spec.enumValues ?? []).map((v) => (
+                    <option key={v} value={v}>
+                      {v}
+                    </option>
+                  ))}
+                </Select>
+              ) : (
+                <Input
+                  value={own(drafts, name) ?? fixedToInput(spec, fixed)}
+                  // A numeric input for a number, with any decimal a step: the tool's type is what
+                  // the check holds the value to, not the browser's step.
+                  {...(numeric ? { type: "number", step: "any" } : {})}
+                  aria-label={name}
+                  onChange={(e) => typed(e.target)}
+                  // A numeric input that goes between "" and text it cannot read ("-" in an empty
+                  // box, or "1e" cleared) changes its validity and not its value, and React's
+                  // onChange skips an unchanged value: the input event still comes.
+                  onInput={
+                    numeric
+                      ? (e) => typed(e.currentTarget as HTMLInputElement)
+                      : undefined
+                  }
+                  onBlur={() => setDrafts(({ [name]: _, ...rest }) => rest)}
+                />
+              )}
+              {specs === null && mode === "fixed" && (
+                <Select
+                  value={handType ?? "string"}
+                  wrapperClassName="sm:max-w-36"
+                  aria-label={t(
+                    "editor.decisionsArgHandType",
+                    "Type of {{arg}}",
+                    {
+                      arg: name,
+                    },
+                  )}
+                  onChange={(e) => {
+                    const type = e.target.value as ArgType;
+                    setHandTypes((h) => ({ ...h, [name]: type }));
+                    const raw = own(drafts, name) ?? fixedToInput(spec, fixed);
+                    setValue(
+                      name,
+                      "fixed",
+                      fixedFromInput({ name, type, required: false }, raw),
+                    );
+                  }}
+                >
+                  <option value="string">
+                    {typeText(t, { name, type: "string", required: false })}
+                  </option>
+                  <option value="number">
+                    {typeText(t, { name, type: "number", required: false })}
+                  </option>
+                  <option value="boolean">
+                    {typeText(t, { name, type: "boolean", required: false })}
+                  </option>
+                  <option value="object">
+                    {t("editor.decisionsArgTypeJson", "JSON (object or list)")}
+                  </option>
+                </Select>
+              )}
+              {(specs === null || !spec) && (
+                <IconButton
+                  danger
+                  label={t("editor.decisionsArgRemove", "Remove argument")}
+                  onClick={() => {
+                    setModes(({ [name]: _, ...rest }) => rest);
+                    setValue(name, "fixed", undefined);
+                  }}
+                >
+                  <Trash2 className="h-4 w-4" aria-hidden="true" />
+                </IconButton>
+              )}
+            </div>
+          </FormField>
+        );
+      })}
+      {specs === null && (
+        <div className="flex items-center gap-2">
+          <Input
+            value={newName}
+            wrapperClassName="max-w-52"
+            placeholder={t("editor.decisionsArgName", "Argument name")}
+            aria-label={t("editor.decisionsArgName", "Argument name")}
+            onChange={(e) => setNewName(e.target.value.trim())}
+          />
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={newName === "" || names.includes(newName)}
+            onClick={() => {
+              setModes((m) => ({ ...m, [newName]: "fixed" }));
+              setRule({ args: { ...rule.args, [newName]: "" } });
+              setNewName("");
+            }}
+          >
+            <Plus aria-hidden="true" />
+            {t("editor.decisionsArgAdd", "Add argument")}
+          </Button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+export function DecisionsFields({
+  agentId,
+  savedAt,
+  storedBlock,
+  storedRuleCount,
+  storedDecisions,
+  savedDecisions,
+  decisions,
+  setDecisions,
+  serverRefusal,
+  granted,
+  customTools = null,
+  grantsPending,
+  grantWriting = false,
+  onGrantTool,
+  onOpenTools,
+  onOpenGeneral,
+  showErrors = true,
+}: {
+  agentId: string;
+  // When the agent was last saved: the activity is read again after every save.
+  savedAt: string | null;
+  // The mark of the questions and rules as STORED, which is what the engine's lines are matched
+  // against (decisionsActivity). Null when the stored block could not run.
+  storedBlock: string | null;
+  // How many rules that stored block has (a line is read against the list it indexes).
+  storedRuleCount: number;
+  // The block as stored: an untouched form is judged by it, since it is what a save writes back.
+  storedDecisions: Record<string, unknown> | null;
+  // The block as stored even after an edit: a rule the save leaves as it was is not asked again.
+  savedDecisions?: Record<string, unknown> | null;
+  decisions: DecisionsForm;
+  setDecisions: (next: (prev: DecisionsForm) => DecisionsForm) => void;
+  serverRefusal: DecisionsServerRefusal | null;
+  // The tools the agent has AS SAVED (what the engine checks), native and custom, by the name the
+  // engine finds them by, or null until they are read.
+  granted: ReadonlySet<string> | null;
+  // The tenant's own tools a rule may name (HTTP, code, and the MCP tools the agent's grants
+  // enable), with their arguments; null until the catalog is read.
+  customTools?: CustomTools | null;
+  // Whether the Tools tab holds grant changes not saved yet: then granting one tool from a rule
+  // would write it beside a selection nobody has confirmed, so the rule sends the operator there.
+  grantsPending: boolean;
+  // A grant write is out (an Allow, or a Tools save): the Allow buttons wait for it, since each
+  // replaces the whole set from the same saved copy.
+  grantWriting?: boolean;
+  onGrantTool: (tool: string) => void;
+  // Opens Tools on that tool's card.
+  onOpenTools: (tool: string) => void;
+  onOpenGeneral: () => void;
+  // Whether the operator has tried to save. Before that, what is missing is said in a neutral line,
+  // and the empty list is not an error: the first look at the tab is the starting points.
+  showErrors?: boolean;
+}) {
+  const { t } = useTranslation();
+  const starterNames = useStarterNames();
+  const issues = useMemo(
+    () =>
+      decisionsFormIssues(
+        decisions,
+        storedDecisions,
+        customTools,
+        savedDecisions ?? storedDecisions,
+      ),
+    [decisions, storedDecisions, customTools, savedDecisions],
+  );
+
+  const [labels, setLabels] = useState<InboxLabelOption[]>([]);
+  const [attributes, setAttributes] = useState<CustomAttribute[]>([]);
+  const [multiAccount, setMultiAccount] = useState(false);
+  const [activity, setActivity] = useState<DecisionsActivity | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLabels([]);
+    setAttributes([]);
+    setMultiAccount(false);
+    void (async () => {
+      try {
+        const [l, a] = await Promise.all([
+          api.api.v1.chatwoot.labels({ agentId }).get(),
+          api.api.v1.chatwoot["custom-attributes"]({ agentId }).get(),
+        ]);
+        if (cancelled) return;
+        if (l.data) {
+          setLabels(l.data.labels);
+          setMultiAccount(l.data.accountCount > 1);
+        }
+        if (a.data) setAttributes(a.data.attributes);
+      } catch {
+        // NOTE: best-effort: both pickers still take a typed value
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: savedAt is the trigger: a save is when new lines can match
+  useEffect(() => {
+    let cancelled = false;
+    setActivity(null);
+    void (async () => {
+      try {
+        const { data } = await api.api.v1.logs.get({
+          query: {
+            source: "inbox",
+            stage: "observe",
+            agentId,
+            limit: HOW_MANY_LINES,
+          },
+        });
+        if (cancelled || !data) return;
+        setActivity(
+          summarizeDecisions(
+            data.items as DecisionLine[],
+            storedBlock,
+            storedRuleCount,
+          ),
+        );
+      } catch {
+        // NOTE: best-effort: the block is editable without its history
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [agentId, savedAt, storedBlock, storedRuleCount]);
+
+  // Which cards are unfolded. A stored block opens folded, one line per question and per rule, so a
+  // block of thirty rules reads as a list; a card with a problem is always open, since the mark is
+  // inside it, and a card just added opens for typing.
+  const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
+  const toggle = (key: string) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  const unfold = (key: string) => setOpen((prev) => new Set(prev).add(key));
+  // A card a problem (or a warning) opened STAYS open once the problem is gone: the operator is
+  // typing in it, and folding it on the keystroke that fixes the field takes the input, and the
+  // focus, away mid-word. Latched after the render that showed it; folding is the operator's click.
+  const forced = [
+    ...decisions.questions
+      .filter((_, qi) => issuesUnder(issues, `questions.${qi}`).length > 0)
+      .map((q) => q.key),
+    ...decisions.rules
+      .filter(
+        (r, ri) =>
+          actionGap(r) !== null ||
+          issuesUnder(issues, `rules.${ri}`).length > 0,
+      )
+      .map((r) => r.key),
+  ];
+  const forcedKey = forced.join(" ");
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `forced` is rebuilt every render; its keys are the dependency
+  useEffect(() => {
+    if (forced.length === 0) return;
+    setOpen((prev) =>
+      forced.every((k) => prev.has(k)) ? prev : new Set([...prev, ...forced]),
+    );
+  }, [forcedKey]);
+
+  const _provider = (decisions.provider || "openai") as DecisionProvider;
+  const questionNames = decisions.questions.map((q) => q.name).filter(Boolean);
+
+  // The message at a field: the form's own problem first, then what the server last said about it.
+  const at = (path: string): string | null => {
+    const issue = issues.get(path);
+    if (issue) return issueText(t, issue);
+    return serverRefusal && serverRefusal.path === path
+      ? serverRefusal.message
+      : null;
+  };
+  const drawnPaths = new Set<string>();
+  const field = (path: string): string | null => {
+    drawnPaths.add(path);
+    return at(path);
+  };
+
+  const setQuestion = (i: number, p: Partial<DecisionQuestionForm>) =>
+    setDecisions((prev) => ({
+      ...prev,
+      questions: prev.questions.map((q, n) => (n === i ? { ...q, ...p } : q)),
+    }));
+  const setRule = (i: number, p: Partial<DecisionRuleForm>) =>
+    setDecisions((prev) => ({
+      ...prev,
+      rules: prev.rules.map((r, n) => (n === i ? { ...r, ...p } : r)),
+    }));
+  const setCondition = (
+    r: number,
+    c: number,
+    next: (
+      prev: DecisionConditionForm,
+      form: DecisionsForm,
+    ) => DecisionConditionForm,
+  ) =>
+    setDecisions((prev) => ({
+      ...prev,
+      rules: prev.rules.map((rule, n) =>
+        n === r
+          ? {
+              ...rule,
+              when: rule.when.map((cond, m) =>
+                m === c ? next(cond, prev) : cond,
+              ),
+            }
+          : rule,
+      ),
+    }));
+  const setArg = (r: number, key: string, value: unknown) =>
+    setDecisions((prev) => ({
+      ...prev,
+      rules: prev.rules.map((rule, n) => {
+        if (n !== r) return rule;
+        const args = { ...rule.args };
+        // An emptied argument is removed rather than stored empty: `add: []` and no `add` mean the
+        // same to the tool, and an optional text the tool would take as given (a handoff reason)
+        // must not be sent as an empty one.
+        if (value === "" || (Array.isArray(value) && value.length === 0)) {
+          delete args[key];
+        } else {
+          args[key] = value;
+        }
+        return { ...rule, args };
+      }),
+    }));
+
+  const addStarter = (kind: DecisionsStarter) =>
+    setDecisions((prev) => withStarter(prev, kind, starterNames));
+  const starterTitle = (kind: DecisionsStarter): string => {
+    switch (kind) {
+      case "sentiment":
+        return t("editor.decisionsStarterSentiment", "Customer sentiment");
+      case "subject":
+        return t("editor.decisionsStarterSubject", "Main subject");
+      default:
+        return t("editor.decisionsStarterHuman", "Asks for a person");
+    }
+  };
+  const starterHint = (kind: DecisionsStarter): string => {
+    switch (kind) {
+      case "sentiment":
+        return t(
+          "editor.decisionsStarterSentimentHint",
+          "Five levels, from very negative to very positive. Each one puts its own label on the conversation and takes the other four off.",
+        );
+      case "subject":
+        return t(
+          "editor.decisionsStarterSubjectHint",
+          'A list of subjects you can edit. The answer is written to the conversation\'s "{{attribute}}" attribute.',
+          { attribute: starterNames.subjectAttribute },
+        );
+      default:
+        return t(
+          "editor.decisionsStarterHumanHint",
+          'Yes or no. When the customer asks to talk to someone, the conversation gets the "{{label}}" label.',
+          { label: starterNames.humanLabel },
+        );
+    }
+  };
+  const notGranted = (rule: DecisionRuleForm): boolean =>
+    granted !== null && ruleToolNotGranted(rule, granted);
+  const grantWarning = (rule: DecisionRuleForm) => (
+    <div
+      data-testid="decisions-rule-not-granted"
+      className="border-warning bg-warning-soft text-text-primary flex flex-wrap items-center gap-2 rounded-md border px-3 py-2 text-xs"
+    >
+      <TriangleAlert
+        className="text-warning h-4 w-4 shrink-0"
+        aria-hidden="true"
+      />
+      <span className="flex-1">
+        {isNativeDecisionTool(rule.tool)
+          ? t(
+              "editor.decisionsRuleNotGranted",
+              "This agent is not allowed to {{action}}, so this rule does not run.",
+              { action: toolLabel(rule.tool).toLowerCase() },
+            )
+          : t(
+              "editor.decisionsRuleCustomNotGranted",
+              'This agent is not allowed to use "{{tool}}", so this rule does not run. Allow it on the Tools tab.',
+              { tool: toolLabel(rule.tool) },
+            )}
+      </span>
+      {/* A custom tool is granted on its own card, with what it needs (an MCP server's tools). */}
+      {grantsPending || !isNativeDecisionTool(rule.tool) ? (
+        <Button
+          size="sm"
+          variant="secondary"
+          onClick={() => onOpenTools(rule.tool)}
+        >
+          {t("editor.decisionsOpenTools", "Open Tools")}
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          variant="secondary"
+          data-testid="decisions-rule-grant"
+          disabled={grantWriting}
+          onClick={() => onGrantTool(rule.tool)}
+        >
+          {t("editor.decisionsGrantTool", "Allow")}
+        </Button>
+      )}
+    </div>
+  );
+
+  const toolLabel = (tool: string): string => {
+    switch (tool) {
+      case "set_labels":
+        return t("editor.decisionsToolSetLabels", "Change labels");
+      case "handoff_to_human":
+        return t("editor.decisionsToolHandoff", "Hand off to a human");
+      case "private_note":
+        return t("editor.decisionsToolNote", "Leave a private note");
+      case "set_custom_attribute":
+        return t("editor.decisionsToolAttribute", "Set a custom attribute");
+      default:
+        return customTools?.get(tool)?.label ?? tool;
+    }
+  };
+  // The custom tools a rule is offered: those the agent has as saved, by label.
+  const offeredCustom = [...(customTools?.values() ?? [])]
+    .filter((c) => granted?.has(c.name))
+    .sort((a, b) => a.label.localeCompare(b.label));
+  const typeLabel = (type: string): string => {
+    switch (type) {
+      case "yes_no":
+        return t("editor.decisionsTypeYesNo", "Yes or no");
+      case "choice":
+        return t("editor.decisionsTypeChoice", "One of a list");
+      case "score":
+        return t("editor.decisionsTypeScore", "A level on a scale");
+      default:
+        return type;
+    }
+  };
+
+  const optionRows = (
+    qi: number,
+    key: "options" | "levels",
+    rows: DecisionOptionForm[],
+    max: number,
+  ) => {
+    const base = `questions.${qi}.${key}`;
+    const setRows = (next: DecisionOptionForm[]) =>
+      setQuestion(qi, key === "options" ? { options: next } : { levels: next });
+    return (
+      <FormField
+        group
+        label={
+          key === "options"
+            ? t("editor.decisionsOptions", "Options")
+            : t("editor.decisionsLevels", "Levels, lowest first")
+        }
+        description={
+          key === "options"
+            ? t(
+                "editor.decisionsOptionsHint",
+                "The answer is one of these. 2 to {{max}}, each value once.",
+                { max },
+              )
+            : t(
+                "editor.decisionsLevelsHint",
+                "The answer is a position on this scale. 2 to {{max}}, each value once.",
+                { max },
+              )
+        }
+        error={field(base)}
+      >
+        <div className="flex flex-col gap-2">
+          {rows.map((row, oi) => {
+            const valueError = field(`${base}.${oi}.value`);
+            return (
+              // biome-ignore lint/suspicious/noArrayIndexKey: rows are positional and carry no id; a level's index IS its value
+              <div key={oi} className="flex flex-col gap-1">
+                <div className="flex items-start gap-2">
+                  {key === "levels" && (
+                    <span className="text-text-muted mt-2 w-5 shrink-0 text-right text-xs tabular-nums">
+                      {oi}
+                    </span>
+                  )}
+                  <Input
+                    value={row.value}
+                    error={!!valueError}
+                    onChange={(e) =>
+                      setRows(
+                        rows.map((x, n) =>
+                          n === oi ? { ...x, value: e.target.value } : x,
+                        ),
+                      )
+                    }
+                    placeholder={t("editor.decisionsOptionValue", "Value")}
+                    aria-label={t(
+                      "editor.decisionsOptionValueAria",
+                      "Value {{n}}",
+                      { n: oi + 1 },
+                    )}
+                    wrapperClassName="max-w-44"
+                    className="text-sm"
+                  />
+                  <Input
+                    value={row.description}
+                    onChange={(e) =>
+                      setRows(
+                        rows.map((x, n) =>
+                          n === oi ? { ...x, description: e.target.value } : x,
+                        ),
+                      )
+                    }
+                    placeholder={t(
+                      "editor.decisionsOptionDescription",
+                      "What it means (optional)",
+                    )}
+                    aria-label={t(
+                      "editor.decisionsOptionDescriptionAria",
+                      "Description {{n}}",
+                      { n: oi + 1 },
+                    )}
+                    wrapperClassName="min-w-0 flex-1"
+                    className="text-sm"
+                  />
+                  {key === "levels" && (
+                    <>
+                      <IconButton
+                        label={t("editor.decisionsMoveUp", "Move up")}
+                        disabled={oi === 0}
+                        onClick={() => setRows(moveItem(rows, oi, oi - 1))}
+                      >
+                        <ArrowUp className="h-4 w-4" aria-hidden="true" />
+                      </IconButton>
+                      <IconButton
+                        label={t("editor.decisionsMoveDown", "Move down")}
+                        disabled={oi === rows.length - 1}
+                        onClick={() => setRows(moveItem(rows, oi, oi + 1))}
+                      >
+                        <ArrowDown className="h-4 w-4" aria-hidden="true" />
+                      </IconButton>
+                    </>
+                  )}
+                  <IconButton
+                    danger
+                    label={t("editor.decisionsRemove", "Remove")}
+                    onClick={() => setRows(rows.filter((_, n) => n !== oi))}
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                </div>
+                {valueError && (
+                  <span role="alert" className="text-error text-xs">
+                    {valueError}
+                  </span>
+                )}
+              </div>
+            );
+          })}
+          <div>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={rows.length >= max}
+              onClick={() => setRows([...rows, { value: "", description: "" }])}
+            >
+              <Plus aria-hidden="true" />
+              {key === "options"
+                ? t("editor.decisionsAddOption", "Add option")
+                : t("editor.decisionsAddLevel", "Add level")}
+            </Button>
+          </div>
+        </div>
+      </FormField>
+    );
+  };
+
+  const conditionRow = (
+    ri: number,
+    ci: number,
+    cond: DecisionConditionForm,
+  ) => {
+    const base = `rules.${ri}.when.${ci}`;
+    const name = cond.question;
+    const q = decisions.questions.find((x) => x.name === name);
+    const questionError = field(`${base}.question`);
+    const errors = [
+      questionError,
+      field(`${base}.minProbability`),
+      field(`${base}.equals`),
+      field(`${base}.minLevel`),
+      field(`${base}.maxLevel`),
+      field(`${base}.minConfidence`),
+      field(base),
+    ].filter((e): e is string => !!e);
+    const set = (p: Partial<DecisionConditionForm>) =>
+      setCondition(ri, ci, (prev) => ({ ...prev, ...p }));
+    const confidence = (
+      <span className="text-text-secondary flex items-center gap-1.5 text-xs">
+        {t("editor.decisionsMinConfidence", "confidence at least")}
+        <NumberInput
+          range={DECISION_PERCENT_RANGE}
+          step={5}
+          optional
+          value={cond.minConfidence}
+          error={!!at(`${base}.minConfidence`)}
+          onChange={(e) => set({ minConfidence: e.target.value })}
+          placeholder={t("editor.decisionsOptional", "any")}
+          aria-label={t(
+            "editor.decisionsMinConfidenceAria",
+            "Minimum confidence, optional",
+          )}
+          wrapperClassName="max-w-24"
+          className="text-sm"
+        />
+        <span aria-hidden="true">%</span>
+      </span>
+    );
+    const options = q?.options.map((o) => o.value).filter(Boolean) ?? [];
+    const levels = q?.levels ?? [];
+    const levelSelect = (key: "minLevel" | "maxLevel", label: string) => {
+      const known = levels.some((_, n) => String(n) === cond[key]);
+      return (
+        <Select
+          value={cond[key]}
+          aria-label={label}
+          onChange={(e) =>
+            set(
+              key === "minLevel"
+                ? { minLevel: e.target.value }
+                : { maxLevel: e.target.value },
+            )
+          }
+          wrapperClassName="max-w-44"
+          className="text-sm"
+        >
+          {!known && (
+            <option value={cond[key]}>
+              {cond[key] === ""
+                ? t("editor.decisionsPick", "Pick…")
+                : t("editor.decisionsMissingLevel", "level {{n}} (gone)", {
+                    n: cond[key],
+                  })}
+            </option>
+          )}
+          {levels.map((l, n) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: a level's index is its value
+            <option key={n} value={String(n)}>
+              {n}
+              {l.value.trim() ? ` · ${l.value.trim()}` : ""}
+            </option>
+          ))}
+        </Select>
+      );
+    };
+    return (
+      <div className="flex flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <Select
+            value={q ? name : cond.question}
+            aria-label={t("editor.decisionsConditionQuestion", "Question")}
+            error={!!questionError}
+            onChange={(e) =>
+              setCondition(ri, ci, (_prev, form) =>
+                conditionFor(form, e.target.value),
+              )
+            }
+            wrapperClassName="max-w-52"
+            className="text-sm"
+          >
+            {!q && (
+              <option value={cond.question}>
+                {name === ""
+                  ? t("editor.decisionsPickQuestion", "Pick a question…")
+                  : t("editor.decisionsMissingQuestion", "{{name}} (gone)", {
+                      name,
+                    })}
+              </option>
+            )}
+            {questionNames.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </Select>
+          {q?.type === "yes_no" && (
+            <span className="text-text-secondary flex items-center gap-1.5 text-xs">
+              {t(
+                "editor.decisionsMinProbability",
+                "probability of yes at least",
+              )}
+              <NumberInput
+                range={DECISION_PERCENT_RANGE}
+                step={5}
+                optional
+                value={cond.minProbability}
+                error={!!at(`${base}.minProbability`)}
+                onChange={(e) => set({ minProbability: e.target.value })}
+                aria-label={t(
+                  "editor.decisionsMinProbabilityAria",
+                  "Minimum probability",
+                )}
+                wrapperClassName="max-w-24"
+                className="text-sm"
+              />
+              <span aria-hidden="true">%</span>
+            </span>
+          )}
+          {q?.type === "choice" && (
+            <>
+              <span className="text-text-secondary text-xs">
+                {t("editor.decisionsEquals", "is")}
+              </span>
+              <Select
+                value={cond.equals}
+                aria-label={t("editor.decisionsEqualsAria", "Option")}
+                error={!!at(`${base}.equals`)}
+                onChange={(e) => set({ equals: e.target.value })}
+                wrapperClassName="max-w-48"
+                className="text-sm"
+              >
+                {!options.includes(cond.equals) && (
+                  <option value={cond.equals}>
+                    {cond.equals === ""
+                      ? t("editor.decisionsPick", "Pick…")
+                      : t("editor.decisionsMissingOption", "{{name}} (gone)", {
+                          name: cond.equals,
+                        })}
+                  </option>
+                )}
+                {options.map((o) => (
+                  <option key={o} value={o}>
+                    {o}
+                  </option>
+                ))}
+              </Select>
+              {confidence}
+            </>
+          )}
+          {q?.type === "score" && (
+            <>
+              <span className="text-text-secondary text-xs">
+                {t("editor.decisionsFromLevel", "from")}
+              </span>
+              {levelSelect(
+                "minLevel",
+                t("editor.decisionsMinLevelAria", "Lowest level"),
+              )}
+              <span className="text-text-secondary text-xs">
+                {t("editor.decisionsToLevel", "to")}
+              </span>
+              {levelSelect(
+                "maxLevel",
+                t("editor.decisionsMaxLevelAria", "Highest level"),
+              )}
+              {confidence}
+            </>
+          )}
+          <IconButton
+            danger
+            label={t("editor.decisionsRemoveCondition", "Remove condition")}
+            onClick={() =>
+              setRule(ri, {
+                when: (decisions.rules[ri]?.when ?? []).filter(
+                  (_, n) => n !== ci,
+                ),
+              })
+            }
+          >
+            <Trash2 className="h-4 w-4" aria-hidden="true" />
+          </IconButton>
+        </div>
+        {errors.map((e) => (
+          <span key={e} role="alert" className="text-error text-xs">
+            {e}
+          </span>
+        ))}
+      </div>
+    );
+  };
+
+  const actionFields = (ri: number, rule: DecisionRuleForm) => {
+    const strings = (v: unknown): string[] =>
+      Array.isArray(v)
+        ? v.filter((x): x is string => typeof x === "string")
+        : [];
+    const str = (v: unknown): string => (typeof v === "string" ? v : "");
+    const scope = actionScope(rule);
+    const scopeField = (
+      <FormField
+        label={t("editor.decisionsScope", "Written to")}
+        className="sm:col-span-2"
+      >
+        <Select
+          value={scope}
+          wrapperClassName="max-w-52"
+          onChange={(e) =>
+            setDecisions((prev) => ({
+              ...prev,
+              rules: prev.rules.map((r, n) =>
+                n === ri ? withActionScope(r, e.target.value) : r,
+              ),
+            }))
+          }
+        >
+          {!["conversation", "contact"].includes(scope) && (
+            <option value={scope}>{scope}</option>
+          )}
+          <option value="conversation">
+            {t("editor.decisionsScopeConversation", "The conversation")}
+          </option>
+          <option value="contact">
+            {t("editor.decisionsScopeContact", "The contact")}
+          </option>
+        </Select>
+      </FormField>
+    );
+    if (rule.tool === "set_labels") {
+      return (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {scopeField}
+          <FormField group label={t("editor.decisionsLabelsAdd", "Add labels")}>
+            <LabelPicker
+              values={strings(rule.args.add)}
+              onChange={(v) => setArg(ri, "add", v)}
+              labels={labels}
+              multiAccount={multiAccount}
+              ariaLabel={t("editor.decisionsLabelsAdd", "Add labels")}
+            />
+          </FormField>
+          <FormField
+            group
+            label={t("editor.decisionsLabelsRemove", "Remove labels")}
+          >
+            <LabelPicker
+              values={strings(rule.args.remove)}
+              onChange={(v) => setArg(ri, "remove", v)}
+              labels={labels}
+              multiAccount={false}
+              ariaLabel={t("editor.decisionsLabelsRemove", "Remove labels")}
+            />
+          </FormField>
+        </div>
+      );
+    }
+    if (rule.tool === "set_custom_attribute") {
+      return (
+        <div className="grid gap-3 sm:grid-cols-2">
+          {scopeField}
+          <FormField
+            group
+            label={t("editor.decisionsAttributeKey", "Attribute")}
+          >
+            <ComboBox
+              value={str(rule.args.key)}
+              onChange={(v) => setArg(ri, "key", v)}
+              items={attributes
+                .filter(
+                  (d) =>
+                    d.model === (SCOPE_MODEL as Record<string, string>)[scope],
+                )
+                .map((d) => ({
+                  id: d.key,
+                  label: d.displayName || d.key,
+                  hint: d.displayName && d.displayName !== d.key ? d.key : "",
+                }))}
+              placeholder={t(
+                "editor.decisionsAttributeKeyPlaceholder",
+                "Pick an attribute…",
+              )}
+              searchPlaceholder={t(
+                "editor.attributeContextSearch",
+                "Search attributes…",
+              )}
+              aria-label={t("editor.decisionsAttributeKey", "Attribute")}
+            />
+          </FormField>
+          <FormField
+            label={t("editor.decisionsAttributeValue", "Value")}
+            description={t(
+              "editor.decisionsAttributeValueHint",
+              "Empty clears the attribute.",
+            )}
+          >
+            <Input
+              value={str(rule.args.value)}
+              onChange={(e) =>
+                setDecisions((prev) => ({
+                  ...prev,
+                  // NOTE: the field is the whole statement: an explicit `clear` stored by REST or
+                  // MCP goes, so an emptied field clears and a typed value is written.
+                  rules: prev.rules.map((r, n) => {
+                    if (n !== ri) return r;
+                    const { clear: _clear, ...args } = r.args;
+                    return { ...r, args: { ...args, value: e.target.value } };
+                  }),
+                }))
+              }
+            />
+          </FormField>
+        </div>
+      );
+    }
+    if (rule.tool === "private_note") {
+      return (
+        <FormField label={t("editor.decisionsNoteContent", "Note")}>
+          <Textarea
+            rows={2}
+            maxLength={decisionTextCap(str(rule.args.content))}
+            value={str(rule.args.content)}
+            onChange={(e) => setArg(ri, "content", e.target.value)}
+          />
+        </FormField>
+      );
+    }
+    if (rule.tool !== "" && !isNativeDecisionTool(rule.tool)) {
+      // Drawn by the rows below, which render after this pass counts what it drew: named here so the
+      // banner does not repeat them.
+      for (const name of [
+        ...(customTools?.get(rule.tool)?.args ?? []).map((s) => s.name),
+        ...Object.keys(rule.args),
+        ...Object.keys(rule.fill),
+      ]) {
+        field(`rules.${ri}.action.args.${name}`);
+        field(`rules.${ri}.action.fill.${name}`);
+      }
+      return (
+        // Keyed by tool: the modes and drafts it keeps belong to one tool's arguments.
+        <CustomToolArgs
+          key={rule.tool}
+          ri={ri}
+          rule={rule}
+          offer={customTools?.get(rule.tool)}
+          questions={decisions.questions}
+          attributes={attributes}
+          setRule={(p) => setRule(ri, p)}
+          field={field}
+        />
+      );
+    }
+    if (rule.tool === "handoff_to_human") {
+      return (
+        <FormField
+          label={t("editor.decisionsHandoffReason", "Reason (optional)")}
+          description={t(
+            "editor.decisionsHandoffReasonHint",
+            "Left as a private note for whoever takes the conversation.",
+          )}
+        >
+          <Input
+            value={str(rule.args.reason)}
+            onChange={(e) => setArg(ri, "reason", e.target.value)}
+          />
+        </FormField>
+      );
+    }
+    return null;
+  };
+
+  // When the rule acts while its conditions keep holding (docs/decisions.md, "When a rule acts").
+  // Preselected by the action until the operator picks one: a note or a transfer would repeat on
+  // every message, labels and attributes would not.
+  const triggerField = (ri: number, rule: DecisionRuleForm) => {
+    const shown = ruleTriggerShown(rule);
+    return (
+      <FormField
+        label={t("editor.decisionsTrigger", "When it acts")}
+        error={field(`rules.${ri}.trigger`)}
+        description={
+          shown === "each_time"
+            ? t(
+                "editor.decisionsTriggerEachTimeHint",
+                "It acts again on every message for as long as the conditions hold.",
+              )
+            : shown === "on_start"
+              ? t(
+                  "editor.decisionsTriggerOnStartHint",
+                  "It acts once when the conditions start holding, and again only after a message in which they did not.",
+                )
+              : t(
+                  "editor.decisionsTriggerOnceHint",
+                  "It acts the first time the conditions hold and never again in that conversation.",
+                )
+        }
+      >
+        <Select
+          value={shown}
+          wrapperClassName="max-w-96"
+          data-testid="decisions-rule-trigger"
+          onChange={(e) => setRule(ri, { trigger: e.target.value })}
+        >
+          <option value="each_time">
+            {t(
+              "editor.decisionsTriggerEachTime",
+              "Every time the conditions hold",
+            )}
+          </option>
+          <option value="on_start">
+            {t(
+              "editor.decisionsTriggerOnStart",
+              "When the conditions start holding",
+            )}
+          </option>
+          <option value="once">
+            {t("editor.decisionsTriggerOnce", "Once per conversation")}
+          </option>
+        </Select>
+      </FormField>
+    );
+  };
+
+  // A folded rule in one line: "When <conditions>, then <action>".
+  const ruleSummary = (rule: DecisionRuleForm): string => {
+    const strings = (v: unknown): string[] =>
+      Array.isArray(v)
+        ? v.filter((x): x is string => typeof x === "string")
+        : [];
+    const when = rule.when.map((c) =>
+      conditionSummary(
+        c,
+        decisions.questions.find((x) => x.name === c.question),
+      ),
+    );
+    const a = rule.args;
+    const detail =
+      rule.tool === "set_labels"
+        ? [
+            ...strings(a.add).map((l) => `+${l}`),
+            ...strings(a.remove).map((l) => `−${l}`),
+          ].join(" ")
+        : rule.tool === "set_custom_attribute"
+          ? `${String(a.key ?? "")} = ${String(a.value ?? "")}`
+          : rule.tool === "private_note"
+            ? String(a.content ?? "")
+            : isNativeDecisionTool(rule.tool)
+              ? ""
+              : [
+                  ...Object.entries(a).map(
+                    ([k, v]) =>
+                      `${k} = ${typeof v === "string" ? v : JSON.stringify(v)}`,
+                  ),
+                  ...Object.entries(rule.fill).map(([k, v]) => `${k} ← ${v}`),
+                ].join(", ");
+    const and = t("editor.decisionsAnd", " and ");
+    return t(
+      "editor.decisionsRuleSummary",
+      "When {{conditions}}, then {{action}}",
+      {
+        conditions: when.join(and),
+        action: detail
+          ? `${toolLabel(rule.tool)}: ${detail}`
+          : toolLabel(rule.tool),
+        interpolation: { escapeValue: false },
+      },
+    );
+  };
+
+  const gapText = (rule: DecisionRuleForm): string | null => {
+    switch (actionGap(rule)) {
+      case "note_empty":
+        return t(
+          "editor.decisionsGapNote",
+          "Without a note this rule fails every time it fires.",
+        );
+      case "attribute_key_empty":
+        return t(
+          "editor.decisionsGapAttribute",
+          "Without an attribute this rule fails every time it fires.",
+        );
+      case "labels_empty":
+        return t(
+          "editor.decisionsGapLabels",
+          "With no label to add or remove this rule changes nothing.",
+        );
+      default:
+        return null;
+    }
+  };
+
+  const body = (
+    <>
+      {activity && (
+        <p
+          className="text-text-muted text-xs"
+          data-testid="decisions-activity-total"
+        >
+          {t(
+            "editor.decisionsActivityTotal",
+            "{{count}} of this agent's latest decisions ran these questions and rules as saved. The number beside each rule counts those.",
+            { count: activity.decisions },
+          )}
+        </p>
+      )}
+
+      <div id="decisions-questions" className="flex scroll-mt-4 flex-col gap-3">
+        <div>
+          <h4 className="text-text-primary text-sm font-medium">
+            {t("editor.decisionsQuestions", "Questions")}
+          </h4>
+          <p className="text-text-muted text-xs">
+            {t(
+              "editor.decisionsQuestionsHint",
+              "What the API is asked about the conversation on every pass. Up to {{max}}, each answered on its own.",
+              { max: QUESTIONS_MAX },
+            )}
+          </p>
+        </div>
+        {decisions.questions.length === 0 && (
+          <div className="flex flex-col gap-2" data-testid="decisions-starters">
+            <p className="text-text-secondary text-xs">
+              {t(
+                "editor.decisionsStartersHint",
+                "Start from a ready question. It comes with its rules, and you can change any of it before saving.",
+              )}
+            </p>
+            <div className="grid gap-2 sm:grid-cols-3">
+              {DECISIONS_STARTERS.map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  data-testid={`decisions-starter-${kind}`}
+                  disabled={!starterFits(decisions, kind, starterNames)}
+                  onClick={() => addStarter(kind)}
+                  className="border-border bg-bg-secondary hover:bg-bg-hover flex flex-col gap-1 rounded-lg border p-3 text-left transition-colors disabled:opacity-50"
+                >
+                  <span className="text-text-primary text-sm font-medium">
+                    {starterTitle(kind)}
+                  </span>
+                  <span className="text-text-muted text-xs">
+                    {starterHint(kind)}
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        {decisions.questions.map((q, qi) => {
+          const qOpen = open.has(q.key) || forced.includes(q.key);
+          return (
+            <div
+              key={q.key}
+              data-testid="decisions-question"
+              className="border-border flex flex-col gap-3 rounded-lg border p-3"
+            >
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  aria-expanded={qOpen}
+                  onClick={() => toggle(q.key)}
+                  className="flex min-w-0 items-center gap-2 text-left"
+                >
+                  <ChevronRight
+                    className={
+                      qOpen
+                        ? "text-text-muted h-4 w-4 shrink-0 rotate-90 transition-transform"
+                        : "text-text-muted h-4 w-4 shrink-0 transition-transform"
+                    }
+                    aria-hidden="true"
+                  />
+                  <h5 className="text-text-primary shrink-0 text-sm font-medium">
+                    {t("editor.decisionsQuestionN", "Question {{n}}", {
+                      n: qi + 1,
+                    })}
+                  </h5>
+                  {!qOpen && (
+                    <span className="text-text-secondary truncate font-mono text-xs">
+                      {q.name}
+                    </span>
+                  )}
+                </button>
+                <Badge>{typeLabel(q.type)}</Badge>
+                <div className="ml-auto flex items-center">
+                  <IconButton
+                    label={t("editor.decisionsMoveUp", "Move up")}
+                    disabled={qi === 0}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        questions: moveItem(prev.questions, qi, qi - 1),
+                      }))
+                    }
+                  >
+                    <ArrowUp className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                  <IconButton
+                    label={t("editor.decisionsMoveDown", "Move down")}
+                    disabled={qi === decisions.questions.length - 1}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        questions: moveItem(prev.questions, qi, qi + 1),
+                      }))
+                    }
+                  >
+                    <ArrowDown className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                  <IconButton
+                    danger
+                    label={t(
+                      "editor.decisionsRemoveQuestion",
+                      "Remove question",
+                    )}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        questions: prev.questions.filter((_, n) => n !== qi),
+                      }))
+                    }
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                </div>
+              </div>
+              {qOpen && (
+                <>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <FormField
+                      label={t("editor.decisionsQuestionName", "Name")}
+                      description={t(
+                        "editor.decisionsQuestionNameHint",
+                        "How rules and logs refer to it, e.g. asks_refund.",
+                      )}
+                      error={field(`questions.${qi}.name`)}
+                    >
+                      <Input
+                        value={q.name}
+                        onChange={(e) =>
+                          setQuestion(qi, { name: e.target.value })
+                        }
+                      />
+                    </FormField>
+                    <FormField
+                      label={t("editor.decisionsQuestionType", "Answer")}
+                      error={field(`questions.${qi}.type`)}
+                    >
+                      <Select
+                        value={q.type}
+                        onChange={(e) =>
+                          setQuestion(qi, { type: e.target.value })
+                        }
+                      >
+                        {!DECISION_QUESTION_TYPES.includes(
+                          q.type as "yes_no",
+                        ) && (
+                          <option value={q.type}>
+                            {q.type === ""
+                              ? t("editor.decisionsPick", "Pick…")
+                              : q.type}
+                          </option>
+                        )}
+                        {DECISION_QUESTION_TYPES.map((type) => (
+                          <option key={type} value={type}>
+                            {typeLabel(type)}
+                          </option>
+                        ))}
+                      </Select>
+                    </FormField>
+                  </div>
+                  <FormField
+                    label={t(
+                      "editor.decisionsQuestionInstructions",
+                      "Question",
+                    )}
+                    error={field(`questions.${qi}.instructions`)}
+                  >
+                    <Textarea
+                      rows={2}
+                      maxLength={decisionTextCap(q.instructions)}
+                      value={q.instructions}
+                      onChange={(e) =>
+                        setQuestion(qi, { instructions: e.target.value })
+                      }
+                      placeholder={t(
+                        "editor.decisionsQuestionInstructionsPlaceholder",
+                        "E.g.: Is the customer asking for their money back?",
+                      )}
+                    />
+                  </FormField>
+                  {q.type === "choice" &&
+                    optionRows(qi, "options", q.options, CHOICE_OPTIONS_MAX)}
+                  {q.type === "score" &&
+                    optionRows(qi, "levels", q.levels, SCORE_LEVELS_MAX)}
+                  {issuesUnder(issues, `questions.${qi}`)
+                    .filter((i) => i.path.length === 2 && i.code !== "required")
+                    .map((i) => (
+                      <span
+                        key={i.code}
+                        role="alert"
+                        className="text-error text-xs"
+                      >
+                        {issueText(t, i)}
+                      </span>
+                    ))}
+                </>
+              )}
+              {!qOpen && q.instructions.trim() && (
+                <p className="text-text-secondary truncate text-xs">
+                  {q.instructions.trim()}
+                </p>
+              )}
+            </div>
+          );
+        })}
+        {field("questions") &&
+          (showErrors || decisions.questions.length > 0) && (
+            <span role="alert" className="text-error text-xs">
+              {decisions.questions.length === 0
+                ? t(
+                    "editor.decisionsNeedsQuestion",
+                    "Add at least one question: the engine has nothing to ask.",
+                  )
+                : at("questions")}
+            </span>
+          )}
+        <div>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={decisions.questions.length >= QUESTIONS_MAX}
+            onClick={() => {
+              const key = freshDecisionKey();
+              unfold(key);
+              setDecisions((prev) => ({
+                ...prev,
+                questions: [
+                  ...prev.questions,
+                  {
+                    key,
+                    name: "",
+                    type: "yes_no",
+                    instructions: "",
+                    options: [
+                      { value: "", description: "" },
+                      { value: "", description: "" },
+                    ],
+                    levels: [
+                      { value: "", description: "" },
+                      { value: "", description: "" },
+                    ],
+                  },
+                ],
+              }));
+            }}
+          >
+            <Plus aria-hidden="true" />
+            {decisions.questions.length === 0
+              ? t("editor.decisionsStartBlank", "Start with a blank question")
+              : t("editor.decisionsAddQuestion", "Add question")}
+          </Button>
+          {decisions.questions.length > 0 &&
+            DECISIONS_STARTERS.filter(
+              (kind) => !starterApplied(decisions, kind, starterNames),
+            ).map((kind) => (
+              <Button
+                key={kind}
+                size="sm"
+                variant="ghost"
+                className="ml-2"
+                disabled={!starterFits(decisions, kind, starterNames)}
+                onClick={() => addStarter(kind)}
+              >
+                <Plus aria-hidden="true" />
+                {starterTitle(kind)}
+              </Button>
+            ))}
+        </div>
+      </div>
+
+      <div className="flex flex-col gap-3">
+        <div>
+          <h4 className="text-text-primary text-sm font-medium">
+            {t("editor.decisionsRules", "Rules")}
+          </h4>
+          <p className="text-text-muted text-xs">
+            {t(
+              "editor.decisionsRulesHint",
+              "A rule fires when every one of its conditions holds, and runs one tool, with arguments fixed or filled from the conversation, the contact and the answers. The agent needs that tool granted on the Tools tab, or the rule cannot run. Up to {{max}}.",
+              { max: RULES_MAX },
+            )}
+          </p>
+        </div>
+        {decisions.rules.map((rule, ri) => {
+          const broken = ruleIsBroken(issues, ri);
+          const gap = gapText(rule);
+          const rOpen = open.has(rule.key) || forced.includes(rule.key);
+          const counted =
+            rule.origin === null ? undefined : activity?.rules.get(rule.origin);
+          return (
+            <div
+              key={rule.key}
+              data-testid="decisions-rule"
+              data-broken={broken ? "true" : "false"}
+              className={
+                broken
+                  ? "border-error flex flex-col gap-3 rounded-lg border p-3"
+                  : "border-border flex flex-col gap-3 rounded-lg border p-3"
+              }
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  aria-expanded={rOpen}
+                  onClick={() => toggle(rule.key)}
+                  className="flex items-center gap-2 text-left"
+                >
+                  <ChevronRight
+                    className={
+                      rOpen
+                        ? "text-text-muted h-4 w-4 shrink-0 rotate-90 transition-transform"
+                        : "text-text-muted h-4 w-4 shrink-0 transition-transform"
+                    }
+                    aria-hidden="true"
+                  />
+                  <h5 className="text-text-primary text-sm font-medium">
+                    {t("editor.decisionsRuleN", "Rule {{n}}", { n: ri + 1 })}
+                  </h5>
+                </button>
+                {broken && (
+                  <Badge variant="error">
+                    {t("editor.decisionsRuleBroken", "Broken")}
+                  </Badge>
+                )}
+                <div className="ml-auto flex items-center">
+                  <IconButton
+                    label={t("editor.decisionsMoveUp", "Move up")}
+                    disabled={ri === 0}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        rules: moveItem(prev.rules, ri, ri - 1),
+                      }))
+                    }
+                  >
+                    <ArrowUp className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                  <IconButton
+                    label={t("editor.decisionsMoveDown", "Move down")}
+                    disabled={ri === decisions.rules.length - 1}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        rules: moveItem(prev.rules, ri, ri + 1),
+                      }))
+                    }
+                  >
+                    <ArrowDown className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                  <IconButton
+                    danger
+                    label={t("editor.decisionsRemoveRule", "Remove rule")}
+                    onClick={() =>
+                      setDecisions((prev) => ({
+                        ...prev,
+                        rules: prev.rules.filter((_, n) => n !== ri),
+                      }))
+                    }
+                  >
+                    <Trash2 className="h-4 w-4" aria-hidden="true" />
+                  </IconButton>
+                </div>
+              </div>
+              {broken && (
+                <p role="alert" className="text-error text-xs">
+                  {t(
+                    "editor.decisionsRuleBrokenHint",
+                    "This rule names a question, an option or a level that no longer exists, so the agent cannot be saved until it points at one that does.",
+                  )}
+                </p>
+              )}
+              {rOpen && (
+                <>
+                  <div className="flex flex-col gap-2">
+                    <span className="text-text-secondary text-xs font-medium tracking-wide uppercase">
+                      {t("editor.decisionsWhen", "When")}
+                    </span>
+                    {rule.when.map((cond, ci) => (
+                      // biome-ignore lint/suspicious/noArrayIndexKey: conditions are positional and carry no id
+                      <div key={ci}>{conditionRow(ri, ci, cond)}</div>
+                    ))}
+                    {field(`rules.${ri}.when`) && (
+                      <span role="alert" className="text-error text-xs">
+                        {t(
+                          "editor.decisionsNeedsCondition",
+                          "Add at least one condition.",
+                        )}
+                      </span>
+                    )}
+                    <div>
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={questionNames.length === 0}
+                        onClick={() =>
+                          setDecisions((prev) => ({
+                            ...prev,
+                            rules: prev.rules.map((r, n) =>
+                              n === ri
+                                ? {
+                                    ...r,
+                                    when: [
+                                      ...r.when,
+                                      conditionFor(
+                                        prev,
+                                        prev.questions
+                                          .map((x) => x.name)
+                                          .find(Boolean) ?? "",
+                                      ),
+                                    ],
+                                  }
+                                : r,
+                            ),
+                          }))
+                        }
+                      >
+                        <Plus aria-hidden="true" />
+                        {t("editor.decisionsAddCondition", "Add condition")}
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <span className="text-text-secondary text-xs font-medium tracking-wide uppercase">
+                      {t("editor.decisionsThen", "Then")}
+                    </span>
+                    <FormField
+                      label={t("editor.decisionsAction", "Action")}
+                      error={field(`rules.${ri}.action.tool`)}
+                    >
+                      <Select
+                        value={rule.tool}
+                        data-testid="decisions-rule-action"
+                        onChange={(e) =>
+                          // The attribute tool's schema asks for `value` even when it is empty.
+                          setRule(ri, {
+                            tool: e.target.value,
+                            args:
+                              e.target.value === "set_custom_attribute"
+                                ? { value: "" }
+                                : {},
+                            fill: {},
+                          })
+                        }
+                      >
+                        {!isNativeDecisionTool(rule.tool) &&
+                          !offeredCustom.some((c) => c.name === rule.tool) && (
+                            <option value={rule.tool}>
+                              {rule.tool === ""
+                                ? t(
+                                    "editor.decisionsPickAction",
+                                    "Pick an action…",
+                                  )
+                                : toolLabel(rule.tool)}
+                            </option>
+                          )}
+                        {DECISION_ACTION_TOOLS.map((tool) => (
+                          <option key={tool} value={tool}>
+                            {toolLabel(tool)}
+                          </option>
+                        ))}
+                        {offeredCustom.length > 0 && (
+                          <optgroup
+                            label={t(
+                              "editor.decisionsCustomTools",
+                              "Your tools",
+                            )}
+                          >
+                            {offeredCustom.map((c) => (
+                              <option key={c.name} value={c.name}>
+                                {c.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                      </Select>
+                    </FormField>
+                    {actionFields(ri, rule)}
+                    {triggerField(ri, rule)}
+                    {notGranted(rule) && grantWarning(rule)}
+                    {gap && (
+                      <span className="text-warning flex items-start gap-1.5 text-xs">
+                        <TriangleAlert
+                          className="mt-0.5 h-3.5 w-3.5 shrink-0"
+                          aria-hidden="true"
+                        />
+                        {gap}
+                      </span>
+                    )}
+                  </div>
+                </>
+              )}
+              {!rOpen && (
+                <p
+                  className="text-text-secondary text-xs"
+                  data-testid="decisions-rule-summary"
+                >
+                  {ruleSummary(rule)}
+                </p>
+              )}
+              {!rOpen && notGranted(rule) && grantWarning(rule)}
+              {activity && activity.decisions > 0 && (
+                <p
+                  className="text-text-muted text-xs"
+                  data-testid="decisions-rule-activity"
+                >
+                  {rule.origin === null
+                    ? t(
+                        "editor.decisionsRuleNew",
+                        "Not saved yet, so it has not decided anything.",
+                      )
+                    : ruleActivityText(t, counted, activity.decisions)}
+                </p>
+              )}
+            </div>
+          );
+        })}
+        {field("rules") && (
+          <span role="alert" className="text-error text-xs">
+            {at("rules")}
+          </span>
+        )}
+        <div>
+          <Button
+            size="sm"
+            variant="secondary"
+            disabled={decisions.rules.length >= RULES_MAX}
+            onClick={() =>
+              setDecisions((prev) => ({
+                ...prev,
+                rules: [
+                  ...prev.rules,
+                  {
+                    key: freshDecisionKey(),
+                    origin: null,
+                    when: [
+                      prev.questions.some((x) => x.name)
+                        ? conditionFor(
+                            prev,
+                            prev.questions.map((x) => x.name).find(Boolean) ??
+                              "",
+                          )
+                        : emptyCondition(),
+                    ],
+                    tool: "set_labels",
+                    args: {},
+                    fill: {},
+                    trigger: "",
+                  },
+                ],
+              }))
+            }
+          >
+            <Plus aria-hidden="true" />
+            {t("editor.decisionsAddRule", "Add rule")}
+          </Button>
+        </div>
+      </div>
+    </>
+  );
+
+  // Whatever the fields above did not draw is said here, so no problem that blocks the save is
+  // silent: a problem at a path this screen has no input for, and a server refusal about one.
+  // The Classifier's fields live on General, so a problem there is one line with the way to it.
+  const classifierIssue = [...issues.keys()].some((path) =>
+    CLASSIFIER_PATHS.has(path),
+  );
+  // Before a save was tried, an empty list is the starting point, said in its own neutral line;
+  // a server refusal or a save attempt turns the banner into an error.
+  const noQuestionYet =
+    !showErrors && decisions.questions.length === 0 && issues.has("questions");
+  const hereCount = [...issues.keys()].filter(
+    (path) =>
+      !CLASSIFIER_PATHS.has(path) && !(noQuestionYet && path === "questions"),
+  ).length;
+  const tone: "error" | "neutral" =
+    showErrors || serverRefusal ? "error" : "neutral";
+  const undrawn = [...issues]
+    .filter(([path]) => !drawnPaths.has(path) && !CLASSIFIER_PATHS.has(path))
+    .map(([path, issue]) => `${path}: ${issueText(t, issue)}`);
+  const serverUndrawn =
+    serverRefusal &&
+    !drawnPaths.has(serverRefusal.path) &&
+    !CLASSIFIER_PATHS.has(serverRefusal.path) &&
+    !issues.has(serverRefusal.path)
+      ? serverRefusal.message
+      : null;
+
+  return (
+    <div className="flex flex-col gap-5" data-testid="decisions-fields">
+      {(issues.size > 0 || serverUndrawn) && (
+        <div
+          role={tone === "error" ? "alert" : "status"}
+          data-testid="decisions-problems"
+          data-tone={tone}
+          data-problems-summary
+          className={cn(
+            "text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs",
+            tone === "error"
+              ? "border-error bg-error-soft"
+              : "border-warning bg-warning-soft",
+          )}
+        >
+          <TriangleAlert
+            className={cn(
+              "mt-0.5 h-4 w-4 shrink-0",
+              tone === "error" ? "text-error" : "text-warning",
+            )}
+            aria-hidden="true"
+          />
+          <div className="flex flex-col gap-1">
+            {noQuestionYet && (
+              <span>
+                {t(
+                  "editor.decisionsNeedsQuestionToSave",
+                  "To save, add at least one question: start from one of the points below or from a blank question.",
+                )}
+              </span>
+            )}
+            {hereCount > 0 && (
+              <span>
+                {t(
+                  "editor.decisionsProblems",
+                  "{{count}} problems keep the questions and rules from being saved. Each is marked on its field below.",
+                  { count: hereCount },
+                )}
+              </span>
+            )}
+            {classifierIssue && (
+              <span className="flex flex-wrap items-center gap-2">
+                {t(
+                  "editor.decisionsClassifierProblem",
+                  "The classifier on the General tab is not complete.",
+                )}
+                <Button size="sm" variant="secondary" onClick={onOpenGeneral}>
+                  {t("editor.decisionsOpenGeneral", "Open General")}
+                </Button>
+              </span>
+            )}
+            {undrawn.map((line) => (
+              <span key={line}>{line}</span>
+            ))}
+            {serverUndrawn && <span>{serverUndrawn}</span>}
+          </div>
+        </div>
+      )}
+      {body}
+    </div>
+  );
+}
+
+// The Classifier: which classification API a decisions agent calls, with which model and key. Drawn
+// on General where the chat model's fields would be (agents#1224), since it is the same question
+// ("what thinks for this agent"); the problems it marks are the write boundary's, at its own paths.
+export function ClassifierFields({
+  decisions,
+  storedDecisions,
+  setDecisions,
+  credentialError,
+  serverRefusal,
+}: {
+  decisions: DecisionsForm;
+  storedDecisions: Record<string, unknown> | null;
+  setDecisions: (next: (prev: DecisionsForm) => DecisionsForm) => void;
+  credentialError: string | null;
+  serverRefusal: DecisionsServerRefusal | null;
+}) {
+  const { t } = useTranslation();
+  const issues = useMemo(
+    () => decisionsFormIssues(decisions, storedDecisions),
+    [decisions, storedDecisions],
+  );
+  const at = (path: string): string | null => {
+    const issue = issues.get(path);
+    if (issue) return issueText(t, issue);
+    return serverRefusal && serverRefusal.path === path
+      ? serverRefusal.message
+      : null;
+  };
+  const patch = (p: Partial<DecisionsForm>) =>
+    setDecisions((prev) => ({ ...prev, ...p }));
+  const provider = (decisions.provider || "openai") as DecisionProvider;
+  const fallbackModel =
+    DEFAULT_DECISION_MODEL[provider] ?? DEFAULT_DECISION_MODEL.openai;
+  return (
+    <div className="grid gap-4 sm:grid-cols-2" data-testid="classifier-fields">
+      <FormField
+        label={t("editor.decisionsProvider", "Classification API")}
+        error={at("provider")}
+      >
+        <Select
+          value={decisions.provider}
+          onChange={(e) => patch({ provider: e.target.value, model: "" })}
+        >
+          {!DECISION_PROVIDERS.includes(
+            decisions.provider as DecisionProvider,
+          ) && (
+            <option value={decisions.provider}>
+              {decisions.provider === ""
+                ? t("editor.decisionsPick", "Pick…")
+                : decisions.provider}
+            </option>
+          )}
+          <option value="openai">{PROVIDER_NAMES.openai}</option>
+          <option value="typesafe">{PROVIDER_NAMES.typesafe}</option>
+        </Select>
+      </FormField>
+      <FormField
+        label={t("editor.decisionsModel", "Model")}
+        description={t(
+          "editor.decisionsModelHint",
+          "Empty uses the default, {{model}}.",
+          { model: fallbackModel },
+        )}
+        error={at("model")}
+      >
+        <Input
+          value={decisions.model}
+          onChange={(e) => patch({ model: e.target.value })}
+          placeholder={fallbackModel}
+        />
+      </FormField>
+      <FormField
+        label={t("editor.decisionsCredential", "API key")}
+        // NOTE: An empty key is said by the picker itself (`required`); the schema's "Required"
+        // under it would say it twice.
+        error={
+          credentialError ??
+          (decisions.credentialRef === "" ? null : at("credentialRef"))
+        }
+        group
+        className="sm:col-span-2"
+      >
+        {/* The picker draws its own "required" line and no invalid mark; `data-problem` is what a Save
+            pressed with the key missing goes to (saveAttempt.ts). */}
+        <div data-problem={issues.has("credentialRef") || undefined}>
+          <CredentialPicker
+            value={decisions.credentialRef}
+            onChange={(v) => patch({ credentialRef: v })}
+            required
+            compatibleTypes={credentialCompat.decisions(provider)}
+            defaultCreateType={credentialCompat.decisions(provider)[0]}
+            ariaLabel={t("editor.decisionsCredential", "API key")}
+          />
+        </div>
+      </FormField>
+    </div>
+  );
+}
+
+// The paths the Classifier draws on General, so the questions tab names them as "on General" rather
+// than as a path.
+export const CLASSIFIER_PATHS: ReadonlySet<string> = new Set([
+  "provider",
+  "model",
+  "credentialRef",
+]);
+
+// The words a starting point writes (labels, levels, options, the questions), in the console's
+// language, so what lands in the conversation reads like the rest of the account.
+function useStarterNames(): StarterNames {
+  const { t } = useTranslation();
+  return {
+    sentimentLevels: [
+      t("editor.starterSentimentVeryNegative", "very negative"),
+      t("editor.starterSentimentNegative", "negative"),
+      t("editor.starterSentimentNeutral", "neutral"),
+      t("editor.starterSentimentPositive", "positive"),
+      t("editor.starterSentimentVeryPositive", "very positive"),
+    ],
+    sentimentLabels: [
+      t("editor.starterSentimentLabelVeryNegative", "sentiment-very-negative"),
+      t("editor.starterSentimentLabelNegative", "sentiment-negative"),
+      t("editor.starterSentimentLabelNeutral", "sentiment-neutral"),
+      t("editor.starterSentimentLabelPositive", "sentiment-positive"),
+      t("editor.starterSentimentLabelVeryPositive", "sentiment-very-positive"),
+    ],
+    subjectOptions: [
+      t("editor.starterSubjectQuestionOption", "question"),
+      t("editor.starterSubjectComplaint", "complaint"),
+      t("editor.starterSubjectCancellation", "cancellation"),
+      t("editor.starterSubjectOther", "other"),
+    ],
+    subjectAttribute: t("editor.starterSubjectAttribute", "subject"),
+    humanLabel: t("editor.starterHumanLabel", "wants-a-person"),
+    sentimentQuestion: t(
+      "editor.starterSentimentQuestion",
+      "How does the customer feel in this conversation?",
+    ),
+    subjectQuestion: t(
+      "editor.starterSubjectQuestion",
+      "What is the conversation mainly about?",
+    ),
+    humanQuestion: t(
+      "editor.starterHumanQuestion",
+      "Does the customer ask to talk to a person?",
+    ),
+    // How rules and logs name each question, in the console's language too. Kept to what a
+    // question name accepts, whatever a translation holds.
+    questionNames: {
+      sentiment: questionName(t("editor.starterSentimentName", "sentiment")),
+      subject: questionName(t("editor.starterSubjectName", "subject")),
+      human: questionName(t("editor.starterHumanName", "asks_human")),
+    },
+  };
+}
+
+function questionName(word: string): string {
+  const name = word
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]+/g, "_")
+    .replace(/^[^a-z]+/, "")
+    .slice(0, 64);
+  return name || "question";
+}

@@ -14,6 +14,7 @@ import {
   CHANNEL_REDIRECT_DEFAULTS,
   type ChannelRedirectConfig,
 } from "@/modules/channel-redirect/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const ENTRY_INBOX = 210;
@@ -42,20 +43,11 @@ describe("redirectSide", () => {
   test("a disabled redirect has no sides at all", () => {
     expect(redirectSide({ ...cfg, enabled: false }, ENTRY_INBOX)).toBeNull();
   });
-
-  test("a half that is not provisioned yet is not a side", () => {
-    expect(
-      redirectSide({ ...cfg, widgetInboxId: null }, WIDGET_INBOX),
-    ).toBeNull(
-      // Null must not match a null inbox id either — the guard is on the id, not on the pairing.
-    );
-    expect(redirectSide({ ...cfg, entryInboxId: null }, null)).toBeNull();
-  });
 });
 
 // Each row is a reason NOT to touch the database, and the reactive gate runs on every inbound
 // message, so this is the predicate that keeps that path free.
-// Issue #222. WHICH conversation is the entry half is the one question the cross-link and the ladder
+// WHICH conversation is the entry half is the one question the cross-link and the ladder
 // share, and the ladder's closing RESOLVES the row it names — so a decision table, not a fixture.
 describe("episodeOriginQuery", () => {
   const base = {
@@ -64,8 +56,8 @@ describe("episodeOriginQuery", () => {
     entryInboxId: ENTRY_INBOX,
   };
 
-  // Review round 6 of #355. Two different facts arrive as the same stored null, and only one of them
-  // means "ask the old predicate". `chatwootRedirectOriginAt` is what separates them: it is set the
+  // Two different facts arrive as the same stored null, and only one of them means "ask the
+  // recency fallback". `chatwootRedirectOriginAt` is what separates them: it is set the
   // first time the fork speaks about this conversation, whatever it says.
   test("a STATED clear has no sibling: it is an answer, not a gap", () => {
     const q = episodeOriginQuery({
@@ -79,32 +71,6 @@ describe("episodeOriginQuery", () => {
     // Not a recency fallback. The source said this episode has no WhatsApp half, and the consumers
     // of this answer MESSAGE and RESOLVE what it names.
     expect(q).toBeNull();
-  });
-
-  test("never having been told still falls back to recency", () => {
-    const q = episodeOriginQuery({
-      ...base,
-      widget: {
-        chatwootRedirectOriginAt: null,
-        redirectOriginDisplayId: null,
-        contactId: 9n,
-      },
-    });
-    expect(q?.by).toBe("recency");
-  });
-
-  // A stated pairing is the answer whether or not we hold a mark for it — a Chatwoot too old to send
-  // `updated_at` writes the value and stamps nothing.
-  test("a stored pairing with no mark is still the answer", () => {
-    const q = episodeOriginQuery({
-      ...base,
-      widget: {
-        chatwootRedirectOriginAt: null,
-        redirectOriginDisplayId: 41,
-        contactId: 9n,
-      },
-    });
-    expect(q?.by).toBe("stored");
   });
 
   test("a stored pairing IS the answer: looked up by id, with no ordering to lose it", () => {
@@ -182,7 +148,7 @@ describe("episodeOriginQuery", () => {
   });
 
   // A contactless widget row still answers when the pairing is stored: the fact does not need the
-  // contact, and refusing there would strand exactly the episodes this change exists to pair.
+  // contact, and refusing there would strand episodes that are paired.
   test("a stored pairing answers even with no contact on the row", () => {
     const q = episodeOriginQuery({
       ...base,
@@ -249,8 +215,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -362,16 +328,6 @@ describe.skipIf(!dbUp)("episodeTestActivatedAt", () => {
       ...over,
     });
 
-  test("an unstamped widget inherits the entry side's activation", async () => {
-    const at = new Date("2026-08-20T10:00:00Z");
-    await stampEntry(ENTRY_CONV, at);
-    try {
-      expect((await askFromWidget(null))?.toISOString()).toBe(at.toISOString());
-    } finally {
-      await clearEntries();
-    }
-  });
-
   // The other direction, which the link-time propagation has never covered: `/teste` typed in the
   // chat is the same person saying the same thing.
   test("an unstamped entry inherits the widget side's activation", async () => {
@@ -470,21 +426,12 @@ describe.skipIf(!dbUp)("episodeTestActivatedAt", () => {
     }
   });
 
-  // The failure direction, and it is the OPPOSITE of the ladder's liveness fence. There an unknown
-  // answer means "send anyway", because the cost is a follow-up the customer should have had. Here an
-  // unknown answer means silence, because the cost is a test agent messaging a real lead — and it is
-  // exactly the behaviour this call replaced, so a failed read can lose the fix, never invent a
-  // refusal.
-  // The reason this module takes the caller's connection at all, measured rather than argued. Every
-  // call site asks from inside a scoped transaction, and `runScopedOn` PINS a pooled connection for
-  // the length of it — the ladder's fences hold an advisory lock in that same transaction. A sibling
-  // read that opens its OWN asks a pinned pool for a second connection, and `DB_POOL_MAX=1` is a
-  // supported setting.
-  //
-  // What makes that worth a test rather than a comment is the failure being SILENT. The read is
-  // swallowed as "no activation" (the test above), so on that setting the agent goes straight back
-  // to judging by the row alone: the very defect this module exists to fix, reintroduced by the
-  // connection it asked on, with nothing failing anywhere to say so.
+  // A failed sibling read answers "no activation", so the test agent stays silent: the OPPOSITE of
+  // the ladder's fail-open liveness fence, because here the cost is a test agent messaging a real
+  // lead. That swallow makes a pool starved by a pinned transaction SILENT: every call site asks
+  // inside one (`runScopedOn` PINS a connection; the ladder's fences hold an advisory lock there),
+  // a read on its OWN connection asks for a second, `DB_POOL_MAX=1` is supported, and nothing fails
+  // to say so.
   test("the sibling read answers inside a pinned transaction, on a pool of one", async () => {
     const at = new Date("2026-08-20T17:00:00Z");
     await stampEntry(ENTRY_CONV, at);

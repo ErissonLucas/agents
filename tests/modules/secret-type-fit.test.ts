@@ -8,9 +8,9 @@ import {
 } from "@/modules/vault/secret-types";
 
 // The decision table for "can an entry of this KIND supply what a field of this USE reads?", which is
-// the one question the write boundary, config-health and the runtime all ask (issue #471). A pure
-// function with a table, rather than a rule re-derived at each of the three: the whole defect was
-// three surfaces answering it differently, and DB-backed tests prove the wiring, never the rule.
+// the one question the write boundary, config-health and the runtime all ask. A pure function with a
+// table, rather than a rule re-derived at each of the three, so the three cannot answer it
+// differently; DB-backed tests prove the wiring, never the rule.
 //
 // Every catalog id appears below, enforced by the fence at the bottom, so adding a secret type fails
 // this file until somebody decides what it can serve.
@@ -21,7 +21,6 @@ const TABLE: [string, boolean, boolean][] = [
   ["generic", true, true],
   ["bearer_token", true, true],
   ["header", true, true],
-  ["basic_auth", true, true],
   ["query", true, true],
   ["openai", true, true],
   ["anthropic", true, true],
@@ -29,12 +28,17 @@ const TABLE: [string, boolean, boolean][] = [
   ["deepseek", true, true],
   ["openrouter", true, true],
   ["openai_compatible", true, true],
+  ["typesafe", true, true],
   ["elevenlabs", true, true],
   ["assemblyai", true, true],
   ["fish", true, true],
   ["asaas", true, true],
   ["resend", true, true],
   ["chatwoot_api_token", true, true],
+  // A plain string that is never a key: `user:password` base64-encoded, sent as `Authorization:
+  // Basic`. Injectable, because that header is a real way to authenticate a call; never an API key,
+  // because a provider SDK would send the pair as a bearer token.
+  ["basic_auth", false, true],
   // Multi-field: the value is `{ clientId, clientSecret }` and the tokens the consent flow merges in.
   // Injectable because `resolveInjectableCredentialEntry` refreshes an access token from it; never an
   // API key, because the field would hand the OBJECT to a provider SDK.

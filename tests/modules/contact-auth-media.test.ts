@@ -12,6 +12,7 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import {
+  awaitOpenTranscriptions,
   clearMediaAnnotations,
   mediaAnnotationFor,
   stashMediaAnnotation,
@@ -25,7 +26,11 @@ import {
   clearContactAuthState,
   mediaRefusedHereThrough,
 } from "@/modules/contact-auth/state";
+import * as sttService from "@/modules/stt/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { until } from "../utils/poll";
+import { countCalls } from "../utils/waiting";
 
 // With the contact authorization gate on, no media of an incoming message reaches the STT or vision
 // provider unless the gate let that message through. Counted at the injected provider fetches.
@@ -46,8 +51,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -411,6 +416,55 @@ describe.skipIf(!dbUp)("contact authorization gate and the media pass", () => {
     expect(providers.auth).toBe(1);
     expect(providers.stt).toBe(1);
     expect(providers.vision).toBe(1);
+  });
+
+  // While the provider is busy the transcription is announced, so a flush re-reading the thread
+  // waits for it; once the pass settles nothing is left open.
+  test("a transcription in flight is announced while the provider works, and closed after", async () => {
+    await seedConversation(8870, INBOX_GATED);
+    authAnswers.push(true);
+    const messageId = 7_810;
+    let openDuring: boolean | null = null;
+    duringStt = async () => {
+      openDuring = await awaitOpenTranscriptions(
+        tenantId,
+        instanceId,
+        [messageId],
+        { timeoutMs: 0 },
+      );
+    };
+    await deliver({ convId: 8870, chatwootInboxId: INBOX_GATED, messageId });
+    expect(providers.stt).toBeGreaterThan(0);
+    expect(openDuring as boolean | null).toBe(true);
+    expect(
+      await awaitOpenTranscriptions(tenantId, instanceId, [messageId], {
+        timeoutMs: 0,
+      }),
+    ).toBe(false);
+  });
+
+  test("a transcription the provider fails is closed too", async () => {
+    await seedConversation(8871, INBOX_GATED);
+    authAnswers.push(true);
+    const messageId = 7_811;
+    let openDuring: boolean | null = null;
+    duringStt = async () => {
+      // NOTE: announced while the provider works, so "closed" below is a close and not "never opened".
+      openDuring = await awaitOpenTranscriptions(
+        tenantId,
+        instanceId,
+        [messageId],
+        { timeoutMs: 0 },
+      );
+      throw new Error("provider down");
+    };
+    await deliver({ convId: 8871, chatwootInboxId: INBOX_GATED, messageId });
+    expect(openDuring as boolean | null).toBe(true);
+    expect(
+      await awaitOpenTranscriptions(tenantId, instanceId, [messageId], {
+        timeoutMs: 0,
+      }),
+    ).toBe(false);
   });
 
   test("on a conversation a person holds no turn runs, and the media is read only if the gate allows it", async () => {
@@ -831,7 +885,8 @@ describe.skipIf(!dbUp)("contact authorization gate and the media pass", () => {
       clearContactAuthState();
     });
 
-    // The provider takes a while, as the real one does, so the deliveries overlap while it runs.
+    // The provider answers only once all three deliveries have asked for the transcription, so they
+    // overlap while it runs: each later one either joins the read in flight or makes its own.
     async function burst(
       convId: number,
       inbox: number,
@@ -839,21 +894,31 @@ describe.skipIf(!dbUp)("contact authorization gate and the media pass", () => {
       humanHeld = false,
     ) {
       const seen: NormalizedChatwootEvent[] = [];
-      duringStt = () => Bun.sleep(80);
-      await Promise.all(
-        (
-          ["message_created", "message_updated", "message_updated"] as const
-        ).map((event) =>
-          deliver({
-            convId,
-            chatwootInboxId: inbox,
-            event,
-            messageId,
-            humanHeld,
-            seen,
-          }),
-        ),
-      );
+      const asks = countCalls(sttService, "transcribeInboundAudio");
+      duringStt = async () => {
+        await until(
+          "the three deliveries asking for the words",
+          () => asks.count() >= 3,
+        );
+      };
+      try {
+        await Promise.all(
+          (
+            ["message_created", "message_updated", "message_updated"] as const
+          ).map((event) =>
+            deliver({
+              convId,
+              chatwootInboxId: inbox,
+              event,
+              messageId,
+              humanHeld,
+              seen,
+            }),
+          ),
+        );
+      } finally {
+        asks.restore();
+      }
       return seen;
     }
 

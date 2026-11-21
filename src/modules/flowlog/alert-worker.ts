@@ -2,23 +2,22 @@ import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import { runInPoolClass } from "@/lib/pool-class";
+import { isDraining } from "@/lib/shutdown";
 import { asSuperAdminOn, runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { tickFailures } from "@/lib/tick-failure";
+import { runWithWorkLabel } from "@/lib/work-label";
 import { nextBackoffMs } from "@/modules/webhooks/outbound/service";
-import { alertErrMsg, sendAlert } from "./alert-send";
+import { alertErrMsg, loadAlertContext, sendAlert } from "./alert-send";
 import { emitDeadLetter } from "./dead-letter";
 
-// Alert delivery worker (claim + deliver). Mirrors the outbound-webhook worker: a single-replica
+// Alert delivery worker (claim + deliver), mirroring the outbound-webhook worker: a single-replica
 // tick reaps stale SENDING rows, claims due PENDING deliveries cross-tenant (FOR UPDATE SKIP
-// LOCKED), hands each one to `sendAlert` (which decrypts the channel URL, vets it, signs and POSTs,
-// OUTSIDE any transaction), and records the outcome (DELIVERED / back to PENDING with full-jitter
-// backoff / DEAD). The send itself lives in ./alert-send.ts because the console's Test button
-// performs the same one (#605), and a probe that took a different path would approve channels whose
-// real alerts never arrive.
+// LOCKED), sends each through `sendAlert` (./alert-send.ts, shared with the console's Test button)
+// OUTSIDE any transaction, and records DELIVERED / PENDING with full-jitter backoff / DEAD.
 //
-// A DEBOUNCE WINDOW gates fresh rows: a just-created delivery (no next_attempt_at) is only claimed
-// once it is older than ALERT_COALESCE_WINDOW_MS, so concurrent burst events accumulate into its
-// `count` before the single POST. Retries (next_attempt_at set) are claimed when due, ignoring the
-// window.
+// A fresh row (no next_attempt_at) is claimed only once it is older than ALERT_COALESCE_WINDOW_MS,
+// so a burst accumulates into its `count` before the single POST. Retries are claimed when due.
 
 const MAX_ATTEMPTS = 8;
 const CLAIM_LIMIT = 50;
@@ -60,6 +59,9 @@ interface ClaimedAlert {
   count: number;
   turnId: string | null;
   conversationId: bigint | null;
+  agentId: bigint | null;
+  causeKey: string | null;
+  createdAt: Date;
   attempts: number;
   type: string;
   url: string;
@@ -72,7 +74,7 @@ function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-async function mapWithConcurrency<T, R>(
+export async function mapWithConcurrency<T, R>(
   items: T[],
   limit: number,
   fn: (item: T) => Promise<R>,
@@ -120,6 +122,8 @@ async function claimDue(
   coalesceWindowMs: number,
   tenantId?: bigint,
 ): Promise<ClaimedAlert[]> {
+  // NOTE: a tick already past its timer when SIGTERM arrives claims nothing new (src/lib/shutdown.ts).
+  if (isDraining()) return [];
   const coalesceSeconds = Math.max(0, Math.floor(coalesceWindowMs / 1000));
   const tenantClause =
     tenantId != null
@@ -158,6 +162,9 @@ async function claimDue(
         a.count,
         a.turn_id         AS "turnId",
         a.conversation_id AS "conversationId",
+        a.agent_id        AS "agentId",
+        a.cause_key       AS "causeKey",
+        a.created_at      AS "createdAt",
         a.attempts,
         picked.type,
         picked.url,
@@ -166,10 +173,9 @@ async function claimDue(
   );
 }
 
-// `unsignedReason` rides along on EVERY terminal write, including this one, because it describes the
-// attempt and not its outcome (issue #724). The delivered row is the one that needed it most: it is
-// the one nothing else marks, and a 2xx from a receiver that does not verify signatures looks
-// exactly like a 2xx from one that does and just rejected the next alert.
+// `unsignedReason` rides on EVERY terminal write, this one included, because it describes the
+// attempt and not its outcome. The delivered row needs it most: a 2xx from a receiver that does not
+// verify signatures looks exactly like one from a receiver that will reject the next alert.
 async function finalizeDelivered(
   base: PrismaClient,
   a: ClaimedAlert,
@@ -190,15 +196,9 @@ async function finalizeDelivered(
   );
 }
 
-// THE NOTIFICATION THAT WILL NEVER ARRIVE, AND THE ONE LINE THAT SAYS SO (issue #356).
-//
-// The sharpest site of the four, because the operator learns about everything else THROUGH this bus,
-// and this is the bus failing. It cannot report itself, so the sink is the flow-log row: it costs
-// nothing, it is not the failing path, and ../flowlog/alerts.ts refuses to turn this particular line
-// back into an alert (the loop is written out there).
-//
-// Both roads to DEAD come here, which is the same collapse #325 did for the outbound bus. They were
-// written apart and neither had a line to forget; a third added the same way would be silent again.
+// Both roads to DEAD come through here. The alert bus cannot report its own failure, so the sink is
+// the flow-log line: it is not the failing path, and ./alerts.ts refuses to turn it back into an
+// alert.
 async function finalizeDead(
   base: PrismaClient,
   a: ClaimedAlert,
@@ -270,10 +270,20 @@ async function deliverClaimed(
   opts: AlertWorkerOptions,
 ): Promise<Outcome> {
   const now = opts.now ?? (() => Date.now());
+  // The names an operator reads the alert by; an unreadable context sends the alert without them.
+  const context = await loadAlertContext(base, {
+    tenantId: a.tenantId,
+    conversationId: a.conversationId,
+    agentId: a.agentId,
+    firstAt: a.createdAt,
+  }).catch((err) => {
+    logger.warn({ err, alertId: String(a.id) }, "alert context unreadable");
+    return null;
+  });
   const res = await sendAlert(
     base,
     sysCtx(a.tenantId),
-    { ...a, deliveryId: String(a.id) },
+    { ...a, deliveryId: String(a.id), context },
     {
       fetchImpl: opts.fetchImpl,
       assertSafe: opts.assertSafe,
@@ -341,6 +351,8 @@ function workerState(): WorkerState {
   return g[WORKER_KEY] as WorkerState;
 }
 
+const alertTickFailures = tickFailures();
+
 async function tick(base: PrismaClient, state: WorkerState): Promise<void> {
   if (state.running) return; // single-replica reentrancy guard
   state.running = true;
@@ -356,21 +368,35 @@ async function tick(base: PrismaClient, state: WorkerState): Promise<void> {
         summary.dead,
       );
     }
+    alertTickFailures.succeeded();
   } catch (err) {
-    logger.error("Alert tick failed: %s", alertErrMsg(err));
+    alertTickFailures.failed(
+      err,
+      {},
+      "Alert tick failed: %s",
+      alertErrMsg(err),
+    );
   } finally {
     state.running = false;
   }
 }
 
+// The execution alert deliveries run as `alerts:delivery`: the label is entered where the timer is created, so every pass
+// inherits it, and a statement that times out in one names this work (docs/logs.md, "Database").
 export function startAlertWorker(opts: AlertWorkerOptions = {}): void {
-  const state = workerState();
-  if (state.timer) return; // singleton (survives bun --hot via globalThis)
-  const base = opts.base ?? basePrisma;
-  const intervalMs = config.alertWorker.intervalMs;
-  state.timer = setInterval(() => void tick(base, state), intervalMs);
-  state.timer.unref?.();
-  logger.info("Alert worker started (interval %dms)", intervalMs);
+  runWithWorkLabel("alerts:delivery", () => {
+    const state = workerState();
+    if (state.timer) return; // singleton (survives bun --hot via globalThis)
+    const base = opts.base ?? basePrisma;
+    const intervalMs = config.alertWorker.intervalMs;
+    // NOTE: background pool: nobody is waiting on a delivery to a third party this second.
+    state.timer = setInterval(
+      () => void runInPoolClass("background", () => tick(base, state)),
+      intervalMs,
+    );
+    state.timer.unref?.();
+    logger.info("Alert worker started (interval %dms)", intervalMs);
+  });
 }
 
 export function stopAlertWorker(): void {

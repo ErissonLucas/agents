@@ -1,13 +1,16 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { AIMessage } from "@langchain/core/messages";
+import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { chatwootThreadId, contactInboxThreadId } from "@/graph/checkpointer";
+import { stampedBurstStart, stampedSentAt } from "@/graph/markers";
 import type { ResolvedModelConfig } from "@/graph/models";
+import { buildThreadStateGraph } from "@/graph/thread-state";
+import { failsUntilAccountFixed } from "@/lib/provider-failure";
 import {
   clearMediaAnnotations,
   stashMediaAnnotation,
@@ -41,17 +44,19 @@ import {
   enqueueJob,
   retireJobsByDedupeKey,
 } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import {
   clearFlowLog,
   flowLogCount,
   flowLogRow,
   flowLogRows,
 } from "@/tests/utils/flowlog";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { until } from "@/tests/utils/poll";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { burnSchedulerJobId } from "../utils/scheduler";
 import {
   EmptyThenReplyModel,
+  FailingModel,
   guardrailModel,
   PromptCapturingModel,
   ResolveThenReplyModel,
@@ -75,8 +80,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -137,11 +142,10 @@ function makeResolveStub(opts: {
   order?: string[];
 }) {
   let i = 0;
-  // Built from the CONFIG it is handed, so the token profile is part of what this stub personifies.
-  // `toggle_status` is a bot-token endpoint (docs/chatwoot.md), and the real client refuses an empty
-  // one before anything leaves the process (issue #79) instead of reporting Chatwoot's 401 for a
-  // credential nobody sent. A stub that ignored the config would let a caller that forgot the
-  // persona token record a handoff that never happened.
+  // NOTE: Built from the config it is handed: `toggle_status` is a bot-token endpoint
+  // (docs/chatwoot.md), and the real client refuses an empty token before anything leaves the
+  // process. A stub that ignored the config would let a caller that forgot the persona token record
+  // a handoff that never happened.
   return async (cfg: { botToken?: string }) =>
     ({
       getMessages: async () => {
@@ -186,19 +190,24 @@ function page(
     type?: number;
     priv?: boolean;
     attachments?: unknown[];
-    // Chatwoot's own `sender.type` ("contact" | "user" | "agent_bot"), which is what separates our
-    // outgoing message from a human agent's (issue #698). Omitted ⇒ the page names no sender, which
-    // is a shape the serializer really emits.
+    // Chatwoot's own `sender.type` ("contact" | "user" | "agent_bot"), which separates our outgoing
+    // message from a human agent's. Omitted ⇒ the page names no sender, a shape the serializer
+    // really emits.
     sender?: string;
     senderId?: number;
     reaction?: boolean;
-    // `content_attributes.external_sender_name`, which is how the fork marks a message that came
-    // back FROM the WhatsApp session instead of out of Chatwoot — an attendant typing on the paired
-    // phone, and nobody in the `sender` field (PR #701, review round 8).
+    // `content_attributes.external_sender_name`: the fork's mark on a message that came back FROM
+    // the WhatsApp session (an attendant typing on the paired phone), with nobody in the `sender`
+    // field.
     fromDevice?: boolean;
-    // `content_attributes.imported`: a row the history importer backfilled, which carries today's id
-    // and last year's conversation (PR #701, review round 9).
+    // WhatsApp Cloud's own marks on a reply typed in the WhatsApp Business app (coexistence):
+    // `external_created_at`, WhatsApp's timestamp, with no `external_sender_name`.
+    fromCloudPhone?: boolean;
+    // `content_attributes.imported`: a row the history importer backfilled, which carries today's
+    // id and last year's conversation.
     imported?: boolean;
+    // `created_at`, in seconds. Omitted ⇒ the row has no instant.
+    createdAt?: number;
   }>,
 ) {
   return {
@@ -206,6 +215,7 @@ function page(
       const ca = {
         ...(m.reaction ? { is_reaction: true } : {}),
         ...(m.fromDevice ? { external_sender_name: "WhatsApp" } : {}),
+        ...(m.fromCloudPhone ? { external_created_at: 1793390000 } : {}),
         ...(m.imported ? { imported: true } : {}),
       };
       return {
@@ -213,6 +223,7 @@ function page(
         content: m.content,
         message_type: m.type ?? 0,
         private: m.priv ?? false,
+        ...(m.createdAt != null ? { created_at: m.createdAt } : {}),
         ...(m.attachments ? { attachments: m.attachments } : {}),
         ...(m.sender
           ? { sender: { id: m.senderId ?? 9, type: m.sender } }
@@ -223,7 +234,7 @@ function page(
   };
 }
 
-// NOTE: A duck-typed model that records every prompt it sees (same shape as ResolveThenReplyModel).
+// A duck-typed model that records every prompt it sees (same shape as ResolveThenReplyModel).
 class CaptureReplyModel {
   seen: string[] = [];
   constructor(private reply: string) {}
@@ -331,16 +342,14 @@ async function convRowId(convId: number) {
 
 async function correctionLine(convId: number) {
   const conversationId = await convRowId(convId);
-  const deadline = Date.now() + POLL_DEADLINE_MS;
-  let lines: Array<{ level: string; detail: unknown }> = [];
-  while (Date.now() < deadline) {
-    lines = await flowLogRows(suDb, {
+  const lines = await until("the correction line", async () => {
+    const found = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, conversationId, stage: "delivery" },
       select: { level: true, detail: true },
     });
-    if (lines.length > 0) break;
-    await new Promise((r) => setTimeout(r, 50));
-  }
+    return found.length > 0 ? found : null;
+  });
   expect(lines).toHaveLength(1);
   const line = lines[0];
   if (line === undefined) throw new Error("no correction line was written");
@@ -375,8 +384,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           model: "gpt-4o-mini",
           credentialRef: `vault:${llmKey.id}`,
         },
-        // Pin split off so the flush asserts a single coalesced send (split is on
-        // by default now and has its own test).
+        // NOTE: Split off so the flush asserts a single coalesced send; split has its own test.
         settings: {
           debounce: { enabled: true, windowSeconds: 15 },
           split: { enabled: false },
@@ -546,8 +554,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe(t0.getTime());
   });
 
-  // ISSUE #746: the burst remembers it holds a customer's reaction, across a text typed after it,
-  // and a new burst starts without the mark.
+  // Across a text typed after the reaction too; a new burst starts without the mark.
   test("armDebounce keeps a burst's reaction mark until the burst ends", async () => {
     const thread = threadOf(7465);
     const cfg = {
@@ -578,7 +585,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(readReactionArmed(await payloadOf())).toBe(true);
     await arm(false, 21);
     expect(readReactionArmed(await payloadOf())).toBe(true);
-    // The earliest reaction of the burst, not the latest arm (PR #821, review round 2).
+    // NOTE: The earliest reaction of the burst, not the latest arm.
     await arm(true, 23);
     expect(readReactionFrom(await payloadOf())).toBe(20);
     await suDb.schedulerJob.updateMany({
@@ -588,8 +595,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     await arm(false, 22);
     expect(readReactionArmed(await payloadOf())).toBe(false);
     expect(readReactionFrom(await payloadOf())).toBeNull();
-    // A text that arrives while the reaction's flush RUNS supersedes that turn; the flush it arms
-    // still owes the reaction (PR #821, review round 3).
+    // NOTE: A text that arrives while the reaction's flush RUNS supersedes that turn; the flush it
+    // arms still owes the reaction.
     await arm(true, 30);
     await suDb.schedulerJob.updateMany({
       where: { tenantId, kind: "DEBOUNCE", dedupeKey: key },
@@ -600,14 +607,13 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(readReactionFrom(await payloadOf())).toBe(30);
   });
 
-  // /reset retires the burst, but a flush already CLAIMED is past every cancel — and this one is a
-  // queued TURN: coalescing and invoking rewrites the thread the command just cleared, with the
-  // operator having been told the conversation was started over. The reply is the smaller half.
+  // /reset retires the burst, but a flush already CLAIMED is past every cancel, and this one is a
+  // queued TURN: coalescing and invoking rewrites the thread the command just cleared, after the
+  // operator was told the conversation was started over. The reply is the smaller half.
   //
-  // The assertions are the WRITES, not the reads. An early "did it fetch the messages" check proved
-  // only where the fence happened to sit, and it went green for a run that stood down before any of
-  // the three things that outlive the command: the thread claim, the invoke that persists the
-  // channel, and the watermark that would declare the burst handled.
+  // The assertions are the WRITES that outlive the command (the thread claim, the invoke that
+  // persists the channel, the watermark that declares the burst handled), not the reads: a read
+  // shows only where the fence happens to sit.
   test("a burst retired while claimed writes nothing", async () => {
     // With a contact-inbox, so the divider/claim block under the `ingest:` lock runs — that is the
     // first of the two boundaries the fence has to hold, and a conversation without one skips it.
@@ -730,20 +736,18 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBeUndefined();
   });
 
-  // O PORTÃO DE POSSE DA #688 É DO CAMINHO QUE ESPERA, E O FLUSH NÃO É ELE. A leitura extra existe
-  // porque o caminho direto pode ficar até `TURN_LEASE_SECONDS + 5` parado esperando outro invoke, e
-  // o portão do receptor respondeu antes disso. O flush não espera esse thread (`waitForThreadTurn`
-  // é ligado só pelo caminho direto) e já tem o seu próprio portão de posse antes do turno, então
-  // alargar aquele para cá seria uma segunda leitura por rajada sem janela nova que ela cubra.
+  // The direct path's ownership gate is not the flush's. That extra read exists because the direct
+  // path can wait up to `TURN_WAIT_MS` on another invoke; the flush never waits on the
+  // thread (`waitForThreadTurn` is wired only on the direct path) and has its own ownership gate
+  // before the turn, so widening that read to it would add a second read per burst with no new
+  // window to cover.
   //
-  // O teste prende a FRONTEIRA, e ela não se vê no comportamento: trocar a condição do portão por
-  // `true` deixa todo o resto verde, porque o flush passaria na leitura e seguiria igual. O que
-  // muda é quantas vezes o banco é perguntado, e é isso que este contador mede.
+  // The boundary is invisible in behaviour: turning the gate's condition into `true` leaves
+  // everything else green, so this counts the reads.
   test("issue #688: the flush does not pay the direct path's ownership read", async () => {
-    // COM contact-inbox, e sem ele o teste é vácuo: o portão mora dentro do bloco da fronteira de
-    // atendimento, que só roda quando a conversa tem um. A primeira versão deste teste usava o
-    // default null, passava, e continuava passando com o portão alargado para todo turno — que é
-    // exatamente o mutante que ele existe para matar.
+    // NOTE: WITH a contact-inbox, or the test is vacuous: the gate lives inside the
+    // attendance-boundary block, which runs only when the conversation has one, and the default
+    // null passes even with the gate widened to every turn.
     await seedConversation(858, { contactInboxId: 8580 });
     const thread = threadOf(858);
     const row = await suDb.schedulerJob.create({
@@ -778,10 +782,10 @@ describe.skipIf(!dbUp)("debounce", () => {
       },
     });
 
-    // A rajada foi respondida do jeito de sempre...
+    // NOTE: The burst was answered as usual...
     expect(out).toEqual({ outcome: "done" });
     expect(sent.length).toBe(1);
-    // ...e o portão do caminho direto não foi consultado uma vez sequer.
+    // NOTE: ...and the direct path's gate was not consulted once.
     expect(leituras).toBe(0);
   });
 
@@ -864,10 +868,49 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(800)).toBe(2);
   });
 
-  // ISSUE #746. The fork's default page carries a reaction only when the message it reacts to is
-  // among the page's last twenty of the same conversation; `?after=` lists by id with no such window.
-  // This stub serves the two reads the way the fork does, so a reaction to an older message (or to
-  // one of an earlier conversation) is on the catch-up read and on no default page.
+  test("the coalesced turn keeps where its burst started next to its newest instant", async () => {
+    await seedConversation(8011);
+    const checkpointer = new MemorySaver();
+    await flushDebounceJob({
+      job: jobFor(8011),
+      base: appDb,
+      deps: {
+        makeModel: fakeModel,
+        makeClient: makeStub({
+          pages: [
+            page([
+              {
+                id: 1,
+                content: "segue o comprovante",
+                createdAt: 1_790_000_000,
+              },
+              { id: 2, content: "conseguem ver?", createdAt: 1_790_000_040 },
+            ]),
+          ],
+          sent: [],
+          calls: { getMessages: 0 },
+        }),
+        checkpointer,
+      },
+    });
+    const state = await buildThreadStateGraph(checkpointer).getState({
+      configurable: { thread_id: threadOf(8011) },
+    });
+    const human = (
+      (state.values as { messages?: BaseMessage[] }).messages ?? []
+    ).find((m) => m.getType() === "human");
+    expect(stampedBurstStart(human as BaseMessage)?.getTime()).toBe(
+      1_790_000_000_000,
+    );
+    expect(stampedSentAt(human as BaseMessage)?.getTime()).toBe(
+      1_790_000_040_000,
+    );
+  });
+
+  // The fork's default page carries a reaction only when the message it reacts to is among the
+  // page's last twenty of the same conversation; `?after=` lists by id with no such window. This
+  // stub serves the two reads the way the fork does, so a reaction to an older message (or to one
+  // of an earlier conversation) is on the catch-up read and on no default page.
   function makeForkStub(opts: {
     // A function answers each default read in turn, for a page that changes while the model runs.
     latest: unknown | (() => unknown);
@@ -1029,7 +1072,7 @@ describe.skipIf(!dbUp)("debounce", () => {
   // The catch-up read stops at a hundred rows (the fork's `CATCH_UP_LIMIT`). A burst further behind
   // its page than that is walked until the read reaches the page: merging the first hundred alone
   // would hand the selectors a history with a hole where the operator's reply sits, and a request
-  // that reply closed would be answered again (PR #821, review round 1).
+  // that reply closed would be answered again.
   const activityRows = (from: number, to: number) =>
     Array.from({ length: to - from + 1 }, (_, i) => ({
       id: from + i,
@@ -1079,43 +1122,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen.join("\n")).not.toContain("quero cancelar");
   });
 
-  // PR #821, review round 2: meeting the page is not reaching the reaction. The orphan sorts above
-  // the page's non-reaction messages, so the read goes on until it runs dry.
-  test("issue #746: the catch-up read goes past the page to the reaction above it", async () => {
-    const convId = 7471;
-    await seedConversation(convId, { lastHandledMessageId: 2 });
-    const sent: Array<[number, string]> = [];
-    const reads: Array<{ after?: number }> = [];
-    const model = new CaptureReplyModel(REPLY);
-    await flushDebounceJob({
-      job: jobFor(convId, { lastMessageId: 120, reactionArmed: true }),
-      base: appDb,
-      deps: {
-        makeModel: () => model as unknown as BaseChatModel,
-        makeClient: makeForkStub({
-          latest: page(activityRows(100, 119)),
-          after: (after: number) =>
-            page(
-              after === 2
-                ? activityRows(3, 102)
-                : [
-                    ...activityRows(103, 119),
-                    { id: 120, content: "🔥", reaction: true },
-                  ],
-            ),
-          sent,
-          reads,
-        }),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(reads.slice(0, 3)).toEqual([{}, { after: 2 }, { after: 102 }]);
-    expect(model.seen[0]).toContain('<reação do cliente emoji="🔥"');
-  });
-
-  // PR #821, review round 2: a conversation the agent never answered has no mark, and the flush was
-  // armed last by the text typed after the reaction. The read starts at the burst's earliest
-  // reaction, not at the arming message.
+  // A conversation the agent never answered has no mark, and the flush was armed last by the text
+  // typed after the reaction.
   test("issue #746: with no mark, the catch-up read starts at the burst's first reaction", async () => {
     const convId = 7472;
     await seedConversation(convId);
@@ -1150,9 +1158,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen[0]).toContain('<reação do cliente emoji="👋"');
   });
 
-  // PR #821, review round 6: the post gate asks the catch-up read too. A second orphan reaction that
-  // arrives while the first one's turn runs is on no default page, and the turn would post over it
-  // instead of yielding to the flush it re-armed.
+  // The post gate asks the catch-up read too. A second orphan reaction that arrives while the first
+  // one's turn runs is on no default page, and the turn would post over it instead of yielding to
+  // the flush it re-armed.
   test("issue #746: a reaction that arrives mid-turn supersedes a reaction's turn", async () => {
     const convId = 7473;
     await seedConversation(convId, { lastHandledMessageId: 2 });
@@ -1187,9 +1195,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent).toEqual([]);
   });
 
-  // PR #821, review round 7: a failure of the gate's extra read keeps the page it already read. The
-  // customer wrote again while the model ran, and the page says so; a failed catch-up must not turn
-  // that into a post.
+  // A failure of the gate's extra read keeps the page it already read. The customer wrote again
+  // while the model ran, and the page says so; a failed catch-up must not turn that into a post.
   test("issue #746: a failed catch-up read at the post gate still judges the page", async () => {
     const convId = 7475;
     await seedConversation(convId, { lastHandledMessageId: 2 });
@@ -1325,20 +1332,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent).toEqual([]);
   });
 
-  // The claim's own table, decided in one place and asked here directly: the paths above prove the
-  // gate consults it, this proves what it answers (issue #452, rewritten for issue #690).
-  //
-  // WHAT CHANGED AND WHY, because one of these assertions is the inverse of what it used to be. The
-  // claim used to be a single number and the test asserted that a claim BEHIND it lost — which is
-  // the arithmetic issue #690 is about: claiming 20 closed 15 without anybody having read 15. What
-  // the assertion was actually protecting is a flush retry and a second click not answering the same
-  // burst twice, and that protection survives in a stronger form: identity. The same ids collide on
-  // the unique index however they are ordered, and a set that OVERLAPS a claimed one loses whole
-  // rather than in part. Both are asserted below, so the rewrite does not trade a proof for a hole.
-  // Issue #750. The claim records WHICH message we answered; the follow-up's activation fence needs
-  // WHEN we answered, and the two are not the same column. The id is a watermark and refuses to move
-  // backwards; the instant is not — a claim below the mark is still our side speaking, and on "did
-  // this conversation become live after the agent was armed" it counts exactly as much.
+  // The claim's own table, asked directly: the paths above prove the gate consults it, this proves
+  // what it answers. The claim records WHICH messages we answered, by identity: the same ids
+  // collide on the unique index however they are ordered, and a set that OVERLAPS a claimed one
+  // loses whole. The follow-up's activation fence needs WHEN we answered, a separate column: the id
+  // is a watermark and refuses to move backwards, the instant is not, since a claim below the mark
+  // is still our side speaking.
   test("the claim also records WHEN our side spoke, including below the mark", async () => {
     const convId = 8977;
     await seedConversation(convId);
@@ -1412,8 +1411,8 @@ describe.skipIf(!dbUp)("debounce", () => {
 
     expect(await claim([10])).toEqual({ won: true });
     expect(await claim([20])).toEqual({ won: true });
-    // THE RETRY, which is what the old arithmetic was really guarding: the same burst claimed twice
-    // loses the second time, now by identity rather than by order.
+    // NOTE: THE RETRY: the same burst claimed twice loses the second time, by identity rather than
+    // by order.
     expect(await claim([20])).toEqual({ won: false, reason: "claimed" });
     // AND THE OVERLAP LOSES WHOLE. A turn that owns part of a tail owns none of it — answering half
     // a burst is how a customer reads a reply to their second message and nothing about their first.
@@ -1426,8 +1425,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     // ...and having lost, it left nothing behind: 19 and 21 are still free for the turn that does
     // read them. A partial insert surviving the loss would close them for a reply nobody sent.
     expect(await claim([19, 21])).toEqual({ won: true });
-    // THE ONE THAT USED TO LOSE. Nobody ever claimed 15, and the turn that just read it is the only
-    // actor that can answer it. This is issue #690 in one line.
+    // NOTE: Nobody ever claimed 15, and the turn that just read it is the only actor that can
+    // answer it: a claim above it does not close it.
     expect(await claim([15])).toEqual({ won: true });
     // AND THE SCALAR DID NOT FOLLOW IT BACKWARDS. Everything still reading that column — the flush's
     // own floor, every conversation below the per-message era — would otherwise treat 16 through 21
@@ -1435,13 +1434,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await stored()).toBe(21);
   });
 
-  // A DELAYED REDELIVERY AND AN OPERATOR'S CLICK LOOK THE SAME AND ARE OPPOSITE (issue #690).
-  //
-  // Both answer a tail the watermark already covers, so arithmetic cannot separate them — the first
-  // shape of this fix tried, and would have let a redelivery of a message answered long ago overturn
-  // the record of its own answer. One is a person deciding a silence was wrong; the other is Chatwoot
-  // repeating itself. The caller says which it is, and the word is required so a path added later
-  // cannot inherit the forgiving one by omission.
+  // A DELAYED REDELIVERY AND AN OPERATOR'S CLICK LOOK THE SAME AND ARE OPPOSITE. Both answer a tail
+  // the watermark already covers, so arithmetic cannot separate them, and letting it decide would
+  // let a redelivery of a message answered long ago overturn the record of its own answer. The
+  // caller says which it is, and the word is required so a path added later cannot inherit the
+  // forgiving one by omission.
   test("a redelivery cannot overturn a dispensal that an operator's click can", async () => {
     const convId = 899;
     await seedConversation(convId);
@@ -1477,8 +1474,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       won: false,
       reason: "claimed",
     });
-    // A person looking at the conversation and pressing the button. Overturning that silence is the
-    // whole reason the button exists (issue #452).
+    // NOTE: A person looking at the conversation and pressing the button. Overturning that silence
+    // is the whole reason the button exists.
     expect(await claim("operator")).toEqual({ won: true });
     // AND HAVING BEEN ANSWERED, it is answered: the row says CLAIMED now, so a second click — or a
     // redelivery arriving after it — meets a claim and not a silence.
@@ -1493,10 +1490,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe("CLAIMED");
   });
 
-  // A1 VARIANT (i), REPRODUCED AT THE CLAIM (issue #690 holdout). A message answered a while ago,
-  // its row still there, the mark well past it, and Chatwoot delivering it a second time. The
-  // sequential case, as opposed to the two simultaneous deliveries of `s5`: the first turn is long
-  // finished, so nothing is racing and identity is the only thing left that can refuse.
+  // A message answered a while ago, its row still there, the mark well past it, and Chatwoot
+  // delivering it a second time. The sequential case, as opposed to two simultaneous deliveries:
+  // the first turn is long finished, so nothing is racing and identity is the only thing left that
+  // can refuse.
   test("a redelivery of a message already claimed is refused, turns later", async () => {
     const convId = 933;
     await seedConversation(convId);
@@ -1529,12 +1526,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await claim(1001, 1000)).toEqual({ won: false, reason: "claimed" });
   });
 
-  // THE CLICK'S ENTRY-TIME CEILING SURVIVES THE FLOOR (issue #452, PR review round 1). Above the
-  // floor the scalars answer nothing for an automatic caller, because every decision up there wrote
-  // a row and the rows are read directly. The operator's click is the exception, and only because it
-  // IGNORES dispensals on purpose: a skip recorded between the moment it read the mark and the
-  // moment it claims is a decision it would otherwise walk straight over. `docs/debounce.md` requires
-  // that skip to refuse the reply.
+  // THE CLICK'S ENTRY-TIME CEILING SURVIVES THE FLOOR. Above the floor the scalars answer nothing
+  // for an automatic caller, because every decision up there wrote a row and the rows are read
+  // directly. The operator's click is the exception because it IGNORES dispensals on purpose: a
+  // skip recorded between reading the mark and claiming is a decision it would otherwise walk
+  // straight over, and `docs/debounce.md` requires that skip to refuse the reply.
   test("a skip landing while the operator's model ran still refuses the click", async () => {
     const convId = 931;
     await seedConversation(convId);
@@ -1578,10 +1574,82 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toEqual({ won: false, reason: "handled" });
   });
 
-  // A DISPENSAL IS ASKED ABOUT THE IDS, NOT ABOUT THE SPAN THEY COVER (issue #690, PR review round
-  // 1). A burst is not dense: the selection drops what renders to nothing, so `[1001, 1005]` spans
-  // four ids it does not contain. Asked as an overlap of intervals, a dispensal sitting entirely
-  // inside that gap suppressed the whole reply for messages the turn was never speaking for.
+  // A transfer's closing line claims past the silence its own hand-over caused, and still elects one
+  // sender: of two transfers racing one burst under a gate exit's dispensal, one line goes out, and a
+  // turn that already claimed the burst keeps it.
+  for (const era of ["scalar", "per-message"] as const) {
+    test(`the transfer claim overturns a gate exit and elects one line (${era} era)`, async () => {
+      const convId = era === "scalar" ? 1814 : 1815;
+      await seedConversation(convId);
+      const { id } = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: convId },
+        select: { id: true },
+      });
+      if (era === "per-message") {
+        await suDb.conversation.update({
+          where: { id },
+          data: { replyClaimFloorMessageId: 0 },
+        });
+      }
+      const claim = (
+        initiatedBy: "automatic" | "transfer",
+        messageIds: number[],
+      ) =>
+        claimReplyBurst({
+          tenantId,
+          conversationDbId: id,
+          toMessageId: Math.max(...messageIds),
+          maxHandledAllowed: Math.min(...messageIds) - 1,
+          messageIds,
+          initiatedBy,
+          base: appDb,
+        });
+      await advanceHandledWatermark({
+        tenantId,
+        conversationDbId: id,
+        toMessageId: 3,
+        dispensed: { kind: "range", afterMessageId: null },
+        base: appDb,
+      });
+      expect((await claim("automatic", [1, 2])).won).toBe(false);
+      expect(await claim("transfer", [1, 2])).toEqual({ won: true });
+      expect((await claim("transfer", [1, 2])).won).toBe(false);
+      expect((await claim("transfer", [2])).won).toBe(false);
+    });
+  }
+
+  test("the transfer claim does not take a burst another turn already claimed", async () => {
+    const convId = 1816;
+    await seedConversation(convId);
+    const { id } = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: convId },
+      select: { id: true },
+    });
+    const claim = (initiatedBy: "automatic" | "transfer") =>
+      claimReplyBurst({
+        tenantId,
+        conversationDbId: id,
+        toMessageId: 2,
+        maxHandledAllowed: 0,
+        messageIds: [1, 2],
+        initiatedBy,
+        base: appDb,
+      });
+    expect(await claim("automatic")).toEqual({ won: true });
+    await advanceHandledWatermark({
+      tenantId,
+      conversationDbId: id,
+      toMessageId: 3,
+      dispensed: { kind: "range", afterMessageId: null },
+      base: appDb,
+    });
+    expect((await claim("transfer")).won).toBe(false);
+  });
+
+  // A DISPENSAL IS ASKED ABOUT THE IDS, NOT ABOUT THE SPAN THEY COVER. A burst is not dense: the
+  // selection drops what renders to nothing, so `[1001, 1005]` spans four ids it does not contain.
+  // Asked as an overlap of intervals, a dispensal inside that gap would suppress the whole reply
+  // for messages the turn never spoke for.
   test("a dispensal inside a sparse burst's gap does not refuse it", async () => {
     const convId = 932;
     await seedConversation(convId);
@@ -1632,8 +1700,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       }),
     ).toEqual({ won: false, reason: "dispensed" });
 
-    // ...and one that covers only PART of the set says so, because the messages it does not cover
-    // are still owed to somebody and the flush comes back for them (PR review, round 5).
+    // NOTE: ...and one that covers only PART of the set says so, because the messages it does not
+    // cover are still owed to somebody and the flush comes back for them.
     expect(
       await claimReplyBurst({
         tenantId,
@@ -1647,73 +1715,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toEqual({ won: false, reason: "partial" });
   });
 
-  // A BURST DOES NOT CARRY WHAT ANOTHER TURN IS ALREADY SPEAKING FOR (issue #690, PR review round
-  // 3). The claim is taken before its turn sends and the watermark only moves after that turn
-  // returns, so in between a message sits above the mark with a row on it, invisible to a selection
-  // that asks the mark alone. Carried into the burst it makes the claim conflict, and the claim is
-  // all-or-nothing — so the message BESIDE it, which nobody claimed, would be refused too and have
-  // nothing coming for it afterwards. This asserts the claim's half of that: the free message wins
-  // on its own.
-  test("a burst claims the message beside one another turn already holds", async () => {
-    const convId = 934;
-    await seedConversation(convId);
-    const { id } = await suDb.conversation.findFirstOrThrow({
-      where: { tenantId, chatwootConversationId: convId },
-      select: { id: true },
-    });
-    // A direct turn claimed 1001 and has not returned yet, so the watermark is still behind it.
-    expect(
-      await claimReplyBurst({
-        tenantId,
-        conversationDbId: id,
-        toMessageId: 1001,
-        maxHandledAllowed: 1000,
-        messageIds: [1001],
-        initiatedBy: "automatic",
-        base: appDb,
-      }),
-    ).toEqual({ won: true });
-
-    // The flush's selection drops 1001 and claims what is actually free.
-    expect(
-      await claimReplyBurst({
-        tenantId,
-        conversationDbId: id,
-        toMessageId: 1002,
-        maxHandledAllowed: 1001,
-        messageIds: [1002],
-        initiatedBy: "automatic",
-        base: appDb,
-      }),
-    ).toEqual({ won: true });
-
-    // ...and carrying 1001 along would have cost 1002 as well, which is the shape the selection
-    // exists to avoid.
-    expect(
-      await claimReplyBurst({
-        tenantId,
-        conversationDbId: id,
-        toMessageId: 1003,
-        maxHandledAllowed: 1002,
-        messageIds: [1001, 1003],
-        initiatedBy: "automatic",
-        base: appDb,
-      }),
-      // `partial`, because 1003 was free: the word is what tells the flush to come back for it.
-    ).toEqual({ won: false, reason: "partial" });
-    expect(
-      await suDb.messageReplyClaim.findFirst({
-        where: { conversationId: id, messageId: 1003 },
-      }),
-    ).toBeNull();
-  });
-
   // THE FLOOR IS THE MAX OF BOTH SCALARS, and a conversation where the CLAIM is ahead of the
-  // watermark is what proves it (issue #690, mutation m6). That state is not hypothetical: the claim
-  // is written before the send and the watermark after the turn, so a reply whose watermark write was
-  // lost leaves exactly this (issue #452). Taking `handled` alone would put every message between the
-  // two above the floor, where "no row" reads as open — and the bot answers a stretch it already
-  // replied to.
+  // watermark proves it. The claim is written before the send and the watermark after the turn, so
+  // a reply whose watermark write was lost leaves exactly this state. Taking `handled` alone would
+  // put every message between the two above the floor, where "no row" reads as open, and the bot
+  // would answer a stretch it already replied to.
   test("the floor starts at the highest of the two scalars, not at the watermark", async () => {
     const convId = 936;
     await seedConversation(convId);
@@ -1760,12 +1766,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toEqual({ won: false, reason: "claimed" });
   });
 
-  // AND THE FLUSH COMES BACK FOR WHAT IT COULD NOT CLAIM (issue #690, mutation m8). The selection
-  // drops what is already spoken for at the moment it reads, so the only way into a partial conflict
-  // is a claim landing INSIDE the turn — which is what the model's side effect does here. Every other
-  // `superseded` completes the job, because a newer message's own flush is armed; this one has
-  // nothing coming for the messages nobody claimed, and rescheduling is the only thing that brings a
-  // turn back to them.
+  // AND THE FLUSH COMES BACK FOR WHAT IT COULD NOT CLAIM. The selection drops what is already
+  // spoken for when it reads, so the only way into a partial conflict is a claim landing INSIDE the
+  // turn, which is what the model's side effect does here. Every other `superseded` completes the
+  // job because a newer message's own flush is armed; this one has nothing coming for the unclaimed
+  // messages, and rescheduling is the only thing that brings a turn back to them.
   test("a partial claim conflict reschedules the flush instead of completing it", async () => {
     const convId = 937;
     await seedConversation(convId);
@@ -1818,12 +1823,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBeNull();
   });
 
-  // AND THE RETRY FINDS THE FLOOR ALREADY PAST IT (issue #698). The test above ends where the damage
-  // begins: the job comes back, and the selection it comes back to still asks a single number.
-  // `readAnsweredFloor` is the max of the two scalars, the winning claim wrote `1002` into one of
-  // them, and message 1 sits below that with no claim row and no dispensal row anywhere. The claim
-  // would grant it (1 is above this conversation's per-message floor, so neither scalar gate even
-  // looks); the selection never offers it.
+  // AND THE RETRY ANSWERS WHAT NOBODY CLAIMED. The job comes back from a partial conflict, the
+  // winning claim wrote `1002` into one of the scalars, and `readAnsweredFloor` is their max, so
+  // message 1 sits below it with no claim row and no dispensal row anywhere. The claim would grant
+  // it (1 is above this conversation's per-message floor, so neither scalar gate looks), and the
+  // selection has to offer it too.
   test("the retry after a partial conflict answers the message nobody claimed", async () => {
     const convId = 938;
     await seedConversation(convId);
@@ -1890,14 +1894,13 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).not.toBeNull();
   });
 
-  // A DISPENSA QUE NÃO ANDA COM A MARCA TEM QUE ABRIR A ERA QUE A TORNA VISÍVEL (issue #725, review
-  // rodada 8). `dispenseMessagesFromReply` é o único escritor de uma linha `DISPENSED` que
-  // deliberadamente NÃO move a marca, e numa conversa que nunca teve reivindicação o piso é nulo:
-  // `readSelectionState` devolve conjuntos vazios ali, a seleção decide só pelos escalares, e a
-  // linha fica invisível para quem monta a rajada — mas continua visível para o índice único do
-  // `claimReplyBurst`, que é tudo ou nada. A rajada `[1, 2]` seria recusada inteira, com a mensagem
-  // nova junto, e o `partial` reagenda para ler de novo exatamente o mesmo estado: um laço, e o
-  // cliente sem resposta até a varredura reparar a entrega antiga.
+  // A DISPENSAL THAT DOES NOT MOVE THE MARK OPENS THE ERA THAT MAKES IT VISIBLE.
+  // `dispenseMessagesFromReply` is the only writer of a `DISPENSED` row that deliberately leaves
+  // the mark, and on a conversation that never had a claim the floor is null: `readSelectionState`
+  // returns empty sets, the selection decides by the scalars alone, and the row is invisible to it
+  // while still visible to the all-or-nothing unique index of `claimReplyBurst`. The burst `[1, 2]`
+  // would be refused whole, new message included, and `partial` would reschedule into the same
+  // state: a loop, with the customer unanswered until the sweep repairs the old delivery.
   test("a dispensal with no floor does not swallow the message beside it", async () => {
     const convId = 935;
     await seedConversation(convId);
@@ -1905,8 +1908,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
-    // O portão recusou a resposta à mensagem 1 e deixou a marca para trás de propósito, porque a
-    // memória dela ainda é devida.
+    // NOTE: The gate refused the reply to message 1 and left the mark behind on purpose, because
+    // its memory is still owed.
     await dispenseMessagesFromReply({
       tenantId,
       conversationDbId: id,
@@ -1935,8 +1938,8 @@ describe.skipIf(!dbUp)("debounce", () => {
 
     expect(out.outcome).toBe("done");
     expect(sent.map(([, text]) => text)).toEqual([REPLY]);
-    // A palavra de cada uma é o que separa as duas decisões: 1 continua silenciada pelo portão, 2 é
-    // desta passada.
+    // NOTE: Each message's word separates the two decisions: 1 stays silenced by the gate, 2
+    // belongs to this pass.
     expect(
       (
         await suDb.messageReplyClaim.findFirstOrThrow({
@@ -1953,11 +1956,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe("CLAIMED");
   });
 
-  // E NADA ABAIXO DO PISO, que é a outra metade do mesmo invariante (issue #725, review rodada 8).
-  // Uma redentrega da era velha bate no mesmo portão fechado, e a decisão sobre ela já foi tomada
-  // pelos escalares: a linha só recriaria o conflito invisível de cima, e abrir a era para ela
-  // contradiz a frase que o `docs/debounce.md` sustenta — no piso e abaixo dele linha nenhuma foi
-  // escrita e nenhuma será.
+  // AND NOTHING AT OR BELOW THE FLOOR, the other half of the same invariant. A redelivery from the
+  // old era hits the same closed gate, and the scalars already decided it: a row would only
+  // recreate the invisible conflict above, and opening the era for it contradicts
+  // `docs/debounce.md`, where at and below the floor no row was written and none will be.
   test("a dispensal at or below the scalars writes nothing and starts no era", async () => {
     const convId = 930;
     await seedConversation(convId, { lastHandledMessageId: 5 });
@@ -1984,8 +1986,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       ).replyClaimFloorMessageId,
     ).toBeNull();
 
-    // E num conjunto misto a era começa, mas só a mensagem que a era nova pode enxergar ganha linha.
-    // A do próprio piso fica de fora com as de baixo: ela é a última que a era velha decidiu.
+    // NOTE: In a mixed set the era starts, but only the message the new era can see gets a row. The
+    // one AT the floor stays out with those below: it is the last one the old era decided.
     await dispenseMessagesFromReply({
       tenantId,
       conversationDbId: id,
@@ -2010,12 +2012,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe(5);
   });
 
-  // THE REPLY A PERSON WROTE IS THE FENCE NO ROW RECORDS (issue #698). Above the per-message floor
-  // the selection reads "no row" as "still owed", and a human agent answering a customer writes no
-  // row anywhere: `pendingIncoming` reads incoming messages only, so without this fence the thread a
-  // person already handled goes back to the model. The rule is asymmetric, and the control below is
-  // what proves the asymmetry rather than a blanket "any outgoing closes everything": OUR own reply
-  // must not close the messages its turn did not claim, or the fix above would undo itself.
+  // THE REPLY A PERSON WROTE IS THE FENCE NO ROW RECORDS. Above the per-message floor the selection
+  // reads "no row" as "still owed", and a human agent answering a customer writes no row anywhere
+  // (`pendingIncoming` reads incoming messages only), so without this fence the thread a person
+  // already handled goes back to the model. The rule is asymmetric, and the control below proves
+  // the asymmetry rather than a blanket "any outgoing closes everything": OUR own reply must not
+  // close the messages its turn did not claim.
   test("an outgoing a PERSON wrote closes the burst before it, and ours does not", async () => {
     const withPage = async (convId: number, senderType: string) => {
       await seedConversation(convId);
@@ -2061,17 +2063,14 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(ours.sent.map(([, text]) => text)).toEqual([REPLY]);
   });
 
-  // THE SAME FENCE, BY THE OTHER ROUTE A PERSON ANSWERS THROUGH (PR #701, review round 8). An
-  // attendant who replies on the phone paired to the inbox's number never opens the CRM, and the
-  // fork stores that echo SENDER-LESS: `senderType` is null on the row, so the clause above sees
-  // nothing and the burst the person just handled goes back to the model. The only mark on it is
-  // `external_sender_name`.
+  // THE SAME FENCE, BY THE PAIRED PHONE. An attendant who replies on the phone paired to the
+  // inbox's number never opens the CRM, and the fork stores that echo SENDER-LESS: `senderType` is
+  // null, so the clause above sees nothing. The only mark on it is `external_sender_name`.
   //
-  // AND THE MARK ALONE IS NOT ENOUGH, which is what the second half measures. On a provider that
-  // does not reserve its send ids, OUR OWN reply comes back wearing exactly this shape whenever the
-  // send response was lost: read as somebody else's, it would have the agent fall silent on a
-  // customer nobody answered — this issue's own defect, arriving through its fix. So the route is
-  // refused off the reserving providers, the same refusal `isDeviceAttendantMessage` makes.
+  // The mark alone is not enough: on a provider that does not reserve its send ids, OUR OWN reply
+  // comes back in exactly this shape whenever the send response was lost, and read as somebody
+  // else's it would silence a customer nobody answered. So the route is refused off the reserving
+  // providers, the same refusal `isDeviceAttendantMessage` makes.
   test("a reply typed on the PAIRED PHONE closes the burst, and only where the provider reserves its ids", async () => {
     const withProvider = async (convId: number, provider: string) => {
       await suDb.inbox.update({
@@ -2131,12 +2130,71 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // O IMPORTADOR ESCREVE O PASSADO COM OS IDS DE HOJE (PR #701, review round 9). Ao parear um
-  // telefone, o histórico entra como mensagens novas do ponto de vista do banco: a resposta que o
-  // atendente deu no ano passado recebe um id ACIMA da pergunta que o cliente mandou agora e casa com
-  // todas as cláusulas da fronteira. Lida como resposta, ela cala esse cliente — e o backlog inteiro
-  // do operador junto, de uma vez, no dia do pareamento. Mesma exclusão que o `hasDeviceAttendantShape`
-  // faz no webhook, aqui num ponto em que a marca é de fato alcançável: esta página vem do banco.
+  // THE SAME FENCE ON WHATSAPP CLOUD. A reply typed in the WhatsApp Business app on a Cloud number
+  // carries Cloud's own marks, never the session's, and the Cloud API never echoes what was sent
+  // through it, so on Cloud those marks are a person. On a session provider the same marks alone are
+  // not: an automation row there gets `external_created_at` once it is sent.
+  test("a phone reply on a CLOUD inbox closes the burst by Cloud's marks, and only on Cloud", async () => {
+    const withProvider = async (convId: number, provider: string) => {
+      await suDb.inbox.update({
+        where: { id: inboxDbId },
+        data: { provider },
+      });
+      await seedConversation(convId);
+      const { id } = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: convId },
+        select: { id: true },
+      });
+      await suDb.conversation.update({
+        where: { id },
+        data: { replyClaimFloorMessageId: 0 },
+      });
+      const sent: Array<[number, string]> = [];
+      await flushDebounceJob({
+        job: jobFor(convId),
+        base: appDb,
+        deps: {
+          makeModel: () => fakeModel(),
+          makeClient: makeStub({
+            pages: [
+              page([
+                { id: 1, content: "oi" },
+                { id: 2, content: "tudo bem?" },
+                {
+                  id: 3,
+                  content: "oi, aqui é a Ana",
+                  type: 1,
+                  fromCloudPhone: true,
+                },
+              ]),
+            ],
+            sent,
+            calls: { getMessages: 0 },
+          }),
+          checkpointer: new MemorySaver(),
+        },
+      });
+      return sent;
+    };
+
+    try {
+      expect(await withProvider(1675, "whatsapp_cloud")).toEqual([]);
+      expect(
+        (await withProvider(1676, "baileys")).map(([, text]) => text),
+      ).toEqual([REPLY]);
+    } finally {
+      await suDb.inbox.update({
+        where: { id: inboxDbId },
+        data: { provider: null },
+      });
+    }
+  });
+
+  // THE IMPORTER WRITES THE PAST WITH TODAY'S IDS. When a phone is paired, its history enters as
+  // new messages: last year's attendant reply gets an id ABOVE the question the customer just sent
+  // and matches every clause of the boundary. Read as a reply, it silences that customer, and the
+  // operator's whole backlog with it on pairing day. Same exclusion `hasDeviceAttendantShape` makes
+  // in the webhook, here where the mark is reachable because this page comes from the database.
   test("a backfilled reply from the phone's history is not a reply to what is live", async () => {
     const convId = 960;
     await suDb.inbox.update({
@@ -2187,10 +2245,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // UMA NOTA PRIVADA NÃO É UMA RESPOSTA AO CLIENTE (bateria de mutação da rodada 10, m7). Ela sai com
-  // remetente `user` e `message_type` de saída, casando com todas as outras cláusulas da fronteira, e
-  // o cliente nunca a vê: é a equipe falando entre si. Lida como resposta, ela cala uma conversa que
-  // ninguém atendeu, que é o custo assimétrico que esta fronteira existe para não pagar.
+  // A PRIVATE NOTE IS NOT A REPLY TO THE CUSTOMER. It goes out with sender `user` and an outgoing
+  // `message_type`, matching every other boundary clause, and the customer never sees it. Read as a
+  // reply, it silences a conversation nobody answered, the asymmetric cost this boundary exists to
+  // avoid.
   test("an operator's private note is not a reply to the customer", async () => {
     const convId = 961;
     await seedConversation(convId);
@@ -2231,9 +2289,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent.map(([, text]) => text)).toEqual([REPLY]);
   });
 
-  // E UM TEMPLATE QUE UMA PESSOA DISPAROU É UMA RESPOSTA (bateria de mutação da rodada 10, m8). Fora
-  // da janela de 24h do WhatsApp é a única forma de a equipe falar, então tratá-lo como outra coisa
-  // faria o agente responder por cima justamente nas conversas que ficaram paradas mais tempo.
+  // AND A TEMPLATE A PERSON SENT IS A REPLY. Outside WhatsApp's 24h window it is the only way the
+  // team can speak, so treating it as anything else would have the agent answer over them in
+  // exactly the conversations that sat idle longest.
   test("a template a person sent closes the burst like any other reply", async () => {
     const convId = 962;
     await seedConversation(convId);
@@ -2273,10 +2331,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent).toEqual([]);
   });
 
-  // A CERCA ACIMA DA MARCA ESCALAR, e não só onde não há marca nenhuma (bateria de mutação da rodada
-  // 10, m15). Antes da era por mensagem o piso é `max(escalar, fronteira)`, e o teste que existia
-  // cobria só o caso de marca nula: com uma marca, o `Math.max` some sem nada ficar vermelho, e a
-  // pergunta que a pessoa já respondeu volta para o modelo.
+  // THE FENCE ABOVE THE SCALAR MARK, not only where there is no mark. Before the per-message era
+  // the floor is `max(scalar, boundary)`; with only the null-mark case covered, the `Math.max`
+  // could go with nothing turning red, and the question the person already answered would go back
+  // to the model.
   test("before the per-message era, the fence applies ABOVE the scalar mark too", async () => {
     const convId = 963;
     await seedConversation(convId, { lastHandledMessageId: 1 });
@@ -2311,15 +2369,14 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(sent.map(([, text]) => text)).toEqual([REPLY]);
     const seen = model.seen.join("\n");
     expect(seen).toContain("qual o prazo");
-    // A que estava ENTRE a marca e a resposta da Ana é a que o `Math.max` tira.
+    // NOTE: The message BETWEEN the mark and Ana's reply is the one the `Math.max` takes out.
     expect(seen).not.toContain("tem alguém?");
   });
 
-  // QUAL PORTÃO RECUSOU IMPORTA (bateria de mutação da rodada 10, m23 e m29). São dois: a SELEÇÃO,
-  // que decide o que entra na rajada, e o portão de POST, que reconfere depois do modelo. Cada um
-  // sozinho produz o mesmo silêncio, então um teste que só olha o que foi enviado passa com qualquer
-  // um dos dois cego — e cego na seleção o modelo roda, com a conta e a latência disso, sobre
-  // mensagens que uma pessoa já respondeu.
+  // WHICH GATE REFUSED MATTERS. There are two: the SELECTION, which decides what enters the burst,
+  // and the POST gate, which rechecks after the model. Either alone produces the same silence, so a
+  // test that only looks at what was sent passes with either one blind, and blind at the selection
+  // the model runs, with its cost and latency, over messages a person already answered.
   test("the device reply is caught by the SELECTION, before the model runs", async () => {
     const convId = 964;
     await suDb.inbox.update({
@@ -2374,9 +2431,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // E O PORTÃO DE POST TEM QUE ENXERGAR A MESMA ROTA (bateria de mutação da rodada 10, m23). Aqui a
-  // resposta do aparelho chega DEPOIS da seleção, dentro da corrida do modelo, que é o único momento
-  // em que a seleção não pode ter visto nada.
+  // AND THE POST GATE HAS TO SEE THE SAME ROUTE. Here the device reply arrives AFTER the selection,
+  // during the model run, the only moment the selection cannot have seen anything.
   test("a device reply that lands mid-turn stops the flush from posting", async () => {
     const convId = 965;
     await suDb.inbox.update({
@@ -2401,9 +2457,9 @@ describe.skipIf(!dbUp)("debounce", () => {
           makeModel: () => fakeModel(),
           makeClient: makeStub({
             pages: [
-              // A seleção, antes de a atendente pegar o telefone.
+              // NOTE: The selection, before the attendant picks up the phone.
               page([{ id: 1, content: "tem alguém?" }]),
-              // O re-fetch do portão, depois.
+              // NOTE: The gate's re-fetch, after.
               page([
                 { id: 1, content: "tem alguém?" },
                 {
@@ -2429,11 +2485,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // THE COMMAND'S FENCE, in the selection this time (issue #698). `/reset` retires the pending burst
-  // and writes a dispensal for its own message id alone, so the messages it withdrew carry no row —
-  // and above the floor "no row" means "offer it". Read without this fence, the next flush rebuilds
-  // the memory the operator cleared and can re-run a request they took back, which is the P1 that
-  // sent the first attempt at this selection back (#690, review round 7).
+  // THE COMMAND'S FENCE, in the selection. `/reset` retires the pending burst and writes a
+  // dispensal for its own message id alone, so the messages it withdrew carry no row, and above the
+  // floor "no row" means "offer it". Without this fence the next flush rebuilds the memory the
+  // operator cleared and can re-run a request they took back.
   test("the selection does not offer back what /reset retired", async () => {
     const convId = 941;
     await seedConversation(convId);
@@ -2474,14 +2529,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("cancela o pedido");
   });
 
-  // AND THE SPEND VERDICT IS ASKED AGAIN ONCE A MESSAGE CAN BE OWED BELOW THE MARK (issue #698).
-  //
-  // The flush skips the ceiling when the watermark already covers the payload's last id: "this burst
-  // was answered by an earlier attempt, so there is nothing to refuse". That reading is a claim about
-  // every message below the mark, and it stops being true the moment the selection stops asking a
-  // single number — which is exactly the case this issue creates, a message with no row sitting below
-  // a mark another turn moved. Taken, the turn runs the model and its tools with no verdict asked,
-  // and withholding the reply afterwards does not unspend it.
+  // AND THE SPEND VERDICT IS ASKED AGAIN ONCE A MESSAGE CAN BE OWED BELOW THE MARK. The flush skips
+  // the ceiling when the watermark already covers the payload's last id ("answered by an earlier
+  // attempt, nothing to refuse"). That reading is a claim about every message below the mark, and
+  // it is false for a message with no row sitting below a mark another turn moved. Skipped, the
+  // turn runs the model and its tools with no verdict asked, and withholding the reply afterwards
+  // does not unspend it.
   test("over the ceiling, an owed message below the mark still gets the verdict", async () => {
     const convId = 942;
     await seedConversation(convId);
@@ -2489,8 +2542,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
-    // The mark covers the job's last id, and message 1 is owed below it: the shape of the retry this
-    // issue is about, written directly rather than raced into.
+    // NOTE: The mark covers the job's last id, and message 1 is owed below it: the retry shape,
+    // written directly rather than raced into.
     await suDb.conversation.update({
       where: { id },
       data: { replyClaimFloorMessageId: 0, lastHandledMessageId: 2 },
@@ -2539,6 +2592,21 @@ describe.skipIf(!dbUp)("debounce", () => {
         },
       });
       // THE ASSERTION. The turn never ran, because the ceiling was asked before it.
+      expect(sent).toEqual([
+        [
+          convId,
+          "Não consigo responder agora. Encaminhei sua mensagem para a equipe.",
+        ],
+      ]);
+      const claims = await suDb.messageReplyClaim.findMany({
+        where: { conversationId: id },
+        select: { messageId: true, reason: true },
+        orderBy: { messageId: "asc" },
+      });
+      expect(claims).toEqual([
+        { messageId: 1, reason: "DISPENSED" },
+        { messageId: 2, reason: "DISPENSED" },
+      ]);
       expect(model.seen).toEqual([]);
     } finally {
       await suDb.tenant.update({
@@ -2551,12 +2619,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // THE OTHER SIDE OF THE ASYMMETRY, and it is the side where the fix undoes itself (issue #698,
-  // holdout scenario s9). The test above proves a PERSON's reply closes the burst before it. This one
-  // proves OURS does not: our reply closes exactly the messages its turn claimed, and a message it
-  // never claimed is still owed afterwards. Read as a boundary, our own outgoing would re-lose every
-  // orphan this selection exists to find — and it would do it silently, because the flush would go on
-  // answering the newest message every time.
+  // THE OTHER SIDE OF THE ASYMMETRY, where the fence would undo itself. The test above proves a
+  // PERSON's reply closes the burst before it; this one proves OURS does not: our reply closes
+  // exactly the messages its turn claimed. Read as a boundary, our own outgoing would silently
+  // re-lose every orphan this selection exists to find, since the flush would go on answering the
+  // newest message every time.
   test("our own reply does not close the message its turn never claimed", async () => {
     const convId = 943;
     await seedConversation(convId);
@@ -2614,15 +2681,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("bom dia");
   });
 
-  // AND BELOW THE PER-MESSAGE FLOOR THE SCALAR STILL DECIDES, WHOLE (issue #698, mutation m7). This
-  // is the half of the rule that must NOT change, and it is invisible in every other test here: down
-  // there no row was ever written and none ever will be, so "no row" means nothing and the two
-  // scalars are the only thing that knows anything. Read by the rule that governs above the floor, a
-  // conversation that predates the per-message era would have its whole history offered back to the
-  // model on the next message — issue #452 and issue #8, reopened by the fix for #690.
-  //
-  // Measured as a gap: the mutant that answers `true` here survived the entire suite, 11890 tests,
-  // before this test existed.
+  // AND BELOW THE PER-MESSAGE FLOOR THE SCALAR STILL DECIDES, WHOLE. Down there no row was ever
+  // written and none ever will be, so "no row" means nothing and the two scalars are the only thing
+  // that knows anything. Read by the rule that governs above the floor, a conversation that
+  // predates the per-message era would have its whole history offered back to the model on the next
+  // message. No other test here sees this half.
   test("below the per-message floor the scalars still close the history", async () => {
     const convId = 944;
     await seedConversation(convId, { lastHandledMessageId: 5 });
@@ -2665,9 +2728,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("a última antiga");
   });
 
-  // AND "AGENT BOT" IS NOT THE SAME AS "OURS" (PR #701, review round 1). The exemption exists because
-  // our own reply is already recorded, message by message, in the claim rows. Another AgentBot on the
-  // same conversation writes nothing here: its reply closes what it answered and this runtime has no
+  // AND "AGENT BOT" IS NOT THE SAME AS "OURS". The exemption exists because our own reply is
+  // already recorded, message by message, in the claim rows. Another AgentBot on the same
+  // conversation writes nothing here: its reply closes what it answered and this runtime has no
   // record of it at all. Exempting every bot reads that reply as ours, so the messages it answered
   // come back as owed the moment the conversation returns to us.
   test("another AgentBot's reply closes the burst before it, like a person's", async () => {
@@ -2717,11 +2780,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("é urgente");
   });
 
-  // AND UMA SAÍDA SEM DONO NÃO É FRONTEIRA (PR #701, review round 1, segunda forma). A regra anda
-  // sobre evidência, nunca sobre silêncio: uma página que não atribuiu a saída pode estar descrevendo
-  // uma resposta NOSSA, e lê-la como de terceiro silencia um cliente que ninguém respondeu, que é o
-  // defeito desta issue chegando pelo conserto dela. O caminho de recuperação de entrega torna esse
-  // custo permanente, e é lá que a assimetria foi medida.
+  // AND AN OUTGOING WITH NO OWNER IS NOT A BOUNDARY. The rule runs on evidence, never on silence: a
+  // page that did not attribute the outgoing may be describing a reply of OURS, and reading it as a
+  // third party's silences a customer nobody answered. Delivery recovery makes that cost permanent.
   test("an outgoing the page did not attribute is not a boundary", async () => {
     const convId = 946;
     await seedConversation(convId);
@@ -2744,7 +2805,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           pages: [
             page([
               { id: 1, content: "tem alguém?" },
-              // Sem `sender`: a resposta automática de fora de horário, que a página não atribui.
+              // NOTE: No `sender`: the out-of-hours auto-reply, which the page does not attribute.
               {
                 id: 2,
                 content: "estamos fora do horário de atendimento",
@@ -2762,63 +2823,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen.join("\n")).toContain("tem alguém?");
   });
 
-  // E O PORTÃO DO FLUSH PERGUNTA O MESMO (PR #701, review round 1, mutante m13). A pessoa responde
-  // ENQUANTO o turno roda: a seleção que montou a rajada é de antes, e o re-fetch do portão é de
-  // depois. Perguntando só "chegou algo mais novo?", o portão vê a cerca ter tirado a rajada inteira
-  // da seleção e lê esse vazio como "ninguém veio depois de mim", postando por cima de quem
-  // respondeu.
-  test("a person who answers mid-turn stops the flush from posting", async () => {
-    const convId = 947;
-    await seedConversation(convId);
-    const { id } = await suDb.conversation.findFirstOrThrow({
-      where: { tenantId, chatwootConversationId: convId },
-      select: { id: true },
-    });
-    await suDb.conversation.update({
-      where: { id },
-      data: { replyClaimFloorMessageId: 0 },
-    });
-    const sent: Array<[number, string]> = [];
-    await flushDebounceJob({
-      job: jobFor(convId),
-      base: appDb,
-      deps: {
-        makeModel: () => fakeModel(),
-        makeClient: makeStub({
-          pages: [
-            // A seleção, antes da resposta humana.
-            page([{ id: 1, content: "tem alguém?" }]),
-            // O re-fetch do portão, depois dela.
-            page([
-              { id: 1, content: "tem alguém?" },
-              {
-                id: 2,
-                content: "oi, sou a Ana do suporte",
-                type: 1,
-                sender: "user",
-                senderId: 41,
-              },
-            ]),
-          ],
-          sent,
-          calls: { getMessages: 0 },
-        }),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(sent).toEqual([]);
-  });
-
-  // ...E QUEM RESPONDEU FECHA A RAJADA, em vez de deixá-la pendurada (issue #703). O teste acima
-  // afirma o silêncio, que é a metade fácil: os dois portões produzem silêncio. A metade que faltava
-  // é a CONTABILIDADE, e ela depende de qual recusa foi.
-  //
-  // `superseded` significa "chegou mensagem nova, e o flush dela está armado", e por isso não avança
-  // a marca, não grava dispensa e não liquida o ledger: a rajada inteira vai ser respondida de novo.
-  // Quando quem fechou foi uma PESSOA, nada disso é verdade — ninguém vem atrás. A rajada ficava sem
-  // marca e sem linha, e a entrega presa que ela estava resgatando continuava `DEAD`, reportada como
-  // cliente que ninguém atendeu e elegível para recuperação, que replaya o turno inteiro numa
-  // conversa já atendida.
+  // ...AND WHOEVER REPLIED CLOSES THE BURST, instead of leaving it hanging. The test above asserts
+  // the silence, which both gates produce; this asserts the BOOKKEEPING. `superseded` means "a new
+  // message arrived and its flush is armed", so it moves no mark, writes no dispensal and settles no
+  // ledger row. When a PERSON closed it nobody comes after, and a burst left open keeps its stranded
+  // delivery `DEAD`, reported as an unanswered customer and eligible for a recovery that replays
+  // the whole turn on an attended conversation.
   test("a burst a PERSON answered is closed, not left pending", async () => {
     const convId = 969;
     await seedConversation(convId);
@@ -2830,8 +2840,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { id },
       data: { replyClaimFloorMessageId: 0 },
     });
-    // A entrega da mensagem 1, morta por uma queda de processo: é exatamente o que reler a thread
-    // resgata, e o que esta recusa tem que fechar.
+    // Message 1's delivery, killed by a process crash: exactly what re-reading the thread
+    // rescues, and what this refusal has to close.
     const presa = await suDb.chatwootWebhookDelivery.create({
       data: {
         tenantId,
@@ -2854,10 +2864,11 @@ describe.skipIf(!dbUp)("debounce", () => {
         makeModel: () => fakeModel(),
         makeClient: makeStub({
           pages: [
-            // A seleção, antes de a atendente responder.
+            // NOTE: The selection, before the attendant replies.
             page([{ id: 1, content: "tem alguém?" }]),
-            // O re-fetch do portão, depois dela. A atribuição NÃO muda: sem isso o recheck de posse
-            // fecharia antes, com `taken-over`, que é outro caminho e já faz a coisa certa.
+            // NOTE: The gate's re-fetch, after it. The assignment does NOT change: otherwise the
+            // ownership recheck closes first with `taken-over`, another path that already does the
+            // right thing.
             page([
               { id: 1, content: "tem alguém?" },
               {
@@ -2875,22 +2886,23 @@ describe.skipIf(!dbUp)("debounce", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // O bot não fala por cima da pessoa: isto é o que já valia.
+    // NOTE: The bot does not talk over the person.
     expect(sent).toEqual([]);
-    // E a rajada fica FECHADA. A marca passa por ela.
+    // And the burst is CLOSED: the mark passes it.
     const conv = await suDb.conversation.findUniqueOrThrow({
       where: { id },
       select: { lastHandledMessageId: true },
     });
     expect(conv.lastHandledMessageId).toBe(1);
-    // A mensagem carrega a palavra que diz o que houve: ninguém a respondeu por nós.
+    // NOTE: The message carries the word that says what happened: nobody answered it on our behalf.
     expect(
       await suDb.messageReplyClaim.findFirst({
         where: { conversationId: id, messageId: 1 },
         select: { reason: true },
       }),
     ).toEqual({ reason: "DISPENSED" });
-    // E a entrega presa sai da lista de perdas, em vez de ser replayada numa conversa atendida.
+    // NOTE: And the stranded delivery leaves the loss list instead of being replayed on an attended
+    // conversation.
     expect(
       (
         await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
@@ -2899,11 +2911,10 @@ describe.skipIf(!dbUp)("debounce", () => {
         })
       ).status,
     ).toBe("PROCESSED");
-    // E A LINHA QUE FECHA A PERDA DIZ QUAL DAS DUAS COISAS ACONTECEU (issue #703, bateria de mutação,
-    // m13). O alerta da perda já foi disparado e não se recolhe, então esta linha é a única coisa que
-    // o operador tem para saber como aquilo terminou. Nós não respondemos nada aqui: dizer
-    // `answered_late` entregaria a ele uma resolução que ninguém escreveu, que é exatamente a mentira
-    // por causa da qual o vocabulário de liquidação foi partido em `answered` e `consumed`.
+    // AND THE LINE THAT CLOSES THE LOSS SAYS WHICH OF THE TWO HAPPENED. The loss alert
+    // already fired and cannot be recalled, so this line is all the operator has to learn how it
+    // ended. We answered nothing here: `answered_late` would hand them a resolution nobody wrote,
+    // which is why settlement tells `answered` from `consumed`.
     const linha = await correctionLine(convId);
     expect((linha.detail as Record<string, unknown>).outcome).toBe(
       "consumed_late",
@@ -2913,11 +2924,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     await suDb.chatwootWebhookDelivery.delete({ where: { id: presa.id } });
   });
 
-  // O CONTROLE QUE MANTÉM AS DUAS PALAVRAS SEPARADAS (issue #703). O conserto acima é uma palavra
-  // nova, e o jeito de ele se desfazer é alguém colapsar as duas de volta num `superseded` só. Aqui
-  // quem fecha é uma mensagem NOVA do cliente, e aí a marca tem que ficar exatamente onde estava: o
-  // flush rearmado responde a rajada inteira, e avançar aqui declararia atendida uma mensagem que
-  // ninguém leu.
+  // THE CONTROL THAT KEEPS THE TWO WORDS APART. Collapsing them back into one `superseded` undoes
+  // the test above. Here a NEW customer message closes the turn, so the mark stays exactly where it
+  // was: the re-armed flush answers the whole burst, and advancing here would declare handled a
+  // message nobody read.
   test("a burst superseded by a NEWER message is left where it was", async () => {
     const convId = 970;
     await seedConversation(convId);
@@ -2938,7 +2948,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         makeClient: makeStub({
           pages: [
             page([{ id: 1, content: "tem alguém?" }]),
-            // O cliente escreveu de novo no meio do turno.
+            // NOTE: The customer wrote again mid-turn.
             page([
               { id: 1, content: "tem alguém?" },
               { id: 2, content: "é urgente" },
@@ -2956,7 +2966,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       select: { lastHandledMessageId: true },
     });
     expect(conv.lastHandledMessageId).toBeNull();
-    // E nenhuma linha: a mensagem 1 continua devida, e o flush rearmado a responde com a 2.
+    // NOTE: And no line: message 1 is still owed, and the re-armed flush answers it with 2.
     expect(
       await suDb.messageReplyClaim.findFirst({
         where: { conversationId: id, messageId: 1 },
@@ -2964,12 +2974,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBeNull();
   });
 
-  // A CERCA VALE ANTES DA ERA POR MENSAGEM TAMBÉM (PR #701, review round 2, P1). Com o piso da era
-  // ainda nulo a seleção era a escalar pura, que não enxerga saída nenhuma, então a rajada saía
-  // carregando uma mensagem que a pessoa já tinha respondido — e o portão novo, vendo essa mensagem
-  // em ou abaixo da fronteira, recusava a rajada INTEIRA. A mensagem de depois da resposta humana,
-  // que ninguém respondeu, morria junto, sem reivindicação e sem reagendamento, e o flush seguinte
-  // repetia tudo enquanto aquele histórico estivesse visível.
+  // THE FENCE HOLDS BEFORE THE PER-MESSAGE ERA TOO. With the era floor still null the selection is
+  // purely scalar and sees no outgoing, so the burst would carry a message the person already
+  // answered, and the gate, seeing it at or below the boundary, would refuse the WHOLE burst. The
+  // message after the human reply, which nobody answered, would die with it, unclaimed and
+  // unrescheduled, and every later flush would repeat that while the history stayed visible.
   test("the foreign-reply fence applies before the per-message era starts", async () => {
     const convId = 948;
     await seedConversation(convId);
@@ -3000,18 +3009,17 @@ describe.skipIf(!dbUp)("debounce", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // A pergunta de depois da resposta humana é respondida, e a de antes dela não.
+    // NOTE: The question after the human reply is answered, the one before it is not.
     expect(sent.map(([, text]) => text)).toEqual([REPLY]);
     const seen = model.seen.join("\n");
     expect(seen).toContain("qual o prazo");
     expect(seen).not.toContain("tem alguém?");
   });
 
-  // UMA REAÇÃO NÃO É UMA RESPOSTA (PR #701, review round 2). O fork guarda o emoji do operador como
-  // mensagem de saída de verdade, pública, com remetente `user` e `content_attributes.is_reaction` —
-  // e `isHumanAgentMessage` em ../../src/modules/chatwoot/normalize.ts já exclui exatamente essa
-  // forma, pelo mesmo motivo: é um aceno, não algo que a equipe disse. Lida como fronteira, ela
-  // fecharia toda pergunta anterior a ela.
+  // A REACTION IS NOT A REPLY. The fork stores the operator's emoji as a real public outgoing
+  // message, with sender `user` and `content_attributes.is_reaction`, and `isHumanAgentMessage` in
+  // src/modules/chatwoot/normalize.ts excludes exactly that shape for the same reason: it is a nod,
+  // not something the team said. Read as a boundary, it would close every earlier question.
   test("an operator's emoji reaction is not a reply", async () => {
     const convId = 949;
     await seedConversation(convId);
@@ -3054,11 +3062,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen.join("\n")).toContain("remarcar pra sexta");
   });
 
-  // E O QUE O TETO RECUSOU TEM QUE FICAR RECUSADO (PR #701, review round 2). O acerto anterior fez o
-  // teto voltar a ser perguntado quando existe órfã abaixo da marca; a liquidação da recusa, porém,
-  // grava a faixa `(marca, último id do job]`, que não cobre nada abaixo da marca. A órfã recusada
-  // ficava sem linha, e o primeiro flush com orçamento de novo executava o pedido que a recusa tinha
-  // acabado de retirar.
+  // AND WHAT THE CEILING REFUSED STAYS REFUSED. The ceiling is asked again when an orphan sits
+  // below the mark, but settling the refusal by the range `(mark, job's last id]` covers nothing
+  // below the mark: the refused orphan would stay rowless, and the first flush with budget again
+  // would run the request the refusal withdrew.
   test("what the ceiling refused stays refused, including below the mark", async () => {
     const convId = 950;
     await seedConversation(convId, { lastHandledMessageId: 2 });
@@ -3123,7 +3130,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         where: { tenantId, source: "inbox" },
       });
     }
-    // Com orçamento de novo, o pedido retirado não é executado.
+    // With budget again, the withdrawn request is not run.
     const model = new CaptureReplyModel(REPLY);
     await flushDebounceJob({
       job: jobFor(convId, { lastMessageId: 2 }),
@@ -3137,103 +3144,13 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(model.seen.join("\n")).not.toContain("segunda via do boleto");
   });
 
-  // E O LEDGER FECHA O MESMO CONJUNTO QUE A RECUSA CONSUMIU (PR #701, review round 3). A recusa do
-  // teto passou a poder decidir sobre uma órfã ABAIXO da marca; o ledger continuava fechando por
-  // faixa a partir da marca, então a entrega daquela órfã ficava DEAD, reportada como perda que
-  // ninguém atendeu e elegível para recuperação, apesar de a recusa já ter decidido sobre ela.
-  test("the ceiling's refusal closes the ledger row of the orphan it consumed", async () => {
-    const convId = 952;
-    await seedConversation(convId, { lastHandledMessageId: 2 });
-    const { id } = await suDb.conversation.findFirstOrThrow({
-      where: { tenantId, chatwootConversationId: convId },
-      select: { id: true },
-    });
-    await suDb.conversation.update({
-      where: { id },
-      data: { replyClaimFloorMessageId: 0 },
-    });
-    // A entrega da órfã, parada e reportada como perda.
-    const reported = await suDb.chatwootWebhookDelivery.create({
-      data: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        deliveryId: `ceiling-orphan-${process.pid}`,
-        event: "message_created",
-        status: "DEAD",
-        processedAt: new Date(Date.now() - 60_000),
-        receivedAt: new Date(Date.now() - 120_000),
-        conversationId: convId,
-        inboundMessageId: 1,
-      },
-      select: { id: true },
-    });
-    const monthStart = new Date(
-      Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
-    );
-    await suDb.tenant.update({
-      where: { id: tenantId },
-      data: {
-        settings: { spendCeiling: { enabled: true, monthlyInboxUsd: 10 } },
-      },
-    });
-    await suDb.spendCostSnapshot.upsert({
-      where: {
-        tenantId_source_monthStart: { tenantId, source: "inbox", monthStart },
-      },
-      create: {
-        tenantId,
-        source: "inbox",
-        monthStart,
-        costUsd: 99,
-        polledAt: new Date(),
-      },
-      update: { costUsd: 99, polledAt: new Date() },
-    });
-    try {
-      await flushDebounceJob({
-        job: jobFor(convId, { lastMessageId: 2 }),
-        base: appDb,
-        deps: {
-          makeModel: () => fakeModel(),
-          makeClient: makeStub({
-            pages: [
-              page([
-                { id: 1, content: "me manda a segunda via" },
-                { id: 2, content: "obrigado" },
-              ]),
-            ],
-            sent: [],
-            calls: { getMessages: 0 },
-          }),
-          checkpointer: new MemorySaver(),
-        },
-      });
-    } finally {
-      await suDb.tenant.update({
-        where: { id: tenantId },
-        data: { settings: {} },
-      });
-      await suDb.spendCostSnapshot.deleteMany({
-        where: { tenantId, source: "inbox" },
-      });
-    }
-    expect(
-      (
-        await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
-          where: { id: reported.id },
-          select: { status: true },
-        })
-      ).status,
-    ).toBe("PROCESSED");
-  });
-
-  // ...E NÃO FECHA A DE QUEM ELA NÃO CONSUMIU (PR #701, review round 12). Alcançar a órfã abaixo da
-  // marca exigiu esticar a faixa do ledger para baixo, e faixa pega tudo o que está NO MEIO: a
-  // entrega que outro turno reivindicou e morreu segurando fica entre a órfã e o topo da rajada, a
-  // seleção a deixou de fora de propósito, e a recusa não decidiu nada sobre ela. Fechada por faixa,
-  // ela vira PROCESSED, que é o único estado que a varredura nunca mais olha — uma perda real
-  // apagada do relatório. Este exit é o único dos quatro que leu a página antes de decidir, então é
-  // o único que pode nomear os membros, e nomear é o que separa os dois casos.
+  // ...AND IT DOES NOT CLOSE THE ONE IT DID NOT CONSUME. Reaching the orphan below the mark
+  // stretches the ledger range down, and a range catches everything IN BETWEEN: a delivery another
+  // turn claimed and died holding sits between the orphan and the burst's top, the selection left
+  // it out on purpose, and the refusal decided nothing about it. Closed by range it becomes
+  // PROCESSED, the one state the sweep never looks at again: a real loss erased from the report.
+  // This exit is the only one of the four that read the page before deciding, so it can name the
+  // members, and naming is what separates the two cases.
   test("the ceiling's refusal does not close a delivery it never consumed", async () => {
     const convId = 966;
     await seedConversation(convId, { lastHandledMessageId: 3 });
@@ -3245,9 +3162,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { id },
       data: { replyClaimFloorMessageId: 0 },
     });
-    // A 2 é de OUTRO turno: reivindicada, e o processo morreu antes de enviar. A seleção a exclui
-    // pela linha de claim, e a entrega dela é perda de verdade, que a varredura ainda tem que
-    // reportar.
+    // NOTE: 2 belongs to ANOTHER turn: claimed, and the process died before sending. The selection
+    // excludes it by its claim row, and its delivery is a real loss the sweep still has to report.
     await suDb.messageReplyClaim.create({
       data: {
         tenantId,
@@ -3270,7 +3186,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       },
       select: { id: true },
     });
-    // A órfã que a recusa CONSOME de fato, abaixo da marca e sem linha nenhuma.
+    // The orphan the refusal really CONSUMES, below the mark and with no row at all.
     const daOrfa = await suDb.chatwootWebhookDelivery.create({
       data: {
         tenantId,
@@ -3344,18 +3260,17 @@ describe.skipIf(!dbUp)("debounce", () => {
           select: { status: true },
         })
       ).status;
-    // A órfã que a recusa consumiu fecha.
+    // NOTE: The orphan the refusal consumed closes.
     expect(await estado(daOrfa.id)).toBe("PROCESSED");
-    // A do turno que morreu segurando a 2 continua sendo perda, e continua no relatório.
+    // NOTE: The delivery of the turn that died holding 2 is still a loss, and stays in the report.
     expect(await estado(daOutraTurma.id)).toBe("DEAD");
   });
 
-  // O LADO DE DENTRO DA MESMA CERCA (PR #701, review round 13). A rodada 9 tirou a linha importada da
-  // FRONTEIRA, que é a metade de saída; esta é a de entrada. O importador não dispara webhook, então
-  // a pergunta que ele traz de volta não tem reivindicação nem dispensa — e acima do piso "sem linha"
-  // é exatamente o que esta seleção lê como "ainda devida". A escalar cobria isso por acidente, e
-  // esta PR é que ensinou a seleção a passar por baixo dela: reaberta, a pergunta do ano passado
-  // volta para o modelo e as ferramentas dela rodam de novo.
+  // THE INBOUND SIDE OF THE SAME FENCE. The imported row is already out of the BOUNDARY, the
+  // outgoing half; this is the incoming half. The importer fires no webhook, so the question it
+  // brings back has no claim and no dispensal, and above the floor "no row" is exactly what this
+  // selection reads as "still owed". Reopened, last year's question goes back to the model and its
+  // tools run again.
   test("an imported question from the history is not an unanswered one", async () => {
     const convId = 967;
     await seedConversation(convId, { lastHandledMessageId: 2 });
@@ -3377,11 +3292,11 @@ describe.skipIf(!dbUp)("debounce", () => {
         makeClient: makeStub({
           pages: [
             page([
-              // Retaguarda que o importador trouxe: id de hoje, conversa do ano passado, sem linha
-              // nenhuma e abaixo da marca que a mensagem real empurrou.
+              // NOTE: Backfill the importer brought: today's id, last year's conversation, no row
+              // at all, and below the mark the real message pushed.
               { id: 1, content: "cancela meu plano", imported: true },
               { id: 2, content: "obrigado", imported: true },
-              // A mensagem de verdade, que é a que o cliente está esperando.
+              // NOTE: The real message, the one the customer is waiting on.
               { id: 3, content: "bom dia, queria remarcar" },
             ]),
           ],
@@ -3397,10 +3312,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("cancela meu plano");
   });
 
-  // E DOS DOIS LADOS DO PISO, como toda cerca desta seleção. Antes da era por mensagem quem decide é
-  // a escalar, que cobre a retaguarda por acidente quando o importador escreve abaixo da marca — e
-  // não cobre quando ele escreve acima dela, que é o caso de uma conversa que ainda não tinha marca
-  // nenhuma. A pergunta do ano passado é a mesma pergunta nos dois casos.
+  // AND ON BOTH SIDES OF THE FLOOR, like every fence of this selection. Before the per-message era
+  // the scalar decides, which covers the backfill by accident when the importer writes below the
+  // mark and does not when it writes above it, as on a conversation that had no mark yet. Last
+  // year's question is the same question in both cases.
   test("the import fence applies before the per-message era too", async () => {
     const convId = 968;
     await seedConversation(convId);
@@ -3430,10 +3345,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("cancela meu plano");
   });
 
-  // E O PORTÃO DE POSSE FECHA A ÓRFÃ TAMBÉM (PR #701, review round 4). A rodada 3 fez a faixa começar
-  // no piso da era, mas o RAMO do contexto que este portão devolve não carregava o campo do piso, e
-  // a expressão caía de volta na marca exatamente aqui. O defeito sobrevivia num ramo, calado: a
-  // órfã ficava sem linha e voltava como devida assim que a conversa voltasse para o bot.
+  // AND THE OWNERSHIP GATE CLOSES THE ORPHAN TOO. The range starts at the era floor, and the
+  // context branch this gate returns has to carry the floor field, or the expression falls back to
+  // the mark right here: the orphan stays rowless and comes back as owed once the conversation
+  // returns to the bot.
   test("a closed ownership gate closes the orphan below the mark too", async () => {
     const convId = 953;
     await seedConversation(convId, {
@@ -3462,7 +3377,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // A conversa volta para o bot e uma mensagem nova chega.
+    // NOTE: The conversation returns to the bot and a new message arrives.
     await suDb.conversation.update({
       where: { id },
       data: { assigneeType: null, assigneeId: null, status: "pending" },
@@ -3493,12 +3408,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(seen).not.toContain("cancela meu plano");
   });
 
-  // O PORTÃO NÃO PODE HERDAR A ESTRATÉGIA DE CAUDA DE QUEM O CHAMOU (PR #701, review round 5). O
-  // clique do operador seleciona a cauda DEPOIS da última saída, e uma saída nossa no meio do turno
-  // (o aviso de ferramenta lenta do prepare.ts) esvazia essa cauda: perguntando com o seletor do
-  // chamador, o portão vê zero e conclui "ninguém veio depois de mim", postando uma resposta que o
-  // cliente já superou. A fronteira também não pega, porque o aviso é NOSSO. A pergunta do portão é
-  // sempre a mesma, seja quem for o chamador: existe mensagem ABERTA acima do que eu ia responder?
+  // THE GATE DOES NOT INHERIT ITS CALLER'S TAIL STRATEGY. The operator's click selects the tail
+  // AFTER the last outgoing, and an outgoing of ours mid-turn (the slow-tool notice from
+  // src/graph/prepare.ts) empties that tail: asked with the caller's selector, the gate sees zero
+  // and concludes "nobody came after me", posting a reply the customer already moved past. The
+  // boundary does not catch it either, because the notice is OURS. The gate always asks one
+  // question: is there an OPEN message above what I was about to answer?
   test("an ack of ours mid-turn does not hide a newer customer message from the click", async () => {
     const convId = 955;
     await seedConversation(convId);
@@ -3507,8 +3422,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       select: { id: true },
     });
     const sent: Array<[number, string]> = [];
-    // A 2 e o nosso aviso chegam DURANTE a chamada do modelo, que é a janela real: tudo que o portão
-    // relê depois é o estado de depois deles.
+    // 2 and our notice arrive DURING the model call, the real window: everything the gate
+    // re-reads afterwards is the state after them.
     let midTurn = false;
     const model = new SideEffectModel(async () => {
       midTurn = true;
@@ -3552,11 +3467,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(clicked.outcome).toBe("superseded");
   });
 
-  // QUEM CLASSIFICA A SAÍDA TEM QUE SER QUEM A PRODUZ (PR #701, review round 6). O payload do job é
-  // de quando a rajada foi armada; quem envia é `ctx.loaded.agentBotToken`, da persona que o inbox
-  // serve AGORA. Religado o inbox nesse meio-tempo, os dois divergem — e classificando pelo payload,
-  // o aviso que a persona nova acabou de postar vira saída de terceiro, a fronteira fecha a rajada
-  // dela mesma e o portão engole a resposta.
+  // THE PERSONA THAT PRODUCES THE OUTGOING CLASSIFIES IT. The job payload is from when the burst
+  // was armed; the sender is `ctx.loaded.agentBotToken`, the persona the inbox serves NOW. With the
+  // inbox rebound in between the two diverge, and classified by the payload, the notice the new
+  // persona just posted becomes a third party's outgoing: the boundary closes its own burst and the
+  // gate swallows the reply.
   test("the persona that sends is the one that classifies its own outgoing", async () => {
     const convId = 956;
     const OTHER_BOT = 77;
@@ -3620,7 +3535,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       midTurn = true;
     });
     await flushDebounceJob({
-      // O payload nomeia o bot ANTIGO, que é o que o job carregava.
+      // NOTE: The payload names the OLD bot, which is what the job carried.
       job: jobFor(convId),
       base: appDb,
       deps: {
@@ -3646,14 +3561,14 @@ describe.skipIf(!dbUp)("debounce", () => {
       },
     });
     void midTurn;
-    // O aviso é da própria persona: ele não fecha a rajada dela.
+    // NOTE: The notice is the persona's own: it does not close its burst.
     expect(sent.length).toBe(1);
   });
 
-  // E O TOPO DO LEDGER É O DA RAJADA, não o do payload (PR #701, review round 7). A recusa relê a
-  // página, então a rajada recusada pode conter mensagem MAIS NOVA que o `lastMessageId` do job. A
-  // dispensa já nomeia todas elas; o ledger, fechando só até o `last` antigo, deixava a entrega da
-  // mais nova parada e reportada como perda, enquanto a seleção já a excluía.
+  // AND THE LEDGER'S TOP IS THE BURST'S, not the payload's. The refusal re-reads the page, so the
+  // refused burst can hold a message NEWER than the job's `lastMessageId`. The dispensal names them
+  // all; a ledger closed only up to the payload's last id would leave the newest one's delivery
+  // stuck and reported as a loss while the selection already excludes it.
   test("the ceiling's refusal closes the ledger row of a message newer than the payload", async () => {
     const convId = 957;
     await seedConversation(convId);
@@ -3675,7 +3590,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         processedAt: new Date(Date.now() - 60_000),
         receivedAt: new Date(Date.now() - 120_000),
         conversationId: convId,
-        // MAIS NOVA que o `lastMessageId` do job abaixo.
+        // NOTE: NEWER than the job's `lastMessageId` below.
         inboundMessageId: 3,
       },
       select: { id: true },
@@ -3741,9 +3656,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe("PROCESSED");
   });
 
-  // THE CEILING STILL ANSWERS BELOW THE FLOOR, which is where issue #452 keeps living: a deliberate
-  // skip writes no row anywhere, so on the messages that predate this conversation's per-message era
-  // the watermark is the only thing that knows anything, and it answers unrelaxed.
+  // THE CEILING STILL ANSWERS BELOW THE FLOOR: a deliberate skip writes no row anywhere, so on the
+  // messages that predate this conversation's per-message era the watermark is the only thing that
+  // knows anything, and it answers unrelaxed.
   //
   // The floor is written here rather than earned, because earning it takes a claim and a claim is
   // what this test needs to be refused.
@@ -3773,8 +3688,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       tenantId,
       conversationDbId: id,
       toMessageId: 40,
-      // Positioning the mark, not reporting a decision: this call closes nothing, and
-      // says so explicitly rather than letting a default speak for it (issue #690).
+      // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says so
+      // explicitly rather than letting a default speak for it.
       dispensed: { kind: "messages", messageIds: [] },
       base: appDb,
     });
@@ -3791,69 +3706,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await claim(50, null)).toEqual({ won: false, reason: "handled" });
   });
 
-  // THE SCALAR CLOSES WHAT NOBODY ANSWERED (issue #690). Two deliveries of one conversation with
-  // debounce OFF, serialized since issue #658: the turn that takes the thread first is the NEWER
-  // message's, and it loaded the channel before the older one existed — measured 12/12 on that
-  // round's holdout, the model's history was `[system, MSG-B]`. The direct path claims ONE message,
-  // its own trigger (`claimReply` in ../../src/graph/runtime.ts), so that turn claims 1002 and the
-  // column, being a single number, closes 1001 with it. The older message's turn is the only actor
-  // in the system that loaded BOTH, and it is exactly the one refused.
-  //
-  // BOTH GATES REFUSE IT, which is why this asserts on the two in order. `claimed` is asked first
-  // (1002 >= 1001), and behind it stands the ceiling: the newer turn advanced the watermark to 1002
-  // on its way out, so `handled > maxHandledAllowed` refuses the same claim a second time. A fix
-  // that moves only the first leaves the message unanswered for the same reason with a different
-  // word in the log.
-  //
-  // Nothing reopens 1001 afterwards: the watermark moved, the channel keeps it as context only, and
-  // no schedule exists for it. If the customer does not write again, that message is never answered
-  // and the operator sees nothing, because from the system's side the burst was served.
-  test("a newer burst's claim does not close a message no turn answered", async () => {
-    const convId = 896;
-    await seedConversation(convId);
-    const { id } = await suDb.conversation.findFirstOrThrow({
-      where: { tenantId, chatwootConversationId: convId },
-      select: { id: true },
-    });
-    const claim = (toMessageId: number, maxHandledAllowed: number | null) =>
-      claimReplyBurst({
-        tenantId,
-        conversationDbId: id,
-        toMessageId,
-        maxHandledAllowed,
-        // The direct path's shape: one turn, one message, its own trigger.
-        messageIds: [toMessageId],
-        initiatedBy: "automatic",
-        base: appDb,
-      });
-
-    // MSG-B (1002) arrives second and is answered first, by a turn that never had MSG-A. The
-    // ceiling is the direct path's own: nothing at or past my message may have been handled.
-    expect(await claim(1002, 1001)).toEqual({ won: true });
-    await advanceHandledWatermark({
-      tenantId,
-      conversationDbId: id,
-      toMessageId: 1002,
-      // Positioning the mark, not reporting a decision: this call closes nothing, and
-      // says so explicitly rather than letting a default speak for it (issue #690).
-      dispensed: { kind: "messages", messageIds: [] },
-      base: appDb,
-    });
-
-    // MSG-A (1001), whose turn read `[system, MSG-B, RESP-B, MSG-A]` and is the one that can answer
-    // it. No turn has spoken for 1001; a reply that never saw it must not close it.
-    expect(await claim(1001, 1000)).toEqual({ won: true });
-  });
-
-  // THE SECOND GATE, ISOLATED (issue #690). The test above is refused by `claimed`, which is asked
-  // first and hides a ceiling standing right behind it: the newer turn advances the watermark to
-  // 1002 on its way out — every outcome but `superseded` does (../../src/graph/runtime.ts) — so
-  // `handled > maxHandledAllowed` refuses the same claim a second time, for a different reason.
-  // Measured rather than reasoned: before the fix this returned `handled`, so a fix that moved only
-  // `claimed` would land exactly here, with the message still unanswered and the word changed in
-  // the log.
-  //
-  // No row is written for 1001 anywhere in here, so the ceiling is the only thing that could refuse.
+  // THE SECOND GATE, ISOLATED. The test above is refused by `claimed` first, which hides the
+  // ceiling standing right behind it: the newer turn advances the watermark to 1002 on its way out
+  // (every outcome but `superseded` does, src/graph/runtime.ts), so `handled > maxHandledAllowed`
+  // would refuse the same claim for a different reason. No row is written for 1001 anywhere in
+  // here, so the ceiling is the only thing that could refuse.
   test("the handled ceiling no longer refuses a message above the floor", async () => {
     const convId = 897;
     await seedConversation(convId);
@@ -3867,8 +3724,8 @@ describe.skipIf(!dbUp)("debounce", () => {
       tenantId,
       conversationDbId: id,
       toMessageId: 1000,
-      // Positioning the mark, not reporting a decision: this call closes nothing, and
-      // says so explicitly rather than letting a default speak for it (issue #690).
+      // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says so
+      // explicitly rather than letting a default speak for it.
       dispensed: { kind: "messages", messageIds: [] },
       base: appDb,
     });
@@ -3888,13 +3745,14 @@ describe.skipIf(!dbUp)("debounce", () => {
       tenantId,
       conversationDbId: id,
       toMessageId: 1002,
-      // Positioning the mark, not reporting a decision: this call closes nothing, and
-      // says so explicitly rather than letting a default speak for it (issue #690).
+      // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says so
+      // explicitly rather than letting a default speak for it.
       dispensed: { kind: "messages", messageIds: [] },
       base: appDb,
     });
 
-    // MSG-A's turn. `handled` is 1002 against a ceiling of 1000, which is what used to refuse it.
+    // NOTE: MSG-A's turn: `handled` is 1002 against a ceiling of 1000, and above the floor that
+    // does not refuse it.
     expect(
       await claimReplyBurst({
         tenantId,
@@ -3918,12 +3776,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     ).toBe(1000);
   });
 
-  // A LOST WATERMARK WRITE MUST NOT COST A SECOND REPLY (issue #452). The claim is written
-  // immediately before the send and the watermark only after the turn returns, so a reply that
-  // lands and then loses its watermark write leaves the message answered with the mark behind it —
-  // the direct path catches that failure and logs it, and a process exit does the same. Selecting
-  // from the mark alone, this flush would coalesce the answered message with the newer one and, the
-  // target being higher, win the claim and answer it again. The floor is the max of the two.
+  // A LOST WATERMARK WRITE MUST NOT COST A SECOND REPLY. The claim is written immediately before
+  // the send and the watermark only after the turn returns, so a reply that lands and then loses
+  // its watermark write leaves the message answered with the mark behind it (the direct path
+  // catches that failure and logs it, and a process exit does the same). Selecting from the mark
+  // alone, this flush would coalesce the answered message with the newer one and, the target being
+  // higher, win the claim and answer it again. The floor is the max of the two.
   test("a message the claim records is not re-answered when the watermark lags", async () => {
     const convId = 895;
     await seedConversation(convId);
@@ -3964,6 +3822,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     // a second time.
     await settleFlowEvents();
     const row = await flowLogRow(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, threadId: threadOf(convId), stage: "debounce" },
       select: { detail: true },
     });
@@ -3971,10 +3830,10 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   // THE SECOND QUESTION THE CLAIM ANSWERS, and the flush needs it too: a burst is selected from
-  // ABOVE the watermark, but the mark can move between that selection and the post — a deliberate
+  // ABOVE the watermark, but the mark can move between that selection and the post. A deliberate
   // skip by another delivery (a handoff, an out-of-hours silence) settles those messages without
-  // ever writing a reply of ours to claim against. The losing CAS used to say so for free; now it
-  // is `requireUnhandled`, asked under the claim's own row lock (issue #452).
+  // ever writing a reply of ours to claim against, and `requireUnhandled` asks about it under the
+  // claim's own row lock.
   test("a burst handled while the turn ran is not answered", async () => {
     const convId = 893;
     await seedConversation(convId);
@@ -3993,8 +3852,8 @@ describe.skipIf(!dbUp)("debounce", () => {
             tenantId,
             conversationDbId: id,
             toMessageId: 1,
-            // Positioning the mark, not reporting a decision: this call closes nothing, and
-            // says so explicitly rather than letting a default speak for it (issue #690).
+            // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and
+            // says so explicitly rather than letting a default speak for it.
             dispensed: { kind: "messages", messageIds: [] },
             base: appDb,
           });
@@ -4026,19 +3885,13 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await replyClaimOf(convId)).toBeNull();
   });
 
-  // ONE CLAIM FOR EVERY POSTING PATH (issue #452). The re-engage button and a flush answer the same
-  // burst through different entry points, and the only thing that stops them both sending is that
-  // they claim the SAME column. Split the claim per caller — the flush on the watermark, the button
-  // on a column of its own — and the two stop contending: an operator clicking while a retry of the
-  // same failed burst is in flight gets the customer two replies.
-  //
-  // Ordered deterministically instead of raced, and stopped at the ONE instant where the claim is
-  // the only thing that can answer: the flush runs to completion inside the click's burst selection,
-  // and then its watermark write is undone. That is a real state, not a contrivance — the claim is
-  // written before the send and the watermark only after the turn returns, so every reply passes
-  // through it, and a lost watermark write leaves the conversation there for good. Letting the
-  // flush's watermark stand instead makes the test pass with the claim GONE: the click's handled
-  // ceiling refuses it on the mark alone, and the mutation that drops the claim's CAS survives.
+  // ONE CLAIM FOR EVERY POSTING PATH. The re-engage button and a flush answer the same burst
+  // through different entry points, and only claiming the SAME column stops both sending: with the
+  // claim split per caller, an operator clicking while a retry of the same failed burst is in
+  // flight gets the customer two replies. Ordered, not raced: the flush completes inside the click's
+  // burst selection and its watermark write is then undone, the real state a lost watermark write
+  // leaves. With the flush's watermark left standing the click's handled ceiling refuses on the mark
+  // alone, and a mutation that drops the claim's CAS survives.
   test("a flush completing inside an operator's click leaves one reply", async () => {
     const convId = 891;
     await seedConversation(convId);
@@ -4053,8 +3906,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     const client = {
       getMessages: async () => {
         fetches += 1;
-        // The click's burst selection (its pre-fetch was #1): the tail is about to be chosen, and
-        // the flush answers it and claims it before the click's own post gate is reached.
+        // NOTE: The click's burst selection (its pre-fetch was the first): the tail is about to be
+        // chosen, and the flush answers it and claims it before the click's own post gate is
+        // reached.
         if (fetches === 2) {
           const before = (
             await suDb.conversation.findUniqueOrThrow({
@@ -4107,14 +3961,10 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   test("a flush retires the ledger row of a message it rescued", async () => {
-    // The half of issue #228 that makes the sweep's question answerable, and the reason there is no
-    // watermark arithmetic left in the classifier.
-    //
-    // Message 1's delivery died mid-processing, so its ledger row sits non-terminal with nothing
-    // working it. Message 2 arrives and arms a flush, and the flush re-reads the WHOLE thread from
-    // Chatwoot rather than the message that armed it — so message 1 is in the burst and does get
-    // answered. Nothing about the conversation's watermarks can express that afterwards, but the
-    // turn knows it, so it says so on the row.
+    // Message 1's delivery died mid-processing, so its ledger row sits non-terminal with
+    // nothing working it. Message 2 arms a flush that re-reads the WHOLE thread from Chatwoot, so
+    // message 1 is in the burst and gets answered. No watermark can express that afterwards, so the
+    // turn says so on the row, and the sweep's classifier needs no watermark arithmetic.
     const convId = 880;
     await seedConversation(convId);
     const stranded = await suDb.chatwootWebhookDelivery.create({
@@ -4167,7 +4017,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
-    await new Promise((r) => setTimeout(r, 200));
+    // `flowLogCount` settles every tracked write before counting, so a line the rescue owed is here.
     expect(
       await flowLogCount(suDb, {
         where: { tenantId, conversationId: conv.id, stage: "delivery" },
@@ -4177,14 +4027,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     await suDb.chatwootWebhookDelivery.delete({ where: { id: stranded.id } });
   });
 
-  // THE LEDGER READS THE LIST THE TURN'S INPUT CAME FROM, not the one the selector produced (issue
-  // #576, PR review round 10). The two are identical today — `pendingIncoming` admits a message on
-  // `content OR an attachment`, the exact complement of the one branch `renderInboundMessage`
-  // returns "" on — so this asks the seam directly, with a `selectPending` that hands the burst a
-  // message the real one would have dropped. That is what a drift between those two predicates
-  // would look like from in here, and the cost of reading `pending` instead is a message recorded
-  // as covered by a turn that never saw it, whose own write-back then finds the record and stays
-  // quiet.
+  // THE LEDGER READS THE LIST THE TURN'S INPUT CAME FROM, not the one the selector produced. The
+  // two agree today (`pendingIncoming` admits a message on `content OR an attachment`, the exact
+  // complement of the branch where `renderInboundMessage` returns ""), so this asks the seam
+  // directly, with a `selectPending` that hands the burst a message the real one would drop.
+  // Reading `pending` instead would record a message as covered by a turn that never saw it, whose
+  // own write-back then finds the record and stays quiet.
   test("the burst separates what rendered from what was selected", async () => {
     const convId = 8942;
     await seedConversation(convId);
@@ -4210,8 +4058,8 @@ describe.skipIf(!dbUp)("debounce", () => {
           pages: [
             page([
               { id: 1, content: "tem horário?" },
-              // Nothing to render: no content, no attachment. This is the shape the real selector
-              // drops, and the shape a voice note takes before its attachment lands (issue #478).
+              // NOTE: Nothing to render: no content, no attachment. The shape the real selector
+              // drops, and the shape a voice note takes before its attachment lands.
               { id: 2, content: "" },
             ]),
           ],
@@ -4320,15 +4168,13 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   test("a flush stopped by a closed gate settles the ledger too", async () => {
-    // The gate exits decide before any Chatwoot fetch: they advance the watermark from the payload's
-    // own lastMessageId and return. A delivery that armed this flush and then died is sitting
-    // PROCESSING, and left there it becomes a reported loss for a message the product deliberately
-    // declined to answer — a human holds the conversation, and reporting "nobody answered" about it
-    // is exactly the wrong thing to page someone with.
+    // The gate exits decide before any Chatwoot fetch: they advance the watermark from the
+    // payload's own lastMessageId and return. A delivery that armed this flush and then died is
+    // sitting PROCESSING, and left there it becomes a reported loss for a message the product
+    // deliberately declined to answer (a human holds the conversation).
     //
-    // The exit knows the burst only as "everything up to this id", which is what the watermark it
-    // writes says, so the retirement takes the same range. Sound as a WRITE at the moment of the
-    // decision, in a way reading a watermark afterwards never was.
+    // The exit knows the burst only as "everything up to this id", which is what its watermark
+    // says, so the retirement takes the same range, written at the moment of the decision.
     const convId = 886;
     // The watermark already sits at 2: messages 1 and 2 had their fate decided before this flush
     // was ever armed.
@@ -4480,21 +4326,14 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   test("a gate closed by ANOTHER BOT leaves the ledger alone", async () => {
-    // The same exit, closed by the one state whose settlement may not widen.
-    //
-    // Chatwoot fans a message to up to two routes — `agent_bots_for` returns the conversation's
-    // assignee bot and the inbox's bot, each with its own delivery id — so a message inside this
-    // burst can have a SECOND ledger row belonging to the bot that now owns the conversation, and
-    // that row can be `PROCESSING` because its turn is running right now. A range write turns it
-    // `PROCESSED`, the one state the sweep never revisits; if that route then dies, the customer it
-    // was answering is unanswered with nothing anywhere saying so.
-    //
-    // The direct webhook path already scopes to its own row here. The flush has no row of its own to
-    // scope to, so it retires nothing: the price is a strand of OURS staying in the loss list while
-    // another bot answers the customer, which is wrong and visible rather than quiet and wrong.
-    //
-    // The watermark still advances, and that half is not a detail: it is what keeps a later flush
-    // from re-coalescing this burst and answering over the bot that took the conversation.
+    // The same exit, closed by the one state whose settlement may not widen. Chatwoot fans a
+    // message to up to two routes (`agent_bots_for`: the assignee bot and the inbox's bot, each
+    // with its own delivery id), so a message in this burst can have a SECOND ledger row,
+    // `PROCESSING` for the bot that now owns the conversation. A range write turns it `PROCESSED`,
+    // which the sweep never revisits; if that route then dies, the customer is unanswered with
+    // nothing saying so. The flush has no row of its own to scope to, so it retires nothing: a
+    // strand of OURS stays in the loss list, wrong but visible. The watermark still advances, which
+    // keeps a later flush from re-coalescing this burst over the bot that took the conversation.
     const convId = 890;
     await seedConversation(convId, {
       assigneeType: "AgentBot",
@@ -4745,14 +4584,11 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   test("a flush leaves a strand the burst did NOT contain alone", async () => {
-    // The regression test for the finding that killed the watermark design for good. Message 1's
-    // delivery died. Message 2 arrived while the conversation was human-owned, so the webhook
-    // advanced the handled watermark past BOTH without answering either. Message 3 then arms a
-    // flush, and the burst floor is now the watermark — so the burst is {3} and message 1 is NOT in
-    // it. Nothing covered message 1, and its row must stay non-terminal to say so.
-    //
-    // Every version of this that read a watermark closed this row: the mark ends up past message 1
-    // whether it counts skips or only posts, because the burst that posted started ABOVE it.
+    // Message 1's delivery died. Message 2 arrived while the conversation was human-owned, so
+    // the webhook advanced the handled watermark past BOTH without answering either. Message 3 then
+    // arms a flush whose burst floor is the watermark, so the burst is {3}: nothing covered message
+    // 1, and its row stays non-terminal to say so. Any rule that reads a watermark closes this row,
+    // whether the mark counts skips or only posts, because the burst that posted started ABOVE it.
     const convId = 882;
     await seedConversation(convId);
     await advanceHandledWatermark({
@@ -4764,8 +4600,8 @@ describe.skipIf(!dbUp)("debounce", () => {
         })
       ).id,
       toMessageId: 2,
-      // Positioning the mark, not reporting a decision: this call closes nothing, and
-      // says so explicitly rather than letting a default speak for it (issue #690).
+      // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says so
+      // explicitly rather than letting a default speak for it.
       dispensed: { kind: "messages", messageIds: [] },
       base: appDb,
     });
@@ -4816,20 +4652,13 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
 
   test("a flush CORRECTS a row already reported as a loss, and says so", async () => {
-    // An earlier round of this PR asserted the opposite, and had confused the RECORD with the
-    // WORKLIST. The record is the flow line, written once and never rewritten; `WHERE status =
-    // 'DEAD'` is the worklist, and it answers "who is still unanswered". A turn that ran over the
-    // message is direct evidence against a verdict the sweep reached by INFERENCE — nothing has
-    // moved this row — so the evidence wins and the row leaves the worklist.
-    //
-    // It happens two ways: the sweep firing in the sliver between a turn posting and the retirement,
-    // and a long-reported message finally answered by a burst that reached back past it. In both the
-    // customer has a reply, and leaving the row in the list sends an operator to a conversation
-    // where there is nothing to do.
-    //
-    // Nothing is erased. The loss line stays, and a second line joins it saying how it ended —
-    // without that, the row would simply vanish from the list while the alert an operator already
-    // received stands with nothing to close it.
+    // The RECORD is the flow line, written once and never rewritten; `WHERE status = 'DEAD'`
+    // is the WORKLIST, and it answers "who is still unanswered". A turn that ran over the message
+    // is direct evidence against a verdict the sweep reached by inference, so the row leaves the
+    // worklist. That happens when the sweep fires between a turn posting and the retirement, or
+    // when a burst reaches back past a long-reported message. Nothing is erased: the loss line
+    // stays and a second line says how it ended, or the alert an operator already received would
+    // stand with nothing to close it.
     const convId = 883;
     await seedConversation(convId);
     const reported = await suDb.chatwootWebhookDelivery.create({
@@ -4983,11 +4812,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(801)).toBeNull();
   });
 
-  // A PARTIAL REPLY MUST NOT CLOSE THE CONVERSATION (issue #429). The old code kept this rule by
-  // accident — a send that failed mid-reply threw, and a throw discards the deferred intent — so
-  // reporting instead of throwing is what woke the path up. The cost of getting it wrong: the model
-  // called `resolve_conversation` believing it had answered, the customer holds the first balloon
-  // and not the rest, and `resolved` is what tells the operator there is nothing left to do.
+  // A PARTIAL REPLY MUST NOT CLOSE THE CONVERSATION. The model called `resolve_conversation`
+  // believing it had answered, the customer holds the first balloon and not the rest, and
+  // `resolved` would tell the operator there is nothing left to do.
   //
   // The turn still reports `posted`: the customer HAS part of it, and re-running would send that
   // part twice. The two questions differ and cannot share one answer.
@@ -5031,7 +4858,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(out).toEqual({ outcome: "done" });
       // The customer got the first balloon and nothing else...
       expect(sent).toEqual([[924, "Certo!"]]);
-      // ...so the conversation stays open. This is the assertion the throw used to make for us.
+      // NOTE: ...so the conversation stays open.
       expect(toggles).toEqual([]);
     });
   });
@@ -5259,23 +5086,15 @@ describe.skipIf(!dbUp)("debounce", () => {
     }
   });
 
-  // ── A balloon that fails mid-reply (issue #429) ────────────────────────────
-  //
-  // The flush is where the duplication the split can cause is actually reachable, and it is not the
-  // path the issue named: there IS no Chatwoot webhook retry (the receiver acks <5s and processes
-  // detached, so Chatwoot is handed a 200 and never re-sends). What retries is the WORKER — a throw
-  // here bubbles out of `flushDebounceJob` with the watermark unadvanced, so the next attempt
-  // coalesces the same burst and answers it again. A reply that threw on its second balloon would
-  // therefore put the first balloon in the conversation twice, and run every side-effecting tool the
-  // turn chose a second time.
-  //
-  // Which is why what already landed decides: the turn reports, the watermark moves, and no retry is
-  // armed. Written against the flush rather than as a unit test because the unit cannot see the
+  // ── A balloon that fails mid-reply ────────────────────────────────────────────
+  // A throw out of `flushDebounceJob` leaves the watermark unadvanced and the WORKER retries: the first
+  // balloon twice, every side-effecting tool re-run. So what already landed decides: the turn reports,
+  // the watermark moves, no retry is armed. Tested at the flush, not as a unit: the unit cannot see the
   // watermark, and the watermark is the whole mechanism.
-  // Personifies the fork on the three properties the reconciliation depends on (issue #499): it
-  // ASSIGNS an id to what it accepts, it STORES the `content_attributes` the create carried, and it
-  // honours `before` when paging. A stub missing any of them sends every reply here down the
-  // "cannot prove delivery" road, which is green for the wrong reason.
+
+  // Personifies the fork on what the reconciliation depends on: it ASSIGNS an id to what it accepts,
+  // STORES the create's `content_attributes` and honours `before` when paging. A stub missing any of
+  // them sends every reply down the "cannot prove delivery" road, green for the wrong reason.
   function makeFailingStub(opts: {
     // The conversation as it stands before the reply: the customer's own messages, INCOMING like
     // the `page` helper writes them, because this same read is what the flush coalesces from.
@@ -5388,20 +5207,12 @@ describe.skipIf(!dbUp)("debounce", () => {
 
   // THE CASE THE WHOLE DECISION TURNS ON, and the one a passing consolidated retry hides: a balloon
   // landed AND the remainder's retry failed too, so the customer holds a truncated answer that
-  // nothing is going to complete.
-  //
-  // "Nothing is going to complete it" is MEASURED, and it is the opposite of what this file claimed
-  // first. A throw here buys no re-answer to fear: `shouldPost` claims the burst with a monotonic
-  // CAS (`lastHandledMessageId < toMessageId`) immediately before the first balloon, so the
-  // watermark is already 7 when the second send fails, and a worker retry coalesces nothing and
-  // posts nothing. Measured against a real Chatwoot on BOTH retry paths — the flush here, and the
-  // delivery recovery, whose second pass ran the whole turn and came back "superseded".
-  //
-  // What the throw did buy was the OPERATOR: `lastError` is written on a throw and on nothing else,
-  // and the flush clears it on "posted". So reporting this as plain "posted" erases the only
-  // conversation-level sign that a customer is sitting on one of three balloons — measured live,
-  // where the fixed code came back `lastError: (none)` on exactly this input while the unfixed code
-  // showed the 502. Hence the separate word and the badge the turn writes itself.
+  // nothing will complete. A throw buys no re-answer here: `shouldPost` claims the burst with a
+  // monotonic CAS immediately before the first balloon, so a worker retry, or the delivery
+  // recovery, coalesces and posts nothing. What a throw does buy is the OPERATOR: `lastError` is
+  // written on a throw and on nothing else, and the flush clears it on "posted", so a plain
+  // "posted" erases the only conversation-level sign that a customer holds one of three balloons.
+  // Hence the separate word and the badge the turn writes itself.
   test("a balloon landed and the remainder failed: reported, and the operator is told", async () => {
     await withSplitEnabled(async () => {
       await seedConversation(922);
@@ -5528,10 +5339,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(calls.getMessages).toBe(0);
   });
 
-  // NOTE: Our bot is 9 (the job payload's agentBotId, and the ChatwootAgentBot row); 77 is another
-  // bot on the same account. The burst was armed while the conversation was still free and an
-  // automation handed it away before the window closed, so the flush is the last place that can
-  // notice.
+  // Our bot is 9 (the job payload's agentBotId, and the ChatwootAgentBot row); 77 is another bot on
+  // the same account. The burst was armed while the conversation was still free and an automation
+  // handed it away before the window closed, so the flush is the last place that can notice.
   test("another bot took the conversation: the flush gate closes before any Chatwoot fetch", async () => {
     await seedConversation(850, { assigneeType: "AgentBot", assigneeId: 77 });
     const sent: Array<[number, string]> = [];
@@ -5592,30 +5402,25 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(873)).toBe(21);
   });
 
-  // A gate that closes has to SAY why it closed, and this one said nothing at all: the burst counted
-  // as handled and the flush returned, so the operator investigating an unanswered conversation
-  // found no line anywhere (issue #271). The two cases below are the two events that wear this one
-  // exit, and the second is the one the ack escalation produces — the case the distinction exists
-  // for, and the one that never reaches the recheck that could already name it, because no turn
-  // ever starts.
+  // A gate that closes has to SAY why it closed, or the operator investigating an unanswered
+  // conversation finds no line anywhere. The two cases below are the two events that wear this one
+  // exit; the second is the ack escalation's, which never reaches the recheck that could already
+  // name it, because no turn ever starts.
   //
-  // Scoped to the conversation asked for, by its INTERNAL id, and polled: the emit is
-  // fire-and-forget, so an unscoped read answers with a neighbour's row and an unpolled one races
-  // the write it is asserting.
+  // Scoped to the conversation by its INTERNAL id, and polled: the emit is fire-and-forget, so an
+  // unscoped read answers with a neighbour's row and an unpolled one races the write it asserts.
   async function handoffDetailOf(convId: number): Promise<unknown> {
     const conversation = await suDb.conversation.findFirstOrThrow({
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
-    for (let i = 0; i < 40; i++) {
-      const row = await flowLogRow(suDb, {
+    const row = await until("the handoff line", () =>
+      flowLogRow(suDb, {
         where: { tenantId, stage: "handoff", conversationId: conversation.id },
         orderBy: { id: "desc" },
-      });
-      if (row) return row.detail;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return null;
+      }),
+    );
+    return row.detail;
   }
 
   async function routeRowOf(convId: number) {
@@ -5623,20 +5428,18 @@ describe.skipIf(!dbUp)("debounce", () => {
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
-    for (let i = 0; i < 40; i++) {
-      const row = await flowLogRow(suDb, {
+    const row = await until("the route line", () =>
+      flowLogRow(suDb, {
         where: { tenantId, stage: "route", conversationId: conversation.id },
         orderBy: { id: "desc" },
-      });
-      if (row) return row;
-      await new Promise((r) => setTimeout(r, 50));
-    }
-    return null;
+      }),
+    );
+    return row;
   }
 
-  // The OTHER unbound-inbox exit, and the one nothing recorded: the gate is OPEN, so this burst is
-  // the bot's to answer and there is simply no agent to answer it. It ended as a silent `done`
-  // (issue #318), which from the operator's side is indistinguishable from an agent that is quiet.
+  // The OTHER unbound-inbox exit: the gate is OPEN, so this burst is the bot's to answer and there
+  // is simply no agent to answer it. A silent `done` here is indistinguishable, from the operator's
+  // side, from an agent that is quiet.
   test("an unbound inbox with the gate open leaves the line that names the inbox", async () => {
     await seedConversation(874);
     const inbox = await suDb.inbox.create({
@@ -5724,8 +5527,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
   });
 
-  // NOTE: The same seat held by OUR bot: assignment to ourselves is the normal steady state once
-  // the agent has taken a conversation, so closing the gate on it would silence every burst.
+  // The same seat held by OUR bot: assignment to ourselves is the normal steady state once the
+  // agent has taken a conversation, so closing the gate on it would silence every burst.
   test("our own bot holding the conversation does not close the flush gate", async () => {
     await seedConversation(851, { assigneeType: "AgentBot", assigneeId: 9 });
     const sent: Array<[number, string]> = [];
@@ -5845,10 +5648,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       );
     });
 
-    // The escalation lands INSIDE the authorization round-trip, which is what that fence exists for:
-    // ten seconds in somebody else's endpoint. The old line here asserted a human takeover, which is
-    // the reading #225 measured as wrong, and this is the state that proves it — nobody is on the
-    // conversation at all.
+    // The escalation lands INSIDE the authorization round-trip, which is what that fence exists
+    // for: ten seconds in somebody else's endpoint. Nobody is on the conversation at all, so this
+    // is not a human takeover.
     test("the conversation leaving mid-authorization is reported as what it was", async () => {
       await seedConversation(872);
       await seedContactOn(872, 72);
@@ -5887,6 +5689,95 @@ describe.skipIf(!dbUp)("debounce", () => {
       });
     });
 
+    // THE RULE STAGE COMES FIRST (docs/contact-auth.md, Two stages): ahead of the spend ceiling, so a
+    // burst this agent does not serve draws no ceiling sentence and no handoff, and the endpoint the
+    // operator put after the rule is never asked about it.
+    test("over the ceiling, a burst the rule refuses is dropped before the ceiling speaks", async () => {
+      const convId = 847;
+      await seedConversation(convId);
+      await seedContactOn(convId, 68);
+      const before = await suDb.agent.findUniqueOrThrow({
+        where: { id: agentDbId },
+        select: { settings: true },
+      });
+      await suDb.agent.update({
+        where: { id: agentDbId },
+        data: {
+          settings: {
+            ...(before.settings as object),
+            contactAuth: {
+              enabled: true,
+              rule: { kind: "label", label: "nenhuma-conversa-tem" },
+              askEndpointAfterRule: true,
+              url: "https://203.0.113.9:9443/check",
+            },
+          },
+        },
+      });
+      await suDb.tenant.update({
+        where: { id: tenantId },
+        data: {
+          settings: { spendCeiling: { enabled: true, monthlyInboxUsd: 10 } },
+        },
+      });
+      const monthStart = new Date(
+        Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), 1),
+      );
+      await suDb.spendCostSnapshot.upsert({
+        where: {
+          tenantId_source_monthStart: { tenantId, source: "inbox", monthStart },
+        },
+        create: {
+          tenantId,
+          source: "inbox",
+          monthStart,
+          costUsd: 99,
+          polledAt: new Date(),
+        },
+        update: { costUsd: 99, polledAt: new Date() },
+      });
+      try {
+        const sent: Array<[number, string]> = [];
+        const toggles: Array<[number, string]> = [];
+        const notes: Array<[number, string]> = [];
+        const auth = { n: 0 };
+        const out = await flushDebounceJob({
+          job: jobFor(convId, { lastMessageId: 8 }),
+          base: appDb,
+          deps: {
+            makeModel: fakeModel,
+            makeClient: makeResolveStub({
+              pages: [page([{ id: 8, content: "oi" }])],
+              sent,
+              calls: { getMessages: 0 },
+              toggles,
+              notes,
+            }) as never,
+            checkpointer: new MemorySaver(),
+            contactAuthFetch: answering(true, auth),
+          },
+        });
+        expect(out).toEqual({ outcome: "done" });
+        expect(auth.n).toBe(0);
+        expect(sent).toEqual([]);
+        expect(toggles).toEqual([]);
+        expect(notes).toEqual([]);
+        expect(await watermarkOf(convId)).toBe(8);
+      } finally {
+        await suDb.agent.update({
+          where: { id: agentDbId },
+          data: { settings: before.settings as object },
+        });
+        await suDb.tenant.update({
+          where: { id: tenantId },
+          data: { settings: {} },
+        });
+        await suDb.spendCostSnapshot.deleteMany({
+          where: { tenantId, source: "inbox" },
+        });
+      }
+    });
+
     test("a refused contact drops the burst: no fetch, no post, watermark advanced", async () => {
       await seedConversation(840);
       await seedContactOn(840, 61);
@@ -5916,9 +5807,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(await watermarkOf(840)).toBe(7);
     });
 
-    // Issue #811. A verdict the authorization endpoint returns after the job's deadline is the
-    // retry's: the run was already failed, and dispensing the burst here would leave that retry
-    // nothing to reconsider. The control is the test above, where the same refusal advances the mark.
+    // A verdict the authorization endpoint returns after the job's deadline is the retry's: the run
+    // was already failed, and dispensing the burst here would leave that retry nothing to
+    // reconsider. The control is the test above, where the same refusal advances the mark.
     test("a refusal that returns after the job's deadline leaves the burst to the retry", async () => {
       await seedConversation(8110);
       await seedContactOn(8110, 81);
@@ -5950,12 +5841,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
 
     test("a refused contact closes the orphan below the mark too", async () => {
-      // PR #701, review round 3 (P1). O portão decide ANTES de qualquer busca no Chatwoot, então ele
-      // não sabe nomear os membros e grava a faixa. A faixa começa na marca, e a órfã que esta PR
-      // ensinou a seleção a enxergar mora ABAIXO dela: sem linha, ela volta como devida assim que a
-      // autorização voltar, e o turno seguinte executa um pedido que este portão já tinha descartado.
-      // A faixa passa a começar no piso da era, que é onde a ausência de linha começa a significar
-      // alguma coisa.
+      // The gate decides BEFORE any Chatwoot fetch, so it cannot name the members and writes
+      // the range. The orphan sits BELOW the mark, so a range starting at the mark leaves it
+      // rowless: it comes back as owed once authorization returns, and the next turn runs a request
+      // this gate already discarded. The range starts at the era floor, where a missing row starts
+      // to mean something.
       const convId = 951;
       await seedConversation(convId, { lastHandledMessageId: 2 });
       await seedContactOn(convId, 71);
@@ -5988,7 +5878,7 @@ describe.skipIf(!dbUp)("debounce", () => {
         },
       });
       expect(sent).toEqual([]);
-      // Autorização de volta: o pedido descartado não é executado.
+      // Authorization is back: the discarded request is not run.
       const model = new CaptureReplyModel(REPLY);
       await flushDebounceJob({
         job: jobFor(convId, { lastMessageId: 2 }),
@@ -6013,10 +5903,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
 
     test("a refused contact closes the ledger row of the orphan too", async () => {
-      // PR #701, review round 4 (P2). A dispensa desceu até o piso da era na rodada 3, e o ledger
-      // continuou começando na marca: dois limites para uma decisão só. A entrega da órfã ficava
-      // parada, reportada como perda que ninguém atendeu e elegível para recuperação, depois de a
-      // recusa já ter decidido sobre ela.
+      // The dispensal and the ledger share one lower bound, the era floor: a ledger starting
+      // at the mark would leave the orphan's delivery stuck, reported as an unattended loss and
+      // eligible for recovery after the refusal already decided it.
       const convId = 954;
       await seedConversation(convId, { lastHandledMessageId: 2 });
       await seedContactOn(convId, 73);
@@ -6067,14 +5956,11 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
 
     test("a refused contact settles the ledger by RANGE: the conversation is still ours", async () => {
-      // The third gate exit, and the one that keeps the wide scope. The other two close because
-      // somebody else owns the conversation; this one closes because of a decision about the
-      // CONTACT, taken while this route still owns it — so there is no sibling delivery racing it,
-      // and a strand inside the burst is one this exit is entitled to close.
-      //
-      // Scoped down to nothing here, every refused burst would leave behind a reported loss for a
-      // message the product deliberately declined to answer, which is the silence issue #228 exists
-      // to remove.
+      // NOTE: The third gate exit, and the one that keeps the wide scope. The other two close
+      // because somebody else owns the conversation; this one closes on a decision about the
+      // CONTACT, taken while this route still owns it, so no sibling delivery races it and a strand
+      // inside the burst is this exit's to close. Scoped down to nothing, every refused burst would
+      // leave a reported loss for a message the product deliberately declined to answer.
       await seedConversation(846);
       await seedContactOn(846, 67);
       const stranded = await suDb.chatwootWebhookDelivery.create({
@@ -6132,10 +6018,10 @@ describe.skipIf(!dbUp)("debounce", () => {
         select: { id: true },
       });
       const sent: Array<[number, string]> = [];
-      // What the defect is about is the MODEL running, not the reply going out: the post gate's CAS
-      // already withholds a reply whose watermark moved, which is why asserting on `sent` alone
-      // passes with the fix reverted. Counting the model is what separates "did not answer" from
-      // "never ran", and a turn that ran spent tokens and may have called side-effecting tools.
+      // The point is the MODEL running, not the reply going out: the post gate's CAS already
+      // withholds a reply whose watermark moved, so asserting on `sent` alone passes without this
+      // fence. Counting the model separates "did not answer" from "never ran", and a turn that ran
+      // spent tokens and may have called side-effecting tools.
       let modelBuilds = 0;
       const countingModel = () => {
         modelBuilds += 1;
@@ -6148,8 +6034,8 @@ describe.skipIf(!dbUp)("debounce", () => {
           tenantId,
           conversationDbId: conv.id,
           toMessageId: 9,
-          // The concurrent delivery closed message 9 without answering it, which is what
-          // this advance reports (issue #690).
+          // NOTE: The concurrent delivery closed message 9 without answering it, which is what this
+          // advance reports.
           dispensed: { kind: "messages", messageIds: [9] },
           base: appDb,
         });
@@ -6200,8 +6086,8 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
 
     // The window the gate opens: the assignee gate runs before a round-trip that can take ten
-    // seconds, so a human arriving inside it used to get the burst answered over their shoulder.
-    // The post gate withholds the reply, but by then the turn's tools have run.
+    // seconds, and a human arriving inside it must not get the burst answered over their shoulder.
+    // The post gate would withhold the reply, but by then the turn's tools have run.
     test("a human taking over during the authorization call ends the flush before the model", async () => {
       await seedConversation(843);
       await seedContactOn(843, 64);
@@ -6271,15 +6157,12 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
 
     test("ANOTHER BOT taking over during the authorization call leaves the ledger alone", async () => {
-      // The same window, closed by the other kind of owner, and the settlement differs because the
-      // two owners mean different things. A human answers the message whichever route carried it;
-      // another BOT has a delivery of its own that may be running right now, and Chatwoot fans a
-      // message to up to two routes (`agent_bots_for`). Retiring by range here turns that live row
-      // `PROCESSED`, the one state the sweep never revisits.
-      //
-      // This exit is the second place the rule has to hold, and it is not reachable from the first:
-      // the gate on the way in passed, and the conversation moved during a ten-second round-trip to
-      // somebody else's endpoint.
+      // NOTE: The same window, closed by the other kind of owner. A human answers the message
+      // whichever route carried it; another BOT has a delivery of its own that may be running now,
+      // since Chatwoot fans a message to up to two routes (`agent_bots_for`), and a range
+      // retirement turns that live row `PROCESSED`, the one state the sweep never revisits. This
+      // exit is the second place the rule holds: the gate on the way in passed, and the
+      // conversation moved during the round-trip.
       await seedConversation(845);
       await seedContactOn(845, 66);
       const sibling = await suDb.chatwootWebhookDelivery.create({
@@ -6346,7 +6229,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
   });
 
-  // ── Issue #8: the watermark must advance on every deliberate skip, not only on a post ──
+  // ── The watermark must advance on every deliberate skip, not only on a post ──
 
   test("advanceHandledWatermark is a monotonic CAS (never moves backwards)", async () => {
     await seedConversation(803);
@@ -6359,8 +6242,8 @@ describe.skipIf(!dbUp)("debounce", () => {
         tenantId,
         conversationDbId: conv.id,
         toMessageId: to,
-        // Positioning the mark, not reporting a decision: this call closes nothing, and
-        // says so explicitly rather than letting a default speak for it (issue #690).
+        // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says
+        // so explicitly rather than letting a default speak for it.
         dispensed: { kind: "messages", messageIds: [] },
         base: appDb,
       });
@@ -6372,39 +6255,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(803)).toBe(8);
   });
 
-  test("an empty reply still advances the watermark (the burst was consumed)", async () => {
-    await seedConversation(804);
-    const sent: Array<[number, string]> = [];
-    const calls = { getMessages: 0 };
-    const out = await flushDebounceJob({
-      job: jobFor(804),
-      base: appDb,
-      deps: {
-        makeModel: () => new FakeListChatModel({ responses: [""] }),
-        makeClient: makeStub({
-          pages: [
-            page([
-              { id: 1, content: "oi" },
-              { id: 2, content: "tem horário amanhã?" },
-            ]),
-          ],
-          sent,
-          calls,
-        }),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(out).toEqual({ outcome: "done" });
-    expect(sent).toEqual([]);
-    expect(await watermarkOf(804)).toBe(2);
-  });
-
-  // AND IT CLAIMS NOTHING, which is the other half and the one the issue is about (#452). The
-  // watermark advances because the burst was CONSUMED — nothing will answer it again on its own —
-  // but no reply left this turn, so the tail is still unanswered and the operator's re-engage is
-  // exactly the thing that should be able to answer it. A claim taken before the turn knows whether
-  // it will send would mark the burst answered and refuse that click forever, which is the reported
-  // bug wearing a different cause.
+  // AND IT CLAIMS NOTHING. The watermark advances because the burst was CONSUMED (nothing will
+  // answer it again on its own), but no reply left this turn, so the tail is still unanswered and
+  // the operator's re-engage is exactly what should answer it. A claim taken before the turn knows
+  // whether it will send would mark the burst answered and refuse that click forever.
   test("an empty reply claims nothing, so the tail stays answerable", async () => {
     await seedConversation(808);
     const sent: Array<[number, string]> = [];
@@ -6432,10 +6286,9 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await replyClaimOf(808)).toBeNull();
   });
 
-  // THE REPORTED SEQUENCE, END TO END (#452): the flush runs, the turn ends without a reply, and the
-  // operator clicks re-engage on a tail nobody answered. Both halves of the fix have to hold at once
-  // — the watermark must not refuse the click (it covers the tail), and neither must the claim (the
-  // empty turn sent nothing, so it holds no claim).
+  // THE SEQUENCE, END TO END: the flush runs, the turn ends without a reply, and the operator
+  // clicks re-engage on a tail nobody answered. Neither the watermark (it covers the tail) nor the
+  // claim (the empty turn holds none) may refuse the click.
   test("the tail an empty flush left is answered by the operator's click", async () => {
     const convId = 809;
     await seedConversation(convId);
@@ -6469,7 +6322,7 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
     expect(flushed).toEqual({ outcome: "done" });
     expect(sent).toEqual([]);
-    // The mark covers the whole tail, which is what made the button report `superseded` forever.
+    // NOTE: The mark covers the whole tail, so the mark alone must not decide the click.
     expect(await watermarkOf(convId)).toBe(2);
 
     const clicked = await reengageConversation(
@@ -6545,13 +6398,13 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(await watermarkOf(806)).toBe(12);
   });
 
-  // Issue #339. The DEBOUNCE dedupeKey is the THREAD, so one physical row serves every burst this
-  // contact ever sends. A flush that dead-lettered (five consecutive failures) left the row carrying
-  // five attempts, and the re-arm only ever wrote status/run_at/payload, so the NEXT burst, days
-  // later, got exactly one attempt before being retired again, forever.
+  // The DEBOUNCE dedupeKey is the THREAD, so one physical row serves every burst this contact ever
+  // sends. A flush that dead-lettered (five consecutive failures) leaves the row carrying five
+  // attempts, and a re-arm that kept them would give the NEXT burst, days later, one attempt before
+  // retiring it again, forever.
   //
-  // A fresh burst is not a guess here: it is the same thing `burstStartedAt` already keys off, a row
-  // that is not PENDING, and both are asserted so the two cannot drift apart.
+  // A fresh burst is the same thing `burstStartedAt` already keys off, a row that is not PENDING,
+  // and both are asserted so the two cannot drift apart.
   test("a burst after a dead-lettered flush starts with the whole budget", async () => {
     await suDb.$executeRawUnsafe(
       `DELETE FROM scheduler_jobs WHERE tenant_id = ${tenantId}`,
@@ -6705,11 +6558,12 @@ describe.skipIf(!dbUp)("debounce", () => {
       { id: 8, content: "até logo" },
       { id: 9, content: "quero marcar um horário pra sexta" },
     ]);
+    const model = new CaptureReplyModel(REPLY);
     const out = await flushDebounceJob({
       job: jobFor(807, { lastMessageId: 9 }),
       base: appDb,
       deps: {
-        makeModel: fakeModel,
+        makeModel: () => model as unknown as BaseChatModel,
         makeClient: makeStub({ pages: [fullHistory], sent, calls }),
         checkpointer: new MemorySaver(),
       },
@@ -6717,13 +6571,24 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(out).toEqual({ outcome: "done" });
     expect(sent).toEqual([[807, REPLY]]); // one reply, to the new request only
     expect(await watermarkOf(807)).toBe(9);
+    // NOTE: the turn was asked about message 9 alone; the backlog the human handled never reached it.
+    expect(model.seen).toHaveLength(1);
+    expect(model.seen[0]).toContain("quero marcar um horário pra sexta");
+    for (const handled of [
+      "quero remarcar",
+      "isso está um absurdo!",
+      "que atendimento péssimo",
+      "obrigado pela ajuda",
+      "até logo",
+    ]) {
+      expect(model.seen[0]).not.toContain(handled);
+    }
   });
 
-  // NOTE: Issue #63, the half a retry cannot cover. When both attempts come back empty the turn is
-  // lost for good and the operator becomes the fallback, so what lands on the conversation badge has
-  // to name the fault. Before this change that row read `undefined is not an object (evaluating
-  // '(await this.generatePrompt(…)).generations[0][0].message')` — JS entrails that tell whoever
-  // picks up the conversation nothing about what happened or what to do.
+  // When both attempts come back empty the turn is lost for good and the operator becomes the
+  // fallback, so the conversation badge has to name the fault, not a JS error (`undefined is not an
+  // object (evaluating ...)`) that tells whoever picks up the conversation nothing about what
+  // happened or what to do.
   test("issue #63: a provider that never completes leaves the operator a readable reason", async () => {
     await seedConversation(812);
     const sent: Array<[number, string]> = [];
@@ -6754,6 +6619,113 @@ describe.skipIf(!dbUp)("debounce", () => {
     expect(row.lastError).not.toContain("generations[0][0]");
     expect(row.lastErrorAt).not.toBeNull();
   });
+
+  // A run that throws is not the outcome while the job has attempts left: the scheduler runs the
+  // burst again, and the next run usually answers. So the run's `generate` line is `info`, flagged
+  // whether another run follows, and the alarm is the death's to raise (announceDeadDebounceFlush).
+  for (const [attempts, willRetry] of [
+    [0, true],
+    [4, false],
+  ] as const) {
+    test(`a run that throws on attempt ${attempts + 1} logs generate at info, willRetry ${willRetry}`, async () => {
+      const conv = 10900 + attempts;
+      await seedConversation(conv);
+      const sent: Array<[number, string]> = [];
+      await expect(
+        flushDebounceJob({
+          job: { ...jobFor(conv), attempts },
+          base: appDb,
+          deps: {
+            makeModel: () => new FailingModel(new Error("upstream 503")),
+            makeClient: makeStub({
+              pages: [page([{ id: 1, content: "oi" }])],
+              sent,
+              calls: { getMessages: 0 },
+            }),
+            checkpointer: new MemorySaver(),
+          },
+        }),
+      ).rejects.toThrow();
+      expect(sent).toEqual([]);
+      const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          threadId: threadOf(conv),
+          stage: "generate",
+          status: "error",
+        },
+        select: { level: true, detail: true },
+      });
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.level).toBe("info");
+      expect(
+        (rows[0]?.detail as Record<string, unknown> | undefined)?.willRetry,
+      ).toBe(willRetry);
+      await clearFlowLog(suDb, { tenantId, threadId: threadOf(conv) });
+    });
+  }
+
+  // A provider out of credit (or with a dead key) refuses every retry until a person acts on the
+  // account: the run says no retry follows even with attempts left, and its failure carries the mark
+  // the scheduler reads to dead-letter the job now. A rate limit keeps its retries.
+  for (const [name, failure, permanent] of [
+    [
+      "no credit",
+      Object.assign(new Error("You exceeded your current quota"), {
+        status: 429,
+        code: "insufficient_quota",
+      }),
+      true,
+    ],
+    [
+      "a rate limit",
+      Object.assign(new Error("slow down"), { status: 429 }),
+      false,
+    ],
+  ] as const) {
+    test(`a run that throws with ${name} on attempt 1 says whether a retry follows`, async () => {
+      const conv = name === "no credit" ? 10910 : 10911;
+      await seedConversation(conv);
+      const sent: Array<[number, string]> = [];
+      let thrown: unknown;
+      try {
+        await flushDebounceJob({
+          job: { ...jobFor(conv), attempts: 0 },
+          base: appDb,
+          deps: {
+            makeModel: () => new FailingModel(failure),
+            makeClient: makeStub({
+              pages: [page([{ id: 1, content: "oi" }])],
+              sent,
+              calls: { getMessages: 0 },
+            }),
+            checkpointer: new MemorySaver(),
+          },
+        });
+      } catch (e) {
+        thrown = e;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      expect(failsUntilAccountFixed(thrown)).toBe(permanent);
+      expect(sent).toEqual([]);
+      const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          threadId: threadOf(conv),
+          stage: "generate",
+          status: "error",
+        },
+        select: { detail: true },
+      });
+      expect(rows).toHaveLength(1);
+      expect(
+        (rows[0]?.detail as Record<string, unknown> | undefined)?.willRetry,
+      ).toBe(!permanent);
+      await clearFlowLog(suDb, { tenantId, threadId: threadOf(conv) });
+    });
+  }
 
   test("issue #49: a newer attachment-only message (voice note) supersedes the flush", async () => {
     await seedConversation(832);
@@ -6883,13 +6855,11 @@ describe.skipIf(!dbUp)("debounce", () => {
   });
   // The post gate is not one question. `shouldPost` re-fetches the conversation from Chatwoot and
   // THEN runs the watermark CAS, so a /reset landing inside that round trip arrives after the ask
-  // that precedes it — and the input-guardrail reply is the send that sits closest to the gate, with
-  // nothing in between to ask again.
-  //
-  // The supersede half cannot stand in for the ask, and the redirect pair is why: a /reset typed on
-  // the ENTRY conversation retires the WIDGET's flush (webhook.ts sweeps both sides), while the
-  // re-fetch reads the widget's own messages, where nothing new arrived. The gate sees a quiet
-  // conversation and claims the burst.
+  // before it, and the input-guardrail reply is the send closest to the gate, with nothing in
+  // between to ask again. The supersede half cannot stand in for the ask: a /reset typed on the
+  // ENTRY conversation of a redirect pair retires the WIDGET's flush
+  // (src/modules/chatwoot/webhook.ts sweeps both sides), while the re-fetch reads the widget's own
+  // messages, where nothing new arrived.
   describe("with an input guardrail that answers", () => {
     const GUARD_MODEL = "guard-sentinel";
     let previousSettings: unknown = null;
@@ -6939,10 +6909,10 @@ describe.skipIf(!dbUp)("debounce", () => {
       });
     });
 
-    // A FAILED SEND KEEPS THE CLAIM (issue #452). The template goes out through a raw `sendMessage`
-    // with no reconciliation, so a rejection here does not even say whether Chatwoot accepted it
-    // first — and the claim is taken before the send precisely so that the scheduler's retry cannot
-    // send it a second time to a customer who may already have it. The claim is never given back.
+    // A FAILED SEND KEEPS THE CLAIM. The template goes out through a raw `sendMessage` with no
+    // reconciliation, so a rejection here does not even say whether Chatwoot accepted it first, and
+    // the claim is taken before the send precisely so that the scheduler's retry cannot send it a
+    // second time to a customer who may already have it. The claim is never given back.
     test("a send that fails keeps the claim, so the retry cannot duplicate it", async () => {
       const convId = 894;
       await seedConversation(convId);
@@ -7047,11 +7017,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(fetches).toBe(2);
       // And the customer got nothing after their reset, template included.
       expect(sent).toEqual([]);
-      // The residual this used to assert is GONE, and the change is what closed it (issue #452). The
-      // post gate no longer claims by advancing the watermark — it claims in `lastRepliedMessageId`
-      // — so a retirement caught by the ask after the claim leaves the watermark exactly where
-      // "stale" says it should be: on a burst nothing answered, which the next flush re-coalesces.
-      // That is the rule the outcome was written for; the old value was the CAS leaking through it.
+      // NOTE: The post gate claims in `lastRepliedMessageId`, not by advancing the watermark, so a
+      // retirement caught by the ask after the claim leaves the watermark where "stale" says it
+      // should be: on a burst nothing answered, which the next flush re-coalesces.
       expect(await watermarkOf(862)).toBeNull();
       // And NOTHING WAS CLAIMED either, because the claim is asked one statement before the send and
       // this turn never got there. The trade the claim makes — a lost reply rather than a risked
@@ -7109,15 +7077,12 @@ describe.skipIf(!dbUp)("debounce", () => {
       });
     });
 
-    // The image is delivered BEFORE the text (a reply must not swallow the attachment), so a text
-    // send that fails after it leaves the customer holding part of the answer even though no balloon
-    // landed — which is what makes `delivered: 0` alone the wrong thing to throw on (issue #429).
-    // A throw here re-runs the turn and posts that picture a second time. Same rule the attachment-
-    // only branch above already keeps, and this is the third site it has to be written at.
-    // THE THIRD LEG, and the one the table exists for: the text lands but a promised file does not.
-    // Asking only about the reply here is how a conversation closed with the customer holding the
-    // words and not the photo they were about. The decision is `mayCloseConversation`, which this
-    // proves the call site actually consults (the table proves the rule; adoption is a second test).
+    // The image is delivered BEFORE the text, so a text send that fails after it leaves the
+    // customer holding part of the answer with no balloon landed: `delivered: 0` alone is the wrong
+    // thing to throw on, since a throw re-runs the turn and posts the picture again. And when the
+    // text lands but a promised file does not, the conversation stays open: the decision is
+    // `mayCloseConversation`, and this proves the call site consults it (the table proves the
+    // rule).
     test("an attachment that failed keeps the conversation open even when the text lands", async () => {
       await seedConversation(926);
       const sent: Array<[number, string]> = [];
@@ -7186,10 +7151,10 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(toggles).toEqual([]);
     });
 
-    // THE SAME RULE ON THE ATTACHMENT-ONLY BRANCH, and this half predates #429: a batch where one
-    // file lands and another fails already reached `applyDeferredResolve`, because `failed` was read
-    // for the throw and not for the close. The customer holds one of the two pictures the agent
-    // promised, and `resolved` says the attendance is finished.
+    // THE SAME RULE ON THE ATTACHMENT-ONLY BRANCH: a batch where one file lands and another fails
+    // reaches `applyDeferredResolve`, so `failed` is read for the close and not only for the throw.
+    // The customer holds one of the two pictures the agent promised, and `resolved` would say the
+    // attendance is finished.
     test("a batch where one attachment failed does not resolve the conversation", async () => {
       await seedConversation(925);
       const attachments: string[] = [];
@@ -7307,10 +7272,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       expect(sent).toEqual([]);
       // The retry that a throw would arm is what would send that picture again.
       expect(await watermarkOf(923)).toBe(7);
-      // AND THE THIRD SHAPE OF A PARTIAL DELIVERY (issue #429), which this branch used to report as
-      // plain `posted`: the customer holds the picture and none of the words. "Not a failed turn"
-      // and "nothing to tell the operator" are different facts, and reporting it as a clean post
-      // makes the flush CLEAR whatever badge the conversation was carrying.
+      // AND THE THIRD SHAPE OF A PARTIAL DELIVERY: the customer holds the picture and none of
+      // the words. "Not a failed turn" and "nothing to tell the operator" are different facts, and
+      // a clean post would make the flush CLEAR whatever badge the conversation carries.
       const conv = await suDb.conversation.findFirstOrThrow({
         where: { tenantId, chatwootConversationId: 923 },
         select: { lastError: true },
@@ -7396,9 +7360,8 @@ describe.skipIf(!dbUp)("debounce", () => {
   // The clean stale returns are fenced at every wait. This is the branch that reaches a write WITHOUT
   // passing any of them: a throw unwinds straight past them into the handler's catch.
   describe("with a turn that throws after the command retired it", () => {
-    // Retires the claim from inside the model call and then rejects, which is the shape the reviewer
-    // named: /reset lands while the invoke (or a TTS call, or a send) is in flight, and that call
-    // then fails.
+    // Retires the claim from inside the model call and then rejects: /reset lands while the invoke
+    // (or a TTS call, or a send) is in flight, and that call then fails.
     const retireThenThrow = (thread: string) =>
       new SideEffectModel(async () => {
         await retireJobsByDedupeKey(
@@ -7471,10 +7434,10 @@ describe.skipIf(!dbUp)("debounce", () => {
     });
   });
 
-  // THE SECOND ASK (issue #146). The webhook's spend gate covers the MESSAGE; the flush runs minutes
-  // later and is where the turn actually spends. A tenant that crosses its ceiling inside that
-  // window — from its own other conversations, or from this one's earlier burst — would otherwise
-  // have an already-armed flush spend past it, and many armed conversations would do it together.
+  // THE SECOND ASK. The webhook's spend gate covers the MESSAGE; the flush runs minutes later and
+  // is where the turn actually spends. A tenant that crosses its ceiling inside that window (from
+  // its own other conversations, or from this one's earlier burst) would otherwise have an
+  // already-armed flush spend past it, and many armed conversations would do it together.
   describe("with the spend ceiling reached between arming and the flush", () => {
     let previousTenantSettings: unknown = null;
     // The OPERATOR'S sentence, deliberately not the shipped default: an expectation written against
@@ -7501,7 +7464,7 @@ describe.skipIf(!dbUp)("debounce", () => {
           },
         },
       });
-      // The month's figure as the poll would have written it: over the ceiling below (#426).
+      // NOTE: The month's figure as the poll would have written it: over the ceiling below.
       await suDb.spendCostSnapshot.create({
         data: {
           tenantId,
@@ -7574,9 +7537,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       await clearFlowLog(suDb, { tenantId });
     });
 
-    // Issue #811. The same refusal with the job's deadline firing during the ceiling's own read: the
-    // run was failed and its retry answers the burst, so the notice, the hand-over and the settlement
-    // are the retry's. The test above is its control.
+    // The same refusal with the job's deadline firing during the ceiling's own read: the run was
+    // failed and its retry answers the burst, so the notice, the hand-over and the settlement are
+    // the retry's. The test above is its control.
     test("a ceiling verdict read after the job's deadline leaves the burst to the retry", async () => {
       await seedConversation(8111);
       const sent: Array<[number, string]> = [];
@@ -7619,9 +7582,9 @@ describe.skipIf(!dbUp)("debounce", () => {
       await clearFlowLog(suDb, { tenantId });
     });
 
-    // Issue #811, the other side: once the announcement reached the conversation, its remaining acts
-    // are this run's. A deadline that fires inside the hand-over does not withhold the note that
-    // explains it, because a retry finds the conversation a person's and never reaches the note.
+    // The other side: once the announcement reached the conversation, its remaining acts are this
+    // run's. A deadline that fires inside the hand-over does not withhold the note that explains
+    // it, because a retry finds the conversation a person's and never reaches the note.
     test("a ceiling announcement the deadline reaches at the hand-over still leaves its note", async () => {
       await seedConversation(8112);
       const sent: Array<[number, string]> = [];
@@ -7764,8 +7727,8 @@ describe.skipIf(!dbUp)("debounce", () => {
           })
         ).id,
         toMessageId: 15,
-        // Positioning the mark, not reporting a decision: this call closes nothing, and
-        // says so explicitly rather than letting a default speak for it (issue #690).
+        // NOTE: Positioning the mark, not reporting a decision: this call closes nothing, and says
+        // so explicitly rather than letting a default speak for it.
         dispensed: { kind: "messages", messageIds: [] },
         base: appDb,
       });
@@ -7798,6 +7761,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       // ...and no refusal line, because nothing was refused.
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         // Scoped to this flush's own thread, not to the tenant: the fixture is shared with the
         // refusals above, and a tenant-wide read would be asserting about their rows too.
         where: { tenantId, threadId: threadOf(914), stage: "spend_ceiling" },
@@ -7873,6 +7837,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       // absence of is proved by the refusals in the sibling tests above.
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         // This flush's own thread, not the tenant: the fixture is shared with those refusals.
         where: { tenantId, threadId: threadOf(913), stage: "spend_ceiling" },
         select: { level: true },
@@ -7925,6 +7890,7 @@ describe.skipIf(!dbUp)("debounce", () => {
 
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, threadId: threadOf(916), stage: "spend_ceiling" },
         select: { level: true },
       });
@@ -7977,6 +7943,7 @@ describe.skipIf(!dbUp)("debounce", () => {
       // ...and no refusal line, because nothing was refused.
       await settleFlowEvents();
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, threadId: threadOf(915), stage: "spend_ceiling" },
         select: { level: true },
       });

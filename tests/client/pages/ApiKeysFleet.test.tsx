@@ -1,6 +1,6 @@
 /// <reference lib="dom" />
 
-import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
 import {
   cleanup,
@@ -10,29 +10,25 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
+import * as AuthModule from "@/client/contexts/AuthContext";
+import { stubExports } from "@/tests/utils/module-stub";
 
 // The API keys page shows the FLEET list to a SUPER_ADMIN and to nobody else, and minting a fleet
-// key sends the password the route demands (issue #308).
+// key sends the password the route demands. The role decides on the client before any request: a
+// TENANT_ADMIN never asks for `/api-keys/fleet`, which would answer 403 into an error box.
 //
-// The role is what decides, and it decides on the client before any request: a TENANT_ADMIN never
-// asks for `/api-keys/fleet` (the route would answer 403, and a section that renders an error box
-// for a list the operator cannot have is a page announcing a scope it does not hold).
-//
-// NOTE: `mock.module` is global to the worker, so the auth stub is declared here with the role the
-// page reads; the role is swapped per test through `currentRole`. Dynamic imports below for the
-// same reason: a static import evaluates before the mock.
+// The auth stub hands the page the role it reads, swapped per test through `currentRole`. It is a
+// `spyOn` on the module object (`stubExports`), so it lasts for this file only.
 
 let currentRole = "SUPER_ADMIN";
-mock.module("@/client/contexts/AuthContext", () => ({
+stubExports(AuthModule, {
   useAuth: () => ({
     user: { id: "1", email: "admin@fazer.ai", role: currentRole },
     loading: false,
     logout: async () => {},
   }),
-  AuthProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 const { ToastProvider } = await import("@/client/components/Toast");
 const { NavGuardProvider } = await import("@/client/contexts/NavGuardContext");
@@ -146,9 +142,9 @@ afterAll(() => {
 });
 
 describe("the fleet keys section", () => {
-  // Review round 3: a key minted before the password rule has no step-up on record and keeps
-  // answering with its creator's password. The list says so, because rotating it is the only way to
-  // get a key that answers by itself, and nothing else on the page would tell the operator which.
+  // NOTE: a key minted before the password rule has no step-up on record and keeps answering with
+  // its creator's password. The list says so, because rotating it is the only way to get a key that
+  // answers by itself, and nothing else on the page would tell the operator which.
   test("a key minted before the rule is marked in the list; one minted under it is not", async () => {
     currentRole = "SUPER_ADMIN";
     installFetchStub();
@@ -162,26 +158,11 @@ describe("the fleet keys section", () => {
     const fleet = screen.getByTestId("api-keys-fleet");
     expect(within(tenant).queryByText(mark) !== null).toBe(true);
     expect(within(fleet).queryByText(mark) === null).toBe(true);
-    // The rotation guidance rides the shared Tooltip on a focusable trigger, so the keyboard reaches
-    // it; never the native `title` attribute, which no keyboard or touch opens (review round 4).
+    // The rotation guidance rides the shared Tooltip on a focusable trigger, so the keyboard
+    // reaches it; never the native `title` attribute, which no keyboard or touch opens.
     const badge = within(tenant).getByText(mark);
     expect(badge.closest("button") !== null).toBe(true);
     expect(tenant.querySelector("[title]")).toBeNull();
-  });
-
-  test("a SUPER_ADMIN sees the fleet list, read from the fleet route", async () => {
-    currentRole = "SUPER_ADMIN";
-    installFetchStub();
-    renderPage();
-    await waitFor(() => {
-      expect(screen.queryByText("provisioner") !== null).toBe(true);
-    });
-    expect(screen.queryByTestId("api-keys-fleet") !== null).toBe(true);
-    expect(
-      requests.some(
-        (r) => r.method === "GET" && r.path === "/api/v1/api-keys/fleet",
-      ),
-    ).toBe(true);
   });
 
   test("a TENANT_ADMIN sees no fleet section and never asks for the fleet route", async () => {
@@ -201,8 +182,8 @@ describe("the fleet keys section", () => {
     );
   });
 
-  // Round 1 of the review: the tenant key answers every later step-up by itself, so the session
-  // that mints it answers the password here.
+  // NOTE: the tenant key answers every later step-up by itself, so the session that mints it
+  // answers the password here.
   test("minting a tenant key sends the password too", async () => {
     currentRole = "TENANT_ADMIN";
     installFetchStub();

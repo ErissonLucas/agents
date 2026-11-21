@@ -19,10 +19,10 @@ describe("dev static plugin HTML bundling", () => {
         bunFullstack: true,
       }),
     );
-    app.listen(0);
+    app.listen({ port: 0, hostname: "127.0.0.1" });
     const port = app.server?.port;
     if (!port) throw new Error("server did not bind");
-    baseUrl = `http://localhost:${port}`;
+    baseUrl = `http://127.0.0.1:${port}`;
   });
 
   afterAll(() => {
@@ -45,7 +45,7 @@ describe("dev static plugin HTML bundling", () => {
     const res = await Bun.fetch(`${baseUrl}${match?.[1]}`);
     expect(res.status).toBe(200);
     expect(res.headers.get("content-type")).toMatch(/javascript/);
-    // NOTE: skip content-length because chunked responses omit it
+    // Skip content-length because chunked responses omit it
     const body = await res.text();
     expect(body.length).toBeGreaterThan(0);
   });

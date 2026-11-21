@@ -1,3 +1,4 @@
+import { runWithWorkLabel } from "@/lib/work-label";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 
 // The indicator the contact watches while a reactive turn works: "typing…" while the model thinks,
@@ -50,7 +51,7 @@ export function holdPresence(
   const arm =
     deps.setInterval ??
     ((fn: () => void, ms: number) => {
-      const t = setInterval(fn, ms);
+      const t = runWithWorkLabel("presence", () => setInterval(fn, ms));
       t.unref?.();
       return t;
     });
@@ -61,7 +62,7 @@ export function holdPresence(
   let timer: unknown = null;
   let ended = false;
   let busy = false;
-  // NOTE: one request at a time, in order, so an "off" can never overtake the "on" before it.
+  // One request at a time, in order, so an "off" can never overtake the "on" before it.
   let chain: Promise<void> = Promise.resolve();
   const push = (v: boolean | "recording"): Promise<void> => {
     chain = chain.then(() => send(client, conversationId, v));

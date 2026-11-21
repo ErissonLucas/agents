@@ -1,5 +1,5 @@
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
-import type { ReactElement, ReactNode } from "react";
+import { type ReactElement, type ReactNode, useState } from "react";
 import { cn } from "@/client/lib/utils";
 
 interface TooltipBaseProps {
@@ -12,25 +12,22 @@ interface TooltipBaseProps {
   // Override/extend the content container's classes (e.g. a wider max-w for rich tooltips). When
   // omitted, the default max-w-xs applies.
   contentClassName?: string;
+  // Keeps the tooltip mounted but closed. For a control whose label is only hidden in some states
+  // (the collapsed sidebar): wrapping it conditionally swaps the element tree, which unmounts the
+  // control and drops keyboard focus the moment the state flips.
+  disabled?: boolean;
 }
 
-// NOTE: when `asChild` is true (default), children is passed directly as the
-// trigger via Radix Slot, which requires a single ReactElement. When `asChild`
-// is false, children is wrapped by Radix Trigger, so any ReactNode is fine. The
-// discriminated union below surfaces that constraint at the type level instead
-// of at runtime.
-//
-// CHILDREN IS REQUIRED, and used to be optional: a `<Tooltip content=… />` with
-// nothing inside rendered its own `?` button. That made a tooltip look exactly
-// like the help affordance while being a different thing, and one that no
-// phone can open, since a Radix tooltip has no touch route in (Popover.tsx).
-// Help behind a `?` is `HelpPopover`; a tooltip LABELS something that is already
-// on screen, so it always has a child to label.
+// With `asChild` (the default) children is the trigger through Radix Slot, which needs a single
+// ReactElement; without it Radix Trigger wraps any ReactNode, and the union below says so in the type.
+// CHILDREN IS REQUIRED: a tooltip LABELS something already on screen. A childless tooltip rendering
+// its own `?` would look like the help affordance while no phone can open it (a Radix tooltip has no
+// touch route in, see Popover.tsx); help behind a `?` is `HelpPopover`.
 type TooltipProps =
   | (TooltipBaseProps & { asChild?: true; children: ReactElement })
   | (TooltipBaseProps & { asChild: false; children: ReactNode });
 
-// NOTE: when asChild=true (default), Radix Slot clones `children` and merges
+// When asChild=true (default), Radix Slot clones `children` and merges
 // props — including `className`. If the cloned child receives a function
 // className (e.g. `<NavLink className={({ isActive }) => ...}>`), Slot
 // stringifies it during the merge and the serialized function ends up in the
@@ -45,9 +42,11 @@ export function Tooltip({
   sideOffset = 6,
   asChild = true,
   contentClassName,
+  disabled = false,
 }: TooltipProps) {
+  const [open, setOpen] = useState(false);
   return (
-    <TooltipPrimitive.Root>
+    <TooltipPrimitive.Root open={open && !disabled} onOpenChange={setOpen}>
       <TooltipPrimitive.Trigger asChild={asChild}>
         {children}
       </TooltipPrimitive.Trigger>
@@ -58,7 +57,7 @@ export function Tooltip({
           sideOffset={sideOffset}
           collisionPadding={8}
           className={cn(
-            "data-[state=closed]:fade-out-0 data-[state=delayed-open]:fade-in-0 z-(--z-tooltip) whitespace-pre-wrap break-words rounded-md border border-border bg-bg-primary px-2.5 py-1.5 text-text-primary text-xs shadow-lg data-[state=closed]:animate-out data-[state=delayed-open]:animate-in",
+            "data-[state=closed]:fade-out-0 data-[state=delayed-open]:fade-in-0 border-border bg-bg-primary text-text-primary data-[state=closed]:animate-out data-[state=delayed-open]:animate-in z-(--z-tooltip) rounded-md border px-2.5 py-1.5 text-xs break-words whitespace-pre-wrap shadow-lg",
             contentClassName ?? "max-w-xs",
           )}
         >

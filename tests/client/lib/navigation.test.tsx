@@ -1,7 +1,11 @@
 /// <reference lib="dom" />
 
 import { describe, expect, test } from "bun:test";
-import { filterNavItems, NAV_ITEMS } from "@/client/lib/navigation";
+import {
+  filterNavItems,
+  groupNavItems,
+  NAV_ITEMS,
+} from "@/client/lib/navigation";
 
 describe("navigation", () => {
   test("includes base routes", () => {
@@ -28,5 +32,33 @@ describe("navigation", () => {
     expect(
       filterNavItems(NAV_ITEMS, "SUPER_ADMIN").find((i) => i.to === "/admin"),
     ).toBeDefined();
+  });
+
+  test("the sidebar groups every item into consecutive sections", () => {
+    const groups = groupNavItems(NAV_ITEMS);
+    expect(groups.map((g) => g.section?.labelKey ?? null)).toEqual([
+      null,
+      "nav.section.integrations",
+      "nav.section.monitoring",
+      "nav.section.system",
+    ]);
+    expect(groups.flatMap((g) => g.items)).toEqual(NAV_ITEMS);
+    // The day-to-day work opens the list with no heading, the agents and what they use included.
+    expect(groups[0]?.items.map((i) => i.to)).toEqual([
+      "/",
+      "/conversations",
+      "/agents",
+      "/approvals",
+      "/resources",
+      "/dashboards",
+      "/channels",
+    ]);
+  });
+
+  test("every role finds the approvals queue, and it carries the badge", () => {
+    const approvals = NAV_ITEMS.find((i) => i.to === "/approvals");
+    expect(approvals?.badge).toBe("approvals");
+    expect(approvals?.requireAdmin).toBeUndefined();
+    expect(NAV_ITEMS.filter((i) => i.badge === "approvals")).toHaveLength(1);
   });
 });

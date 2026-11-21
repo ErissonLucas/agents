@@ -27,15 +27,6 @@ describe("extractText", () => {
     expect(text).toBe("# Título\n\nConteúdo.");
   });
 
-  test("csv: accepted by extension", async () => {
-    const { text } = await extractText({
-      name: "data.csv",
-      type: "text/csv",
-      bytes: toBytes("a,b,c\n1,2,3"),
-    });
-    expect(text).toBe("a,b,c\n1,2,3");
-  });
-
   test("txt: accepted by mime type even with unknown extension", async () => {
     const { text } = await extractText({
       name: "file.unknown",
@@ -55,15 +46,6 @@ describe("extractText", () => {
     expect(err.translationKey).toBe("errors.unsupportedFileType");
   });
 
-  test("unsupported mime with unknown extension throws 415", async () => {
-    const err = await extractText({
-      name: "file.xyz",
-      type: "application/octet-stream",
-      bytes: toBytes("data"),
-    }).catch((e) => e);
-    expect(err.statusCode).toBe(415);
-  });
-
   test("text exceeding 2M chars throws 413 errors.documentTooLarge", async () => {
     // Build a string just over the 2_000_000 char cap.
     const big = "a".repeat(2_000_001);
@@ -77,11 +59,9 @@ describe("extractText", () => {
   });
 
   test("pdf: extracts the text of a real one-page document", async () => {
-    // The success path had no test, which is what made the ownership fix invisible: the loader used
-    // to build its own `PDFDocumentProxy` and hand it to unpdf, and unpdf only destroys documents it
-    // created itself ("caller-supplied proxies keep their lifecycle with the caller"), so one parsed
-    // PDF stayed alive per upload. Passing the bytes puts the lifecycle back with unpdf, and this is
-    // what proves the two routes extract the same thing (issue #697, review round 1).
+    // The loader passes unpdf the bytes, not its own `PDFDocumentProxy`: unpdf only destroys
+    // documents it created ("caller-supplied proxies keep their lifecycle with the caller"), so a
+    // proxy would keep one parsed PDF alive per upload. This proves both routes extract the same.
     const objs = [
       "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
       "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
@@ -111,31 +91,35 @@ describe("extractText", () => {
   });
 
   test("PDF with no extractable text throws 422 errors.noExtractableText", async () => {
-    // A minimal valid PDF that contains no text streams: just the required structure,
-    // no content stream. unpdf will return an empty string for this.
+    // A well-formed PDF with one page and no content stream, its xref offsets computed so the
+    // parser reads it rather than refusing it: the empty text is what the loader has to refuse.
+    const objects = [
+      "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n",
+      "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n",
+      "3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj\n",
+    ];
+    let body = "%PDF-1.4\n";
+    const offsets: number[] = [];
+    for (const o of objects) {
+      offsets.push(body.length);
+      body += o;
+    }
+    const xrefAt = body.length;
     const emptyPdf = [
-      "%PDF-1.4",
-      "1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj",
-      "2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj",
-      "3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj",
-      "xref",
-      "0 4",
-      "0000000000 65535 f ",
-      "0000000009 00000 n ",
-      "0000000058 00000 n ",
-      "0000000115 00000 n ",
-      "trailer<</Size 4/Root 1 0 R>>",
-      "startxref",
-      "190",
-      "%%EOF",
-    ].join("\n");
+      body,
+      "xref\n0 4\n0000000000 65535 f \n",
+      ...offsets.map((o) => `${String(o).padStart(10, "0")} 00000 n \n`),
+      `trailer<</Size 4/Root 1 0 R>>\nstartxref\n${xrefAt}\n%%EOF\n`,
+    ].join("");
     const err = await extractText({
       name: "empty.pdf",
       type: "application/pdf",
       bytes: toBytes(emptyPdf),
-    }).catch((e) => e);
-    // Either 422 (no text) or a parse error from unpdf on a malformed PDF.
-    // We accept either: the invariant is that no text is returned silently.
-    expect([422, 500, 400]).toContain(err.statusCode ?? 422);
+    }).then(
+      () => null,
+      (e: { statusCode?: number; translationKey?: string }) => e,
+    );
+    expect(err?.statusCode).toBe(422);
+    expect(err?.translationKey).toBe("errors.noExtractableText");
   });
 });

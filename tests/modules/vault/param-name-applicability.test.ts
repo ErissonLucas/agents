@@ -19,13 +19,12 @@ import {
   createVaultEntry,
   updateVaultEntry,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // A `paramName` is only ever read for the kinds whose catalog entry declares `needsParamName`
-// (`resolveSecretInjection` takes the name from there, and from nowhere else). Every other kind
-// used to STORE the field and then discard it: the write said 200, the console read the name back,
-// and the outbound request carried no credential at all. That is issue #488 — an operator wired a
-// `generic` credential with `paramName: Authorization`, expecting the bare JWT the API wanted, and
-// got a 401 with nothing anywhere saying the field was dead.
+// (`resolveSecretInjection` takes the name from there, and from nowhere else). Stored on any other
+// kind, the write says 200 and the console reads the name back while the outbound request carries no
+// credential: a `generic` credential with `paramName: Authorization` gets a 401 and no word why.
 //
 // The rule is the CATALOG, not a list written here: a kind that declares no use for the field
 // refuses it, and a kind this build does not know keeps passing (the same carve-out
@@ -49,8 +48,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -188,8 +187,8 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   }
 
   test("the reporter's config is refused, and the one that works is not", async () => {
-    // NOTE: Issue #488 verbatim: a bare JWT that the API wants in `Authorization`, with no Bearer. The
-    // kind that does that is `header`; `generic` never injects anything.
+    // A bare JWT that the API wants in `Authorization`, with no Bearer. The kind that does that
+    // is `header`; `generic` never injects anything.
     const e = await refusal(() =>
       createVaultEntry(
         ctx(),
@@ -251,7 +250,7 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   });
 
   test("the MCP dry run refuses it too, so the preview cannot promise what apply rejects", async () => {
-    // NOTE: `credential_create` defaults to dry_run and answers BEFORE reaching the core, so a rule
+    // `credential_create` defaults to dry_run and answers BEFORE reaching the core, so a rule
     // the core learns later is a rule the preview promises away (padroes: "dry run tem que prever o
     // apply"). Both halves have to refuse, and the apply half must not create a row.
     const p = {
@@ -283,7 +282,7 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   });
 
   test("the MCP dry run still previews the config that works", async () => {
-    // NOTE: the control for the case above — the guard has to refuse the dead field and nothing
+    // The control for the case above — the guard has to refuse the dead field and nothing
     // else, or it is the preview lying in the other direction.
     const p = {
       tenantId,
@@ -301,7 +300,7 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   });
 
   test("createPendingVaultEntry refuses it too — the surface the MCP tool writes through", async () => {
-    // NOTE: `credential_create` is reference-only and never carries a secret, so it is the one path where
+    // `credential_create` is reference-only and never carries a secret, so it is the one path where
     // paramName is the only thing the operator supplies besides name and kind.
     const e = await refusal(() =>
       createPendingVaultEntry(
@@ -341,7 +340,7 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   });
 
   test("a row that already carries a dead param name stays editable", async () => {
-    // NOTE: The refusal covers what a write INTRODUCES. Rows written before it exists keep their stray
+    // The refusal covers what a write INTRODUCES. Rows written before it exists keep their stray
     // value, and a save that does not touch the field must still go through, or the rule strands
     // exactly the operators who hit the defect.
     const { id } = await createVaultEntry(
@@ -366,7 +365,7 @@ describe.skipIf(!dbUp)("vault: a param name the kind cannot use", () => {
   });
 
   test("a stored kind this build no longer knows keeps accepting one", async () => {
-    // NOTE: `createVaultEntry` refuses an unknown kind up front, so this state is only reachable through
+    // `createVaultEntry` refuses an unknown kind up front, so this state is only reachable through
     // a row an older build wrote. Patching it must not be refused by a catalog that has moved on.
     const { id } = await createVaultEntry(
       ctx(),

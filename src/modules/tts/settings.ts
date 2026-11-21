@@ -1,6 +1,7 @@
 import { TTS_PROVIDER_NAMES } from "./providers";
 
 import {
+  clampTtsTimeout,
   readSpeakableLimits,
   readVoiceChoiceSettings,
   readVoiceSettings,
@@ -67,6 +68,20 @@ export function readTtsConfig(settings: unknown): TtsConfig {
       : null,
     ...readSpeakableLimits(bag),
     ...readVoiceChoiceSettings(bag),
+    // NOTE: in TTS_DEFAULTS' order: an absent block reads as those defaults, and a writer comparing
+    // the two by serialization would otherwise record a change nobody made.
+    fallbackTimeoutMs: clampTtsTimeout(bag.fallbackTimeoutMs),
+    // An unknown name is no fallback at all, never "the primary's provider": that would retry the
+    // provider that just failed.
+    fallbackProvider: TTS_PROVIDER_NAMES.includes(
+      str(bag.fallbackProvider) ?? "",
+    )
+      ? str(bag.fallbackProvider)
+      : null,
+    fallbackModel: str(bag.fallbackModel) ?? "",
+    fallbackVoice: str(bag.fallbackVoice) ?? "",
+    fallbackCredentialRef: str(bag.fallbackCredentialRef),
+    fallbackBaseURL: str(bag.fallbackBaseURL),
     ...readVoiceSettings(bag),
   };
 }
@@ -75,7 +90,7 @@ export function readTtsConfig(settings: unknown): TtsConfig {
 // adapters use that null to omit their settings object entirely, so an untouched agent's request body
 // stays byte-identical to what it was before this feature existed.
 export function voiceSettingsOf(cfg: TtsConfig): TtsVoiceSettings | null {
-  // NOTE: coerce undefined to null before the emptiness test — the fields are optional on the type
+  // Coerce undefined to null before the emptiness test — the fields are optional on the type
   // (so every pre-existing TtsConfig literal still compiles) and `undefined !== null` would otherwise
   // read an untouched config as "the operator set something".
   const v: TtsVoiceSettings = {
@@ -87,6 +102,24 @@ export function voiceSettingsOf(cfg: TtsConfig): TtsVoiceSettings | null {
     latency: cfg.latency ?? null,
   };
   return Object.values(v).some((x) => x !== null) ? v : null;
+}
+
+// The fallback voice as a config of its own, so it goes through the same checks and the same
+// synthesis as the primary, or null when none is configured. Everything that is not the voice (mode,
+// rewrite, delivery knobs, audio check, timeout) is the agent's and stays.
+export function ttsFallbackConfig(cfg: TtsConfig): TtsConfig | null {
+  if (!cfg.fallbackProvider) return null;
+  const same = cfg.fallbackProvider === cfg.provider;
+  return {
+    ...cfg,
+    provider: cfg.fallbackProvider,
+    model: cfg.fallbackModel,
+    voice: cfg.fallbackVoice,
+    credentialRef:
+      cfg.fallbackCredentialRef ?? (same ? cfg.credentialRef : null),
+    baseURL: cfg.fallbackBaseURL ?? (same ? cfg.baseURL : null),
+    fallbackProvider: null,
+  };
 }
 
 // The audio-vs-text decision (pure). contactVoiceReply: true=audio, false=text, null=unknown.

@@ -6,8 +6,11 @@ import {
   enqueueJob,
   enqueueJobUnlessClaimed,
 } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { blockedByChain } from "@/tests/utils/pg-waits";
+import { until } from "@/tests/utils/poll";
 
-// `enqueueJobUnlessClaimed`, estado por estado (issue #786): uma linha CLAIMED fica intocada, e todo
+// `enqueueJobUnlessClaimed`, estado por estado: uma linha CLAIMED fica intocada, e todo
 // outro estado se arma exatamente como `enqueueJob` arma, que é o contrato que a varredura do
 // follow-up sempre teve. A segunda metade é a que impede a guarda de ficar larga demais.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -26,8 +29,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -130,7 +133,7 @@ describe.skipIf(!dbUp)("enqueueJobUnlessClaimed (issue #786)", () => {
     }
   });
 
-  // A corrida da issue na ordem que uma leitura seguida de escrita perderia: a varredura lê PENDING,
+  // NOTE: a corrida na ordem que uma leitura seguida de escrita perderia: a varredura lê PENDING,
   // a reivindicação comita, e só então o arme escreve. O arme espera o lock da linha e reavalia a
   // condição contra a versão reivindicada.
   test("a claim that commits while the arm waits on the row lock still wins", async () => {
@@ -141,29 +144,34 @@ describe.skipIf(!dbUp)("enqueueJobUnlessClaimed (issue #786)", () => {
     });
     let armed: boolean | undefined;
     let settled = false;
+    let arming: Promise<void> = Promise.resolve();
     await suDb.$transaction(async (tx) => {
       await tx.$executeRaw`
         UPDATE scheduler_jobs
            SET status = 'CLAIMED', claim_seq = claim_seq + 1,
                payload = '{"v":"running","stepIndex":0}'::jsonb
          WHERE id = ${id}`;
-      const arming = enqueueJobUnlessClaimed(arm(new Date())).then((r) => {
+      const [me] = await tx.$queryRaw<{ pid: number }[]>`
+        SELECT pg_backend_pid() AS pid`;
+      arming = enqueueJobUnlessClaimed(arm(new Date())).then((r) => {
         armed = r;
         settled = true;
       });
-      await Bun.sleep(300);
+      await until(
+        "o arme parado no lock, ou terminado sem ele",
+        async () => settled || (await blockedByChain(suDb, me?.pid ?? -1)) >= 1,
+      );
       // O rendezvous disparou: o arme está parado no lock, não terminou antes da reivindicação.
       expect(settled).toBe(false);
-      void arming;
     });
-    while (!settled) await Bun.sleep(10);
+    await arming;
     expect(armed).toBe(false);
     const r = await row();
     expect(r.status).toBe("CLAIMED");
     expect(r.payload).toEqual({ v: "running", stepIndex: 0 });
   });
 
-  // `leaveLaterRun` (issue #796): uma linha PENDING com `run_at` no futuro foi adiada pelo handler de
+  // NOTE: `leaveLaterRun`: uma linha PENDING com `run_at` no futuro foi adiada pelo handler de
   // propósito, e o arme da varredura não a puxa de volta nem troca o payload dela. Uma já vencida,
   // uma terminada e uma ausente se armam como antes, e uma adiada que o chamador não reconhece como
   // sua (o predicado recusa o payload) é substituída.

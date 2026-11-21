@@ -12,32 +12,23 @@ import {
 import { EMBEDDING_DIM } from "@/modules/rag/embeddings";
 import { getJobHandler } from "@/modules/scheduler/worker";
 import { updateEmbeddingSettings } from "@/modules/tenant-settings/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
-// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+// TENANT_ADMIN, the role that tells `runScopedOn` the id never came from outside.
 const ctxOf = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: null,
   role: "TENANT_ADMIN",
 });
 
-// Issue #163: editing a document WHILE it is being indexed used to discard the edit, silently.
-//
-// Chunking and embedding run outside any transaction (they are network I/O), which is minutes of
-// window on a large document. An edit landing in that window sets the row back to PENDING — that is
-// how a re-index is requested — and the in-flight run then published `READY` with no status guard,
-// erasing the marker the re-armed job needed. The re-armed job re-read the row, saw READY, and
-// returned; the row kept the new text and search kept the chunks built from the old one, forever.
-//
-// The guard is the publish itself: a run may only publish while the row is still PROCESSING, i.e.
-// while it is still the run that owns the document. It runs FIRST inside the replace-chunks
-// transaction, so a stale run also writes no chunks at all and search keeps answering from the last
-// consistent index instead of going wrong for a while.
-//
-// The embed is not the only window, and the last test here covers the other one: the text to index
-// and the PROCESSING mark are read in ONE transaction, because an edit landing between a separate
-// read and the mark leaves the row PENDING (the value it already had) — so the mark is taken
-// successfully, over text the document no longer has.
+// An edit that lands WHILE a document is being indexed is kept. Chunking and embedding run outside
+// any transaction (network I/O, minutes on a large document), and an edit sets the row back to
+// PENDING to request a re-index; a stale run publishing `READY` would erase that marker, and search
+// would keep the old chunks forever. So a run publishes only while the row is still PROCESSING, as
+// the first step of the replace-chunks transaction, and a stale run writes no chunks at all. The
+// text to index and the PROCESSING mark are read in ONE transaction: an edit between a separate read
+// and the mark leaves the row PENDING, and the mark would succeed over text the document lost.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -55,8 +46,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -75,9 +66,9 @@ function ctx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// The embedding provider, personified: an OpenAI-compatible /embeddings endpoint. It exists to hold
-// the request open, because the window this issue is about IS the duration of that call — a double
-// that returned instantly would never let an edit land mid-run.
+// The embedding provider, personified: an OpenAI-compatible /embeddings endpoint. It holds the
+// request open, because the window under test IS the duration of that call: a double that returned
+// instantly would never let an edit land mid-run.
 let embedServer: ReturnType<typeof Bun.serve> | undefined;
 let baseURL = "";
 // Fires once, while a request is in flight. This is the operator typing.
@@ -123,14 +114,15 @@ let savedAllowPrivate = false;
 
 beforeAll(() => {
   if (!dbUp) return;
-  // The fixture below is a loopback embedding endpoint reached through the REAL ingest path, and
-  // `embedCompatible` now runs the SSRF guard on the operator-configured URL before fetching — which
+  // NOTE: the fixture below is a loopback embedding endpoint reached through the REAL ingest path,
+  // and `embedCompatible` runs the SSRF guard on the operator-configured URL before fetching, which
   // refuses 127.0.0.1 under NODE_ENV=test, exactly as it would in production. Same save/restore the
   // mcp-oauth suite uses for its own loopback fixture; reaching a private endpoint for real is the
   // operator's explicit SSRF_ALLOW_PRIVATE_TARGETS opt-in, and it is not what this suite is about.
   savedAllowPrivate = config.ssrf.allowPrivateTargets;
   config.ssrf.allowPrivateTargets = true;
   embedServer = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
@@ -183,7 +175,7 @@ async function seedTenant(slug: string): Promise<{ id: bigint; kb: bigint }> {
     data: { name: slug, slug: `${slug}-${process.pid}` },
   });
   tenants.push(t.id);
-  // NOTE: the credential carries the baseURL (resolveEmbeddingStatus reads it off the secret), which is
+  // The credential carries the baseURL (resolveEmbeddingStatus reads it off the secret), which is
   // what points the ingest at the double above without unlocking the settings block.
   const cred = await suDb.vaultEntry.create({
     data: {
@@ -246,7 +238,7 @@ async function readDoc(tenantId: bigint, id: bigint) {
   );
 }
 
-// What search actually reads. The document row is not the answer to this issue — the chunks are.
+// What search actually reads: the chunks, not the document row.
 async function readChunks(tenantId: bigint, id: bigint): Promise<string[]> {
   const rows = await suDb.$queryRaw<{ content: string }[]>`
     SELECT content FROM knowledge_chunks
@@ -294,8 +286,8 @@ describe.skipIf(!dbUp)(
       expect(row.chunkCount).toBe(1);
     });
 
-    // NOTE: The issue's sequence, end to end: the effect it names is that search keeps reading the old text
-    // forever, so the assertion is on the chunks after the re-armed job has had its turn.
+    // NOTE: end to end, the assertion is on the chunks after the re-armed job has had its turn,
+    // since a lost edit shows as search reading the old text forever.
     test("the edit lands in the index, not just in the row", async () => {
       const { id, kb } = await seedTenant("rag-edit");
       const doc = await createDocument({
@@ -312,22 +304,21 @@ describe.skipIf(!dbUp)(
       };
       await runIngest(id, doc.id);
 
-      // NOTE: The in-flight run must not have published: the row still carries the operator's re-index
+      // The in-flight run must not have published: the row still carries the operator's re-index
       // marker, which is the only thing that makes the re-armed job do any work.
       const midway = await readDoc(id, doc.id);
       expect(midway.content).toBe("EDITED TEXT");
       expect(midway.status).toBe("PENDING");
 
-      // NOTE: The re-armed job (step 6 of the issue) — the one that used to find READY and return.
+      // NOTE: the re-armed job, which must not find READY and return.
       await runIngest(id, doc.id);
 
       expect(await readChunks(id, doc.id)).toEqual(["EDITED TEXT"]);
       expect((await readDoc(id, doc.id)).status).toBe("READY");
     });
 
-    // NOTE: The same question one branch over: the FAILED write had no status guard either, so a stale run
-    // that errored stamped a failure for content the document no longer holds — and FAILED is just as
-    // effective at swallowing the re-index marker as READY is.
+    // NOTE: the same question one branch over: the FAILED write is guarded too, since FAILED
+    // swallows the re-index marker as READY does, for content the document no longer holds.
     test("a stale run that fails does not stamp its failure on the edited document", async () => {
       const { id, kb } = await seedTenant("rag-fail");
       const doc = await createDocument({
@@ -384,11 +375,9 @@ describe.skipIf(!dbUp)(
       expect(await readChunks(id, doc.id)).toEqual(["THIRD TEXT"]);
     });
 
-    // NOTE: Round 1 review, P2: the embed is not the only window. The run reads the document's text and
-    // takes the mark in two separate steps, and an edit landing BETWEEN them leaves the row PENDING
-    // (the value it already had), so the claim still succeeds — carrying text the document no
-    // longer has. The run then indexes the old text and publishes it legitimately, which is the
-    // same permanent divergence through a narrower door.
+    // NOTE: the embed is not the only window. Were the text read and the mark taken in two steps, an
+    // edit BETWEEN them leaves the row PENDING (the value it had), so the claim succeeds carrying
+    // text the document no longer has, and the run publishes it legitimately.
     test("what gets indexed is the text the claim froze, not the text read before it", async () => {
       const { id, kb } = await seedTenant("rag-claim");
       const doc = await createDocument({
@@ -400,7 +389,7 @@ describe.skipIf(!dbUp)(
         base: appDb,
       });
 
-      // NOTE: There is no network in this gap, so it needs a seam rather than the embedding double. The
+      // There is no network in this gap, so it needs a seam rather than the embedding double. The
       // knowledge-base config read sits inside it, right after the document read.
       let fired = false;
       const hooked = appDb.$extends({

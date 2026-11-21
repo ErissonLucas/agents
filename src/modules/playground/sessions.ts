@@ -9,7 +9,7 @@ import basePrisma from "@/api/lib/prisma";
 import { getCheckpointer } from "@/graph/checkpointer";
 import { DATA_FENCE } from "@/graph/nudge";
 import { customerFacingReply, proactiveReply } from "@/graph/silence";
-import { CONVERSATION_NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
+import { PLAYGROUND_SIMULATED_NATIVE_TOOL_NAMES } from "@/graph/tools/channel-natives";
 import {
   buildPlaygroundTrace,
   collectTraceSources,
@@ -37,7 +37,9 @@ import { type LoadedTurnNote, listThreadTurnNotes } from "./turn-notes";
 
 // Conversation native tools are always simulated in the playground, so label their results as such
 // on reopen too (the mock config isn't persisted, so mocked results show unlabeled on replay).
-const SIMULATED_TOOL_NAMES = new Set<string>(CONVERSATION_NATIVE_TOOL_NAMES);
+const SIMULATED_TOOL_NAMES = new Set<string>(
+  PLAYGROUND_SIMULATED_NATIVE_TOOL_NAMES,
+);
 
 const TITLE_MAX = 80;
 const LIST_LIMIT = 30;
@@ -50,24 +52,17 @@ function msgType(m: BaseMessage): string {
   return anyM.getType?.() ?? anyM._getType?.() ?? "";
 }
 
-// The turn's reply = the last AI message with non-empty text in the slice. (We can't use the
-// graph's lastAssistantText here: it returns the last message's content regardless of type, so a
-// silent follow-up slice — just the system nudge, no AI — would wrongly echo the nudge text.)
+// The turn's reply: the last AI message in the slice. Not the graph's lastAssistantText, which
+// returns the last message regardless of type and would echo a silent follow-up's nudge text.
 function lastAi(
   messages: BaseMessage[],
-  // WHICH RULE sanitizes it, and it has to be the one the live run used. A follow-up's reply went
-  // out through `proactiveReply`, which strips a stray token from a real answer; an ordinary turn's
-  // went out through `customerFacingReply`, which deliberately keeps it (editing a customer-facing
-  // answer is the data loss `docs/graph.md` prohibits). Rebuilding both with the reactive rule
-  // showed a reopened follow-up a different reply from the one the operator was given, with the
-  // token back in it (round 22).
+  // Which rule sanitizes it, the one the live run used: `proactiveReply` strips a stray token from a
+  // follow-up's reply; `customerFacingReply` keeps it in an ordinary turn (editing a customer-facing
+  // answer is the data loss docs/graph.md prohibits).
   followup: boolean,
 ): { text: string; id?: string } {
-  // NOTE: THE LAST AI MESSAGE, even when it is empty — not the last one that happens to have text. A turn
-  // that ends in silence ends with an empty AI message (after `skip_reply`'s tool result), and an
-  // EARLIER tool-calling AI message in the same slice can carry text; scanning past the empty one
-  // returned that instead, so reopening the session showed a follow-up the live run reported silent
-  // (issue #454, review round 9).
+  // NOTE: the LAST AI message, even when it is empty: a silent turn ends with an empty AI message,
+  // and an earlier tool-calling AI message in the slice can carry text that was never the reply.
   for (let k = messages.length - 1; k >= 0; k--) {
     const m = messages[k] as BaseMessage;
     if (msgType(m) === "ai") {
@@ -76,11 +71,9 @@ function lastAi(
       const txt = contentToText(m.content).trim();
       if (txt) {
         const id = (m as unknown as { id?: unknown }).id;
-        // NOTE: The checkpointer holds the model's RAW turn, so a reload rebuilds text the live response
-        // already sanitized — a session reopened after a silent follow-up would show `[[SKIP]]`
-        // again (issue #454). Sanitized after picking WHICH message is the reply, not before: a
-        // sentinel-only turn is a silent turn, and letting the scan walk past it would render the
-        // previous exchange's text as this turn's answer.
+        // NOTE: the checkpointer holds the RAW turn, so the reload re-sanitizes (else `[[SKIP]]`
+        // shows again). After picking which message is the reply: a sentinel-only turn is silent,
+        // and walking past it would render the previous exchange's text.
         return {
           text: followup
             ? proactiveReply(txt).text
@@ -167,10 +160,9 @@ export interface RebuiltTurn {
   // client renders a suppression note instead of an empty bubble, because "nothing was sent" and
   // "the agent chose silence" are different statements.
   suppressed?: boolean;
-  // The id of the human message that opened this turn, which the service mints as the turn's own id
-  // (issue #839): the ledger rows of the turn carry the same id, and that is how a reopened session
-  // gives each reply back the usage line it had live. A follow-up opens on its nudge, so it has one
-  // too; a legacy SystemMessage follow-up does not.
+  // The id of the human message that opened this turn, minted by the service as the turn's own id:
+  // the turn's ledger rows carry it, which is how a reopened session gives each reply its usage line.
+  // A follow-up opens on its nudge, so it has one too; a legacy SystemMessage follow-up does not.
   turnId?: string;
   // What this turn spent, from the ledger rows carrying its turnId. Absent for a turn from before
   // the column, and for one whose calls the ledger has no id for.
@@ -224,7 +216,7 @@ export function rebuildPlaygroundTurns(
     const isFollowup = human ? raw.includes(DATA_FENCE) : true;
     const reply = lastAi(slice, isFollowup);
     if (human) {
-      // A proactive follow-up is now injected as a HUMAN turn (a SystemMessage would make strict
+      // NOTE: A proactive follow-up is injected as a HUMAN turn (a SystemMessage would make strict
       // providers reject the call — see graph.ts). renderNudge always embeds DATA_FENCE, which can't
       // be forged from user input, so it cleanly distinguishes a nudge from a real user message.
       if (isFollowup) {
@@ -282,22 +274,10 @@ export function rebuildPlaygroundTurns(
   return turns;
 }
 
-// Folds the transcript notes over the checkpointer-derived turns (issue #136).
-//
-// A note WITH a message id overrides the reply that message produced. A note without one is a whole
-// turn the thread never received (the input block). And a third case joins them rather than forming
-// a mechanism of its own: an override whose message the rebuild DROPPED, which happens whenever the
-// agent's own reply was empty. Every one of those asks the same question of an id — does the
-// transcript still show it? — and the answer decides between overriding in place and being placed.
-//
-// Getting that question wrong in either direction loses a turn, so the placements share one loop
-// and one guarantee: a target that no longer resolves still renders, at the end. Losing the turn
-// entirely is the failure this whole store exists to prevent.
-// Where a placement goes, for both shapes that need placing. `after` is the message it follows;
-// `whenUnanchored` is what a NULL after means, and the two shapes mean opposite things by it: an
-// input block with no anchor happened on an empty thread and belongs first, while an annotation
-// whose user message was never recorded has no known home and belongs at the end. An `after` that
-// is set but never seen falls to the end either way.
+// Where a placement goes. `after` is the message it follows; `whenUnanchored` is what a NULL after
+// means: an input block with no anchor happened on an empty thread and belongs first, while an
+// annotation whose user message was never recorded belongs at the end. An `after` that is set but
+// never seen falls to the end either way.
 interface Placement {
   after: string | null;
   whenUnanchored: "start" | "end";
@@ -347,6 +327,10 @@ function annotatedReply(note: LoadedTurnNote): RebuiltTurn {
   };
 }
 
+// Folds the transcript notes over the checkpointer-derived turns. A note WITH a message id overrides
+// that reply; one without is a turn the thread never received (the input block); an override whose
+// message the rebuild dropped (an empty reply) is placed like the latter. A target that no longer
+// resolves still renders, at the end: losing the turn is what this store exists to prevent.
 export function applyTurnNotes(
   turns: RebuiltTurn[],
   notes: LoadedTurnNote[],
@@ -403,7 +387,7 @@ export function applyTurnNotes(
         role: "assistant",
         text: "",
         suppressed: true,
-        // The note stands for this turn's reply, so it carries the turn's usage line (issue #839).
+        // NOTE: the note stands for this turn's reply, so it carries the turn's usage line.
         ...(n.userMessageId ? { turnId: n.userMessageId } : {}),
         trace: [...n.guardrails],
         sources: [],
@@ -436,14 +420,11 @@ export function applyTurnNotes(
   return out;
 }
 
-// Hands each turn's ledger usage to the reply the operator read for it (issue #839): the LAST
-// agent-side bubble carrying that turnId, which is where the live turn drew its line.
-//
-// A turn that billed calls and replied nothing (the agent chose silence, or it failed after a call)
-// showed "(no reply)" with its line live, and the rebuild drops an empty reply, so the bubble is put
-// back after the user's message, with the line. Only where the ledger has rows for that turn: an
-// older turn, from before the column, keeps the transcript it always had. A silent follow-up has no
-// user message on screen to follow, so its calls stay in the session total only.
+// Hands each turn's ledger usage to the reply the operator read for it: the LAST agent-side bubble
+// carrying that turnId, where the live turn drew its line. A turn that billed calls and replied
+// nothing gets its empty bubble back after the user's message, with the line, but only where the
+// ledger has rows for it. A silent follow-up has no user message to follow, so its calls stay in the
+// session total only.
 export function attachTurnUsage(
   turns: RebuiltTurn[],
   byTurn: ReadonlyMap<string, TurnUsage>,
@@ -495,6 +476,7 @@ async function usageByTurn(
         promptTokens: true,
         cachedReadTokens: true,
         cacheCreationTokens: true,
+        cacheCreation1hTokens: true,
         completionTokens: true,
         costUsd: true,
       },
@@ -510,6 +492,7 @@ async function usageByTurn(
       promptTokens: g._sum.promptTokens,
       cachedReadTokens: g._sum.cachedReadTokens,
       cacheCreationTokens: g._sum.cacheCreationTokens,
+      cacheCreation1hTokens: g._sum.cacheCreation1hTokens,
       completionTokens: g._sum.completionTokens,
       costUsd: usdOrNull(g._sum.costUsd),
       pricedCalls: g._count.costUsd,
@@ -518,6 +501,20 @@ async function usageByTurn(
     out.set(g.turnId, usage);
   }
   return out;
+}
+
+// A playground thread whose agent was deleted while it ran: its notes and its checkpoint, written
+// after the delete swept the agent's sessions.
+async function forgetDeletedAgentThread(
+  base: PrismaClient,
+  ctx: TenantContext,
+  agentId: bigint,
+  threadId: string,
+): Promise<void> {
+  await runScopedOn(base, ctx, (db) =>
+    db.playgroundTurnNote.deleteMany({ where: { agentId, threadId } }),
+  );
+  await (await getCheckpointer()).deleteThread(threadId);
 }
 
 // Upsert the session metadata after a turn. Best-effort: a history-write hiccup must never break the
@@ -533,13 +530,22 @@ export async function upsertPlaygroundSession(
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) return;
   const title = clipText(titleHint.replace(/\s+/g, " ").trim(), TITLE_MAX);
   try {
-    await runScopedOn(base, ctx, (db) =>
-      db.playgroundSession.upsert({
+    const agentGone = await runScopedOn(base, ctx, async (db) => {
+      // The agent row, shared against `deleteAgent`'s lock: a turn that ran while its agent was
+      // deleted finds it gone here and recreates no session, and one that got here first has its
+      // session taken by the delete.
+      const [agent] = await db.$queryRaw<{ id: bigint }[]>`
+        SELECT id FROM agents WHERE id = ${agentId} FOR KEY SHARE`;
+      if (!agent) return true;
+      await db.playgroundSession.upsert({
         where: { tenantId_threadId: { tenantId, threadId } },
         create: { tenantId, agentId, threadId, title },
         update: { updatedAt: new Date() },
-      }),
-    );
+      });
+      return false;
+    });
+    // NOTE: what that turn wrote after the delete took its sessions has no session left to reach it.
+    if (agentGone) await forgetDeletedAgentThread(base, ctx, agentId, threadId);
   } catch (e) {
     logger.warn(
       "playground: session upsert failed: %s",
@@ -651,7 +657,7 @@ export async function getPlaygroundSessionTurns(
   return attachTurnUsage(turns, await usageByTurn(base, ctx, threadId));
 }
 
-// A fresh thread for a session about to start (issue #839), so its first call is billed to a thread
+// A fresh thread for a session about to start, so its first call is billed to a thread
 // the console already holds. Only an id: nothing is written until a turn runs on it. The agent is
 // read under the caller's scope first, so an id for another tenant's agent is a 404, not a string.
 export async function startPlaygroundThread(
@@ -667,7 +673,7 @@ export async function startPlaygroundThread(
   return newPlaygroundThreadId(ctx.tenantId as bigint, agentId);
 }
 
-// What a session has spent so far, from the ledger (issue #839): the total a reopened session
+// What a session has spent so far, from the ledger: the total a reopened session
 // shows. The live turns sum the same rows in process (`sumTurnUsage`), counted only when on this
 // thread, so the two totals are one sum read two ways. The session row existing in OUR tenant-scoped
 // table is the authorization, as in getPlaygroundSessionTurns.
@@ -681,7 +687,7 @@ export async function getPlaygroundSessionUsage(
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) {
     throw new NotFoundError("session not found", "errors.sessionNotFound");
   }
-  // Grouped by step, so the session total names its calls the way each turn does (issue #858).
+  // Grouped by step, so the session total names its calls the way each turn does.
   const groups = await runScopedOn(base, ctx, (db) =>
     db.llmUsage.groupBy({
       by: ["node", "priceTable"],
@@ -691,6 +697,7 @@ export async function getPlaygroundSessionUsage(
         promptTokens: true,
         cachedReadTokens: true,
         cacheCreationTokens: true,
+        cacheCreation1hTokens: true,
         completionTokens: true,
         costUsd: true,
       },
@@ -704,6 +711,7 @@ export async function getPlaygroundSessionUsage(
       promptTokens: g._sum.promptTokens,
       cachedReadTokens: g._sum.cachedReadTokens,
       cacheCreationTokens: g._sum.cacheCreationTokens,
+      cacheCreation1hTokens: g._sum.cacheCreation1hTokens,
       completionTokens: g._sum.completionTokens,
       costUsd: usdOrNull(g._sum.costUsd),
       pricedCalls: g._count.costUsd,
@@ -713,12 +721,9 @@ export async function getPlaygroundSessionUsage(
   return usage;
 }
 
-// Remove a session from history, thread and all — which is what the endpoint has always said it
-// does. Leaving the checkpointer thread behind used to be harmless, because the transcript WAS the
-// thread; now the annotations that explain it live in rows of ours, and the turn endpoint accepts
-// any thread id that passes the fence below. So a caller holding a deleted id could open a turn on
-// it and get the old conversation back with the moderation deleted: the raw replies a guardrail
-// replaced, presented as the agent's own (issue #136).
+// Remove a session from history, thread and all. The turn endpoint accepts any thread id that passes
+// the fence, so a leftover thread could be reopened with its moderation notes gone: the raw replies
+// a guardrail replaced, presented as the agent's own.
 export async function deletePlaygroundSession(
   ctx: TenantContext,
   agentId: bigint,
@@ -731,20 +736,16 @@ export async function deletePlaygroundSession(
   if (!isValidPlaygroundThread(threadId, tenantId, agentId)) {
     throw new NotFoundError("session not found", "errors.sessionNotFound");
   }
-  // Before the unscoped delete below, and NOT as a side effect of the scoped block after it. The
-  // checkpointer lives outside RLS and carries no foreign key to `tenants`, so a tenant's playground
-  // threads OUTLIVE the tenant row: a stale selector can still name a thread that exists, and
-  // refusing afterwards would erase a transcript on a request that then reports itself refused.
-  // This is the same gate called earlier, not a second one: `runScopedOn` is where an unknown tenant
-  // is verified, and it verifies nothing at all for a caller whose id came from a row (issue #268).
+  // NOTE: verifies the tenant BEFORE the unscoped delete: checkpointer threads outlive the tenant row
+  // (no RLS, no foreign key), and refusing afterwards would erase a transcript on a refused request.
+  // `runScopedOn` verifies nothing for a caller whose id came from a row.
   await runScopedOn(base, ctx, async () => undefined);
-  // First, and not swallowed: a delete that dropped our rows and left the thread would leave
-  // exactly the state described above. Failing here leaves the session whole instead.
+  // First, and not swallowed: dropping our rows and leaving the thread is the state above.
   const checkpointer = await getCheckpointer();
   await checkpointer.deleteThread(threadId);
   await runScopedOn(base, ctx, async (db) => {
-    // The transcript notes go with it. Left behind they would be orphans, and pruned separately
-    // they would put a still-reloadable session back to the raw reply (issue #136).
+    // NOTE: the transcript notes go with it; pruned separately they would put a still-reloadable
+    // session back to the raw reply.
     await db.playgroundTurnNote.deleteMany({ where: { agentId, threadId } });
     await db.playgroundSession.deleteMany({ where: { agentId, threadId } });
   });

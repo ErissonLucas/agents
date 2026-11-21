@@ -13,6 +13,7 @@ import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 // The other half of the compaction tests, and the half that would otherwise be missing entirely:
@@ -39,8 +40,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -145,7 +146,7 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     };
   }
 
-  // NOTE: A conversation_* event carries the conversation's fields at the ROOT of the payload, not
+  // A conversation_* event carries the conversation's fields at the ROOT of the payload, not
   // nested under `conversation` the way a message event does (see normalize.ts).
   async function deliver(event: string, conversation: Record<string, unknown>) {
     deliverySeq += 1;
@@ -214,7 +215,7 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     });
   }
 
-  // NOTE: A strictly increasing stamp, NOT the wall clock. The mirror orders writes by the
+  // A strictly increasing stamp, NOT the wall clock. The mirror orders writes by the
   // conversation's own `updated_at`, and two rounds landing inside the same second would make the
   // second one look stale — the mirror would drop it, no transition would be seen, and the test
   // would fail for a reason that has nothing to do with what it is testing.
@@ -406,10 +407,10 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
         query: {
           conversation: {
             findUnique({ args, query }) {
-              if (
-                (args.select as { contactInboxId?: boolean } | undefined)
-                  ?.contactInboxId
-              ) {
+              // Only that lookup, the pairing with its inbox relation: the mirror's own read selects the
+              // pairing too, beside the inbox FK.
+              const select = args.select as Record<string, unknown> | undefined;
+              if (select?.contactInboxId && select.inbox) {
                 throw new Error("injected: mirror lookup unavailable");
               }
               return query(args);
@@ -570,10 +571,9 @@ describe.skipIf(!dbUp)("memory compaction: arming from the webhook", () => {
     expect(boundaryPayload.reason).toBe("new_attendance");
     expect(boundaryPayload.conversationId).toBe(501);
 
-    // A third attendance whose turn never produces a reply: the boundary must survive anyway. It
-    // used to advance the marker and depend on the invoke to write the divider, so a guardrail that
-    // answered before the model — or a throw, as here — left an attendance nothing could ever find
-    // the boundary of again.
+    // NOTE: a third attendance whose turn never produces a reply: the boundary must survive anyway.
+    // Advancing the marker and leaving the divider to the invoke would let a guardrail that answers
+    // before the model, or a throw as here, leave an attendance whose boundary nothing can find.
     await suDb.conversation.create({
       data: {
         tenantId,

@@ -7,7 +7,7 @@ import {
   registerRateLimitMiddleware,
 } from "@/api/middlewares/rateLimit";
 
-// NOTE: tests/setup.ts captures Bun's native Response before happy-dom replaces it globally, and
+// tests/setup.ts captures Bun's native Response before happy-dom replaces it globally, and
 // Bun.serve does not recognize the spec one. Restored for the duration of this file only, the same
 // way tests/api/features/realtime does it. Requests go through `Bun.fetch` for the mirror-image
 // reason: the global `fetch` is happy-dom's, which enforces the Same Origin Policy against the
@@ -35,10 +35,13 @@ const serve = (max: number, trusted = false) => {
   const app = new Elysia()
     .use(rateLimitMiddleware(max, clientKeyFor(trusted, 1)))
     .get("/api/x", () => "x");
-  const listening = app.listen(0) as unknown as ListeningApp;
+  const listening = app.listen({
+    port: 0,
+    hostname: "127.0.0.1",
+  }) as unknown as ListeningApp;
   if (!listening.server?.port) throw new Error("Failed to start test server");
   servers.push(listening.server);
-  return { url: `http://localhost:${listening.server.port}/api/x` };
+  return { url: `http://127.0.0.1:${listening.server.port}/api/x` };
 };
 
 beforeAll(() => {
@@ -67,6 +70,26 @@ describe("rate-limit keying (client address, not the socket peer)", () => {
   });
 
   // The other half: the limit still has to BITE. Same client, same bucket, budget spent.
+  test("every refusal is the error shape, the second as much as the first", async () => {
+    const { url } = serve(1, true);
+    const answers: Array<[number, unknown]> = [];
+    for (let i = 0; i < 3; i++) {
+      const res = await Bun.fetch(url, {
+        headers: { "x-forwarded-for": "203.0.113.90" },
+      });
+      answers.push([
+        res.status,
+        res.status === 429 ? await res.json() : await res.text(),
+      ]);
+    }
+    const refused = { error: "Rate limit exceeded. Please try again later." };
+    expect(answers).toEqual([
+      [200, "x"],
+      [429, refused],
+      [429, refused],
+    ]);
+  });
+
   test("one forwarded client still exhausts its own budget", async () => {
     const { url } = serve(2, true);
     const statuses: number[] = [];
@@ -113,8 +136,8 @@ describe("rate-limit keying (client address, not the socket peer)", () => {
 
 // Which requests the DCR limiter covers. The budget is 10/min because an open DCR endpoint lets
 // anyone mint OAuth client rows, so a spelling that routes but escapes the limiter is the whole
-// limiter: measured before the fix, 14 registrations through `/register/` under that ceiling, every
-// one a 200 and none carrying a `RateLimit-*` header.
+// limiter: a trailing-slash `/register/` that escapes it takes unlimited registrations, each a 200
+// with no `RateLimit-*` header.
 describe("the DCR limiter covers every spelling that routes", () => {
   const post = (path: string) =>
     new Request(`http://localhost${path}`, { method: "POST" });
@@ -158,11 +181,14 @@ describe("the DCR limiter covers every spelling that routes", () => {
     const app = new Elysia()
       .use(registerRateLimitMiddleware())
       .post("/api/v1/mcp/oauth/register", () => ({ ok: true }));
-    const listening = app.listen(0) as unknown as ListeningApp;
+    const listening = app.listen({
+      port: 0,
+      hostname: "127.0.0.1",
+    }) as unknown as ListeningApp;
     if (!listening.server?.port) throw new Error("Failed to start test server");
     servers.push(listening.server);
     const send = (path: string) =>
-      Bun.fetch(`http://localhost:${listening.server.port}${path}`, {
+      Bun.fetch(`http://127.0.0.1:${listening.server.port}${path}`, {
         method: "POST",
       });
 

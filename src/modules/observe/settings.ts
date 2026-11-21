@@ -1,20 +1,25 @@
-// What a monitoring agent DOES with what it reads (issue #477), configured under
-// `agent.settings.monitoring`. Read leniently, like every other behavior block: a missing or
-// malformed field takes its default.
-//
-// WHAT USED TO BE HERE and is deliberately gone (issue #568): the label groups. A monitoring agent
-// was a classifier, and this block told it what to classify into — a taxonomy with its own screen,
-// its own schema, its own write-time assertions and its own cross-agent conflict rules. None of
-// that belonged to the MODE. A watcher is the ordinary agent that cannot answer the customer, and
-// what it does with a conversation is what its prompt and its tools say, exactly as for a
-// responder: labelling is `set_labels`, and which labels exclude each other is a sentence in the
-// operator's own prompt, not a structure the product stores.
-//
-// What is left is what is genuinely about OBSERVING: when to look, and how much to read.
+import { MONITORING_RANGES } from "@/modules/agents/number-ranges";
+import { projectDecisionsBlock } from "@/modules/decisions/config";
+
+// What a monitoring agent DOES with what it reads, configured under `agent.settings.monitoring`.
+// Read leniently, like every other behavior block: a missing or malformed field takes its default.
+// It holds only what is about OBSERVING (when to look, how much to read): what a watcher does with
+// a conversation is its prompt and tools, as for a responder (labelling is `set_labels`).
 
 export type MonitoringAnalysis = "incremental" | "on_resolve";
 
+// HOW the watcher decides: `llm` is the ordinary graph with the agent's prompt and tools;
+// `decisions` asks a classification API typed questions and turns the answers
+// into tool calls by rule (modules/decisions, docs/decisions.md). Anything else reads as `llm`, so a
+// row written before the key existed, or with a value this build does not know, keeps today's path.
+export type MonitoringEngine = "llm" | "decisions";
+
 export interface MonitoringConfig {
+  engine: MonitoringEngine;
+  // The `decisions` engine's block, CARRIED as stored and validated where it is used
+  // (modules/decisions/config.ts): this reader is the one every rewrite of `monitoring` goes through
+  // (the MCP merge, the console's save), so a block it did not carry would be deleted by them.
+  decisions: Record<string, unknown> | null;
   // `incremental`: a turn per debounced burst of customer messages, and a final one on resolve.
   // `on_resolve`: the final one only.
   analysis: MonitoringAnalysis;
@@ -26,15 +31,21 @@ export interface MonitoringConfig {
 }
 
 export const MONITORING_DEFAULTS: Readonly<MonitoringConfig> = Object.freeze({
+  engine: "llm",
+  decisions: null,
   analysis: "incremental",
   window: { messages: 20 },
   debounce: { windowSeconds: 20, maxWindowSeconds: 60 },
 });
 
-export const WINDOW_MESSAGES_MIN = 4;
-export const WINDOW_MESSAGES_MAX = 60;
-export const OBSERVE_WINDOW_MIN_SECONDS = 3;
-export const OBSERVE_WINDOW_MAX_SECONDS = 600;
+export const WINDOW_MESSAGES_MIN = MONITORING_RANGES.windowMessages.min;
+export const WINDOW_MESSAGES_MAX = MONITORING_RANGES.windowMessages.max;
+// ZERO IS A SETTING, not a floor to round up from: the observation is due the moment the message is
+// ingested, one model call per customer message, for an operator who wants the verdict while the
+// conversation is happening. The drain is woken at the row's own instant (`wakeObserveDrainAt`), so
+// a window below the drain's interval is honored and not rounded up to it.
+export const OBSERVE_WINDOW_MIN_SECONDS = MONITORING_RANGES.windowSeconds.min;
+export const OBSERVE_WINDOW_MAX_SECONDS = MONITORING_RANGES.windowSeconds.max;
 
 function clampInt(v: unknown, min: number, max: number, fallback: number) {
   if (typeof v !== "number" || !Number.isFinite(v)) return fallback;
@@ -76,6 +87,8 @@ export function readMonitoringConfig(settings: unknown): MonitoringConfig {
     Math.max(def.debounce.maxWindowSeconds, windowSeconds),
   );
   return {
+    engine: bag.engine === "decisions" ? "decisions" : "llm",
+    decisions: projectDecisionsBlock(bag.decisions),
     analysis: bag.analysis === "on_resolve" ? "on_resolve" : "incremental",
     window: {
       messages: clampInt(

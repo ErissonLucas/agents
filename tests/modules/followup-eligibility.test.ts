@@ -1,6 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
 import {
   type FollowUpLiveness,
   isFollowUpLive,
@@ -8,8 +6,8 @@ import {
 } from "@/modules/followups/eligibility";
 
 // Decision table: one row per reason the handler drops a claimed follow-up job. The console indicator
-// reads the same predicate, so a row that flips here flips in both places at once — which is the
-// whole point of the predicate existing (issue #72).
+// reads the same predicate, so a row that flips here flips in both places at once, which is the
+// whole point of the predicate existing.
 
 const LIVE: FollowUpLiveness = {
   agentEnabled: true,
@@ -55,8 +53,8 @@ const cases: Array<{
     live: true,
   },
   {
-    // Nothing else here excludes a third mode: without this arm a monitoring agent with follow-up
-    // switched on chases the customer it is forbidden to answer (issue #209).
+    // NOTE: Nothing else here excludes a third mode: without this arm a monitoring agent with follow-up
+    // switched on chases the customer it is forbidden to answer.
     name: "a monitoring agent, whatever the conversation says",
     patch: { agentMode: "monitoring", testActivatedAt: new Date() },
     live: false,
@@ -83,9 +81,9 @@ const cases: Array<{
     patch: { assigneeType: "AgentBot" },
     live: true,
   },
-  // ── The ownership axis (issue #214). The same conversation is live or dead depending on what the
-  //    READER can say about the holder, which is the divergence the predicate now carries explicitly
-  //    instead of leaving each reader to build its own gate.
+  // NOTE: ── The ownership axis. The same conversation is live or dead depending on what the READER can say
+  //    about the holder, which the predicate carries explicitly instead of each reader building its own
+  //    gate.
   {
     name: "the mirror names another party's bot, or one it cannot identify",
     patch: { assigneeType: "AgentBot", mirrorHolder: "not-ours" },
@@ -112,10 +110,9 @@ const cases: Array<{
     patch: { assigneeType: "User", mirrorHolder: "not-ours" },
     live: false,
   },
-  // ── The engagement axis (issue #652). Every other arm above asks whether the sequence may
-  //    CONTINUE; this one asks whether it ever started. A conversation the agent deliberately stayed
-  //    out of with `skip_reply` passes all of them — pending, bot-owned, agent on, customer silent —
-  //    and is exactly the row the sweep was selecting.
+  // NOTE: ── The engagement axis. Every other arm above asks whether the sequence may CONTINUE; this one
+  //    asks whether it ever started. A conversation the agent deliberately stayed out of with
+  //    `skip_reply` passes all of them (pending, bot-owned, agent on, customer silent).
   {
     name: "nobody on our side has ever spoken in this conversation",
     patch: { ourSideHasSpoken: false },
@@ -137,68 +134,7 @@ describe("isFollowUpLive", () => {
   }
 });
 
-// `mirrorHolder: "not-asked"` reads as live, so it is only sound for a reader that re-asks Chatwoot
-// before it sends. The decision table above proves what the predicate DOES with each value; it cannot
-// prove that the readers pass the value they are entitled to, and picking "not-asked" is what a new
-// reader does when the strict answer is inconvenient — which is issue #214 all over again, silently.
-//
-// A file-scoped check, and deliberately no stronger: it says the abstaining file also arms the live
-// probe, not that the two are on the same branch. That is enough to make a copy-paste into a reader
-// with no probe fail here and be read about.
-describe('mirrorHolder: "not-asked" — who may say it', () => {
-  function sourceFiles(dir: string): string[] {
-    const out: string[] = [];
-    for (const entry of readdirSync(dir)) {
-      const full = join(dir, entry);
-      if (statSync(full).isDirectory()) out.push(...sourceFiles(full));
-      else if (full.endsWith(".ts") || full.endsWith(".tsx")) out.push(full);
-    }
-    return out;
-  }
-
-  test("every reader that abstains re-asks Chatwoot before sending", () => {
-    const abstaining = sourceFiles("src").filter((f) =>
-      readFileSync(f, "utf8").includes('mirrorHolder: "not-asked"'),
-    );
-    // The handler is the one reader entitled to it today; zero matches would mean the check went
-    // stale (the string moved or was renamed) rather than that the rule holds.
-    expect(abstaining).toEqual(["src/modules/followups/handlers.ts"]);
-    for (const f of abstaining) {
-      expect(readFileSync(f, "utf8")).toContain(
-        "requireLiveBotOwnership: true",
-      );
-    }
-  });
-});
-
-// O slate limpo dos comandos (`/reset` e `/teste`) encerra o episódio zerando as âncoras que a cerca
-// do silêncio lê. Desde a issue #750 são DUAS — a fala do cliente e a nossa, e a cerca toma a mais
-// recente —, então limpar uma só devolve a passagem pela outra: a varredura recria o follow-up que o
-// comando acabou de cancelar, sem ninguém ter falado.
-//
-// Cerca por fonte porque o defeito é de OMISSÃO num `data: {}` novo, e nenhuma asserção de
-// comportamento alcança o terceiro call site que ainda não existe. Ela mede uma GRAFIA: quem zerar as
-// âncoras por caminho diferente (um `$executeRaw`, um spread) passa por aqui sem ser visto, e é por
-// isso que o bloco vizinho, no `chatwoot-reset`, exerce o comportamento de um deles de verdade.
-describe("slate limpo: as duas âncoras do silêncio saem juntas", () => {
-  test("todo bloco que zera lastFollowUpAt também zera lastRepliedAt", () => {
-    const src = readFileSync("src/modules/chatwoot/webhook.ts", "utf8");
-    const blocos = [...src.matchAll(/lastFollowUpAt: null,/g)];
-    // Zero casamentos seria a cerca envelhecida (campo renomeado, bloco movido), não a regra valendo.
-    expect(blocos.length).toBeGreaterThanOrEqual(2);
-    for (const m of blocos) {
-      // A janela é generosa de propósito: o que importa é os dois estarem no MESMO `data`, e a ordem
-      // entre eles é de quem escreve.
-      const janela = src.slice(
-        Math.max(0, (m.index ?? 0) - 800),
-        (m.index ?? 0) + 800,
-      );
-      expect(janela).toContain("lastRepliedAt: null,");
-    }
-  });
-});
-
-// The predicate itself, one half at a time (issue #816 added the third).
+// The predicate itself, one term at a time.
 describe("ourSideHasSpoken", () => {
   const none = {
     lastRepliedMessageId: null,

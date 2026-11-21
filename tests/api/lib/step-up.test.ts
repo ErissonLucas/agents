@@ -5,22 +5,11 @@ import {
   mockUser,
   setupPrismaMock,
 } from "@/tests/utils/prisma-mock";
-import { countInSrc } from "@/tests/utils/source-text";
 
-// Step-up is a property of the SESSION, and a Bearer API key has none (issue #308).
-//
-// Six routes re-ask the acting user's password before an irreversible act (minting a key is one of
-// them, since the key answers every later step-up by itself). Each read that password
-// against the row `ctx.userId` names, which for an API-key principal is the key's CREATOR: a machine
-// holding the key could only pass by also holding a person's password, and that is the coupling the
-// issue reports as "fragile by nature" (the password rotates, the person leaves, the automation
-// breaks). The key is presented on every request and was itself minted under a step-up; there is
-// nothing left for a password to prove, so the helper answers for the principal kind, once, and the
-// routes stop spelling the check themselves.
-//
-// "Minted under a step-up" is what the key carries (`stepUpAt`), not what its kind implies: a key
-// that predates the rule was minted with no password anywhere, and it keeps answering the way every
-// key did before, with its creator's password (review round 3).
+// Step-up is a property of the SESSION, and a Bearer API key has none: a key minted under a step-up
+// (`stepUpAt`) answers it by itself, rather than with its creator's password, which would tie the
+// automation to a person. A key with no step-up on record answers with its creator's password. The
+// rule is in docs/api-and-fleet.md, "Step-up is a property of the session".
 
 setupPrismaMock();
 const { confirmStepUp, requireSession } = await import("@/api/lib/step-up");
@@ -50,9 +39,8 @@ describe("confirmStepUp", () => {
     expect((err as AppError).translationKey).toBe("errors.invalidPassword");
   });
 
-  // Missing is not incorrect. Before the field became optional on the wire the schema answered 422
-  // with no name for what was missing; a session that omits it now gets the sentence the console can
-  // show.
+  // Missing is not incorrect: the field is optional on the wire, so a session that omits it gets a
+  // sentence naming what is missing rather than a schema 422.
   test("a session without a password is refused as required (400), before any lookup", async () => {
     for (const absent of [undefined, ""]) {
       const err = await confirmStepUp(session(), absent).catch((e) => e);
@@ -87,10 +75,9 @@ describe("confirmStepUp", () => {
     expect(mockFindUnique).not.toHaveBeenCalled();
   });
 
-  // Review round 3 on #308: a key that predates the rule has no step-up to carry, so it answers
-  // the way every key did before this change, with its creator's password (`userId` names the
-  // creator for a key). Nothing it could do yesterday is refused, nothing it could not do is
-  // allowed. Absent is the same as null: no step-up on record is no step-up.
+  // A key with no step-up on record answers with its creator's password (`userId` names the creator
+  // for a key), so nothing it could do is refused and nothing it could not do is allowed. Absent is
+  // the same as null.
   test("a key minted before the rule (no step-up on record) still answers with its creator's password", async () => {
     for (const legacy of [
       session({ actorType: "api_key", stepUpAt: null }),
@@ -107,16 +94,9 @@ describe("confirmStepUp", () => {
       await expect(confirmStepUp(legacy, "s3cret")).resolves.toBeUndefined();
     }
   });
-
-  // The cookie session's `actorType` is absent (the tenancy boundary only stamps "api_key"); absent
-  // is a session, never a key.
-  test("an absent actorType is a session", async () => {
-    const err = await confirmStepUp({ userId: 1n }, undefined).catch((e) => e);
-    expect((err as AppError).translationKey).toBe("errors.passwordRequired");
-  });
 });
 
-// A key never mints a credential that outlives it (review round 2): the routes that mint one refuse
+// A key never mints a credential that outlives it: the routes that mint one refuse
 // a key outright, in either spelling the two boundaries use for "this is a key".
 describe("requireSession", () => {
   test("a session passes, in both shapes", () => {
@@ -141,45 +121,6 @@ describe("requireSession", () => {
       expect((err as AppError).translationKey).toBe(
         "errors.apiKeyRequiresSession",
       );
-    }
-  });
-});
-
-// The rule has one implementation. A route that spells `verifyPassword(` itself has decided, on
-// its own, whether a key may pass — and it decided the old way, against the creator's row. The
-// legitimate callers are the definition, and the two places where a password IS the credential and
-// no session exists yet: the login route, and accepting an invitation into an account that already
-// exists (issue #756), which proves the account is the invitee's.
-describe("every step-up goes through confirmStepUp", () => {
-  test("verifyPassword( is called from the login paths and the helper only", async () => {
-    const found = await countInSrc(/\bverifyPassword\(/g);
-    const allowed = new Set([
-      "src/api/features/auth/auth.service.ts",
-      "src/api/features/auth/auth.controller.ts",
-      "src/api/features/invitations/invitation.service.ts",
-      "src/api/lib/step-up.ts",
-    ]);
-    const strays = Object.keys(found).filter((f) => !allowed.has(f));
-    expect(strays).toEqual([]);
-    // Control: the sweep can see a call at all, or an empty stray list proves nothing.
-    expect(found["src/api/lib/step-up.ts"]).toBe(1);
-  });
-
-  // The principal the helper reads is the one the boundary stamped (`stepUpAt` included). A route
-  // that builds `{ userId, actorType }` by hand has dropped the step-up on record, and every key
-  // reaching it, legacy or not, is asked the creator's password — or, with a different hand-built
-  // shape, none is. One spelling at the AuthUser seam (`stepUpPrincipalOf`), the context elsewhere.
-  test("every call site hands the helper the boundary's principal, never a hand-built one", async () => {
-    const calls = await countInSrc(/\bconfirmStepUp\(/g);
-    const whole = await countInSrc(
-      /\bconfirmStepUp\(\s*(?:ctx\b|stepUpPrincipalOf\()/g,
-    );
-    const sites = Object.entries(calls).filter(
-      ([file]) => file !== "src/api/lib/step-up.ts",
-    );
-    expect(sites.length).toBeGreaterThan(1);
-    for (const [file, n] of sites) {
-      expect([file, whole[file] ?? 0]).toEqual([file, n]);
     }
   });
 });

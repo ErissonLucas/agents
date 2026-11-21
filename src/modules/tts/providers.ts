@@ -1,24 +1,19 @@
-// NOTE: Text-to-speech provider abstraction. Each provider has a different shape, so each gets a thin
-// adapter behind one interface + registry. Adding a provider = one function + one registry entry, no
-// caller changes. The API key is a vault entry; provider/voice are per-agent. The OUTPUT CONTAINER
-// follows the destination channel (TtsRequest.format, chosen by pickTtsFormat): WhatsApp renders a
-// recorded voice note (PTT) only when the audio is **Ogg/Opus** — anything else arrives as a plain
-// file attachment — while Meta's Instagram messaging accepts audio only as aac/m4a/wav/mp4 and
-// refuses ogg AND mp3 (the send job fails AFTER Chatwoot shows the message as sent, so the customer
-// silently never receives it). openai emits aac natively; elevenlabs has no aac/wav output, so its
-// Instagram replies are raw PCM wrapped in a 44-byte RIFF header locally (pcmToWav — a header write,
-// not a transcode); openrouter only emits mp3 and therefore cannot serve Instagram at all (the
-// service falls back to a text reply there). gemini emits only raw PCM, which is wrapped into a
-// RIFF header for "wav" and encoded to Ogg/Opus in-process for "ogg_opus" (ogg-opus.ts, WASM). fish
-// is asked for that same PCM and takes the same path.
+// Text-to-speech provider abstraction: a thin adapter per provider behind one interface + registry.
+// The output container follows the destination channel (`pickTtsFormat`): WhatsApp renders a voice
+// note only for Ogg/Opus, and Instagram accepts only aac/m4a/wav/mp4, failing other formats after
+// Chatwoot shows the message sent. elevenlabs has no aac/wav, so its PCM gets a local RIFF header
+// (pcmToWav, not a transcode); openrouter emits only mp3 and cannot serve Instagram (text fallback).
+// gemini and fish emit raw PCM, wrapped in a RIFF header for "wav" and encoded to Ogg/Opus
+// in-process for "ogg_opus" (ogg-opus.ts, WASM).
 
 import { pcmToOggOpus } from "./ogg-opus";
-import type { TtsVoiceSettings } from "./settings-shared";
+import {
+  TTS_TIMEOUT_DEFAULT_MS,
+  type TtsVoiceSettings,
+} from "./settings-shared";
 import { pcmToWav } from "./wav";
 
-const TTS_TIMEOUT_MS = 60_000;
-
-// NOTE: the audio container the reply is delivered in, decided per destination channel by pickTtsFormat.
+// The audio container the reply is delivered in, decided per destination channel by pickTtsFormat.
 export type TtsOutputFormat = "ogg_opus" | "aac" | "wav" | "mp3";
 
 export interface TtsRequest {
@@ -35,6 +30,8 @@ export interface TtsRequest {
   // NOTE: how the words are delivered (see TtsVoiceSettings). Omitted/null = the operator set nothing,
   // so the adapter drops the field entirely instead of sending its own idea of a default.
   voiceSettings?: TtsVoiceSettings | null;
+  // NOTE: how long this one request may take, body included. Omitted = TTS_TIMEOUT_DEFAULT_MS.
+  timeoutMs?: number;
 }
 
 export interface TtsResult {
@@ -72,12 +69,12 @@ export class TtsError extends Error {
   }
 }
 
-// NOTE: a provider error body is not a safe thing to keep (free-text messages carry account/billing
+// A provider error body is not a safe thing to keep (free-text messages carry account/billing
 // detail and echoed credentials), but the machine-readable STATUS inside it is: `voice_not_found`,
 // `invalid_api_key`, `quota_exceeded` each end a debugging session in one line. Known shapes:
 // ElevenLabs `{detail: {status}}`, OpenAI/OpenRouter `{error: {code|type}}`, Google `{error: {status}}`.
 const MAX_ERROR_BODY = 8_192;
-// NOTE: the guard that keeps prose out by construction — a code is a slug, a message has spaces and
+// The guard that keeps prose out by construction — a code is a slug, a message has spaces and
 // punctuation. A body whose "code" field holds a sentence is dropped rather than logged.
 const ERROR_CODE_RE = /^[a-z0-9][a-z0-9._-]{0,63}$/i;
 
@@ -85,7 +82,7 @@ function pickErrorCode(value: unknown): string | null {
   return typeof value === "string" && ERROR_CODE_RE.test(value) ? value : null;
 }
 
-// NOTE: reads at most `max` bytes and cancels the stream past that, instead of `res.text()`, which
+// Reads at most `max` bytes and cancels the stream past that, instead of `res.text()`, which
 // buffers the WHOLE body before any size check — a chunked error body has no declared length, so an
 // unbounded one would be fully materialized just to be discarded.
 async function readCappedText(
@@ -115,7 +112,7 @@ async function readCappedText(
   return new TextDecoder().decode(joined);
 }
 
-// NOTE: reads the provider's error code off a failed response. Never throws and never returns free text:
+// Reads the provider's error code off a failed response. Never throws and never returns free text:
 // a body that is absent, oversized, not JSON, or carries no slug-shaped code yields null.
 export async function readProviderErrorCode(
   res: Response,
@@ -142,7 +139,7 @@ export async function readProviderErrorCode(
   }
 }
 
-// NOTE: Chatwoot infers file_type "audio" from the audio/* mime + the extension, and `is_recorded_audio`
+// Chatwoot infers file_type "audio" from the audio/* mime + the extension, and `is_recorded_audio`
 // marks it as a recording; baileys then sends Ogg/Opus to WhatsApp as a PTT voice note.
 const RESULT_BY_FORMAT: Record<
   TtsOutputFormat,
@@ -154,7 +151,7 @@ const RESULT_BY_FORMAT: Record<
   mp3: { mime: "audio/mpeg", fileName: "reply.mp3" },
 };
 
-// NOTE: picks the container for the destination channel. Instagram (Meta messaging) accepts audio only as
+// Picks the container for the destination channel. Instagram (Meta messaging) accepts audio only as
 // aac/m4a/wav/mp4 — ogg and mp3 are refused by the send job AFTER Chatwoot already shows the message
 // as sent, so the customer silently never receives the reply. Every other channel keeps the
 // WhatsApp-first default: Ogg/Opus (native PTT voice note) when the provider can emit it, else the
@@ -172,7 +169,25 @@ export function pickTtsFormat(
   return provider.formats.includes("ogg_opus") ? "ogg_opus" : "mp3";
 }
 
-// NOTE: OpenAI speech: POST /audio/speech; response_format maps 1:1 from the requested container ("opus"
+// One request under its deadline, body included. An abort while the body is still streaming surfaces
+// as a read error that names no timeout (`EncodingError: Failed to read response body` in Bun), so
+// once our own signal fired its reason is what is thrown: a slow provider is a timeout, and the
+// fallback voice is asked for exactly that. A `TtsError` is kept: its status arrived before the
+// deadline, and only the optional error code was being read when it fired.
+async function underDeadline(
+  req: TtsRequest,
+  run: (signal: AbortSignal) => Promise<TtsResult>,
+): Promise<TtsResult> {
+  const signal = AbortSignal.timeout(req.timeoutMs ?? TTS_TIMEOUT_DEFAULT_MS);
+  try {
+    return await run(signal);
+  } catch (err) {
+    if (signal.aborted && !(err instanceof TtsError)) throw signal.reason;
+    throw err;
+  }
+}
+
+// OpenAI speech: POST /audio/speech; response_format maps 1:1 from the requested container ("opus"
 // returns an Ogg-Opus stream, the WhatsApp voice-note format; "aac" serves Instagram natively).
 const OPENAI_FORMAT: Record<TtsOutputFormat, string> = {
   ogg_opus: "opus",
@@ -181,7 +196,10 @@ const OPENAI_FORMAT: Record<TtsOutputFormat, string> = {
   mp3: "mp3",
 };
 
-async function openaiSynthesize(req: TtsRequest): Promise<TtsResult> {
+async function openaiSynthesize(
+  req: TtsRequest,
+  signal: AbortSignal,
+): Promise<TtsResult> {
   const base = (req.baseURL ?? "https://api.openai.com/v1").replace(/\/+$/, "");
   const res = await req.fetchImpl(`${base}/audio/speech`, {
     method: "POST",
@@ -196,14 +214,14 @@ async function openaiSynthesize(req: TtsRequest): Promise<TtsResult> {
       response_format: OPENAI_FORMAT[req.format],
     }),
     redirect: "error",
-    signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+    signal,
   });
   if (!res.ok)
     throw new TtsError("openai", res.status, await readProviderErrorCode(res));
   return { audio: await res.arrayBuffer(), ...RESULT_BY_FORMAT[req.format] };
 }
 
-// NOTE: ElevenLabs text-to-speech: POST /text-to-speech/{voice_id}?output_format=…. Opus output was added
+// ElevenLabs text-to-speech: POST /text-to-speech/{voice_id}?output_format=…. Opus output was added
 // 2025-03; 48kHz/64kbps is ample for a voice note. There is no aac/wav output, so the "wav"
 // container is served as pcm_24000 (raw 16-bit mono PCM, available on every plan tier) wrapped in a
 // RIFF header locally — a 44-byte header write, no transcode.
@@ -239,7 +257,10 @@ function elevenlabsVoiceSettings(
   return Object.keys(out).length ? out : undefined;
 }
 
-async function elevenlabsSynthesize(req: TtsRequest): Promise<TtsResult> {
+async function elevenlabsSynthesize(
+  req: TtsRequest,
+  signal: AbortSignal,
+): Promise<TtsResult> {
   const base = (req.baseURL ?? "https://api.elevenlabs.io/v1").replace(
     /\/+$/,
     "",
@@ -262,7 +283,7 @@ async function elevenlabsSynthesize(req: TtsRequest): Promise<TtsResult> {
         voice_settings: elevenlabsVoiceSettings(req.voiceSettings),
       }),
       redirect: "error",
-      signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+      signal,
     },
   );
   if (!res.ok)
@@ -281,13 +302,16 @@ async function elevenlabsSynthesize(req: TtsRequest): Promise<TtsResult> {
   return { audio: raw, ...RESULT_BY_FORMAT[req.format] };
 }
 
-// NOTE: OpenRouter speech: dedicated audio API (launched 2026-05-01), POST /audio/speech. Unlike openai/
+// OpenRouter speech: dedicated audio API (launched 2026-05-01), POST /audio/speech. Unlike openai/
 // elevenlabs it has NO Opus output option (only "mp3"/"pcm", and pcm's sample rate varies per routed
 // model, so it cannot be safely wrapped), so the reply arrives at WhatsApp as a plain file
 // attachment instead of a native voice note (PTT) — surfaced as a warning in the editor — and
 // Instagram cannot be served at all (pickTtsFormat returns null there; the service falls back to a
 // text reply). The `format` field is accepted but always rendered as mp3.
-async function openrouterSynthesize(req: TtsRequest): Promise<TtsResult> {
+async function openrouterSynthesize(
+  req: TtsRequest,
+  signal: AbortSignal,
+): Promise<TtsResult> {
   const base = (req.baseURL ?? "https://openrouter.ai/api/v1").replace(
     /\/+$/,
     "",
@@ -305,7 +329,7 @@ async function openrouterSynthesize(req: TtsRequest): Promise<TtsResult> {
       response_format: "mp3",
     }),
     redirect: "error",
-    signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+    signal,
   });
   if (!res.ok)
     throw new TtsError(
@@ -316,7 +340,7 @@ async function openrouterSynthesize(req: TtsRequest): Promise<TtsResult> {
   return { audio: await res.arrayBuffer(), ...RESULT_BY_FORMAT.mp3 };
 }
 
-// NOTE: Gemini speech: generateContent with the AUDIO response modality. The output is base64 audio in
+// Gemini speech: generateContent with the AUDIO response modality. The output is base64 audio in
 // one inline part, documented as raw PCM (s16le, mono, 24 kHz, rate also named in its mimeType), so
 // every container is built here: a RIFF header for "wav", an in-process Opus encode for "ogg_opus".
 // `providerFormat` names the PCM the wire carries, since the container never reaches Google.
@@ -329,7 +353,7 @@ export function geminiPcm(
   mimeType: string | undefined,
   provider = "gemini",
 ): { pcm: ArrayBuffer; sampleRate: number } {
-  // NOTE: a copy through the Uint8Array constructor, since Buffer#slice is a view onto a shared pool.
+  // A copy through the Uint8Array constructor, since Buffer#slice is a view onto a shared pool.
   const copy = (from: number, to: number) =>
     new Uint8Array(bytes.subarray(from, to)).buffer as ArrayBuffer;
   const ascii = (off: number) =>
@@ -353,7 +377,10 @@ export function geminiPcm(
   };
 }
 
-async function geminiSynthesize(req: TtsRequest): Promise<TtsResult> {
+async function geminiSynthesize(
+  req: TtsRequest,
+  signal: AbortSignal,
+): Promise<TtsResult> {
   const base = (
     req.baseURL ?? "https://generativelanguage.googleapis.com/v1beta"
   ).replace(/\/+$/, "");
@@ -375,7 +402,7 @@ async function geminiSynthesize(req: TtsRequest): Promise<TtsResult> {
         },
       }),
       redirect: "error",
-      signal: AbortSignal.timeout(TTS_TIMEOUT_MS),
+      signal,
     },
   );
   if (!res.ok)
@@ -404,11 +431,11 @@ async function geminiSynthesize(req: TtsRequest): Promise<TtsResult> {
   };
 }
 
-// NOTE: Fish Audio: POST /v1/tts, Bearer key, the model in a `model` HEADER and the voice as
+// Fish Audio: POST /v1/tts, Bearer key, the model in a `model` HEADER and the voice as
 // `reference_id`. Its `opus` output names no container in the docs, so the voice note is built the
 // way Gemini's is: 16-bit mono PCM at 24 kHz, encoded to Ogg/Opus here (and wrapped for "wav").
-// A 429/5xx is retried once inside the same 60s budget; the status maps to our own slug, never to
-// the provider's message (402 = the account ran out of credit, 401 = the key is wrong).
+// A 429/5xx is retried once inside the request's own deadline; the status maps to our own slug,
+// never to the provider's message (402 = the account ran out of credit, 401 = the key is wrong).
 const FISH_PCM_RATE = 24_000;
 const FISH_SPEED: readonly [number, number] = [0.5, 2];
 const FISH_ERROR_CODE: Record<number, string> = {
@@ -458,7 +485,7 @@ export function makeFishSynthesize(opts: {
       /\/+$/,
       "",
     );
-    const deadline = Date.now() + opts.budgetMs;
+    const deadline = Date.now() + (req.timeoutMs ?? opts.budgetMs);
     const payload = JSON.stringify(fishBody(req));
     const post = () =>
       req.fetchImpl(`${base}/tts`, {
@@ -487,7 +514,7 @@ export function makeFishSynthesize(opts: {
     if (raw.byteLength === 0) throw new TtsError("fish", 502, "no_audio");
     if (req.format === "mp3")
       return { audio: raw.buffer, ...RESULT_BY_FORMAT.mp3 };
-    // NOTE: a RIFF body, should one come back, is unwrapped and its own sample rate honoured.
+    // A RIFF body, should one come back, is unwrapped and its own sample rate honoured.
     const { pcm, sampleRate } = geminiPcm(
       raw,
       `audio/pcm;rate=${FISH_PCM_RATE}`,
@@ -509,7 +536,8 @@ const PROVIDERS: Record<string, TtsProvider> = {
     defaultVoice: "alloy",
     formats: ["ogg_opus", "aac", "wav", "mp3"],
     providerFormat: (format) => OPENAI_FORMAT[format],
-    synthesize: openaiSynthesize,
+    synthesize: (req) =>
+      underDeadline(req, (signal) => openaiSynthesize(req, signal)),
   },
   elevenlabs: {
     defaultModel: "eleven_flash_v2_5",
@@ -517,7 +545,8 @@ const PROVIDERS: Record<string, TtsProvider> = {
     requiresVoice: true,
     formats: ["ogg_opus", "wav", "mp3"],
     providerFormat: elevenlabsOutput,
-    synthesize: elevenlabsSynthesize,
+    synthesize: (req) =>
+      underDeadline(req, (signal) => elevenlabsSynthesize(req, signal)),
   },
   openrouter: {
     // Verified live end-to-end (GET /models?output_modalities=speech + a real /audio/speech call).
@@ -531,14 +560,16 @@ const PROVIDERS: Record<string, TtsProvider> = {
     defaultVoice: "af_alloy",
     formats: ["mp3"],
     providerFormat: () => "mp3",
-    synthesize: openrouterSynthesize,
+    synthesize: (req) =>
+      underDeadline(req, (signal) => openrouterSynthesize(req, signal)),
   },
   gemini: {
     defaultModel: "gemini-2.5-flash-preview-tts",
     defaultVoice: "Kore",
     formats: GEMINI_FORMATS,
     providerFormat: () => "pcm_s16le_24000",
-    synthesize: geminiSynthesize,
+    synthesize: (req) =>
+      underDeadline(req, (signal) => geminiSynthesize(req, signal)),
   },
   fish: {
     defaultModel: "s2.1-pro",
@@ -550,7 +581,7 @@ const PROVIDERS: Record<string, TtsProvider> = {
     providerFormat: (format) =>
       fishFormat(format) === "pcm" ? "pcm_s16le_24000" : "mp3",
     synthesize: makeFishSynthesize({
-      budgetMs: TTS_TIMEOUT_MS,
+      budgetMs: TTS_TIMEOUT_DEFAULT_MS,
       retryDelayMs: 1_000,
     }),
   },

@@ -11,6 +11,7 @@ import {
   issueAccessToken,
   verifyAccessToken,
 } from "@/modules/mcp/oauth/tokens";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
 // Self-service connections module (oauth/connections.ts): a user lists/disconnects only their OWN MCP
@@ -31,8 +32,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -40,7 +41,7 @@ let tenantA = 0n;
 let userA = 0n;
 let userB = 0n;
 
-// The caller, as the principal the disconnect now records itself under (#400).
+// The caller, as the principal the disconnect records itself under.
 const asUser = (userId: bigint): TenantContext & { userId: bigint } => ({
   tenantId: tenantA,
   userId,
@@ -133,18 +134,36 @@ describe.skipIf(!dbUp)("mcp self-service connections", () => {
   });
 
   test("activeTokenCount counts only the caller's live tokens", async () => {
-    await issueAccessToken({
-      clientId,
-      userId: userA,
-      tenantId: tenantA,
-      role: "TENANT_ADMIN",
-      scopes: ["mcp:read"],
-      base: appDb,
+    const count = async (userId: bigint) =>
+      (await listMyConnections(userId, appDb)).find(
+        (c) => c.clientId === clientId,
+      )?.activeTokenCount;
+    const beforeA = (await count(userA)) ?? 0;
+    const beforeB = (await count(userB)) ?? 0;
+    const issue = (userId: bigint) =>
+      issueAccessToken({
+        clientId,
+        userId,
+        tenantId: tenantA,
+        role: "TENANT_ADMIN",
+        scopes: ["mcp:read"],
+        base: appDb,
+      });
+    await issue(userA);
+    await issue(userB);
+    const revoked = await issue(userA);
+    await su?.mcpOAuthAccessToken.update({
+      where: { jti: revoked.jti },
+      data: { revokedAt: new Date() },
     });
-    const row = (await listMyConnections(userA, appDb)).find(
-      (c) => c.clientId === clientId,
-    );
-    expect(row?.activeTokenCount).toBeGreaterThanOrEqual(1);
+    const expired = await issue(userA);
+    await su?.mcpOAuthAccessToken.update({
+      where: { jti: expired.jti },
+      data: { expiresAt: new Date(Date.now() - 1_000) },
+    });
+    // NOTE: one live token of A's; B's, the revoked one and the expired one are not A's live tokens.
+    expect(await count(userA)).toBe(beforeA + 1);
+    expect(await count(userB)).toBe(beforeB + 1);
   });
 
   test("disconnect forgets the approval AND revokes the caller's tokens", async () => {

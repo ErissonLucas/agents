@@ -20,6 +20,7 @@ import {
   runPlaygroundTurn,
   toPlaygroundInvokeError,
 } from "@/modules/playground/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRows } from "../utils/flowlog";
 import {
   ScriptedCaptureModel,
@@ -42,8 +43,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -240,28 +241,9 @@ describe.skipIf(!dbUp)("playground", () => {
     );
   });
 
-  // The second half of issue #454's family. The playground runs the production toolset on a thread
-  // of its own, and its REACTIVE path restated none of the silence rule the follow-up path next to
-  // it already had — so the operator testing an agent could be shown the raw token as the reply.
-  test("the follow-up's skip sentinel is not rendered as a playground reply", async () => {
-    const r = await runPlaygroundTurn({
-      ctx: ctx(tenantId),
-      agentId: agentOk,
-      message: "oi",
-      base: appDb,
-      deps: {
-        makeModel: () =>
-          new FakeListChatModel({ responses: [FOLLOWUP_SKIP_SENTINEL] }),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(r.reply).toBe("");
-  });
-
-  // Round 10. Emptying the REPLY does not empty the THREAD: `graph.invoke` checkpointed the raw
-  // message before the rule ran, a playground session is multi-turn on one thread, and the next turn
-  // would read one more sentinel answer — the compounding the inbox path rolls back. The playground
-  // claims production fidelity (`docs/playground.md`), and this is the one place it was not.
+  // NOTE: emptying the REPLY does not empty the THREAD: `graph.invoke` checkpoints the raw message
+  // before the rule runs, and on a multi-turn session the next turn would read one more sentinel
+  // answer, the compounding the inbox path rolls back (production fidelity, `docs/playground.md`).
   test("a token-silenced playground turn leaves nothing behind in the thread", async () => {
     const checkpointer = new MemorySaver();
     const r = await runPlaygroundTurn({
@@ -312,14 +294,13 @@ describe.skipIf(!dbUp)("playground", () => {
         checkpointer: new MemorySaver(),
       },
     });
-    // Round 4: carried, not edited out (docs/graph.md — never strip a real reply).
+    // NOTE: carried, not edited out (docs/graph.md: never strip a real reply).
     expect(r.reply).toBe(`${FOLLOWUP_SKIP_SENTINEL} Claro, posso ajudar.`);
   });
 
-  // The playground synthesized WITHOUT the speech rewrite until #105, so the operator heard a
-  // different rendering than the customer. Observable effects, in the order the operator meets them:
-  // the voice provider is handed the REWRITTEN text, the audio is saved against the turn, and the
-  // rewrite is billed as its own row tagged playground (out of the dashboard, never an alert).
+  // NOTE: the operator hears the rendering the customer hears. In the order the operator meets
+  // them: the voice provider is handed the REWRITTEN text, the audio is saved against the turn, and
+  // the rewrite is billed as its own row tagged playground (out of the dashboard, never an alert).
   test("an audio reply is rewritten for speech, saved, and billed as playground usage", async () => {
     const spoken: string[] = [];
     const ttsFetch = (async (_url: unknown, init?: RequestInit) => {
@@ -364,8 +345,8 @@ describe.skipIf(!dbUp)("playground", () => {
     ]);
   });
 
-  // Issue #787: the operator hears what the customer hears, so the URL stays out of the speech here
-  // too, and the reply itself keeps it.
+  // NOTE: the operator hears what the customer hears, so the URL stays out of the speech here too,
+  // and the reply itself keeps it.
   test("a URL is kept out of the playground's speech, and stays in the reply (#787)", async () => {
     const spoken: string[] = [];
     const ttsFetch = (async (_url: unknown, init?: RequestInit) => {
@@ -425,7 +406,7 @@ describe.skipIf(!dbUp)("playground", () => {
     expect(r.ttsMediaId).toBeUndefined();
   });
 
-  // Issue #856: the playground asks the same plan, so a reply built to be read goes as text there too
+  // NOTE: the playground asks the same plan, so a reply built to be read goes as text there too
   // once the agent turned the switch on, and is spoken while it is off.
   test("a price table gets no audio in the playground once the agent sends such replies as text (#856)", async () => {
     const table =
@@ -485,8 +466,8 @@ describe.skipIf(!dbUp)("playground", () => {
     }
   });
 
-  // Issue #859: the playground asks production's plan, so its "answer in audio" switch tells the model
-  // the same thing a customer's voice note does, and the model's choice of text is honoured the same.
+  // The playground asks production's plan, so its "answer in audio" switch tells the model the
+  // same thing a customer's voice note does, and the model's choice of text is honoured the same.
   async function withAudioAgent(
     extra: Record<string, unknown>,
     fn: () => Promise<void>,
@@ -570,9 +551,9 @@ describe.skipIf(!dbUp)("playground", () => {
     );
   });
 
-  // Codex review of #879: production's follow-up (the nudge) is never offered reply_as_text, so the
-  // simulation must not be either, and for an agent with no other tool that extra tool would also
-  // keep `skip_reply` bound and change the silence protocol.
+  // NOTE: production's follow-up (the nudge) is never offered reply_as_text, so the simulation must
+  // not be either; for an agent with no other tool that extra tool would also keep `skip_reply`
+  // bound and change the silence protocol.
   test("a simulated follow-up is not offered reply_as_text (#859)", async () => {
     await withAudioAgent(
       { mode: "mirror", textChoice: true, spokenNotice: true },
@@ -650,6 +631,7 @@ describe.skipIf(!dbUp)("playground", () => {
         expect(r.ttsMediaId).toBeUndefined();
         expect(spoken).toEqual([]);
         const lines = await flowLogRows(suDb, {
+          orderBy: { id: "asc" },
           where: { tenantId, threadId: r.threadId },
         });
         expect(
@@ -675,8 +657,8 @@ describe.skipIf(!dbUp)("playground", () => {
     );
   });
 
-  // Issue #755: the playground dates what the operator types with the instant it says it was
-  // written, so a session shows the history the way a real turn would send it.
+  // NOTE: the playground dates what the operator types with the instant it says it was written, so
+  // a session shows the history the way a real turn would send it.
   test("the operator's message is kept with the instant it was written", async () => {
     const checkpointer = new MemorySaver();
     const before = Date.now();
@@ -797,11 +779,10 @@ describe.skipIf(!dbUp)("playground", () => {
     );
   });
 
-  // Round 13, and the other side of the same switch: the removal belongs to the simulated FOLLOW-UP
-  // and to nothing else. On a REACTIVE turn an agent granted `skip_reply` and nothing else is the
-  // operator's own configuration — it is how their agent answers "ok" and "obrigado" with silence —
-  // and production keeps the tool there. A playground that removed it would show them an agent that
-  // cannot make the decision they configured.
+  // NOTE: the removal belongs to the simulated FOLLOW-UP only. On a REACTIVE turn an agent granted
+  // `skip_reply` alone is the operator's configuration (how it answers "ok" and "obrigado" with
+  // silence), production keeps the tool there, and removing it would show an agent that cannot make
+  // the decision they configured.
   test("an ordinary playground turn keeps a lone skip_reply", async () => {
     const grant = await suDb.agentToolSelection.create({
       data: {
@@ -846,10 +827,9 @@ describe.skipIf(!dbUp)("playground", () => {
     }
   });
 
-  // Round 16, the playground twin of round 15's fix. An agent that can bind no tool is told to say
-  // nothing with the token, and emptying the REPLY does not empty the THREAD — a playground session
-  // is multi-turn on one thread, so the next simulated turn reads the token back as a sentence the
-  // customer was told, which is precisely what production stopped doing.
+  // NOTE: an agent that can bind no tool is told to say nothing with the token, and emptying the
+  // REPLY does not empty the THREAD: on a multi-turn session the next simulated turn would read the
+  // token back as a sentence the customer was told, which production does not do.
   test("a silent simulated follow-up leaves its token out of the thread", async () => {
     const grant = await suDb.agentToolSelection.create({
       data: {
@@ -888,9 +868,9 @@ describe.skipIf(!dbUp)("playground", () => {
     }
   });
 
-  // The scope, pinned exactly as production pins it: a follow-up that produced no text at all left
-  // nothing to be read as something said, so it pays no round trip and its turn stands. The two
-  // paths agreeing on this is the playground's whole claim.
+  // NOTE: the scope, pinned exactly as production pins it: a follow-up that produced no text at all
+  // leaves nothing to be read as something said, so it pays no round trip and its turn stands. The
+  // two paths agreeing on this is the playground's whole claim.
   test("a simulated follow-up that wrote nothing is not rolled back", async () => {
     const checkpointer = new MemorySaver();
     const r = await runPlaygroundFollowup({
@@ -905,6 +885,67 @@ describe.skipIf(!dbUp)("playground", () => {
     expect(r.silent).toBe(true);
     const after = await threadMessages(checkpointer, r.threadId);
     expect(after.filter((m) => m.getType() === "ai")).toHaveLength(1);
+  });
+
+  // The preview follows production's closing-step rule: a sequence whose only step is an empty closer
+  // reaches no model, and says what the step does instead.
+  test("a simulated follow-up whose only step is an empty closer reaches no model", async () => {
+    let calls = 0;
+    const r = await runPlaygroundFollowup({
+      ctx: ctx(tenantId),
+      agentId: agentOk,
+      base: appDb,
+      overrides: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [
+              {
+                delayValue: 1,
+                delayUnit: "hours",
+                instructions: "  ",
+                resolve: true,
+              },
+            ],
+          },
+        },
+      },
+      deps: {
+        makeModel: () => {
+          calls++;
+          return fakeModel();
+        },
+        checkpointer: new MemorySaver(),
+      },
+    });
+    expect(calls).toBe(0);
+    expect(r).toMatchObject({ reply: "", closesOnly: true, silent: false });
+  });
+
+  test("a simulated follow-up previews the first step when the empty closer comes after it", async () => {
+    const r = await runPlaygroundFollowup({
+      ctx: ctx(tenantId),
+      agentId: agentOk,
+      base: appDb,
+      overrides: {
+        settings: {
+          followUp: {
+            enabled: true,
+            steps: [
+              { delayValue: 1, delayUnit: "hours", instructions: "" },
+              {
+                delayValue: 1,
+                delayUnit: "hours",
+                instructions: "",
+                resolve: true,
+              },
+            ],
+          },
+        },
+      },
+      deps: { makeModel: fakeModel, checkpointer: new MemorySaver() },
+    });
+    expect(r).toMatchObject({ reply: REPLY, closesOnly: false });
   });
 
   // Positive control: a follow-up that really answered keeps its turn, or the assertion above would
@@ -922,7 +963,7 @@ describe.skipIf(!dbUp)("playground", () => {
     expect(after.map((m) => String(m.content))).toContain(REPLY);
   });
 
-  // Round 12, the WIRING of the same rule production applies (`tests/graph/silence.test.ts` proves
+  // NOTE: the WIRING of the same rule production applies (`tests/graph/silence.test.ts` proves
   // the rule). A source that yields nothing leaves the granted channel as the WHOLE toolset, and
   // binding one lone schema at an endpoint that refuses them costs the entire follow-up. This model
   // IS such an endpoint: `bindTools` throws.
@@ -973,20 +1014,6 @@ describe.skipIf(!dbUp)("playground", () => {
     } finally {
       await suDb.agentToolSelection.delete({ where: { id: grant.id } });
     }
-  });
-
-  test("a follow-up with an empty model reply is reported as silent", async () => {
-    const r = await runPlaygroundFollowup({
-      ctx: ctx(tenantId),
-      agentId: agentOk,
-      base: appDb,
-      deps: {
-        makeModel: () => new FakeListChatModel({ responses: [""] }),
-        checkpointer: new MemorySaver(),
-      },
-    });
-    expect(r.reply).toBe("");
-    expect(r.silent).toBe(true);
   });
 
   test("listPlaygroundTools classifies native/utility/http/rag and marks simulated", async () => {
@@ -1091,7 +1118,10 @@ describe("runPlaygroundAudioTurn guards", () => {
         agentId: 1n,
         file: fakeFile(30 * 1024 * 1024, "audio/webm"),
       }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({
+      statusCode: 413,
+      translationKey: "errors.audioTooLarge",
+    });
   });
 
   test("rejects a non-audio mime type", async () => {
@@ -1101,7 +1131,10 @@ describe("runPlaygroundAudioTurn guards", () => {
         agentId: 1n,
         file: fakeFile(1000, "image/png"),
       }),
-    ).rejects.toThrow();
+    ).rejects.toMatchObject({
+      statusCode: 415,
+      translationKey: "errors.unsupportedAudioType",
+    });
   });
 });
 

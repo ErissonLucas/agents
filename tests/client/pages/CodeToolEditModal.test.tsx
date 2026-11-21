@@ -1,16 +1,17 @@
 /// <reference lib="dom" />
 
-import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { completionStatus, startCompletion } from "@codemirror/autocomplete";
 import { EditorView } from "@codemirror/view";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
   screen,
   waitFor,
 } from "@testing-library/react";
+import * as acorn from "acorn";
 import { ToastProvider } from "@/client/components";
 import { isMacLike, scopeKeyLabel } from "@/client/components/CodeEditor";
 import { useModalController } from "@/client/components/Modal";
@@ -24,6 +25,7 @@ import {
   payloadOfCodeTool,
   starterCode,
 } from "@/client/pages/resources/CodeToolEditModal";
+import { until } from "@/tests/utils/poll";
 
 // The dominant pattern in this suite: pure-function tests over the exported form helpers, plus one
 // happy-dom render that proves the load-bearing UI rule — an invalid body warns but never disables
@@ -31,10 +33,9 @@ import {
 
 afterEach(cleanup);
 
-// The body is no longer a `<textarea>`: it is CodeMirror (issue #538), so `fireEvent.change` has
-// nothing to change. `EditorView.findFromDOM` is CodeMirror's own way to reach the view that owns a
-// node, so the test drives the REAL editor and its onChange rather than a stand-in for it, which is
-// what keeps these tests about the modal instead of about the widget.
+// The body is CodeMirror, not a `<textarea>`, so `fireEvent.change` has nothing to change.
+// `EditorView.findFromDOM` is CodeMirror's own way to reach the view that owns a node, so the test
+// drives the REAL editor and its onChange, which keeps these tests about the modal.
 function setCode(text: string) {
   const host = document.body.querySelector(".cm-editor") as HTMLElement;
   const view = EditorView.findFromDOM(host);
@@ -216,10 +217,9 @@ test("an invalid body warns but leaves Save enabled", async () => {
   expect(save?.hasAttribute("disabled")).toBe(false);
 });
 
-// The defect as the operator meets it, and the only place it is visible: Escape is how a suggestion
-// is dismissed, and it is also how this dialog closes. Radix hears the press first (capture phase on
-// `document`), so before the claim in escapeClaim.ts the same key that put the popup away asked
-// whether to throw the body out. Measured in a browser; this is the regression fence for it.
+// Escape is how a suggestion is dismissed, and it is also how this dialog closes. Radix hears the
+// press first (capture phase on `document`), so without the claim in escapeClaim.ts the key that
+// puts the popup away would also ask whether to throw the body out.
 test("Escape dismisses the suggestion without offering to discard the body", async () => {
   render(<Harness />);
   fireEvent.click(screen.getByText("open"));
@@ -238,8 +238,8 @@ test("Escape dismisses the suggestion without offering to discard the body", asy
   await waitFor(() => expect(completionStatus(view.state)).toBe("active"));
 
   content.dispatchEvent(
-    // `cancelable`, as a real keydown is: the fix works by `preventDefault`, which Radix reads back
-    // (react-dismissable-layer), and `preventDefault` on a non-cancelable event does nothing.
+    // NOTE: `cancelable`, as a real keydown is: the claim works by `preventDefault`, which Radix
+    // reads back (react-dismissable-layer), and on a non-cancelable event it does nothing.
     new KeyboardEvent("keydown", {
       key: "Escape",
       bubbles: true,
@@ -264,10 +264,10 @@ test("Escape dismisses the suggestion without offering to discard the body", asy
   );
 });
 
-// The defect as the operator meets it: open a tool, touch nothing, press Escape, and be asked
-// whether to discard changes. A body stored with CRLF (saved over MCP from a Windows client, or
-// carried in by an import) cannot survive CodeMirror, which normalizes line endings on the way in,
-// and the normalized text used to come back through `onChange` as if the operator had typed it.
+// Open a tool, touch nothing, press Escape: no "discard changes?" prompt. A body stored with CRLF
+// (saved over MCP from a Windows client, or imported) cannot survive CodeMirror, which normalizes
+// line endings on the way in, and that normalization must not come back through `onChange` as if
+// the operator had typed it.
 test("a tool stored with CRLF opens clean, and closes without asking", async () => {
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -340,7 +340,7 @@ test("a body with no return warns without disabling Save", async () => {
 
 // The other DOM rule: an answer belongs to the opening that asked for it. The GET outlives the
 // dialog, so closing while it is out and reopening on another tool would otherwise let the first
-// answer fill the second form — and Save would then patch the new id with the old tool's contents.
+// answer fill the second form, and Save would then patch the new id with the old tool's contents.
 // `fetch` is intercepted rather than the api module: `mock.module` is process-global and tears down
 // mocks other files installed (the note in document-starters-race.test.tsx).
 function TwoToolsHarness() {
@@ -463,8 +463,9 @@ test("a save the server warned about says so in the toast, not only under the fi
 });
 
 test("reopening a tool whose body does not parse warns again, without an edit", async () => {
-  // The opening clears the warnings, and reopening the same tool leaves the body identical — so an
-  // effect keyed only on the text does not rerun and a broken body looks clean until it is typed in.
+  // The opening clears the warnings, and reopening the same tool leaves the body identical,
+  // so an effect keyed only on the text does not rerun and a broken body looks clean until typed
+  // in.
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const href =
@@ -555,8 +556,8 @@ test("a save that lands after the dialog was dismissed does not close the next o
 
 test("a save that FAILS after the dialog was dismissed does not mark the next one", async () => {
   // A refusal that arrives for a dialog that is gone has nowhere to land, and would put the
-  // previous tool's error on the form now open. This drives the RESPONSE branch — the client
-  // returns a transport failure as `error` rather than throwing — and the `catch` beside it carries
+  // previous tool's error on the form now open. This drives the RESPONSE branch (the client returns
+  // a transport failure as `error` rather than throwing), and the `catch` beside it carries
   // the same guard for the exceptions the client does not convert.
   const realFetch = globalThis.fetch;
   let fail = () => {};
@@ -611,49 +612,146 @@ test("a save that FAILS after the dialog was dismissed does not mark the next on
   }
 });
 
-test("the parser only runs while the dialog is open", () => {
-  // This component stays mounted on the Tools page and the agent editor, and the empty form starts
-  // with the starter body — so an ungated effect downloads the parser chunk and parses a body
-  // nobody is editing, on every visit to either page. A source fence rather than a module mock:
-  // `mock.module` is process-global here and tears down mocks other files installed (the note in
-  // document-starters-race.test.tsx), and what is being asserted is one guard's presence.
-  const src = readFileSync(
-    "src/client/pages/resources/CodeToolEditModal.tsx",
-    "utf8",
-  );
-  const effect = src.slice(
-    src.indexOf("const code = form.code;") - 400,
-    src.indexOf("const code = form.code;"),
-  );
-  expect(effect.includes("if (!modal.isOpen) return;")).toBe(true);
+// This component stays mounted on the Tools page and the agent editor, and the empty form starts
+// with the starter body, so an ungated effect downloads the parser chunk and parses a body nobody is
+// editing, on every visit to either page. Asked of the parser itself: closed, it is never called;
+// opened, it is.
+test("the parser only runs while the dialog is open", async () => {
+  const parse = spyOn(acorn, "parse");
+  jest.useFakeTimers();
+  try {
+    render(<TwoToolsHarness />);
+    act(() => jest.advanceTimersByTime(1_000));
+    await act(async () => {});
+    const whileClosed = parse.mock.calls.length;
+    fireEvent.click(screen.getByText("open-new"));
+    act(() => jest.advanceTimersByTime(1_000));
+    jest.useRealTimers();
+    await waitFor(() => expect(parse.mock.calls.length).toBeGreaterThan(0));
+    expect(whileClosed).toBe(0);
+  } finally {
+    jest.useRealTimers();
+    parse.mockRestore();
+  }
 });
 
-test("a save in flight cannot be dismissed, and its finally belongs to its own opening", () => {
-  // Round 25. Two guards over one hole: a save dismissed with Esc/X and reopened before it answers.
-  // The dialog now refuses the dismissal, the rule the test modal beside it already follows
-  // (docs/modals.md) and the rule that makes the second guard unreachable from the UI, which is
-  // exactly why it is asserted here rather than driven: an unscoped `setSaving(false)` would leave
-  // the reopened form disabled with nothing running, for as long as the first request takes.
-  // A source fence for the reason the fence above gives.
-  const src = readFileSync(
-    "src/client/pages/resources/CodeToolEditModal.tsx",
-    "utf8",
-  );
-  expect(src.includes("onCloseRequest={saving ? () => {} : undefined}")).toBe(
-    true,
-  );
-  const saveFn = src.slice(src.indexOf("async function save()"));
-  const tail = saveFn.slice(saveFn.indexOf("} finally {"));
-  expect(
-    tail.startsWith(
-      "} finally {\n      if (sessionRef.current === session) setSaving(false);",
-    ),
-  ).toBe(true);
+// NO WAY OUT WHILE THE SAVE IS IN FLIGHT (docs/modals.md): dismissing mid-request and reopening
+// offers a second Save for a write already on its way. Asked of the dialog: Escape on an unedited
+// stored tool whose save is out leaves it open.
+// Edited or not: on an edited form the dismissal would otherwise open the discard prompt, whose
+// "Discard" closes the dialog with the PATCH still on its way.
+test.each([
+  ["unedited", false],
+  ["edited", true],
+])("a save in flight cannot be dismissed, %s", async (_, edited) => {
+  const realFetch = globalThis.fetch;
+  const held: Array<() => void> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const href = input instanceof Request ? input.url : String(input);
+    const method = (init?.method ?? "GET").toUpperCase();
+    if (href.includes("/code-tools") && method !== "GET") {
+      await new Promise<void>((r) => held.push(r));
+      return new Response(JSON.stringify({ tool: codeTool(), warnings: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (/\/code-tools\/\d+/.test(href)) {
+      return new Response(JSON.stringify({ tool: codeTool() }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return realFetch(input as RequestInfo, init);
+  }) as typeof fetch;
+  try {
+    render(<TwoToolsHarness />);
+    fireEvent.click(screen.getByText("open-1"));
+    await screen.findByDisplayValue("Look up CPF");
+    if (edited) {
+      fireEvent.change(descriptionField(), {
+        target: { value: "an edited description" },
+      });
+    }
+    fireEvent.click(screen.getByText("Save").closest("button") as HTMLElement);
+    await waitFor(() => expect(held.length).toBe(1));
+    fireEvent.keyDown(document.activeElement ?? document.body, {
+      key: "Escape",
+    });
+    await act(async () => {});
+    expect(screen.queryAllByText("Edit code tool").length).toBe(1);
+    expect(screen.queryByText("Discard changes?")).toBeNull();
+    held[0]?.();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// A save's `finally` belongs to its own opening. Asked through two saves held at once: the first is
+// left behind by a programmatic close, the second is made in the next opening, and the first answers
+// while the second is still out. Its `finally` must not clear the flag the second one set, or the
+// open dialog would offer Cancel with a write still on its way. The dismissal half is the test above.
+test("a save that answers after its dialog was reopened leaves the new save in flight", async () => {
+  const realFetch = globalThis.fetch;
+  const held: Array<() => void> = [];
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const href = input instanceof Request ? input.url : String(input);
+    if (
+      href.includes("/code-tools") &&
+      (init?.method ?? "GET").toUpperCase() === "POST"
+    ) {
+      await new Promise<void>((r) => held.push(r));
+      return new Response(JSON.stringify({ tool: codeTool(), warnings: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return realFetch(input as RequestInfo, init);
+  }) as typeof fetch;
+  const cancelDisabled = () =>
+    screen.getByText("Cancel").closest("button")?.hasAttribute("disabled");
+  const fillAndSave = () => {
+    fireEvent.change(document.body.querySelector("input") as HTMLElement, {
+      target: { value: "Look up CPF" },
+    });
+    fireEvent.change(descriptionField(), {
+      target: { value: "a description" },
+    });
+    setCode("return 1");
+    fireEvent.click(screen.getByText("Save").closest("button") as HTMLElement);
+  };
+  try {
+    render(<TwoToolsHarness />);
+    fireEvent.click(screen.getByText("open-new"));
+    fillAndSave();
+    await waitFor(() => expect(held.length).toBe(1));
+    fireEvent.click(screen.getByText("close-it"));
+    fireEvent.click(screen.getByText("open-new"));
+    await waitFor(() => expect(cancelDisabled()).toBe(false));
+    fillAndSave();
+    await waitFor(() => expect(held.length).toBe(2));
+    expect(cancelDisabled()).toBe(true);
+
+    await act(async () => {
+      held[0]?.();
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(cancelDisabled()).toBe(true);
+    expect(screen.queryAllByText("New code tool").length).toBe(1);
+
+    await act(async () => {
+      held[1]?.();
+      await new Promise((r) => setTimeout(r, 30));
+    });
+    expect(screen.queryAllByText("New code tool").length).toBe(0);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });
 
 // The starter body's comment is the first console text an author of a code tool reads, so it
 // follows the console's language like every label around it. The `return` line does not: that is
-// the language's own word. Shipped in English since #517, caught in a browser over a pt-BR form.
+// the language's own word.
 test("the starter body speaks the console's language, and its code does not", async () => {
   const en = starterCode(i18n.t);
   expect(en).toContain("return { ok: true };");
@@ -671,17 +769,10 @@ test("the starter body speaks the console's language, and its code does not", as
   }
 });
 
-// Two lines, and the first one earns its place: it names the key that opens the list, which is the
-// one thing the editor cannot teach by itself. What it used to say instead (what `input` and
-// `context` hold, that the answer is a `return`) is what the completion and the `?` already answer,
-// so it was a paragraph about the body the author is about to delete.
-//
-// ONE key is named, and it is the one the READER's machine delivers: `SHOW_SCOPE_KEY` in
-// CodeEditor.tsx carries the keydown log that settled it (macOS eats the whole Ctrl+Space family,
-// and Alt-i is the circumflex dead key on a US International layout, so Chrome sends `key: "Dead"`
-// with `keyCode: 229`). `Mod-i` is one binding with two names, and printing the wrong one is worse
-// than printing none: it is a key the reader can press and watch do nothing. So the assertion is
-// that the line names the current platform's name and NOT the other, in both catalogs.
+// Two lines, and the first names the key that opens the list, the one thing the editor cannot teach
+// by itself (why that key: docs/ui.md, The code tool editor). `Mod-i` has two names, and printing
+// the wrong one names a key that does nothing, so the line names the current platform's name and
+// NOT the other, in both catalogs.
 test("the starter body is two lines, and names the platform's key", () => {
   for (const lang of ["en", "pt-BR"] as const) {
     const body = starterCode(i18n.getFixedT(lang));
@@ -691,17 +782,15 @@ test("the starter body is two lines, and names the platform's key", () => {
     expect(lines[0]).toContain(scopeKeyLabel());
     const other = scopeKeyLabel() === "Ctrl+I" ? "\u2318I" : "Ctrl+I";
     expect(lines[0]).not.toContain(other);
-    // And never the keys that measured as unreachable.
+    // NOTE: and never the keys that do not reach the editor on some platform.
     expect(/Ctrl-Space|Alt-i|Alt-`/.test(lines[0] ?? "")).toBe(false);
   }
 });
 
-// The other place the key is named, and the one that went stale in ENGLISH ONLY while every fence
-// stayed green: `code-tools-locale-defaults` compares each `t()` default against the English catalog,
-// so a chord hard-coded in BOTH agrees with itself and passes. pt-BR was right, English pointed at a
-// key that had already been measured as unreachable on a Mac, and the starter body two fields up
-// said something else. So the assertion is about the class rather than that line: nothing the
-// operator reads may spell a chord: the key has two names and only `scopeKeyLabel` knows which.
+// `code-tools-locale-defaults` compares each `t()` default against the English catalog, so a chord
+// hard-coded in BOTH agrees with itself and passes. Hence a sweep over the class: nothing the
+// operator reads may spell a chord, since the key has two names and only `scopeKeyLabel` knows
+// which.
 test("no codeTools string spells a hotkey, they interpolate it", () => {
   const CHORD = /Ctrl-|Cmd-|Alt-|\u2318|\u2325|Ctrl\+|Shift\+/;
   const flat: Array<[string, string]> = [];
@@ -787,4 +876,81 @@ test("the mirror of CodeMirror's platform rule, at the edges", () => {
     expect([name, isMacLike(nav(over))]).toEqual([name, want]);
   }
   expect(isMacLike(undefined)).toBe(false);
+});
+
+// A save whose dialog closed under it: the operator cannot dismiss it while the request is out ("a save
+// in flight cannot be dismissed"), so the close is the page's own, and the answer arrives after. The next opening is a
+// fresh form, so Cancel works there.
+test("a save closed mid-flight leaves the next opening able to cancel", async () => {
+  const realFetch = globalThis.fetch;
+  let answer: (r: Response) => void = () => {};
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const href =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    if (
+      href.includes("/code-tools") &&
+      (init?.method ?? "GET").toUpperCase() === "POST"
+    ) {
+      return new Promise<Response>((resolve) => {
+        answer = resolve;
+      });
+    }
+    return realFetch(input as RequestInfo, init);
+  }) as typeof fetch;
+  try {
+    let abandonedSaved = false;
+    function SavedHarness() {
+      const modal = useModalController<{ id?: string }>();
+      return (
+        <ToastProvider>
+          <button type="button" onClick={() => modal.open({})}>
+            open
+          </button>
+          <button type="button" onClick={() => modal.close()}>
+            close-it
+          </button>
+          <CodeToolEditModal
+            modal={modal}
+            onSaved={() => {
+              abandonedSaved = true;
+            }}
+          />
+        </ToastProvider>
+      );
+    }
+    render(<SavedHarness />);
+    fireEvent.click(screen.getByText("open"));
+    const label = document.body.querySelector("input") as HTMLInputElement;
+    fireEvent.change(label, { target: { value: "Look up CPF" } });
+    fireEvent.change(descriptionField(), {
+      target: { value: "a description" },
+    });
+    setCode("return input.cpf;");
+    fireEvent.click(screen.getByText("Save").closest("button") as HTMLElement);
+
+    fireEvent.click(screen.getByText("close-it"));
+    await waitFor(() =>
+      expect(document.body.textContent?.includes("Look up CPF")).toBe(false),
+    );
+
+    await act(async () => {
+      answer(
+        new Response(JSON.stringify({ tool: codeTool(), warnings: [] }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      );
+      await until("the abandoned save to answer", () => abandonedSaved);
+    });
+
+    fireEvent.click(screen.getByText("open"));
+    const cancel = await screen.findByText("Cancel");
+    expect(cancel.closest("button")?.hasAttribute("disabled")).toBe(false);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
 });

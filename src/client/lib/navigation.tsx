@@ -1,9 +1,11 @@
 import {
   Bot,
+  ClipboardCheck,
   ClipboardList,
   Gauge,
   Globe,
   KeyRound,
+  LayoutDashboard,
   LibraryBig,
   LifeBuoy,
   MessagesSquare,
@@ -17,7 +19,7 @@ import type { ElementType, SVGProps } from "react";
 import { GithubIcon } from "@/client/components/icons/GithubIcon";
 import { isAdminRole } from "@/client/lib/roles";
 
-// NOTE: ElementType (not ComponentType) so it fits lucide's ForwardRefExotic
+// ElementType (not ComponentType) so it fits lucide's ForwardRefExotic
 // components, inline React icons, and `<img>`-based brand marks without
 // per-item casts.
 export type NavItemIcon = ElementType<{
@@ -32,15 +34,54 @@ export interface NavItem {
   icon: NavItemIcon;
   // NOTE: bump to requiredRole if more roles are added
   requireAdmin?: boolean;
-  // Optional count badge driven by a named source. "approvals" => pending KB suggestions
-  // (usePendingApprovals). The sidebar renders a numeric pill (expanded) or a dot (collapsed).
+  // Optional count badge driven by a named source. "approvals" => everything waiting on this person
+  // (usePendingApprovals): document approvals, plus pending KB suggestions for an admin. The sidebar
+  // renders a numeric pill (expanded) or a dot (collapsed).
   badge?: "approvals";
+  // Optional heading the sidebar groups this item under. Consecutive items with the same
+  // `labelKey` form one group; a run without a section renders with no heading. Add the key's magic
+  // comment next to the item like the labels above.
+  section?: { labelKey: string; defaultLabel: string };
 }
+
+export interface NavGroup {
+  section: NavItem["section"] | null;
+  items: NavItem[];
+}
+
+export function groupNavItems(items: NavItem[]): NavGroup[] {
+  const groups: NavGroup[] = [];
+  for (const item of items) {
+    const key = item.section?.labelKey ?? null;
+    const last = groups.at(-1);
+    if (last && (last.section?.labelKey ?? null) === key) {
+      last.items.push(item);
+    } else {
+      groups.push({ section: item.section ?? null, items: [item] });
+    }
+  }
+  return groups;
+}
+
+// t('nav.section.integrations', 'Integrations')
+// t('nav.section.monitoring', 'Monitoring')
+// t('nav.section.system', 'System')
+const INTEGRATIONS = {
+  labelKey: "nav.section.integrations",
+  defaultLabel: "Integrations",
+};
+const MONITORING = {
+  labelKey: "nav.section.monitoring",
+  defaultLabel: "Monitoring",
+};
+const SYSTEM = { labelKey: "nav.section.system", defaultLabel: "System" };
 
 // t('nav.dashboard', 'Dashboard')
 // t('nav.conversations', 'Conversations')
+// t('nav.approvals', 'Approvals')
 // t('nav.agents', 'Agents')
 // t('nav.resources', 'Components')
+// t('nav.dashboards', 'Dashboards')
 // t('nav.channels', 'Channels')
 // t('nav.webhooks', 'Webhooks')
 // t('nav.apiKeys', 'API keys')
@@ -70,12 +111,25 @@ export const NAV_ITEMS: NavItem[] = [
     requireAdmin: true,
   },
   {
+    to: "/approvals",
+    labelKey: "nav.approvals",
+    defaultLabel: "Approvals",
+    icon: ClipboardCheck,
+    badge: "approvals",
+  },
+  {
     to: "/resources",
     labelKey: "nav.resources",
     defaultLabel: "Components",
     icon: LibraryBig,
     requireAdmin: true,
-    badge: "approvals",
+  },
+  {
+    to: "/dashboards",
+    labelKey: "nav.dashboards",
+    defaultLabel: "Dashboards",
+    icon: LayoutDashboard,
+    requireAdmin: true,
   },
   {
     to: "/channels",
@@ -90,6 +144,7 @@ export const NAV_ITEMS: NavItem[] = [
     defaultLabel: "Webhooks",
     icon: Webhook,
     requireAdmin: true,
+    section: INTEGRATIONS,
   },
   {
     to: "/api-keys",
@@ -97,6 +152,7 @@ export const NAV_ITEMS: NavItem[] = [
     defaultLabel: "API keys",
     icon: KeyRound,
     requireAdmin: true,
+    section: INTEGRATIONS,
   },
   {
     to: "/logs",
@@ -104,6 +160,7 @@ export const NAV_ITEMS: NavItem[] = [
     defaultLabel: "Logs",
     icon: ScrollText,
     requireAdmin: true,
+    section: MONITORING,
   },
   {
     to: "/audit",
@@ -111,6 +168,7 @@ export const NAV_ITEMS: NavItem[] = [
     defaultLabel: "Audit",
     icon: ClipboardList,
     requireAdmin: true,
+    section: MONITORING,
   },
   {
     to: "/admin",
@@ -118,12 +176,14 @@ export const NAV_ITEMS: NavItem[] = [
     defaultLabel: "Admin",
     icon: Shield,
     requireAdmin: true,
+    section: SYSTEM,
   },
   {
     to: "/settings",
     labelKey: "nav.settings",
     defaultLabel: "Settings",
     icon: Settings,
+    section: SYSTEM,
   },
 ];
 
@@ -152,7 +212,7 @@ export interface SupportContact {
   icon: ElementType<SVGProps<SVGSVGElement>>;
 }
 
-// NOTE: SUPPORT_LINK renders above SECONDARY_LINKS with a "Need help?" label
+// SUPPORT_LINK renders above SECONDARY_LINKS with a "Need help?" label
 // and opens a modal with the email + copy-to-clipboard action (instead of
 // a raw mailto: link, which is unreliable when the user has no mail client).
 // The email itself is i18n-driven so projects can route support to a

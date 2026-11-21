@@ -11,9 +11,10 @@ import {
   rotateIntegrationRouteToken,
   updateIntegrationInstance,
 } from "@/modules/integrations/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
-// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+// TENANT_ADMIN, the role that tells `runScopedOn` the id never came from outside.
 const ctxOf = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: null,
@@ -41,8 +42,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -91,7 +92,7 @@ describe.skipIf(!dbUp)("integration route token", () => {
     expect(one.routeToken).toBe(created.routeToken as string);
     expect(one.routeTokenStatus).toBe("present");
 
-    // NOTE: The list backs a screen that shows no URL, so it must not ship N tokens to the browser.
+    // The list backs a screen that shows no URL, so it must not ship N tokens to the browser.
     const many = await listIntegrationInstances(ctx(), appDb);
     const row = many.find((i) => i.id === String(created.id));
     expect(row?.routeToken).toBeNull();
@@ -220,12 +221,10 @@ describe.skipIf(!dbUp)("integration route token", () => {
     ).rejects.toBeInstanceOf(AppError);
   });
 
-  // Issue #362. Two of `config`'s keys are read back as HEADER NAMES, and nothing between the
-  // operator's JSON and `request.headers.get` asked whether they are ones — so a trailing space
-  // answered every delivery 500 instead of the uniform 401, and the provider retried a request that
-  // could never succeed. Refused rather than trimmed, the call issue #340 made for vault values:
-  // `x tok` has to be refused regardless of trimming, and the operator typing into raw JSON has no
-  // other feedback.
+  // Two of `config`'s keys are read back as HEADER NAMES, so the write asks whether they are ones: a
+  // trailing space would answer every delivery 500 instead of the uniform 401, and the provider would
+  // retry a request that can never succeed. Refused rather than trimmed, like vault values: `x tok` has
+  // to be refused regardless of trimming, and the operator typing into raw JSON has no other feedback.
   const unusable = [
     "asaas-access-token ",
     " x-tok",
@@ -297,7 +296,12 @@ describe.skipIf(!dbUp)("integration route token", () => {
         },
         appDb,
       );
-      expect(created.id).toBeDefined();
+      const stored = await getIntegrationInstance(
+        ctxOf(tenantId),
+        created.id,
+        appDb,
+      );
+      expect(stored.config).toEqual({ authHeader: value });
     }
   });
 
@@ -314,7 +318,10 @@ describe.skipIf(!dbUp)("integration route token", () => {
       },
       appDb,
     );
-    expect(objectValued.id).toBeDefined();
+    expect(
+      (await getIntegrationInstance(ctxOf(tenantId), objectValued.id, appDb))
+        .config,
+    ).toEqual({ authHeader: { a: 1 } });
 
     const created = await createIntegrationInstance(
       ctxOf(tenantId),
@@ -328,7 +335,9 @@ describe.skipIf(!dbUp)("integration route token", () => {
       },
       appDb,
     );
-    expect(created.id).toBeDefined();
+    expect(
+      (await getIntegrationInstance(ctxOf(tenantId), created.id, appDb)).config,
+    ).toEqual({ authHeader: 42, signatureHeader: null, extra: { a: 1 } });
   });
 
   test("rotating an unknown instance is a 404, not a silent mint", async () => {

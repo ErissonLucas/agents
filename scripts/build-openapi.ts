@@ -4,13 +4,16 @@
 // the file (`--write`, wired as `bun openapi:generate`) or verifies the committed copy matches and fails
 // on drift (default, wired into `bun check` + CI). GitHub Pages serves the committed file (see
 // `.github/workflows/deploy-swagger.yml`), so this is the single source of truth for the public docs.
-//
+
 // NOTE: The `@elysiajs/openapi` plugin is `enabled: env !== "production"` (src/api/index.ts), and
 // config reads NODE_ENV at module-eval time. Force development BEFORE anything imports config: this
 // assignment must run before the dynamic `@/app` import evaluates, so `@/app`/`@/config` are imported
 // dynamically below (a static import would be hoisted above this line and read the ambient NODE_ENV).
 process.env.NODE_ENV = "development";
 process.env.LOG_LEVEL ??= "warn";
+// The published spec is the default install's: a route behind a switch that is off by default
+// (CLIENT_CHANNEL_ENABLED) stays out of it whatever the developer's own environment says.
+process.env.CLIENT_CHANNEL_ENABLED = "false";
 
 const OUTPUT_PATH = "openapi.json";
 const DOCS_JSON_PATH = "/api/docs/json";
@@ -34,7 +37,7 @@ const API_SERVER = {
 
 type OpenApiDoc = { servers?: unknown } & Record<string, unknown>;
 
-// NOTE: TypeBox emits modern JSON Schema (`patternProperties` for Record<string, X>, and
+// TypeBox emits modern JSON Schema (`patternProperties` for Record<string, X>, and
 // `anyOf: [X, {type: "null"}]` for nullable unions), neither of which exists in OpenAPI 3.0 —
 // that dialect predates JSON Schema 2020-12. The plugin still labels the document 3.0.3, so
 // every such schema is a hard validation error and Swagger UI flags the spec as invalid.
@@ -43,7 +46,7 @@ type OpenApiDoc = { servers?: unknown } & Record<string, unknown>;
 // the key pattern; `type: "null"` -> `nullable` is 3.0-only vocabulary).
 const OPENAPI_VERSION = "3.1.0";
 
-// NOTE: Keys the generator emits that are not OpenAPI in any dialect, so they stay invalid even
+// Keys the generator emits that are not OpenAPI in any dialect, so they stay invalid even
 // under 3.1: `nullable` is 3.0-only vocabulary (dropped in 3.1) and is redundant here anyway —
 // every occurrence sits beside an `anyOf` that already carries `{type: "null"}`, so removing it
 // loses nothing. `maxSize` (TypeBox file constraint) and `ws` (Elysia WebSocket route) have no
@@ -61,12 +64,11 @@ function stripNonOpenApiKeys(node: unknown): unknown {
   return out;
 }
 
-// NOTE: Elysia emits a group's index route as `/v1/agents/` (the `.get("/")` inside the group),
-// but the server answers both spellings — probed live: `/api/health` and `/api/health/` both 200,
-// `/api/v1/agents` and `/api/v1/agents/` both 401. The trailing slash is therefore an artifact of
-// how the route is declared, not the canonical path, and it makes readers think the two forms
-// differ. Strip it so the published paths are the canonical ones. Guarded against collisions: if
-// the unslashed twin already exists, the entries would silently overwrite each other.
+// Elysia emits a group's index route as `/v1/agents/` (the `.get("/")` inside the group),
+// but the server answers both spellings, so the trailing slash is an artifact of how the route is
+// declared, not the canonical path, and it makes readers think the two forms differ. Strip it.
+// Guarded against collisions: if the unslashed twin already exists, the entries would silently
+// overwrite each other.
 function stripTrailingSlashes(
   paths: Record<string, unknown>,
 ): Record<string, unknown> {
@@ -84,7 +86,7 @@ function stripTrailingSlashes(
   return out;
 }
 
-// NOTE: For a body-less response (`t.Void()`, e.g. the 302 on the MCP authorize endpoint) the plugin
+// For a body-less response (`t.Void()`, e.g. the 302 on the MCP authorize endpoint) the plugin
 // emits the bare schema as `content` — `{"type": "void", …}` — but OpenAPI's `content` is a map of
 // MEDIA TYPES, so that shape is invalid in every dialect. A response with no body simply omits
 // `content`, which is what this restores. Detection: a real media-type map has "/" in its keys. For a

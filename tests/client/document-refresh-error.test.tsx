@@ -10,24 +10,24 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
+import { fetchTracker } from "@/tests/utils/fetch-settle";
 
-// The panel reloads itself constantly: after a template is saved or deleted, after a starter is
-// used, and whenever the operator switches language. Those refreshes run while the company profile
-// below is an OPEN FORM the operator may be typing into.
-//
-// A failed refresh must not take the screen away. The `loading` flag already knows this — it is the
-// first load only, precisely so a reload does not unmount the editor — but `error` was shared, so
-// one failed background request replaced the whole panel with a retry card and threw away whatever
-// was in the form, along with the guard that would have warned about leaving it.
-//
-// NOTE: the language is switched on the REAL i18n instance rather than by mocking react-i18next —
+// The panel reloads itself often (after a template save or delete, a starter, a language switch)
+// while the company profile may be an OPEN FORM being typed into. A failed refresh must not take
+// the screen away: `loading` is first-load only for that reason, and `error` must be too, or one
+// failed background request would replace the panel with a retry card and discard the form.
+
+// The language is switched on the REAL i18n instance rather than by mocking react-i18next:
 // `mock.module` and its restore are global to the process and tear down other files' mocks.
-// NOTE: assertions reduce to a boolean or a string BEFORE expect; a failing expectation holding a
-// DOM node serializes a cyclic happy-dom tree and stalls the runner.
+// Assertions reduce to a boolean or a string BEFORE expect; a failing expectation holding a DOM
+// node serializes a cyclic happy-dom tree and stalls the runner.
 
 (globalThis as { happyDOM?: { setURL(u: string): void } }).happyDOM?.setURL(
   "http://localhost/recursos/documentos",
 );
+
+// Every answer released so far is delivered and read before a "nothing happened" assertion.
+const fetches = fetchTracker();
 
 const { default: i18n } = await import("@/client/lib/i18n");
 const { DocumentsPanel } = await import(
@@ -48,7 +48,7 @@ let failSettings = false;
 // screen can only mean it travelled from the response.
 let settingsRefusal = "boom";
 
-globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+const answer = async (input: RequestInfo | URL, init?: RequestInit) => {
   const url = new URL(
     typeof input === "string"
       ? input
@@ -73,6 +73,7 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       });
     }
     return json({
+      approvalLink: { mode: "console", urlTemplate: "" },
       company: {
         name: "",
         document: "",
@@ -86,7 +87,9 @@ globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     });
   }
   return json({ documents: [] });
-}) as unknown as typeof fetch;
+};
+globalThis.fetch = ((input: RequestInfo | URL, init?: RequestInit) =>
+  fetches.track(answer(input, init))) as unknown as typeof fetch;
 
 beforeEach(() => {
   failSettings = false;
@@ -108,9 +111,8 @@ test("a failed refresh keeps the company form and what was typed into it", async
       </ToastProvider>
     </MemoryRouter>,
   );
-  // The letterhead is a modal now, so it has to be opened to be typed into — and being open is
-  // exactly the state this rule is about: a background refresh must not take the form away from
-  // under whoever is using it.
+  // NOTE: the letterhead is a modal, so it has to be opened to be typed into, and being open is
+  // exactly the state this rule is about.
   fireEvent.click(
     await screen.findByRole("button", { name: /^(edit|fill in)$/i }),
   );
@@ -124,12 +126,8 @@ test("a failed refresh keeps the company form and what was typed into it", async
   await act(async () => {
     await i18n.changeLanguage("pt-BR");
   });
-  await waitFor(() => {
-    expect(screen.queryAllByText(/Retry|Tentar novamente/).length >= 0).toBe(
-      true,
-    );
-  });
-  await new Promise((r) => setTimeout(r, 60));
+  // The failing refresh is answered and the panel has handled it.
+  await fetches.settled();
 
   // The form is still there, still holding the edit.
   const boxes = await screen.findAllByRole("textbox");
@@ -156,10 +154,10 @@ test("a failed FIRST load still shows the retry card", async () => {
   });
 });
 
-// #233. A failed refresh keeps the screen (above) AND says what the server said. The toast lives in
-// `failed`, a callback that awaits nothing — `load` is the one that knows WHICH of the four requests
-// refused, so the response travels to it as an argument. That wiring is what this proves: the static
-// fence judges the SHAPE of the call, not that the reason arrives.
+// A failed refresh keeps the screen (above) AND says what the server said. The toast lives in
+// `failed`, which awaits nothing; `load` knows WHICH of the four requests refused, so the response
+// travels to it as an argument. This proves the reason arrives; the static fence only judges the
+// SHAPE of the call.
 test("a failed refresh shows the reason the server sent", async () => {
   await i18n.changeLanguage("en");
   settingsRefusal = "Your plan does not include letterheads.";
@@ -177,10 +175,9 @@ test("a failed refresh shows the reason the server sent", async () => {
     await i18n.changeLanguage("pt-BR");
   });
 
-  // Both sentences are searched for, in both languages: the refresh that fires here is the one the
-  // language switch caused, so the fallback would come out in pt-BR. Searching only for the English
-  // one would fail by TIMEOUT instead of by showing what was on screen, which is a worse failure —
-  // it cannot tell "the wrong sentence" from "no toast at all".
+  // Both sentences are searched for, in both languages: the refresh here is the one the language
+  // switch caused, so the fallback comes out in pt-BR. Searching only for English would fail by
+  // TIMEOUT, unable to tell "the wrong sentence" from "no toast at all".
   const anyToast = /letterheads|Could not refresh|atualizar esta página/;
   // Reduced to a string before the expectation: a failing assertion holding a happy-dom node
   // serializes a cyclic tree and stalls the runner.

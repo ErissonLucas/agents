@@ -52,7 +52,7 @@ describe("Fish Audio STT", () => {
       ...REQ,
       fetchImpl,
     });
-    expect(text).toBe("Oi, tudo bem? Tudo ótimo.");
+    expect(text).toEqual({ text: "Oi, tudo bem? Tudo ótimo." });
     expect(calls.length).toBe(1);
     expect(calls[0]?.url).toBe("https://api.fish.audio/v1/asr");
     expect(calls[0]?.init.method).toBe("POST");
@@ -107,7 +107,7 @@ describe("Fish Audio STT", () => {
       { status: 503, body: { status: 503, message: "busy" } },
       { body: { text: "olá", duration: 1, segments: [] } },
     ]);
-    expect(await fast({ ...REQ, fetchImpl })).toBe("olá");
+    expect(await fast({ ...REQ, fetchImpl })).toEqual({ text: "olá" });
     expect(calls.length).toBe(2);
   });
 

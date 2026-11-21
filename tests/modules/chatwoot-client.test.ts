@@ -47,11 +47,11 @@ describe("ChatwootClient", () => {
         ...baseConfig,
         baseUrl: "https://169.254.169.254",
       }),
-      // real SSRF guard (no assertSafe override)
+      // NOTE: real SSRF guard (no assertSafe override)
     ).rejects.toThrow();
   });
 
-  // Issue #746: `after` is the fork's catch-up read, which lists by id with no reaction window, and
+  // `after` is the fork's catch-up read, which lists by id with no reaction window, and
   // `before` the page walk. Each is its own query string, and neither is the default page.
   test("getMessages spells the default page, before and after", async () => {
     const { fetchImpl, calls } = stub(200, { payload: [] });
@@ -70,6 +70,149 @@ describe("ChatwootClient", () => {
       `${base}?after=3`,
     ]);
     expect(calls[2]?.headers["api-access-token"]).toBe("ADMIN_TOK");
+  });
+
+  // The filter compares `last_activity_at` with a whole date, so the bound is the day BEFORE the
+  // instant asked for: a conversation active on that same day past the instant is still returned.
+  test("listContactConversationsByActivity asks the filter for the contact's picked inboxes since the day before", async () => {
+    const { fetchImpl, calls } = stub(200, {
+      payload: [
+        { id: 31, inbox_id: 2, status: "open", last_activity_at: 1791800000 },
+        {
+          id: 7,
+          inbox_id: 3,
+          status: "resolved",
+          last_activity_at: 1791700000,
+        },
+      ],
+    });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const refs = await client.listContactConversationsByActivity({
+      contactId: 77,
+      inboxIds: [2, 3],
+      activeSince: new Date("2026-09-12T00:30:00Z"),
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toBe(
+      "https://chat.example.com/api/v1/accounts/5/conversations/filter",
+    );
+    expect(calls[0]?.headers["api-access-token"]).toBe("ADMIN_TOK");
+    expect(calls[0]?.body).toEqual({
+      page: 1,
+      per_page: 25,
+      sort_by: "last_activity_at_desc",
+      payload: [
+        {
+          attribute_key: "contact_id",
+          filter_operator: "equal_to",
+          values: [77],
+          query_operator: "and",
+        },
+        {
+          attribute_key: "inbox_id",
+          filter_operator: "equal_to",
+          values: [2, 3],
+          query_operator: "and",
+        },
+        {
+          attribute_key: "last_activity_at",
+          filter_operator: "is_greater_than",
+          values: ["2026-09-11"],
+          query_operator: null,
+        },
+      ],
+    });
+    expect(refs.map((r) => [r.id, r.inboxId])).toEqual([
+      [31, 2],
+      [7, 3],
+    ]);
+    expect(refs[0]?.lastActivityAt?.getTime()).toBe(1791800000 * 1000);
+  });
+
+  // The filter leads with the admin token's pinned conversations, so a full first page of old pinned
+  // ones does not end the read: the recently active one on the next page is still returned.
+  test("listContactConversationsByActivity reads past a full page until one comes back short", async () => {
+    const pinned = Array.from({ length: 25 }, (_, i) => ({
+      id: 100 + i,
+      inbox_id: 2,
+      last_activity_at: 1791000000,
+    }));
+    const pages: unknown[][] = [
+      pinned,
+      [{ id: 7, inbox_id: 2, last_activity_at: 1791800000 }, pinned[0]],
+    ];
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      const body = JSON.parse(init?.body as string) as { page: number };
+      bodies.push(body.page);
+      return {
+        ok: true,
+        status: 200,
+        text: async () =>
+          JSON.stringify({ payload: pages[body.page - 1] ?? [] }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const refs = await client.listContactConversationsByActivity({
+      contactId: 77,
+      inboxIds: [2],
+      activeSince: new Date("2026-09-12T00:30:00Z"),
+    });
+    expect(bodies).toEqual([1, 2]);
+    expect(refs).toHaveLength(26);
+    expect(refs.some((r) => r.id === 7)).toBe(true);
+  });
+
+  test("listContactConversationsByActivity stops at four full pages", async () => {
+    const bodies: number[] = [];
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      const page = (JSON.parse(init?.body as string) as { page: number }).page;
+      bodies.push(page);
+      const payload = Array.from({ length: 25 }, (_, i) => ({
+        id: page * 100 + i,
+        inbox_id: 2,
+        last_activity_at: 1791000000,
+      }));
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ payload }),
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const refs = await client.listContactConversationsByActivity({
+      contactId: 77,
+      inboxIds: [2],
+      activeSince: new Date("2026-09-12T00:30:00Z"),
+    });
+    expect(bodies).toEqual([1, 2, 3, 4]);
+    expect(refs).toHaveLength(100);
+  });
+
+  // A filter answer without a list is not "no conversations": the block reports the listing unread.
+  test("listContactConversationsByActivity throws on an answer with no payload array", async () => {
+    const { fetchImpl } = stub(200, { meta: {} });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await expect(
+      client.listContactConversationsByActivity({
+        contactId: 77,
+        inboxIds: [2],
+        activeSince: new Date("2026-09-12T00:30:00Z"),
+      }),
+    ).rejects.toThrow("no payload array");
   });
 
   test("sendMessage uses the bot token and the right URL/body", async () => {
@@ -91,10 +234,9 @@ describe("ChatwootClient", () => {
     });
   });
 
-  // THE NAME TRAVELS OUT WITH THE REQUEST (issue #499), because the send that fails never returns
-  // anything: an id assigned by the response cannot help the attempt that timed out. Verified
-  // against the fork that `content_attributes` handed to the create is persisted verbatim and comes
-  // back on the read.
+  // THE NAME TRAVELS OUT WITH THE REQUEST, because the send that fails never returns anything: an
+  // id assigned by the response cannot help the attempt that timed out. The fork persists the
+  // `content_attributes` handed to the create verbatim and returns them on the read.
   test("sendMessage carries the send id in content_attributes when asked", async () => {
     const { fetchImpl, calls } = stub(200, { id: 1 });
     const client = await createChatwootClient(baseConfig, {
@@ -108,17 +250,63 @@ describe("ChatwootClient", () => {
     });
   });
 
-  // And OMITTED otherwise, rather than sent empty: the fork stores the bag verbatim, so a key
-  // written on every message whether or not anything will read it is exactly the hypothesis-shaped
-  // debt this repo asks callers not to leave behind.
-  test("sendMessage sends no content_attributes when no id was asked for", async () => {
+  // And OMITTED otherwise, rather than sent empty: the fork stores the bag verbatim, so an
+  // always-present key would be written on every message whether or not anything reads it.
+  // Every create carries a send name, so a message from the managed bot without one is known not to
+  // be the engine's (foreignBotMessageOf).
+  test("sendMessage names the send even when no id was asked for", async () => {
     const { fetchImpl, calls } = stub(200, { id: 1 });
     const client = await createChatwootClient(baseConfig, {
       fetchImpl,
       assertSafe: passthroughSafe,
     });
     await client.sendMessage(42, "olá");
-    expect(calls[0]?.body).not.toHaveProperty("content_attributes");
+    await client.sendPrivateNote(42, "nota");
+    for (const c of calls) {
+      const ca = (c.body as { content_attributes?: Record<string, unknown> })
+        .content_attributes;
+      expect(Object.keys(ca ?? {})).toEqual(["fazer_ai_send_id"]);
+      expect(String(ca?.fazer_ai_send_id)).toMatch(/^engine:[0-9a-f-]{36}$/);
+    }
+  });
+
+  test("sendTemplate and sendFileAttachment name the send", async () => {
+    const bodies: unknown[] = [];
+    const fetchImpl = (async (_u: string, init?: RequestInit) => {
+      bodies.push(
+        init?.body instanceof FormData
+          ? JSON.parse(String(init.body.get("content_attributes")))
+          : JSON.parse(String(init?.body)).content_attributes,
+      );
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "{}",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.sendTemplate(42, {
+      content: "Oi",
+      name: "lembrete",
+      category: "UTILITY",
+      language: "pt_BR",
+      processedParams: {},
+    });
+    await client.sendFileAttachment(
+      42,
+      new ArrayBuffer(4),
+      "a.pdf",
+      "application/pdf",
+    );
+    for (const ca of bodies) {
+      expect(String((ca as Record<string, unknown>)?.fazer_ai_send_id)).toMatch(
+        /^engine:[0-9a-f-]{36}$/,
+      );
+    }
+    expect(bodies).toHaveLength(2);
   });
 
   test("sendPrivateNote sets private:true", async () => {
@@ -151,7 +339,7 @@ describe("ChatwootClient", () => {
       fetchImpl,
       assertSafe: passthroughSafe,
     });
-    // Operator-initiated actions must be attributed to the instance admin, not the persona bot.
+    // NOTE: operator-initiated actions must be attributed to the instance admin, not the persona bot.
     await client.assignToAgent(42, 99, { asAdmin: true });
     await client.unassignConversation(42, { asAdmin: true });
     await client.toggleStatus(42, "pending", { asAdmin: true });
@@ -170,6 +358,38 @@ describe("ChatwootClient", () => {
     expect(calls[0]?.url).toContain("/conversations/42/assignments");
     expect(calls[0]?.body).toMatchObject({ assignee_id: 0 });
     expect(calls[0]?.headers["api-access-token"]).toBe("BOT_TOK");
+  });
+
+  test("assignAgentBot names the bot by type and says who the answer names", async () => {
+    const answers: Array<[unknown, "bot" | "user" | null]> = [
+      // The fork's `agent_bot_slim`: the bot it assigned.
+      [{ id: 501, name: "Bot", bot_type: "webhook" }, "bot"],
+      // A Chatwoot that ignores `assignee_type` reads the id as a USER's.
+      [
+        { id: 501, name: "Ana", email: "ana@example.com", role: "agent" },
+        "user",
+      ],
+      // A bot the fork cannot find renders null.
+      [null, null],
+      // Another bot is not this one.
+      [{ id: 502, name: "Other", bot_type: "webhook" }, null],
+    ];
+    for (const [payload, expected] of answers) {
+      const { fetchImpl, calls } = stub(200, payload);
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      expect(await client.assignAgentBot(42, 501, { asAdmin: true })).toBe(
+        expected,
+      );
+      expect(calls[0]?.url).toContain("/conversations/42/assignments");
+      expect(calls[0]?.body).toEqual({
+        assignee_id: 501,
+        assignee_type: "AgentBot",
+      });
+      expect(calls[0]?.headers["api-access-token"]).toBe("ADMIN_TOK");
+    }
   });
 
   test("toggleTyping uses the bot token (toggle_typing_status is bot-accessible)", async () => {
@@ -319,6 +539,8 @@ describe("ChatwootClient", () => {
         model: "contact_attribute",
         displayType: "list",
         values: ["Free", "Pro"],
+        regexPattern: null,
+        regexCue: null,
       },
     ]);
   });
@@ -388,8 +610,8 @@ describe("ChatwootClient", () => {
   // written the file, so the eager STT/vision download races it and gets a 404 on a fresh voice note.
   // The retry is opt-in: the interactive media proxy must still fail fast on a genuinely missing file.
   describe("downloadAttachment write race", () => {
-    // A public documentation IP (RFC 5737) keeps the real anti-SSRF guard happy without a DNS lookup —
-    // downloadAttachment always uses the real guard, never deps.assertSafe.
+    // A public documentation IP (RFC 5737) passes the real anti-SSRF guard without a DNS
+    // lookup: downloadAttachment always uses the real guard, never deps.assertSafe.
     const HOST = "https://203.0.113.10";
     const URL_ = `${HOST}/rails/active_storage/blobs/redirect/abc/audio.ogg`;
 
@@ -548,8 +770,8 @@ describe("ChatwootClient", () => {
     });
   });
 
-  // A client built without the token a call needs used to send the empty string and read Chatwoot's
-  // 401 back, which reported a local wiring mistake as a remote rejection (issue #79).
+  // A client built without the token a call needs refuses locally: sending the empty string would
+  // read Chatwoot's 401 back and report a local wiring mistake as a remote rejection.
   test("refuses to call with an empty token instead of sending it", async () => {
     const { fetchImpl, calls } = stub(200, {});
     const client = await createChatwootClient(
@@ -562,7 +784,7 @@ describe("ChatwootClient", () => {
   });
 
   // The multipart senders build their own fetch instead of going through request(), so the guard has
-  // to be on both of them too — otherwise the empty token still goes out on the wire.
+  // to be on both of them too, otherwise the empty token still goes out on the wire.
   test("the multipart senders refuse an empty token as well", async () => {
     const { fetchImpl, calls } = stub(200, {});
     const client = await createChatwootClient(
@@ -580,16 +802,12 @@ describe("ChatwootClient", () => {
     expect(calls).toHaveLength(0);
   });
 
-  // O NOME DO ARQUIVO TEM QUE SOBREVIVER À SERIALIZAÇÃO, e não só existir no objeto (issue #763). O
-  // fork casa o metadado do anexo POR NOME — `uploaded_filename(attachment)` no `message_builder` —,
-  // então uma parte que chega chamada `blob` perde as DUAS coisas que este envio carrega: o
-  // `transcribed_text`, que é o texto falado desta issue, e o `is_recorded_audio`, que é o que faz o
-  // WhatsApp tocar o áudio como gravação em vez de pendurar um arquivo. Medido nas duas pontas: com
-  // `new Blob(...)` mais o terceiro argumento do `append`, sob o preload deste repo (o
-  // `tests/dom-setup.ts` instala os globais do happy-dom, cujo FormData não é o nativo), o corpo sai
-  // `filename="blob"` e o Chatwoot grava `{}` no meta; com um `File` de verdade o nome viaja nos
-  // dois ambientes. E a asserção é sobre o corpo SERIALIZADO porque o objeto FormData mente: o
-  // `form.get()` devolve um File com o nome certo mesmo no caso que se perde no fio.
+  // O NOME DO ARQUIVO TEM QUE SOBREVIVER À SERIALIZAÇÃO: o fork casa o metadado do anexo POR NOME
+  // (`uploaded_filename(attachment)` no `message_builder`), e uma parte chamada `blob` perde o
+  // `transcribed_text` e o `is_recorded_audio`. Sob o preload deste repo (`tests/dom-setup.ts`, com
+  // o FormData do happy-dom), um `Blob` com o nome no terceiro argumento do `append` sai
+  // `filename="blob"`; um `File` leva o nome nos dois ambientes. A asserção é sobre o corpo
+  // SERIALIZADO porque `form.get()` devolve um File com o nome certo mesmo quando o fio o perde.
   test("o nome do arquivo viaja no corpo serializado, no áudio e no anexo comum", async () => {
     const bodies: BodyInit[] = [];
     const fetchImpl = (async (_u: string, init?: RequestInit) => {
@@ -630,7 +848,7 @@ describe("ChatwootClient", () => {
     expect(wire).toHaveLength(2);
     expect(wire[0]).toContain('filename="reply.ogg"');
     expect(wire[0]).not.toContain('filename="blob"');
-    // E a chave do metadado casa o nome que viajou, que é a outra metade do acordo com o fork.
+    // NOTE: e a chave do metadado casa o nome que viajou, que é a outra metade do acordo com o fork.
     expect(wire[0]).toContain(
       "attachments_metadata[reply.ogg][transcribed_text]",
     );
@@ -638,7 +856,7 @@ describe("ChatwootClient", () => {
     expect(wire[1]).not.toContain('filename="blob"');
   });
 
-  // #792: a voice note whose speech left a URL out carries the whole reply in its bag, as the JSON
+  // A voice note whose speech left a URL out carries the whole reply in its bag, as the JSON
   // string the builder parses on a multipart create; one with nothing left out carries no bag.
   test("the whole reply rides content_attributes only when the speech is not it", async () => {
     const bodies: BodyInit[] = [];
@@ -674,29 +892,62 @@ describe("ChatwootClient", () => {
         transcribedText: "Confirmei para quinta",
       },
     );
+    await client.sendAudioMessage(
+      42,
+      new ArrayBuffer(4),
+      "t.ogg",
+      "audio/ogg",
+      { transcribedText: "Confirmei para quinta", sendId: "reply:k:1" },
+    );
     const forms = bodies as FormData[];
-    expect(forms[0]?.get("content_attributes")).toBe(
-      JSON.stringify({ fazer_ai_reply_text: whole }),
+    const bag = (i: number) =>
+      JSON.parse(String(forms[i]?.get("content_attributes")));
+    expect(bag(0).fazer_ai_reply_text).toBe(whole);
+    expect(bag(1)).not.toHaveProperty("fazer_ai_reply_text");
+    expect(bag(1).fazer_ai_send_id).toMatch(/^engine:/);
+    // The voice note's name, so its refusal can tell the text after it is the same reply.
+    expect(forms[2]?.get("content_attributes")).toBe(
+      JSON.stringify({ fazer_ai_send_id: "reply:k:1" }),
     );
-    expect(forms[1]?.has("content_attributes")).toBe(false);
   });
 
-  test("an admin-token call on that same client still works", async () => {
-    const { fetchImpl, calls } = stub(200, { payload: [] });
-    const client = await createChatwootClient(
-      { ...baseConfig, botToken: "" },
-      { fetchImpl, assertSafe: passthroughSafe },
+  // A voice note of the operator's words says so in the same bag, with or without the whole reply.
+  test("the operator's words are marked in content_attributes", async () => {
+    const bodies: BodyInit[] = [];
+    const fetchImpl = (async (_u: string, init?: RequestInit) => {
+      if (init?.body) bodies.push(init.body);
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "{}",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.sendAudioMessage(
+      42,
+      new ArrayBuffer(4),
+      "o.ogg",
+      "audio/ogg",
+      {
+        transcribedText: "Olá",
+        byOperator: true,
+      },
     );
-    await client.getConversationLabels(42);
-    expect(calls).toHaveLength(1);
-    expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+    const bag = JSON.parse(
+      String((bodies[0] as FormData).get("content_attributes")),
+    );
+    expect(bag.fazer_ai_reply_by_operator).toBe(true);
+    expect(bag).not.toHaveProperty("fazer_ai_reply_text");
   });
 
-  // THE SHAPE THIS ENDPOINT ACTUALLY ANSWERS (issue #495 review, round 3). The fork's view is
-  // `json.agent_bot do ... if @agent_bot.present?`, so the key is always there and its EMPTINESS is
-  // the answer. The first version of this parser read `res.id` and would have reported "no bot" for
-  // every attached bot there is — a stub handing back a bare number could never have caught it,
-  // which is why the three shapes are driven through the real client here.
+  // THE SHAPE THIS ENDPOINT ACTUALLY ANSWERS. The fork's view is `json.agent_bot do ... if
+  // @agent_bot.present?`, and Jbuilder drops a key whose block wrote nothing, so an inbox with no bot
+  // answers `{}` (measured on the fork, 4.18). A parser that read `res.id` would report "no bot" for
+  // every attached bot, and a stub handing back a bare number cannot catch that, so the shapes are
+  // driven through the real client here.
   describe("the inbox's attached agent bot", () => {
     const read = async (payload: unknown) => {
       const { fetchImpl, calls } = stub(200, payload);
@@ -720,11 +971,81 @@ describe("ChatwootClient", () => {
       expect((await read({ agent_bot: {} })).got).toBeNull();
       expect((await read({ agent_bot: null })).got).toBeNull();
     });
-    // Not `null`: a body without the key is a Chatwoot that does not serve this route, or a shape we
-    // do not recognise, and a caller must not read that as "there is no bot".
-    test("a body without the key is unknown, not none", async () => {
-      expect((await read({})).got).toBeUndefined();
+    test("an object without the key is the real answer for an inbox with no bot", async () => {
+      expect((await read({})).got).toBeNull();
+    });
+    // Not `null`: any other shape without the key is one we do not recognise, and a caller must not
+    // read that as "there is no bot".
+    test("any other shape without the key is unknown, not none", async () => {
       expect((await read({ something_else: 1 })).got).toBeUndefined();
+      expect((await read({ error: "nope" })).got).toBeUndefined();
+      expect((await read({ agent_bot: { id: "555" } })).got).toBeUndefined();
+      expect((await read({ agent_bot: { name: "Menu" } })).got).toBeUndefined();
+      expect((await read({ agent_bot: 7 })).got).toBeUndefined();
+      expect((await read("<html>")).got).toBeUndefined();
+      expect((await read([])).got).toBeUndefined();
+    });
+  });
+
+  describe("getContactEmail", () => {
+    test("reads the contact's email with the admin token; blank or missing is null", async () => {
+      for (const [email, want] of [
+        [" ana@example.com ", "ana@example.com"],
+        ["", null],
+        [null, null],
+        [undefined, null],
+      ] as const) {
+        const { fetchImpl, calls } = stub(200, { payload: { email } });
+        const client = await createChatwootClient(baseConfig, {
+          fetchImpl,
+          assertSafe: passthroughSafe,
+        });
+        expect(await client.getContactEmail(7)).toBe(want);
+        expect(calls[0]?.method).toBe("GET");
+        expect(calls[0]?.url).toBe(
+          "https://chat.example.com/api/v1/accounts/5/contacts/7",
+        );
+        expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+      }
+    });
+
+    // The Calendar invite reads the address an update_contact of the same turn may still be writing.
+    // On the contact's queue the read waits for the PUT, so it cannot answer with the old address.
+    test("waits behind an update of the same contact that is still in flight", async () => {
+      const order: string[] = [];
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      let stored = "old@example.com";
+      const fetchImpl = (async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET";
+        order.push(`${method} start`);
+        if (method === "PUT") {
+          await gate;
+          stored = (JSON.parse(init?.body as string) as { email: string })
+            .email;
+        }
+        order.push(`${method} end`);
+        return {
+          ok: true,
+          status: 200,
+          text: async () =>
+            JSON.stringify({ payload: { email: stored, id: 7, url } }),
+        } as unknown as Response;
+      }) as unknown as typeof fetch;
+      const client = await createChatwootClient(baseConfig, {
+        fetchImpl,
+        assertSafe: passthroughSafe,
+      });
+      const put = client.updateContact(7, { email: "new@example.com" });
+      const read = client.getContactEmail(7);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(order).toEqual(["PUT start"]);
+      release();
+      await put;
+      expect(await read).toBe("new@example.com");
+      expect(order).toEqual(["PUT start", "PUT end", "GET start", "GET end"]);
     });
   });
 
@@ -743,7 +1064,7 @@ describe("ChatwootClient", () => {
 
   // Chatwoot names whoever made the request on the activity line it writes, so the token this write
   // carries decides whether the timeline reads "Observadora added cancelamento" or the name of the
-  // person whose token provisioned the instance (issue #493).
+  // person whose token provisioned the instance.
   describe("conversation labels are written by the persona", () => {
     test("the write carries the bot token and the read stays on the admin one", async () => {
       const { fetchImpl, calls } = stub(200, { payload: ["cancelamento"] });
@@ -778,12 +1099,10 @@ describe("ChatwootClient", () => {
       expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
     });
 
-    // `conversations/labels` entered BOT_ACCESSIBLE_ENDPOINTS only on 2026-06-05 (upstream #14655),
-    // and self-hosted versions are not ours to pick: an older instance answers 401. The label is the
-    // observer's whole product, so it is written anyway, by the admin, and the attribution is what is
-    // lost — never the label.
-    // A 401 whose reason is the bot token being refused ON THIS ENDPOINT, which is what a server
-    // older than 2026-06-05 answers.
+    // A 401 whose reason is the bot token being refused ON THIS ENDPOINT, which is what a Chatwoot
+    // without `conversations/labels` in BOT_ACCESSIBLE_ENDPOINTS (before 2026-06-05) answers. The
+    // label is the observer's whole product, so it is written anyway, by the admin: the attribution
+    // is what is lost, never the label.
     function refusingBot(reason: string) {
       const calls: Captured[] = [];
       const fetchImpl = (async (url: string, init?: RequestInit) => {
@@ -822,9 +1141,9 @@ describe("ChatwootClient", () => {
       expect(calls[1]?.body).toEqual({ labels: ["cancelamento"] });
     });
 
-    // A BROKEN CREDENTIAL IS ALSO 401 (issue #493 review, round 1), and falling back on it would
-    // hide it behind a write that succeeds under a person's name — this bug, restored, with nothing
-    // left to notice it. Both of Chatwoot's credential refusals are raised instead.
+    // A BROKEN CREDENTIAL IS ALSO 401, and falling back on it would hide it behind a write that
+    // succeeds under a person's name, with nothing left to notice it. Both of Chatwoot's credential
+    // refusals are raised instead.
     test.each([
       ["Invalid Access Token"],
       ["Bot is not authorized to access this account"],
@@ -846,7 +1165,7 @@ describe("ChatwootClient", () => {
     );
 
     // The warning names the instance, and the instance is the operator's configured base URL: a URL
-    // carrying userinfo would keep it all the way into the log line (issue #493 review, round 2).
+    // carrying userinfo would keep it all the way into the log line.
     test("the fallback warning carries no credential from the base URL", async () => {
       const { fetchImpl } = refusingBot(
         "Access to this endpoint is not authorized for bots",
@@ -864,7 +1183,7 @@ describe("ChatwootClient", () => {
         const logged = JSON.stringify(warn.mock.calls);
         expect(logged).not.toContain("s3cr3t");
         expect(logged).not.toContain("user:");
-        // Still says WHICH instance, which is what the field is for.
+        // NOTE: still says WHICH instance, which is what the field is for.
         expect(logged).toContain("chat.example.com");
       } finally {
         warn.mockRestore();
@@ -913,5 +1232,197 @@ describe("ChatwootClient", () => {
       ).rejects.toBeInstanceOf(ChatwootApiError);
       expect(calls).toHaveLength(1);
     });
+  });
+
+  test("findContactIdByIdentifier filters on the whole identifier, not a substring search", async () => {
+    const { fetchImpl, calls } = stub(200, { payload: [{ id: 42 }] });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    expect(await client.findContactIdByIdentifier("fazer-ai-client:1")).toBe(
+      42,
+    );
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.url).toBe(
+      "https://chat.example.com/api/v1/accounts/5/contacts/filter",
+    );
+    expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+    expect(calls[0]?.body).toEqual({
+      payload: [
+        {
+          attribute_key: "identifier",
+          filter_operator: "equal_to",
+          values: ["fazer-ai-client:1"],
+          query_operator: null,
+        },
+      ],
+    });
+  });
+
+  test("findContactIdByIdentifier answers null when no contact has it", async () => {
+    const { fetchImpl } = stub(200, { payload: [] });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    expect(await client.findContactIdByIdentifier("x")).toBeNull();
+  });
+
+  test("createContact sends only the fields it has and reads the fork's nested contact", async () => {
+    const { fetchImpl, calls } = stub(200, {
+      payload: { contact: { id: 77 }, contact_inbox: {} },
+    });
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    expect(
+      await client.createContact({
+        name: "Ana",
+        email: "ana@exemplo.com",
+        phone_number: null,
+        identifier: "fazer-ai-client:1",
+      }),
+    ).toBe(77);
+    expect(calls[0]?.body).toEqual({
+      name: "Ana",
+      email: "ana@exemplo.com",
+      identifier: "fazer-ai-client:1",
+    });
+    expect(calls[0]?.headers[CHATWOOT_AUTH_HEADER]).toBe("ADMIN_TOK");
+  });
+
+  test("sendMessageAsAdmin carries fixed email recipients only when asked", async () => {
+    const { fetchImpl, calls } = stub(200, {});
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    await client.sendMessageAsAdmin(9, "oi", {
+      private: false,
+      toEmails: ["a@b.co", "c@d.co"],
+    });
+    await client.sendMessageAsAdmin(9, "nota", { private: true });
+    expect(calls.map((c) => c.body)).toEqual([
+      {
+        content: "oi",
+        private: false,
+        message_type: "outgoing",
+        to_emails: "a@b.co,c@d.co",
+        content_attributes: { fazer_ai_platform_sent: true },
+      },
+      {
+        content: "nota",
+        private: true,
+        message_type: "outgoing",
+        content_attributes: { fazer_ai_platform_sent: true },
+      },
+    ]);
+  });
+});
+
+describe("parseLiveConversation states the assignee only when the payload does", () => {
+  // The REST show renders `meta` on every conversation and leaves `assignee_type` out of it when
+  // nobody holds the conversation, so a `meta` without the key is the unassigned shape.
+  test("a meta without an assignee says nobody; a payload without meta says nothing", async () => {
+    const { parseLiveConversation } = await import(
+      "@/modules/chatwoot/normalize"
+    );
+    const stated = parseLiveConversation({
+      id: 1,
+      status: "pending",
+      meta: { assignee_type: null, assignee: null },
+    });
+    const unassigned = parseLiveConversation({
+      id: 1,
+      status: "pending",
+      meta: { channel: "Channel::Api" },
+    });
+    const omittedMeta = parseLiveConversation({ id: 1, status: "pending" });
+    expect(stated?.assigneeStated).toBe(true);
+    expect([unassigned?.assigneeStated, unassigned?.assigneeType]).toEqual([
+      true,
+      null,
+    ]);
+    expect(omittedMeta?.assigneeStated).toBe(false);
+  });
+});
+
+// The flag the split path reads to resend a reply: whether the origin asked for the request again.
+describe("ChatwootApiError carries whether the response asked for a retry", () => {
+  test.each([
+    ["with Retry-After", { "retry-after": "5" }, true],
+    ["without it", {}, false],
+  ])("a 503 %s", async (_label, headers, expected) => {
+    const fetchImpl = (async () =>
+      ({
+        ok: false,
+        status: 503,
+        headers: new Headers(headers),
+        text: async () => "{}",
+      }) as unknown as Response) as unknown as typeof fetch;
+    const client = await createChatwootClient(baseConfig, {
+      fetchImpl,
+      assertSafe: passthroughSafe,
+    });
+    const err = await client.sendMessage(1, "oi").catch((e) => e);
+    expect(err).toBeInstanceOf(ChatwootApiError);
+    expect((err as ChatwootApiError).status).toBe(503);
+    expect((err as ChatwootApiError).retryAfter).toBe(expected);
+  });
+});
+
+describe("one queue per target across a base URL move", () => {
+  test("clients loaded before and after a move merge into the same contact, not over each other", async () => {
+    // One Chatwoot behind two addresses: the contact's attributes live in one place.
+    let stored: Record<string, unknown> = {};
+    let gets = 0;
+    const fetchImpl = (async (_url: string, init?: RequestInit) => {
+      const method = init?.method ?? "GET";
+      if (method === "GET") {
+        gets += 1;
+        const snapshot = { ...stored };
+        // The first read is slow: an unserialized second write would read the same empty hash.
+        if (gets === 1) await new Promise((r) => setTimeout(r, 30));
+        return {
+          ok: true,
+          status: 200,
+          text: async () =>
+            JSON.stringify({ payload: { custom_attributes: snapshot } }),
+        } as unknown as Response;
+      }
+      const body = JSON.parse(String(init?.body ?? "{}")) as {
+        custom_attributes?: Record<string, unknown>;
+      };
+      stored = body.custom_attributes ?? {};
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "{}",
+      } as unknown as Response;
+    }) as unknown as typeof fetch;
+    const deps = { fetchImpl, assertSafe: passthroughSafe };
+    const before = await createChatwootClient(
+      {
+        ...baseConfig,
+        baseUrl: "http://10.0.0.5:3000",
+        identity: "chatwoot-deployment:9",
+      },
+      deps,
+    );
+    const after = await createChatwootClient(
+      {
+        ...baseConfig,
+        baseUrl: "https://chat.example.com",
+        identity: "chatwoot-deployment:9",
+      },
+      deps,
+    );
+    await Promise.all([
+      before.setContactCustomAttributes(77, { a: 1 }),
+      after.setContactCustomAttributes(77, { b: 2 }),
+    ]);
+    expect(JSON.stringify(stored)).toBe(JSON.stringify({ a: 1, b: 2 }));
   });
 });

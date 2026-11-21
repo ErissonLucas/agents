@@ -2,8 +2,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { recordDirectUsage } from "@/graph/usage";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #855: every billed call records how long it took, beside its tokens. The LangChain capture is
+// Every billed call records how long it took, beside its tokens. The LangChain capture is
 // driven by a real turn in tests/graph/runtime.test.ts; this is the other writer, the one vision (and
 // any call made outside LangChain) goes through.
 
@@ -23,8 +24,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;

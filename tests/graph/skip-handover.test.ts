@@ -30,10 +30,15 @@ import {
 } from "@/graph/tools/native";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
+import {
+  HANDOFF_DEFAULTS,
+  type HandoffConfig,
+} from "@/modules/handoff/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// Issue #659: `skip_reply` carries a reason, and a silence that names a person, or any silence on a
+// `skip_reply` carries a reason, and a silence that names a person, or any silence on a
 // conversation nobody on our side has answered, hands the conversation to `open` with a private note.
 
 const skipLine = (
@@ -52,19 +57,118 @@ const skipLine = (
     },
   });
 
+const PINNED_TEAM: HandoffConfig = {
+  ...HANDOFF_DEFAULTS,
+  mode: "pinned",
+  targetTeamId: 7,
+};
+
+// The hand-over goes where `handoff_to_human` would: the operator's pinned target, else Chatwoot's
+// routing. Every write it makes, in order.
+async function handOver(
+  handoff: HandoffConfig,
+  opts: { failOn?: "toggle" | "assign"; instanceId?: bigint } = {},
+) {
+  const calls: string[] = [];
+  const client = {
+    toggleStatus: async () => {
+      calls.push("toggle");
+      if (opts.failOn === "toggle") throw new Error("chatwoot 500");
+      return {};
+    },
+    assignTeam: async (_c: number, id: number) => {
+      calls.push(`team:${id}`);
+      if (opts.failOn === "assign") throw new Error("chatwoot 404");
+      return {};
+    },
+    assignToAgent: async (_c: number, id: number) => {
+      calls.push(`agent:${id}`);
+      if (opts.failOn === "assign") throw new Error("chatwoot 404");
+      return {};
+    },
+    sendPrivateNote: async () => {
+      calls.push("note");
+      return {};
+    },
+  } as unknown as ChatwootClient;
+  const opened = await applySkipHandover({
+    client,
+    conversationId: 1,
+    kind: "needs_human",
+    detail: null,
+    handoff,
+    instanceId: opts.instanceId ?? 3n,
+    flow: { tenantId: 1n, turnId: "t", source: "inbox" } as never,
+  });
+  return { opened, calls };
+}
+
+describe("where the skip hand-over sends the conversation (#1027)", () => {
+  test("a pinned team receives it, after the status change and before the note", async () => {
+    const r = await handOver(PINNED_TEAM);
+    expect(r.opened).toBe(true);
+    expect(r.calls).toEqual(["toggle", "team:7", "note"]);
+  });
+
+  test("a pinned agent receives it, and wins over a team set beside it", async () => {
+    const r = await handOver({ ...PINNED_TEAM, targetAgentId: 11 });
+    expect(r.calls).toEqual(["toggle", "agent:11", "note"]);
+  });
+
+  test("route, agent_choice and a pin with no target leave it to Chatwoot's routing", async () => {
+    for (const hc of [
+      HANDOFF_DEFAULTS,
+      { ...PINNED_TEAM, mode: "agent_choice" as const },
+      { ...PINNED_TEAM, targetTeamId: null },
+    ]) {
+      const r = await handOver(hc);
+      expect(r.calls).toEqual(["toggle", "note"]);
+    }
+  });
+
+  test("a pin picked in another account is not applied here", async () => {
+    const r = await handOver(
+      { ...PINNED_TEAM, targetInstanceId: 9 },
+      { instanceId: 3n },
+    );
+    expect(r.calls).toEqual(["toggle", "note"]);
+    const same = await handOver(
+      { ...PINNED_TEAM, targetInstanceId: 3 },
+      { instanceId: 3n },
+    );
+    expect(same.calls).toEqual(["toggle", "team:7", "note"]);
+  });
+
+  test("an assignment that fails leaves it open, with the note, and does not throw", async () => {
+    const r = await handOver(PINNED_TEAM, { failOn: "assign" });
+    expect(r.opened).toBe(true);
+    expect(r.calls).toEqual(["toggle", "team:7", "note"]);
+  });
+
+  test("a status change that fails assigns nobody", async () => {
+    const r = await handOver(PINNED_TEAM, { failOn: "toggle" });
+    expect(r.opened).toBe(false);
+    expect(r.calls).toEqual(["toggle"]);
+  });
+});
+
 describe("the reason on skip_reply", () => {
-  test("the schema requires it and accepts exactly the three values", async () => {
+  const callerOf = (proactive: boolean) => {
     const [skip] = buildNativeTools(
-      { client: {} as never, conversationId: 1 },
+      { client: {} as never, conversationId: 1, proactive },
       [SKIP_REPLY_TOOL],
     );
-    const call = (args: Record<string, unknown>) =>
+    return (args: Record<string, unknown>) =>
       skip?.invoke({
         type: "tool_call",
         id: "c1",
         name: SKIP_REPLY_TOOL,
         args,
       } as never);
+  };
+
+  test("a follow-up's schema requires it and accepts exactly the three values", async () => {
+    const call = callerOf(true);
     await expect(call({})).rejects.toThrow();
     await expect(call({ reason: "later" })).rejects.toThrow();
     for (const reason of ["acknowledged", "not_for_us", "needs_human"]) {
@@ -74,12 +178,33 @@ describe("the reason on skip_reply", () => {
     }
   });
 
+  // A turn that answers a customer has one silence: nothing to answer. The reasons that hand the
+  // conversation over were a transfer the customer never heard about; handoff_to_human is the door.
+  test("a turn that answers a customer offers only acknowledged", async () => {
+    const call = callerOf(false);
+    // The refusal names the door that hands over and speaks: a bare "expected acknowledged" is read
+    // as "stay silent with acknowledged".
+    await expect(call({ reason: "not_for_us" })).rejects.toThrow(
+      /handoff_to_human/,
+    );
+    await expect(call({ reason: "needs_human" })).rejects.toThrow(
+      /handoff_to_human/,
+    );
+    const out = (await call({ reason: "acknowledged" })) as ToolMessage;
+    expect(out.additional_kwargs[SKIP_REPLY_REASON_KEY]).toBe("acknowledged");
+  });
+
   test("an observer is not promised a hand-over it does not run, and is pointed at handoff_to_human", () => {
-    const describe = (muted: boolean) =>
-      buildNativeTools({ client: { muted } as never, conversationId: 1 }, [
-        SKIP_REPLY_TOOL,
-      ])[0]?.description ?? "";
-    expect(describe(false)).toContain("hand the conversation to the team");
+    const describe = (muted: boolean, proactive = false) =>
+      buildNativeTools(
+        { client: { muted } as never, conversationId: 1, proactive },
+        [SKIP_REPLY_TOOL],
+      )[0]?.description ?? "";
+    expect(describe(false, true)).toContain(
+      "hand the conversation to the team",
+    );
+    expect(describe(false)).not.toContain("needs_human");
+    expect(describe(false)).toContain("handoff_to_human");
     expect(describe(true)).not.toContain("hand the conversation to the team");
     expect(describe(true)).toContain("handoff_to_human");
   });
@@ -184,9 +309,12 @@ describe("the reason on skip_reply", () => {
       conversationId: 1,
       kind: "needs_human",
       detail: null,
+      handoff: PINNED_TEAM,
+      instanceId: 1n,
       flow: { tenantId: 1n, turnId: "t", source: "inbox" } as never,
       stillWanted: async () => wanted,
     });
+    // Neither the assignment nor the note follows a run withdrawn during the status change.
     expect(calls).toEqual(["toggle"]);
   });
 
@@ -236,7 +364,12 @@ describe("skipReply.handoff off: an agent with no team behind it", () => {
 
   const offTool = () =>
     buildNativeTools(
-      { client: {} as never, conversationId: 1, skipReplyHandoff: false },
+      {
+        client: {} as never,
+        conversationId: 1,
+        proactive: true,
+        skipReplyHandoff: false,
+      },
       [SKIP_REPLY_TOOL],
     )[0];
   const call = (args: Record<string, unknown>) =>
@@ -287,8 +420,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -346,7 +479,7 @@ class SkipTwiceModel {
             tool_calls: [
               {
                 name: "skip_reply",
-                args: { reason: "needs_human" },
+                args: { reason: "acknowledged" },
                 id: `call_skip_${n}`,
               },
             ],
@@ -401,6 +534,14 @@ function recordingClient(calls: Call[], failOn?: string, page: unknown[] = []) {
     toggleStatus: async (conversationId: number, status: string) => {
       calls.push(["toggleStatus", conversationId, status]);
       if (status === failOn) throw new Error("chatwoot 500");
+      return {};
+    },
+    assignTeam: async (conversationId: number, teamId: number) => {
+      calls.push(["assignTeam", conversationId, String(teamId)]);
+      return {};
+    },
+    assignToAgent: async (conversationId: number, agentId: number) => {
+      calls.push(["assignToAgent", conversationId, String(agentId)]);
       return {};
     },
   } as unknown as ChatwootClient;
@@ -469,7 +610,7 @@ async function turn(
   return { outcome, calls };
 }
 
-// Chatwoot's message page as the REST partial renders it, for the activity trail of issue #897.
+// Chatwoot's message page as the REST partial renders it, for the activity trail.
 const THANKS = 50;
 const row = (id: number, messageType: number, extra = {}) => ({
   id,
@@ -576,7 +717,10 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
     expect(calls).toEqual([]);
   });
 
-  test("not_for_us and needs_human open it, with a note that says which", async () => {
+  // The reasons that hand the conversation over are a follow-up's alone (nudge.test.ts covers them).
+  // Here the model asks for one anyway: the call is refused, the turn ends without a chosen silence,
+  // and a conversation our side already answered is not opened behind the customer's back.
+  test("a turn that answers a customer cannot hand it over by silence", async () => {
     await seed(65_902, true);
     await seed(65_903, true);
     const a = await turn(
@@ -584,32 +728,54 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
       new SkipModel({ reason: "not_for_us", detail: "relatório DMARC" }),
     );
     const b = await turn(65_903, new SkipModel({ reason: "needs_human" }));
-    expect(shape(a.calls)).toEqual([
-      ["toggleStatus", 65_902, "open"],
-      ["sendPrivateNote", 65_902, ""],
-    ]);
-    expect(shape(b.calls)).toEqual([
-      ["toggleStatus", 65_903, "open"],
-      ["sendPrivateNote", 65_903, ""],
-    ]);
-    expect(a.calls[1]?.[2]).toBe(
-      skipHandoverNote("not_for_us", "relatório DMARC"),
-    );
-    expect(b.calls[1]?.[2]).toBe(skipHandoverNote("needs_human", null));
-    // Nothing public: the customer is not told anything.
-    expect([...a.calls, ...b.calls].some(([op]) => op === "sendMessage")).toBe(
-      false,
-    );
-    const conv = await suDb.conversation.findFirstOrThrow({
-      where: { tenantId, chatwootConversationId: 65_902 },
-      select: { id: true },
+    expect(a.calls).toEqual([]);
+    expect(b.calls).toEqual([]);
+  });
+
+  test("with the handoff pinned to a team, the skip lands in that team's queue (#1027)", async () => {
+    const agent = await suDb.agent.findFirstOrThrow({
+      where: { tenantId },
+      select: { id: true, settings: true },
     });
-    const lines = await flowLogRows(suDb, {
-      where: { conversationId: conv.id, stage: "handoff" },
+    await suDb.agent.update({
+      where: { id: agent.id },
+      data: {
+        settings: {
+          ...(agent.settings as Record<string, unknown>),
+          handoff: { mode: "pinned", targetTeamId: 7 },
+        },
+      },
     });
-    expect(lines.map((l) => l.detail)).toEqual([
-      { outcome: "opened_after_skip", reason: "not_for_us", noted: true },
-    ]);
+    try {
+      await seed(65_951, false);
+      const b = await turn(65_951, new SkipModel({ reason: "acknowledged" }));
+      expect(shape(b.calls)).toEqual([
+        ["toggleStatus", 65_951, "open"],
+        ["assignTeam", 65_951, "7"],
+        ["sendPrivateNote", 65_951, ""],
+      ]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: 65_951 },
+        select: { id: true },
+      });
+      const lines = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: { conversationId: conv.id, stage: "handoff" },
+      });
+      expect(lines.map((l) => l.detail)).toEqual([
+        {
+          outcome: "opened_after_skip",
+          reason: "unanswered",
+          noted: true,
+          assigned: "team",
+        },
+      ]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agent.id },
+        data: { settings: agent.settings as object },
+      });
+    }
   });
 
   test("the floor: any silence on a conversation nobody answered opens it", async () => {
@@ -648,7 +814,7 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
   });
 
   test("a reaffirmed silence writes one note", async () => {
-    await seed(65_905, true);
+    await seed(65_905, false);
     const { calls } = await turn(65_905, new SkipTwiceModel());
     expect(shape(calls)).toEqual([
       ["toggleStatus", 65_905, "open"],
@@ -689,10 +855,10 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
   });
 
   test("a resolve that failed to land does not keep the conversation from a person", async () => {
-    await seed(65_908, true);
+    await seed(65_908, false);
     const { calls } = await turn(
       65_908,
-      new SkipModel({ reason: "needs_human" }, true),
+      new SkipModel({ reason: "acknowledged" }, true),
       "resolved",
     );
     expect(shape(calls)).toEqual([
@@ -706,13 +872,13 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
     await seed(65_906, false);
     const { calls } = await turn(
       65_906,
-      new SkipModel({ reason: "needs_human" }, true),
+      new SkipModel({ reason: "acknowledged" }, true),
     );
     expect(calls.filter(([op]) => op !== "toggleStatus")).toEqual([]);
     expect(calls.map(([, , s]) => s)).toEqual(["resolved"]);
   });
 
-  // Issue #897. The message this turn answers is the one that reopened a resolved conversation (a
+  // NOTE: The message this turn answers is the one that reopened a resolved conversation (a
   // thank-you after the agent closed it), and the model acknowledged it without calling
   // `resolve_conversation`. The conversation goes back to where it was instead of waiting in
   // `pending` for a follow-up to nudge the customer who just said thanks.
@@ -751,21 +917,6 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
       THANKS,
     );
     expect(calls).toEqual([]);
-  });
-
-  test("a reopening message the model hands to a person still goes to a person", async () => {
-    await seed(65_912, true, true);
-    const { calls } = await turn(
-      65_912,
-      new SkipModel({ reason: "needs_human" }),
-      undefined,
-      reopenedByThanks,
-      THANKS,
-    );
-    expect(shape(calls)).toEqual([
-      ["toggleStatus", 65_912, "open"],
-      ["sendPrivateNote", 65_912, ""],
-    ]);
   });
 
   test("a reopening message answered by nobody's choice is not closed", async () => {
@@ -930,6 +1081,7 @@ describe.skipIf(!dbUp)("a silence a person has to see", () => {
         select: { id: true },
       });
       const lines = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { conversationId: conv.id, stage: "handoff" },
       });
       expect(lines.map((l) => l.detail)).toEqual([

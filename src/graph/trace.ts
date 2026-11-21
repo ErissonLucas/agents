@@ -1,11 +1,12 @@
 import type { BaseMessage } from "@langchain/core/messages";
+import { measureText, type TextSize } from "@/graph/token-count";
 import { redactSecretsDeep, scrubbedClip } from "@/lib/redact";
 import type { GuardrailReport } from "@/modules/guardrails/gate";
 
 // Builds a sanitized, human-readable execution trace from the graph's final message list, for the
 // agent playground (UI + the agent_playground MCP tool). It is a DEBUG view: the sequence of tool
 // calls (name + args), tool results (output / error), the KB sources a search grounded on, and any
-// intermediate assistant reasoning. The final assistant message (the reply) is excluded — it is
+// intermediate assistant reasoning. The final assistant message (the reply) is excluded: it is
 // returned separately as `reply`. Every arg/output passes through the secret redactor; resolved
 // credentials never reach here (they live only in request headers at fetch time, not in a message).
 
@@ -33,6 +34,10 @@ export interface TraceToolResult {
   id: string | null; // tool_call_id, to pair with the originating call
   name: string | null;
   output: string; // redacted + truncated
+  // The whole result as the model got it, before redaction and the clip above: what this call adds to
+  // every later model call of the turn. Optional only because a playground session saved before sizes
+  // were recorded replays its old trace without one.
+  size?: TextSize;
   isError: boolean;
   sources?: TraceSource[]; // present for search_knowledge (from the ToolMessage artifact)
   // Playground only: the result came from an operator-supplied mock, or a simulated conversation
@@ -42,7 +47,7 @@ export interface TraceToolResult {
 }
 
 // Playground tool-simulation context for labeling results in the trace (which tool names were mocked
-// by the operator vs simulated conversation tools). Both optional — production traces pass neither.
+// by the operator vs simulated conversation tools). Both optional: production traces pass neither.
 export interface TraceLabelOpts {
   mockedNames?: Set<string>;
   simulatedNames?: Set<string>;
@@ -66,37 +71,55 @@ export interface TraceMedia {
   output: string; // redacted + truncated
 }
 
-// A moderation screening, which runs OUTSIDE the graph on both sides of it and so never lands in
-// the message-derived trace either. On the inbox path what the guardrail did is announced as a
-// private note on the conversation; the playground is not a conversation, and without this entry a
-// template reply is indistinguishable from an agent that answered badly (issue #136). `clean` and
-// `unavailable` are here for the reading the reply cannot give on its own: whether a guardrail ran
-// at all, which is what makes a misconfigured one visible where it is cheapest to notice.
-// It IS the gate's own report, tagged: the playground pushes one straight through. Re-declaring
-// the fields here would be the same union written twice, and the outcomes are exactly the decisions
-// the gate can reach minus the one that reports nothing. `action` is the action as it was CARRIED
-// OUT (a `generated` with no replacement in hand sends the template, and says template);
-// `categories` and `rationale` are model-written and present only on a trip, and are the operator's
-// whole explanation of why the reply they are reading is not the one the agent wrote.
+// A moderation screening, which runs OUTSIDE the graph and so never lands in the message-derived
+// trace. The playground has no private note to announce it, so without this entry a template reply
+// looks like an agent that answered badly; `clean` and `unavailable` show whether a guardrail ran at
+// all. It extends the gate's own report rather than re-declaring the union. `action` is the action
+// as CARRIED OUT (a `generated` with no replacement sends the template, and says template).
 export interface TraceGuardrail extends GuardrailReport {
   type: "guardrail";
 }
 
-// The one way a report becomes a trace row. `rationale` and `categories` are written by a model
-// that was shown the reply, so a token the reply leaked can come back quoted inside them — and this
-// row is returned over REST/MCP and persisted, exactly like the assistant text a few lines below,
-// which is redacted and bounded for that reason. Pushing the report through `...r` gave the judge's
-// prose a path into the trace that the agent's own prose does not have.
+// The one way a report becomes a trace row. `rationale` and `categories` are written by a model that
+// was shown the reply, so they can quote a leaked token; this row is returned over REST/MCP and
+// persisted, so they are redacted and bounded like the assistant text. Spreading `...r` would skip
+// that.
 export function traceGuardrail(r: GuardrailReport): TraceGuardrail {
   return {
     type: "guardrail",
     direction: r.direction,
     outcome: r.outcome,
     ...(r.action ? { action: r.action } : {}),
+    ...(r.held ? { held: true as const } : {}),
+    ...(r.check ? { check: r.check } : {}),
+    // The factual-grounding claims: model-written, quoting the reply and the tool results.
+    ...(r.claims?.length
+      ? {
+          claims: r.claims.slice(0, CATEGORIES_MAX).map((c) => ({
+            claim: scrubbedClip(c.claim, OUTPUT_MAX),
+            type: c.type,
+            evidence: scrubbedClip(c.evidence, OUTPUT_MAX),
+          })),
+        }
+      : {}),
+    // The external check's own fields; the reason is the operator endpoint's text, bounded here.
+    ...(r.external
+      ? {
+          external: {
+            decision: r.external.decision,
+            latencyMs: r.external.latencyMs,
+            ...(r.external.reason
+              ? { reason: scrubbedClip(r.external.reason, OUTPUT_MAX) }
+              : {}),
+            ...(r.external.cause ? { cause: r.external.cause } : {}),
+            ...(r.external.status ? { status: r.external.status } : {}),
+          },
+        }
+      : {}),
     ...(r.categories?.length
       ? {
-          // Bounded in count as well as in length: the list is model-written, so nothing upstream
-          // limits how many labels come back.
+          // NOTE: Bounded in count as well as in length: the list is model-written, so nothing
+          // upstream limits how many labels come back.
           categories: r.categories
             .slice(0, CATEGORIES_MAX)
             .map((c) => scrubbedClip(c, CATEGORY_MAX)),
@@ -104,6 +127,17 @@ export function traceGuardrail(r: GuardrailReport): TraceGuardrail {
       : {}),
     ...(r.rationale
       ? { rationale: scrubbedClip(r.rationale, OUTPUT_MAX) }
+      : {}),
+    // Numbers and the screening's own question keys (./guardrails/classify), not model text: copied
+    // as they are, bounded in count like the categories.
+    ...(r.scores?.length
+      ? {
+          scores: r.scores.slice(0, CATEGORIES_MAX).map((s) => ({
+            category: scrubbedClip(s.category, CATEGORY_MAX),
+            probability: s.probability,
+            threshold: s.threshold,
+          })),
+        }
       : {}),
   };
 }
@@ -121,7 +155,7 @@ const OUTPUT_MAX = 2000;
 const CATEGORIES_MAX = 12;
 const CATEGORY_MAX = 80;
 
-function msgType(m: BaseMessage): string {
+export function msgType(m: BaseMessage): string {
   const anyM = m as unknown as {
     getType?: () => string;
     _getType?: () => string;
@@ -175,10 +209,10 @@ export function buildPlaygroundTrace(
   messages: BaseMessage[],
   labels: TraceLabelOpts = {},
 ): TraceEntry[] {
-  // The checkpointer accumulates the whole thread; restrict to THIS turn — everything after the
-  // last turn-opening message. A normal turn opens with the human message we just sent; a follow-up
-  // turn opens with the injected nudge SystemMessage. Either way it is the latest human/system
-  // message. Then drop the trailing reply (surfaced separately).
+  // The checkpointer accumulates the whole thread; restrict to THIS turn, everything after
+  // the last turn-opening message. A normal turn opens with the human message we just sent; a
+  // follow-up turn opens with the injected nudge SystemMessage. Either way it is the latest
+  // human/system message. Then drop the trailing reply (surfaced separately).
   let start = 0;
   for (let i = messages.length - 1; i >= 0; i--) {
     const ty = msgType(messages[i] as BaseMessage);
@@ -229,11 +263,13 @@ export function buildPlaygroundTrace(
       const mocked = !!(name && labels.mockedNames?.has(name));
       // A mock takes precedence over the simulated label (the operator's mock overrode the no-op).
       const simulated = !mocked && !!(name && labels.simulatedNames?.has(name));
+      const text = contentToText(tm.content);
       entries.push({
         type: "tool_result",
         id: tm.tool_call_id ?? null,
         name,
-        output: scrubbedClip(contentToText(tm.content), OUTPUT_MAX),
+        output: scrubbedClip(text, OUTPUT_MAX),
+        size: measureText(text),
         isError: tm.status === "error",
         ...(sources ? { sources } : {}),
         ...(mocked ? { mocked: true } : {}),

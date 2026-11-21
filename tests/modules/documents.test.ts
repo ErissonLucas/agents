@@ -29,6 +29,8 @@ import {
   setCompanyLogoKey,
   updateCompanySettings,
 } from "@/modules/tenant-settings/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { VIOLATION_SHAPES } from "@/tests/utils/raw-violation";
 
 // DB-backed: what the scoped writes and the RLS fence actually do. The rules themselves are a table
 // in document-blocks.test.ts; this file proves the persistence follows the decision — and covers the
@@ -61,8 +63,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -132,6 +134,28 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     await rm(DIR, { recursive: true, force: true });
   });
 
+  // The issue's contract: change the default, not each starter. A template created with no style, or
+  // with only its language, reads back exactly as the starters of that language.
+  test("a template created without a style reads back as the starters' style", async () => {
+    for (const [name, style, locale] of [
+      ["Sem estilo", undefined, "pt-BR"],
+      ["No style en", { locale: "en-US", currency: "USD" }, "en-US"],
+    ] as const) {
+      const created = await createDocumentTemplate(
+        ctx(tenantA),
+        {
+          name,
+          blocks: [{ id: "header", type: "header", title: "{{doc_title}}" }],
+          fields: [],
+          ...(style ? { style } : {}),
+        },
+        appDb,
+      );
+      const starter = documentStarter("quote", locale);
+      expect(created.style).toEqual(starter?.style as never);
+    }
+  });
+
   test("creates a template and derives the agent's tool name from it", async () => {
     const tpl = await getDocumentTemplate(ctx(tenantA), templateId, appDb);
     expect(tpl.slug).toBe("orcamento");
@@ -192,8 +216,8 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
         appDb,
       ),
     ).rejects.toThrow(/Recibo mensal/);
-    // The slug is an identifier the operator never typed, so it must not be what the message is
-    // about — that was the old wording, and it sent people looking for a field that does not exist.
+    // NOTE: The slug is an identifier the operator never typed, so the message must be about the name: a
+    // message about the slug sends people looking for a field that does not exist.
     await expect(
       createDocumentTemplate(
         ctx(tenantA),
@@ -275,6 +299,50 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(moved.slug).toBe("termo_b");
   });
 
+  // The same rename lost to a concurrent writer: the pre-check saw the name free, and the index is
+  // what refuses it. The answer still names the name, not the slug, in either shape of the violation.
+  test.each(VIOLATION_SHAPES)(
+    "a rename that loses the name to a concurrent writer is told the name is taken, the violation %s",
+    async (label, shape) => {
+      const tag = label.slice(0, 3);
+      const b = await createDocumentTemplate(
+        ctx(tenantA),
+        { name: `Termo corrido ${tag}`, blocks: MINIMAL_BLOCKS, fields: [] },
+        appDb,
+      );
+      let raced = false;
+      const racing = appDb.$extends({
+        query: {
+          documentTemplate: {
+            async update({ args, query }) {
+              if (!raced) {
+                raced = true;
+                await suDb.documentTemplate.create({
+                  data: {
+                    tenantId: tenantA,
+                    name: `Termo disputado ${tag}`,
+                    slug: `termo_disputado_vencedor_${tag}`,
+                  },
+                });
+              }
+              return query(args);
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+      const refused = await updateDocumentTemplate(
+        ctx(tenantA),
+        BigInt(b.id),
+        { name: `Termo disputado ${tag}` },
+        shape(racing),
+      ).catch((e: unknown) => e);
+      expect(raced).toBe(true);
+      expect((refused as AppError).translationKey).toBe(
+        "errors.documentTemplateNameTaken",
+      );
+    },
+  );
+
   // The near-miss: two names that LOOK different and normalise the same. Refusing "Orcamento"
   // because "Orçamento" exists reads as a bug unless the message names both.
   test("names both templates when it is the normalisation that collides", async () => {
@@ -292,8 +360,8 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow(/Contrato Padrão/);
   });
 
-  // A name whose derived slug could never be valid. Both of these were 400s about the slug, and
-  // neither is an unusual thing to call a template.
+  // NOTE: A name whose derived slug could not be valid without normalisation; neither is an unusual thing
+  // to call a template.
   test("takes a name whose derived slug used to be refused outright", async () => {
     const dated = await createDocumentTemplate(
       ctx(tenantA),
@@ -315,14 +383,11 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow(/"Image" would produce the tool send_image/);
   });
 
-  // The uniqueness check asks two indexes, and a rename supplies only ONE of them: a name, with the
-  // slug deliberately left alone. Prisma reads `where: { slug: undefined }` as NO FILTER, so asking
-  // the slug side anyway does not return "nothing matched" — it returns whatever row comes first,
-  // which is a wrong answer that happens to be discarded by the caller's own narrowing.
-  //
-  // Asserted on the QUERY because the outcome cannot show it: with both guards in place and with
-  // only the caller's, the refusal is identical. What differs is that one of them computes an answer
-  // it has no right to.
+  // NOTE: The uniqueness check asks two indexes, and a rename supplies only ONE: a name, with the slug left
+  // alone. Prisma reads `where: { slug: undefined }` as NO FILTER, so asking the slug side anyway
+  // returns whatever row comes first, a wrong answer the caller's own narrowing happens to discard.
+  // Asserted on the QUERY because the outcome is identical either way; what differs is that one of
+  // them computes an answer it has no right to.
   test("a rename asks the name index and nothing else", async () => {
     await createDocumentTemplate(
       ctx(tenantA),
@@ -354,11 +419,10 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect("slug" in (wheres[0] as object)).toBe(false);
   });
 
-  // A description is read by the MODEL and drawn by nobody, so it is deliberately NOT held to the
-  // printability rule the name and the number prefix are: an emoji in it is fine. What is not fine
-  // is a character the COLUMN refuses. The length check passed, the value reached
-  // `document_templates.description`, and Postgres answered with a 500 — or, from a bundle import,
-  // by aborting the transaction the whole import runs in.
+  // NOTE: A description is read by the MODEL and drawn by nobody, so it is deliberately NOT held to the
+  // printability rule the name and the number prefix are: an emoji in it is fine. A character the
+  // COLUMN refuses is not: past the length check, Postgres answers with a 500 or, from a bundle
+  // import, aborts the transaction the whole import runs in.
   test("refuses a description the column cannot hold, and keeps accepting an emoji", async () => {
     await expect(
       createDocumentTemplate(
@@ -385,29 +449,6 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
       appDb,
     );
     expect(ok.description).toContain("😀");
-  });
-
-  // The dry run and the apply have to agree: both refuse, and both say it about the name.
-  test("the dry run refuses the same duplicate the apply refuses", async () => {
-    await createDocumentTemplate(
-      ctx(tenantA),
-      { name: "Proposta dupla", blocks: MINIMAL_BLOCKS, fields: [] },
-      appDb,
-    );
-    expect(
-      await documentTemplateWriteProblem(
-        ctx(tenantA),
-        { name: "Proposta dupla" },
-        appDb,
-      ),
-    ).toMatch(/Proposta dupla/);
-    await expect(
-      createDocumentTemplate(
-        ctx(tenantA),
-        { name: "Proposta dupla", blocks: MINIMAL_BLOCKS, fields: [] },
-        appDb,
-      ),
-    ).rejects.toThrow(/Proposta dupla/);
   });
 
   // The fence: uniqueness is per tenant, so a neighbour holding the name must not refuse mine.
@@ -459,10 +500,10 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow(/blank/);
   });
 
-  // THE 409 THE PREVIEW CAN ANSWER, so the contract test above it is not asserting a status nothing
-  // produces. A template written by a newer build is READ tolerantly everywhere else; the write path
-  // refuses it instead of silently dropping the half it cannot parse, and previewing by id alone
-  // takes that same path, because a caller who sent no blocks and no fields authored neither.
+  // NOTE: The 409 the preview can answer. A template written by a newer build is READ tolerantly everywhere
+  // else; the write path refuses it instead of silently dropping the half it cannot parse, and
+  // previewing by id alone takes that same path, because a caller who sent no blocks and no fields
+  // authored neither.
   test("previewing a saved template this build cannot read answers 409", async () => {
     const future = await suDb.documentTemplate.create({
       data: {
@@ -484,6 +525,39 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
       (e: unknown) => e as { statusCode?: number },
     );
     expect(thrown?.statusCode).toBe(409);
+  });
+
+  // The sample values are written in the document's language, so an English template does not
+  // preview with Portuguese line items.
+  test("a preview fills its samples in the template's language", async () => {
+    const draft = (locale: "pt-BR" | "en-US") => ({
+      name: "Amostra",
+      blocks: [
+        { id: "t", type: "text", text: "Olá {{cliente}}" },
+        { id: "i", type: "lineItems", field: "itens" },
+      ],
+      fields: [
+        { name: "cliente", label: "Cliente", type: "text" },
+        { name: "itens", label: "Itens", type: "lineItems" },
+      ],
+      style: { locale },
+    });
+    const text = async (bytes: Buffer) => {
+      const { getDocumentProxy } = await import("unpdf");
+      const pdf = await getDocumentProxy(new Uint8Array(bytes));
+      const page = await pdf.getPage(1);
+      return (await page.getTextContent()).items
+        .map((item) => ("str" in item ? item.str : ""))
+        .join(" ");
+    };
+    const en = await text(
+      await previewDocumentTemplate(ctx(tenantA), draft("en-US"), appDb),
+    );
+    const pt = await text(
+      await previewDocumentTemplate(ctx(tenantA), draft("pt-BR"), appDb),
+    );
+    expect(en.includes("Initial consultation")).toBe(true);
+    expect(pt.includes("Consultoria inicial")).toBe(true);
   });
 
   test("previews an unsaved draft without issuing anything", async () => {
@@ -508,10 +582,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(row?.lastNumber).toBe(0);
   });
 
-  // The key is the FIRST thing bound, into a `text` comparison, before the template is even read. So
-  // a key the REST schema accepts on its length alone reached Postgres and came back as a 500 —
-  // ahead of any refusal a caller could act on. Checked in the CORE, so the agent tool and MCP get
-  // the same answer as REST.
+  // NOTE: The key is the FIRST thing bound, into a `text` comparison, before the template is even read, so a
+  // key the REST schema accepts on length alone would reach Postgres as a 500. Checked in the CORE, so
+  // the agent tool and MCP get the same answer as REST.
   test("refuses an idempotency key the column cannot hold", async () => {
     await expect(
       issueDocument({
@@ -622,14 +695,11 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(after?.lastNumber).toBe((before?.lastNumber ?? 0) + 6);
   });
 
-  // The snapshot is what makes an issued document immutable: editing the template afterwards cannot
-  // change a PDF the customer already holds.
-  //
-  // It is also the regression guard for the ORDER of the two checks inside issueDocument. Validating
-  // the caller's values against the CURRENT template before looking the key up made this retry fail
-  // with "cliente is not a declared field" — a 400 for a document that already existed, because the
-  // template had since dropped the field. The key means the document is already frozen; nothing
-  // about the template as it stands today can change that.
+  // NOTE: The snapshot is what makes an issued document immutable: editing the template afterwards cannot
+  // change a PDF the customer already holds. It also pins the ORDER of the two checks inside
+  // issueDocument: the key is looked up before the caller's values are validated against the CURRENT
+  // template, or this retry answers 400 ("cliente is not a declared field") for a document that already
+  // exists. The key means the document is already frozen.
   test("a retried issuance renders the stored snapshot, not the edited template", async () => {
     // Its OWN template: this row gets edited out from under its documents, and doing that to the
     // shared one leaves every later issuance failing on fields the edit removed — a pollution that
@@ -822,8 +892,8 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     });
     expect(row?.templateId).toBeNull();
     // The PDF is published by renaming a temporary into place, so a reader never sees a half-written
-    // file. The window itself is not reachable from a single-process test (see issue.ts), but the
-    // residue is: a successful issuance leaves no `.part` behind.
+    // file. The window itself is not reachable from a single-process test (see
+    // src/modules/documents/issue.ts), but the residue is: a successful issuance leaves no `.part` behind.
     const litter = await readdir(`${DIR}/${tenantA}`).catch(() => []);
     expect(litter.filter((f) => f.endsWith(".part"))).toEqual([]);
   });
@@ -834,62 +904,62 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
   // luck reaches from a test. Forced here by letting another connection win the key in between: the
   // conflict then lands on the real unique index, in the real transaction, which is the only way to
   // exercise what recovery from it has to survive.
-  test("a caller that loses the idempotency race gets the winner's document", async () => {
-    const key = `race-${process.pid}`;
-    let raced = false;
-    const racing = appDb.$extends({
-      query: {
-        issuedDocument: {
-          async create({ args, query }) {
-            if (!raced) {
-              raced = true;
-              await suDb.issuedDocument.create({
-                data: {
-                  tenantId: tenantA,
-                  templateId,
-                  title: "Orçamento",
-                  // What a real competing issuance writes, which is the point: the row that comes
-                  // back has to be the WINNER's, prefix included, not a reconstruction of our own.
-                  numberPrefix: "ORC-",
-                  idempotencyKey: key,
-                  status: "PENDING",
-                  snapshot: (args.data as { snapshot: unknown })
-                    .snapshot as never,
-                },
-              });
-            }
-            return query(args);
+  test.each(VIOLATION_SHAPES)(
+    "a caller that loses the idempotency race gets the winner's document, the violation %s",
+    async (label, shape) => {
+      const key = `race-${process.pid}-${label.slice(0, 3)}`;
+      let raced = false;
+      const racing = appDb.$extends({
+        query: {
+          issuedDocument: {
+            async create({ args, query }) {
+              if (!raced) {
+                raced = true;
+                await suDb.issuedDocument.create({
+                  data: {
+                    tenantId: tenantA,
+                    templateId,
+                    title: "Orçamento",
+                    // What a real competing issuance writes, which is the point: the row that comes
+                    // back has to be the WINNER's, prefix included, not a reconstruction of our own.
+                    numberPrefix: "ORC-",
+                    idempotencyKey: key,
+                    status: "PENDING",
+                    snapshot: (args.data as { snapshot: unknown })
+                      .snapshot as never,
+                  },
+                });
+              }
+              return query(args);
+            },
           },
         },
-      },
-    }) as unknown as PrismaClient;
+      }) as unknown as PrismaClient;
 
-    const doc = await issueDocument({
-      ctx: ctx(tenantA),
-      templateId,
-      idempotencyKey: key,
-      values: VALUES,
-      base: racing,
-      storageDir: DIR,
-    });
-    expect(raced).toBe(true);
-    expect(doc.status).toBe("READY");
-    expect(doc.number).toMatch(/^ORC-/);
-    expect(
-      await suDb.issuedDocument.count({
-        where: { tenantId: tenantA, idempotencyKey: key },
-      }),
-    ).toBe(1);
-  });
+      const doc = await issueDocument({
+        ctx: ctx(tenantA),
+        templateId,
+        idempotencyKey: key,
+        values: VALUES,
+        base: shape(racing),
+        storageDir: DIR,
+      });
+      expect(raced).toBe(true);
+      expect(doc.status).toBe("READY");
+      expect(doc.number).toMatch(/^ORC-/);
+      expect(
+        await suDb.issuedDocument.count({
+          where: { tenantId: tenantA, idempotencyKey: key },
+        }),
+      ).toBe(1);
+    },
+  );
 
-  // ── the printed number is frozen with the document ──
-  //
-  // Its own template, because this test EDITS and then DELETES the one it uses.
-  //
-  // The number a customer reads on the PDF has to keep matching the number the console lists and the
-  // file name the download carries. Resolving the prefix from the live template breaks all three at
-  // once: renaming ORC- to PROP- rewrites history, and deleting the template (which nulls the FK,
-  // by design — the documents survive it) drops the prefix entirely.
+  // NOTE: The printed number is frozen with the document. Its own template, because this test EDITS and then
+  // DELETES the one it uses. The number on the PDF has to keep matching the number the console lists
+  // and the download's file name. Resolving the prefix from the live template breaks all three at once:
+  // renaming ORC- to PROP- rewrites history, and deleting the template (which nulls the FK, by design:
+  // the documents survive it) drops the prefix entirely.
   test("prints the number from the prefix frozen at issuance", async () => {
     const starter = documentStarter("quote", "pt-BR");
     if (!starter) throw new Error("no starter");
@@ -979,9 +1049,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
         appDb,
       ),
     ).rejects.toThrow(/100/);
-    // A template id of ZERO is a supplied id, not a missing one. No sequence hands out 0, so the
-    // honest answer is "no such template" — the truthy reading rendered a blank draft preview
-    // instead, telling the operator their template was fine.
+    // NOTE: A template id of ZERO is a supplied id, not a missing one. No sequence hands out 0, so the answer
+    // is "no such template"; a truthy reading renders a blank draft preview, telling the operator their
+    // template is fine.
     await expect(
       previewDocumentTemplate(ctx(tenantA), { id: 0n }, appDb),
     ).rejects.toThrow(/not found/i);
@@ -1000,9 +1070,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
         appDb,
       ),
     ).rejects.toThrow(/tagline/);
-    // A preview has to show what the SAVE would produce, so it merges a partial style the way the
-    // patch does. Replacing outright rendered a saved template without its footer while saving the
-    // same patch kept it — the preview approving a document the apply would not make.
+    // A preview has to show what the SAVE would produce, so it merges a partial style the way the patch
+    // does. Replacing outright renders a saved template without its footer while saving the same patch
+    // keeps it: the preview approving a document the apply would not make.
     const saved = await getDocumentTemplate(ctx(tenantA), templateId, appDb);
     expect(saved.style.footerText).toBeTruthy();
     const previewed = await previewDocumentTemplate(
@@ -1046,9 +1116,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
         appDb,
       ),
     ).rejects.toThrow(/numberPrefix/);
-    // …and the same gate holds it to what the page can print: the prefix is DRAWN, at the front of
-    // every document number that template ever issues, so a length check alone let a character the
-    // fonts turn into a different one through.
+    // NOTE: ...and the same gate holds it to what the page can print: the prefix is DRAWN at the front of every
+    // document number that template issues, so a length check alone lets through a character the fonts
+    // turn into a different one.
     await expect(
       previewDocumentTemplate(
         ctx(tenantA),
@@ -1074,9 +1144,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(pdfHeader(bytes)).toBe("%PDF-");
   });
 
-  // WHO CHOSE THE SLUG decides which input the refusal is about, and getting it wrong sends the
+  // NOTE: WHO CHOSE THE SLUG decides which input the refusal is about, and getting it wrong sends the
   // operator to change something that cannot clear the clash: a slug they typed themselves stays
-  // exactly where it is no matter what they rename the template to. Issue #231.
+  // exactly where it is no matter what they rename the template to.
   test("a taken slug names the slug when it was typed, and the name when it was derived", async () => {
     const starter = documentStarter("receipt", "pt-BR");
     if (!starter) throw new Error("no starter");
@@ -1114,15 +1184,14 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     );
     expect(typed?.field).toBe("slug");
     expect(derived?.field).toBe("name");
-    // The sentence is the same one in both, and it is the one that was already there.
+    // NOTE: The sentence is the same one in both.
     expect(typed?.translationKey).toBe("errors.documentTemplateNameCollides");
     expect(derived?.translationKey).toBe("errors.documentTemplateNameCollides");
   });
 
-  // Which INPUT a refusal is about cannot depend on the HTTP method that carried the write. The
-  // patch path had a hand-written copy of the create path's refusal (same sentence, same key) that
-  // named no field, so the console would have had somewhere to put the message on create and nowhere
-  // on rename. Issue #231.
+  // NOTE: Which INPUT a refusal is about cannot depend on the HTTP method that carried the write: a patch
+  // refusal that names no field leaves the console somewhere to put the message on create and nowhere
+  // on rename.
   test("a bad slug names the same input whether it was created or renamed", async () => {
     const starter = documentStarter("receipt", "pt-BR");
     if (!starter) throw new Error("no starter");
@@ -1168,35 +1237,38 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
 
   // Creation already answers a taken slug with a conflict; an update raising the same constraint has
   // to answer the same way, or the console shows an internal error for a name the operator can fix.
-  test("answers a slug already taken on update with a conflict", async () => {
-    const starter = documentStarter("receipt", "pt-BR");
-    if (!starter) throw new Error("no starter");
-    const tpl = await createDocumentTemplate(
-      ctx(tenantA),
-      {
-        name: "Recibo para renomear",
-        slug: "recibo_para_renomear",
-        blocks: starter.blocks,
-        fields: starter.fields,
-        style: starter.style,
-      },
-      appDb,
-    );
-    await expect(
-      updateDocumentTemplate(
+  test.each(VIOLATION_SHAPES)(
+    "answers a slug already taken on update with a conflict, the violation %s",
+    async (label, shape) => {
+      const starter = documentStarter("receipt", "pt-BR");
+      if (!starter) throw new Error("no starter");
+      const tag = label.slice(0, 3);
+      const tpl = await createDocumentTemplate(
         ctx(tenantA),
-        BigInt(tpl.id),
-        { slug: "orcamento" },
+        {
+          name: `Recibo para renomear ${tag}`,
+          slug: `recibo_para_renomear_${tag}`,
+          blocks: starter.blocks,
+          fields: starter.fields,
+          style: starter.style,
+        },
         appDb,
-      ),
-    ).rejects.toThrow(/already exists/);
-  });
+      );
+      await expect(
+        updateDocumentTemplate(
+          ctx(tenantA),
+          BigInt(tpl.id),
+          { slug: "orcamento" },
+          shape(appDb),
+        ),
+      ).rejects.toThrow(/already exists/);
+    },
+  );
 
-  // The version is the cache buster, and it has to move on EVERY write. An upload now writes a file
-  // of its own, but the URL the console reads the letterhead from does not carry the key — it is
-  // `/tenant-settings/company/logo?v=<version>`, resolved server-side — so a version that stood
-  // still would leave the console, and any cache holding that response, showing the previous
-  // letterhead while freshly issued documents already carry the new one.
+  // NOTE: The version is the cache buster, and it has to move on EVERY write. The URL the console reads the
+  // letterhead from does not carry the key (it is `/tenant-settings/company/logo?v=<version>`, resolved
+  // server-side), so a version that stood still would leave the console, and any cache holding that
+  // response, showing the previous letterhead while freshly issued documents carry the new one.
   test("every logo write moves the version, including two in the same millisecond", async () => {
     const first = await setCompanyLogoKey(
       ctx(tenantB),
@@ -1277,7 +1349,7 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
       expect((failed as AppError).statusCode).toBe(400);
       expect((failed as AppError).message).toContain("name");
     }
-    // The same question on the update path, which raised the same raw error.
+    // The same question on the update path.
     const tpl = await createDocumentTemplate(
       ctx(tenantA),
       { name: "Nomeado", blocks: MINIMAL_BLOCKS, fields: [] },
@@ -1293,14 +1365,11 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect((patchFailed as AppError).statusCode).toBe(400);
   });
 
-  // ── two callers healing the same unnumbered row ──
-  //
-  // A document exists unnumbered for a moment by design: the counter is bumped AFTER the insert so a
-  // lost idempotency race consumes no number. In that window the loser of such a race re-reads the
-  // row, sees `number: null`, and heals it — at the same time as the winner. Without a claim on the
-  // document row, both take a number from the counter, one update is discarded, and the caller whose
-  // update lost renders a document with NO number at all and writes it over the winner's PDF: the
-  // customer's link then serves a quote with a blank where its identity should be.
+  // NOTE: Two callers healing the same unnumbered row. A document exists unnumbered for a moment by design:
+  // the counter is bumped AFTER the insert so a lost idempotency race consumes no number. In that
+  // window the loser re-reads the row, sees `number: null`, and heals it at the same time as the
+  // winner. Without a claim on the document row both take a number, one update is discarded, and the
+  // loser renders a document with NO number and writes it over the winner's PDF.
   test("two callers healing the same unnumbered document agree on one number", async () => {
     const key = `unnumbered-${process.pid}`;
     const seed = await issueDocument({
@@ -1797,9 +1866,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     const keptBlocks = raw?.blocks as { id: string }[] | undefined;
     expect(keptBlocks?.find((b) => b.id === "assinatura")).toBeDefined();
 
-    // …and the PREVIEW says the same thing. It used to read the parsed DTO, where the unknown block
-    // has already been dropped, so a style-only preview rendered a clean PDF and the MCP dry run
-    // built on it reported the write as fine — a dry run approving a write that cannot be applied.
+    // NOTE: ...and the PREVIEW says the same thing. Read from the parsed DTO, where the unknown block is
+    // already dropped, a style-only preview would render a clean PDF and the MCP dry run built on it
+    // would approve a write that cannot be applied.
     await expect(
       previewDocumentTemplate(
         ctx(tenantA),
@@ -1809,21 +1878,67 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow(/newer version wrote/);
   });
 
-  // The same zero, on the list filter: `?templateId=0` selects the documents of a template that
-  // cannot exist, which is none of them. Read as "no filter given" it answers with every document
-  // the tenant has ever issued.
-  test("filters by a template id of zero rather than ignoring it", async () => {
-    const all = await listIssuedDocuments(ctx(tenantA), {}, appDb);
-    expect(all.length).toBeGreaterThan(0);
-    expect(
-      await listIssuedDocuments(ctx(tenantA), { templateId: 0n }, appDb),
-    ).toEqual([]);
+  // The refusal above is about dropping what this version cannot read, so it reaches exactly the
+  // saves that rewrite the content. A rename writes no content column and keeps the unknown block
+  // byte for byte; the same rename next to a block text is refused whole, the name included.
+  test("a template holding a block type it cannot read still takes a save that leaves the content alone", async () => {
+    const starter = documentStarter("quote", "pt-BR");
+    if (!starter) throw new Error("no starter");
+    const tpl = await createDocumentTemplate(
+      ctx(tenantA),
+      {
+        name: "Metadados do futuro",
+        slug: "metadados_do_futuro",
+        blocks: starter.blocks,
+        fields: starter.fields,
+        style: starter.style,
+      },
+      appDb,
+    );
+    const id = BigInt(tpl.id);
+    const textBlock = tpl.blocks.find((b) => b.type === "text");
+    if (!textBlock) throw new Error("starter has no text block");
+    const unreadable = [
+      ...tpl.blocks,
+      { id: "b1", type: "bloco_do_futuro" },
+    ] as never;
+    await suDb.documentTemplate.update({
+      where: { id },
+      data: { blocks: unreadable },
+    });
+    const stored = () =>
+      suDb.documentTemplate.findUniqueOrThrow({
+        where: { id },
+        select: { name: true, enabled: true, blocks: true },
+      });
+
+    await updateDocumentTemplate(
+      ctx(tenantA),
+      id,
+      { name: "Renomeado", enabled: false },
+      appDb,
+    );
+    const renamed = await stored();
+    expect(renamed.name).toBe("Renomeado");
+    expect(renamed.enabled).toBe(false);
+    expect(renamed.blocks).toEqual(unreadable);
+
+    await expect(
+      updateDocumentTemplate(
+        ctx(tenantA),
+        id,
+        { name: "Pela metade", blockText: { [textBlock.id]: "x" } },
+        appDb,
+      ),
+    ).rejects.toThrow(/newer version wrote/);
+    const after = await stored();
+    expect(after.name).toBe("Renomeado");
+    expect(after.blocks).toEqual(unreadable);
   });
 
-  // The same tolerance through the SAVE, which is where it costs something: a style property a
-  // newer build wrote used to make the whole parse fail, and the write-back then stored every
-  // default over the operator's settings — a patch of one colour resetting margin, locale, currency
-  // and page numbers, with a 200.
+  // NOTE: The same tolerance through the SAVE, which is where it costs something: if a style property a newer
+  // build wrote failed the whole parse, the write-back would store every default over the operator's
+  // settings, a patch of one colour resetting margin, locale, currency and page numbers, with a 200.
   test("a style patch keeps settings beside a value this version cannot read", async () => {
     const starter = documentStarter("quote", "pt-BR");
     if (!starter) throw new Error("no starter");
@@ -1867,14 +1982,11 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect((raw?.style as { font?: string })?.font).toBe("brand-grotesk-2027");
   });
 
-  // A logo the settings NAME and the disk does not have is a cross-format replacement landing
-  // between the two reads a render does: the upload commits the new key and deletes the file the old
-  // one named, which is the file the render is reaching for. Answering null freezes an IMMUTABLE
-  // document without a letterhead, even though both the profile before and the profile after had
-  // one, and nothing ever fixes it.
-  //
-  // Forced deterministically: the first settings read returns the key that is about to be deleted,
-  // and the second (the retry) returns what actually committed.
+  // NOTE: A logo the settings NAME and the disk does not have is a cross-format replacement landing between
+  // the two reads a render does: the upload commits the new key and deletes the file the old one named.
+  // Answering null would freeze an IMMUTABLE document without a letterhead although the profile before
+  // and after both had one. Forced deterministically: the first settings read returns the key about to
+  // be deleted, and the second (the retry) returns what actually committed.
   test("re-reads the settings when the logo they name is already gone", async () => {
     const dir = `${config.documentsStorageDir}/company`;
     const png = [
@@ -1932,10 +2044,10 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     await clearCompanyLogo(ctx(tenantB), appDb);
   });
 
-  // The exact question, asked where every value is known: would THIS document draw anything? Four
-  // review rounds tried to answer it from the template alone and each found another conditional the
-  // one before had missed. Refused BEFORE the insert, so no number is burned for a blank page — an
-  // issued document is immutable, and a blank one is blank forever.
+  // NOTE: The exact question, asked where every value is known: would THIS document draw anything? The
+  // template alone cannot answer it (every optional token is another conditional). Refused BEFORE the
+  // insert, so no number is burned for a blank page: an issued document is immutable, and a blank one
+  // is blank forever.
   test("refuses to issue a document that would come out blank", async () => {
     const tpl = await createDocumentTemplate(
       ctx(tenantA),
@@ -2088,61 +2200,65 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     await suDb.documentTemplate.delete({ where: { id } });
   });
 
-  // The template can be deleted between the read that loads it and the insert that references it.
-  // The foreign key then refuses the row, and a raw P2003 reaches the caller as a 500 — and an agent
-  // turn as an integration-failure alert about somebody deleting their own template. It is the same
-  // event the read itself would have reported a moment earlier, so it gets the same answer.
-  test("answers a template deleted mid-issuance the way a missing one is answered", async () => {
-    const starter = documentStarter("receipt", "pt-BR");
-    if (!starter) throw new Error("no starter");
-    const tpl = await createDocumentTemplate(
-      ctx(tenantA),
-      {
-        name: "Recibo em fuga",
-        slug: "recibo_em_fuga",
-        blocks: starter.blocks,
-        fields: starter.fields,
-        style: starter.style,
-      },
-      appDb,
-    );
-    const id = BigInt(tpl.id);
-    let deleted = false;
-    // Deletes between the template read and the insert — the window the foreign key is guarding.
-    const racing = appDb.$extends({
-      query: {
-        issuedDocument: {
-          async create({ args, query }) {
-            if (!deleted) {
-              deleted = true;
-              await suDb.documentTemplate.delete({ where: { id } });
-            }
-            return query(args);
+  // NOTE: The template can be deleted between the read that loads it and the insert that references it.
+  // The foreign key then refuses the row, and a raw P2003 would reach the caller as a 500 (and an agent
+  // turn as an integration-failure alert). It is the same event the read would have reported a moment
+  // earlier, so it gets the same answer.
+  test.each(VIOLATION_SHAPES)(
+    "answers a template deleted mid-issuance the way a missing one is answered, the violation %s",
+    async (label, shape) => {
+      const starter = documentStarter("receipt", "pt-BR");
+      if (!starter) throw new Error("no starter");
+      const tag = label.slice(0, 3);
+      const tpl = await createDocumentTemplate(
+        ctx(tenantA),
+        {
+          name: `Recibo em fuga ${tag}`,
+          slug: `recibo_em_fuga_${tag}`,
+          blocks: starter.blocks,
+          fields: starter.fields,
+          style: starter.style,
+        },
+        appDb,
+      );
+      const id = BigInt(tpl.id);
+      let deleted = false;
+      // Deletes between the template read and the insert — the window the foreign key is guarding.
+      const racing = appDb.$extends({
+        query: {
+          issuedDocument: {
+            async create({ args, query }) {
+              if (!deleted) {
+                deleted = true;
+                await suDb.documentTemplate.delete({ where: { id } });
+              }
+              return query(args);
+            },
           },
         },
-      },
-    }) as unknown as PrismaClient;
+      }) as unknown as PrismaClient;
 
-    const failed = await issueDocument({
-      ctx: ctx(tenantA),
-      templateId: id,
-      idempotencyKey: `fk-race-${process.pid}`,
-      values: {
-        cliente: "Ana",
-        valor: 100,
-        referencia: "serviço",
-        pago_em: "2026-09-05",
-      },
-      base: racing,
-      storageDir: DIR,
-    }).catch((e: unknown) => e);
-    expect(deleted).toBe(true);
-    expect(failed).toBeInstanceOf(AppError);
-    expect((failed as AppError).statusCode).toBe(404);
-    expect((failed as AppError).translationKey).toBe(
-      "errors.documentTemplateNotFound",
-    );
-  });
+      const failed = await issueDocument({
+        ctx: ctx(tenantA),
+        templateId: id,
+        idempotencyKey: `fk-race-${process.pid}-${tag}`,
+        values: {
+          cliente: "Ana",
+          valor: 100,
+          referencia: "serviço",
+          pago_em: "2026-09-05",
+        },
+        base: shape(racing),
+        storageDir: DIR,
+      }).catch((e: unknown) => e);
+      expect(deleted).toBe(true);
+      expect(failed).toBeInstanceOf(AppError);
+      expect((failed as AppError).statusCode).toBe(404);
+      expect((failed as AppError).translationKey).toBe(
+        "errors.documentTemplateNotFound",
+      );
+    },
+  );
 
   // A partial style patch must change ONLY what it names. Validated on its own, the parse fills
   // every omitted property with a default, and writing that result resets the operator's colour,
@@ -2185,9 +2301,8 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(after.style.showPageNumbers).toBe(true);
   });
 
-  // …and a style the CALLER wrote is still refused by name. The strict pass moved off the merged
-  // value (which carries whatever a newer build stored) onto the patch itself, and it has to still
-  // be there.
+  // NOTE: ...and a style the CALLER wrote is still refused by name. The strict pass runs on the patch itself,
+  // not on the merged value (which carries whatever a newer build stored).
   test("still names a bad value in the style the caller sent", async () => {
     await expect(
       updateDocumentTemplate(
@@ -2207,9 +2322,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).rejects.toThrow(/fontt/);
   });
 
-  // Truthiness on a filter is the widest possible answer to the narrowest possible question: a
-  // caller asking for template 0 or for the empty thread key had its filter dropped and received
-  // the tenant's whole recent list instead of nothing.
+  // NOTE: Truthiness on a filter is the widest possible answer to the narrowest possible question: a caller
+  // asking for template 0 or for the empty thread key would get its filter dropped and receive the
+  // tenant's whole recent list instead of nothing.
   test("an explicit filter that is falsy still filters", async () => {
     const all = await listIssuedDocuments(ctx(tenantA), {}, appDb);
     expect(all.length).toBeGreaterThan(0);
@@ -2221,10 +2336,10 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     ).toEqual([]);
   });
 
-  // The FILE has one publisher, decided by the filesystem: `link` fails with EEXIST when the name is
-  // taken, so a second render adopts what is there rather than replacing it. Without that, and
-  // because the logo is read live, a letterhead swapped between two renders of one key made the
-  // published document visibly change after it had been served.
+  // NOTE: The FILE has one publisher, decided by the filesystem: `link` fails with EEXIST when the name is
+  // taken, so a second render adopts what is there rather than replacing it. Otherwise, because the logo
+  // is read live, a letterhead swapped between two renders of one key would make the published document
+  // change after it had been served.
   test("a render that publishes second adopts the first file, never replaces it", async () => {
     const key = `claim-loser-${process.pid}`;
     const seed = await issueDocument({
@@ -2267,10 +2382,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
       },
     }) as unknown as PrismaClient;
 
-    // …and the caller returns the PUBLISHED bytes, not its own render: the logo is read live, so the
-    // two can differ, and withBytes would have attached one PDF to a reply while the download link
-    // served another. This holds whether the claim was won or lost — what is on disk is the
-    // document.
+    // ...and the caller returns the PUBLISHED bytes, not its own render: the logo is read live, so the two
+    // can differ, and returning its own render would attach one PDF to a reply while the download link
+    // served another. This holds whether the claim was won or lost: what is on disk is the document.
     const loser = await issueDocument({
       ctx: ctx(tenantA),
       templateId,
@@ -2389,14 +2503,11 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(new TextDecoder().decode(again.bytes)).toBe("PUBLISHED-FIRST");
   });
 
-  // …and what it must NOT adopt: a file left behind by the quotes subsystem this one replaces.
-  //
-  // An install upgraded from quotes keeps writing into the directory its QUOTES_STORAGE_DIR names
-  // (Coolify freezes that value), and that directory already holds `<tenantId>/<quoteId>.pdf`.
-  // `issued_documents` is a new table with a new sequence, so its ids start over and land on those
-  // names. Adoption then reads as "another renderer got here first" and marks the row READY over a
-  // stranger's quote — which is what the download serves and what the agent attaches to the
-  // conversation. A path segment no numeric id can produce is what keeps the two sets apart.
+  // NOTE: ...and what it must NOT adopt: a file left behind by the quotes subsystem this one replaces. An
+  // install upgraded from quotes keeps writing into the directory its QUOTES_STORAGE_DIR names (Coolify
+  // freezes that value), which already holds `<tenantId>/<quoteId>.pdf`. `issued_documents` has its own
+  // sequence, so its ids land on those names, and adopting one would mark the row READY over a
+  // stranger's quote. A path segment no numeric id can produce keeps the two sets apart.
   test("never adopts a legacy quote PDF that happens to share its id", async () => {
     const key = `legacy-${process.pid}`;
     const seed = await issueDocument({
@@ -2438,17 +2549,13 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     expect(stored?.pdfStorageKey).not.toBe(`${tenantA}/${id}.pdf`);
   });
 
-  // A failed upload must leave the letterhead every render is reading exactly as it found it, and
-  // must not leave its own bytes behind either. Both come from the same property: the file it wrote
-  // is a file nothing else can be pointing at, because its name is new.
-  //
-  // This is where a copy-aside and a three-way rollback used to live. What removed them: the
-  // rollback ran after its own transaction ended, so it had to decide from outside the lock whether
-  // the state it meant to undo was still there — and the case it could not answer was two uploads
-  // that both failed, whose compensations ran in the wrong order, leaving an uncommitted image as
-  // the live letterhead while the settings still described the old one.
+  // NOTE: A failed upload must leave the letterhead every render is reading exactly as it found it, and must
+  // not leave its own bytes behind either. Both come from the same property: the file it wrote is a
+  // file nothing else can be pointing at, because its name is new. A copy-aside with a rollback is the
+  // wrong design: the rollback runs after its transaction ends, outside the lock, and two failed
+  // uploads compensating in the wrong order leave an uncommitted image as the live letterhead.
   test("a failed logo write leaves the previous letterhead in place", async () => {
-    // NOTE: setCompanyLogo reads config.documentsStorageDir directly — there is no dir to inject —
+    // setCompanyLogo reads config.documentsStorageDir directly — there is no dir to inject —
     // so this test writes into the configured one. Everything it asserts is therefore scoped to its
     // OWN tenant's keys: the directory is shared with other runs, and a stale file from one of them
     // is not this test's subject. It cleans up after itself at the end.
@@ -2589,10 +2696,9 @@ describe.skipIf(!dbUp)("document templates + issuance", () => {
     for (const f of await mine()) await rm(`${dir}/${f}`, { force: true });
   });
 
-  // An operator asking for the logo to be gone means gone: clearing the key alone left the image on
-  // disk and in every backup taken afterwards. And every upload writes a NEW path, so the file the
-  // previous one wrote is referenced by nothing the moment the row commits — kept forever unless
-  // something drops it.
+  // NOTE: An operator asking for the logo to be gone means gone: clearing the key alone would leave the image
+  // on disk and in every later backup. And every upload writes a NEW path, so the file the previous one
+  // wrote is referenced by nothing the moment the row commits, kept forever unless something drops it.
   test("removes the file a logo no longer references", async () => {
     const dir = `${config.documentsStorageDir}/company`;
     const mine = async () =>

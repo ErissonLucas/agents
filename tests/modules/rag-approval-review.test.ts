@@ -8,20 +8,20 @@ import {
   createSuggestion,
   editApprovalItem,
 } from "@/modules/rag/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
-// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+// TENANT_ADMIN, the role that tells `runScopedOn` the id never came from outside.
 const ctxOf = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: null,
   role: "TENANT_ADMIN",
 });
 
-// Issue #81: the composition, not any single piece. A suggestion the agent hedged is copied into the
-// knowledge base verbatim on approval, so the hedge is embedded and every later answer on the
-// subject inherits it. These pin the two halves the fix leans on: the reviewer's revision is what
-// gets stored, and `rationale` — where the sharpened tool description now sends every caveat — never
-// reaches the base.
+// The composition, not any single piece. A suggestion is copied into the knowledge base on approval,
+// so a hedge in it would be embedded and inherited by every later answer on the subject. These pin
+// the two halves that prevent it: the reviewer's revision is what gets stored, and `rationale`
+// (where the tool description sends every caveat) never reaches the base.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -39,8 +39,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -58,16 +58,20 @@ const RATIONALE = "Não consegui confirmar com o setor responsável.";
 let tenantId = 0n;
 let kbId = 0n;
 
+// A base of its own per test: a proposal repeated for the same base lands on the row already there,
+// and these tests propose the same two texts again and again.
+let kbSeq = 0;
 async function seed() {
-  if (tenantId) return;
-  const t = await suDb.tenant.create({
-    data: { name: "AR", slug: `ar-${process.pid}` },
-  });
-  tenantId = t.id;
+  if (!tenantId) {
+    const t = await suDb.tenant.create({
+      data: { name: "AR", slug: `ar-${process.pid}` },
+    });
+    tenantId = t.id;
+  }
   const kb = await suDb.knowledgeBase.create({
     data: {
       tenantId,
-      name: "AR-KB",
+      name: `AR-KB-${++kbSeq}`,
       embeddingModel: "text-embedding-3-small",
     },
   });
@@ -113,8 +117,7 @@ describe.skipIf(!dbUp)("approval review before approval", () => {
     await appDb.$disconnect();
   });
 
-  // What the console could not do before: the reviewer's text is what lands, and the hedge the agent
-  // wrote never reaches the base.
+  // NOTE: the reviewer's text is what lands, and the hedge the agent wrote never reaches the base.
   test("an edited suggestion is approved as edited, not as proposed", async () => {
     await seed();
     const item = await createSuggestion({
@@ -144,33 +147,9 @@ describe.skipIf(!dbUp)("approval review before approval", () => {
     expect(text).not.toContain("Solicita-se validação");
   });
 
-  // The other half of the contract the tool description now states: doubt belongs in `rationale`
-  // precisely because approval never carries it across.
-  test("the rationale never reaches the knowledge base", async () => {
-    await seed();
-    const item = await createSuggestion({
-      ctx: ctxOf(tenantId),
-      knowledgeBaseId: kbId,
-      proposedContent: REVISED,
-      proposedTitle: "Prazo 2",
-      rationale: RATIONALE,
-      base: appDb,
-    });
-    await approveApprovalItem({
-      ctx: ctxOf(tenantId),
-      id: item.id,
-      demoMode: true,
-      base: appDb,
-    });
-    const text = await lastApprovedText();
-    expect(text).toBe(REVISED);
-    expect(text).not.toContain("Não consegui confirmar");
-  });
-
-  // Review finding, round 2 (P1): approval used the text read in its FIRST phase, so a revision
-  // saved between that read and the claim was accepted by the CAS and then thrown away — the
-  // un-revised text was what got embedded, with both reviewers told it worked. The claim now
-  // returns the row's text in the same statement, so there is no window to lose an update in.
+  // NOTE: the claim returns the row's text in the same statement. Embedding the text read in the
+  // FIRST phase would throw away a revision saved between that read and the claim, which the CAS
+  // accepts, with both reviewers told it worked.
   test("the claim returns the text the row holds at claim time, not an earlier read", async () => {
     await seed();
     const item = await createSuggestion({

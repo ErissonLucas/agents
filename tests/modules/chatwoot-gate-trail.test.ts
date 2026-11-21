@@ -5,18 +5,16 @@ import { encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
 
 // The webhook's own ownership gate, and the line it leaves behind.
 //
-// Every message that arrives on a conversation the bot no longer owns takes this exit, and until
-// issue #271 it produced one process log line that named no reason and nothing the operator's console
-// could show. The customer keeps writing, the bot stays silent, and the trail an investigation reads
-// is empty — which is how the ack escalation was first read as a human takeover.
-//
-// The effect asserted here is the row in `execution_logs`, because that is what the console reads.
+// Every message that arrives on a conversation the bot no longer owns takes this exit: the customer
+// keeps writing and the bot stays silent, so the exit has to leave a reason an investigation can
+// read. The effect asserted here is the row in `execution_logs`, because that is what the console
+// reads (a process log line is not).
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -34,8 +32,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -208,24 +206,19 @@ describe.skipIf(!dbUp)("the webhook gate leaves a trail", () => {
     });
   }
 
-  // Scoped to the conversation asked for, by its INTERNAL id, and polled: the emit is
-  // fire-and-forget, so an unscoped read answers with a neighbour's row and an unpolled one races
-  // the write it is asserting.
-  async function handoffRows(convId: number, waitMs = POLL_DEADLINE_MS) {
+  // Scoped to the conversation asked for, by its INTERNAL id, and read settled: the emit is
+  // fire-and-forget, so an unscoped read answers with a neighbour's row, and a raw read races the
+  // write it is asserting. The settle answers both "it was written" and "nothing was written".
+  async function handoffRows(convId: number) {
     const conv = await suDb.conversation.findFirst({
       where: { tenantId, chatwootConversationId: convId },
       select: { id: true },
     });
     if (!conv) return [];
-    const deadline = Date.now() + waitMs;
-    for (;;) {
-      const rows = await flowLogRows(suDb, {
-        where: { tenantId, stage: "handoff", conversationId: conv.id },
-        orderBy: { id: "asc" },
-      });
-      if (rows.length > 0 || Date.now() > deadline) return rows;
-      await new Promise((r) => setTimeout(r, 50));
-    }
+    return flowLogRows(suDb, {
+      where: { tenantId, stage: "handoff", conversationId: conv.id },
+      orderBy: { id: "asc" },
+    });
   }
 
   test("a human holding the conversation is reported as a takeover", async () => {
@@ -249,13 +242,11 @@ describe.skipIf(!dbUp)("the webhook gate leaves a trail", () => {
     });
   });
 
-  // The line has to name the reading the GATE decided on, and after #295 that is no longer the one
-  // the payload proposed: a payload is a snapshot of an earlier instant and the mirror row is what
-  // this event settled on, so the gate reads the mirror's status. `describeClosedGate` states the
-  // same rule from its own side — the status rides along instead of being re-read, because a second
-  // query would answer about a different moment — and a proposal is a different moment just as
-  // surely. Reported from the payload, a conversation the operator had already resolved was recorded
-  // as `ownership_lost` at `pending`, which sends an investigation after a missing assignee.
+  // The line has to name the reading the GATE decided on, which is the mirror's status, not the
+  // payload's: a payload is a snapshot of an earlier instant. `describeClosedGate` carries the status
+  // along instead of re-reading it, for the same reason. Reported from the payload, a conversation
+  // the operator already resolved would read as `ownership_lost` at `pending`, sending an
+  // investigation after a missing assignee.
   test("the status reported is the one the gate closed on, not the one proposed", async () => {
     const T = Math.floor(Date.now() / 1000);
     // One delivery to put the conversation in the mirror, then the resolve written onto the row with
@@ -271,14 +262,14 @@ describe.skipIf(!dbUp)("the webhook gate leaves a trail", () => {
       where: { tenantId, chatwootConversationId: 9107 },
       data: { status: "resolved", chatwootStatusAt: T + 3600 },
     });
-    // The stranded message, serialized a minute BEFORE that resolve. Behind the status mark on its
-    // own clock, so the reopen exception refuses it and the mirror stays `resolved`.
+    // The stranded message, serialized a minute BEFORE that resolve. Behind the status mark
+    // on its own clock, so the reopen exception refuses it and the mirror stays `resolved`.
     //
     // The spy is taken HERE, around the one delivery whose line this is about, and restored in a
     // `finally`. `logger` is a module singleton shared by every test in the process, so a spy left
-    // standing is seen by the next file's own `spyOn` — measured on CI, where it made a neighbouring
-    // suite read this file's line instead of its own. `mockRestore` also clears `mock.calls` in Bun,
-    // so the lines are copied out first.
+    // standing is seen by the next file's own `spyOn`, and a neighbouring suite would read this
+    // file's line instead of its own. `mockRestore` also clears `mock.calls` in Bun, so the lines are
+    // copied out first.
     const info = spyOn(logger, "info");
     let lines: unknown[][] = [];
     try {
@@ -327,7 +318,7 @@ describe.skipIf(!dbUp)("the webhook gate leaves a trail", () => {
       { assigneeType: "User", status: "open" },
       { event: "message_updated" },
     );
-    expect(await handoffRows(9103, 300)).toEqual([]);
+    expect(await handoffRows(9103)).toEqual([]);
   });
 
   // A switched-off agent was never going to answer, so a gate line there would explain the silence
@@ -339,7 +330,7 @@ describe.skipIf(!dbUp)("the webhook gate leaves a trail", () => {
     });
     try {
       await deliver(9104, { assigneeType: "User", status: "open" });
-      expect(await handoffRows(9104, 300)).toEqual([]);
+      expect(await handoffRows(9104)).toEqual([]);
     } finally {
       await suDb.agent.update({
         where: { id: agentDbId },

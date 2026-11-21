@@ -1,14 +1,28 @@
+import { readdir } from "node:fs/promises";
 import cors from "@elysiajs/cors";
 import { staticPlugin } from "@elysiajs/static";
 import Elysia, { NotFoundError, ValidationError } from "elysia";
 import { helmet } from "elysia-helmet";
 import api from "@/api";
+import { refusedForSession } from "@/api/lib/auth";
 import { cspDirectives } from "@/api/lib/csp";
+import { getLocaleFromHeader, translateWithLocale } from "@/api/lib/i18n";
 import logger from "@/api/lib/logger";
 import { parseOrigins } from "@/api/lib/origin";
 import { refusalBody, refusalHeaders } from "@/api/lib/refusal";
+import { loggedPath, loggedUrl } from "@/api/lib/request-target";
 import { schemaRefusal } from "@/api/lib/schema-refusal";
-import { errorDetail, isFrameworkRefusal } from "@/api/lib/unhandled-error";
+import {
+  readServedBuild,
+  type ServedBuild,
+  stampServedBuild,
+} from "@/api/lib/served-build";
+import {
+  applyStaticCacheControl,
+  developmentIndexHandler,
+  productionIndexHandler,
+} from "@/api/lib/static-cache";
+import { isFrameworkRefusal } from "@/api/lib/unhandled-error";
 import { localeMiddleware } from "@/api/middlewares/locale";
 import {
   credentialRateLimitMiddleware,
@@ -16,6 +30,7 @@ import {
   rateLimitMiddleware,
   registerRateLimitMiddleware,
   staticRateLimitMiddleware,
+  webhookAuthFailureLimitMiddleware,
 } from "@/api/middlewares/rateLimit";
 import config from "@/config";
 import { AppError } from "@/lib/errors";
@@ -24,49 +39,81 @@ import {
   protectedResourceMetadata,
 } from "@/modules/mcp/oauth/metadata";
 
-const HASHED_ASSET_PATTERN = /-[a-z0-9]{8,}\.[\w]+$/i;
-
-// NOTE: SPA catch-all for BrowserRouter. Dev hands Elysia the HTMLBundle
+// SPA catch-all for BrowserRouter. Dev hands Elysia the HTMLBundle
 // from public/index.html so Bun's bundler resolves the <script> reference
 // and HMR keeps working on deep routes; prod serves the pre-built
 // dist/index.html via Bun.file. Without this, refreshes on /settings,
 // /admin, etc. would 404 because only `/` is registered by staticPlugin.
+// The production handler also sets the document's cache policy and answers
+// 404 for a missing file (see api/lib/static-cache.ts).
 const indexHandler =
   config.env === "production"
-    ? () => Bun.file("dist/index.html")
+    ? productionIndexHandler("dist/index.html")
     : (await import("@/public/index.html")).default;
 
-// A FACTORY, BECAUSE A TEST THAT ADDS A ROUTE MUST NOT ADD IT TO EVERYONE'S APP.
-//
-// The default export below is still the one instance the server runs, and nothing in production
-// calls this. What it exists for is the two test files that need a route of their own on a REAL
-// app (the `onError` arm under test is registered here, so a hand-rolled Elysia would pin the test's
-// own ordering instead of this file's).
-//
-// They used to register those routes on the shared default export, and it worked only for whichever
-// file reached it first: Elysia compiles its router on the first request, so a later file's
-// `app.get(...)` never took effect and its requests fell through to the `/*` SPA handler at the
-// bottom. The symptom was `SyntaxError: JSON Parse error: Unexpected identifier "Something"` — the
-// error shell's HTML, parsed as JSON — and it was invisible because the full serial run happens to
-// give those files an order where the first one is the one that mattered. Measured on a clean tree:
-// `bun test --shard=1/4` failed 19 tests this way, and four of eight `k/8` shards failed nine
-// between them, each a different set.
-// ASYNC because the static plugin below is awaited inside the chain, which is also why this could
-// not be a plain `const` factory. Top-level `await` on the line that builds the default export keeps
-// `App` resolving to the Elysia type rather than to a promise.
-export async function buildApp() {
+// The build dist/ holds, named on every response (api/lib/served-build.ts). Dev serves no build.
+const servedBuild =
+  config.env === "production" ? await readServedBuild("dist/build.json") : null;
+
+// Elysia's own `/*`. In dev the document goes out through Bun's native routes (below), so this one
+// answers only what the carve-outs hand back: a missing asset gets the production 404.
+const spaCatchAll =
+  config.env === "production"
+    ? indexHandler
+    : developmentIndexHandler(indexHandler);
+
+// Since Elysia 1.4.30 an HTMLBundle reaches Bun's native router only on a route with no hook
+// (createNativeStaticHandler checks the pipeline before isHTMLBundle), and every route here inherits
+// helmet and the locale hooks, so `.get("/*", indexHandler)` in dev answers "{}" for every SPA
+// path. Dev registers the bundle straight on Bun's routes table instead, GET only, with a
+// carve-out for each entry of public/ (favicons, /assets/*), for /api and for the OAuth discovery
+// documents, so those still reach Elysia. Served natively, the dev document carries no helmet
+// headers; API responses do, and so does the production document, whose handler is a plain function.
+const devSpaRoutes: Record<string, false | unknown> =
+  config.env === "production"
+    ? {}
+    : {
+        ...Object.fromEntries(
+          (await readdir("public", { withFileTypes: true }))
+            .filter(
+              (entry) => !["index.html", "index.css"].includes(entry.name),
+            )
+            .map((entry) => [
+              entry.isDirectory() ? `/${entry.name}/*` : `/${entry.name}`,
+              false,
+            ]),
+        ),
+        "/.well-known/*": false,
+        "/*": { GET: indexHandler },
+      };
+
+// A factory so a test that needs its own route gets its own real app: Elysia compiles its router on
+// the first request, so a route added to the shared default export afterwards never takes effect and
+// falls through to the `/*` SPA handler. A hand-rolled Elysia would test its own `onError` ordering,
+// not this file's. Production runs only the default export below.
+// Async because the static plugin is awaited inside the chain; the top-level `await` on the default
+// export keeps `App` the Elysia type rather than a promise.
+export async function buildApp({
+  build = servedBuild,
+}: {
+  build?: ServedBuild | null;
+} = {}) {
   const app = new Elysia({
-    // NOTE: Tell Bun's native routes table not to intercept /api paths via
-    // the catch-all SPA HTMLBundle registered below. Without these
-    // carve-outs Bun would serve index.html for /api/* before Elysia's
-    // fetch handler ever runs (causa-raiz documentada em
-    // elysiajs/elysia#1515 e issues do Bun #17595, #17363, #23999). The
-    // bare /api carve-out covers requests without a trailing slash. Re-run
-    // the smoke test in docs/routing.md when upgrading Elysia.
+    // NOTE: without these carve-outs Bun's native routes table serves the SPA HTMLBundle for /api/*
+    // before Elysia's fetch handler runs; the bare /api entry covers requests without a trailing
+    // slash. Root cause and the smoke test to re-run on an Elysia upgrade: docs/routing.md.
     serve: {
+      // Bun closes a connection idle for 10 s by default. A metrics read sends nothing until it
+      // answers, inside METRICS_TIMEOUT_MS, so the idle limit sits past that budget: the read's own
+      // answer, or its 503, always reaches the caller. Bun caps it at 255 s.
+      idleTimeout: Math.min(
+        255,
+        Math.ceil(config.metrics.timeoutMs / 1000) + 10,
+      ),
       routes: {
         "/api": false,
         "/api/*": false,
+        ...devSpaRoutes,
       },
     },
   })
@@ -80,54 +127,36 @@ export async function buildApp() {
           // instead of after a deploy to staging/prod.
           reportOnly: config.env !== "production",
         },
-        // NOTE: Relax COOP from the helmet default (same-origin) so a document this app serves does
-        // not needlessly isolate itself from popups it opens. This helps GSI's "Continue with Google"
-        // button (accounts.google.com posts back to window.opener). It applies to Elysia-served
-        // responses, which includes the vault OAuth callback popup document (google_oauth/mcp_oauth).
-        // It does NOT reach the SPA shell — that HTML is served by Bun's static routes table, BYPASSING
-        // Elysia/helmet, so the opener page stays COOP unsafe-none regardless. For the vault OAuth
-        // popups we therefore do NOT depend on window.opener.postMessage: the external provider's
-        // authorize endpoint answers with its own COOP same-origin, which disowns our popup handle mid
-        // -flow (window.opener becomes null AND popup.closed lies). The result is delivered to the
-        // opener via BroadcastChannel (origin-scoped, browsing-context-group-independent) plus a
-        // server-status poll — see src/client/lib/oauthPopup.ts. This header is correct hygiene, not the
-        // load-bearing signal. https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cross-Origin-Opener-Policy
+        // NOTE: relaxed from helmet's same-origin so GSI's popup can post back to window.opener. It is
+        // hygiene, not the load-bearing signal: the SPA shell is served by Bun's routes table (no
+        // helmet), and a provider's own COOP nulls the vault OAuth popup's opener mid-flow, so that
+        // result travels by BroadcastChannel plus a status poll (src/client/lib/oauthPopup.ts).
         crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
       }),
     )
     .use(localeMiddleware)
-    .onAfterResponse(({ request, set }) => {
-      logger.info("%s %s [%s]", request.method, request.url, set.status);
+    .onRequest(({ set }) => stampServedBuild(build, set.headers))
+    // NOTE: the status a returned Response carries wins over `set.status`: a limiter's refusal is a
+    // cloned Response that leaves `set.status` at its default.
+    .onAfterResponse(({ request, route, set, responseValue }) => {
+      const status =
+        responseValue instanceof Response ? responseValue.status : set.status;
+      logger.info(
+        "%s %s [%s]",
+        request.method,
+        loggedUrl(request.url, route),
+        status,
+      );
     })
-    .onAfterHandle(({ request, set }) => {
-      const url = new URL(request.url);
-      const path = url.pathname;
-
-      if (path === "/" || path.endsWith(".html")) {
-        set.headers["cache-control"] = "no-cache";
-      } else if (HASHED_ASSET_PATTERN.test(path)) {
-        set.headers["cache-control"] = "public, max-age=31536000, immutable";
-      } else if (/\.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?)$/i.test(path)) {
-        set.headers["cache-control"] = "public, max-age=86400";
-      }
-    })
-    // NOTE: typed app errors (ForbiddenError 403, TenantTargetRequiredError 400, NotFoundError 404,
-    // ...) carry their HTTP status. Logged at warn, since they are expected control-flow and not server
-    // faults. When the error carries a translationKey, localize it from the request's Accept-Language
-    // (the request ALS may not be in scope here) so user-facing messages are not raw English.
-    //
-    // NOTE: registered BEFORE the limiters, while everything else below is registered AFTER them, and
-    // the split is load-bearing in BOTH directions. An AppError is thrown from a MATCHED route, or from
-    // a hook that runs after the limiters' counting hook, so the request has already been charged. The
-    // plugin cannot know that: its own `onError` reads `error.status ?? error.statusCode`, where our
-    // NotFoundError is indistinguishable from a route that never existed, so it charges a second time.
-    // That is not merely an overcharge. Measured with a max of 4 and one request of budget left, a
-    // request that should have been admitted and answered 404 came back 429: the second charge crossed
-    // the ceiling, and the limiter answers from its own hook without ever reaching the handler below.
-    // Answering AppError here keeps it away from the plugin entirely.
-    .onError(({ path, error, request, set }) => {
+    .onAfterHandle(applyStaticCacheControl)
+    // NOTE: AppErrors carry their HTTP status and log at warn (expected control flow). The message is
+    // localized from Accept-Language because the request ALS may not be in scope here.
+    // Registered BEFORE the limiters: an AppError comes from a matched route that was already charged,
+    // and the plugin's own `onError` cannot tell our NotFoundError from a missing route, so it would
+    // charge again and can turn an admitted 404 into a 429.
+    .onError(({ path, route, error, request, set }) => {
       if (!(error instanceof AppError)) return;
-      logger.warn("%s %s", path, error.message);
+      logger.warn("%s %s", loggedPath(path, route), error.message);
       const body = refusalBody(error, request.headers.get("accept-language"));
       // NOTE: keep set.status in sync, because the access log in onAfterResponse reads it and a raw
       // Response alone would make a 4xx show up there as a 500.
@@ -142,49 +171,49 @@ export async function buildApp() {
     .use(registerRateLimitMiddleware())
     .use(credentialRateLimitMiddleware())
     .use(staticRateLimitMiddleware())
-    // NOTE: everything the AppError handler above does not answer, registered AFTER the limiters ON
-    // PURPOSE. This is the mirror image of that split: a request rejected BEFORE the handler never
-    // reaches the plugin's counting hook, so the plugin charges those from its own `onError`, and
-    // Elysia stops at the first error handler that RETURNS A VALUE. With this registered first the
-    // NOT_FOUND branch below answered and the plugin never ran: measured on the real app, `POST
-    // /api/nope` and any request to a missing non-/api path came back 404 with no `RateLimit-*` header
-    // and no budget spent. An unknown GET under /api looked metered only because the `.get("/api/*")`
-    // guard below turns it into a MATCHED route, which the normal hook counts.
-    // PARSE still is not affected either way, because the `default:` branch below returns `undefined`
-    // for it and the chain continues to the plugin regardless of order. VALIDATION is answered here
-    // now (issue #255) and so DOES depend on this placement: the plugin has already charged it by the
-    // time this handler returns.
-    .onError(({ path, error, request, set }) => {
-      // NOTE: a schema refusal, answered in the app's own vocabulary instead of TypeBox's. Registered
-      // HERE, after the limiters, and not next to the AppError branch above: the rate-limit plugin
-      // charges request-side VALIDATION from its own `onError` (see the note in middlewares/rateLimit
-      // .ts on 4.6.3), and Elysia stops at the first handler that RETURNS A VALUE, so answering it
-      // before the plugin would hand back an uncharged budget to anyone willing to send a body the
-      // schema refuses. Everything about the body and the log line is decided in api/lib/schema
-      // -refusal.ts, including why the submitted value reaches neither.
-      //
-      // Keyed on IDENTITY, not on `code`. Elysia forwards the thrown value's own `code` property when
-      // it has one, so `code === "VALIDATION"` is also true of any plain error that happens to carry
-      // that string — measured: such an error was answered 422 in the app's schema vocabulary, and the
-      // `as ValidationError` cast this replaces was simply false about it. Issue #263 has the long
-      // version; the rule is that a branch deciding what a failure IS cannot read a property the
-      // failure sets.
+    .use(webhookAuthFailureLimitMiddleware())
+    // NOTE: registered AFTER the limiters on purpose. A request rejected before its handler is charged
+    // from the plugin's own `onError`, and Elysia stops at the first error handler that returns a
+    // value, so answering NOT_FOUND or VALIDATION before the plugin would leave them uncharged.
+    // Framework refusals such as PARSE return `undefined` below, so they reach the plugin either way.
+    .onError(async ({ path, route, error, request, set }) => {
+      const logged = loggedPath(path, route);
+      // NOTE: a schema refusal in the app's own vocabulary (body and log line: api/lib/schema-refusal.ts).
+      // Here and not next to the AppError branch, so the plugin's charge for VALIDATION is not skipped
+      // (see middlewares/rateLimit.ts). Keyed on identity, not `code`: Elysia forwards a thrown value's
+      // own `code`, so any plain error carrying "VALIDATION" would match.
       if (error instanceof ValidationError) {
+        // NOTE: the gate's answer to a request with no session, before anything about its input.
+        // Charged by the limiters' own handler above, as the schema refusal would have been.
+        if (await refusedForSession(request)) {
+          logger.warn("%s refused: no session", logged);
+          set.status = 401;
+          return Response.json(
+            {
+              error: translateWithLocale(
+                getLocaleFromHeader(request.headers.get("accept-language")),
+                "errors.unauthorized",
+                "Unauthorized",
+              ),
+            },
+            { status: 401 },
+          );
+        }
         const refusal = schemaRefusal(
           error,
           request.headers.get("accept-language"),
         );
         const line = "%s %s";
         if (refusal.severity === "error") {
-          logger.error(line, path, refusal.log);
+          logger.error(line, logged, refusal.log);
         } else {
-          logger.warn(line, path, refusal.log);
+          logger.warn(line, logged, refusal.log);
         }
         set.status = refusal.status;
         return Response.json(refusal.body, { status: refusal.status });
       }
 
-      logger.error("%s\n%s", path, error);
+      logger.error("%s\n%s", logged, error);
 
       if (error instanceof NotFoundError) {
         // NOTE: API endpoints respond with JSON 404. SPA paths normally
@@ -197,33 +226,23 @@ export async function buildApp() {
         return new Response("Not Found", { status: 404 });
       }
 
-      // NOTE: everything that is not a refusal Elysia itself raised is an unhandled failure, and
-      // its text does not reach the client outside development. Stated by exclusion, and decided
-      // from the thrown VALUE rather than from `code`, because `code` is a property the value
-      // carries and any library can set it. The measurements behind both of those choices are in
-      // api/lib/unhandled-error.ts; the short version is that a redact-list keyed on `code` leaked
-      // twice, once through a string code and once through a numeric one.
+      // NOTE: anything that is not a refusal Elysia itself raised is an unhandled failure, and its
+      // text reaches the log above and never the client, in development too: a dev server receiving
+      // Chatwoot webhooks is reachable from outside. Decided from the thrown value, not from
+      // `code`, which any library can set (see api/lib/unhandled-error.ts).
       if (isFrameworkRefusal(error)) return;
-      // NOTE: `set.status` too, not just the Response's. The access log in onAfterResponse reads
-      // `set.status`, and Elysia seeds it from the thrown value's own `status` property — so an
-      // error carrying `status: 401` is answered 500 here and LOGGED as 401 unless this line runs.
-      // Same reason the AppError arm above carries the same note.
+      // NOTE: `set.status` too: the access log reads it, and Elysia seeds it from the thrown value's
+      // own `status`, so an error carrying `status: 401` would be answered 500 but logged as 401.
       set.status = 500;
-      const message =
-        config.env === "development"
-          ? errorDetail(error)
-          : "Something went wrong";
-      return new Response(message, { status: 500 });
+      return new Response("Something went wrong", { status: 500 });
     })
     .use(
       await staticPlugin({
         assets: config.env === "production" ? "dist" : "public",
         prefix: "/",
         alwaysStatic: true,
-        // NOTE: @elysiajs/static 1.4.9 renamed `bundleHTML` to `bunFullstack`
-        // and flipped the default to `false`. Without this, dev serves
-        // `public/index.html` raw and the `<script src="../src/client/frontend.tsx">`
-        // reference cannot be resolved. See elysiajs/elysia-static#63.
+        // NOTE: `bunFullstack` defaults to false; without it dev serves `public/index.html` raw and
+        // its `<script src="../src/client/frontend.tsx">` reference cannot resolve.
         bunFullstack: config.env === "development",
       }),
     )
@@ -247,14 +266,13 @@ export async function buildApp() {
     .get("/.well-known/oauth-protected-resource", () =>
       protectedResourceMetadata(),
     )
-    // Path-aware variant (RFC 9728 §3.1): MCP clients probe
-    // /.well-known/oauth-protected-resource/<resource-path> before the root. There is a single
-    // protected resource, so serve the same metadata for any suffix — otherwise the probe falls
-    // through to the SPA catch-all and returns index.html (HTML), which strict clients choke on.
+    // NOTE: MCP clients probe /.well-known/oauth-protected-resource/<resource-path> before the root
+    // (RFC 9728 §3.1). There is a single protected resource, so any suffix gets the same metadata
+    // instead of falling through to the SPA's HTML, which strict clients reject.
     .get("/.well-known/oauth-protected-resource/*", () =>
       protectedResourceMetadata(),
     )
-    .get("/*", indexHandler);
+    .get("/*", spaCatchAll);
 
   app.use(
     cors(

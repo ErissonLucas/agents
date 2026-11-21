@@ -9,7 +9,7 @@ import {
   // translate('errors.invalidId', 'Not a valid {{label}}')
   getIssuedDocumentPdf,
   issueDocument,
-  listIssuedDocuments,
+  pageIssuedDocuments,
   revokeIssuedDocument,
 } from "@/modules/documents/issue";
 
@@ -18,12 +18,10 @@ import {
 // tenant-scoped — the scoped read is the boundary, because the filesystem has no RLS. Served under
 // /api, never staticPlugin.
 
-// NOTE: these AppError translationKeys are localized centrally in `onError`, not through a literal
-// translate() call, so they are declared here for the i18n extractor (keepRemoved: false). They
-// belong to the documents MODULE, and they are declared in this controller because the api extractor
-// only scans `src/api/**` — a declaration next to the throw site would be invisible to it, and the
-// customer-facing effect of a missing key is silent: `onError` falls back to the English message.
-// t/translate magic comments — keep defaults in sync with src/api/locales/*.json:
+// NOTE: these AppError translationKeys are localized centrally in `onError`, so they are declared
+// here for the i18n extractor (keepRemoved: false). They belong to the documents module, but the api
+// extractor only scans `src/api/**`, and a missing key silently falls back to English. Keep the
+// defaults in sync with src/api/locales/*.json.
 // translate('errors.documentTemplateNotFound', 'Document template not found')
 // translate('errors.documentNotFound', 'Document not found')
 // translate('errors.documentTemplateDisabled', 'This document template is disabled')
@@ -38,13 +36,62 @@ import {
 // translate('errors.invalidCompanyField', 'This company profile field is not valid: {{reason}}')
 // translate('errors.invalidDocumentValues', 'The values do not match what this template declares: {{reason}}')
 // translate('errors.invalidDocumentSlug', 'This identifier is not valid: {{reason}}')
+// translate('errors.slugShape', 'the slug must start with a letter and contain only lowercase letters, digits and underscores')
+// translate('errors.slugTooLong', 'the slug must be at most {{max}} characters (it becomes the tool name send_<slug>, and providers cap a tool name)')
+// translate('errors.slugBuiltInTool', 'the slug would produce the tool name "{{tool}}", which is already a built-in tool')
+// translate('errors.nextNumberRange', 'nextNumber: must be a whole number from 1 to {{max}}.')
+// translate('errors.idempotencyKeyReserved', 'idempotencyKey: the prefix "{{prefix}}" is reserved for approved documents.')
 // translate('errors.documentToolNameTaken', 'The tool name {{tool}} is already used by the tool "{{holder}}"')
 // translate('errors.invalidDocumentTemplateName', 'This document template name is not valid: {{reason}}')
 // translate('errors.documentRevoked', 'This document was revoked and cannot be issued again')
 // translate('errors.documentNotNumbered', 'This document could not be numbered because its template no longer exists')
 // translate('errors.invalidDocumentTemplateDescription', 'This document template description is not valid: {{reason}}')
 // translate('errors.documentTemplateUnreadable', 'This template contains content a newer version wrote, so it cannot be saved from here: {{reason}}')
+// translate('errors.unstorableReason', '{{field}} contains characters the database cannot store ({{codePoints}}) — a NUL or half of a character, which PostgreSQL refuses in text and JSON columns alike.')
+// translate('errors.unprintableReason', '{{field}} contains characters this document cannot print ({{characters}}) — the PDF fonts cover Latin text only, and printing them anyway would put a different character in the document.')
+// translate('errors.documentWhereBlock', 'block "{{id}}"')
+// translate('errors.documentHalfValidatorSaid', '{{half}}: {{detail}}')
+// translate('errors.documentStyleUnknownProperty', 'style: "{{property}}" is not a style property, so it would be stored and never take effect. Check the spelling against document_template_schema, or remove it.')
+// translate('errors.documentUnknownProperty', '{{half}}: "{{property}}" is not a property this version understands, so it would be stored and never take effect. Check the spelling against document_template_schema, or remove it.')
+// translate('errors.documentTooManyFields', 'fields: at most {{max}} per document, got {{count}} — the declared fields become the agent\'s tool schema, published on every turn.')
+// translate('errors.documentNothingPrints', 'blocks: a document needs at least one block that can print something (header, text, fields, lineItems or totals) — as written, every issued document would be a numbered blank page.')
+// translate('errors.documentBlocksValidatorSaid', 'blocks: {{detail}} — blocks are {"type":"header"|"text"|"fields"|"lineItems"|"totals"|"divider", "id":"…"}.')
+// translate('errors.documentTooManyBlocks', 'blocks: at most {{max}} per document, got {{count}}.')
+// translate('errors.documentDuplicateBlockId', 'blocks: duplicate block id "{{id}}" — ids address a block across reorders, so two blocks cannot share one.')
+// translate('errors.documentDuplicateFieldName', 'fields: duplicate field name "{{name}}".')
+// translate('errors.documentReservedFieldPrefix', 'fields: "{{name}}" starts with a reserved prefix (company_, empresa_, doc_, documento_) — those names already resolve to the company profile or the document itself, and a field would shadow them silently.')
+// translate('errors.documentBlockFieldUndeclared', 'blocks: {{type}} block "{{id}}" points {{prop}} at "{{name}}", which is not a declared field.')
+// translate('errors.documentBlockFieldWrongType', 'blocks: {{type}} block "{{id}}" needs {{prop}} to name a field of type {{types}}, but "{{name}}" is {{actual}}.')
+// translate('errors.documentTooManyTokens', 'blocks: at most {{max}} {{token}} per document, counting repeats, got {{count}} — each one expands to a value of up to 2000 characters when the document is issued.')
+// translate('errors.documentTokenMalformed', '{{half}}: {{where}} uses {{token}}, which is not a readable token: a name must start with a lowercase letter and contain only lowercase letters, digits and underscores. As written it would print with its braces in the customer\'s document.')
+// translate('errors.documentTokenNotScalar', '{{half}}: {{where}} uses {{token}}, which is a lineItems field. A table cannot be printed as a token — it renders as a blank. Use a lineItems block to show those items.')
+// translate('errors.documentTokenUnknown', '{{half}}: {{where}} uses {{token}}, which is neither a declared field nor a reserved name. Declare it in fields, or remove it — an unresolved token renders as a blank space in the customer\'s document.')
+// translate('errors.documentValueTextTooLong', 'must be a string of at most {{max}} characters')
+// translate('errors.documentValueNotNumber', 'must be a finite number')
+// translate('errors.documentValueTooLarge', 'must be at most {{max}}')
+// translate('errors.documentValueNotDate', 'must be an ISO date (YYYY-MM-DD)')
+// translate('errors.documentValueNotList', 'must be a list of line items')
+// translate('errors.documentValueTooManyItems', 'must have at most {{max}} line items')
+// translate('errors.documentLineItemsValidatorSaid', 'line items: {{detail}} — each is {"description":"…","quantity":n,"unitPrice":n}')
+// translate('errors.documentLineItemBlankDescription', 'line items: every item needs a description that is not blank once whitespace and control characters are removed')
+// translate('errors.documentLineItemFactorTooLarge', 'line items: "{{description}}" has a quantity or unit price above {{max}}')
+// translate('errors.documentLineItemTotalTooLarge', 'line items: "{{description}}" totals more than {{max}}')
+// translate('errors.documentValuesNotObject', 'values must be an object keyed by field name.')
+// translate('errors.documentValueUndeclared', 'values: "{{name}}" is not a declared field of this template (declared: {{declared}}).')
+// translate('errors.documentValueUndeclaredNone', 'values: "{{name}}" is not a declared field of this template (declared: none).')
+// translate('errors.documentValueRequired', 'values: "{{name}}" ({{label}}) is required.')
+// translate('errors.documentValueRequiredItems', 'values: "{{name}}" ({{label}}) is required, so it needs at least one item.')
+// translate('errors.documentValueRequiredBlank', 'values: "{{name}}" ({{label}}) is required, and this value is blank once whitespace and control characters are removed.')
+// translate('errors.documentValueProblem', 'values: "{{name}}" {{problem}}.')
+// translate('errors.documentNameLength', 'name: must be between {{min}} and {{max}} characters.')
+// translate('errors.documentDescriptionLength', 'description: must be at most {{max}} characters.')
+// translate('errors.documentNumberPrefixLength', 'numberPrefix: must be at most {{max}} characters.')
+// translate('errors.documentApprovalTtlRange', 'approvalTtlHours: must be a whole number of hours from {{min}} to {{max}}.')
+// translate('errors.documentBlockTextOnCreate', 'blockText: only an update can replace text by block id; when creating, write the text inside blocks.')
+// translate('errors.documentBlockTextNotText', 'blockText: "{{id}}" is not a text block of this template.')
 // translate('errors.invalidDocumentNumberPrefix', 'This document number prefix is not valid: {{reason}}')
+// translate('errors.documentNumberAlreadyUsed', '{{asked}} cannot be the next number: {{used}} was already issued. Choose {{min}} or above, or change the prefix to start a new sequence.')
+// translate('errors.invalidDocumentNextNumber', 'This next document number is not valid: {{reason}}')
 // translate('errors.invalidIdempotencyKey', 'This idempotency key is not valid: {{reason}}')
 // translate('errors.documentNotStored', 'This document could not be stored')
 // translate('errors.documentWouldBeBlank', 'This document would be blank: with the values given, no block prints anything.')
@@ -59,18 +106,11 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   return ctx;
 }
 
-// Ids are constrained HERE, at the transport, rather than left to the global handler that turns a
-// BigInt parse error into a 400 by matching the word "BigInt" in an engine's message. That mapping
-// was measured and it does work today — but it is a coupling to wording nobody here controls, and a
-// malformed id is a validation failure the route can name on its own.
-// The conversation key an issued document is bound to, constrained to the SHAPE the runtime writes
-// and bounded.
-//
-// `issued_documents.thread_id` is indexed (tenantId, threadId), so a long enough value is refused by
-// POSTGRES with an index-row-size error — a 500 for a field a caller typed, on a route that
-// advertises validation. Three numeric ids is what the key IS (tenantId:instanceId:conversationId),
-// so anything else was never going to match a conversation anyway, and the length follows from the
-// shape rather than being a second guess at it.
+// The conversation key an issued document is bound to, constrained at the transport to the shape the
+// runtime writes (tenantId:instanceId:conversationId) and bounded by it. `issued_documents.thread_id`
+// is indexed, so an unbounded value is refused by Postgres with an index-row-size error, a 500 for a
+// field a caller typed. Ids are constrained here rather than left to the global handler that maps a
+// BigInt parse error to 400 by matching wording in an engine's message.
 export const threadIdSchema = t.String({
   pattern: "^[0-9]{1,20}:[0-9]{1,20}:[0-9]{1,20}$",
   maxLength: 64,
@@ -87,7 +127,7 @@ export const documentsController = new Elysia({
     "/",
     async ({ tenantContext, query }) => ({
       instance: instanceIdentity,
-      documents: await listIssuedDocuments(ctxOrThrow(tenantContext), {
+      ...(await pageIssuedDocuments(ctxOrThrow(tenantContext), {
         limit: query.limit ? Number(query.limit) : undefined,
         // `!== undefined` for the same reason the preview route uses it: `?templateId=0` is a
         // filter, and dropping it answers with EVERY document instead of none. (`limit` above can
@@ -97,7 +137,12 @@ export const documentsController = new Elysia({
             ? requireDbId(query.templateId, "template id")
             : undefined,
         threadId: query.threadId,
-      }),
+        before:
+          query.before !== undefined
+            ? requireDbId(query.before, "document id")
+            : undefined,
+        query: query.q,
+      })),
     }),
     {
       requireRole: "TENANT_ADMIN",
@@ -119,6 +164,20 @@ export const documentsController = new Elysia({
         ),
         threadId: t.Optional(
           t.String({ description: "Only documents issued on this thread." }),
+        ),
+        before: t.Optional(
+          t.String({
+            pattern: "^[0-9]+$",
+            description:
+              "Only documents older than this id: the next page after the last one read.",
+          }),
+        ),
+        q: t.Optional(
+          t.String({
+            maxLength: 200,
+            description:
+              "Part of the printed number (prefix and padded counter, e.g. ORC-0005) or of the title.",
+          }),
         ),
       }),
       detail: doc(

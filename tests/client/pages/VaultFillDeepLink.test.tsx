@@ -6,27 +6,22 @@ import {
   beforeEach,
   describe,
   expect,
-  mock,
   test,
 } from "bun:test";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { ToastProvider } from "@/client/components";
+import * as ThemeModule from "@/client/contexts/ThemeContext";
 import { withI18n } from "@/tests/utils/i18n";
+import { stubExports } from "@/tests/utils/module-stub";
 
-// Issue #151: `credential_create` answers with a `fillAt` link so the operator can put the secret in
-// out of band. The vault panel looked the id up in the tenant the browser happened to have selected
-// and, when it was not there, stripped `?fill` anyway. The result was a page that behaved as if the
-// operator had navigated there by hand: no modal, no message, and the link spent, so refreshing did
-// not retry it.
+// `credential_create` answers with a `fillAt` link so the operator can put the secret in out of
+// band. These drive the vault panel through the same `?fill` a real link carries. The assertion
+// that matters is the URL: a miss in the selected tenant must leave the parameter alone, so the
+// operator can switch tenant in the header (a full reload) and have the same link resolve.
 //
-// These drive the panel through the same `?fill` a real link carries. The assertion that matters is
-// the URL: a miss must leave the parameter alone, because that is what lets the operator switch
-// tenant in the header (a full reload) and have the same link resolve.
-//
-// NOTE: every assertion reduces to a boolean or a string BEFORE expect. A failing expectation that
-// holds a DOM node serializes a cyclic happy-dom tree and stalls the runner.
+// Every assertion reduces to a boolean or a string BEFORE expect: a failing expectation that holds
+// a DOM node serializes a cyclic happy-dom tree and stalls the runner.
 
 let entriesPayload: Record<string, unknown>[] = [];
 const realFetch = globalThis.fetch;
@@ -54,15 +49,14 @@ function installFetchStub() {
   }) as typeof fetch;
 }
 
-mock.module("@/client/contexts/ThemeContext", () => ({
+stubExports(ThemeModule, {
   useTheme: () => ({
     theme: "dark",
     resolvedTheme: "dark",
     setTheme: () => {},
   }),
   useThemedAsset: (path: string) => ({ src: path }),
-  ThemeProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 const { VaultPanel } = await import("@/client/pages/resources/VaultPanel");
 
@@ -140,6 +134,13 @@ describe("vault fill deeplink", () => {
       expect(seenSearch).toBe("");
     });
     // Spending it is only correct because it was used: the fill modal is open on that entry.
-    expect(screen.queryAllByText("OpenAI").length).toBeGreaterThan(0);
+    const dialog = screen.queryByRole("dialog", {
+      name: "Fill pending credential",
+    });
+    expect(dialog !== null).toBe(true);
+    const values = Array.from(dialog?.querySelectorAll("input") ?? []).map(
+      (el) => el.value,
+    );
+    expect(values).toContain("OpenAI");
   });
 });

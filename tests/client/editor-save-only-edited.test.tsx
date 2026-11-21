@@ -1,0 +1,322 @@
+/// <reference lib="dom" />
+
+import { afterEach, describe, expect, test } from "bun:test";
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import {
+  type EditorAgent,
+  editTab,
+  lastSavedSettings,
+  renderEditor,
+  stubEditorApi,
+} from "../utils/agent-editor";
+
+// A save writes what the operator edited and nothing else (agents#1206, agents#1304). A block the
+// operator never touched stays exactly as stored, absent included: written out with the values the
+// form showed, it would freeze today's defaults into the agent, so a later change of a default in
+// the code no longer reaches it, and the stored settings stop saying what the operator chose.
+
+const realFetch = globalThis.fetch;
+afterEach(() => {
+  cleanup();
+  globalThis.fetch = realFetch;
+});
+
+const field = (label: RegExp): HTMLInputElement => {
+  const el = screen.getByLabelText(label);
+  if (!(el instanceof HTMLInputElement))
+    throw new Error(`${label} is not an input`);
+  return el;
+};
+
+const change = (el: Element, value: string) =>
+  fireEvent.change(el, { target: { value } });
+
+async function saveBehavior(
+  seed: EditorAgent,
+  edit?: () => void,
+): Promise<{ before: unknown; after: Record<string, unknown> | undefined }> {
+  const stub = stubEditorApi(seed);
+  const before = structuredClone(stub.agent.settings);
+  await renderEditor(stub, "behavior");
+  edit?.();
+  fireEvent.click(screen.getByRole("button", { name: "Save" }));
+  await screen.findByText("Agent saved.");
+  return { before, after: lastSavedSettings(stub) };
+}
+
+const saveButton = () => screen.getByRole("button", { name: "Save" });
+
+// An untouched Behavior tab has nothing to save (agents#1365): Save is disabled and nothing is sent.
+async function untouched(seed: EditorAgent, edit?: () => void): Promise<void> {
+  const stub = stubEditorApi(seed);
+  await renderEditor(stub, "behavior");
+  edit?.();
+  await waitFor(() => expect(saveButton()).toHaveProperty("disabled", true));
+  fireEvent.click(saveButton());
+  expect(stub.writes.filter((w) => w.method === "PATCH")).toEqual([]);
+}
+
+// The guardrails' own on/off.
+const mainSwitch = (): HTMLElement =>
+  screen.getByRole("switch", { name: /Enable guardrails/ });
+
+describe("Guardrails and Redirect: an untouched tab has nothing to save (agents#1206)", () => {
+  for (const tab of ["guardrails", "channelRedirect"] as const) {
+    test(`${tab}: Save is disabled on a fresh agent, and nothing is written`, async () => {
+      const stub = stubEditorApi({ settings: {} });
+      await renderEditor(stub, tab);
+      expect(saveButton()).toHaveProperty("disabled", true);
+      fireEvent.click(saveButton());
+      expect(stub.writes.filter((w) => w.method === "PATCH")).toEqual([]);
+    });
+  }
+
+  test("guardrails: an edit enables Save, undoing it disables Save again", async () => {
+    const stub = stubEditorApi({ settings: {} });
+    await renderEditor(stub, "guardrails");
+    fireEvent.click(mainSwitch());
+    await waitFor(() => expect(saveButton()).toHaveProperty("disabled", false));
+    fireEvent.click(mainSwitch());
+    await waitFor(() => expect(saveButton()).toHaveProperty("disabled", true));
+  });
+
+  test("guardrails: an edited save writes its block and no other", async () => {
+    const stub = stubEditorApi({ settings: {} });
+    await renderEditor(stub, "guardrails");
+    fireEvent.click(mainSwitch());
+    await waitFor(() => expect(saveButton()).toHaveProperty("disabled", false));
+    fireEvent.click(saveButton());
+    await screen.findByText("Agent saved.");
+    expect(Object.keys(lastSavedSettings(stub) ?? {})).toEqual(["guardrails"]);
+  });
+});
+
+describe("Behavior writes the sections the operator edited (agents#1304)", () => {
+  test("a reply agent with no settings, untouched, has nothing to save", async () => {
+    await untouched({ settings: {} });
+  });
+
+  test("editing the wait window writes debounce and nothing else", async () => {
+    const { after } = await saveBehavior({ settings: {} }, () =>
+      change(field(/^Wait window \(s\)/), "25"),
+    );
+    expect(Object.keys(after ?? {})).toEqual(["debounce"]);
+    const debounce = after?.debounce as Record<string, unknown> | undefined;
+    expect(debounce?.windowSeconds).toBe(25);
+  });
+
+  // The serialization is lossy (`Number(x) || 15`): a stored 0 and a typed 15 serialize alike, so
+  // the edit is judged on the form state, before it.
+  test("a stored 0 changed to the default is an edit, and is written", async () => {
+    const { after } = await saveBehavior(
+      {
+        settings: {
+          debounce: {
+            enabled: true,
+            windowSeconds: 0,
+            maxMessagesPerBurst: 20,
+            maxWindowSeconds: 60,
+          },
+        },
+      },
+      () => change(field(/^Wait window \(s\)/), "15"),
+    );
+    const debounce = after?.debounce as Record<string, unknown> | undefined;
+    expect(debounce?.windowSeconds).toBe(15);
+  });
+
+  test("editing and undoing leaves nothing to save", async () => {
+    await untouched({ settings: {} }, () => {
+      change(field(/^Wait window \(s\)/), "25");
+      change(field(/^Wait window \(s\)/), "15");
+    });
+  });
+
+  test("a block stored in part and never edited is not completed with defaults", async () => {
+    const { after } = await saveBehavior(
+      { settings: { debounce: { enabled: true } } },
+      () => change(field(/^Max tool calls \/ turn/), "3"),
+    );
+    expect(after?.debounce).toEqual({ enabled: true });
+  });
+
+  test("editing split keeps the stored debounce and grounding as they are", async () => {
+    const settings = {
+      debounce: {
+        enabled: true,
+        windowSeconds: 30,
+        maxMessagesPerBurst: 7,
+        maxWindowSeconds: 90,
+      },
+      split: { enabled: true, maxChars: 500, typingWpm: 200, maxDelayMs: 5000 },
+      grounding: { maxDistance: 0.4 },
+    };
+    const { after } = await saveBehavior({ settings }, () =>
+      change(field(/^Max chars \/ message/), "450"),
+    );
+    expect(Object.keys(after ?? {}).sort()).toEqual([
+      "debounce",
+      "grounding",
+      "split",
+    ]);
+    expect(after?.debounce).toEqual(settings.debounce);
+    expect(after?.grounding).toEqual(settings.grounding);
+    const split = after?.split as Record<string, unknown> | undefined;
+    expect(split?.maxChars).toBe(450);
+  });
+
+  test("switching on the other inboxes writes that block and nothing else", async () => {
+    const { after } = await saveBehavior({ settings: {} }, () =>
+      fireEvent.click(
+        screen.getByRole("switch", {
+          name: /Read this contact's conversations in other inboxes/,
+        }),
+      ),
+    );
+    expect(Object.keys(after ?? {})).toEqual(["otherInboxes"]);
+    const other = after?.otherInboxes as Record<string, unknown> | undefined;
+    expect(other?.enabled).toBe(true);
+  });
+
+  const monitoring = {
+    engine: "decisions",
+    analysis: "incremental",
+    window: { messages: 12 },
+    debounce: { windowSeconds: 45, maxWindowSeconds: 120 },
+    decisions: {
+      provider: "typesafe",
+      model: "jev-latest",
+      credentialRef: "vault:1",
+      questions: [
+        {
+          name: "pede_reembolso",
+          type: "yes_no",
+          instructions: "O cliente pede o dinheiro de volta?",
+        },
+      ],
+      rules: [
+        {
+          when: [{ question: "pede_reembolso", minProbability: 0.7 }],
+          action: { tool: "set_labels", args: { add: ["reembolso"] } },
+        },
+      ],
+    },
+  };
+
+  test("a watcher with only monitoring, untouched, has nothing to save", async () => {
+    await untouched({ mode: "monitoring", settings: { monitoring } });
+  });
+
+  test("a watcher's burst window edit writes monitoring with the decision setup as stored", async () => {
+    const { after } = await saveBehavior(
+      { mode: "monitoring", settings: { monitoring } },
+      () => change(field(/^Burst window \(seconds\)/), "50"),
+    );
+    expect(Object.keys(after ?? {})).toEqual(["monitoring"]);
+    const m = after?.monitoring as Record<string, unknown>;
+    expect((m.debounce as Record<string, unknown>).windowSeconds).toBe(50);
+    expect(m.decisions).toEqual(monitoring.decisions);
+    expect(m.engine).toBe(monitoring.engine);
+    expect(m.analysis).toBe(monitoring.analysis);
+    expect(m.window).toEqual(monitoring.window);
+  });
+
+  // Behavior's timing and the decision setup share the `monitoring` block, and one write carries
+  // both: the setup goes over the timing this same write carries, not over the stored one.
+  test("a watcher's burst window and its questions edited together both go out", async () => {
+    const stub = stubEditorApi({
+      mode: "monitoring",
+      settings: { monitoring },
+    });
+    await renderEditor(stub, "behavior");
+    change(field(/^Burst window \(seconds\)/), "50");
+    fireEvent.click(screen.getByRole("tab", { name: /^Questions and rules/ }));
+    await screen.findByRole("tab", {
+      name: /^Questions and rules/,
+      selected: true,
+    });
+    editTab("decisions");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Agent saved.");
+    const m = lastSavedSettings(stub)?.monitoring as Record<string, unknown>;
+    expect((m.debounce as Record<string, unknown>).windowSeconds).toBe(50);
+    expect(m.decisions).not.toEqual(monitoring.decisions);
+  });
+});
+
+// The Tools tab serializes its blocks twice, from the form and from the server's copy, and sends only
+// the ones that differ, the way Behavior does: a block nobody touched goes back as stored.
+describe("Tools writes the blocks the operator edited", () => {
+  const CATALOG = {
+    native: [{ name: "set_labels" }, { name: "private_note" }],
+  };
+  const GRANTED = [
+    { source: "NATIVE", enabledTools: ["set_labels"], knowledgeBaseIds: [] },
+  ];
+
+  async function saveTools(
+    settings: Record<string, unknown>,
+    edit: () => void,
+  ): Promise<Record<string, unknown> | undefined> {
+    const stub = stubEditorApi(
+      { settings },
+      { catalog: CATALOG, grants: GRANTED },
+    );
+    await renderEditor(stub, "tools");
+    edit();
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Agent saved.");
+    return lastSavedSettings(stub);
+  }
+
+  test("a grant change alone writes no settings block", async () => {
+    const after = await saveTools({}, () => editTab("tools"));
+    expect(after ?? {}).toEqual({});
+  });
+
+  test("a grant change keeps every stored block exactly, and adds none", async () => {
+    const stored = {
+      handoff: { instructions: "  chame a equipe  " },
+      setLabels: { protected: ["vip"] },
+      sendImage: { hosts: ["cdn.example.com"], extra: 1 },
+      debounce: { windowSeconds: 15 },
+    };
+    const after = await saveTools(structuredClone(stored), () =>
+      editTab("tools"),
+    );
+    expect(after).toEqual(stored);
+  });
+
+  test("editing the labels off limits writes setLabels and no other block", async () => {
+    const after = await saveTools({ debounce: { windowSeconds: 15 } }, () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Settings", expanded: false }),
+      );
+      change(
+        screen.getByRole("textbox", { name: "Labels off limits" }),
+        "vip, financeiro",
+      );
+    });
+    expect(Object.keys(after ?? {}).sort()).toEqual(["debounce", "setLabels"]);
+    const setLabels = after?.setLabels as { protected?: string[] } | undefined;
+    expect(setLabels?.protected).toEqual(["vip", "financeiro"]);
+  });
+
+  test("trimming a stored note is an edit, even though both trim to the same text", async () => {
+    const after = await saveTools(
+      { toolGuidance: { set_labels: "  use vip  " } },
+      () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Settings", expanded: false }),
+        );
+        const field = Array.from(document.querySelectorAll("textarea")).find(
+          (el) => el.value === "  use vip  ",
+        );
+        if (!field) throw new Error("the set_labels note is not drawn");
+        change(field, "use vip");
+      },
+    );
+    const guidance = after?.toolGuidance as Record<string, string> | undefined;
+    expect(guidance?.set_labels).toBe("use vip");
+  });
+});

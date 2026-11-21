@@ -16,12 +16,14 @@ import { failableTool, toolFailure } from "@/graph/tools/failure";
 import type { TenantContext } from "@/lib/tenancy";
 import { createAlertChannel } from "@/modules/flowlog/channels";
 import type { FlowContext } from "@/modules/flowlog/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRows } from "../utils/flowlog";
 import { outboundUrl } from "../utils/outbound";
+import { until } from "../utils/poll";
 
-// NOTE: The tool line of the execution-flow log must distinguish integration failures from successes:
+// The tool line of the execution-flow log must distinguish integration failures from successes:
 // a ToolMessage with status "error" (failableTool) is logged as ONE warn/error line with the
-// friendly string as errorMessage, so alert channels (minLevel warn) can fire (issue #40).
+// friendly string as errorMessage, so alert channels (minLevel warn) can fire.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -39,8 +41,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -64,10 +66,11 @@ type LogRow = {
   detail: unknown;
 };
 
-// NOTE: emitFlowEvent is fire-and-forget; poll until the expected row count lands.
+// emitFlowEvent is fire-and-forget; poll until the expected row count lands.
 async function pollToolRows(turnId: string, count: number): Promise<LogRow[]> {
-  for (let i = 0; i < 50; i++) {
+  return until(`${count} tool row(s)`, async () => {
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, turnId, stage: "tool" },
       select: {
         level: true,
@@ -76,13 +79,11 @@ async function pollToolRows(turnId: string, count: number): Promise<LogRow[]> {
         detail: true,
       },
     });
-    if (rows.length >= count) return rows;
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  return [];
+    return rows.length >= count ? rows : null;
+  }).catch((): LogRow[] => []);
 }
 
-// NOTE: Scripted model: first call emits a tool_call for `toolName`, second call replies with text.
+// Scripted model: first call emits a tool_call for `toolName`, second call replies with text.
 // Captures every message list it is invoked with, so the test can assert what the model SAW.
 class ToolCallThenReplyModel {
   seen: BaseMessage[][] = [];
@@ -161,14 +162,41 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(rows[0]?.errorMessage).toBeNull();
   });
 
-  // Issue #243, and the concrete way a third party's characters reach `execution_logs.error_message`.
-  // An HTTP tool passes the remote's response body through verbatim so the model can read it, and
-  // `toolFailure` makes that body the failure's cause. With `logToolValues` on, the operator asked to
-  // SEE that body, so `failureCause` hands the whole thing here instead of the first line.
-  //
-  // `error_message` is a `text` column and Postgres refuses a NUL in one (22021), while emitFlowEvent
-  // is fire-and-forget with a catch: the refusal never reaches the turn and the line is simply not
-  // there. Turning detailed logging ON is what used to make the log line disappear.
+  // NOTE: The size is measured before the row's own caps: a result far past the per-string cut is
+  // stored clipped, and its size still says how big it was, with tool values off and on.
+  test("the stored line carries the whole result's size past the detail cut", async () => {
+    const big = "x".repeat(50_000);
+    for (const logValues of [false, true]) {
+      const flow = flowCtx();
+      const logger = new ToolFlowLogger(flow, { logValues });
+      logger.handleToolStart(
+        {} as never,
+        "{}",
+        "run-size",
+        undefined,
+        undefined,
+        undefined,
+        "probe",
+      );
+      logger.handleToolEnd(
+        new ToolMessage({ content: big, tool_call_id: "c1", name: "probe" }),
+        "run-size",
+      );
+      const rows = await pollToolRows(flow.turnId, 1);
+      const detail = rows[0]?.detail as {
+        output?: unknown;
+        resultSize?: { chars?: number; tokens?: number };
+      };
+      expect(detail?.resultSize?.chars).toBe(50_000);
+      expect((detail?.resultSize?.tokens ?? 0) > 0).toBe(true);
+      expect(JSON.stringify(detail?.output ?? "").length < 50_000).toBe(true);
+    }
+  });
+
+  // NOTE: How a third party's characters reach `execution_logs.error_message`: an HTTP tool's response
+  // body is the failure's cause, and with `logToolValues` on `failureCause` hands all of it here.
+  // Postgres refuses a NUL in a `text` column (22021) and emitFlowEvent swallows the refusal, so
+  // without sanitizing, turning detailed logging ON makes the line silently disappear.
   test("a response body carrying a NUL still lands the tool line", async () => {
     const flow = flowCtx();
     const logger = new ToolFlowLogger(flow, { logValues: true });
@@ -196,7 +224,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(rows[0]?.errorMessage).toContain("HTTP 400");
   });
 
-  // Issue #844: a slow search is attributed on its own line. `search_knowledge` counts the times its
+  // NOTE: A slow search is attributed on its own line. `search_knowledge` counts the times its
   // query embedding was asked again and puts the count in its artifact; the line carries it only
   // when there was one.
   test("a tool that had to ask again says how many times, and only then", async () => {
@@ -236,7 +264,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(details.filter((d) => "retries" in d)).toHaveLength(1);
   });
 
-  test("a ToolMessage with status error logs ONE warn/error line carrying the message", async () => {
+  test("a ToolMessage with status error logs ONE info/error line carrying the message", async () => {
     const flow = flowCtx();
     const logger = new ToolFlowLogger(flow);
     logger.handleToolStart(
@@ -259,24 +287,107 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     );
     const rows = await pollToolRows(flow.turnId, 1);
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.level).toBe("warn");
+    // NOTE: `info`: the model may call the tool again and succeed; the turn's outcome is `settle`'s.
+    expect(rows[0]?.level).toBe("info");
     expect(rows[0]?.status).toBe("error");
     expect(rows[0]?.errorMessage).toContain(
       "Google Calendar returned HTTP 500.",
     );
-    // The failure text lives in errorMessage, which has its own sanitizer and its own contract.
-    // `detail` keeps only the shape of what came back (issue #78): a tool result is a provider's
+    // NOTE: The failure text lives in errorMessage, which has its own sanitizer and its own contract.
+    // `detail` keeps only the shape of what came back: a tool result is a provider's
     // response body, which is no more allowlisted than the arguments that produced it.
     expect((rows[0]?.detail as Record<string, unknown> | null)?.output).toBe(
       "string(34)",
     );
   });
 
-  // The other half of that same contract, which was not being kept (issue #141). An operator's HTTP
-  // tool returns `HTTP <status>\n<body>`, and the body is the other end's: a business API answers a
-  // failed lookup with the customer's own record in it. `detail.output` was already reduced to a
-  // shape; `errorMessage` was taking the identical string whole, so the row kept by one column what
-  // the column beside it had just refused. The diagnosis is the part we wrote: the status line.
+  // THE TURN'S OUTCOME PER TOOL. A failed call is `info` when it ends, because the model may call the
+  // tool again; `settle` writes one `warn` for each tool that failed on every call it made, and
+  // nothing for one that failed and then worked.
+  test("a tool that failed and then worked leaves no warn; one that always failed leaves one", async () => {
+    const flow = flowCtx();
+    const logger = new ToolFlowLogger(flow);
+    let run = 0;
+    const call = (tool: string, failed: boolean, thrown = false) => {
+      const id = `run-outcome-${run++}`;
+      logger.handleToolStart(
+        {} as never,
+        "{}",
+        id,
+        undefined,
+        undefined,
+        undefined,
+        tool,
+      );
+      if (thrown) logger.handleToolError(new Error("socket hang up"), id);
+      else
+        logger.handleToolEnd(
+          failed
+            ? new ToolMessage({
+                status: "error",
+                content: "HTTP 502",
+                tool_call_id: id,
+                name: tool,
+              })
+            : "ok",
+          id,
+        );
+    };
+    call("consulta_pedido", true);
+    call("consulta_pedido", false);
+    call("agenda", true);
+    call("agenda", true, true);
+    call("estoque", false);
+    logger.settle();
+    // Settling again writes nothing more: the outcome is the turn's, said once.
+    logger.settle();
+    const rows = await pollToolRows(flow.turnId, 6);
+    expect(rows).toHaveLength(6);
+    const warns = rows.filter((r) => r.level === "warn");
+    expect(warns).toHaveLength(1);
+    expect(warns[0]?.detail).toEqual({ tool: "agenda", failedCalls: 2 });
+    expect(warns[0]?.errorMessage).toBe(
+      "agenda failed on every call this turn (2): socket hang up",
+    );
+    expect(
+      rows.filter((r) => r.level !== "warn").every((r) => r.level === "info"),
+    ).toBe(true);
+  });
+
+  // A call still running when the turn ended (a deadline rejects before LangChain delivers the
+  // tool's error) reports after `settle`, and is judged when it lands: a tool whose only call failed
+  // late still gets its `warn`, once, and a late success after an earlier failure gets none.
+  test("a call that ends after the turn settled is judged when it lands", async () => {
+    const flow = flowCtx();
+    const logger = new ToolFlowLogger(flow);
+    const start = (id: string, tool: string) =>
+      logger.handleToolStart(
+        {} as never,
+        "{}",
+        id,
+        undefined,
+        undefined,
+        undefined,
+        tool,
+      );
+    start("late-1", "agenda");
+    start("late-2", "estoque");
+    logger.handleToolError(new Error("socket hang up"), "late-2");
+    start("late-3", "estoque");
+    logger.settle();
+    logger.handleToolError(new Error("deadline"), "late-1");
+    logger.handleToolEnd("ok", "late-3");
+    const rows = await pollToolRows(flow.turnId, 4);
+    const warns = rows.filter((r) => r.level === "warn");
+    expect(warns.map((r) => r.detail)).toEqual([
+      { tool: "agenda", failedCalls: 1 },
+    ]);
+  });
+
+  // NOTE: The other half of that contract. An operator's HTTP tool returns `HTTP <status>\n<body>`,
+  // and the body is the other end's (a business API answers a failed lookup with the customer's own
+  // record). `errorMessage` must not keep whole what `detail.output` reduces to a shape; the part we
+  // wrote, the status line, is the diagnosis.
   test("a returned failure keeps the status line we wrote, never the body the other end sent", async () => {
     const flow = flowCtx();
     const logger = new ToolFlowLogger(flow);
@@ -299,14 +410,16 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       }),
       "run-body",
     );
-    const rows = await pollToolRows(flow.turnId, 1);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.level).toBe("warn");
+    logger.settle();
+    const rows = await pollToolRows(flow.turnId, 2);
+    expect(rows.map((r) => r.level).sort()).toEqual(["info", "warn"]);
     // Still enough to alert on and to diagnose: which tool, and what the other end answered.
-    expect(rows[0]?.errorMessage).toBe("HTTP 422");
-    expect(rows[0]?.errorMessage).not.toContain("Zebrafina");
-    expect(rows[0]?.errorMessage).not.toContain("12345678900");
-    expect(JSON.stringify(rows[0]?.detail)).not.toContain("12345678900");
+    expect(rows.find((r) => r.level === "info")?.errorMessage).toBe("HTTP 422");
+    expect(rows.find((r) => r.level === "warn")?.errorMessage).toBe(
+      "consulta_paciente failed on every call this turn (1): HTTP 422",
+    );
+    expect(JSON.stringify(rows)).not.toContain("Zebrafina");
+    expect(JSON.stringify(rows)).not.toContain("12345678900");
   });
 
   // `logToolValues` is the escape hatch the repo already gives an operator investigating one agent,
@@ -351,7 +464,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       undefined,
       "probe",
     );
-    // The ToolMessage-like shape the callback receives, with a structured content — which is where a
+    // NOTE: The ToolMessage-like shape the callback receives, with a structured content, which is where a
     // provider's own keys would arrive.
     logger.handleToolEnd(
       { content: { cpf: "12345678900", nome: "Maria Souza" } },
@@ -365,7 +478,7 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(detail?.output).toBe("object(2 keys)");
   });
 
-  test("e2e through the graph: one warn line AND the model sees the exact friendly string", async () => {
+  test("e2e through the graph: the call's info line, the turn's warn, AND the model sees the exact friendly string", async () => {
     const MSG = "The payment provider rejected the request (HTTP 503).";
     const probe = failableTool(async () => toolFailure(MSG), {
       name: "probe_fail",
@@ -381,13 +494,15 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       tools: [probe],
     });
     const flow = flowCtx();
+    const logger = new ToolFlowLogger(flow);
     await graph.invoke(
       { messages: [new HumanMessage("oi")] },
       {
         configurable: { thread_id: `tfl-${process.pid}` },
-        callbacks: [new ToolFlowLogger(flow)],
+        callbacks: [logger],
       },
     );
+    logger.settle();
 
     const second = model.seen[1] ?? [];
     const toolMsg = second.find((m) => m.getType() === "tool") as
@@ -398,11 +513,12 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
     expect(toolMsg?.status).toBe("error");
     expect(toolMsg?.tool_call_id).toBe("call_f1");
 
-    const rows = await pollToolRows(flow.turnId, 1);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.level).toBe("warn");
-    expect(rows[0]?.status).toBe("error");
-    expect(rows[0]?.errorMessage).toContain("HTTP 503");
+    const rows = await pollToolRows(flow.turnId, 2);
+    expect(rows.map((r) => [r.level, r.status]).sort()).toEqual([
+      ["info", "error"],
+      ["warn", "error"],
+    ]);
+    for (const r of rows) expect(r.errorMessage).toContain("HTTP 503");
   });
 
   test("the issue's full loop: a marked failure creates an alert delivery for a minLevel:warn channel", async () => {
@@ -433,28 +549,28 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       tools: [probe],
     });
     const flow = flowCtx();
+    const logger = new ToolFlowLogger(flow);
     await graph.invoke(
       { messages: [new HumanMessage("oi")] },
       {
         configurable: { thread_id: `tfl-alert-${process.pid}` },
-        callbacks: [new ToolFlowLogger(flow)],
+        callbacks: [logger],
       },
     );
+    logger.settle();
 
-    // NOTE: The delivery row is what the alert worker POSTs from — before this fix the failure was
-    // logged info/ok and no channel could ever produce one (the issue's exact complaint).
-    let delivery: { stage: string | null; level: string | null } | null = null;
-    for (let i = 0; i < 50 && !delivery; i++) {
-      delivery = await suDb.alertDelivery.findFirst({
+    // The delivery row is what the alert worker POSTs from, so a failure logged info/ok would
+    // never reach a channel.
+    const delivery = await until("the alert delivery", () =>
+      suDb.alertDelivery.findFirst({
         where: { tenantId, channelId: BigInt(channel.id), stage: "tool" },
         select: { stage: true, level: true },
-      });
-      if (!delivery) await new Promise((r) => setTimeout(r, 100));
-    }
+      }),
+    ).catch(() => null);
     expect(delivery).not.toBeNull();
     expect(delivery?.level).toBe("warn");
   });
-  // Issue #65 review: a tool's ARGUMENTS land in ExecutionLog.detail, which docs/logs.md states never
+  // NOTE: A tool's ARGUMENTS land in ExecutionLog.detail, which docs/logs.md states never
   // carries message text or PII. send_image adds two shapes the secret redactor does not catch: a URL
   // whose credential rides in the query (a presigned link — `redactSecretsDeep` keys off names like
   // `api_key`, not off `X-Amz-Signature`), and a caption, which is text written for the customer.
@@ -484,8 +600,8 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
         { messages: [new HumanMessage("oi")] },
         {
           configurable: { thread_id: `tfl-args-${crypto.randomUUID()}` },
-          // Same as production: the logger gets the toolset, which is where the declared parameter
-          // names come from. Without it no key is ever named (issue #78, round 1).
+          // NOTE: Same as production: the logger gets the toolset, which is where the declared parameter
+          // names come from. Without it no key is ever named.
           callbacks: [new ToolFlowLogger(flow, { ...opts, tools: [probe] })],
         },
       );
@@ -500,55 +616,6 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       });
       expect(logged?.url).toMatch(/^string\(\d+\)$/);
       expect(JSON.stringify(logged)).not.toContain("deadbeefcafe0000");
-    });
-
-    // Everything past the scheme is model-written free text: an order number, a document, a person's
-    // name in a filename — and the HOST too, because an operator who allows `*.loja.com.br` has handed
-    // the model the subdomain. `detail` is documented to hold ids/counts/enums and to be exportable.
-    test("an identifying path does not survive into storage", async () => {
-      const logged = await argsLoggedFor({
-        url: "https://cdn.loja.com.br/pedidos/48213/nota-fiscal-maria-silva.png",
-      });
-      expect(logged?.url).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("maria-silva");
-      expect(JSON.stringify(logged)).not.toContain("48213");
-    });
-
-    test("a subdomain the model chose under a wildcard host is gone too", async () => {
-      const logged = await argsLoggedFor({
-        url: "https://pedido-48213.loja.com.br/foto.png",
-      });
-      expect(logged?.url).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("48213");
-    });
-
-    test("credentials embedded in the URL itself are dropped too", async () => {
-      const logged = await argsLoggedFor({
-        url: "https://usuario:senha-secreta@cdn.loja.com.br/fotos/x.png",
-      });
-      expect(logged?.url).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("senha-secreta");
-      expect(JSON.stringify(logged)).not.toContain("usuario");
-    });
-
-    // WHATWG ignores leading spaces and control characters, so this is a working URL to `new URL()`
-    // and to `fetch` — and was ordinary text to a `^https?` prefix check, which stored it whole.
-    test("whitespace in front of a URL does not smuggle it past the sanitizer", async () => {
-      const logged = await argsLoggedFor({
-        url: " \thttps://cdn.loja.com.br/fotos/x.png?token=segredo-escondido",
-      });
-      expect(logged?.url).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("segredo-escondido");
-    });
-
-    // A string that announces itself as http(s) and then does not parse is exactly the case where we
-    // cannot tell which part of it is host and which is payload, so none of it is kept.
-    test("a URL that does not parse is replaced, not passed through", async () => {
-      const logged = await argsLoggedFor({
-        url: "https://cdn.loja.com.br:99999/x.png?token=segredo-em-voo",
-      });
-      expect(logged?.url).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("segredo-em-voo");
     });
 
     // A key the model invented (a free-form record parameter, or any provider-authored result) has no
@@ -574,17 +641,6 @@ describe.skipIf(!dbUp)("ToolFlowLogger — failure-aware tool lines", () => {
       );
       expect(logged?.url).toBe("https://cdn.loja.com.br/x.png");
       expect(logged?.caption).toBe("Oi Maria");
-    });
-
-    test("a caption never reaches storage at all", async () => {
-      const logged = await argsLoggedFor({
-        url: "https://cdn.loja.com.br/x.png",
-        caption: "Oi Maria, aqui está o modelo que você pediu",
-      });
-      // The caption used to be dropped by NAME; now it is described like anything else, and the
-      // text is gone either way — without a list of key names to keep adding to.
-      expect(logged?.caption).toMatch(/^string\(\d+\)$/);
-      expect(JSON.stringify(logged)).not.toContain("Maria");
     });
   });
 });

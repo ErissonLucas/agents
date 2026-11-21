@@ -1,8 +1,8 @@
 /// <reference lib="dom" />
 
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -10,13 +10,19 @@ import {
   waitFor,
 } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
+import { CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES } from "@/graph/tools/channel-natives";
+import {
+  type EditorStub,
+  lastSavedSettings,
+  renderEditor,
+  stubEditorApi,
+} from "../utils/agent-editor";
 
-// Issue #880: `sendImage.allowedHosts` is config OF the send_image tool, and an empty list makes the
-// tool refuse every call while it is still offered to the model. It lived in the Behavior tab, so the
-// operator granting the tool on the Tools tab saw nothing saying a list existed, or that it was empty.
-// It is edited on the tool's own card now and written by the Tools save, the way `crossInboxCase` and
-// `handoff` are. Two saves write the same settings column and each resends the whole bag, so the
-// ownership has to be exact on both sides.
+// `sendImage.allowedHosts` is config OF the send_image tool, and an empty list makes the tool refuse
+// every call while it is still offered to the model, so it is edited on the tool's own card, where
+// the operator grants it, and written by the Tools save, the way `crossInboxCase` and `handoff` are.
+// Two saves write the same settings column and each resends the whole bag, so the ownership has to
+// be exact on both sides.
 
 const { ToolGrantsEditor } = await import(
   "@/client/pages/agents/ToolGrantsEditor"
@@ -26,15 +32,10 @@ const { readSendImageState, serializeSendImage, sendImageHasNoHost } =
 const { ToastProvider } = await import("@/client/components/Toast");
 const { AuthProvider } = await import("@/client/contexts/AuthContext");
 const { ThemeProvider } = await import("@/client/contexts/ThemeContext");
-const {
-  NATIVE_TOOL_NAMES,
-  RAG_TOOL_NAMES,
-  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
-} = await import("@/graph/tools/catalog");
-const { readSendImageConfig } = await import("@/modules/images/settings");
-const { rebaseToolGrants } = await import(
-  "@/client/pages/agents/toolsBaseline"
+const { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } = await import(
+  "@/graph/tools/catalog"
 );
+const { readSendImageConfig } = await import("@/modules/images/settings");
 
 const WARNING =
   "No host is allowed yet, so every call is refused. Add at least one host.";
@@ -67,103 +68,152 @@ describe("the form round-trips what is stored", () => {
   });
 });
 
-describe("which save owns the block (source)", () => {
-  const src = readFileSync(
-    "src/client/pages/agents/AgentEditorPage.tsx",
-    "utf8",
-  );
-  const slice = (from: string, to: string) => {
-    const start = src.indexOf(from);
-    expect(start, `anchor not found: ${from}`).toBeGreaterThan(-1);
-    const end = src.indexOf(to, start + from.length);
-    expect(end, `closing anchor not found: ${to}`).toBeGreaterThan(-1);
-    return src.slice(start, end);
+// The two saves write the same settings column, each resending the whole bag: the Tools save owns
+// the block, and a Behavior save carries whatever the Tools save last stored. Asked of the whole
+// editor, rendered against a stubbed API.
+describe("which save owns the block", () => {
+  const STORED = { allowedHosts: ["cdn.loja.com.br"] };
+
+  async function openTools(): Promise<EditorStub> {
+    const stub = stubEditorApi(
+      { settings: { sendImage: STORED } },
+      {
+        catalog: { native: [{ name: "send_image" }] },
+        grants: [
+          {
+            source: "NATIVE",
+            enabledTools: ["send_image"],
+            knowledgeBaseIds: [],
+          },
+        ],
+      },
+    );
+    await renderEditor(stub, "tools");
+    return stub;
+  }
+  async function field(): Promise<HTMLTextAreaElement> {
+    if (!hostsField()) expand();
+    return await waitFor(() => {
+      const el = hostsField();
+      if (!el) throw new Error("the hosts field is not drawn");
+      return el;
+    });
+  }
+  async function typeHosts(value: string) {
+    fireEvent.change(await field(), { target: { value } });
+  }
+  const goTo = async (name: RegExp) => {
+    fireEvent.click(screen.getByRole("tab", { name }));
+    await act(async () => {});
   };
-
-  test("the Tools save writes it and keeps the shared bag in step", () => {
-    const body = slice("async function saveTools(", "\n  }\n");
-    expect(body).toContain(
-      "const sendImageJson = serializeSendImage(sendImage);",
-    );
-    expect(body.match(/sendImage: sendImageJson,/g)?.length ?? 0).toBe(2);
-  });
-
-  test("the Behavior save does not name it, so it cannot write a stale form over it", () => {
-    const body = slice("function buildSettings(", "\n  }\n");
-    expect(body).toContain("...settings,");
-    expect(body).not.toContain("sendImage");
-  });
-
-  test("it is re-read with the other tool config, not by a Behavior load or revert", () => {
-    const body = slice("const syncToolConfig = useCallback(", "}, []);");
-    expect(body).toContain("setSendImage(b.sendImage);");
-    expect(src.match(/setSendImage\(b\.sendImage\)/g)?.length).toBe(1);
-  });
-
-  test("it lights the Tools tab's unsaved dot, not Behavior's", () => {
-    expect(slice("tools: JSON.stringify({", "}),")).toContain("sendImage,");
-    expect(slice("behavior: JSON.stringify({", "}),")).not.toContain(
-      "sendImage",
-    );
-  });
-
-  test("the Behavior tab no longer draws the section", () => {
-    const behavior = readFileSync(
-      "src/client/pages/agents/BehaviorTab.tsx",
-      "utf8",
-    );
-    expect(behavior).not.toContain("sendImage");
-  });
-});
-
-// Review round 1 of #887: the Knowledge save writes the grant set and none of the Tools config, so it
-// may move only the grants half of the Tools baseline. Before, it recaptured all of it, and a host list
-// typed and not saved stopped reading as unsaved.
-describe("the Knowledge save leaves unsaved tool config dirty", () => {
-  test("only the grants move", () => {
-    const baseline = JSON.stringify({
-      grants: ["old"],
-      sendImage: { allowedHosts: "" },
+  const patches = (stub: EditorStub) =>
+    stub.writes.filter((w) => w.method === "PATCH" && w.body.settings);
+  const savedHosts = (stub: EditorStub) =>
+    (lastSavedSettings(stub)?.sendImage as { allowedHosts?: string[] })
+      ?.allowedHosts;
+  const behaviorSwitch = () =>
+    screen.findByRole("switch", {
+      name: /Stop answering when a person replies to the customer/,
     });
-    const snapshot = JSON.stringify({
-      grants: ["new"],
-      sendImage: { allowedHosts: "cdn.loja.com.br" },
-    });
-    const rebased = rebaseToolGrants(baseline, snapshot);
-    expect(JSON.parse(rebased)).toEqual({
-      grants: ["new"],
-      sendImage: { allowedHosts: "" },
-    });
-    // Still dirty against the live snapshot, and clean once the config matches again.
-    expect(rebased).not.toBe(snapshot);
-    expect(
-      rebaseToolGrants(
-        baseline,
-        JSON.stringify({ ...JSON.parse(baseline), grants: ["new"] }),
-      ),
-    ).toBe(JSON.stringify({ ...JSON.parse(baseline), grants: ["new"] }));
+  async function saveBehaviorEdit(stub: EditorStub) {
+    const before = patches(stub).length;
+    await goTo(/Behavior/);
+    fireEvent.click(await behaviorSwitch());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(before + 1));
+  }
+  const dirty = (name: RegExp) =>
+    screen.getByRole("tab", { name }).querySelector(".bg-warning") !== null;
+
+  test("the Tools save writes it and keeps the shared bag in step", async () => {
+    const stub = await openTools();
+    await typeHosts("cdn.novo.com.br");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(savedHosts(stub)).toEqual(["cdn.novo.com.br"]));
+    await saveBehaviorEdit(stub);
+    expect(savedHosts(stub)).toEqual(["cdn.novo.com.br"]);
   });
 
-  test("the Knowledge save asks for it, and the recapture honors it", () => {
-    const src = readFileSync(
-      "src/client/pages/agents/AgentEditorPage.tsx",
-      "utf8",
-    );
-    const start = src.indexOf("async function saveGrants(");
-    const body = src.slice(start, src.indexOf("\n  }\n", start));
-    expect(body).toContain("toolGrantsOnlyRef.current = true;");
-    expect(src).toContain(
-      "rebaseToolGrants(baselineRef.current.tools, sectionSnap.tools)",
-    );
-    // The flag is what picks that branch, and the Tools recapture is what consumes it.
-    expect(src).toContain(
-      'const grantsOnly = k === "tools" && toolGrantsOnlyRef.current;',
-    );
-    expect(src).toContain("[k]: grantsOnly");
-    const save = src.indexOf("async function saveTools(");
-    expect(src.slice(save, src.indexOf("\n  }\n", save))).not.toContain(
-      "toolGrantsOnlyRef",
-    );
+  // The bar saves the agent in one write: Behavior's blocks and Tools' together, the list as the
+  // Tools tab holds it, so neither writes a stale copy of the other's form.
+  test("a save of Behavior and Tools writes the drafted list, once", async () => {
+    const stub = await openTools();
+    await typeHosts("rascunho.com.br");
+    await goTo(/Behavior/);
+    fireEvent.click(await behaviorSwitch());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(1));
+    const hostsIn = (w: { body: Record<string, unknown> }) =>
+      (
+        (w.body.settings as Record<string, unknown>).sendImage as {
+          allowedHosts?: string[];
+        }
+      )?.allowedHosts;
+    const [write] = patches(stub);
+    expect(write && hostsIn(write)).toEqual(["rascunho.com.br"]);
+  });
+
+  // A refused save writes neither tab, so the field keeps the draft and both stay unsaved.
+  test("a refused save keeps the drafted list and both tabs unsaved", async () => {
+    const stub = await openTools();
+    await typeHosts("rascunho.com.br");
+    stub.override = (method) =>
+      method === "PATCH"
+        ? Response.json({ error: "boom" }, { status: 500 })
+        : undefined;
+    await goTo(/Behavior/);
+    fireEvent.click(await behaviorSwitch());
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(1));
+    for (let i = 0; i < 5; i++) await act(async () => {});
+    expect(dirty(/Behavior/)).toBe(true);
+    await goTo(/Tools/);
+    expect((await field()).value).toBe("rascunho.com.br");
+    expect(dirty(/Tools/)).toBe(true);
+  });
+
+  test("it lights the Tools tab's unsaved dot, not Behavior's", async () => {
+    await openTools();
+    expect(dirty(/Tools/)).toBe(false);
+    await typeHosts("outro.com.br");
+    await waitFor(() => expect(dirty(/Tools/)).toBe(true));
+    expect(dirty(/Behavior/)).toBe(false);
+  });
+
+  test("the Behavior tab no longer draws the section", async () => {
+    await openTools();
+    await goTo(/Behavior/);
+    await behaviorSwitch();
+    // NOTE: booleans: a failed expectation holding a node serializes the whole tree and stalls.
+    expect({
+      labelled: screen.queryByLabelText("Allowed hosts") !== null,
+      field: hostsField() !== null,
+    }).toEqual({ labelled: false, field: false });
+  });
+
+  // Tools and Knowledge go out in one write: refused, it leaves the host list and the reviewer both
+  // unsaved.
+  test("a refused save leaves the host list and the Knowledge edit unsaved", async () => {
+    const stub = await openTools();
+    await typeHosts("rascunho.com.br");
+    await waitFor(() => expect(dirty(/Tools/)).toBe(true));
+    await goTo(/Knowledge/);
+    const provider = document
+      .getElementById("kb-review")
+      ?.querySelector("select");
+    if (!provider)
+      throw new Error("the reviewer's provider select is not drawn");
+    fireEvent.change(provider, { target: { value: "anthropic" } });
+    stub.override = (method) =>
+      method === "PATCH"
+        ? Response.json({ error: "boom" }, { status: 500 })
+        : undefined;
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(patches(stub).length).toBe(1));
+    await act(async () => {});
+    expect(dirty(/Tools/)).toBe(true);
+    expect(dirty(/Knowledge/)).toBe(true);
+    expect(stub.requests.some((r) => r.startsWith("PUT "))).toBe(false);
   });
 });
 
@@ -240,10 +290,14 @@ function renderCard(opts: {
       mergeContacts: false,
       resolveOrigin: false,
       subjectTemplate: "",
+      openingTemplate: "",
+      noteTemplate: "",
     },
     setCrossInboxCase: noop,
     sendImage: { allowedHosts: opts.hosts },
     setSendImage: noop,
+    resolveConversation: { assignLabels: [] },
+    setResolveConversation: noop,
     setCustomAttributeInstructions: noop,
     labelInstructions: "",
     protectedLabels: "",
@@ -252,6 +306,10 @@ function renderCard(opts: {
     setAllowedLabels: noop,
     outsideAllowedLabels: "refuse",
     setOutsideAllowedLabels: noop,
+    labelRemoval: "any",
+    setLabelRemoval: noop,
+    writableAttributes: { conversation: [], contact: [], task: [] },
+    setWritableAttributes: noop,
     setLabelInstructions: noop,
     updateKanbanTaskInstructions: "",
     setUpdateKanbanTaskInstructions: noop,
@@ -299,12 +357,12 @@ describe("the send_image card", () => {
     renderCard({ granted: true, hosts: "" });
     await ready();
     expect(screen.queryAllByText("Send image").length).toBeGreaterThan(0);
-    // Collapsed, as it loads: the warning is already on screen.
+    // NOTE: collapsed, as it loads: the warning is already on screen.
     expect(hostsField()).toBeNull();
     expect(screen.queryByText(WARNING)).not.toBeNull();
     expand();
     expect(hostsField()).not.toBeNull();
-    // A single textarea keeps its label: the field is named "Allowed hosts" (review round 1 of #887).
+    // NOTE: a single textarea keeps its label: the field is named "Allowed hosts".
     expect(screen.getByLabelText("Allowed hosts")).toBe(
       hostsField() as HTMLTextAreaElement,
     );
@@ -335,7 +393,7 @@ describe("the send_image card", () => {
     // One title: the tool left the simple-toggle grid for its own card.
     const dots = () =>
       document.querySelectorAll(
-        'span.rounded-full.bg-accent[aria-hidden="true"]',
+        'span.rounded-full.bg-accent-solid[aria-hidden="true"]',
       ).length;
     renderCard({ granted: true, hosts: "cdn.loja.com.br" });
     await ready();

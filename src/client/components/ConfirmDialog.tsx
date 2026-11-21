@@ -10,7 +10,8 @@ export interface ConfirmPayload {
   cancelLabel?: string;
   danger?: boolean;
   // Awaited; the dialog shows a busy state until it settles, then closes. Throw
-  // to keep the dialog open on failure (the caller surfaces its own error toast).
+  // to keep the dialog open on failure (the caller surfaces its own error toast);
+  // the dialog swallows the throw, since the click handler is the only awaiter.
   onConfirm: () => void | Promise<void>;
 }
 
@@ -33,6 +34,8 @@ export function ConfirmDialog({
     try {
       await payload.onConfirm();
       modal.close();
+    } catch {
+      // NOTE: the caller already showed why; staying open is the whole response.
     } finally {
       setBusy(false);
     }
@@ -43,7 +46,7 @@ export function ConfirmDialog({
       modal={modal}
       size="sm"
       title={payload?.title ?? ""}
-      onCloseRequest={busy ? () => undefined : undefined}
+      busy={busy}
       footer={
         <div className="flex justify-end gap-2">
           <Button
@@ -64,7 +67,7 @@ export function ConfirmDialog({
       }
     >
       {payload?.message && (
-        <p className="text-sm text-text-secondary">{payload.message}</p>
+        <p className="text-text-secondary text-sm">{payload.message}</p>
       )}
     </Modal>
   );

@@ -5,6 +5,7 @@ import {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from "react";
 import { Logo } from "@/client/components/Logo";
@@ -13,7 +14,9 @@ import {
   getActiveTenantId,
 } from "@/client/lib/activeTenant";
 import { api } from "@/client/lib/api";
+import { applyUserUpdate } from "@/client/lib/applyUserUpdate";
 import { performLogout } from "@/client/lib/logout";
+import { resetPasskeyOffer } from "@/client/lib/passkeyOffer";
 import { noteOperator } from "@/client/lib/toolSample";
 import type { TtsCheckMode } from "@/modules/tts/settings-shared";
 
@@ -22,9 +25,9 @@ export interface User {
   email: string;
   name: string | null;
   role: string;
-  // NOTE: null only for SUPER_ADMIN (cross-tenant). Used by the UI to scope per-tenant
-  // concerns (branding, realtime topic). For everyone else it is the tenant THIS session runs
-  // under: the membership the console selected, or the person's default (issue #756).
+  // Null only for SUPER_ADMIN (cross-tenant). Used by the UI to scope per-tenant concerns (branding,
+  // realtime topic). For everyone else it is the tenant THIS session runs under: the membership the
+  // console selected, or the person's default.
   tenantId: string | null;
   // The tenant's display name (header chip). Only /auth/me returns it; login/signup/accept
   // responses omit it (optional here), and login() backfills it via a /me refresh. Null for
@@ -34,8 +37,12 @@ export interface User {
   // it; drives the settings change-password form vs the "you sign in with Google" note. Optional
   // because login/signup/accept responses omit it (backfilled by the /me refresh).
   hasPassword?: boolean;
-  // Every tenant the person belongs to, with the role held there (issue #756). Only /auth/me returns
-  // it; more than one puts the membership switcher in the header. Empty for the SUPER_ADMIN.
+  // Whether the account is linked to a Google identity, and when it was created. Only /auth/me
+  // returns them (the Settings pages read them), backfilled by the /me refresh after a login.
+  googleLinked?: boolean;
+  createdAt?: string | null;
+  // Every tenant the person belongs to, with the role held there. Only /auth/me returns it; more than
+  // one puts the membership switcher in the header. Empty for the SUPER_ADMIN.
   tenants?: { id: string; name: string; role: string }[];
 }
 
@@ -54,12 +61,20 @@ interface AuthContextType {
   setupRequired: boolean;
   setupTokenRequired: boolean;
   signupEnabled: boolean;
+  // Whether passkey sign-in is on (PASSKEYS_ENABLED); off, no screen shows a passkey.
+  passkeysEnabled: boolean;
   mcpStdioEnabled: boolean;
-  // The deployment's audio detector, as far as the editor needs it (issue #802).
+  // Whether this install runs the client channel; off, no screen shows a client source.
+  clientChannelEnabled: boolean;
+  // The deployment's audio detector, as far as the editor needs it.
   ttsCheck: { configured: boolean; mode: TtsCheckMode };
   login: (user: User) => void;
   logout: () => Promise<boolean>;
   refresh: () => Promise<void>;
+  // Applies fields a mutation already returned (PATCH /auth/me), so a save does not depend on a
+  // follow-up refresh. Keyed by the account that made the change: a response landing after a
+  // sign-out and a sign-in as someone else must not rename the new account.
+  updateUser: (userId: string, fields: Partial<User>) => void;
 }
 
 // Exported so a test can hand a component what /me would have said without the whole provider.
@@ -71,25 +86,32 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [setupRequired, setSetupRequired] = useState(false);
   const [setupTokenRequired, setSetupTokenRequired] = useState(false);
   const [signupEnabled, setSignupEnabled] = useState(false);
+  const [passkeysEnabled, setPasskeysEnabled] = useState(false);
   const [mcpStdioEnabled, setMcpStdioEnabled] = useState(false);
+  const [clientChannelEnabled, setClientChannelEnabled] = useState(false);
   const [ttsCheck, setTtsCheck] = useState<{
     configured: boolean;
     mode: TtsCheckMode;
   }>({ configured: false, mode: "off" });
   const [loading, setLoading] = useState(true);
+  // Bumped on every sign-in and sign-out. A /me response that left under an earlier session must not
+  // touch the current one: a refresh resolving after a sign-out would otherwise bring the
+  // signed-out user back.
+  const sessionGen = useRef(0);
+  // The user as last applied, for `updateUser`, which merges into it without a second setter. Written
+  // only in `applyUser`, not per render: a sign-out and a late save landing in one batch must see the
+  // sign-out, and the render in between is exactly what has not happened yet.
+  const userRef = useRef<User | null>(null);
 
-  // THE ONLY CALLER OF `setUser`, and that is the point rather than a tidiness: what has to happen
-  // on every transition to unauthenticated is written once, where the transition IS, instead of at
-  // each of the places that can cause one. The tool editor keeps the last saved sample response in
-  // memory (`client/lib/toolSample`), which is the customer's data; left behind, the next sign-in on
-  // this same tab would be offered the previous operator's responses.
-  //
-  // Rounds 4 and 5 of review are the same finding twice, which is why this is a chokepoint now and
-  // not a third call added beside the other two. The paths that end a session are the explicit
-  // logout below, a 401 on any request and the socket's auth-loss close (both through the
-  // `auth:unauthorized` event), and a `/me` that answers with a null user, which is how a refresh
-  // observes a session the server has already ended. Only the first is spelled like a logout.
+  // THE ONLY CALLER OF `setUser`, so what has to happen on every transition to unauthenticated
+  // is written once, where the transition IS. The tool editor keeps the last sample response in memory
+  // (`client/lib/toolSample`), the customer's data, which the next sign-in on this tab must not be
+  // offered. The paths that end a session are the explicit logout below, a 401 on any request and the
+  // socket's auth-loss close (both via `auth:unauthorized`), and a `/me` answering a null user, which
+  // is how a refresh observes a session the server already ended.
+
   const applyUser = useCallback((next: User | null) => {
+    userRef.current = next;
     setUser(next);
     // UNCONDITIONAL, and the comparison is the module's: what it owns is whose captured responses it
     // is holding, and every transition this console makes is one it has to hear about. That includes
@@ -100,22 +122,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     noteOperator(next?.id ?? null);
   }, []);
 
-  const clearUser = useCallback(() => applyUser(null), [applyUser]);
+  const clearUser = useCallback(() => {
+    sessionGen.current += 1;
+    resetPasskeyOffer();
+    applyUser(null);
+  }, [applyUser]);
 
-  // NOTE: Shared /me fetch used at boot and for explicit refreshes (e.g. after
+  // Shared /me fetch used at boot and for explicit refreshes (e.g. after
   // a /setup 409, where the server flipped to "setup complete" but this client
   // still has the stale `setupRequired=true` and would otherwise loop through
   // SetupGate). Returns `true` when the server gave a definitive answer (a 200
   // with body, or a 4xx) and `false` on a transient failure (network error or
   // 5xx) so the boot path can retry instead of treating it as "logged out".
   const fetchAuthState = useCallback(async () => {
+    const genAtStart = sessionGen.current;
     try {
       const { data, error } = await api.api.auth.me.get();
+      if (sessionGen.current !== genAtStart) return true;
       if (data && !error) {
-        // NOTE: `applyUser(data.user ?? null)` (not the prior conditional
-        // `if (data.user)`) so a refresh() that observes a logged-out server
-        // state clears any stale signed-in client state. The boot path is
-        // unaffected (user defaults to null), but refresh() relies on this.
+        // NOTE: applied even when null, so a refresh() that observes a logged-out server clears any stale
+        // signed-in client state. The boot path is unaffected (user defaults to null).
         applyUser(data.user ?? null);
         adoptSessionTenant(data.user ?? null, data.defaultTenantId ?? null);
         const next: AuthProviders = {};
@@ -137,12 +163,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           setSetupTokenRequired(data.setupTokenRequired);
         if (typeof data.signupEnabled === "boolean")
           setSignupEnabled(data.signupEnabled);
+        if (typeof data.passkeysEnabled === "boolean")
+          setPasskeysEnabled(data.passkeysEnabled);
         if (typeof data.mcpStdioEnabled === "boolean")
           setMcpStdioEnabled(data.mcpStdioEnabled);
+        // NOTE: the Free edition's session answer has no such field, and the channel stays off there.
+        if (
+          "clientChannelEnabled" in data &&
+          typeof data.clientChannelEnabled === "boolean"
+        )
+          setClientChannelEnabled(data.clientChannelEnabled);
         if (data.ttsCheck) setTtsCheck(data.ttsCheck);
         return true;
       }
-      // NOTE: Eden types `error` as `null` for /me (the route declares no
+      // Eden types `error` as `null` for /me (the route declares no
       // non-2xx responses), but the framework still surfaces a real error
       // object on a 5xx or network failure at runtime, hence the cast. A 4xx is
       // a definitive client-side answer (stop); 5xx/unknown is transient.
@@ -161,16 +195,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     await fetchAuthState();
   }, [fetchAuthState]);
 
+  const updateUser = useCallback(
+    (userId: string, fields: Partial<User>) =>
+      applyUser(applyUserUpdate(userRef.current, userId, fields)),
+    [applyUser],
+  );
+
   useEffect(() => {
     let cancelled = false;
 
-    // NOTE: The server is briefly unreachable during `bun dev --hot` reloads
-    // and during transient network blips in production. The prior code treated
-    // any failed /me at boot as "logged out", so a refresh landing in that
-    // window sporadically redirected to /login (via ProtectedRoute) even though
-    // the auth cookie was still valid. Retry network/5xx with a short backoff
-    // (~4.5s worst case); only a 200 (session resolved, user or null) or a 4xx
-    // ends the check. On the happy path the first attempt resolves instantly.
+    // The server is briefly unreachable during `bun dev --hot` reloads and network blips in
+    // production, and treating a failed /me at boot as "logged out" would redirect to /login (via
+    // ProtectedRoute) with the auth cookie still valid. So network/5xx retries with a short backoff
+    // (~4.5s worst case); only a 200 (user or null) or a 4xx ends the check.
     const resolveAuth = async () => {
       const backoffMs = [300, 600, 1200, 2400];
       for (let attempt = 0; ; attempt++) {
@@ -194,7 +231,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [clearUser]);
 
   const login = (loggedInUser: User) => {
-    // NOTE: A SUPER_ADMIN (tenantId null) with no active tenant selected yet would let the dashboard
+    // A SUPER_ADMIN (tenantId null) with no active tenant selected yet would let the dashboard
     // mount and fire tenant-scoped calls (agents, metrics, approvals) with no X-Tenant-Id BEFORE the
     // async /me refresh seeds the selector → 400 on first paint. The boot/reload path avoids this by
     // awaiting /me before clearing `loading`; /setup avoids it by seeding the tenant synchronously from
@@ -202,6 +239,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     // tenant). Non-super users, and browsers that already hold a stored selection, skip the wait.
     const awaitsTenantSeed =
       loggedInUser.role === "SUPER_ADMIN" && getActiveTenantId() === null;
+    sessionGen.current += 1;
+    // NOTE: a new sign-in may be offered a passkey again, and work the last one started must not act
+    // for this one.
+    resetPasskeyOffer();
     applyUser(loggedInUser);
     // NOTE: A successful auth means at least one account exists, so first-run
     // setup is necessarily done. Clear the (boot-time) flag so SetupGate stops
@@ -223,9 +264,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   if (loading) {
     return (
-      <div className="flex min-h-dvh flex-col items-center justify-center gap-6 bg-bg-primary">
+      <div className="bg-bg-primary flex min-h-dvh flex-col items-center justify-center gap-6">
         <Logo className="h-10" />
-        <Loader2 className="h-6 w-6 animate-spin text-text-secondary" />
+        <Loader2 className="text-text-secondary h-6 w-6 animate-spin" />
       </div>
     );
   }
@@ -239,11 +280,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setupRequired,
         setupTokenRequired,
         signupEnabled,
+        passkeysEnabled,
         mcpStdioEnabled,
+        clientChannelEnabled,
         ttsCheck,
         login,
         logout,
         refresh,
+        updateUser,
       }}
     >
       {children}
@@ -251,8 +295,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   );
 }
 
-// The deployment's audio detector, read without requiring a provider (issue #802): the Behavior tab
-// is also rendered on its own (tests, previews), and there "no detector" is the honest answer.
+// The deployment's audio detector, read without requiring a provider: the Behavior tab is also
+// rendered on its own (tests, previews), and there "no detector" is the honest answer.
 export function useTtsCheckInfo(): { configured: boolean; mode: TtsCheckMode } {
   return (
     useContext(AuthContext)?.ttsCheck ?? { configured: false, mode: "off" }
@@ -265,4 +309,10 @@ export function useAuth() {
     throw new Error("useAuth must be used within an AuthProvider");
   }
   return context;
+}
+
+// The client channel switch alone, false outside an AuthProvider: the screens that hide the client
+// source are also rendered on their own (tests, embeds), where no session exists to ask.
+export function useClientChannelEnabled(): boolean {
+  return useContext(AuthContext)?.clientChannelEnabled ?? false;
 }

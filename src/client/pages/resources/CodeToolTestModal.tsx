@@ -33,31 +33,10 @@ import { fieldTypeLabels } from "./toolFieldTypes";
 // out of a failed call) but reports a code tool's answer — the text the agent would receive, whether
 // it failed, and the console output — not an HTTP status and a body.
 
-// Which of the runtime's context variables this body is SEEN to read, in the runtime's own order.
-//
-// A shortcut, and it has to be read as one: this is arbitrary JavaScript, so `const { contact_email
-// } = context` and `const c = context; c.contact_email` are ordinary spellings no property scan can
-// see (round 27). Missing one silently is the failure this dialog exists to avoid, so the operator
-// can always ask for the full list; what the scan buys is that the ordinary body opens with the two
-// fields it uses instead of ten.
-//
-// The same question the HTTP tool's dialog asks of a template (`contextNamesReferencedBy`), and
-// asked for the same reason: the operator can only supply a value for a name they are shown, and
-// showing all ten when the body reads one is a form nobody fills. TEXT, not a parse: a body that
-// does not compile is savable and testable by design, so a parser that refuses it would take the
-// dialog down with it, and the cost of reading one name too many is one empty field.
-//
-// Only the ten the runtime exposes as strings. `conversationAttributes` and `contactAttributes` are
-// objects a turn loads from the database, and no text field can stand for them.
-// What the dialog actually SENDS, out of the boxes it collected. Only what the operator filled in:
-// a blank box is a variable the turn did not have either, which is a real case the body has to
-// survive, and sending "" for it would test a different one.
-//
-// `agent_name` is the exception, because it is the exception at RUN time: `httpToolContext` spreads
-// it unconditionally, and the vocabulary says `always: true` on that basis, so a body may
-// dereference it without a `??`. A dialog that can omit it simulates a turn that cannot happen, and
-// fails a body the runtime never fails. Blank falls back to the default the box opens with rather
-// than dropping the key.
+// What the dialog SENDS, out of the boxes it collected: only what the operator filled in, since a
+// blank box is a variable the turn did not have either, and sending "" would test a different case.
+// `agent_name` is the exception, as at run time: `httpToolContext` always spreads it (`always: true`
+// in the vocabulary), so a body may dereference it without `??`. Blank falls back to the default.
 export function contextToSend(
   collected: Record<string, string>,
   names: readonly string[],
@@ -68,23 +47,23 @@ export function contextToSend(
     const v = collected[name] ?? "";
     if (v !== "") out[name] = v;
   }
-  // NOTE: outside the loop because `names` comes from a SCAN of the body, and a scan can miss the
-  // read: `const { agent_name } = context` names it nowhere a regex over member access can see, so
-  // the name would not be in the list to fall back for. The guarantee is about the RUNTIME, which
-  // spreads the key unconditionally, so it cannot depend on the dialog having recognised how the
-  // body spells the read.
+  // Outside the loop because `names` comes from a SCAN of the body, which misses reads like
+  // `const { agent_name } = context`; the runtime spreads the key unconditionally regardless.
   const typed = collected.agent_name ?? "";
   out.agent_name = typed !== "" ? typed : agentNameDefault;
   return out;
 }
 
+// Which of the runtime's context variables this body is SEEN to read, in the runtime's own order: a
+// shortcut, since destructured or aliased reads are invisible to a property scan, so the full list
+// is always one click away. TEXT, not a parse, because a body that does not compile is still
+// testable. Only the ten string variables; the attribute objects have no text field to stand in.
 export function contextNamesUsedBy(code: string): string[] {
   const used = new Set<string>();
   for (const m of code.matchAll(
-    // Four spellings, and optional chaining is not the exotic one: a body reading a variable the
-    // turn may not have is WRITTEN `context?.contact_email` (round 26). Two top-level alternatives
-    // because `?.` sits in a different place in each: before the bracket in `context?.["x"]`, in
-    // place of the dot in `context?.x`.
+    // NOTE: Four spellings, optional chaining included: a body reading a variable the turn may not
+    // have writes `context?.contact_email`. Two top-level alternatives because `?.` sits before the
+    // bracket in `context?.["x"]` and in place of the dot in `context?.x`.
     /\bcontext\s*(?:\?\.\s*\[|\[)\s*(?:"([^"]*)"|'([^']*)')\s*\]|\bcontext\s*\??\.\s*([A-Za-z_$][\w$]*)/g,
   )) {
     const name = m[1] ?? m[2] ?? m[3];
@@ -150,10 +129,10 @@ export function CodeToolTestModal({
   // The conversation variables, which no model supplies and no dialog can guess. Collected the way
   // the HTTP tool's dialog collects the `{{names}}` its template mentions.
   const [context, setContext] = useState<Record<string, string>>({});
-  // The zone `Date`, TIMEZONE and NOW_LOCAL run in. It is the AGENT's at run time and the dialog has
-  // no agent, so it is asked rather than assumed: silently using the browser's made a body that
-  // reads a date pass here and behave differently in production, with the two zones never named on
-  // screen. The browser's is the first guess because it is the one the operator can sanity-check.
+  // The zone `Date`, TIMEZONE and NOW_LOCAL run in. It is the AGENT's at run time and the
+  // dialog has no agent, so it is asked rather than assumed: silently using the browser's would let a
+  // date-reading body pass here and behave differently in production. The browser's is the first
+  // guess because it is the one the operator can sanity-check.
   const [timezone, setTimezone] = useState("UTC");
   // The scan below cannot see a destructured or aliased read, so the full list is one click away.
   const [allContext, setAllContext] = useState(false);
@@ -275,7 +254,7 @@ export function CodeToolTestModal({
       title={t("codeTools.testTitle", "Test this code tool")}
       // NO WAY OUT WHILE A REQUEST IS IN FLIGHT: the token makes a late answer harmless but does not
       // un-run the body, so dismissing and running again would run it twice (docs/modals.md).
-      onCloseRequest={running ? () => {} : undefined}
+      busy={running}
       footer={
         <div className="flex items-center justify-between gap-2">
           <span className="text-error text-xs">{error}</span>
@@ -403,7 +382,7 @@ export function CodeToolTestModal({
           <div className="flex flex-col gap-2">
             {contextNames.map((name) => (
               <div key={name} className="flex items-center gap-2 text-xs">
-                <code className="w-40 shrink-0 truncate rounded bg-bg-tertiary px-1 py-0.5 font-mono">
+                <code className="bg-bg-tertiary w-40 shrink-0 truncate rounded px-1 py-0.5 font-mono">
                   {name}
                 </code>
                 <Input
@@ -461,16 +440,16 @@ export function CodeToolTestModal({
         </FormField>
 
         {result && (
-          <div className="flex flex-col gap-2 rounded-md border border-border p-3">
+          <div className="border-border flex flex-col gap-2 rounded-md border p-3">
             <div className="flex items-center gap-2 text-xs">
               {result.failed ? (
                 <AlertTriangle
-                  className="h-4 w-4 shrink-0 text-warning"
+                  className="text-warning h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
               ) : (
                 <Check
-                  className="h-4 w-4 shrink-0 text-success"
+                  className="text-success h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
               )}
@@ -484,7 +463,7 @@ export function CodeToolTestModal({
               group
               label={t("codeTools.testResult", "What the agent would receive")}
             >
-              <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg-tertiary p-2 text-text-primary text-xs">
+              <pre className="border-border bg-bg-tertiary text-text-primary max-h-48 overflow-auto rounded-md border p-2 text-xs break-words whitespace-pre-wrap">
                 {result.text}
               </pre>
             </FormField>
@@ -493,7 +472,7 @@ export function CodeToolTestModal({
                 group
                 label={t("codeTools.testLogs", "Console output")}
               >
-                <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-bg-tertiary p-2 text-text-secondary text-xs">
+                <pre className="border-border bg-bg-tertiary text-text-secondary max-h-40 overflow-auto rounded-md border p-2 text-xs break-words whitespace-pre-wrap">
                   {logs.join("\n")}
                 </pre>
               </FormField>

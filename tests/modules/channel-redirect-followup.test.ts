@@ -1,9 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import type { BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { isNudgeTurn } from "@/graph/markers";
 import {
   armRedirectChatFollowUp,
   chatFollowupNudge,
@@ -21,7 +23,9 @@ import {
   type enqueueJob,
   rescheduleJob,
 } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { flowLogRows } from "../utils/flowlog";
 
 describe("parseRedirectFollowUpPayload", () => {
   test("valid chat-stage payload", () => {
@@ -196,7 +200,7 @@ describe("armRedirectChatFollowUp", () => {
     });
   });
 
-  // Review round 12 of #355. The stamp is what lets the mirror's retirement tell the ladder it is
+  // The stamp is what lets the mirror's retirement tell the ladder it is
   // ending from the one it is starting, and both directions matter: an event that states an episode
   // must put it on the job, and an event that states none must leave the key OFF rather than write
   // a null that reads as "the cleared episode".
@@ -358,8 +362,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -540,15 +544,11 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     await suDb.tenant.delete({ where: { id: tenantId } }).catch(() => {});
   });
 
-  // The caller with no job to ask about. A widget resolve reaches the closing straight from a webhook,
-  // so every `stillWanted` fence inside is one this path skips — while /reset CLEARS the at-most-once
-  // anchor on purpose, so the funnel can be tested again. Between this run's claim and its sends, that
-  // clear used to leave it free to post the goodbye and resolve the sibling on an episode the operator
-  // had just been told was erased.
-  //
-  // The reset lands in exactly that window. The rendezvous is the claim re-read itself, because the
-  // claim's own write holds the row until it commits: a second connection writing there first blocks
-  // on the lock instead of simulating anything.
+  // The caller with no job to ask about: a widget resolve reaches the closing straight from a webhook,
+  // skipping every `stillWanted` fence, while /reset CLEARS the at-most-once anchor on purpose. A
+  // clear between this run's claim and its sends must stop the goodbye. The rendezvous is the claim
+  // re-read itself, because the claim's own write holds the row until it commits: a second connection
+  // writing there first blocks on the lock instead of simulating anything.
   const restoreAnchor = async () => {
     await suDb.conversation.updateMany({
       where: { tenantId, chatwootConversationId: WIDGET_CONV },
@@ -556,9 +556,9 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     });
   };
 
-  // Review round 10 of #355. A timed close (`closeChat: true`) posts the goodbye on the chat and
-  // resolves it BEFORE it looks the WhatsApp sibling up, and every fence past that first send is
-  // deliberately skipped — half a goodbye is worse than a duplicate. So the sibling lookup is the one
+  // A timed close (`closeChat: true`) posts the goodbye on the chat and resolves it BEFORE it looks
+  // the WhatsApp sibling up, and every fence past that first send is deliberately skipped (half a
+  // goodbye is worse than a duplicate). So the sibling lookup is the one
   // read that happens after this run is already committed to an episode, and re-reading the pairing
   // there lets a re-entry landing inside those round trips redirect the WhatsApp half: a move sends
   // the goodbye to, and RESOLVES, the conversation the NEW episode just paired with.
@@ -774,7 +774,8 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       query: {
         conversation: {
           async findFirst({ args, query }) {
-            if (!cleared) {
+            // NOTE: After the chat goodbye, so the reset lands on the sibling lookup.
+            if (!cleared && s.sent.length > 0) {
               cleared = true;
               await restoreAnchor();
             }
@@ -806,14 +807,86 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     }
   });
 
-  // The other ordering, and the one the anchor alone cannot see. Above, the reset lands AFTER the
-  // claim and the post-claim re-read catches it. Here it lands BEFORE: the resolve trigger reaches
-  // this function straight from a webhook, so it carries no `stillWanted`, and while it is loading
-  // Issue #222. The closing MESSAGES and RESOLVES the conversation it picks, and it used to pick the
-  // contact's most-recently-active conversation on the entry inbox. Writing into an older entry
-  // conversation is enough to make it the latest, so the goodbye and the resolve land on a thread that
-  // was never this episode's origin. Here the decoy is deliberately newer, and the stored pairing
-  // still wins.
+  // The limit's count is a read between the closing's fences and its first goodbye, so a reset landing
+  // there is caught by asking again after it, before anything has left.
+  test("a scheduled closing reset during the limit's count sends nothing", async () => {
+    await restoreAnchor();
+    const s = stubClient();
+    let cleared = false;
+    const resetOnCount = suDb.$extends({
+      query: {
+        agentTurnDelivery: {
+          async count({ args, query }) {
+            if (!cleared) {
+              cleared = true;
+              await restoreAnchor();
+            }
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      const outcome = await deliverRedirectClosing({
+        tenantId,
+        instanceId,
+        widgetConversationId: WIDGET_CONV,
+        entryInboxId: 110,
+        closingMessage: "Vamos encerrar por aqui.",
+        closeChat: true,
+        base: resetOnCount,
+        deps: { makeClient: s.makeClient },
+      });
+      expect(cleared).toBe(true);
+      expect(outcome).toBe("already-closed");
+      expect(s.sent).toEqual([]);
+      expect(s.resolved).toEqual([]);
+    } finally {
+      await restoreAnchor();
+    }
+  });
+
+  test("a resolve-path closing reset during the limit's count sends nothing", async () => {
+    await restoreAnchor();
+    const s = stubClient();
+    let cleared = false;
+    const resetOnCount = suDb.$extends({
+      query: {
+        agentTurnDelivery: {
+          async count({ args, query }) {
+            if (!cleared) {
+              cleared = true;
+              await restoreAnchor();
+            }
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      const outcome = await deliverRedirectClosing({
+        tenantId,
+        instanceId,
+        widgetConversationId: WIDGET_CONV,
+        entryInboxId: 110,
+        closingMessage: "Vamos encerrar por aqui.",
+        closeChat: false,
+        base: resetOnCount,
+        deps: { makeClient: s.makeClient },
+      });
+      expect(cleared).toBe(true);
+      expect(outcome).toBe("already-closed");
+      expect(s.sent).toEqual([]);
+      expect(s.resolved).toEqual([]);
+    } finally {
+      await restoreAnchor();
+    }
+  });
+
+  // The closing MESSAGES and RESOLVES the conversation it picks. The contact's most recently active
+  // entry conversation is the wrong pick: writing into an older one makes it the latest, and the
+  // goodbye lands on a thread that was never this episode's origin. The decoy is newer, and the stored
+  // pairing still wins.
   test("the closing acts on the STORED origin, not the most recently active entry conversation", async () => {
     await restoreAnchor();
     const DECOY_CONV = 7173;
@@ -834,7 +907,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
         chatwootConversationId: DECOY_CONV,
         status: "pending",
         threadId: `${tenantId}:${instanceId}:${DECOY_CONV}`,
-        // NEWER than the origin: the old predicate would take this one.
+        // NOTE: NEWER than the origin: the recency fallback would take this one.
         lastEventAt: new Date(Date.now() + 60_000),
         lastInboundAt: new Date(),
       },
@@ -875,10 +948,10 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     }
   });
 
-  // the conversation, the agent, the bot and the client, /reset clears the anchor. The claim then
-  // SUCCEEDS -- `redirectClosedAt: null` reads the same whether nobody ever closed it or the command
-  // just wiped it -- and every check downstream is happy with the timestamp this run itself wrote.
-  // The customer gets a goodbye on an episode the operator was told had been erased.
+  // The other ordering, which the anchor alone cannot see: the reset lands BEFORE the claim. The
+  // resolve trigger carries no `stillWanted`, and while it loads the conversation, the agent, the bot
+  // and the client, /reset clears the anchor. The claim then SUCCEEDS (`redirectClosedAt: null` reads
+  // the same whether nobody ever closed it or the command just wiped it), so it needs its own fence.
   test("a closing that claims a reset-cleared anchor sends nothing", async () => {
     await restoreAnchor();
     const s = stubClient();
@@ -952,7 +1025,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
 
   // The hole the comparison alone leaves. If `lastInboundAt` was ALREADY null when this run read it,
   // /reset writes null too and the predicate matches straight across the command it is fencing — the
-  // claim succeeds and the goodbye goes out exactly as before. Every other column the command touches
+  // claim succeeds and the goodbye goes out anyway. Every other column the command touches
   // goes to null or to zero, so none of them closes it either. A caller with no job AND no token to
   // compare therefore does not get to claim at all.
   test("a jobless closing with no episode token does not claim", async () => {
@@ -1042,7 +1115,13 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       });
 
       expect(outcome).toBe("delivered");
-      expect(s.sent.length).toBeGreaterThan(0);
+      expect(s.sent).toEqual([[ENTRY_CONV, "Vamos encerrar por aqui."]]);
+      expect(s.resolved).toEqual([ENTRY_CONV]);
+      const row = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: WIDGET_CONV },
+        select: { redirectClosedAt: true },
+      });
+      expect(row.redirectClosedAt).toBeInstanceOf(Date);
     } finally {
       await restoreAnchor();
       await suDb.conversation.updateMany({
@@ -1052,17 +1131,11 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     }
   });
 
-  // THE JOB IS ASKED AGAIN AFTER THE CLAIM READ, and that read is a database round trip. THE RULE
-  // (../../src/graph/nudge.ts) is one ask per stretch of I/O that precedes a write, and never any I/O
-  // between an ask and the write it guards. A /reset landing inside that round trip retires this job
-  // while the claim check — which asks about the ANCHOR, not about the job — still reports this run
-  // as the one delivering: the goodbye goes out and both conversations are resolved, on an episode
-  // the operator was told had been erased.
-  //
-  // The reset is committed FROM INSIDE the claim read, through the same `$extends` query seam the
-  // jobless test above uses, so the window is the real one rather than a stub flipping on a call
-  // count. That is what makes this pin the ORDER: an ask moved back above the read would answer
-  // before the retirement lands and send anyway.
+  // THE JOB IS ASKED AGAIN AFTER THE CLAIM READ. THE RULE (../../src/graph/nudge.ts) is one ask per
+  // stretch of I/O that precedes a write, and never any I/O between an ask and the write it guards;
+  // the claim check asks about the ANCHOR, not the job, so it cannot see a /reset inside that read.
+  // The reset is committed FROM INSIDE the claim read (the same `$extends` seam as the jobless test
+  // above), which pins the ORDER: an ask moved back above the read would answer too early and send.
   test("a reset landing inside the claim read stops the closing", async () => {
     await restoreAnchor();
     const s = stubClient();
@@ -1138,7 +1211,308 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       });
 
       expect(outcome).toBe("delivered");
-      expect(s.sent.length).toBeGreaterThan(0);
+      expect(s.sent).toEqual([[ENTRY_CONV, "Vamos encerrar por aqui."]]);
+      expect(s.resolved).toEqual([ENTRY_CONV]);
+      const row = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: WIDGET_CONV },
+        select: { redirectClosedAt: true },
+      });
+      expect(row.redirectClosedAt).toBeInstanceOf(Date);
+    } finally {
+      await restoreAnchor();
+    }
+  });
+
+  // The ladder's fixed sends count toward the agent's proactive limit like a nudge does, against the
+  // conversation they go to: past it the link is not sent and the goodbye stays a private note.
+  const withProactiveLimitReached = async (
+    run: () => Promise<void>,
+    chatwootConversationId = ENTRY_CONV,
+  ) => {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentId },
+      select: { settings: true },
+    });
+    const entry = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId },
+      select: { id: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          ...(before.settings as Record<string, unknown>),
+          limits: { maxProactivePerDay: 1 },
+        },
+      },
+    });
+    await suDb.agentTurnDelivery.create({
+      data: { tenantId, conversationId: entry.id, proactive: true },
+    });
+    try {
+      await run();
+    } finally {
+      await suDb.agentTurnDelivery.deleteMany({
+        where: { conversationId: entry.id },
+      });
+      await suDb.conversation.update({
+        where: { id: entry.id },
+        data: { proactiveLimitAlertedAt: null },
+      });
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: before.settings ?? {} },
+      });
+    }
+  };
+
+  // Outside the 24h window the link goes as the channel-redirect template, and a NAMED one is keyed
+  // by its placeholder names, read from the sibling inbox's synced templates.
+  test("outside the window the link is the channel-redirect template, keyed by name", async () => {
+    const before = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentId },
+      select: { settings: true },
+    });
+    const entry = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: ENTRY_CONV },
+      select: { id: true, lastInboundAt: true },
+    });
+    await suDb.inbox.updateMany({
+      where: { tenantId, chatwootInboxId: 110 },
+      data: { channelType: "Channel::Whatsapp", provider: "whatsapp_cloud" },
+    });
+    await suDb.conversation.update({
+      where: { id: entry.id },
+      data: { lastInboundAt: new Date(Date.now() - 48 * 3_600_000) },
+    });
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          ...(before.settings as Record<string, unknown>),
+          serviceWindow: {
+            templates: {
+              channel_redirect: {
+                name: "volta_site",
+                params: ["{{nome_contato}}"],
+              },
+            },
+          },
+        },
+      },
+    });
+    const posted: unknown[] = [];
+    const named = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.includes("/inboxes/110")) {
+        return Response.json({
+          id: 110,
+          message_templates: [
+            {
+              name: "volta_site",
+              language: "pt_BR",
+              status: "APPROVED",
+              parameter_format: "NAMED",
+              components: [
+                { type: "BODY", text: "Oi {{cliente}}, volte ao site." },
+              ],
+            },
+          ],
+        });
+      }
+      if (url.includes("/messages") && typeof init?.body === "string") {
+        posted.push(JSON.parse(init.body));
+      }
+      return httpDouble(input);
+    }) as typeof fetch;
+    try {
+      const job = await claimed("whatsapp");
+      globalThis.fetch = named;
+      try {
+        await redirectFollowUpHandler(job, appDb, deps());
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+      const sent = posted as Array<{
+        template_params?: { name: string; processed_params: { body: unknown } };
+      }>;
+      expect(sent.map((m) => m.template_params?.name)).toEqual(["volta_site"]);
+      expect(sent[0]?.template_params?.processed_params.body).toEqual({
+        cliente: "Cliente",
+      });
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: before.settings ?? {} },
+      });
+      await suDb.conversation.update({
+        where: { id: entry.id },
+        data: { lastInboundAt: entry.lastInboundAt },
+      });
+      await suDb.inbox.updateMany({
+        where: { tenantId, chatwootInboxId: 110 },
+        data: { channelType: null, provider: null },
+      });
+    }
+  });
+
+  test("outside the window with no template the link is a note, and the note is not silent", async () => {
+    const entry = await suDb.conversation.findFirstOrThrow({
+      where: { tenantId, chatwootConversationId: ENTRY_CONV },
+      select: { id: true, lastInboundAt: true },
+    });
+    await suDb.inbox.updateMany({
+      where: { tenantId, chatwootInboxId: 110 },
+      data: { channelType: "Channel::Whatsapp", provider: "whatsapp_cloud" },
+    });
+    await suDb.conversation.update({
+      where: { id: entry.id },
+      data: { lastInboundAt: new Date(Date.now() - 48 * 3_600_000) },
+    });
+    const posted: Array<{ private?: boolean; template_params?: unknown }> = [];
+    const recording = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (
+        String(input).includes("/messages") &&
+        typeof init?.body === "string"
+      ) {
+        posted.push(JSON.parse(init.body));
+      }
+      return httpDouble(input);
+    }) as typeof fetch;
+    try {
+      const job = await claimed("whatsapp");
+      globalThis.fetch = recording;
+      try {
+        await redirectFollowUpHandler(job, appDb, deps());
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+      expect(posted.map((m) => m.private === true)).toEqual([true]);
+      const [line] = await flowLogRows(suDb, {
+        // flowlog-scope: tenant-wide. The follow-up job writes its note line with no conversation of
+        // ours to hang it on, and this is the only test of the file that makes one.
+        where: { tenantId, stage: "service_window" },
+        orderBy: { id: "desc" },
+        take: 1,
+      });
+      expect({ level: line?.level, detail: line?.detail }).toEqual({
+        level: "warn",
+        detail: {
+          agent: String(agentId),
+          kind: "channel_redirect",
+          reason: "no_template",
+        },
+      });
+    } finally {
+      await suDb.conversation.update({
+        where: { id: entry.id },
+        data: { lastInboundAt: entry.lastInboundAt },
+      });
+      await suDb.inbox.updateMany({
+        where: { tenantId, chatwootInboxId: 110 },
+        data: { channelType: null, provider: null },
+      });
+    }
+  });
+
+  test("past the proactive limit the WhatsApp link is not sent", async () => {
+    await withProactiveLimitReached(async () => {
+      const job = await claimed("whatsapp");
+      wire.length = 0;
+      globalThis.fetch = httpDouble;
+      try {
+        await redirectFollowUpHandler(job, appDb, deps());
+      } finally {
+        globalThis.fetch = originalFetch;
+      }
+      expect(wire.some((u) => u.includes("/redirect_tokens"))).toBe(true);
+      expect(wire.some((u) => u.includes("/messages"))).toBe(false);
+    });
+  });
+
+  test("past the proactive limit the goodbye is a private note, and the conversation still closes", async () => {
+    await restoreAnchor();
+    const sent: Array<[number, string, boolean]> = [];
+    const resolved: number[] = [];
+    const client = {
+      getConversation: async (c: number) => ({
+        id: c,
+        status: "pending",
+        meta: {},
+      }),
+      sendMessage: async (
+        c: number,
+        t: string,
+        opts?: { private?: boolean },
+      ) => {
+        sent.push([c, t, opts?.private === true]);
+        return {};
+      },
+      sendPrivateNote: async () => ({}),
+      toggleStatus: async (c: number) => {
+        resolved.push(c);
+        return {};
+      },
+    } as unknown as ChatwootClient;
+    try {
+      await withProactiveLimitReached(async () => {
+        const outcome = await deliverRedirectClosing({
+          tenantId,
+          instanceId,
+          widgetConversationId: WIDGET_CONV,
+          entryInboxId: 110,
+          closingMessage: "Vamos encerrar por aqui.",
+          closeChat: false,
+          base: suDb,
+          deps: { makeClient: async () => client },
+        });
+        expect(outcome).toBe("delivered");
+      });
+      expect(sent).toEqual([[ENTRY_CONV, "Vamos encerrar por aqui.", true]]);
+      expect(resolved).toContain(ENTRY_CONV);
+    } finally {
+      await restoreAnchor();
+    }
+  });
+
+  test("past the proactive limit on the chat, its goodbye is a private note and the WhatsApp goodbye still goes", async () => {
+    await restoreAnchor();
+    const s = stubClient();
+    const sent: Array<[number, boolean]> = [];
+    const noting = {
+      makeClient: async () => {
+        const inner = await s.makeClient();
+        return {
+          ...inner,
+          sendMessage: async (
+            c: number,
+            t: string,
+            opts?: { private?: boolean },
+          ) => {
+            sent.push([c, opts?.private === true]);
+            return inner.sendMessage(c, t);
+          },
+        } as unknown as Awaited<ReturnType<typeof s.makeClient>>;
+      },
+    };
+    try {
+      await withProactiveLimitReached(async () => {
+        await deliverRedirectClosing({
+          tenantId,
+          instanceId,
+          widgetConversationId: WIDGET_CONV,
+          entryInboxId: 110,
+          closingMessage: "Vamos encerrar por aqui.",
+          closeChat: true,
+          base: appDb,
+          deps: { makeClient: noting.makeClient },
+        });
+      }, WIDGET_CONV);
+      expect(sent).toEqual([
+        [WIDGET_CONV, true],
+        [ENTRY_CONV, false],
+      ]);
+      expect(s.resolved).toEqual([WIDGET_CONV, ENTRY_CONV]);
     } finally {
       await restoreAnchor();
     }
@@ -1174,7 +1548,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       update: { status: "CLAIMED", payload },
     });
     // The snapshot the worker holds: captured at claim time, before any stamp. The token comes from
-    // the ROW, never a literal — a retire in an earlier test bumps it, and a hardcoded 0 would then
+    // the ROW, never a literal: a retire in an earlier test bumps it, and a hardcoded 0 would then
     // read as superseded and make every later ladder stand down for the wrong reason.
     return {
       id: row.id,
@@ -1192,9 +1566,9 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     persistUsage: async () => {},
   });
 
-  // Issue #281. The chat stage is the only one of the three that needs the agent to author anything,
-  // and it used to advance regardless: an agent that could not answer at all still cost the lead its
-  // softest stage, moving them one step closer to the closing with nothing sent.
+  // The chat stage is the only one of the three that needs the agent to author anything, so it must
+  // not advance when the agent cannot answer: that would cost the lead its softest stage with nothing
+  // sent.
   async function withUnresolvableCredential<T>(
     fn: () => Promise<T>,
   ): Promise<T> {
@@ -1222,9 +1596,9 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     }
   }
 
-  // Review round 12 of #355. Every reschedule here rebuilds the payload field by field, so the
-  // episode stamp the retirement reads has to be listed on each one or the ladder loses it at the
-  // first stage advance — and a ladder with no stamp reads as the PREVIOUS episode's, which is
+  // Every reschedule here rebuilds the payload field by field, so the episode stamp the retirement
+  // reads has to be listed on each one or the ladder loses it at the first stage advance, and a
+  // ladder with no stamp reads as the PREVIOUS episode's, which is
   // exactly the job the next pairing change retires.
   test("a stage advance carries the episode stamp forward", async () => {
     const job = await claimed("chat", 6203);
@@ -1325,13 +1699,13 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     expect(s.resolved).toEqual([]);
   });
 
-  // AND THE SAME WINDOW WITH THE DATABASE GONE, which is the pair the incident actually reported:
-  // a /reset, and a pool too exhausted to answer whether it happened. The lenient probe answers "not
-  // retired" to an unreadable row — right for a send it must not abandon halfway, wrong here, because
-  // the ask inside the thread's critical section runs BEFORE the divider and the checkpoint. Guessing
-  // there writes the memory back after the operator was told it was cleared, and no later fence
-  // catches it. `runAgentNudge` marks that one ask `{ strict: true }`, and this callback has to carry
-  // it through: the liveness half stays fail-open, the retirement half stops failing open.
+  // AND THE SAME WINDOW WITH THE DATABASE GONE: a /reset, and a pool too exhausted to answer whether
+  // it happened. The lenient probe answers "not retired" to an unreadable row, right for a send it
+  // must not abandon halfway, wrong here, because the ask inside the thread's critical section runs
+  // BEFORE the divider and the checkpoint. Guessing there writes the memory back after the operator
+  // was told it was cleared, and no later fence catches it. `runAgentNudge` marks that one ask
+  // `{ strict: true }`, and this callback has to carry it through: the liveness half stays fail-open,
+  // the retirement half does not.
   test("a retirement read that fails after the reset does not write the memory back", async () => {
     const job = await claimed();
     let reads = 0;
@@ -1355,17 +1729,23 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       },
     }) as unknown as PrismaClient;
     const s = stubClient();
+    const checkpointer = new MemorySaver();
 
     await redirectFollowUpHandler(job, failing, {
       ...deps(),
+      checkpointer,
       makeClient: s.makeClient,
     }).catch(() => {
       // The strict ask propagates, and the scheduler's own bounded retry is what carries the job.
       // Whether it surfaces as a throw or a stand-down is the handler's business; what this test is
-      // about is the line below.
+      // about is the lines below.
     });
 
-    // Nothing left, and nothing was written back over the reset.
+    // Nothing was written back over the reset, and nothing left.
+    const memory = await checkpointer.getTuple({
+      configurable: { thread_id: widgetThread },
+    });
+    expect(memory).toBeUndefined();
     expect(s.sent).toEqual([]);
     expect(s.resolved).toEqual([]);
   });
@@ -1437,6 +1817,26 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     // The stale run stays down: nothing sent, nothing resolved.
     expect(s.sent).toEqual([]);
     expect(s.resolved).toEqual([]);
+  });
+
+  test("the chat stage writes its directive under the job's id", async () => {
+    const job = await claimed("chat");
+    const s = stubClient();
+    const checkpointer = new MemorySaver();
+    await redirectFollowUpHandler(job, appDb, {
+      ...deps(),
+      checkpointer,
+      makeClient: s.makeClient,
+    });
+    const memory = await checkpointer.getTuple({
+      configurable: { thread_id: widgetThread },
+    });
+    const directives = (
+      (memory?.checkpoint.channel_values.messages ?? []) as BaseMessage[]
+    ).filter(isNudgeTurn);
+    expect(directives.map((m) => m.id)).toEqual([
+      expect.stringMatching(new RegExp(`^nudge:job:${job.id}:`)),
+    ]);
   });
 
   // The last boundary the handler does not own: its RETURN. Whatever it decides, the worker is what
@@ -1533,6 +1933,41 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     expect(wire.some((u) => u.includes("/messages"))).toBe(false);
   });
 
+  // Deeper still: the proactive limit's count is a read between the send routine's fence and the
+  // send, so the routine asks once more after it.
+  test("a retire during the proactive limit's count stops the WhatsApp send", async () => {
+    const job = await claimed("whatsapp");
+    const s = stubClient();
+    let retired = false;
+    const retireOnCount = appDb.$extends({
+      query: {
+        agentTurnDelivery: {
+          async count({ args, query }) {
+            const res = await query(args);
+            if (!retired) {
+              retired = true;
+              await retireNow();
+            }
+            return res;
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    wire.length = 0;
+    globalThis.fetch = httpDouble;
+    try {
+      await redirectFollowUpHandler(job, retireOnCount, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    expect(retired).toBe(true);
+    expect(wire.some((u) => u.includes("/messages"))).toBe(false);
+    expect(s.sent).toEqual([]);
+  });
+
   // And the closing, which is the one that resolves both conversations. Its fence sits with the
   // at-most-once claim, after the reads: a ladder retired mid-read must not burn an anchor on a
   // closing it then refuses to deliver, or the funnel could never close again.
@@ -1553,6 +1988,42 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
       select: { redirectClosedAt: true },
     });
     expect(widget.redirectClosedAt).toBeNull();
+  });
+
+  // NOTE: Every ask around the closing guards a SEND, so an unreadable answer there is "go": standing
+  // down on a pool blip would leave the funnel open with nothing scheduled to close it. Only the ask
+  // inside a nudge's critical section is strict, and the closing runs no nudge.
+  test("a fence read that fails at the closing still delivers it", async () => {
+    const job = await claimed("closing");
+    const s = stubClient();
+    let reads = 0;
+    const failing = appDb.$extends({
+      query: {
+        schedulerJob: {
+          async findUnique({ args, query }) {
+            reads += 1;
+            if (reads === 1) return query(args);
+            throw new Error(
+              "Timed out fetching a new connection from the pool",
+            );
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    try {
+      await redirectFollowUpHandler(job, failing, {
+        ...deps(),
+        makeClient: s.makeClient,
+      });
+    } finally {
+      // The delivered closing stamps the anchor; the tests below start from an open funnel.
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: WIDGET_CONV },
+        data: { redirectClosedAt: null },
+      });
+    }
+    expect(reads).toBeGreaterThan(1);
+    expect(s.resolved).toEqual([WIDGET_CONV, ENTRY_CONV]);
   });
 
   // The window the CLAIM itself opens: it is a write, so the answer taken before it predates it. The
@@ -1582,18 +2053,31 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     const job = await claimed("whatsapp");
     const s = stubClient();
     wire.length = 0;
-    globalThis.fetch = httpDouble;
+    const posts: Array<[string, string]> = [];
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      if (String(input).includes("/messages"))
+        posts.push([String(input), String(init?.body ?? "")]);
+      return httpDouble(input, init);
+    }) as typeof fetch;
+    let result: Awaited<ReturnType<typeof redirectFollowUpHandler>>;
     try {
-      await redirectFollowUpHandler(job, appDb, {
+      result = await redirectFollowUpHandler(job, appDb, {
         ...deps(),
         makeClient: s.makeClient,
       });
     } finally {
       globalThis.fetch = originalFetch;
     }
-    // Specifically: it posts. Asserting only that SOMETHING hit the wire would let a stage that
-    // merely mints a link stand in for one that messages the customer.
-    expect(wire.some((u) => u.includes("/messages"))).toBe(true);
+    // Specifically: it posts the link to the WhatsApp side. A stage that merely mints a link, or
+    // posts it to the chat, does not stand in for one that messages the customer.
+    expect(posts).toHaveLength(1);
+    expect(posts[0]?.[0]).toContain(`/conversations/${ENTRY_CONV}/messages`);
+    expect(posts[0]?.[1]).toContain("Ainda dá tempo: ");
+    expect(posts[0]?.[1]).toContain("tok-1");
+    expect(result.outcome).toBe("reschedule");
   });
 
   // The gate the predicate above describes, asked where it is actually consumed. The stage's own
@@ -1639,21 +2123,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     });
   });
 
-  test("a switched-off agent does not post the closing, nor resolve", async () => {
-    await withAgentDisabled(async () => {
-      const job = await claimed("closing");
-      const s = stubClient();
-      const result = await redirectFollowUpHandler(job, appDb, {
-        ...deps(),
-        makeClient: s.makeClient,
-      });
-      expect(result).toEqual({ outcome: "done" });
-      expect(s.sent).toEqual([]);
-      expect(s.resolved).toEqual([]);
-    });
-  });
-
-  // ── Issue #246: the gate answers at handler entry and the stages send later, across I/O of their
+  // ── The gate answers at handler entry and the stages send later, across I/O of their
   //    own. These pin what the ladder does when the switch flips INSIDE that window, which is the
   //    moment an operator watching a lead being chased is likeliest to reach for it.
   test("switched off during the link mint sends nothing AND does not advance", async () => {
@@ -1942,15 +2412,10 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
         data: { testActivatedAt: null },
       });
     }
-    // The reset really landed mid-run, so this is the window and not a run that stopped earlier.
-    // `stampReads` stays at 1: the fence answers "retired" before it ever reaches the fallible read,
-    // which is the ordering this pins. Move the retirement read back after the stamp read and the
-    // double's throw reaches the outer catch, the fence answers "go", and the closing goes out.
-    //
-    // What the double CANNOT reproduce is a query PostgreSQL rejects: it throws in JS before any SQL
-    // runs, so the transaction is never left aborted. That case is why the ordering exists rather
-    // than a catch — with a real abort, every later statement in the transaction fails too — and it
-    // is argued in the code, not covered here.
+    // NOTE: `stampReads` stays at 1: the fence answers "retired" before it reaches the fallible
+    // read. With the retirement read after the stamp read, the double's throw reaches the outer catch
+    // and the closing goes out. The double cannot reproduce a query PostgreSQL rejects (which aborts
+    // the transaction, so a catch is not enough); that is why the ordering exists.
     expect(retiredMidRun).toBe(true);
     expect(stampReads).toBe(1);
     expect(s.sent).toEqual([]);
@@ -2064,20 +2529,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     expect(s.resolved).toEqual([]);
   });
 
-  test("an un-retired ladder still runs", async () => {
-    const job = await claimed();
-    const s = stubClient();
-
-    await redirectFollowUpHandler(job, appDb, {
-      ...deps(),
-      makeClient: s.makeClient,
-    });
-
-    // The control the negative above needs: a fence that stood every ladder down would pass it.
-    expect(s.sent.map(([c]) => c)).toEqual([WIDGET_CONV]);
-  });
-
-  // Issue #811. The same stage whose job's deadline already ended: the run was failed and its slot
+  // The same stage whose job's deadline already ended: the run was failed and its slot
   // handed to the next job, so the nudge it would author is one nobody is waiting for, and the retry
   // would send it a second time. The registration hands the job's signal down to `runAgentNudge`.
   test("a chat stage its job's deadline already ended sends nothing", async () => {
@@ -2103,7 +2555,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     expect(commits).toBe(0);
   });
 
-  // Issue #811, the other side: a nudge that reached the chat spent the stage, and the run says so,
+  // The other side: a nudge that reached the chat spent the stage, and the run says so,
   // so that a run past its deadline has its advance written instead of its retry nudging again.
   test("a chat stage whose nudge reached the chat commits its run", async () => {
     const job = await claimed();
@@ -2158,28 +2610,7 @@ describe.skipIf(!dbUp)("a ladder retired while claimed", () => {
     await setStamps(widget, entry);
   };
 
-  // `/teste` typed on WhatsApp AFTER the link: the entry row carries the stamp, the widget row does
-  // not, and the one-shot propagation is already spent. Stage 2's destination IS the entry
-  // conversation — the activated one — so the ladder goes mute on the very channel that was activated.
-  test("stage 2 sends when the activation is on the side it messages", async () => {
-    await asTestAgent(null, new Date());
-    const job = await claimed("whatsapp");
-    const s = stubClient();
-    wire.length = 0;
-    globalThis.fetch = httpDouble;
-    try {
-      await redirectFollowUpHandler(job, appDb, {
-        ...deps(),
-        makeClient: s.makeClient,
-      });
-    } finally {
-      globalThis.fetch = originalFetch;
-      await restoreProduction();
-    }
-    expect(wire.filter((u) => u.includes("/messages"))).toHaveLength(1);
-  });
-
-  // Issue #811: the link sent spends stage 2, and the run says so, so that a run past its deadline
+  // The link sent spends stage 2, and the run says so, so that a run past its deadline
   // has its advance to the closing written instead of its retry sending the link again.
   test("stage 2 commits its run when the link is sent", async () => {
     await asTestAgent(null, new Date());
@@ -2291,15 +2722,5 @@ describe("isRedirectFollowUpLive", () => {
         testActivatedAt: new Date("2026-01-01"),
       }),
     ).toBe(true);
-  });
-
-  test("an activation stamp never revives a production agent that is off", () => {
-    expect(
-      isRedirectFollowUpLive({
-        ...live,
-        agentEnabled: false,
-        testActivatedAt: new Date("2026-01-01"),
-      }),
-    ).toBe(false);
   });
 });

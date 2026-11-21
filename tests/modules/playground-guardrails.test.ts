@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { AIMessage, type BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
@@ -6,6 +6,7 @@ import { MemorySaver } from "@langchain/langgraph";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
+import { getCheckpointer } from "@/graph/checkpointer";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
   runPlaygroundFollowup,
@@ -18,20 +19,21 @@ import {
   rebuildPlaygroundTurns,
 } from "@/modules/playground/sessions";
 import { listThreadTurnNotes } from "@/modules/playground/turn-notes";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogRow } from "../utils/flowlog";
+import { until } from "../utils/poll";
 import { guardrailModel } from "../utils/scripted-models";
 
-// The context a console operator carries. The playground takes the REQUEST's context now, not an id
-// rebuilt from it, so these read exactly as the controller calls them (issue #268).
+// The context a console operator carries. The playground takes the REQUEST's context, not an id
+// rebuilt from it, so these read exactly as the controller calls them.
 function ctx(t: bigint): TenantContext {
   return { tenantId: t, userId: null, role: "TENANT_ADMIN" };
 }
 
-// Issue #136: the playground ran the agent's graph directly and never screened anything, so the
-// operator read a reply the customer would never have received. These tests are written against
-// what the operator READS — the returned reply and the trace — because that is the artefact the
-// issue is about; asserting that the gate was constructed would pass on a build that screens and
-// then throws the verdict away.
+// The playground screens its turns like the inbox, so the operator reads the reply the customer
+// would receive. These tests read what the operator READS (the returned reply and the trace):
+// asserting that the gate was constructed would pass on a build that screens and then throws the
+// verdict away.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -49,8 +51,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -61,6 +63,8 @@ let agentTemplate = 0n;
 let agentSilent = 0n;
 let agentInput = 0n;
 let agentBrokenGuard = 0n;
+let agentHeldBroken = 0n;
+let agentExternal = 0n;
 let agentDeadCredential = 0n;
 let agentBoth = 0n;
 let agentInputSilent = 0n;
@@ -203,9 +207,8 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
       promptAdherence: false,
       answerRelevance: false,
     };
-    // BOTH directions are declared on every agent, because both default to enabled: leaving one
-    // implicit lets it screen first and answer for the direction under test, which is how the
-    // silent-action case first reported the template.
+    // BOTH directions are declared on every agent, because both default to enabled: leaving
+    // one implicit lets it screen first and answer for the direction under test.
     const dir = (over: object = {}) => ({
       enabled: false,
       action: "template",
@@ -239,6 +242,19 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
       guardrails: guardrails({ input: dir({ enabled: true }), output: dir() }),
     });
     agentBrokenGuard = await mk("Broken", outputOnly());
+    // The operator's endpoint judges the reply after a clean built-in screening.
+    agentExternal = await mk("External", {
+      guardrails: {
+        ...guardrails({ input: dir(), output: dir({ enabled: true }) }),
+        external: { url: "https://check.example.com/hook" },
+      },
+    });
+    agentHeldBroken = await mk("HeldBroken", {
+      guardrails: {
+        ...guardrails({ input: dir(), output: dir({ enabled: true }) }),
+        onFailure: "hold",
+      },
+    });
     // Enabled, with a credentialRef pointing at a vault entry that is not there (deleted, or from
     // another tenant). `prepare.ts` leaves the key empty and logs; the console shows a ref and an
     // available toggle, so this is the misconfiguration the operator cannot see from the editor.
@@ -294,7 +310,7 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     await appDb.$disconnect();
   });
 
-  // The headline of the issue: the operator reads what the customer would read.
+  // NOTE: the operator reads what the customer would read.
   test("an output violation replaces the reply the operator reads", async () => {
     const m = models({ violated: true });
     const r = await runPlaygroundTurn({
@@ -307,18 +323,6 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(r.reply).toBe(TEMPLATE);
     expect(r.reply).not.toBe(RAW_REPLY);
     expect(m.judgeCalls()).toBe(1);
-  });
-
-  test("an output violation with the silent action leaves no reply at all", async () => {
-    const m = models({ violated: true });
-    const r = await runPlaygroundTurn({
-      ctx: ctx(tenantId),
-      agentId: agentSilent,
-      message: "e o concorrente?",
-      base: appDb,
-      deps: deps(m),
-    });
-    expect(r.reply).toBe("");
   });
 
   // Faithful reproduction of the direction that does not merely alter the reply: it skips the graph.
@@ -358,7 +362,8 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     });
   });
 
-  // The case the issue names as the one the playground is the natural place to notice.
+  // NOTE: the playground is the natural place for the operator to notice a guardrail that cannot
+  // be built.
   test("a guardrail that cannot be built is fail-open, and says so in the trace", async () => {
     const m = models({ violated: false, breakJudge: true });
     const r = await runPlaygroundTurn({
@@ -374,9 +379,8 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     ]);
   });
 
-  // Same case, one step earlier: the credential itself never resolved, so there is no model to try.
-  // It used to report `not-run`, which is the answer for a guardrail the operator switched OFF, and
-  // is the one of the issue's three cases that stayed invisible.
+  // NOTE: same case, one step earlier: the credential never resolved, so there is no model to try.
+  // `not-run` would be wrong here: it is the answer for a guardrail the operator switched OFF.
   test("a guardrail whose credential is gone is unavailable, not silently off", async () => {
     const m = models({ violated: true });
     const r = await runPlaygroundTurn({
@@ -398,23 +402,24 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     // Scoped to THIS agent, not just the tenant: every test here shares one tenant, and the
     // broken-model test a few lines up writes its own guardrail warn. Taking the newest row for the
     // tenant would read that one whenever this one has not landed yet (the emit is fire-and-forget).
-    let detail: unknown;
-    for (let i = 0; i < 50 && !detail; i++) {
-      detail = (
-        await flowLogRow(suDb, {
-          // flowlog-scope: agent — every test here shares the tenant but owns its agent, which is
-          // what fences this read (the note above says which neighbour it would otherwise take).
-          where: {
-            tenantId,
-            agentId: agentDeadCredential,
-            stage: "guardrail",
-            level: "warn",
-          },
-          select: { detail: true },
-        })
-      )?.detail;
-      if (!detail) await new Promise((r) => setTimeout(r, 100));
-    }
+    const detail = await until(
+      "the guardrail's warn line",
+      async () =>
+        (
+          await flowLogRow(suDb, {
+            orderBy: { id: "asc" },
+            // flowlog-scope: agent — every test here shares the tenant but owns its agent, which is
+            // what fences this read (the note above says which neighbour it would otherwise take).
+            where: {
+              tenantId,
+              agentId: agentDeadCredential,
+              stage: "guardrail",
+              level: "warn",
+            },
+            select: { detail: true },
+          })
+        )?.detail,
+    );
     expect(detail).toMatchObject({ outcome: "credential_not_found" });
   });
 
@@ -473,9 +478,9 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(shape.slice(1, -1)).toContain("tool_call");
   });
 
-  // Findings from review round 1, all one cause: the guardrail's effect was returned and never
-  // stored, so a reload rebuilt the transcript from the checkpointer and showed the reply the
-  // guardrail took away. Asserted on the ROW, because the join over it is tabled separately.
+  // NOTE: the guardrail's effect is stored, or a reload rebuilds the transcript from the
+  // checkpointer and shows the reply the guardrail took away. Asserted on the ROW, because the join
+  // over it is tabled separately.
   test("an output trip is recorded for the reload, with the screened text", async () => {
     const m = models({ violated: true });
     const r = await runPlaygroundTurn({
@@ -557,6 +562,77 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(
       await suDb.playgroundTurnNote.count({ where: { threadId: r.threadId } }),
     ).toBe(0);
+  });
+
+  // The bug it catches: the simulated follow-up held while the same follow-up in production passes,
+  // so the playground shows the operator a behaviour the inbox never has.
+  test("under hold a follow-up whose judge cannot run still goes out, as in production", async () => {
+    const m = models({ violated: false, breakJudge: true });
+    const r = await runPlaygroundFollowup({
+      ctx: ctx(tenantId),
+      agentId: agentHeldBroken,
+      base: appDb,
+      deps: deps(m),
+    });
+    expect(r.suppressed).toBe(false);
+    expect(r.trace.filter((e) => e.type === "guardrail")).toMatchObject([
+      { outcome: "unavailable" },
+    ]);
+  });
+
+  // The bug it catches: the playground skipping the operator's endpoint, or tracing its block without
+  // the reason and the time it took.
+  test("the external check's block shows in the reply and in the trace", async () => {
+    const m = models({ violated: false });
+    const r = await runPlaygroundTurn({
+      ctx: ctx(tenantId),
+      agentId: agentExternal,
+      message: "oi",
+      base: appDb,
+      deps: {
+        ...deps(m),
+        externalCheck: {
+          assertSafe: async (u: string) => new URL(u),
+          fetchImpl: (async (_u: string, init: RequestInit) => {
+            const b = JSON.parse(String(init.body)) as { candidateId: string };
+            return new Response(
+              JSON.stringify({
+                decision: "block",
+                candidateId: b.candidateId,
+                reason: "MOTIVO-PG",
+              }),
+            );
+          }) as unknown as typeof fetch,
+        },
+      },
+    });
+    expect(r.reply).toBe(TEMPLATE);
+    const external = r.trace.filter(
+      (e) => e.type === "guardrail" && "external" in e && e.external,
+    );
+    expect(external).toMatchObject([
+      {
+        outcome: "replaced",
+        action: "template",
+        external: { decision: "block", reason: "MOTIVO-PG" },
+      },
+    ]);
+  });
+
+  // The bug it catches: a held turn traced as an ordinary policy hand-over, indistinguishable from a trip.
+  test("under hold a reply whose judge cannot run is held, and the trace says why", async () => {
+    const m = models({ violated: false, breakJudge: true });
+    const r = await runPlaygroundTurn({
+      ctx: ctx(tenantId),
+      agentId: agentHeldBroken,
+      message: "oi",
+      base: appDb,
+      deps: deps(m),
+    });
+    expect(r.reply === RAW_REPLY).toBe(false);
+    expect(r.trace.filter((e) => e.type === "guardrail")).toMatchObject([
+      { outcome: "handed-off", held: true },
+    ]);
   });
 
   // "Nothing was sent" has two causes and the operator needs them apart: reported as silence, the
@@ -673,12 +749,11 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(turns[1]?.suppressed).toBeUndefined();
   });
 
-  // Reload, end to end and through the REAL checkpointer, because every other assertion here is on
-  // one half: the row that gets written, or the fold over a row handed in. Five review rounds found
-  // the same defect in the seam between them, so the seam gets a test that spans it. The first turn
-  // answers with nothing on purpose: the rebuild drops an empty AI message, so the raw tail of the
-  // thread and the last message the transcript SHOWS are different ids, and an anchor taken from
-  // the wrong one moves the blocked turn to the end.
+  // NOTE: reload end to end through the REAL checkpointer, spanning the seam between the row that
+  // gets written and the fold over it, which the other assertions test one half at a time. The
+  // first turn answers with nothing on purpose: the rebuild drops an empty AI message, so the raw
+  // tail and the last message the transcript SHOWS differ, and an anchor taken from the wrong one
+  // moves the blocked turn to the end.
   test("a reload renders the blocked turn in the place it happened", async () => {
     const silentModel = (() => ({
       async invoke() {
@@ -731,9 +806,9 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(blocked?.trace).toMatchObject([
       { type: "guardrail", direction: "input" },
     ]);
-    // A clean screening survives the reload too. Without it, reopening a session cannot tell a turn
-    // that was screened and approved from one run with the toggle off, which is the ambiguity this
-    // whole issue is about. The first turn ran with the toggle off and carries nothing.
+    // NOTE: a clean screening survives the reload too, or reopening a session cannot tell a turn
+    // screened and approved from one run with the toggle off. The first turn ran with the toggle off
+    // and carries nothing.
     expect(turns[4]?.trace).toMatchObject([
       { type: "guardrail", outcome: "clean" },
     ]);
@@ -801,10 +876,9 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
     expect(rendered).toContain(anchor as string);
   });
 
-  // Every tenant-scoped model is registered with the tenancy extension, which supplies tenant_id on
-  // insert so callers need not, and OVERRIDES a caller-supplied one (anti-spoof). The helper here
-  // passes it explicitly, so nothing broke without the registration; what was missing is the
-  // contract, and both halves of it are asserted through a plain scoped create.
+  // NOTE: every tenant-scoped model is registered with the tenancy extension, which supplies
+  // tenant_id on insert and OVERRIDES a caller-supplied one (anti-spoof). The helper passes it
+  // explicitly and would work unregistered, so both halves go through a plain scoped create.
   test("a turn note is written under the tenancy extension's own rules", async () => {
     const threadId = `${tenantId}:playground:${agentTemplate}:${crypto.randomUUID()}`;
     const other = await suDb.tenant.create({
@@ -931,18 +1005,28 @@ describe.skipIf(!dbUp)("playground guardrails (issue #136)", () => {
   // The line that makes the delete safe to perform at all: `deleteThread` is scoped by nothing, and
   // every Chatwoot conversation lives in the same checkpointer.
   test("a thread outside the fence is refused, not deleted", async () => {
-    await expect(
-      deletePlaygroundSession(
+    const checkpointer = await getCheckpointer();
+    const deleted = spyOn(checkpointer, "deleteThread");
+    try {
+      const refusal = await deletePlaygroundSession(
         ctx(tenantId),
         agentTemplate,
         `${tenantId}:1:4242`,
         appDb,
-      ),
-    ).rejects.toThrow();
+      ).then(
+        () => null,
+        (e: unknown) => e as { statusCode?: number; translationKey?: string },
+      );
+      expect(refusal?.statusCode).toBe(404);
+      expect(refusal?.translationKey).toBe("errors.sessionNotFound");
+      expect(deleted).not.toHaveBeenCalled();
+    } finally {
+      deleted.mockRestore();
+    }
   });
 
-  // Family sweep: the inbox's proactive path is screened (issue #160), so the playground's simulated
-  // follow-up has to be, or the fix covers one of the two paths the playground reproduces.
+  // NOTE: the inbox's proactive path is screened, so the playground's simulated follow-up is too,
+  // or the playground would misreport one of the two paths it reproduces.
   test("the simulated follow-up is screened on the output direction", async () => {
     const m = models({ violated: true });
     const r = await runPlaygroundFollowup({

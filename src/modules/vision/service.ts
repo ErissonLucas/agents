@@ -1,9 +1,10 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import { recordDirectUsage } from "@/graph/usage";
+import { recordDirectUsage, type UsageNode } from "@/graph/usage";
 import { AppError, NotFoundError } from "@/lib/errors";
-import { shareInFlight } from "@/lib/locks";
+import { shareAbortableInFlight } from "@/lib/locks";
+import { sanitizeErrorMessage } from "@/lib/redact";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import {
   fileReadFor,
@@ -23,10 +24,19 @@ import {
   spendCeilingVerdict,
 } from "@/modules/spend-ceiling/service";
 import { tryResolveApiKeyEntry } from "@/modules/vault/service";
-import { MediaSourceMismatchError, runMediaConverter } from "./convert";
+import {
+  MediaSourceMismatchError,
+  MediaTooLargeError,
+  runMediaConverter,
+} from "./convert";
+import { readImageDimensions } from "./convert/dimensions";
 import { isDecorativeImage } from "./decorative";
 import { visionAcceptsDocuments } from "./document-support";
-import { normalizeMediaType, planImageConversion } from "./media-conversion";
+import {
+  imageLimitsFor,
+  normalizeMediaType,
+  planImageConversion,
+} from "./media-conversion";
 import { pdfTextForModel, readPdfText } from "./pdf-text";
 import {
   getVisionProvider,
@@ -43,6 +53,7 @@ import {
   VISION_MAX_ATTEMPTS,
 } from "./retry";
 import { readVisionConfig, type VisionConfig } from "./settings";
+import { isUnread, skipLevel, type Unread, unreadCauseOf } from "./unread";
 
 // Image/document extraction orchestration (the vision mirror of stt/service): download the file,
 // extract its content via the configured provider (key from the vault), and write the result back
@@ -66,9 +77,8 @@ export async function resolveVisionConfig(
   chatwootInboxId: number,
   base: PrismaClient = basePrisma,
   // The agent whose settings answer, when the caller already knows it: a delivery on an OBSERVER's
-  // route (issue #476) is read by the observer's runtime, not by whoever `Inbox.agentId` names —
-  // nobody, on an inbox a human team answers — so the inbox read below would answer for the wrong
-  // agent, or for none. Absent, the inbox's responder answers, as before.
+  // route is read by the observer's runtime, not by whoever `Inbox.agentId` names (possibly nobody).
+  // Absent, the inbox's responder answers.
   opts: { agentId?: bigint | null } = {},
 ): Promise<VisionConfig | null> {
   const cfg = await runScopedOn(base, sysCtx(tenantId), async (db) => {
@@ -101,14 +111,10 @@ export async function resolveVisionConfig(
 const realSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
-// One extraction, asked as many times as the policy in ./retry allows. A transient provider failure
-// used to end the attachment for good — `extract` was called once and the caller degraded to the
-// "couldn't extract" marker, which is what enters the conversation history (issue #319).
-//
-// The flow span is INSIDE the loop, so each attempt is its own `vision` line carrying its own
-// `attempt` and duration. That is what makes a retried failure readable on the Logs page: three
-// lines saying 503 name an endpoint that is down, while one line summarising them reads like one
-// bad call. A first-attempt success is unchanged — a single line, now with `attempt: 1`.
+// One extraction, asked as many times as the policy in ./retry allows.
+// The flow span is INSIDE the loop, so each attempt is its own `vision` line with its own `attempt`
+// and duration: three lines saying 503 name an endpoint that is down, one summary reads like one
+// bad call.
 export async function extractWithRetry(args: {
   provider: VisionProvider;
   req: Omit<VisionRequest, "timeoutMs">;
@@ -120,13 +126,15 @@ export async function extractWithRetry(args: {
   // battery that cannot move the clock cannot tell a budget read before the wait from one read
   // after it.
   now?: () => number;
+  // The caller's deadline: past it, no further attempt is started.
+  signal?: AbortSignal;
 }): Promise<VisionResult> {
   const { kind } = args.req;
-  // NOTE: A `baseURL` means the operator chose the endpoint, so the latency is their hardware's and
+  // A `baseURL` means the operator chose the endpoint, so the latency is their hardware's and
   // none of our measurements describe it — the ceiling stands down and the attempt keeps the total.
   const customEndpoint = args.req.baseURL !== null;
   const sleep = args.sleep ?? realSleep;
-  // NOTE: `performance.now`, not `Date.now`: this is a hard deadline, and a wall clock can move
+  // `performance.now`, not `Date.now`: this is a hard deadline, and a wall clock can move
   // BACKWARD (an NTP correction, a VM resuming from a snapshot — this project has seen the Docker
   // VM's clock drift after sleep). A negative elapsed would hand an attempt more than the total has
   // left. The monotonic source cannot, and only differences are read here, so its arbitrary origin
@@ -134,8 +142,34 @@ export async function extractWithRetry(args: {
   const now = args.now ?? (() => performance.now());
   const startedAt = now();
   let lastErr: unknown;
+  // The attempt whose failure line promised another one, while that promise is still open. The loop
+  // can still stop without keeping it (the wait overslept the budget, the caller's deadline came), and
+  // then the extraction ended unread with only an `info` line behind it.
+  let promisedAfter: number | null = null;
+  // The next attempt's wait, drawn once when a failure asks whether a retry follows, and spent by the
+  // loop as drawn: the delay is jittered, and a second draw could answer the other way at the edge of
+  // the budget, which is a line saying the file went unread followed by the read.
+  let plannedDelayMs: number | null | undefined;
+  // Whether the loop will start another attempt after this one fails with `err`: the same three
+  // readings the top of the loop makes, taken before the wait instead of after it.
+  const retryFollows = (attempt: number, err: unknown): boolean => {
+    if (!isTransientVisionFailure(err) || args.signal?.aborted) return false;
+    const delayMs = retryDelayMs(attempt + 1);
+    plannedDelayMs = delayMs;
+    if (delayMs === null) return false;
+    return (
+      attemptBudgetMs({
+        kind,
+        attempt: attempt + 1,
+        elapsedMs: now() - startedAt + delayMs,
+        customEndpoint,
+      }) !== null
+    );
+  };
   for (let attempt = 1; attempt <= VISION_MAX_ATTEMPTS; attempt++) {
-    const delayMs = retryDelayMs(attempt);
+    const delayMs =
+      plannedDelayMs !== undefined ? plannedDelayMs : retryDelayMs(attempt);
+    plannedDelayMs = undefined;
     if (delayMs === null) break;
     // NOTE: Two readings of the same question, because the wait sits between them. The first asks
     // whether waiting is worth it AT ALL — a wait that lands past the total costs the turn hundreds
@@ -150,7 +184,7 @@ export async function extractWithRetry(args: {
     )
       break;
     if (delayMs > 0) await sleep(delayMs);
-    // NOTE: The second is the one the provider gets, and it is read AFTER the wait: `sleep` is what
+    // The second is the one the provider gets, and it is read AFTER the wait: `sleep` is what
     // a stalled or suspended process oversleeps, and a deadline computed from the nominal delay
     // would hand that process time the total no longer has.
     const budgetMs = attemptBudgetMs({
@@ -160,6 +194,7 @@ export async function extractWithRetry(args: {
       customEndpoint,
     });
     if (budgetMs === null) break;
+    if (args.signal?.aborted) break;
     try {
       return await withFlowStage(
         args.flow,
@@ -171,11 +206,28 @@ export async function extractWithRetry(args: {
           // do not carry the same number: the last attempt gets what is left of the total. Without
           // it a 39s timeout reads as a slow provider rather than as the budget running out.
           detail: { kind, attempt, budgetMs },
-          // NOTE: Recovered (→ "couldn't extract" marker), so a failure reads as an advisory, not
-          // a red error — same contract as TTS.
-          errorLevel: "warn",
+          // NOTE: A read cut at the output ceiling still returns text, so it would otherwise reach the
+          // agent as a finished description with nothing on the Logs page. Only when true: the key's
+          // absence is the ordinary line.
+          detailOf: (out) => (out.truncated ? { truncated: true } : {}),
+          // NOTE: An attempt followed by another is `info`, flagged `willRetry`. The one that ends
+          // the extraction is a `warn` naming what went unread: the turn recovers with the "couldn't
+          // extract" marker, so it is an advisory and not a red error, the same contract as TTS.
+          failureOf: (err) => {
+            if (retryFollows(attempt, err)) {
+              promisedAfter = attempt;
+              return { level: "info", detail: { willRetry: true } };
+            }
+            promisedAfter = null;
+            return { level: "warn", detail: { unread: kind } };
+          },
         },
-        () => args.provider.extract({ ...args.req, timeoutMs: budgetMs }),
+        () =>
+          args.provider.extract({
+            ...args.req,
+            timeoutMs: budgetMs,
+            signal: args.signal,
+          }),
       );
     } catch (err) {
       // NOTE: A permanent failure (a bad key, a model id that does not exist, a file the provider
@@ -184,10 +236,24 @@ export async function extractWithRetry(args: {
       lastErr = err;
     }
   }
-  // NOTE: Reached when the attempts or the budget ran out, and by the loop's own bound — so
-  // stopping never depends only on a rule that lives elsewhere. `lastErr` is always set here:
-  // attempt 1 is asked at zero elapsed, so it always gets a budget and either returns or fills it.
-  throw lastErr;
+  // NOTE: The retry the last line announced did not happen, so this is the outcome line it deferred.
+  if (promisedAfter !== null && args.flow) {
+    emitFlowEvent(args.flow, {
+      stage: "vision",
+      level: "warn",
+      status: "error",
+      provider: args.providerName,
+      model: args.model,
+      detail: { kind, attempt: promisedAfter, unread: kind },
+      errorMessage: sanitizeErrorMessage(lastErr),
+    });
+  }
+  // NOTE: Reached when the attempts, the budget or the caller's deadline ran out, and by the loop's
+  // own bound, so stopping never depends only on a rule that lives elsewhere. `lastErr` is unset
+  // only when the deadline had already passed before attempt 1, which always gets a budget.
+  throw (
+    lastErr ?? new Error("vision: the deadline passed before the first attempt")
+  );
 }
 
 export interface ExtractInboundParams {
@@ -195,7 +261,7 @@ export interface ExtractInboundParams {
   instanceId: bigint;
   conversationId: number;
   messageId: number;
-  // Null for an image kept inside an email body (#864): there is no attachment to write back to.
+  // Null for an image kept inside an email body: there is no attachment to write back to.
   attachmentId: number | null;
   dataUrl: string;
   cfg: VisionConfig;
@@ -209,12 +275,15 @@ export interface ExtractInboundParams {
   // Optional execution-flow context: when present, the extraction is logged as a `vision` stage
   // (mirrors STT), so a skip/failure is visible on the Logs page instead of vanishing.
   flow?: FlowContext;
-  // Whether to write this extraction into the in-process annotation store. Default true, which is
-  // the single-attachment contract. The webhook passes FALSE because it analyses every attachment
-  // and stashes ONE aggregate after the loop: the store is keyed by MESSAGE, so an intermediate
-  // write is a singleton wearing the aggregate's clothes, and a debounce flush landing mid-flight
-  // would overlay it over the complete meta (PR #692 review, round 3).
+  // Whether to write this extraction into the in-process annotation store. Default true. The
+  // webhook passes FALSE and stashes ONE aggregate after the loop: the store is keyed by MESSAGE, so
+  // a per-file write mid-flight would overlay a partial result over the complete meta.
   stashAnnotation?: boolean;
+  // The caller's deadline, handed to the provider attempts.
+  signal?: AbortSignal;
+  // The ledger step the call is billed under: an agent's reading by default, the occurrence
+  // monitor's when it reads again what upstream Chatwoot no longer holds.
+  usageNode?: Extract<UsageNode, "vision" | "occurrence_vision">;
 }
 
 export interface ExtractResult {
@@ -228,43 +297,44 @@ function metaKeyFor(kind: VisionKind): "image_description" | "extracted_text" {
   return kind === "image" ? "image_description" : "extracted_text";
 }
 
-// Downloads, extracts, and writes the content back to Chatwoot. Returns the extraction (also
-// persisted in the attachment meta) or null when vision is not runnable, the file is unsupported
-// (non-image/PDF, or a PDF on an image-only provider), or it yields nothing. Best-effort: the
-// webhook never strands delivery on it.
-// THE CONVERSION, in the one place both entry points share. The question it answers is not "can
-// this be read at all" — `visionKindForMime` asked that, about the file — but "can THIS PROVIDER
-// read it", which is ./media-conversion's table. When the answer is no and a converter applies, what
-// goes to the provider is the converted bytes and the converted mime.
-//
-// A FAILED CONVERSION SKIPS, with one exception that a measurement carved out. The reason a
-// conversion is attempted at all is that the provider does not read what the customer sent, so
-// sending the original anyway would buy a 400 whose answer is already known — but that reasoning
-// rests on the declared type being true, and Chatwoot serves whatever content type the uploader's
-// server declared. Measured on 2026-09-18: a PNG announced as `image/heic` is read by the vendor at
-// 200, because the vendors sniff bytes and ignore the data URI's label. Skipping there would take an
-// attachment that WAS read before this feature existed and stop reading it, which is why
-// `MediaSourceMismatchError` — the declared type lied — falls back to the original instead of
-// skipping, while every other failure still skips (issue #697, holdout scenario s8).
-//
-// The line it writes is the only record of where half a second of the turn went (~450ms of the 560ms
-// total is the HEVC decode), and it is written ONLY when a conversion happened, so the 98.6% of
-// attachments that need none add nothing to the Logs page.
+// THE CONVERSION, shared by both entry points: "can THIS PROVIDER read it" (./media-conversion),
+// after `visionKindForMime` asked whether the file is readable at all.
+// A FAILED CONVERSION SKIPS, except `MediaSourceMismatchError` (the declared type lied): vendors sniff
+// the bytes, so the original goes as-is and is still read. The flow line is written ONLY when a
+// conversion happened, so attachments that need none add nothing to the Logs page.
 async function convertForProvider(args: {
   bytes: ArrayBuffer;
   mimeType: string | null;
   provider: string;
+  baseURL: string | null;
   flow?: FlowContext;
 }): Promise<
   | { ok: true; bytes: ArrayBuffer; mimeType: string | null }
   | { ok: false; reason: string }
 > {
+  const limits = imageLimitsFor(args.provider);
   const plan = planImageConversion({
     mimeType: args.mimeType,
     provider: args.provider,
+    // Read only where a limit on size exists to compare against; a header walk is cheap but not free.
+    dimensions:
+      limits.maxEdge === null && limits.maxPatches === null
+        ? null
+        : readImageDimensions(args.bytes),
+    byteLength: args.bytes.byteLength,
+    baseURL: args.baseURL,
   });
   if (plan.action === "as-is")
     return { ok: true, bytes: args.bytes, mimeType: args.mimeType };
+  // NOTE: Application log only; the Logs page gets the caller's skip line with the reason.
+  if (plan.action === "over-limit") {
+    logger.info(
+      "vision: %s over the provider's documented limit and no converter fits it, the attachment was not read (provider=%s)",
+      normalizeMediaType(args.mimeType),
+      args.provider,
+    );
+    return { ok: false, reason: "over_provider_limit" };
+  }
   const startedAt = performance.now();
   try {
     const bytes = await runMediaConverter(plan.converter, args.bytes);
@@ -287,16 +357,19 @@ async function convertForProvider(args: {
     return { ok: true, bytes, mimeType: plan.to };
   } catch (err) {
     const why = err instanceof Error ? err.message : String(err);
-    // TWO LINES, because the two outcomes are not the same event and one sentence for both said the
-    // wrong thing about the commoner one. A mismatch stopped NOTHING: the bytes go to the provider
-    // untouched and the attachment is read, so "conversion failed" at `warn` reports a failure that
-    // did not happen, on the population that produces it most (Chatwoot serves whatever content type
-    // the uploader's server declared). What it is worth saying is that the declared type was wrong,
-    // because an operator seeing a run of them is looking at a mislabelling upstream of us.
-    //
-    // Neither sentence reaches `execution_logs`: the Logs page gets `convert_failed` as the reason
-    // code from the caller, and a mismatch leaves no line there at all because nothing was skipped.
-    // These are the application log, which is what someone debugging one attachment reads.
+    // NOTE: A fit that was only prudent (a soft limit) and could not run leaves the original, which
+    // the provider may still read; skipping it would turn a readable file into an unread one.
+    if (!plan.required) {
+      logger.info(
+        "vision: %s — the original goes as received (provider=%s)",
+        why,
+        args.provider,
+      );
+      return { ok: true, bytes: args.bytes, mimeType: args.mimeType };
+    }
+    // NOTE: A mismatch stopped NOTHING (the bytes go untouched and are read), so it logs that the
+    // declared type was wrong, at info, not a conversion failure at warn. These are application log
+    // lines only: the Logs page gets the caller's `convert_failed`, and nothing for a mismatch.
     if (err instanceof MediaSourceMismatchError) {
       logger.info(
         "vision: %s — sent as received, the provider sniffs the bytes (provider=%s)",
@@ -304,6 +377,14 @@ async function convertForProvider(args: {
         args.provider,
       );
       return { ok: true, bytes: args.bytes, mimeType: args.mimeType };
+    }
+    if (err instanceof MediaTooLargeError) {
+      logger.info(
+        "vision: %s, the attachment was not read (provider=%s)",
+        why,
+        args.provider,
+      );
+      return { ok: false, reason: "over_pixel_cap" };
     }
     // The converter id is already the head of the wrapped message, so it is not repeated here.
     logger.warn(
@@ -317,40 +398,79 @@ async function convertForProvider(args: {
 
 // What an email body image comes back as when it is an ornament (a signature icon, the logo of a
 // quoted email). Not a failure, so it is neither extracted nor counted among the files the model is
-// told were not read (#864). A URL that is not this Chatwoot's never gets here: the caller drops it
+// told were not read. A URL that is not this Chatwoot's never gets here: the caller drops it
 // before the per-message cap is applied.
 export const BODY_IMAGE_IGNORED = "ignored" as const;
 
+// Downloads, extracts, and writes the content back to Chatwoot. Returns the extraction (also
+// persisted in the attachment meta) or null when vision is not runnable, the file is unsupported,
+// or it yields nothing. Best-effort: the webhook never strands delivery on it.
 export async function extractInboundFile(
   params: ExtractInboundParams,
 ): Promise<ExtractResult | null> {
-  const r = await extractInbound(params);
-  return r === BODY_IMAGE_IGNORED || r === BODY_IMAGE_OVER_CAP ? null : r;
+  const r = await readInboundFile(params);
+  return isUnread(r) ? null : r;
 }
 
-// An image Chatwoot's mailbox kept inside the email body instead of making it an attachment (#864).
+// The same read, saying why when the file was not read.
+export async function readInboundFile(
+  params: ExtractInboundParams,
+): Promise<ExtractResult | Unread> {
+  const r = await extractInbound(params);
+  return r === BODY_IMAGE_IGNORED || r === BODY_IMAGE_OVER_CAP
+    ? { unread: "failed" }
+    : r;
+}
+
+// An image Chatwoot's mailbox kept inside the email body instead of making it an attachment.
 export function extractBodyImage(
   params: Omit<ExtractInboundParams, "attachmentId">,
-): Promise<ExtractResult | null | typeof BODY_IMAGE_IGNORED> {
+): Promise<ExtractResult | Unread | typeof BODY_IMAGE_IGNORED> {
   return extractInbound({
     ...params,
     attachmentId: null,
     bodyImage: true,
-  }) as Promise<ExtractResult | null | typeof BODY_IMAGE_IGNORED>;
+  }) as Promise<ExtractResult | Unread | typeof BODY_IMAGE_IGNORED>;
 }
 
 // A body image past the per-message cap, downloaded only to know whether it is an ornament: it is
 // never sent to the provider, and what is not an ornament is what the model is told was not read.
 export const BODY_IMAGE_OVER_CAP = "over_cap" as const;
-export function classifyBodyImage(
+export async function classifyBodyImage(
   params: Omit<ExtractInboundParams, "attachmentId">,
 ): Promise<null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP> {
-  return extractInbound({
+  const r = await extractInbound({
     ...params,
     attachmentId: null,
     bodyImage: true,
     classifyOnly: true,
-  }) as Promise<null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP>;
+  });
+  return r === BODY_IMAGE_IGNORED || r === BODY_IMAGE_OVER_CAP ? r : null;
+}
+
+function fileReadKey(p: {
+  tenantId: bigint;
+  instanceId: bigint;
+  messageId: number;
+  attachmentId: number | null;
+  dataUrl: string;
+  classifyOnly?: boolean;
+}): string {
+  return `vision:${p.tenantId}:${p.instanceId}:${p.messageId}:${p.attachmentId ?? p.dataUrl}:${p.classifyOnly ? "classify" : "read"}`;
+}
+
+// The read of a file this process already holds, for a caller whose own wait for it was cut short.
+export function rememberedFileRead(p: {
+  tenantId: bigint;
+  instanceId: bigint;
+  messageId: number;
+  attachmentId: number | null;
+  dataUrl: string;
+}): ExtractResult | null {
+  const v = fileReadFor(fileReadKey(p))?.value;
+  return v && typeof v === "object" && "kind" in v && "text" in v
+    ? (v as ExtractResult)
+    : null;
 }
 
 // One read per file, however many deliveries of its message ask: a delivery that finds the file
@@ -362,9 +482,12 @@ function extractInbound(
     classifyOnly?: boolean;
   },
 ): Promise<
-  ExtractResult | null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP
+  | ExtractResult
+  | Unread
+  | typeof BODY_IMAGE_IGNORED
+  | typeof BODY_IMAGE_OVER_CAP
 > {
-  const key = `vision:${params.tenantId}:${params.instanceId}:${params.messageId}:${params.attachmentId ?? params.dataUrl}:${params.classifyOnly ? "classify" : "read"}`;
+  const key = fileReadKey(params);
   const kept = fileReadFor(key);
   if (kept)
     return Promise.resolve(
@@ -373,37 +496,51 @@ function extractInbound(
         | typeof BODY_IMAGE_IGNORED
         | typeof BODY_IMAGE_OVER_CAP,
     );
-  return shareInFlight(key, async () => {
-    const value = await extractInboundOnce(params);
-    if (value !== null) rememberFileRead(key, value);
-    return value;
-  });
+  return shareAbortableInFlight(
+    key,
+    async (signal) => {
+      const value = await extractInboundOnce({
+        ...params,
+        signal,
+        // Kept before the write-back: a caller that stops waiting during that write still finds the
+        // read it paid for.
+        remember: (r) => rememberFileRead(key, r),
+      });
+      if (!isUnread(value)) rememberFileRead(key, value);
+      return value;
+    },
+    params.signal,
+  );
 }
 
 async function extractInboundOnce(
   params: ExtractInboundParams & {
     bodyImage?: boolean;
     classifyOnly?: boolean;
+    remember?: (r: ExtractResult) => void;
   },
 ): Promise<
-  ExtractResult | null | typeof BODY_IMAGE_IGNORED | typeof BODY_IMAGE_OVER_CAP
+  | ExtractResult
+  | Unread
+  | typeof BODY_IMAGE_IGNORED
+  | typeof BODY_IMAGE_OVER_CAP
 > {
   const { cfg } = params;
   const base = params.base ?? basePrisma;
 
-  // Surface a skip on the Logs/turn trail (warn + skipped) so a vision that silently does nothing
-  // (attachment left unextracted) is visible to the operator instead of vanishing. Mirrors STT.
-  const skip = (reason: string): null => {
+  // Surface a skip on the Logs/turn trail so a vision that silently does nothing (attachment left
+  // unextracted) is visible to the operator instead of vanishing. Mirrors STT.
+  const skip = (reason: string): Unread => {
     if (params.flow) {
       emitFlowEvent(params.flow, {
         stage: "vision",
-        level: "warn",
+        level: skipLevel(reason),
         status: "skipped",
         provider: cfg.provider,
         detail: { reason },
       });
     }
-    return null;
+    return { unread: unreadCauseOf(reason) };
   };
 
   const provider = getVisionProvider(cfg.provider);
@@ -419,8 +556,8 @@ async function extractInboundOnce(
     tryResolveApiKeyEntry(db, cfg.credentialRef as string),
   );
   if (entry.state !== "ok") {
-    // Gone/unfilled and wrong-KIND are separate lines because the operator's move differs: re-pick or
-    // fill one, move the other to the field it belongs on (issue #471).
+    // NOTE: Gone/unfilled and wrong-KIND are separate lines because the operator's move differs:
+    // re-pick or fill one, move the other to the field it belongs on.
     if (entry.state === "unusable") {
       logger.warn(
         "vision: credential %s is a %s credential, which cannot be used as an API key — skipping",
@@ -449,6 +586,7 @@ async function extractInboundOnce(
     // retrying it would multiply whatever a crafted body asks for.
     ({ bytes, contentType } = await client.downloadAttachment(params.dataUrl, {
       retryOnMissing: !params.bodyImage,
+      signal: params.signal,
     }));
   } catch (err) {
     if (params.flow) {
@@ -479,64 +617,19 @@ async function extractInboundOnce(
     if (cfg.pdfText === false) return skip("document_not_supported");
     // Read locally, so no spend ceiling: nothing is billed.
     const local = await pdfTextFor(bytes, params.flow, cfg.provider);
-    if (local === null) return null;
+    if (local === null) return { unread: "failed" };
     return keepExtraction(params, client, "document", local);
   }
 
-  // THE SPEND CEILING, asked here and not by the caller. Vision runs on the incoming attachment
-  // BEFORE the webhook's gates decide anything, so the turn ceiling upstream has not run yet and
-  // an image sent into a spent month would be billed with nothing to stop it.
-  //
-  // ASKED ONCE THE CALL IS KNOWN TO BE POSSIBLE, immediately before it, and not at the top of this
-  // function. A refusal says that spend was what stood in the way, and everything above — an unknown
-  // provider, a missing credential, a type this endpoint cannot read — is a reason the provider was
-  // never going to be called at all, so a `vision` line saying the attachment was skipped for budget
-  // would name a cause that was not operative. The download above is a Chatwoot fetch, not a billed
-  // one, and it is what tells this function the attachment's type in the first place.
-  //
-  // It is the REFUSAL half that this ordering is for. The warning is a statement about the MONTH,
-  // true whether or not this particular call runs, so a window it claims early costs at most a
-  // staler percentage in the line the operator reads — see the waiver in `.codex-review-waived`,
-  // which is where that adjudication lives.
-  //
-  // IT ANNOUNCES THE WARNING AND NOT THE REFUSAL, which is the one thing this gate does differently
-  // from the other four, and the asymmetry is what the two halves leave behind.
-  //
-  // `spend_ceiling` `over` is written per refused MESSAGE, and this runs on the same message the
-  // webhook gate refuses moments later: writing it here would put two refusal rows and two alert
-  // bumps on the Logs page for one customer message, and the count of refusals is the number an
-  // operator reads off that page. Nothing is lost by staying quiet, because the `vision` line below
-  // says `skipped` with `spend_ceiling` as its reason, which is the stage the reader filters by when
-  // they are asking why an attachment was never read.
-  //
-  // The WARNING leaves no such trace: the call proceeds, the attachment is read, and no line
-  // anywhere says the month crossed its fraction. And the gate that would have said it may never
-  // run — vision is upstream of every one of them, so a human-owned conversation, a silenced agent,
-  // a redirect or an hour outside the schedule consumes the delivery first, and this billed call is
-  // the only thing that happened. It cannot double-write: the warning's window is claimed once, so
-  // a gate that follows and asks the same question writes nothing.
-  //
-  // The playground's own file path asks in the same place, for the same reason, and differs only in
-  // what it does with the answer: it goes through `assertPlaygroundSpendCeiling`, where no webhook
-  // gate follows it and both halves are its own to announce.
-  // BEFORE THE CEILING, and this is the same rule the `visionKindForMime` check above follows: a
-  // refusal says SPEND was what stood in the way, so it is asked after everything that would have
-  // stopped the call anyway (docs/spend-ceiling.md, "Where the gate is asked"). A HEIC that is
-  // truncated or over the pixel cap is refused in a month with budget to spare, so answering
-  // `spend_ceiling` in a spent one reports a refusal that never happened and sends the operator to
-  // change a budget that cannot make the file readable.
-  //
-  // It costs a decode this turn may not spend anything on — the earlier ordering was written to
-  // avoid exactly that, and it bought the wrong thing. The cost is bounded (one conversion at a
-  // time, 50 Mpx cap) and it is the same trade this path already makes for the download, which sits
-  // below the ceiling because it is what tells us the file's type in the first place.
-  //
-  // A mismatch is NOT one of these: it falls back to the original bytes and the call still happens,
-  // so it is the ceiling's business like any other readable file.
+  // THE SPEND CEILING, asked here because vision runs BEFORE the webhook's gates, and only
+  // once the call is known to be possible: a refusal must mean spend was what stood in the way, so
+  // the conversion (which can refuse on its own) runs first. It announces the warning and not the
+  // refusal; why is in docs/spend-ceiling.md ("Vision asks for itself").
   const converted = await convertForProvider({
     bytes,
     mimeType: contentType,
     provider: cfg.provider,
+    baseURL: entry.baseUrl ?? cfg.baseURL,
     flow: params.flow,
   });
   if (!converted.ok) return skip(converted.reason);
@@ -566,6 +659,7 @@ async function extractInboundOnce(
       model: cfg.model || provider.defaultModel,
       flow: params.flow,
       sleep: params.deps?.sleep,
+      signal: params.signal,
       req: {
         bytes: converted.bytes,
         mimeType:
@@ -577,6 +671,8 @@ async function extractInboundOnce(
         apiKey: entry.secret,
         baseURL: entry.baseUrl ?? cfg.baseURL,
         fetchImpl: params.deps?.fetchImpl ?? fetch,
+        maxOutputTokens: cfg.maxOutputTokens,
+        reasoningEffort: cfg.reasoningEffort,
       },
     });
   } catch (e) {
@@ -592,27 +688,26 @@ async function extractInboundOnce(
       },
       "inbound vision extraction failed; leaving attachment unextracted",
     );
-    return null;
+    return { unread: "failed" };
   }
   const text = extracted.text.trim();
-  // The row is written whether or not the extraction yielded text: a call that came back empty was
-  // billed exactly like one that came back full, and the early return below used to end the
-  // function before anything could record it.
+  // NOTE: The row is written whether or not the extraction yielded text: a call that came back empty
+  // was billed like one that came back full, so the usage is recorded before the early return.
   if (params.flow && extracted.usage) {
     await recordDirectUsage(params.flow, {
       provider: cfg.provider,
       model: cfg.model || provider.defaultModel,
-      node: "vision",
+      node: params.usageNode ?? "vision",
       ...extracted.usage,
       durationMs: performance.now() - readStartedAt,
     });
   }
-  if (!text) return null;
+  if (!text) return { unread: "failed" };
   return keepExtraction(params, client, kind, text);
 }
 
 // The text layer of a PDF the provider cannot take (./pdf-text), already worded for the model. Null
-// when the read failed or timed out: the attachment then counts as unread, as before this existed.
+// when the read failed or timed out: the attachment then counts as unread.
 async function pdfTextFor(
   bytes: ArrayBuffer,
   flow: FlowContext | undefined,
@@ -666,14 +761,14 @@ async function pdfTextFor(
 // What every successful read ends with, provider or local: the annotation store, then the
 // write-back onto the attachment.
 async function keepExtraction(
-  params: ExtractInboundParams,
+  params: ExtractInboundParams & { remember?: (r: ExtractResult) => void },
   client: ChatwootClient,
   kind: VisionKind,
   text: string,
 ): Promise<ExtractResult> {
   const { cfg } = params;
-  // NOTE: Stash BEFORE the write-back — same contract as the STT pass: on upstream Chatwoot (no
-  // fork meta route) the in-process overlay is the only reader of this extraction (issue #49).
+  // NOTE: Stash BEFORE the write-back, same contract as the STT pass: on upstream Chatwoot (no
+  // fork meta route) the in-process overlay is the only reader of this extraction.
   if (params.stashAnnotation !== false)
     stashMediaAnnotation(
       {
@@ -684,6 +779,7 @@ async function keepExtraction(
       kind === "image" ? { imageDescription: text } : { extractedText: text },
     );
 
+  params.remember?.({ kind, text });
   // NOTE: Write back so the debounce re-fetch (and human agents) see it. Best-effort; surfaced on
   // the flow log so a meta that never lands is visible to the operator.
   if (params.attachmentId !== null)
@@ -716,10 +812,9 @@ async function keepExtraction(
 }
 
 export interface PlaygroundExtractParams {
-  // The REQUEST's context, unlike the inbound path above, whose tenant id this process read from a
-  // row. Rebuilding one here would tell the unknown-tenant check at `runScopedOn` that a caller's
-  // stale selector was internal, and the operator would get "agent not found" for a tenant that is
-  // gone rather than a refusal naming the selection they are carrying (issue #268).
+  // The REQUEST's context, unlike the inbound path, whose tenant id was read from a row. Rebuilding
+  // one here would make the unknown-tenant check at `runScopedOn` treat a stale selector as internal
+  // and answer "agent not found" instead of refusing the selection.
   ctx: TenantContext;
   agentId: bigint;
   file: ArrayBuffer;
@@ -821,9 +916,22 @@ export async function extractPlaygroundFile(
     bytes: params.file,
     mimeType: params.mimeType,
     provider: cfg.provider,
+    baseURL: entry.baseUrl ?? cfg.baseURL,
     flow: params.flow,
   });
-  if (!converted.ok) return { kind: "unsupported", text: "" };
+  if (!converted.ok) {
+    // The inbound path writes this line through its `skip`; the playground has no marker to leave,
+    // so the line is what tells the operator why the file was not read.
+    if (params.flow)
+      emitFlowEvent(params.flow, {
+        stage: "vision",
+        level: skipLevel(converted.reason),
+        status: "skipped",
+        provider: cfg.provider,
+        detail: { reason: converted.reason },
+      });
+    return { kind: "unsupported", text: "" };
+  }
 
   // The playground's own ceiling, asked once the file is known to be extractable AND convertible,
   // and before the provider round trip. It throws (see `assertPlaygroundSpendCeiling`), so an
@@ -854,6 +962,8 @@ export async function extractPlaygroundFile(
         apiKey: entry.secret,
         baseURL: entry.baseUrl ?? cfg.baseURL,
         fetchImpl: params.deps?.fetchImpl ?? fetch,
+        maxOutputTokens: cfg.maxOutputTokens,
+        reasoningEffort: cfg.reasoningEffort,
       },
     });
     if (params.flow && extracted.usage) {

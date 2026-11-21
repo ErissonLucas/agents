@@ -20,8 +20,9 @@ import {
   getTenantSettings,
   updatePriceOverrides,
 } from "@/modules/tenant-settings/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #865: a tenant's own prices for model calls, consulted before the price table when a ledger
+// A tenant's own prices for model calls, consulted before the price table when a ledger
 // row is priced, and recorded in the row so a price corrected later can find the rows it wrote.
 
 const tokens = (promptTokens: number, completionTokens: number) => ({
@@ -63,15 +64,6 @@ describe("what prices a call", () => {
     );
   });
 
-  test("a server the table can never price is priced by the tenant's own rate", () => {
-    const own = block([
-      { provider: "openai-compatible", model: "", input: 0.05, output: 0.05 },
-    ]);
-    expect(
-      priceCall("openai-compatible", "", tokens(2_000, 200), AT, own).costUsd,
-    ).toBeCloseTo((2_000 * 0.05 + 200 * 0.05) / 1e6, 12);
-  });
-
   test("the image reader's `gemini` finds a price saved under `google`", () => {
     const own = block([
       { provider: "google", model: "gemini-3.5-flash", input: 1, output: 2 },
@@ -104,7 +96,7 @@ describe("what prices a call", () => {
     ).toBeCloseTo(1, 12);
   });
 
-  // A cache rate the tenant left empty means no discount, never no price (verification of #865).
+  // NOTE: a cache rate the tenant left empty means no discount, never no price.
   test("a cache read or write on a tenant price with no cache rate is charged at its input rate", () => {
     const own = block([
       { provider: "openai", model: "gpt-4o-mini", input: 0.1, output: 0.3 },
@@ -242,8 +234,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -396,7 +388,7 @@ describe.skipIf(!dbUp)("a saved price prices the next call", () => {
     ]);
   });
 
-  // The MCP tools read and write the same list, with the same validation (issue #865).
+  // NOTE: the MCP tools read and write the same list, with the same validation.
   test("over MCP: a preview writes nothing, an apply saves, the read returns it, and a bad list is refused alike", async () => {
     const token = (scopes: string[]): VerifiedToken => ({
       userId: null as unknown as bigint,

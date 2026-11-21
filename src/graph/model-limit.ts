@@ -1,7 +1,18 @@
 import logger from "@/api/lib/logger";
 import config from "@/config";
-import { asProviderFailure } from "@/lib/provider-failure";
-import { Semaphore } from "@/lib/semaphore";
+import {
+  asProviderFailure,
+  clearAccountFailure,
+  failsUntilAccountFixedAt,
+  markReportedElsewhere,
+  providerFailure,
+} from "@/lib/provider-failure";
+import {
+  type PermitClass,
+  Semaphore,
+  type SemaphorePolicy,
+} from "@/lib/semaphore";
+import type { CapacityOccupancy } from "@/modules/flowlog/capacity";
 import {
   EMPTY_COMPLETION_MESSAGE,
   isEmptyCompletionFault,
@@ -22,32 +33,67 @@ import {
 
 const KEY = Symbol.for("fazerai.model.semaphore");
 
+// The background's share is a count of permits held at once, the percentage of the permits rounded
+// down, so a semaphore too small for a share relies on the aging bound alone.
+export function modelSemaphorePolicy(c: typeof config): SemaphorePolicy {
+  return {
+    backgroundMin: Math.floor(
+      (c.agent.modelConcurrency * c.agent.backgroundSharePercent) / 100,
+    ),
+    agingMs: c.agent.backgroundMaxWaitMs,
+  };
+}
+
+export function modelSemaphore(): Semaphore {
+  return sem();
+}
+
 function sem(): Semaphore {
   const g = globalThis as unknown as Record<symbol, Semaphore>;
-  g[KEY] ??= new Semaphore(config.agent.modelConcurrency);
+  g[KEY] ??= new Semaphore(
+    config.agent.modelConcurrency,
+    modelSemaphorePolicy(config),
+  );
   return g[KEY];
 }
 
-// NOTE: short on purpose — a customer is waiting on the other end of this call.
+// The semaphore as it stands, for a `capacity` line to say which limit held a reply.
+export interface ModelPermitReading {
+  permits: number;
+  inFlight: number;
+  waiting: number;
+  // The queue split by class: a background count that only grows is a starved background.
+  waitingReply: number;
+  waitingBackground: number;
+  heldBackground: number;
+}
+
+export function modelPermitReading(): ModelPermitReading {
+  const s = sem();
+  const byClass = s.classReading();
+  return {
+    permits: s.permits,
+    inFlight: s.permits - s.free,
+    waiting: s.waiting,
+    waitingReply: byClass.reply.waiting,
+    waitingBackground: byClass.background.waiting,
+    heldBackground: byClass.background.held,
+  };
+}
+
+// Short on purpose: a customer is waiting on the other end of this call.
 const RETRY_DELAY_MS = 250;
 
-// The one place that knows an error came from a provider, which is what makes it the place to say
-// what it may repeat. This used to name the empty-completion fault and let everything else "travel
-// untouched" — and untouched is the leak: the request carried the whole conversation, so a refusal
-// quoting its input put the customer's words verbatim into the flow log, the alert body POSTed to
-// the operator's channel, `Conversation.lastError` and the private note this failure writes into the
-// customer's own Chatwoot conversation. All four read `.message` of whatever was thrown, so this
-// single substitution closes all four and no call site downstream changes.
-//
-// The empty-completion case keeps its own sentence because that diagnosis is OURS: nothing in the
-// response says it, we concluded it from the expression that failed. Everything else goes to the
-// closed vocabulary in `@/lib/provider-failure`, with the original kept as `cause` for the process
-// log.
+// The one place that knows an error came from a provider, so the place to say what it may repeat.
+// The request carried the whole conversation, so a provider message quoting its input would put the
+// customer's words into the flow log, the operator alert, `Conversation.lastError` and the private
+// note in their Chatwoot conversation, all of which read `.message`; substituting here covers all
+// four. Everything goes to the closed vocabulary in `@/lib/provider-failure` (original kept as
+// `cause`), except the empty completion, whose diagnosis is ours: nothing in the response says it.
 function describeProviderFault(err: unknown): unknown {
   if (isEmptyCompletionFault(err)) {
-    // No log of its own: this fault is only ever reached after the retry, which already logged the
-    // failing expression with the error object. A second line here was written and removed once
-    // mutation showed it killed nothing — the retry's log is what covers this path.
+    // NOTE: no log of its own: this fault is only reached after the retry, which already logged the
+    // failing expression with the error object.
     return new Error(EMPTY_COMPLETION_MESSAGE, { cause: err });
   }
   if (isProviderNoticeFault(err)) return new Error(PROVIDER_NOTICE_MESSAGE);
@@ -59,60 +105,80 @@ export interface ModelLabels {
   model: string;
 }
 
+// A fallback that failed, and, when it had been handed the turn by a failing primary, that primary's
+// failure: the one a fallback that answers reports as `primaryFailure`, which needs a line of its own
+// when nothing answered. Absent when the fallback already had the turn (an earlier round demoted the
+// primary) and no primary was asked.
+export interface FallbackFailedInfo extends ModelLabels {
+  reason: string;
+  failure: string;
+  primary?: ModelLabels & { reason: string; failure: string };
+}
+
 export interface ModelFallback<T> {
   // The same call, against the other provider. A thunk rather than a model, because only the caller
-  // knows what "the same call" means — which messages, which bound tools, and which metadata names
+  // knows what "the same call" means: which messages, which bound tools, and which metadata names
   // the model for the usage row. Handed the deadline's signal, like the primary's thunk.
   run: (signal: AbortSignal) => Promise<T>;
-  // The fallback's own deadline: it is another provider, with its own ceiling (issue #819).
+  // The fallback's own deadline: it is another provider, with its own ceiling.
   deadlineMs: number;
   // What it runs on, for the lines this module writes about it.
   labels: ModelLabels;
-  // Fired when the fallback takes the turn, so the runtime can leave a warn on the trail. `reason`
-  // is already the redacted word: the request carried the whole conversation, so the provider's own
-  // sentence may be the customer's coming back.
-  onFallback?: (info: { reason: string }) => void;
-  // Fired when the fallback ALSO failed, which is the turn's real ending. Its own line, because the
-  // `generate` stage wrapping this call is labelled with the PRIMARY by construction: without it an
-  // operator reads "the fallback took the turn (ok)" followed by an error attributed to the model
-  // that never made the second call, which reads as the primary failing twice.
-  onFallbackFailed?: (info: { reason: string }) => void;
+  // Fired once the fallback ANSWERED, so the runtime can leave a warn on the trail; never before the
+  // outcome is known, or a fallback that fails a moment later reads as having taken the turn.
+  // `reason` is the primary's, already the redacted word: the request carried the whole conversation,
+  // so the provider's own sentence may be the customer's coming back.
+  onFallback?: (info: {
+    reason: string;
+    failure: string;
+    // Whether the primary's failure is one it will repeat until its account is fixed: a caller that
+    // keeps the fallback for later rounds asks it before ending the job on the fallback's account.
+    primaryFailsUntilAccountFixed: boolean;
+  }) => void;
+  // Fired when the fallback ALSO failed, which is the turn's real ending, with both failures: the
+  // fallback's (`reason`, `failure`) and the primary's that handed it the turn, so the primary's
+  // failure still reaches a line of its own.
+  onFallbackFailed?: (info: {
+    reason: string;
+    failure: string;
+    primaryReason: string;
+    primaryFailure: string;
+  }) => void;
 }
 
-// WHICH MODEL AN EVENT IS ABOUT, carried on every event and NOT optional.
-//
-// It was optional for one round, defaulting to the agent's configured model at each of the four
-// places that write a flow line. Review found two of the four still reading only `attempt`, so a
-// retry made by the FALLBACK was published under the primary's name — the third time in this change
-// that a row named the wrong model. Optional-with-a-default is a rule every call site has to
-// remember; carried on the event is a rule there is nothing to remember about, because the only
-// place that knows which of the two models it just called is this one.
+// Which model an event is about, carried on every event and NOT optional: only this module knows
+// which of the two models it just called, and a label defaulted at each call site would publish a
+// fallback's retry under the primary's name.
 export interface ModelRetryInfo extends ModelLabels {
   attempt: number;
   error: unknown;
 }
 
-// A wait for a permit that outlasted the operator's threshold (issue #812). `waitedMs` is measured
-// when it is reported, which is while the call is STILL waiting: at least the threshold, never the
-// whole wait.
+// A wait for a permit that outlasted the operator's threshold. `waitedMs` is measured when it is
+// reported, which is while the call is STILL waiting: at least the threshold, never the whole wait.
 export interface PermitWaitInfo {
   waitedMs: number;
   thresholdMs: number;
+  occupancy: CapacityOccupancy;
 }
 
-// EVERY CALL HAS A DEADLINE (issue #819). `runModelCall` applies it itself, through
+// Every call has a deadline. `runModelCall` applies it itself, through
 // `callWithDeadline`, so no call through this module can wait on a provider for longer, whatever its
 // adapter does with the signal. `deadlineMs` is the caller's own value; left out, a call gets the
-// agent's `modelCallTimeoutMs`, and `tests/lib/model-call-deadline-sweep.test.ts` keeps every caller
+// agent's `modelCallTimeoutMs`, and `biome-plugins/require-model-call-deadline.grit` keeps every caller
 // under `src/` from leaving it out, so the default is a floor for tests and never a site's policy.
 export type ModelCallOptions<T> = {
   deadlineMs?: number;
-  // The caller's own end, which today is a job's deadline (issue #834). It ends the wait for a
+  // The caller's own end, which is a job's deadline. It ends the wait for a
   // permit: a call whose signal aborts leaves the queue with the signal's reason and takes no permit,
   // so a run past its deadline stops holding its row in the running set until a permit frees. It
   // does not reach `fn`, which is handed the call's own deadline; a caller that wants the model call
   // itself ended joins the two there, as the agent turn does.
   signal?: AbortSignal;
+  // Who is waiting on this call (src/lib/semaphore.ts): `reply` (the default) is a customer's turn,
+  // `background` is work nobody waits on this second, which yields its permit to replies under
+  // contention, within its share and its aging bound.
+  priority?: PermitClass;
 } & (
   | ReportingModelCallOptions<T>
   | {
@@ -129,9 +195,9 @@ interface ReportingModelCallOptions<T> {
   primary: ModelLabels;
   // Fired when a call is retried, so the runtime can leave a warn on the turn's trail. Best-effort.
   onRetry?: (info: ModelRetryInfo) => void;
-  // Absent for every caller that has nothing behind its provider, which is every caller today except
-  // the agent turn. None of the bounds in `model-fallback` apply to a model built without one; the
-  // agent turn bounds that call with `callWithDeadline` instead (issue #809).
+  // Absent for every caller that has nothing behind its provider, which is every caller except the
+  // agent turn. None of the bounds in `model-fallback` apply to a model built without one; the agent
+  // turn bounds that call with `callWithDeadline` instead.
   fallback?: ModelFallback<T>;
   // Fired ONCE when this call has waited for a permit past `config.agent.capacityWaitAlertMs`, and
   // while it still waits, so the operator hears about a saturated instance during the wait rather
@@ -142,15 +208,11 @@ interface ReportingModelCallOptions<T> {
 }
 
 // A deadline on ONE model call, retries included, that holds whether or not the adapter honours the
-// abort signal (issue #809). The signal goes to the call, so an adapter that listens cancels its own
-// request: measured, the OpenAI-shaped clients and Anthropic stop in the same 2.0s. The race is what
-// holds on one that does not: the Google adapter ignores both `signal` and `timeout` (measured, still
-// waiting at 90s), so its request is left to finish on its own while the turn has already failed.
-// `signal.reason` is the DOMException `TimeoutError`, which `provider-failure` already reads as
-// "timeout".
-//
-// Built INSIDE the thunk `runModelCall` runs, never before it, for the reason summarize.ts gives: a
-// signal created outside spends its budget waiting on the semaphore.
+// abort signal. The signal goes to the call, so an adapter that listens (the OpenAI-shaped clients,
+// Anthropic) cancels its own request; the race holds on one that does not (the Google adapter
+// ignores `signal` and `timeout`), leaving that request to finish on its own. `signal.reason` is the
+// DOMException `TimeoutError`, which `provider-failure` reads as "timeout". Built INSIDE the thunk
+// `runModelCall` runs: a signal created outside spends its budget waiting on the semaphore.
 export function callWithDeadline<T>(
   ms: number,
   run: (signal: AbortSignal) => Promise<T>,
@@ -171,20 +233,16 @@ export async function runModelCall<T>(
 ): Promise<T> {
   const fallback = opts?.fallback;
   const deadlineMs = opts?.deadlineMs ?? config.agent.modelCallTimeoutMs;
-  // ONE attempt at ONE model, carrying the single recovery LangChain cannot make for us. Written
-  // once and applied to BOTH models: the fallback answers the customer in the primary's place, so an
-  // intermittent empty completion costs it the turn exactly the way it cost the primary one before
-  // issue #63 — measured at 1 in 184 on one install, which is not a rate a last resort may ignore.
-  // The first version of this invoked the fallback bare, and review found it.
-  //
-  // The deadline is armed per ATTEMPT and inside the permit: a retry gets a fresh one, and time spent
-  // queueing on the semaphore is not spent from it.
+  // One attempt at one model, with the single recovery LangChain cannot make, applied to BOTH
+  // models: the fallback answers in the primary's place, and an intermittent empty completion would
+  // cost it the turn the same way. The deadline is armed per ATTEMPT and inside the permit: a retry
+  // gets a fresh one, and time queueing on the semaphore is not spent from it.
   const attemptOn = async (
     call: (signal: AbortSignal) => Promise<T>,
     labels: ModelLabels | undefined,
     ms: number,
   ): Promise<T> => {
-    // NOTE: a provider notice is thrown, not retried: the same model answers it again.
+    // A provider notice is thrown, not retried: the same model answers it again.
     const run = async () => {
       const out = await callWithDeadline(ms, call);
       if (isProviderNotice(out)) {
@@ -210,19 +268,30 @@ export async function runModelCall<T>(
     }
   };
 
-  // NOTE: armed before the queue and cleared as the permit is granted. A permit that is free now is
+  // Armed before the queue and cleared as the permit is granted. A permit that is free now is
   // granted in the next microtask, long before any timer can fire, so an uncontended call reports
   // nothing.
   const onPermitWait = opts?.onPermitWait;
+  const priority = opts?.priority ?? "reply";
   let waitTimer: ReturnType<typeof setTimeout> | undefined;
   if (onPermitWait) {
     const thresholdMs = config.agent.capacityWaitAlertMs;
     const queuedAt = performance.now();
     waitTimer = setTimeout(() => {
       try {
+        const model = modelPermitReading();
         onPermitWait({
           waitedMs: Math.round(performance.now() - queuedAt),
           thresholdMs,
+          occupancy: {
+            limit: "AGENT_MODEL_CONCURRENCY",
+            class: priority,
+            modelInFlight: model.inFlight,
+            modelPermits: model.permits,
+            modelWaiting: model.waiting,
+            modelWaitingReply: model.waitingReply,
+            modelWaitingBackground: model.waitingBackground,
+          },
         });
       } catch (err) {
         logger.warn({ err }, "reporting a model permit wait failed");
@@ -232,47 +301,66 @@ export async function runModelCall<T>(
   }
 
   // NOTE: cleared on every way out of the wait, a call that left the queue included: a wait that
-  // ended is no longer one to report (issue #834).
+  // ended is not one to report.
   try {
-    return await sem().run(async () => {
-      clearTimeout(waitTimer);
-      // Reached with the error the PROVIDER raised, which is the whole reason the decision lives here
-      // rather than at the call site. One lane up, the error has already been through
-      // `describeProviderFault` and is one of our own three words: `statusOf` still reads (the status
-      // rides along), but "timeout" has become a message on an Error named "Error", so a predicate
-      // asking the SDK's question would answer no to the exact case it exists for.
-      const failed = async (err: unknown): Promise<T> => {
-        const described = describeProviderFault(err);
-        if (!fallback || !isFallbackWorthy(err)) throw described;
-        const reason =
-          described instanceof Error ? described.message : "provider error";
-        logger.warn(
-          { err },
-          "primary model provider failed; handing the turn to the fallback",
-        );
-        fallback.onFallback?.({ reason });
-        try {
-          return await attemptOn(
-            fallback.run,
-            fallback.labels,
-            fallback.deadlineMs,
+    return await sem().run(
+      async () => {
+        clearTimeout(waitTimer);
+        // Reached with the error the PROVIDER raised, which is why the decision lives here and
+        // not at the call site: after `describeProviderFault`, "timeout" is a message on an Error named
+        // "Error", so a predicate asking the SDK's question would answer no to the case it exists for.
+        const failed = async (err: unknown): Promise<T> => {
+          const described = describeProviderFault(err);
+          if (!fallback || !isFallbackWorthy(err)) throw described;
+          const reason =
+            described instanceof Error ? described.message : "provider error";
+          logger.warn(
+            { err },
+            "primary model provider failed; handing the turn to the fallback",
           );
-        } catch (fallbackErr) {
-          // The fallback is the last thing there is, so what it failed with is what the turn reports.
-          // Redacted the same way: a second vendor's prose is no safer than the first's.
-          const out = describeProviderFault(fallbackErr);
-          fallback.onFallbackFailed?.({
-            reason: out instanceof Error ? out.message : "provider error",
+          const primaryFailure = providerFailure(err);
+          let answered: T;
+          try {
+            answered = await attemptOn(
+              fallback.run,
+              fallback.labels,
+              fallback.deadlineMs,
+            );
+          } catch (fallbackErr) {
+            // The fallback is the last thing there is, so what it failed with is what the turn
+            // reports. Redacted the same way: a second vendor's prose is no safer than the first's.
+            const out = describeProviderFault(fallbackErr);
+            // NOTE: the job ends on the fallback's account only when the primary's failure would
+            // repeat too; otherwise the next attempt goes to the primary, which may answer.
+            if (!failsUntilAccountFixedAt(err)) clearAccountFailure(out);
+            if (fallback.onFallbackFailed) {
+              const failure = providerFailure(fallbackErr);
+              fallback.onFallbackFailed({
+                reason: out instanceof Error ? out.message : "provider error",
+                failure,
+                primaryReason: reason,
+                primaryFailure,
+              });
+              markReportedElsewhere(out, failure);
+            }
+            throw out;
+          }
+          fallback.onFallback?.({
+            reason,
+            failure: primaryFailure,
+            primaryFailsUntilAccountFixed: failsUntilAccountFixedAt(err),
           });
-          throw out;
+          return answered;
+        };
+        try {
+          return await attemptOn(fn, opts?.primary, deadlineMs);
+        } catch (err) {
+          return failed(err);
         }
-      };
-      try {
-        return await attemptOn(fn, opts?.primary, deadlineMs);
-      } catch (err) {
-        return failed(err);
-      }
-    }, opts?.signal);
+      },
+      opts?.signal,
+      priority,
+    );
   } finally {
     clearTimeout(waitTimer);
   }

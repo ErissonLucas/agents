@@ -5,18 +5,13 @@ import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { useState } from "react";
 import { useDocumentPreview } from "@/client/pages/resources/documents/useDocumentPreview";
 
-// The preview is keyed on the EDITING SESSION, not on the template.
-//
-// The request is debounced by 600 ms, so whatever the previous session produced stays on screen
-// until the next response lands. Keyed on the template id that reads as correct and does nothing in
-// the case that matters: an operator edits a template, cancels, and reopens the SAME one — the id
-// has not changed, so the discarded draft's PDF is what they read while typing the new one.
-//
-// The call site is now protected by the compiler (`session` is a required number, and a template id
-// is a string), so what is left to prove here is the rule itself: a new session drops the previous
-// document AT ONCE, without waiting for the request that replaces it.
-//
-// NOTE: every assertion reduces to a boolean or a string BEFORE expect — a failing expectation that
+// The preview is keyed on the EDITING SESSION, not on the template. The request is debounced by
+// 600 ms, so the previous session's output stays on screen until the next response lands; keyed on
+// the template id, reopening the SAME template after cancelling would show the discarded draft's
+// PDF. The compiler guards the call site (`session` is a number, a template id a string); this
+// proves a new session drops the previous document AT ONCE.
+
+// Every assertion reduces to a boolean or a string BEFORE expect: a failing expectation that
 // holds a DOM node serializes a cyclic happy-dom tree and stalls the runner.
 
 const realFetch = globalThis.fetch;
@@ -82,41 +77,41 @@ describe("useDocumentPreview", () => {
     );
   });
 
-  // Reading the body is a SECOND await, and the session can change during it. The success path
-  // re-checks after `res.blob()`; the refusal path did not after `res.json()`, so a validation error
-  // about the draft the operator just left would land in the new session and sit there — naming a
-  // block they have already fixed — until the newer request answered.
+  // NOTE: reading the body is a SECOND await, and the session can change during it. Both paths re-check
+  // after it (`res.blob()` and `res.json()`), or a validation error about the draft just left would
+  // land in the new session, naming a block already fixed, until the newer request answered.
   test("a refusal whose body arrives after the session changed is dropped", async () => {
-    let releaseBody: (() => void) | undefined;
-    const held = new Promise<void>((r) => {
-      releaseBody = r;
-    });
+    const asked = Promise.withResolvers<void>();
+    const body = Promise.withResolvers<void>();
+    const read = Promise.withResolvers<void>();
     respond = async () => ({
       ok: false,
       status: 400,
+      // Real headers, because `mediaFetch` reads them before the caller ever reaches the body.
+      headers: new Headers({ "Content-Type": "application/json" }),
       json: async () => {
-        await held;
+        asked.resolve();
+        await body.promise;
+        read.resolve();
         return { error: 'block "corpo" is empty' };
       },
     });
 
     const view = render(<Harness />);
-    // The refusal's headers are in; its body is not.
-    await waitFor(
-      () => {
-        expect(releaseBody !== undefined).toBe(true);
-      },
-      { timeout: 3000 },
-    );
-    await new Promise((r) => setTimeout(r, 800));
+    // The refusal's headers are in, and the hook is reading its body.
+    await asked.promise;
 
     // The operator reopens on a new session, and only THEN does the old body finish parsing.
     act(() => {
       reopen();
     });
     respond = okResponse;
-    releaseBody?.();
-    await new Promise((r) => setTimeout(r, 50));
+    await act(async () => {
+      body.resolve();
+      await read.promise;
+      // The hook's own reactions to the parsed body run before the next turn of the loop.
+      await new Promise((r) => setTimeout(r, 0));
+    });
 
     // The stale refusal never reaches the screen, and the new session's document does.
     expect(seenError).toBeNull();

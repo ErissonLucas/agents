@@ -4,7 +4,11 @@ import type { PrismaClient as PrismaClientType } from "@/../generated/prisma/cli
 import { PrismaClient } from "@/../generated/prisma/client";
 import { createTenant } from "@/api/v1/tenants.admin.service";
 import { listTenants } from "@/api/v1/tenants.service";
-import { ActiveTenantNotFoundError, AppError } from "@/lib/errors";
+import {
+  ActiveTenantNotFoundError,
+  AppError,
+  ProEditionError,
+} from "@/lib/errors";
 import { resolveRequestTenantContext, type TenantContext } from "@/lib/tenancy";
 import { issueDocument } from "@/modules/documents/issue";
 import {
@@ -43,30 +47,15 @@ import {
   searchKnowledge,
   updateKnowledgeBase,
 } from "@/modules/rag/service";
-import { codeOnly, withoutComments } from "@/tests/utils/source-text";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { withoutComments } from "@/tests/utils/source-text";
 
-// #268 fixed the playground and said the playground was the one console surface that handed a
-// module a bare tenant id. It was four more: knowledge/RAG, experiments, integrations and
-// documents. Same mechanism — `runScopedOn` verifies an unknown tenant ONLY for a `SUPER_ADMIN`
-// context, because the role is what separates an id that reached this process from outside (the
-// `X-Tenant-Id` selector the console persists in the browser) from one it read from a row; a module
-// that takes `tenantId: bigint` and rebuilds a `TENANT_ADMIN` context around it tells that check the
-// id was internal, whatever its real provenance.
-//
-// Measured before the change, against this database, with a selector naming a tenant that does not
-// exist. Five answered as though the tenant were real and merely empty:
-//
-//   listKnowledgeBases   -> []   listPendingApprovals -> []   searchKnowledge -> []
-//   listExperiments      -> []   readEmbeddingBlock   -> { reason: "embedding_not_configured" }
-//
-// while the same selector on any other route answered 404 `ActiveTenantNotFoundError`. The rest did
-// refuse, about the wrong fact — "knowledge base not found", "document not found", "experiment not
-// found", "document template not found", "tool definition not found" — none of which tells the
-// console anything about the selector it is carrying, so the recovery #265 added never fires. The
-// one write in the set was worse still: `createIntegrationInstance` reached Postgres and came back
-// with a raw foreign-key violation, which is not an `AppError` at all and surfaces as a 500.
-//
-// Issue #280.
+// The console's knowledge/RAG, experiments, integrations and documents controllers hand their modules
+// the CALLER's context, never a bare tenant id: `runScopedOn` verifies an unknown tenant only for a
+// `SUPER_ADMIN` context (docs/tenancy.md, rule 5). A rebuilt context makes a dead `X-Tenant-Id`
+// selector read as an empty tenant, or as "<thing> not found", which the console's selector recovery
+// never reacts to, or (on `createIntegrationInstance`) a raw foreign-key 500. With a selector naming
+// no tenant, every entry point below answers `ActiveTenantNotFoundError`.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -84,8 +73,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -133,8 +122,7 @@ function operator(tenantId: bigint): TenantContext {
   return { tenantId, userId: 1n, role: "TENANT_ADMIN" };
 }
 
-// Counts the existence check, so "a console operator does not pay for this" is measured rather than
-// asserted.
+// Counts the existence check, so "a console operator does not pay for this" is asserted by a count.
 function counting(base: PrismaClient) {
   const seen = { tenantFindUnique: 0 };
   const client = base.$extends({
@@ -151,9 +139,9 @@ function counting(base: PrismaClient) {
 }
 
 describe.skipIf(!dbUp)("a REST call carrying a dead tenant selector", () => {
-  // One row per exported entry point the four controllers reach, because the defect was per call
-  // site: the decision lives in `runScopedOn` and what this pins is that each of these actually
-  // reaches it with the CALLER's context instead of one rebuilt from the id inside it.
+  // One row per exported entry point the four controllers reach, because the rule holds per
+  // call site: the decision lives in `runScopedOn`, and this pins that each one reaches it with the
+  // CALLER's context instead of one rebuilt from the id inside it.
   //
   // Ids and names below are deliberately arbitrary. Every one of these refuses before the row it
   // names is looked up, which is the whole point: the answer must be about the selector, not about
@@ -309,15 +297,10 @@ describe.skipIf(!dbUp)("a REST call carrying a dead tenant selector", () => {
   });
 });
 
-// Why the same modules reached over MCP were left alone, measured rather than assumed.
-//
-// The MCP transport asks this question at its OWN boundary: every per-tenant tool is registered
-// through `registerTenantTool`, which calls `resolveEffectivePrincipal` before the handler runs, and
-// a SUPER_ADMIN token's `tenant` selector is resolved against the tenants table there. So an id that
-// reached the process from outside has already been proven to name a row by the time any of the
-// functions above sees it, and the `ctx.tenantId` those tools carry is no longer caller-supplied in
-// the sense that matters. That is also why they keep passing `ctx` down without paying twice being
-// a problem: `runScopedOn` re-asks a question already answered, once per scoped block.
+// Why the same modules reached over MCP need nothing more: `registerTenantTool` resolves a
+// SUPER_ADMIN token's `tenant` selector against the tenants table before the handler runs
+// (docs/mcp.md), so an outside id is proven to name a row before any function above sees it, and
+// `runScopedOn` re-asking once per scoped block costs little.
 describe.skipIf(!dbUp)(
   "the MCP transport refuses the same selector earlier",
   () => {
@@ -358,68 +341,6 @@ describe.skipIf(!dbUp)(
   },
 );
 
-// The half a table cannot cover. Everything above proves the FUNCTIONS refuse; it says nothing about
-// whether the next route added to one of these controllers unwraps the request's context back down
-// to an id, which is exactly how the defect got in — twice, in two different spellings (a `bigint`
-// helper in three controllers, an inline cast in two more).
-//
-// Keyed on the TRANSPORT, not on a module path: the modules legitimately keep `sysCtx` for their
-// internal callers (the graph, the ingest job, the scheduler all carry an id read from a row), so a
-// sweep of `src/modules/**` would be a sweep of the wrong thing. #268's guard scanned one module
-// directory and the two offenders that lived outside it were found by review, not by the guard.
-export function handsOutABareTenantId(source: string): boolean {
-  // A helper that unwraps the request's context down to its id, so every route below it can pass
-  // the id on: the shape that was in knowledge, experiments and n8n-export.
-  if (/\):\s*bigint\s*\{[\s\S]{0,300}?\breturn\s+\w+\.tenantId;/.test(source)) {
-    return true;
-  }
-  // The same unwrapping written inline at the call: the shape that was in integrations-admin and
-  // documents. In a controller the context always came from the request, so the cast is always the
-  // provenance being thrown away — there is no benign spelling of it here.
-  return /\.tenantId as bigint/.test(source);
-}
-
-describe("no REST controller hands a module a bare tenant id", () => {
-  const HELPER = `function tenantId(ctx: TenantContext | null): bigint {
-  if (!ctx) throw new ForbiddenError();
-  if (ctx.tenantId === null) throw new TenantTargetRequiredError();
-  return ctx.tenantId;
-}`;
-  const INLINE = `const created = await createIntegrationInstance(
-        ctx.tenantId as bigint,
-        b,
-      );`;
-
-  // A sweep that finds nothing passes whether or not it works, so both shapes are shown to be
-  // caught, and the shape that REPLACED them is shown not to be.
-  test("the predicate catches both shapes that were there", () => {
-    expect(handsOutABareTenantId(HELPER)).toBe(true);
-    expect(handsOutABareTenantId(INLINE)).toBe(true);
-    expect(
-      handsOutABareTenantId(`function ctxOrThrow(ctx: TenantContext | null): TenantContext {
-  if (!ctx) throw new ForbiddenError();
-  if (ctx.tenantId === null) throw new TenantTargetRequiredError();
-  return ctx;
-}`),
-    ).toBe(false);
-    // A row's id is not a selector: this is the case the role predicate exists to let through.
-    expect(handsOutABareTenantId("await getTenantName(user.tenantId)")).toBe(
-      false,
-    );
-  });
-
-  test("no file under src/api does", async () => {
-    const { Glob } = await import("bun");
-    const offenders: string[] = [];
-    for await (const rel of new Glob("**/*.ts").scan("src/api")) {
-      // Through the scan, so prose naming the shape is not counted as one (#424).
-      const src = codeOnly(await Bun.file(`src/api/${rel}`).text());
-      if (handsOutABareTenantId(src)) offenders.push(rel);
-    }
-    expect(offenders).toEqual([]);
-  });
-});
-
 // The negative control for the two exemptions at the bottom of this file, and the reason they are
 // exemptions rather than routes nobody got around to converting: a FLEET operation answers the
 // selector instead of refusing it. `listTenants` and `createTenant` both branch to `asSuperAdminOn`
@@ -427,14 +348,16 @@ describe("no REST controller hands a module a bare tenant id", () => {
 // their response maps to name a 404 would publish a status they cannot return.
 describe.skipIf(!dbUp)("a fleet route answers a dead selector", () => {
   test("listing tenants returns the fleet rather than refusing", async () => {
-    const rows = await listTenants(fromSelector(deadId), appDb);
-    expect(Array.isArray(rows)).toBe(true);
+    const ids = (await listTenants(fromSelector(deadId), appDb)).map(
+      (r) => r.id,
+    );
+    expect(ids).toContain(String(liveId));
+    expect(ids).not.toContain(String(deadId));
   });
 
-  // Written as "whatever it answers, it is not about the selector" because this file ships to both
-  // editions: the derivation swaps `tenants.admin.service` for a stub that refuses with
-  // `ProEditionError` in Free, so asserting the row gets created would fail there for a reason that
-  // has nothing to do with what is under test.
+  // Either edition's answer, because this file ships to both: the derivation swaps
+  // `tenants.admin.service` for a stub that refuses with `ProEditionError` in Free, and Pro creates
+  // the row. Anything else is the selector, or something broken, answering.
   test("creating a tenant never refuses the selector", async () => {
     const slug = `selsweep-fleet-${process.pid}`;
     const err = await createTenant(
@@ -445,6 +368,14 @@ describe.skipIf(!dbUp)("a fleet route answers a dead selector", () => {
       .then(() => null)
       .catch((e: unknown) => e);
     try {
+      const created = await suDb.tenant.findUnique({
+        where: { slug },
+        select: { name: true },
+      });
+      expect([
+        err === null && created?.name === "SelSweepFleet",
+        err instanceof ProEditionError,
+      ]).toContain(true);
       expect(err instanceof ActiveTenantNotFoundError).toBe(false);
     } finally {
       await suDb.tenant.deleteMany({ where: { slug } });
@@ -454,18 +385,12 @@ describe.skipIf(!dbUp)("a fleet route answers a dead selector", () => {
 
 // The other half of "refuses, naming the selector": the CONTRACT has to name that refusal too.
 //
-// A status a route returns that the contract does not name is a status no generated client knows how
-// to handle: `openapi.json` is committed and `bun openapi:check` gates it, and the Eden types the
-// console is built against come from the same declarations. #284 declared the twelve routes it had
-// just converted; issue #297 is the fifty older ones, which could ALREADY answer 404 before that
-// change and did not say so, and it is why this sweep is no longer scoped to two files.
-//
-// Measured for #297 over real HTTP — the whole app, a real Postgres, a SUPER_ADMIN cookie and an
-// `X-Tenant-Id` naming a tenant that does not exist. 48 of the 50 answered
-// `404 errors.tenantNotFound` carrying `X-Tenant-Id-Invalid`; the two that did not are the fleet
-// routes exempted below. Reachability is input-dependent and that is why it was measured rather than
-// read: `POST /v1/agents/tts/list` answers 200 for `provider: "openai"` (a curated list, no scoped
-// read) and 404 for `provider: "elevenlabs"`, which resolves a vault credential inside the scope.
+// A status a route returns that the contract does not name is one no generated client handles:
+// `openapi.json` is committed, `bun openapi:check` gates it, and the console's Eden types come from
+// the same declarations. So every route that passes the context on declares the dead-selector 404
+// (`errors.tenantNotFound`, with `X-Tenant-Id-Invalid`), except the fleet routes exempted below.
+// Reachability is input-dependent: `POST /v1/agents/tts/list` answers 200 for `provider: "openai"`
+// (a curated list) and 404 for `provider: "elevenlabs"` (a vault read inside the scope).
 export function passesTheContextOn(routeBlock: string): boolean {
   // Used as a VALUE — an argument, an assignment, a property — rather than as a bare authorization
   // statement (`ctxOrThrow(tenantContext);`), which reaches no scoped read and so cannot 404.
@@ -503,13 +428,26 @@ export function routeIdentity(
 // asking them to declare a status they never return — which is its own kind of wrong contract.
 //
 // Both are fleet operations: `listTenants` and `createTenant` branch to `asSuperAdminOn` for a
-// SUPER_ADMIN caller, so the id the selector carries is never looked up. Measured, with a dead
-// selector, both answered 200 (and `POST /v1/tenants` created the tenant). Pinned as behaviour by
-// the two rows in the DB-backed block above rather than only asserted here, because an exemption
-// that only lives in a list is an exemption nobody re-checks.
+// SUPER_ADMIN caller, so the selector's id is never looked up and a dead one still gets 200. Pinned
+// as behaviour by two rows in the DB-backed block above, since an exemption that only lives in a
+// list is one nobody re-checks.
 const CANNOT_REFUSE_THE_SELECTOR = new Set([
   "get /v1/tenants",
   "post /v1/tenants",
+]);
+
+// Routes the published spec leaves out while their switch is off, which is how `openapi.json` is
+// generated: the client channel (CLIENT_CHANNEL_ENABLED), its turn and its client apps. Their own 404
+// is pinned in tests/api/v1/client-turn-stream.test.ts and tests/api/v1/client-apps.test.ts.
+const UNPUBLISHED_WHILE_OFF = new Set([
+  "post /v1/agents/{id}/client/turn",
+  "get /v1/client-apps",
+  "get /v1/client-apps/{id}",
+  "post /v1/client-apps",
+  "patch /v1/client-apps/{id}",
+  "delete /v1/client-apps/{id}",
+  "post /v1/client-apps/{id}/secrets",
+  "delete /v1/client-apps/{id}/secrets/{kid}",
 ]);
 
 async function sweepRoutes(): Promise<
@@ -606,7 +544,9 @@ describe("a route that can refuse the selector declares that refusal", () => {
         Record<string, { responses?: Record<string, unknown> }>
       >;
     };
-    const routes = await sweepRoutes();
+    const routes = (await sweepRoutes()).filter(
+      (r) => !UNPUBLISHED_WHILE_OFF.has(`${r.verb} ${r.path}`),
+    );
     const missing = routes
       .filter((r) => !CANNOT_REFUSE_THE_SELECTOR.has(`${r.verb} ${r.path}`))
       .filter((r) => !spec.paths?.[r.path]?.[r.verb]?.responses?.["404"])

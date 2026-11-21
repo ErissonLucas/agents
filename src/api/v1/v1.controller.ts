@@ -2,35 +2,51 @@ import { Elysia, t } from "elysia";
 import { createInvite } from "@/api/features/invitations/invitation.service";
 import { doc, errors } from "@/api/lib/openapi";
 import {
+  badQueryParam,
   parseQueryCount,
+  parseQueryEnum,
   parseQueryId,
   parseQueryInstant,
   parseQueryText,
 } from "@/api/lib/query-filters";
+import { tRanged } from "@/api/lib/ranged";
 import { confirmStepUp, STEP_UP_PASSWORD_DESCRIPTION } from "@/api/lib/step-up";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import {
+  dashboardFilterQuery,
+  METRICS_NOTE,
+  parseDashboardFilter,
+} from "@/api/v1/dashboard.controller";
 import config from "@/config";
 import { requireDbId } from "@/lib/db-id";
 import { AppError, ForbiddenError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
+import { CHATWOOT_ID_RANGE } from "@/lib/number-range";
 import type { TenantContext } from "@/lib/tenancy";
-import { getLangfuseCosts } from "@/modules/analytics/langfuse-costs";
+import { getDashboardCosts } from "@/modules/analytics/costs";
+import { DRILL_OUTCOMES } from "@/modules/analytics/drilldown";
 import {
   getInstanceMetrics,
   getKpis,
   getTimeseries,
 } from "@/modules/analytics/service";
+import {
+  linkSearchFor,
+  resolveChatwootConversation,
+} from "@/modules/conversations/chatwoot-link";
 import { reengageConversation } from "@/modules/conversations/reengage";
 import {
   getConversationDetail,
   getConversationMedia,
   getConversationMessages,
+  getConversationToolResult,
   handoffConversation,
   listConversationAgentOptions,
   listConversations,
   returnConversationToAgent,
   setConversationStatus,
 } from "@/modules/conversations/service";
+import { tryDecisionsAgent } from "@/modules/decisions/try";
 import {
   createTenant,
   deleteTenant,
@@ -43,6 +59,8 @@ import { getTenant, listTenants, type TenantUpdate } from "./tenants.service";
 // `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
 // throw site rather than an English sentence on a pt-BR caller's screen.
 // translate('errors.conversationNotFound', 'Conversation not found.')
+// translate('errors.toolCallNotFound', 'Tool call not found in this conversation.')
+// translate('errors.agentNotDecisionsObserver', 'Only an agent that observes with questions and rules can be tested on a conversation.')
 // translate('errors.reengageNoAgent', 'No agent is bound to the inbox of this conversation.')
 // translate('errors.returnNoResponder', 'No responder is bound to the inbox of this conversation.')
 // translate('errors.returnAgentOff', 'The responder of this inbox is switched off.')
@@ -55,12 +73,27 @@ import { getTenant, listTenants, type TenantUpdate } from "./tenants.service";
 // translate('errors.returnResponderChanged', 'The responder of this inbox changed while the conversation was being returned; try again.')
 // translate('errors.tenantConfirmMismatch', 'The name confirmation does not match.')
 
-// NOTE: requireAuth guarantees a user, and tenancyPlugin derives tenantContext from it, so
+// requireAuth guarantees a user, and tenancyPlugin derives tenantContext from it, so
 // a null context here is an impossible state — throw (handled by onError as 403) rather
 // than return an error body, keeping each success response a single shape for the treaty.
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
   return ctx;
+}
+
+// Chatwoot's ids are Postgres `integer`s on both sides, so anything past that range names nothing and
+// is refused as malformed rather than sent to a query that would fail on the bind.
+const CHATWOOT_ID_MAX = 2_147_483_647;
+function chatwootIdParam(s: string, param: string): number {
+  const n = parseQueryCount(s, param) as number;
+  if (n < 1 || n > CHATWOOT_ID_MAX) badQueryParam(param);
+  return n;
+}
+
+// The `bot` of a Chatwoot conversation link: a SHA-256 in lowercase hex, as `hashRouteToken` writes it.
+function botHashParam(s: string): string {
+  if (!/^[0-9a-f]{64}$/.test(s)) badQueryParam("bot");
+  return s;
 }
 
 // Builds the one-time accept link the operator copies/sends (there is no mailer).
@@ -71,6 +104,28 @@ function acceptUrl(token: string): string {
 // Versioned read API. The same surface serves the React UI and (future) fleet dashboard.
 // Every response carries instance identity so a fleet can attribute events. Mounted under
 // the /api group, so paths are /api/v1/*.
+// The dashboard drill-down (src/modules/analytics/drilldown.ts): present when any of its four
+// parameters is, with the outcome defaulting to every conversation of the view.
+function parseDrillDown(query: {
+  createdSince?: string;
+  createdUntil?: string;
+  inboxId?: string;
+  outcome?: string;
+}) {
+  const createdSince = parseQueryInstant(query.createdSince, "createdSince");
+  const createdUntil = parseQueryInstant(query.createdUntil, "createdUntil");
+  const inboxId = parseQueryId(query.inboxId, "inboxId");
+  const outcome = parseQueryEnum(query.outcome, "outcome", DRILL_OUTCOMES);
+  if (
+    createdSince === undefined &&
+    createdUntil === undefined &&
+    inboxId === undefined &&
+    outcome === undefined
+  )
+    return undefined;
+  return { createdSince, createdUntil, inboxId, outcome: outcome ?? "all" };
+}
+
 export const v1Controller = new Elysia({ prefix: "/v1" })
   .use(tenancyPlugin)
   .get("/meta", () => ({ instance: instanceIdentity }), {
@@ -163,8 +218,12 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   // Irreversible.
   .delete(
     "/tenants/:id",
-    async ({ tenantContext, params, body }) => {
+    async ({ tenantContext, params, body, request, server }) => {
       const ctx = ctxOrThrow(tenantContext);
+      // The tenant's accounts and logs are emptied in batches that outlast the server's idle timeout,
+      // and nothing is sent until they end; without lifting it the console shows a failure while the
+      // delete goes on.
+      server?.timeout(request, 0);
       const b = body as { confirmName: string; password?: string };
       const id = requireDbId(params.id);
       const tenant = await getTenant(ctx, id);
@@ -219,6 +278,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         | undefined;
       if (body.adminEmail) {
         const created = await createInvite(ctx, {
+          // biome-ignore lint/plugin/no-bigint-cast: the id of the tenant row this handler just created.
           tenantId: BigInt(tenant.id),
           email: body.adminEmail,
           role: "TENANT_ADMIN",
@@ -274,6 +334,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         cursor: parseQueryId(query.cursor, "cursor"),
         q: parseQueryText(query.q, "q"),
         agentId: parseQueryId(query.agentId, "agentId"),
+        drillDown: parseDrillDown(query),
       });
       return {
         instance: instanceIdentity,
@@ -292,7 +353,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         limit: t.Optional(
           t.String({
             description:
-              "Optional max number of conversations to return, parsed as an integer.",
+              "Page size: an integer, 1 or more (default 50). A page holds at most 100 conversations, so a larger value is served as 100.",
           }),
         ),
         cursor: t.Optional(
@@ -310,7 +371,30 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         agentId: t.Optional(
           t.String({
             description:
-              "Optional agent id: only conversations whose inbox is bound to that agent (inboxes it only observes are excluded).",
+              "Optional agent id: only conversations on inboxes that agent answers or observes (an observer attachment still pending counts). With any dashboard parameter below, the dashboard's agent filter instead: bound to the agent, or the agent ran on it.",
+          }),
+        ),
+        createdSince: t.Optional(
+          t.String({
+            description:
+              "Dashboard drill-down: conversations created at or after this ISO instant.",
+          }),
+        ),
+        createdUntil: t.Optional(
+          t.String({
+            description:
+              "Dashboard drill-down: conversations created before this ISO instant.",
+          }),
+        ),
+        inboxId: t.Optional(
+          t.String({
+            description: "Dashboard drill-down: only this inbox.",
+          }),
+        ),
+        outcome: t.Optional(
+          t.String({
+            description:
+              "Dashboard drill-down: all | involved | resolved_by_agent | handoff, as the dashboard funnel counts them.",
           }),
         ),
       }),
@@ -325,8 +409,64 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
       response: errors(400, 401, 404),
     },
   )
+  // Searches only the tenants the caller can open (`linkSearchFor`); nothing outside them is read.
+  .get(
+    "/conversations/chatwoot-link",
+    async ({ tenantContext, getAuthUser, query }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const ref = {
+        accountId: chatwootIdParam(query.accountId, "accountId"),
+        conversationId: chatwootIdParam(query.conversationId, "conversationId"),
+        ...(query.inboxId !== undefined
+          ? { inboxId: chatwootIdParam(query.inboxId, "inboxId") }
+          : {}),
+        ...(query.bot !== undefined
+          ? { botHash: botHashParam(query.bot) }
+          : {}),
+      };
+      return {
+        instance: instanceIdentity,
+        matches: await resolveChatwootConversation(
+          linkSearchFor(ctx, await getAuthUser()),
+          ref,
+        ),
+      };
+    },
+    {
+      query: t.Object({
+        accountId: t.String({
+          description: "The Chatwoot account id the conversation belongs to.",
+        }),
+        conversationId: t.String({
+          description:
+            "The conversation number Chatwoot shows in its own URL (its display id), not this platform's id.",
+        }),
+        inboxId: t.Optional(
+          t.String({
+            description:
+              "The Chatwoot inbox id, to tell apart two connected Chatwoot servers that reuse an account id.",
+          }),
+        ),
+        bot: t.Optional(
+          t.String({
+            description:
+              "SHA-256 (hex) of the route token in the outgoing URL of the Agent Bot the link came through. Names the Chatwoot server the conversation belongs to, which account and inbox ids alone do not.",
+          }),
+        ),
+      }),
+      requireAuth: true,
+      detail: {
+        ...doc(
+          "Find a Chatwoot conversation",
+          "Resolves a Chatwoot conversation (account, display id, optional inbox) to this platform's conversation id and its tenant, among the tenants the caller can open. Empty when none of them has it; more than one entry only when the account id is ambiguous and no inbox was given.",
+        ),
+        tags: ["Conversations"],
+      },
+      response: errors(400, 401, 404, 422),
+    },
+  )
   // Same gate as the list above, on purpose: whoever can read the conversations can see what the
-  // agent filter offers (issue #607), without the admin-only agent configuration.
+  // agent filter offers, without the admin-only agent configuration.
   .get(
     "/conversations/agents",
     async ({ tenantContext }) => ({
@@ -366,6 +506,37 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         ...doc(
           "Get conversation",
           "Returns the conversation metadata shell by primary key, without the live message thread.",
+        ),
+        tags: ["Conversations"],
+      },
+      response: errors(400, 401, 404),
+    },
+  )
+  // One tool call's kept whole result, apart from the conversation above so its refresh stays small.
+  .get(
+    "/conversations/:id/tool-results/:lineId",
+    async ({ tenantContext, params }) =>
+      getConversationToolResult(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        requireDbId(params.lineId),
+      ),
+    {
+      requireAuth: true,
+      params: t.Object({
+        id: t.String({
+          description:
+            "Conversation primary key (BigInt serialized as a decimal string).",
+        }),
+        lineId: t.String({
+          description:
+            "The tool entry's `id` on the conversation's `trail[]` (its log line).",
+        }),
+      }),
+      detail: {
+        ...doc(
+          "Get a tool call's kept whole result",
+          "Returns the whole result the model received for one tool call of the conversation, when its agent keeps full turn detail (`settings.observability.fullDetailRetentionDays`) and it has not expired: `status` is `kept`, `gone` or `not_kept`, `text` the result, `cut` whether the kept text stopped at its 500,000-character ceiling.",
         ),
         tags: ["Conversations"],
       },
@@ -480,7 +651,7 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
       }),
       body: t.Object({
         assigneeId: t.Optional(
-          t.Integer({
+          tRanged(CHATWOOT_ID_RANGE, {
             description:
               "Chatwoot agent id to assign; omit to hand off without assigning a specific human.",
           }),
@@ -536,18 +707,12 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
       return { instance: instanceIdentity, outcome };
     },
     {
-      // RANK, NOT JUST A SESSION (issue #753), and é a única das quatro rotas de conversa que pede
-      // isso. As outras três — `/handoff`, `/return` e `/status` — são as ops que o `docs/ui.md`
-      // descreve como a tela do atendente, e `/conversations` é a única rota do console que de
-      // propósito não é admin-gated. Esta fala com o CLIENTE: ela dispara um turno proativo, no
-      // orçamento de modelo do tenant, e isso não é operar uma conversa.
-      //
-      // `requireRole` e não uma comparação com `!== "AGENT"`: ele é hierárquico (`roleAtLeast`),
-      // então o SUPER_ADMIN e a chave de frota continuam entrando — é o que o `docs/tenancy.md`
-      // manda ("Gate by rank, never by `!== \"AGENT\"`"). E ele roda no `beforeHandle`, antes de o
-      // handler resolver o id, o que é a metade que não aparece no código: checada depois, a recusa
-      // distinguiria "existe" de "não existe" e viraria um oráculo de enumeração para quem não pode
-      // agir.
+      // RANK, not just a session, unlike `/handoff`, `/return` and `/status` (the attendant's
+      // screen in docs/ui.md): this route speaks to the CUSTOMER, firing a proactive turn on the
+      // tenant's model budget. `requireRole`, never `!== "AGENT"`: it is hierarchical, so SUPER_ADMIN
+      // and the fleet key still pass (docs/tenancy.md). It runs in `beforeHandle`, before the handler
+      // resolves the id: checked later, the refusal would tell "exists" from "does not" and become an
+      // enumeration oracle for whoever cannot act.
       requireRole: "TENANT_ADMIN",
       params: t.Object({
         id: t.String({
@@ -563,6 +728,42 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
         tags: ["Conversations"],
       },
       response: errors(400, 401, 403, 404),
+    },
+  )
+  // An agent that observes with questions and rules, run once on this conversation without acting:
+  // its saved block, the evidence a tick reads, one paid classification billed as the playground.
+  .post(
+    "/conversations/:id/decisions-test",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      tick: await tryDecisionsAgent(
+        ctxOrThrow(tenantContext),
+        requireDbId(body.agentId),
+        requireDbId(params.id),
+      ),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description:
+            "Conversation primary key (BigInt serialized as a decimal string).",
+        }),
+      }),
+      body: t.Object({
+        agentId: t.String({
+          description:
+            "A monitoring agent on the decisions engine (switched off or not attached to the inbox is fine), as a decimal string.",
+        }),
+      }),
+      detail: {
+        ...doc(
+          "Test a decisions agent on a conversation",
+          "Runs the agent's SAVED questions and rules once on this conversation, as a tick would (the same evidence, its classifier and key), and returns the result in the shape the conversation page draws a tick with: answers, the rules that would fire with their action (`outcome: decided`), the ones held back by their trigger, and the near misses. Nothing is executed and nothing is written to the conversation or the trigger state. One paid classification call, recorded and gated as the playground (429 past its spend ceiling). A tick that cannot run says why (`outcome: failed` or `skipped`) instead of answers. Requires TENANT_ADMIN or above.",
+        ),
+        tags: ["Conversations"],
+      },
+      response: errors(400, 401, 403, 404, 422, 429),
     },
   )
   .post(
@@ -605,29 +806,14 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   .get(
     "/metrics",
     async ({ tenantContext, query }) => {
-      const since = parseQueryInstant(query.since, "since");
-      const metrics = await getInstanceMetrics(ctxOrThrow(tenantContext), {
-        since,
-        source: query.source,
-      });
+      const metrics = await getInstanceMetrics(
+        ctxOrThrow(tenantContext),
+        parseDashboardFilter(query),
+      );
       return { instance: instanceIdentity, metrics };
     },
     {
-      query: t.Object({
-        since: t.Optional(
-          t.String({
-            description:
-              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
-          }),
-        ),
-        // Usage segment: "inbox" (real) | "playground". Omitted → all sources.
-        source: t.Optional(
-          t.Union([t.Literal("inbox"), t.Literal("playground")], {
-            description:
-              "Usage segment to scope the metrics: inbox (real traffic) or playground; omit for all sources.",
-          }),
-        ),
-      }),
+      query: t.Object(dashboardFilterQuery),
       requireAuth: true,
       detail: {
         ...doc(
@@ -642,64 +828,35 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   .get(
     "/metrics/kpis",
     async ({ tenantContext, query }) => {
-      const since = parseQueryInstant(query.since, "since");
-      const kpis = await getKpis(ctxOrThrow(tenantContext), {
-        since,
-      });
+      const ctx = ctxOrThrow(tenantContext);
+      const filter = parseDashboardFilter(query);
+      const kpis = await getKpis(ctx, filter);
       return { instance: instanceIdentity, kpis };
     },
     {
-      query: t.Object({
-        since: t.Optional(
-          t.String({
-            description:
-              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
-          }),
-        ),
-      }),
+      query: t.Object(dashboardFilterQuery),
       requireAuth: true,
       detail: {
         ...doc(
           "Dashboard KPIs",
-          "Returns the headline dashboard KPIs since an optional start time.",
+          `Returns the headline dashboard KPIs since an optional start time. ${METRICS_NOTE}`,
         ),
         tags: ["Dashboard"],
       },
-      response: errors(400, 401, 404),
+      response: errors(400, 401, 404, 422),
     },
   )
   .get(
     "/metrics/timeseries",
     async ({ tenantContext, query }) => {
-      const since = parseQueryInstant(query.since, "since");
-      const points = await getTimeseries(ctxOrThrow(tenantContext), {
-        since,
-        source: query.source,
-        tz: query.tz,
-      });
+      const points = await getTimeseries(
+        ctxOrThrow(tenantContext),
+        parseDashboardFilter(query),
+      );
       return { instance: instanceIdentity, points };
     },
     {
-      query: t.Object({
-        since: t.Optional(
-          t.String({
-            description:
-              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
-          }),
-        ),
-        source: t.Optional(
-          t.Union([t.Literal("inbox"), t.Literal("playground")], {
-            description:
-              "Usage segment to scope the series: inbox (real traffic) or playground; omit for all sources.",
-          }),
-        ),
-        tz: t.Optional(
-          t.String({
-            description:
-              "IANA timezone (e.g. America/Sao_Paulo) used to bucket days; invalid values fall back to UTC.",
-          }),
-        ),
-      }),
+      query: t.Object(dashboardFilterQuery),
       requireAuth: true,
       detail: {
         ...doc(
@@ -714,35 +871,18 @@ export const v1Controller = new Elysia({ prefix: "/v1" })
   .get(
     "/metrics/costs",
     async ({ tenantContext, query }) => {
-      const since = parseQueryInstant(query.since, "since");
-      const costs = await getLangfuseCosts(ctxOrThrow(tenantContext), {
-        since,
-        source: query.source,
-      });
+      const ctx = ctxOrThrow(tenantContext);
+      const filter = parseDashboardFilter(query);
+      const costs = await getDashboardCosts(ctx, filter);
       return { instance: instanceIdentity, costs };
     },
     {
-      query: t.Object({
-        // Usage segment: "inbox" (real) | "playground". Omitted → both of our environments, and
-        // never the project's other traffic (issue #427).
-        source: t.Optional(
-          t.Union([t.Literal("inbox"), t.Literal("playground")], {
-            description:
-              "Usage segment to scope the cost: inbox (real traffic) or playground; omit for both.",
-          }),
-        ),
-        since: t.Optional(
-          t.String({
-            description:
-              "Optional ISO start instant (2026-01-01T00:00:00Z). A value that is not one is refused with a 400 naming the parameter.",
-          }),
-        ),
-      }),
+      query: t.Object(dashboardFilterQuery),
       requireAuth: true,
       detail: {
         ...doc(
           "Cost metrics",
-          "Returns Langfuse-derived cost metrics for the tenant since an optional start time.",
+          `Returns the tenant's LLM cost from its own usage ledger since an optional start time: total, per local day, per model, the calls no price covered, and the Langfuse link when configured. ${METRICS_NOTE}`,
         ),
         tags: ["Dashboard"],
       },

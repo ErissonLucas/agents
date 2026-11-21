@@ -1,9 +1,15 @@
-import type { InboundAuthStrategy } from "@/../generated/prisma/client";
+import type {
+  InboundAuthStrategy,
+  PrismaClient,
+} from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { redactEndpoint } from "@/modules/audit/projection";
 import { sendAlertChannelTest } from "@/modules/flowlog/channel-test";
 import {
   assertAlertChannelWritable,
+  assertAlertEvents,
   assertExcludedAgents,
   createAlertChannel,
   deleteAlertChannel,
@@ -12,6 +18,8 @@ import {
 } from "@/modules/flowlog/channels";
 import { isKnownCatalogType } from "@/modules/integrations/catalog";
 import {
+  assertFetchBackTool,
+  assertIntegrationCreatable,
   assertIntegrationWritable,
   createIntegrationInstance,
   deleteIntegrationInstance,
@@ -22,7 +30,7 @@ import {
   getWebhookDelivery,
   requeueWebhookDelivery,
 } from "@/modules/webhooks/outbound/deliveries";
-import { isOutboundEvent } from "@/modules/webhooks/outbound/events";
+import { isSubscribableEvent } from "@/modules/webhooks/outbound/events";
 import {
   assertWebhookSubscriptionCreatable,
   assertWebhookSubscriptionUpdatable,
@@ -75,7 +83,7 @@ export async function webhookCreate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  const bad = args.events.filter((e) => !isOutboundEvent(e));
+  const bad = args.events.filter((e) => !isSubscribableEvent(e));
   if (bad.length) return err(`unknown event(s): ${bad.join(", ")}`);
   let secretRef: string | null | undefined;
   if (args.secret_ref) {
@@ -85,10 +93,8 @@ export async function webhookCreate(
   }
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       await assertWebhookSubscriptionCreatable({
         url: args.url,
         events: args.events,
@@ -143,7 +149,7 @@ export async function webhookUpdate(
   const id = parseMcpId(args.webhook_id, "webhook_id");
   if (typeof id !== "bigint") return id;
   if (args.events) {
-    const bad = args.events.filter((e) => !isOutboundEvent(e));
+    const bad = args.events.filter((e) => !isSubscribableEvent(e));
     if (bad.length) return err(`unknown event(s): ${bad.join(", ")}`);
   }
   const patch: {
@@ -181,10 +187,8 @@ export async function webhookUpdate(
       afterProj[k] = patch[k];
     }
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       await assertWebhookSubscriptionUpdatable(patch);
       return ok({
         dryRun: true,
@@ -234,13 +238,9 @@ export async function webhookDelete(
   }
 }
 
-// Put a DEAD outbound delivery back in the worker's queue (issue #305). The state change is the
-// service's; what this adds is the MCP contract around it.
-//
-// The dry run READS THE ROW instead of echoing the argument back, and that is the whole point of
-// it here: the only way this call fails is the row not being DEAD, so a preview built from the id
-// alone would approve exactly the requests the apply refuses. It answers with the same refusal, on
-// the same read, one step earlier.
+// Put a DEAD outbound delivery back in the worker's queue. The dry run READS THE ROW: the only way
+// the call fails is the row not being DEAD, so a preview from the id alone would approve exactly
+// what the apply refuses.
 export async function webhookDeliveryRequeue(
   principal: VerifiedToken,
   args: { delivery_id: string; dry_run?: boolean },
@@ -317,12 +317,41 @@ export async function webhookTest(
 
 // ── alert channels ──
 
+// Where a channel's destination comes from: the raw URL (write-only, like `deployment_connect`'s
+// admin token, docs/mcp.md) or the NAME of a vault entry holding it. Exactly one on create; at most
+// one on update.
+type UrlSource = { raw?: string; ref?: string };
+
+function urlSourceOf(
+  args: { url?: string; url_ref?: string },
+  required = true,
+): UrlSource | WriteResult {
+  if (args.url !== undefined && args.url_ref !== undefined) {
+    return err("pass either url or url_ref, not both");
+  }
+  if (required && args.url === undefined && args.url_ref === undefined) {
+    return err("url or url_ref is required");
+  }
+  return { raw: args.url, ref: args.url_ref };
+}
+
+async function urlValueOf(
+  ctx: TenantContext,
+  source: UrlSource,
+  base: PrismaClient,
+): Promise<{ value: string } | { fail: WriteResult }> {
+  if (source.raw !== undefined) return { value: source.raw };
+  return resolveSecretValue(ctx, source.ref as string, base);
+}
+
 export interface AlertChannelCreateArgs {
   name: string;
   type: "discord" | "webhook";
-  url_ref: string;
+  url?: string;
+  url_ref?: string;
   min_level?: "info" | "warn" | "error";
   stages?: string[];
+  exclude_events?: string[];
   exclude_agent_ids?: string[];
   secret_ref?: string | null;
   enabled?: boolean;
@@ -337,9 +366,13 @@ export async function alertChannelCreate(
   const base = deps.base ?? basePrisma;
   const ctx = gate(principal);
   if ("ok" in ctx) return ctx;
-  // Validate the URL credential exists (the token-bearing URL is stored as a vault secret).
-  const urlRefCheck = await resolveSecretRef(ctx, args.url_ref, base);
-  if ("fail" in urlRefCheck) return urlRefCheck.fail;
+  const source = urlSourceOf(args);
+  if ("ok" in source) return source;
+  if (source.ref !== undefined) {
+    // The URL credential exists (a token-bearing URL kept as a vault secret).
+    const urlRefCheck = await resolveSecretRef(ctx, source.ref, base);
+    if ("fail" in urlRefCheck) return urlRefCheck.fail;
+  }
   let secretRef: string | null | undefined;
   if (args.secret_ref) {
     const resolved = await resolveSecretRef(ctx, args.secret_ref, base);
@@ -347,18 +380,17 @@ export async function alertChannelCreate(
     secretRef = resolved.ref;
   }
   if (args.dry_run !== false) {
-    // NOTE: the core's own two questions, asked before the preview answers it. The URL is RESOLVED
-    // here — the same read the apply does two lines below — because the destination this channel
-    // would post to is not in the arguments, it is the value behind `url_ref`, and vetting the ref
-    // instead of the value is what let a preview approve `not-a-url` and a loopback address (#510).
-    // The value is never returned: only its verdict is.
-    const urlValue = await resolveSecretValue(ctx, args.url_ref, base);
+    // The core's own two questions. The URL is RESOLVED here, as the apply does, because the
+    // destination is the value behind `url_ref`, and vetting the ref instead would approve
+    // `not-a-url` or a loopback address. Only the verdict is returned, never the value.
+    const urlValue = await urlValueOf(ctx, source, base);
     if ("fail" in urlValue) return urlValue.fail;
     try {
       await assertAlertChannelWritable({
         url: urlValue.value,
         stages: args.stages ?? [],
       });
+      assertAlertEvents(args.exclude_events ?? []);
       // the agent ids are answered the same way the apply answers them, so a typo fails here
       await assertExcludedAgents(ctx, args.exclude_agent_ids ?? [], base);
     } catch (e) {
@@ -371,16 +403,19 @@ export async function alertChannelCreate(
       preview: {
         name: args.name,
         type: args.type,
-        urlRef: args.url_ref,
+        ...(source.ref !== undefined
+          ? { urlRef: source.ref }
+          : { urlMasked: redactEndpoint(urlValue.value) }),
         minLevel: args.min_level ?? "error",
         stages: args.stages ?? [],
+        excludeEvents: args.exclude_events ?? [],
         excludeAgentIds: args.exclude_agent_ids ?? [],
         secretRef: args.secret_ref ?? null,
         enabled: args.enabled ?? true,
       },
     });
   }
-  const url = await resolveSecretValue(ctx, args.url_ref, base);
+  const url = await urlValueOf(ctx, source, base);
   if ("fail" in url) return url.fail;
   try {
     const created = await createAlertChannel(
@@ -391,6 +426,7 @@ export async function alertChannelCreate(
         url: url.value,
         minLevel: args.min_level,
         stages: args.stages,
+        excludeEvents: args.exclude_events,
         excludeAgentIds: args.exclude_agent_ids,
         secretRef,
         enabled: args.enabled,
@@ -407,9 +443,11 @@ export interface AlertChannelUpdateArgs {
   channel_id: string;
   name?: string;
   type?: "discord" | "webhook";
+  url?: string;
   url_ref?: string;
   min_level?: "info" | "warn" | "error";
   stages?: string[];
+  exclude_events?: string[];
   exclude_agent_ids?: string[];
   secret_ref?: string | null;
   enabled?: boolean;
@@ -422,6 +460,7 @@ interface AlertChannelPatch {
   url?: string;
   minLevel?: "info" | "warn" | "error";
   stages?: string[];
+  excludeEvents?: string[];
   excludeAgentIds?: string[];
   secretRef?: string | null;
   enabled?: boolean;
@@ -437,8 +476,10 @@ export async function alertChannelUpdate(
   if ("ok" in ctx) return ctx;
   const id = parseMcpId(args.channel_id, "channel_id");
   if (typeof id !== "bigint") return id;
-  if (args.url_ref !== undefined) {
-    const refCheck = await resolveSecretRef(ctx, args.url_ref, base);
+  const source = urlSourceOf(args, false);
+  if ("ok" in source) return source;
+  if (source.ref !== undefined) {
+    const refCheck = await resolveSecretRef(ctx, source.ref, base);
     if ("fail" in refCheck) return refCheck.fail;
   }
   let secretRef: string | null | undefined;
@@ -457,10 +498,12 @@ export async function alertChannelUpdate(
   if (args.type !== undefined) nonSecret.type = args.type;
   if (args.min_level !== undefined) nonSecret.minLevel = args.min_level;
   if (args.stages !== undefined) nonSecret.stages = args.stages;
+  if (args.exclude_events !== undefined)
+    nonSecret.excludeEvents = args.exclude_events;
   if (args.exclude_agent_ids !== undefined)
     nonSecret.excludeAgentIds = args.exclude_agent_ids;
   if (args.enabled !== undefined) nonSecret.enabled = args.enabled;
-  const urlRotated = args.url_ref !== undefined;
+  const urlRotated = source.raw !== undefined || source.ref !== undefined;
   const secretRotated = args.secret_ref !== undefined;
   if (Object.keys(nonSecret).length === 0 && !urlRotated && !secretRotated) {
     return err("no updatable fields provided");
@@ -478,11 +521,10 @@ export async function alertChannelUpdate(
     }
     if (args.dry_run !== false) {
       // Same pair as on create, on the patch: the stage list, and the VALUE behind a rotated
-      // `url_ref` rather than the ref (#510). Resolved only when the patch rotates it, so an
-      // unrelated rename does not read a secret it has no question about.
+      // `url_ref`. Resolved only when the patch rotates it, so a rename reads no secret.
       let urlValue: string | undefined;
-      if (urlRotated && args.url_ref !== undefined) {
-        const resolved = await resolveSecretValue(ctx, args.url_ref, base);
+      if (urlRotated) {
+        const resolved = await urlValueOf(ctx, source, base);
         if ("fail" in resolved) return resolved.fail;
         urlValue = resolved.value;
       }
@@ -490,6 +532,9 @@ export async function alertChannelUpdate(
         url: urlValue,
         stages: nonSecret.stages,
       });
+      // Against the channel as listed, as the apply asks it against the row it locks.
+      if (nonSecret.excludeEvents !== undefined)
+        assertAlertEvents(nonSecret.excludeEvents, current.excludeEvents);
       if (nonSecret.excludeAgentIds !== undefined) {
         await assertExcludedAgents(
           ctx,
@@ -503,12 +548,15 @@ export async function alertChannelUpdate(
         target,
         diff: diffFields(beforeProj, afterProj),
         urlRotated,
+        ...(urlValue !== undefined && {
+          urlMasked: redactEndpoint(urlValue),
+        }),
         secretRotated,
       });
     }
     const patch: AlertChannelPatch = { ...nonSecret };
-    if (urlRotated && args.url_ref !== undefined) {
-      const url = await resolveSecretValue(ctx, args.url_ref, base);
+    if (urlRotated) {
+      const url = await urlValueOf(ctx, source, base);
       if ("fail" in url) return url.fail;
       patch.url = url.value;
     }
@@ -612,15 +660,18 @@ export async function integrationCreate(
     inboundSecretRef = resolved.ref;
   }
   try {
-    // Before the preview, not only before the write: `dry_run` defaults to true, so the preview is
-    // the operator's FIRST answer, and one that approves what the apply refuses is worse than no
-    // preview at all (issue #248).
-    assertIntegrationWritable(args.catalog_type, {
+    // NOTE: before the preview, not only before the write: `dry_run` defaults to true, so the
+    // preview is the operator's FIRST answer and must refuse what the apply refuses.
+    assertIntegrationCreatable(args.catalog_type, {
       config: args.config,
       inboundAuthStrategy: args.inbound_auth_strategy as
         | InboundAuthStrategy
         | undefined,
     });
+    if (args.config) {
+      const config = args.config;
+      await runScopedOn(base, ctx, (db) => assertFetchBackTool(db, config));
+    }
     if (args.dry_run !== false) {
       return ok({
         dryRun: true,
@@ -736,7 +787,16 @@ export async function integrationUpdate(
       afterProj[k] = patch[k];
     }
     const target = `integration:${id}`;
-    assertIntegrationWritable(current.catalogType, patch);
+    assertIntegrationWritable(
+      current.catalogType,
+      patch,
+      current.config,
+      current.inboundAuthStrategy as InboundAuthStrategy,
+    );
+    if (patch.config) {
+      const config = patch.config;
+      await runScopedOn(base, ctx, (db) => assertFetchBackTool(db, config));
+    }
     if (args.dry_run !== false) {
       return ok({
         dryRun: true,

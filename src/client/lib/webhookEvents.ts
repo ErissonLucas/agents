@@ -25,11 +25,129 @@ export function webhookEventLabel(ev: string, t: TFunction): string {
       return t("webhooks.eventLabels.kanbanCardMoved", "Kanban card moved");
     case "llm.usage":
       return t("webhooks.eventLabels.llmUsage", "LLM usage reported");
+    case "document.approval_requested":
+      return t(
+        "webhooks.eventLabels.documentApprovalRequested",
+        "Document approval requested",
+      );
+    case "document.approval_decided":
+      return t(
+        "webhooks.eventLabels.documentApprovalDecided",
+        "Document approval decided",
+      );
+    case "document.approval_outcome":
+      return t(
+        "webhooks.eventLabels.documentApprovalOutcome",
+        "Document approval outcome",
+      );
+    case "channel.connected":
+      return t("webhooks.eventLabels.channelConnected", "Channel connected");
+    case "channel.disconnected":
+      return t(
+        "webhooks.eventLabels.channelDisconnected",
+        "Channel disconnected",
+      );
     case "tenant.created":
       return t("webhooks.eventLabels.tenantCreated", "Workspace created");
     case "heartbeat":
       return t("webhooks.eventLabels.heartbeat", "Heartbeat (periodic signal)");
     default:
       return ev;
+  }
+}
+
+// The name of an event family in the console. `null` is the group of events with no family.
+export function webhookFamilyLabel(
+  family: string | null,
+  t: TFunction,
+): string {
+  switch (family) {
+    case "conversation":
+      return t("webhooks.families.conversation", "Conversations");
+    case "document":
+      return t("webhooks.families.document", "Documents");
+    case "channel":
+      return t("webhooks.families.channel", "Channels");
+    case "kanban":
+      return t("webhooks.families.kanban", "Kanban board");
+    case "llm":
+      return t("webhooks.families.llm", "Usage");
+    case "tenant":
+      return t("webhooks.families.tenant", "Workspace");
+    case null:
+      return t("webhooks.families.system", "System");
+    default:
+      return family;
+  }
+}
+
+// One line on when an event fires and what its `data` carries, under its label in the form.
+export function webhookEventDescription(
+  ev: string,
+  t: TFunction,
+): string | null {
+  switch (ev) {
+    case "conversation.created":
+      return t(
+        "webhooks.eventDescriptions.conversationCreated",
+        "A new conversation arrives. Ids, inbox, status and who it is assigned to.",
+      );
+    case "conversation.status_changed":
+      return t(
+        "webhooks.eventDescriptions.conversationStatusChanged",
+        "A conversation changes status (open, pending, snoozed, resolved). The new and the previous one.",
+      );
+    case "conversation.handoff":
+      return t(
+        "webhooks.eventDescriptions.conversationHandoff",
+        "A person is assigned to the conversation. Conversation and inbox ids.",
+      );
+    case "kanban.card_moved":
+      return t(
+        "webhooks.eventDescriptions.kanbanCardMoved",
+        "The agent moves a card to another step. Card, step and conversation.",
+      );
+    case "llm.usage":
+      return t(
+        "webhooks.eventDescriptions.llmUsage",
+        "A model call is billed. Model, step and token counts.",
+      );
+    case "tenant.created":
+      return t(
+        "webhooks.eventDescriptions.tenantCreated",
+        "A workspace is created on this instance.",
+      );
+    case "document.approval_requested":
+      return t(
+        "webhooks.eventDescriptions.documentApprovalRequested",
+        "A document waits for a person to approve it. Request, template, conversation and expiry.",
+      );
+    case "document.approval_decided":
+      return t(
+        "webhooks.eventDescriptions.documentApprovalDecided",
+        "An approval is approved, rejected or expires. Status, reviewer and issued document.",
+      );
+    case "document.approval_outcome":
+      return t(
+        "webhooks.eventDescriptions.documentApprovalOutcome",
+        "What the decision came to in the conversation: delivered, noted, not sent or handed over.",
+      );
+    case "channel.connected":
+      return t(
+        "webhooks.eventDescriptions.channelConnected",
+        "A WhatsApp inbox's session comes back online. Inbox ids, provider and the previous state.",
+      );
+    case "channel.disconnected":
+      return t(
+        "webhooks.eventDescriptions.channelDisconnected",
+        "A WhatsApp inbox's session goes offline (closed, reconnecting or waiting for a new QR). Inbox ids, provider, the new state and the previous one.",
+      );
+    case "heartbeat":
+      return t(
+        "webhooks.eventDescriptions.heartbeat",
+        "A periodic signal that the instance is up.",
+      );
+    default:
+      return null;
   }
 }

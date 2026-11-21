@@ -2,36 +2,161 @@ import * as DropdownMenuPrimitive from "@radix-ui/react-dropdown-menu";
 import {
   Check,
   ChevronDown,
+  ChevronRight,
+  Languages,
   LogOut,
   Monitor,
   Moon,
   Settings,
   Sun,
-  UserRound,
 } from "lucide-react";
-import { useId } from "react";
+import {
+  type ReactNode,
+  type RefObject,
+  useEffect,
+  useId,
+  useRef,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router";
+import { Avatar } from "@/client/components/Avatar";
+import { RoleBadge } from "@/client/components/RoleBadge";
 import { useToast } from "@/client/components/Toast";
 import { useAuth } from "@/client/contexts/AuthContext";
+import { useConfirmLeave } from "@/client/contexts/NavGuardContext";
 import { useTheme } from "@/client/contexts/ThemeContext";
+import { useMediaQuery } from "@/client/hooks/useMediaQuery";
 import { LANGUAGES } from "@/client/lib/languages";
 import { afterLogout } from "@/client/lib/logout";
+import { isAdminRole } from "@/client/lib/roles";
 import { cn } from "@/client/lib/utils";
 
 // t('theme.auto', 'Auto')
 // t('theme.light', 'Light')
 // t('theme.dark', 'Dark')
+const AUTO_THEME = {
+  value: "auto" as const,
+  icon: Monitor,
+  labelKey: "theme.auto",
+};
 const THEME_OPTIONS = [
-  { value: "auto" as const, icon: Monitor, labelKey: "theme.auto" },
+  AUTO_THEME,
   { value: "light" as const, icon: Sun, labelKey: "theme.light" },
   { value: "dark" as const, icon: Moon, labelKey: "theme.dark" },
 ];
 
 const menuItemCls =
-  "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary data-[state=checked]:text-text-primary";
+  "flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-text-secondary outline-none transition-colors data-[highlighted]:bg-bg-hover data-[highlighted]:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary";
 
-const menuLabelCls = "px-2 py-1 font-medium text-text-muted text-xs uppercase";
+const menuContentCls =
+  "data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 z-(--z-dropdown) overflow-hidden rounded-lg border border-border-hover bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in";
+
+const separatorCls = "-mx-1 my-1 h-px bg-border";
+
+// The phone submenu overlaps the menu, in spacing steps so it follows the density setting and the
+// browser's font size: `w-44` wide, with its right edge 3 steps inside the trigger's. It drops by
+// the trigger's own height, so the row that opened it stays uncovered.
+const OVERLAP_SUBMENU_WIDTH_STEPS = 44;
+const OVERLAP_SUBMENU_INSET_STEPS = 3;
+
+// One `--spacing` step in px, read when the submenu opens. Radix takes the offsets as numbers, so
+// the rem-based token has to be resolved here; 4px is the compact default.
+function spacingStepPx(): number {
+  const root = getComputedStyle(document.documentElement);
+  const raw = root.getPropertyValue("--spacing").trim();
+  const value = Number.parseFloat(raw);
+  if (!Number.isFinite(value) || value <= 0) return 4;
+  if (raw.endsWith("rem")) return value * Number.parseFloat(root.fontSize);
+  return raw.endsWith("px") ? value : 4;
+}
+
+function LanguageSubContent({
+  wide,
+  trigger,
+  children,
+}: {
+  wide: boolean;
+  trigger: RefObject<HTMLDivElement | null>;
+  children: ReactNode;
+}) {
+  const contentRef = useRef<HTMLDivElement>(null);
+  const pointer = useRef<{ x: number; y: number } | null>(null);
+  // NOTE: where the pointer last was, read in the capture phase so it is already known when the
+  // trigger's own leave handler moves the focus. `pointerout` fires before `pointerleave` with the
+  // point the pointer left at, which `pointermove` alone would not have recorded yet.
+  useEffect(() => {
+    if (wide) return;
+    const track = (event: PointerEvent) => {
+      pointer.current = { x: event.clientX, y: event.clientY };
+    };
+    document.addEventListener("pointermove", track, true);
+    document.addEventListener("pointerout", track, true);
+    return () => {
+      document.removeEventListener("pointermove", track, true);
+      document.removeEventListener("pointerout", track, true);
+    };
+  }, [wide]);
+  if (wide) {
+    return (
+      <DropdownMenuPrimitive.SubContent
+        sideOffset={6}
+        alignOffset={-5}
+        className={cn(menuContentCls, "min-w-44")}
+      >
+        {children}
+      </DropdownMenuPrimitive.SubContent>
+    );
+  }
+  const step = spacingStepPx();
+  return (
+    <DropdownMenuPrimitive.SubContent
+      ref={contentRef}
+      sideOffset={
+        -(OVERLAP_SUBMENU_WIDTH_STEPS + OVERLAP_SUBMENU_INSET_STEPS) * step
+      }
+      // One pixel short of the trigger's height: the drop lands on a fractional edge that rounds
+      // below the row, and a pointer on the whole pixel left between them is on the next item, whose
+      // hover closes the submenu. Overlapping that pixel hides only the row's bottom padding.
+      alignOffset={Math.max(
+        (trigger.current?.getBoundingClientRect().height ?? 0) - 1,
+        0,
+      )}
+      avoidCollisions={false}
+      // NOTE: Radix still treats this as a right-side submenu, so a mouse moving down or left into
+      // it leaves the trigger outside the pointer-grace area and focus goes back to the parent
+      // menu, which would close it. That focus is ignored only while the pointer is over the
+      // submenu; focus reaching the parent from anywhere else (an item, the theme row's label)
+      // still closes it, as beside a desktop menu.
+      onFocusOutside={(event) => {
+        const target = event.detail.originalEvent.target;
+        if (
+          !(target instanceof Element) ||
+          target.getAttribute("role") !== "menu"
+        )
+          return;
+        const box = contentRef.current?.getBoundingClientRect();
+        const at = pointer.current;
+        if (!box || !at) return;
+        // The submenu sits one trigger height down, a fraction of a pixel off the trigger's bottom
+        // edge, and the browser hands a pointer at a whole pixel to the next item before that edge.
+        // So the trigger and the submenu, over the submenu's width, are one column: a pointer
+        // moving down it is on its way in, not outside.
+        const triggerTop = trigger.current?.getBoundingClientRect().top;
+        const top = Math.min(box.top, triggerTop ?? box.top);
+        if (
+          at.x >= box.left &&
+          at.x <= box.right &&
+          at.y >= top &&
+          at.y <= box.bottom
+        )
+          event.preventDefault();
+      }}
+      className={cn(menuContentCls, "w-44 shadow-xl")}
+    >
+      {children}
+    </DropdownMenuPrimitive.SubContent>
+  );
+}
 
 export function UserMenu() {
   const { t, i18n } = useTranslation();
@@ -39,7 +164,11 @@ export function UserMenu() {
   const { user, logout } = useAuth();
   const { theme, setTheme } = useTheme();
   const navigate = useNavigate();
-  const emailLabelId = useId();
+  // Both items leave the page in code, which the nav guard's link listener cannot see; a dirty
+  // page form asks first.
+  const confirmLeave = useConfirmLeave();
+  const triggerLabelId = useId();
+  const themeLabelId = useId();
 
   const handleLogout = async () =>
     // ONLY WHEN THE SESSION ACTUALLY ENDED. The cookie is HttpOnly, so a logout the server did not
@@ -57,6 +186,14 @@ export function UserMenu() {
         ),
     );
 
+  const email = user?.email ?? "";
+  const displayName = user?.name?.trim() || email;
+  const currentTheme =
+    THEME_OPTIONS.find((option) => option.value === theme) ?? AUTO_THEME;
+  const currentLanguage = LANGUAGES.find((l) => l.code === i18n.language);
+  const wideViewport = useMediaQuery("(min-width: 768px)");
+  const languageTriggerRef = useRef<HTMLDivElement>(null);
+
   return (
     <DropdownMenuPrimitive.Root>
       <DropdownMenuPrimitive.Trigger asChild>
@@ -65,28 +202,23 @@ export function UserMenu() {
           // NOTE: fallback to `nav.userMenu` when email is missing (auth
           // bootstrap or partial-user states) so the trigger always has an
           // accessible name. When present, `aria-labelledby` wins over
-          // `aria-label` and exposes the visible email instead.
+          // `aria-label` and exposes the visible name (or email) instead.
           aria-label={t("nav.userMenu", "User menu")}
-          aria-labelledby={user?.email ? emailLabelId : undefined}
-          className="group inline-flex items-center gap-2 rounded-lg border border-border bg-bg-tertiary px-2 py-1.5 text-sm text-text-secondary transition-colors hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary"
+          aria-labelledby={email ? triggerLabelId : undefined}
+          className="group text-text-secondary hover:bg-bg-hover hover:text-text-primary data-[state=open]:bg-bg-hover data-[state=open]:text-text-primary inline-flex items-center gap-2 rounded-md py-1 pr-1.5 pl-1 text-sm transition-colors"
         >
-          <span
-            aria-hidden="true"
-            className="flex h-6 w-6 items-center justify-center rounded-full bg-bg-primary text-text-primary"
-          >
-            <UserRound className="h-4 w-4" />
-          </span>
-          {user?.email && (
+          {email && <Avatar name={user?.name} email={email} size="sm" />}
+          {email && (
             <span
-              id={emailLabelId}
-              className="hidden max-w-45 truncate sm:inline"
+              id={triggerLabelId}
+              className="hidden max-w-40 truncate font-medium sm:inline"
             >
-              {user.email}
+              {displayName}
             </span>
           )}
           <ChevronDown
             aria-hidden="true"
-            className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180"
+            className="text-text-muted h-3.5 w-3.5 transition-transform group-data-[state=open]:rotate-180"
           />
         </button>
       </DropdownMenuPrimitive.Trigger>
@@ -95,85 +227,122 @@ export function UserMenu() {
         <DropdownMenuPrimitive.Content
           align="end"
           sideOffset={6}
-          className="data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 z-(--z-dropdown) min-w-56 overflow-hidden rounded-lg border border-border bg-bg-secondary p-1 shadow-lg data-[state=closed]:animate-out data-[state=open]:animate-in"
+          className={cn(menuContentCls, "w-64")}
         >
-          <DropdownMenuPrimitive.Label className={menuLabelCls}>
-            {t("theme.label", "Theme")}
-          </DropdownMenuPrimitive.Label>
-          <DropdownMenuPrimitive.RadioGroup
-            value={theme}
-            onValueChange={(value) => setTheme(value as typeof theme)}
-          >
-            {THEME_OPTIONS.map(({ value, icon: Icon, labelKey }) => {
-              const selected = value === theme;
-              return (
+          {email && (
+            <>
+              {/* Who is signed in, so an avatar-only trigger (mobile)
+                  still has the name and email one tap away. Not an item: it
+                  is skipped by arrow-key navigation. */}
+              <div className="flex items-center gap-2.5 px-2 pt-1.5 pb-2">
+                <Avatar name={user?.name} email={email} size="md" />
+                <div className="min-w-0 flex-1">
+                  <p className="text-text-primary truncate text-sm font-medium">
+                    {displayName}
+                  </p>
+                  {user?.name?.trim() && (
+                    <p className="text-text-muted truncate text-xs">{email}</p>
+                  )}
+                </div>
+                {user && isAdminRole(user.role) && (
+                  <RoleBadge role={user.role} className="shrink-0" />
+                )}
+              </div>
+              <DropdownMenuPrimitive.Separator className={separatorCls} />
+            </>
+          )}
+
+          {/* The three theme options sit in one row. Each is a radio item
+              with its own accessible name, and the row's label spells out the
+              current choice, so the icons never carry meaning alone. */}
+          <div className="flex items-center justify-between gap-2 py-0.5 pr-0.5 pl-2">
+            <span id={themeLabelId} className="text-text-secondary text-sm">
+              {t("theme.label", "Theme")}
+              <span className="text-text-muted">
+                {" · "}
+                {/* biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments above THEME_OPTIONS */}
+                {t(currentTheme.labelKey)}
+              </span>
+            </span>
+            <DropdownMenuPrimitive.RadioGroup
+              value={theme}
+              onValueChange={(value) => setTheme(value as typeof theme)}
+              aria-labelledby={themeLabelId}
+              className="border-border bg-bg-tertiary flex gap-0.5 rounded-md border p-0.5"
+            >
+              {THEME_OPTIONS.map(({ value, icon: Icon, labelKey }) => (
                 <DropdownMenuPrimitive.RadioItem
                   key={value}
                   value={value}
-                  className={cn(menuItemCls, {
-                    "bg-bg-tertiary": selected,
-                  })}
+                  // biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments above THEME_OPTIONS
+                  aria-label={t(labelKey)}
+                  className="text-text-muted data-[highlighted]:bg-bg-hover data-[state=checked]:bg-bg-hover data-[highlighted]:text-text-primary data-[state=checked]:text-text-primary grid h-6 w-7 place-items-center rounded-sm transition-colors outline-none"
                 >
-                  <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                  {/* biome-ignore lint/plugin/no-dynamic-i18n-key: extracted via magic comments in THEME_OPTIONS */}
-                  <span className="flex-1">{t(labelKey)}</span>
-                  {selected && (
-                    <Check
-                      className="ml-auto h-3.5 w-3.5 shrink-0"
-                      aria-hidden="true"
-                    />
-                  )}
+                  <Icon className="h-3.5 w-3.5" aria-hidden="true" />
                 </DropdownMenuPrimitive.RadioItem>
-              );
-            })}
-          </DropdownMenuPrimitive.RadioGroup>
+              ))}
+            </DropdownMenuPrimitive.RadioGroup>
+          </div>
 
-          <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
-
-          <DropdownMenuPrimitive.Label className={menuLabelCls}>
-            {t("language.label", "Language")}
-          </DropdownMenuPrimitive.Label>
-          <DropdownMenuPrimitive.RadioGroup
-            value={i18n.language}
-            onValueChange={(value) => i18n.changeLanguage(value)}
-          >
-            {LANGUAGES.map((lang) => {
-              const selected = lang.code === i18n.language;
-              return (
-                <DropdownMenuPrimitive.RadioItem
-                  key={lang.code}
-                  value={lang.code}
-                  className={cn(menuItemCls, {
-                    "bg-bg-tertiary": selected,
-                  })}
+          <DropdownMenuPrimitive.Sub>
+            <DropdownMenuPrimitive.SubTrigger
+              ref={languageTriggerRef}
+              className={menuItemCls}
+            >
+              <Languages className="h-4 w-4 shrink-0" aria-hidden="true" />
+              <span className="flex-1">{t("language.label", "Language")}</span>
+              <span className="text-text-muted text-xs">
+                {currentLanguage?.name}
+              </span>
+              <ChevronRight
+                className="text-text-muted h-3.5 w-3.5 shrink-0"
+                aria-hidden="true"
+              />
+            </DropdownMenuPrimitive.SubTrigger>
+            <DropdownMenuPrimitive.Portal>
+              {/* Beside the menu there is no room on a phone, so Radix flips the submenu
+                  left and never shifts it back on screen (left -56px at 393px wide). Below md it
+                  opens on top of the menu instead, just under its trigger, at a fixed width. */}
+              <LanguageSubContent
+                wide={wideViewport}
+                trigger={languageTriggerRef}
+              >
+                <DropdownMenuPrimitive.RadioGroup
+                  value={i18n.language}
+                  onValueChange={(value) => i18n.changeLanguage(value)}
                 >
-                  <span className="text-base" aria-hidden="true">
-                    {lang.flag}
-                  </span>
-                  <span className="flex-1">{lang.name}</span>
-                  {selected && (
-                    <Check
-                      className="ml-auto h-3.5 w-3.5 shrink-0"
-                      aria-hidden="true"
-                    />
-                  )}
-                </DropdownMenuPrimitive.RadioItem>
-              );
-            })}
-          </DropdownMenuPrimitive.RadioGroup>
-
-          <DropdownMenuPrimitive.Separator className="my-1 h-px bg-border" />
+                  {LANGUAGES.map((lang) => (
+                    <DropdownMenuPrimitive.RadioItem
+                      key={lang.code}
+                      value={lang.code}
+                      className={menuItemCls}
+                    >
+                      <span className="text-base" aria-hidden="true">
+                        {lang.flag}
+                      </span>
+                      <span className="flex-1">{lang.name}</span>
+                      <DropdownMenuPrimitive.ItemIndicator>
+                        <Check className="h-3.5 w-3.5" aria-hidden="true" />
+                      </DropdownMenuPrimitive.ItemIndicator>
+                    </DropdownMenuPrimitive.RadioItem>
+                  ))}
+                </DropdownMenuPrimitive.RadioGroup>
+              </LanguageSubContent>
+            </DropdownMenuPrimitive.Portal>
+          </DropdownMenuPrimitive.Sub>
 
           <DropdownMenuPrimitive.Item
-            onSelect={() => navigate("/settings")}
+            onSelect={() => confirmLeave(() => navigate("/settings"))}
             className={menuItemCls}
           >
             <Settings className="h-4 w-4 shrink-0" aria-hidden="true" />
             <span>{t("nav.settings", "Settings")}</span>
           </DropdownMenuPrimitive.Item>
 
+          <DropdownMenuPrimitive.Separator className={separatorCls} />
+
           <DropdownMenuPrimitive.Item
-            onSelect={handleLogout}
+            onSelect={() => confirmLeave(() => void handleLogout())}
             className={menuItemCls}
           >
             <LogOut className="h-4 w-4 shrink-0" aria-hidden="true" />

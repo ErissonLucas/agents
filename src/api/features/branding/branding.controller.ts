@@ -11,29 +11,25 @@ import {
 } from "./branding.admin.service";
 import { getGlobalBranding, readBrandingAsset } from "./branding.service";
 
-// GLOBAL identity/branding transport. Reads (the config + the binary assets) are PUBLIC — they
+// GLOBAL identity/branding transport. Reads (the config + the binary assets) are PUBLIC: they
 // must load before any auth/tenant context (login/setup pages, the favicon). Writes are gated to
 // SUPER_ADMIN (identity is fleet-level, not tenant-level). Mounted under the /api group.
 const variantParams = t.Object({
-  kind: t.Union([t.Literal("logo"), t.Literal("favicon")], {
-    description: 'Asset kind: accepts "logo" or "favicon".',
+  kind: t.Union([t.Literal("logo"), t.Literal("favicon"), t.Literal("mark")], {
+    description:
+      'Asset kind: accepts "logo", "favicon" or "mark" (the square symbol the collapsed sidebar shows).',
   }),
   variant: t.Union([t.Literal("dark"), t.Literal("light")], {
     description: 'Theme variant: accepts "dark" or "light".',
   }),
 });
 
-// The writes need a principal to attribute their audit row to. Resolved per WRITE HANDLER and not by
-// mounting `tenancyPlugin`: that plugin derives globally, so it would run on the two PUBLIC routes
-// here as well, on the identity config the login page loads before any session exists and on the
-// favicon. Measured on both routes, driving the real app: mounting it adds ONE `user.findUnique` per
-// request that carries a session cookie (0 -> 1 on each) and none for an anonymous one, and it turns
-// a transient DB failure into a 503 on the one route that has to answer before auth. These three are
-// SUPER_ADMIN-only
-// and rare, so paying one extra lookup here is the cheaper side by far.
-//
-// `tenantId` is pinned null rather than read: branding is fleet-level, and the audit row must not
-// follow whichever tenant this admin happens to have selected.
+// The writes need a principal for their audit row, resolved per WRITE HANDLER rather than by
+// mounting `tenancyPlugin`: that plugin derives globally, so the two PUBLIC routes (the identity
+// config the login page loads, the favicon) would pay a user lookup per cookie-carrying request and
+// answer a transient DB failure with a 503 before auth. The writes are rare, so they pay it instead.
+// `tenantId` is pinned null: branding is fleet-level, and the audit row must not follow whichever
+// tenant the admin has selected.
 async function actorOf(
   getAuthUser: () => Promise<{
     id: bigint;
@@ -58,7 +54,7 @@ export const brandingController = new Elysia({
   .use(authPlugin)
   // Public: the resolved global identity (colors + which asset variants exist + cache version).
   // no-store: this config changes on every branding edit and the client re-fetches after each
-  // mutation (e.g. removing a logo) — a heuristically-cached stale copy would point the UI at an
+  // mutation (e.g. removing a logo); a heuristically-cached stale copy would point the UI at an
   // asset that no longer exists (broken/empty logo). The binary assets stay long-cached (?v=).
   .get(
     "/",
@@ -75,13 +71,13 @@ export const brandingController = new Elysia({
         security: [],
         responses: {
           200: jsonResponse(
-            "The resolved global branding: brand name, color mode and tokens, which logo/favicon variants exist, and the cache-busting version.",
+            "The resolved global branding: brand name, color mode and tokens, which logo/favicon/mark variants exist, and the cache-busting version.",
           ),
         },
       },
     },
   )
-  // Public: serve a logo/favicon binary. Hardened headers neutralize a directly-opened SVG and
+  // Public: serve a logo/favicon/mark binary. Hardened headers neutralize a directly-opened SVG and
   // the version query (?v=) makes the long-lived cache safe to bust on change.
   .get(
     "/asset/:kind/:variant",
@@ -109,7 +105,7 @@ export const brandingController = new Elysia({
       detail: {
         ...doc(
           "Get branding asset",
-          "Serves a logo or favicon binary for the given kind and theme variant, long-cached and busted via the ?v= query. Public so assets load before any auth context.",
+          "Serves a logo, favicon or mark binary for the given kind and theme variant, long-cached and busted via the ?v= query. Public so assets load before any auth context.",
         ),
         security: [],
       },
@@ -177,7 +173,7 @@ export const brandingController = new Elysia({
       response: errors(400, 401, 403, 422),
     },
   )
-  // SUPER_ADMIN: upload a logo/favicon variant (multipart). The service re-checks type + size.
+  // SUPER_ADMIN: upload a logo/favicon/mark variant (multipart). The service re-checks type + size.
   .put(
     "/asset/:kind/:variant",
     async ({ getAuthUser, params, body }) =>
@@ -198,17 +194,17 @@ export const brandingController = new Elysia({
         file: t.File({
           maxSize: "2m",
           description:
-            "Logo or favicon file (multipart). MIME and per-kind size are re-validated server-side.",
+            "Logo, favicon or mark file (multipart). MIME and per-kind size are re-validated server-side.",
         }),
       }),
       detail: doc(
         "Upload branding asset",
-        "Uploads a logo or favicon binary for the given kind and theme variant (multipart). SUPER_ADMIN only.",
+        "Uploads a logo, favicon or mark binary for the given kind and theme variant (multipart). SUPER_ADMIN only.",
       ),
       response: errors(400, 401, 403, 422),
     },
   )
-  // SUPER_ADMIN: remove a logo/favicon variant.
+  // SUPER_ADMIN: remove a logo/favicon/mark variant.
   .delete(
     "/asset/:kind/:variant",
     async ({ getAuthUser, params }) =>
@@ -222,7 +218,7 @@ export const brandingController = new Elysia({
       params: variantParams,
       detail: doc(
         "Delete branding asset",
-        "Removes the stored logo or favicon binary for the given kind and theme variant. SUPER_ADMIN only.",
+        "Removes the stored logo, favicon or mark binary for the given kind and theme variant. SUPER_ADMIN only.",
       ),
       response: errors(400, 401, 403, 422),
     },

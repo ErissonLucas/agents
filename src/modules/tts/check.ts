@@ -1,11 +1,8 @@
 import type { TtsCheckMode } from "@/config";
 
-// Client for the corrupted-audio detector (issue #779, docs/tts.md "Checking the audio").
-//
-// The detector is a separate HTTP service the operator runs, and this file is the whole of what the
-// agents side knows about it: one POST with the audio and the words it was meant to say, one JSON
-// answer. It holds no thresholds. Where "corrupted" starts is calibrated on the detector's side,
-// against the deployment's own traffic, so nothing here has a number to drift.
+// Client for the corrupted-audio detector (docs/tts.md "Checking the audio"), a separate HTTP
+// service the operator runs: one POST with the audio and the words it was meant to say, one JSON
+// answer. No thresholds here: they are calibrated on the detector's side.
 
 export interface TtsCheckConfig {
   url: string;
@@ -75,7 +72,7 @@ export async function checkSynthesizedAudio(params: {
   const headers: Record<string, string> = {};
   if (cfg.token) headers.authorization = `Bearer ${cfg.token}`;
 
-  // NOTE: the deadline covers the body as well as the headers, and so does the classification: a
+  // The deadline covers the body as well as the headers, and so does the classification: a
   // detector that answers its headers in time and then stalls is a timeout, and a connection that
   // drops mid-body is a network failure. Only a body that ARRIVED and is not JSON is `malformed`.
   let raw: string;

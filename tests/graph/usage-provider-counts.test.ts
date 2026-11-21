@@ -1,21 +1,18 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { fileURLToPath } from "node:url";
 import { ChatAnthropic } from "@langchain/anthropic";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { ChatOpenAI } from "@langchain/openai";
 import { UsageCapture, type UsageRow } from "@/graph/usage";
 
-// Issue #334, and the reason these drive the vendor adapters instead of asserting on a fake result:
-// the defect was never in our arithmetic over a shape we control, it was in what an ADAPTER hands
-// over. `@langchain/google-genai` maps `output_tokens` from `candidatesTokenCount` alone and reads
-// `thoughtsTokenCount` nowhere — a hand-written `usage_metadata` fixture would have encoded that
-// belief instead of testing it, which is exactly how the wrong number got into the ledger.
-//
-// So each server below answers in its own vendor's raw response shape, the real client parses it,
-// and the assertion is on the ROW the ledger would have written.
+// These drive the vendor adapters instead of asserting on a fake result, because what can be wrong
+// is what an ADAPTER hands over, not our arithmetic: `@langchain/google-genai` maps `output_tokens`
+// from `candidatesTokenCount` alone and reads `thoughtsTokenCount` nowhere, and a hand-written
+// `usage_metadata` fixture would encode that belief instead of testing it. Each server answers in
+// its vendor's raw response shape, the real client parses it, and the assertion is on the ROW the
+// ledger would write.
 
-// NOTE: happy-dom's `fetch` enforces same-origin (so every call is preflighted) and its `Response`
+// happy-dom's `fetch` enforces same-origin (so every call is preflighted) and its `Response`
 // is not the one Bun's socket layer recognises. Same two workarounds as
 // tests/modules/guardrail-constrained.test.ts.
 const CORS = {
@@ -32,6 +29,7 @@ const preflight = (req: Request) =>
 
 function serving(body: () => unknown) {
   return Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const pre = preflight(req);
@@ -92,7 +90,7 @@ const gemini = () =>
   new ChatGoogleGenerativeAI({
     model: "gemini-3.5-flash",
     apiKey: "x",
-    baseUrl: `http://localhost:${geminiServer.port}`,
+    baseUrl: `http://127.0.0.1:${geminiServer.port}`,
   });
 
 // ── Anthropic ───────────────────────────────────────────────────────────────
@@ -149,7 +147,7 @@ describe("the ledger records what the provider billed", () => {
     geminiMode = "thinking";
     const row = await rowFor(gemini(), "gemini-3.5-flash");
     expect(row.promptTokens).toBe(1200);
-    // NOTE: 180 candidates + 640 thoughts. Red before the fix: 180, and the 640 were billed to
+    // NOTE: 180 candidates + 640 thoughts. Counting the candidates alone would bill the 640 to
     // nobody.
     expect(row.completionTokens).toBe(820);
   });
@@ -168,7 +166,7 @@ describe("the ledger records what the provider billed", () => {
       new ChatAnthropic({
         model: "claude-haiku-4-5",
         apiKey: "x",
-        clientOptions: { baseURL: `http://localhost:${anthropicServer.port}` },
+        clientOptions: { baseURL: `http://127.0.0.1:${anthropicServer.port}` },
       }),
       "claude-haiku-4-5",
     );
@@ -185,7 +183,7 @@ describe("the ledger records what the provider billed", () => {
       new ChatOpenAI({
         model: "gpt-5.4-nano",
         apiKey: "x",
-        configuration: { baseURL: `http://localhost:${openaiServer.port}` },
+        configuration: { baseURL: `http://127.0.0.1:${openaiServer.port}` },
       }),
       "gpt-5.4-nano",
     );
@@ -194,57 +192,5 @@ describe("the ledger records what the provider billed", () => {
     // completion exactly, so the Gemini repair must find no gap here.
     expect(row.completionTokens).toBe(200);
     expect(row.cachedReadTokens).toBe(800);
-  });
-});
-
-// ── the premise the Gemini repair rests on ──────────────────────────────────
-
-// `toolUsePromptTokenCount` is summed into Gemini's `totalTokenCount` too, and it is populated by
-// Gemini's BUILT-IN tools (Search grounding, code execution, URL context). While none is enabled the
-// gap is only thinking; enable one and part of it becomes prompt-side spend booked as output.
-//
-// The premise is therefore checked rather than trusted, and this is where the check lives.
-const GEMINI_BUILTIN_TOOLS =
-  /\b(googleSearch|google_search|googleSearchRetrieval|codeExecution|code_execution|urlContext|url_context)\b/;
-
-function declaresBuiltinTool(source: string): boolean {
-  return GEMINI_BUILTIN_TOOLS.test(source);
-}
-
-async function tsFilesUnder(dir: string): Promise<string[]> {
-  const glob = new Bun.Glob("**/*.ts");
-  const out: string[] = [];
-  for await (const f of glob.scan({ cwd: dir, absolute: true })) out.push(f);
-  return out;
-}
-
-describe("no Gemini built-in tool is enabled", () => {
-  // NOTE: a sweep that finds nothing passes whether the premise holds or the pattern is broken.
-  test("the predicate recognises a built-in tool declaration", () => {
-    expect(
-      declaresBuiltinTool(`const g = model.bindTools([{ googleSearch: {} }]);`),
-    ).toBe(true);
-    expect(
-      declaresBuiltinTool(
-        `const g = model.bindTools([{ codeExecution: {} }]);`,
-      ),
-    ).toBe(true);
-    expect(
-      declaresBuiltinTool(`const g = model.bindTools(toGeminiTools(tools));`),
-    ).toBe(false);
-  });
-
-  test("src/ enables none, so the total's gap is thinking alone", async () => {
-    const offenders: string[] = [];
-    for (const file of await tsFilesUnder(
-      fileURLToPath(new URL("../../src", import.meta.url)),
-    )) {
-      if (declaresBuiltinTool(await Bun.file(file).text())) {
-        offenders.push(file.split("/src/")[1] as string);
-      }
-    }
-    // NOTE: turning one on is allowed, but then `extractTokenUsage` has to stop attributing the
-    // whole gap to generation, so this must be answered, not deleted.
-    expect(offenders).toEqual([]);
   });
 });

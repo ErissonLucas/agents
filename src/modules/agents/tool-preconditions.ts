@@ -1,19 +1,7 @@
-// A condition an operator declares on ONE granted tool, checked by the runtime at the moment the
-// model calls it: unmet, and the call does not run. It is the enforceable half of `toolGuidance`
-// (tool-guidance.ts): guidance says WHEN to use a tool and is re-decided by the model every turn;
-// a precondition says when the tool MAY be used, and is not the model's to re-decide.
-//
-// Measured motivation (issue #101): an agent told, in five separate places, never to hand off
-// without the article URL called `handoff_to_human` on three consecutive runs of the same input and
-// wrote the unmet condition into its own `reason` argument each time. The prompt was not the defect;
-// the absence of an enforcement point was.
-//
-// TYPED, and deliberately not an expression language. The market splits here: OPA/Rego and Cedar are
-// expression languages because their audience writes code, while the operator-facing products
-// (Copilot Studio) give conditions over a NAMED VARIABLE and no syntax at all. This surface is
-// configured by the same operator who types the prompt, so it is data. It is also the direction that
-// stays open: a closed set of conditions translates mechanically into an expression later, while an
-// expression published to operators is a contract that cannot be taken back.
+// A condition an operator declares on ONE granted tool, checked by the runtime when the model calls
+// it: unmet, the call does not run. The enforceable half of `toolGuidance`, which the model re-decides
+// every turn. Typed data, not an expression language: a closed set of conditions can become an
+// expression later, while an expression published to operators cannot be taken back.
 
 // This type is the STATE NAMESPACE shared with the operator-authored code tools (graph/tools/
 // code.ts): "what can a rule see about the conversation" is the same question for both, and the
@@ -23,7 +11,6 @@
 // LANGUAGE: a code tool's body may loop, throw and hit a limit, and its failure is reported; a
 // precondition has to always terminate and always answer, because its answer decides whether a call
 // happens at all, so it stays a closed set of typed conditions.
-import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
 
 export interface PreconditionState {
   // The mirrored Chatwoot bags, read from OUR tables (never a live Chatwoot call), at the moment the
@@ -34,20 +21,24 @@ export interface PreconditionState {
   contactAttributes: Record<string, unknown>;
 }
 
-// ONE kind today, and the union is written as a union anyway: `kind` is the tag a second condition
-// will be added on, and a shape that has to be widened later is a shape whose readers were written
-// without it. What is NOT here is a condition over the message history — see the note on
-// PreconditionState in the PR: the graph state is unreachable from a tool outside a Pregel run
-// (`getCurrentTaskInput()` throws "internal scratchpad not initialized", measured), and the mirror
-// does not hold message bodies. That condition needs a transcript source that does not exist yet.
+// The named attribute carries a value (any non-blank value), or equals a given one.
+export type AttributePrecondition = {
+  kind: "attribute";
+  scope: "conversation" | "contact";
+  key: string;
+  equals?: string;
+};
+
+// Every value the call's arguments choose on the customer's behalf (which option, how many, which
+// day) was said or confirmed by the customer. Judged per call against the customer's own messages in
+// the graph state the tool node hands the tool (graph/tools/customer-choice.ts), so it holds only
+// where a call comes from a model turn: a rule's action and a voice call carry no transcript, and
+// there it refuses.
+export type CustomerChoicePrecondition = { kind: "customer_choice" };
+
 export type ToolPrecondition =
-  // The named attribute carries a value (any non-blank value), or equals a given one.
-  {
-    kind: "attribute";
-    scope: "conversation" | "contact";
-    key: string;
-    equals?: string;
-  };
+  | AttributePrecondition
+  | CustomerChoicePrecondition;
 
 const SCOPES = new Set(["conversation", "contact"]);
 function str(v: unknown): string | null {
@@ -57,6 +48,18 @@ function str(v: unknown): string | null {
 // Exported because the WRITE boundary needs the same parse the runtime uses. Two parsers is how a
 // value gets accepted by the API and then ignored by the turn.
 export function parseToolPrecondition(raw: unknown): ToolPrecondition | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  if ((raw as Record<string, unknown>).kind === "customer_choice") {
+    return { kind: "customer_choice" };
+  }
+  return parseAttributePrecondition(raw);
+}
+
+// The attribute kind alone, for the contact-authorization rule, whose gate runs before any turn and
+// has no transcript to judge a choice against.
+export function parseAttributePrecondition(
+  raw: unknown,
+): AttributePrecondition | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const c = raw as Record<string, unknown>;
   if (c.kind === "attribute") {
@@ -80,32 +83,46 @@ export function parseToolPrecondition(raw: unknown): ToolPrecondition | null {
   return null;
 }
 
-// Stored flat at `settings.toolPreconditions = { [toolName]: ToolPrecondition }`, keyed by TOOL NAME
-// rather than by grant id. That is what makes one map cover all six tool sources at once: prepare.ts
-// merges native, document, HTTP, MCP, toolpack and RAG tools into a single name-unique list
-// (dropDuplicateToolNames), so a name is the one identifier every source already agrees on.
-//
-// A malformed condition is DROPPED, not repaired: a precondition that "sort of" parses is worse than
-// none, because the operator would read the tool as guarded while the runtime treats it as open. The
-// write side refuses instead of dropping, so a dropped condition here means settings written before
-// this shipped, or written around the API.
-//
-// The NAME is not filtered here, only at the write boundary (isGuardableToolName). An agent import
-// copies a settings bag verbatim, so a rule on a non-native name can arrive without passing that
-// boundary, and the honest thing for the runtime to do with it is to guard the tool if the name
-// still matches one. When it matches nothing the seam says so (prepare.ts) rather than leaving the
-// operator to read an inert rule as protection.
-// NULL-PROTOTYPE, and both directions of that bit. A tool name is operator text: `__proto__` as a
-// key on a plain object mutates the prototype instead of storing a rule, so the guard the operator
-// wrote simply disappears; and a tool named `constructor` or `toString` finds an INHERITED value on
-// lookup, so an unguarded tool is blocked by something nobody configured.
-function emptyMap(): Record<string, ToolPrecondition> {
-  return Object.create(null) as Record<string, ToolPrecondition>;
+// A tool's rule is one condition or a list of them, all required. The bound keeps the refusal a
+// sentence the model can act on in one message.
+export const TOOL_PRECONDITION_CONDITIONS_MAX = 10;
+
+// One condition stored as an object reads as a list of one, so every bag written before lists existed
+// keeps its meaning. A list is all or nothing: a list with one bad condition would otherwise guard on
+// the conditions that parsed, a weaker rule than the operator wrote.
+export function parseToolPreconditionList(
+  raw: unknown,
+): ToolPrecondition[] | null {
+  if (!Array.isArray(raw)) {
+    const one = parseToolPrecondition(raw);
+    return one ? [one] : null;
+  }
+  if (raw.length === 0 || raw.length > TOOL_PRECONDITION_CONDITIONS_MAX) {
+    return null;
+  }
+  const out: ToolPrecondition[] = [];
+  for (const item of raw) {
+    const cond = parseToolPrecondition(item);
+    if (!cond) return null;
+    out.push(cond);
+  }
+  return out;
 }
 
+// NULL-PROTOTYPE, because a tool name is operator text: `__proto__` on a plain object would mutate the
+// prototype instead of storing a rule, and `constructor` or `toString` would find an inherited value.
+function emptyMap(): Record<string, ToolPrecondition[]> {
+  return Object.create(null) as Record<string, ToolPrecondition[]>;
+}
+
+// `settings.toolPreconditions = { [toolName]: ToolPrecondition | ToolPrecondition[] }`, keyed by name
+// because a name is the one identifier all six tool sources share (dropDuplicateToolNames). A
+// malformed rule is DROPPED: one that half-parses reads as a guard while the runtime treats the tool
+// as open. Names are filtered only at write (isGuardableToolName): an imported rule still guards a
+// tool whose name matches.
 export function readToolPreconditions(
   settings: unknown,
-): Record<string, ToolPrecondition> {
+): Record<string, ToolPrecondition[]> {
   const bag =
     settings && typeof settings === "object" && !Array.isArray(settings)
       ? (settings as Record<string, unknown>).toolPreconditions
@@ -113,16 +130,43 @@ export function readToolPreconditions(
   if (!bag || typeof bag !== "object" || Array.isArray(bag)) return emptyMap();
   const out = emptyMap();
   for (const [name, raw] of Object.entries(bag as Record<string, unknown>)) {
-    const cond = parseToolPrecondition(raw);
-    if (cond) out[name] = cond;
+    const conds = parseToolPreconditionList(raw);
+    if (conds) out[name] = conds;
   }
   return out;
 }
 
+// The rules as the API and the audit show them: one condition as an object and two or more as a list,
+// the same shape the console writes, so a bag stored before lists reads back exactly as it was.
+export function readToolPreconditionsForDisplay(
+  settings: unknown,
+): Record<string, ToolPrecondition | ToolPrecondition[]> {
+  const out = Object.create(null) as Record<
+    string,
+    ToolPrecondition | ToolPrecondition[]
+  >;
+  for (const [name, conds] of Object.entries(readToolPreconditions(settings))) {
+    out[name] = conds.length === 1 ? (conds[0] as ToolPrecondition) : conds;
+  }
+  return out;
+}
+
+// The conditions of one rule that the state does not meet, in the order the operator wrote them.
+export function unmetPreconditions(
+  conds: readonly ToolPrecondition[],
+  state: PreconditionState,
+): ToolPrecondition[] {
+  return conds.filter((c) => !evaluatePrecondition(c, state));
+}
+
+// A choice condition is UNMET here: this reads attributes only, and a caller that judges choices
+// (graph/tools/precondition.ts) takes them out first. Every other caller has no transcript to judge
+// against, and a precondition fails closed.
 export function evaluatePrecondition(
   cond: ToolPrecondition,
   state: PreconditionState,
 ): boolean {
+  if (cond.kind === "customer_choice") return false;
   const bag =
     cond.scope === "conversation"
       ? state.conversationAttributes
@@ -149,56 +193,43 @@ export function evaluatePrecondition(
 // status code of a refusal cannot do: tell the model what to DO next, so the turn continues instead
 // of ending. In the reported case the right next move is to ask the customer for the URL, and the
 // model only knows that if the refusal says which URL is missing.
+// Every unmet condition is named, so the model can ask for all of them in one message instead of one
+// per turn.
 export function unmetPreconditionMessage(
   toolName: string,
-  cond: ToolPrecondition,
+  unmet: readonly ToolPrecondition[],
 ): string {
-  const what =
-    cond.equals === undefined
-      ? `the ${cond.scope} attribute \`${cond.key}\` to be set`
-      : `the ${cond.scope} attribute \`${cond.key}\` to be \`${cond.equals}\``;
-  return `\`${toolName}\` was not run: it requires ${what}, and it is not. Continue the conversation and obtain it first — do not tell the customer about this restriction.`;
+  const what = unmet.map((cond) =>
+    cond.kind === "customer_choice"
+      ? "the customer to have chosen every value in this call"
+      : cond.equals === undefined
+        ? `the ${cond.scope} attribute \`${cond.key}\` to be set`
+        : `the ${cond.scope} attribute \`${cond.key}\` to be \`${cond.equals}\``,
+  );
+  if (what.length === 1) {
+    return `\`${toolName}\` was not run: it requires ${what[0]}, and it is not. Continue the conversation and obtain it first — do not tell the customer about this restriction.`;
+  }
+  return `\`${toolName}\` was not run: it requires ${what.join("; ")}, and none of these holds yet. Continue the conversation and obtain all of them first — do not tell the customer about this restriction.`;
 }
 
-// WHICH NAMES MAY CARRY A RULE, and the answer is the native catalog — not "any tool name".
-//
-// The runtime applies a condition to whatever exposed name matches, at the one seam where all six
-// sources meet, and that stays true. What is refused here is WRITING a rule on a name whose exposed
-// form is not stable identity, because a precondition that follows a name onto a different tool, or
-// stops matching entirely, is a guard that silently stops guarding — the single failure this feature
-// must not have.
-//
-// Measured, per source:
-//   - NATIVE: the name IS the identity. `handoff_to_human` is not renameable, not namespaced, and the
-//     assembly reserves every native name — the built ones win by order, the ones an allowlist left
-//     out are reserved outright (../../graph/tools/unique-names.ts) — so no other source can take it.
-//   - HTTP: `ToolDefinition.name` is normalized on write and `@@unique([tenantId, name])`. Stable
-//     today, but a rename is a plain PATCH away and nothing would carry the rule across it.
-//   - MCP: `mcp__<slug>__<tool>`, where the slug is derived from the connection's display name —
-//     including the fallback for a name that yields no ASCII at all (emoji-only, CJK-only), which is
-//     a digest of the name and no longer the connection id (#412). A `_2` suffix on two
-//     slug-colliding connections is decided by grant order, which is anchored on the connection's
-//     name. So the name survives a re-save (#389) and an export/import (#412) — and still moves
-//     under a RENAME of the connection, which nothing carries the rule across.
-//   - INTEGRATION: two instances of one catalog type expose the SAME names; the later is dropped,
-//     and which one survives is again grant order, anchored on (catalogType, name) — so it too
-//     survives a transfer and moves under a rename.
-//
-// So the extension past native waits on a name a rename cannot move, which is its own change to how
-// MCP and toolpack tools are namespaced. The console offers exactly this set for the same
-// reason (ToolPreconditionsEditor), and docs/graph.md carries the boundary.
-//
-// This is the repo's existing shape for a settings bag keyed by tool name, not a new one:
-// `toolGuidance` is restricted to the same catalog in both of its readers (readToolGuidance drops a
-// non-native key, and text-caps.ts only caps the native ones, saying "an unknown one is text nothing
-// ever reads"). What differs is the POLICY, and deliberately: guidance DROPS an unusable key
-// silently, this REFUSES it at the write. A lost hint is a hint; a lost guard reads on screen as
-// protection that is not there.
+// The refusal of a call whose values the customer has not chosen. The values are quoted back so the
+// model asks about THEM: a model that wrote every option of the catalog into one call, or picked one
+// itself, otherwise asks something vaguer or calls again with the same arguments.
+export function unchosenValuesMessage(toolName: string, args: unknown): string {
+  return `\`${toolName}\` was not run: it requires the customer to have chosen every value in this call, and these values include a choice the customer has not made yet (${JSON.stringify(args)}). Ask the customer to choose, in plain words, and call it again after they answer. Do not say it was done, and do not tell the customer about this restriction.`;
+}
+
+// Which names may carry a rule: any name a tool of any source can be called by (native, toolpack,
+// HTTP, code, MCP), which is the providers' tool-name shape. The runtime matches a rule by the name
+// the model calls, so a rule on a name the agent does not have, or no longer has after a rename or a
+// revoked grant, guards nothing; that is reported where it is seen (the editor flags the row, the
+// turn writes a warn line) rather than refused here, where an MCP server's tools may not even be
+// listable. A name no source can produce (a space, a leading underscore, `__proto__`) is refused; a
+// leading `-` is allowed, since the custom-tool normalizer keeps one.
+export const GUARDABLE_TOOL_NAME = /^(?!_)[A-Za-z0-9_-]{1,64}$/;
+
 export function isGuardableToolName(name: unknown): name is string {
-  return (
-    typeof name === "string" &&
-    (NATIVE_TOOL_NAMES as readonly string[]).includes(name)
-  );
+  return typeof name === "string" && GUARDABLE_TOOL_NAME.test(name);
 }
 
 // Every entry of a settings bag that does not parse, named. The write side refuses on a non-empty
@@ -215,18 +246,12 @@ export function invalidToolPreconditions(settings: unknown): string[] {
     return ["toolPreconditions"];
   return Object.entries(bag as Record<string, unknown>)
     .filter(
-      // NOTE: The KEY is checked as well as the value, and it is the half a value-only check misses: a
-      // padded name (`" handoff_to_human "`) parses fine as a condition, so the API reported success
-      // on a rule that can never match, for a tool that stayed unguarded.
-      // NOTE: `null` is a REMOVAL, not an entry that failed to parse. The MCP merge consumes it as a
-      // tombstone (behavior-settings.ts) because an absent key there means "leave it alone"; over
-      // REST, where the bag is sent whole, omitting the key already removes the rule and a null is
-      // simply inert. Reading it as invalid would refuse the only way to delete one — but the NAME
-      // is still checked, so a tombstone for a tool that could never have been guarded is refused
-      // rather than reporting success for a no-op.
+      // NOTE: The KEY is checked too: a padded name parses as a condition but never matches a tool.
+      // NOTE: `null` is a REMOVAL (the MCP merge's tombstone), not a parse failure; its name is still
+      // checked, so removing a rule from a tool that could never be guarded is refused.
       ([name, raw]) =>
         !isGuardableToolName(name) ||
-        (raw !== null && parseToolPrecondition(raw) === null),
+        (raw !== null && parseToolPreconditionList(raw) === null),
     )
     .map(([name]) => name);
 }

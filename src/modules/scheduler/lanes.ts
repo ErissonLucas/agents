@@ -1,40 +1,14 @@
+import type { PoolClass } from "@/lib/pool-class";
 import type { FlowLevel } from "@/modules/flowlog/stages";
 import type { SchedulerJobKind } from "@/modules/scheduler/service";
 
-// Which drain each job kind belongs to, and the rule for when a new drain is warranted.
-//
-// THE RULE: a lane is justified by CADENCE or by BUDGET. Never by duration.
-//
-// Duration was the reason this file exists, and it is the reason that no longer applies. The shared
-// tick used to drain its batch one job at a time, so a slow kind delayed every kind claimed with it,
-// and the only escape was a lane of one's own — which is how a design with two special cases and one
-// queue holding everything else grew, one lane at a time, with nothing saying when the next was due
-// (issue #165). The shared tick now drains concurrently, like the other two always have, so a slow
-// job no longer delays anything. A kind that is merely slow needs no lane.
-//
-// What still justifies one:
-//
-//   CADENCE — the kind's latency is felt at a different timescale than the shared tick's. DEBOUNCE
-//   is the case: a flush waiting up to a full scheduler interval is a customer watching a reply not
-//   arrive, so it gets a fast tick of its own. Concurrency does not help here; the wait is until the
-//   next tick, not behind another job.
-//
-//   BUDGET — the kind must be capped against a resource the shared lane does not cap. MEMORY_COMPACT
-//   is the case: it fires for every agent on every closed attendance and takes permits from the same
-//   model semaphore a customer's turn queues on, so its lane sizes its batch to a quarter of that
-//   budget. Concurrency does not help here either; it is the opposite of what is wanted.
-//
-//   A CAP OF ITS OWN is the same question asked from the other side. OBSERVE is the case (issue
-//   #621): its rows follow traffic, so the fixed batch cannot hold them, and the traffic share it
-//   used to take is a ceiling of five rows a tick for the whole install, split with ingestion and the
-//   recoveries. A label is read live, so a queue that grows without bound there is felt. Its lane is
-//   drained BY THE SHARED TICK, with a claim of its own sized to the provider bound it already runs
-//   under: the tick rate is right, only the cap was wrong, and a worker of its own would add a flag
-//   an install can leave off.
-//
-// So the question for an eleventh kind is not "is it slow" but "does it need a different tick rate,
-// or a cap of its own". If neither, it belongs here, and the compiler will ask: this map is exhaustive
-// over SchedulerJobKind, so a kind added to the enum does not compile until it is placed.
+// Which drain each job kind belongs to. A lane is justified by CADENCE or by BUDGET, never by
+// duration: the shared tick drains concurrently, so a kind that is merely slow needs no lane.
+// CADENCE: its latency is felt at a different timescale than the shared tick's (DEBOUNCE).
+// BUDGET: it must be capped against a resource the shared lane does not cap (MEMORY_COMPACT takes
+// permits from the model semaphore a customer's turn queues on). OBSERVE is both: a cadence of its
+// own, and a cap of its own because its rows follow traffic.
+// The map is exhaustive over SchedulerJobKind, so a new kind does not compile until it is placed.
 
 export type SchedulerLane = "shared" | "debounce" | "compaction" | "observe";
 
@@ -52,23 +26,32 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // Budget: fires for every agent on every closed attendance, against the model semaphore a
   // customer's turn queues on, so its batch is sized to a fraction of that budget.
   MEMORY_COMPACT: "compaction",
-  // Shared, and the first draft of this had it on the debounce tick for a cadence reason that no
-  // longer holds. What waits behind a queued ingestion is the next turn's CONTEXT, and a turn now
-  // drains what it needs before invoking (../../graph/ingest-job.ts, drainPendingIngest) instead of
-  // hoping the tick got there first. With the barrier the cadence stops mattering, and the fast tick
-  // turns into a liability: the debounce worker can be switched off (DEBOUNCE_WORKER_ENABLED), and
-  // a kind parked in that lane would then never drain at all, silently, on an install that simply
-  // does not use debounce.
+  // Budget: a summary of another inbox's conversation, on the same model semaphore as compaction.
+  OTHER_INBOX_SUMMARY: "compaction",
+  // Shared: a turn drains the ingestion it needs before invoking (../../graph/ingest-job.ts,
+  // drainPendingIngest), so cadence does not matter, and the debounce worker can be switched off
+  // (DEBOUNCE_WORKER_ENABLED), which would leave a kind parked in that lane never drained.
   INGEST_MESSAGE: "shared",
+  INGEST_FALLBACK: "shared",
   // Shared: it is a sweep, and neither reason applies. Its cadence is minutes by design (a delivery
   // is not stranded until nothing has moved it for ten), and the work it does is one indexed query
   // per tenant — the arming it may do costs nothing, and the flush that follows is a DEBOUNCE job
   // that gets claimed on its own lane with its own budget.
   DELIVERY_SWEEP: "shared",
+  // Shared, for the same reasons: a cadence of minutes, a few Chatwoot reads per bound inbox, and the
+  // recoveries it arms are claimed as kinds of their own.
+  RECONCILE_SWEEP: "shared",
   // Shared, and neither reason applies: one HTTP round trip to Langfuse per tenant per period, at
-  // a cadence of minutes by design (issue #426). The ceiling's gate reads the row it writes, so a
-  // late poll costs staleness, which the row reports, and never a customer's turn.
+  // a cadence of minutes by design. The ceiling's gate reads the row it writes, so a late poll
+  // costs staleness, which the row reports, and never a customer's turn.
   SPEND_CEILING_POLL: "shared",
+  // Shared, and neither reason applies: one round per account every few minutes at most, whose model
+  // calls take the shared lane's provider concurrency like any other proactive spend.
+  OCCURRENCE_ROUND: "shared",
+  // The monitor's listing of the inboxes no agent receives (occurrences/sweep.ts): a few Chatwoot
+  // reads per monitor per cadence, and no model call.
+  OCCURRENCE_SWEEP: "shared",
+  DASHBOARD_LOG_FACTS_BACKFILL: "shared",
   // Shared, and neither reason applies. Cadence: the message it answers has been unanswered for at
   // least the sweep's staleness window, so a wait of one shared tick is not what the customer feels.
   // Budget: it does spend the model, but the cap that needs is the shared lane's own provider
@@ -81,56 +64,113 @@ export const JOB_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // notices. Budget: it spends no model at all, only two or three Chatwoot calls, and the shared
   // lane's provider concurrency is not the resource that bounds those.
   TAKEOVER_RECOVERY: "shared",
-  // Shared, for the same two answers as the takeover recovery beside it and with the same arithmetic.
-  // Cadence: what it recovers is a memory append, and the reply has already been missing from the
-  // thread for the sweep's whole staleness window, so a shared tick is not what anyone feels.
-  // Budget: it spends no model — one Chatwoot read and one enqueue — so a lane of its own would
-  // reserve capacity nothing is contending for.
-  //
-  // How long it keeps trying against a Chatwoot that is down is not a lane question: see
-  // `JOB_RETRY_BASE_MS` below (issue #744).
+  // Shared, for the takeover recovery's reasons: the reply has already been missing for the sweep's
+  // staleness window, and it spends no model (one Chatwoot read and one enqueue). Retrying against
+  // a Chatwoot that is down is `JOB_RETRY_BASE_MS`'s question, not the lane's.
   HUMAN_REPLY_RECOVERY: "shared",
-  // A cap of its own, drained by the shared tick (issue #621). Cadence is not the reason: a label that
-  // lands one shared tick after the burst it describes is not a delay anyone feels. The cap is. On
-  // the traffic share it waited behind every ingestion row armed before it, and one busy observed
-  // inbox had a ceiling of 20 observations a minute against a demand of 31 in the p90 hour and 73 at
-  // the peak. It still runs under the shared lane's provider concurrency, the same pool a customer's turn
-  // queues on, so a busy inbox's observers cannot starve the replies on it.
+  // Cadence AND a cap of its own. Cadence: an observer's verdict is read while the conversation is
+  // happening, so a row that waits a whole shared interval lands on a conversation that has moved
+  // on; the scheduler drains this lane on a fast tick of its own (./worker.ts, runObserveTick),
+  // started with the scheduler itself, so there is no flag an install can leave off. Cap: on the
+  // traffic share it waited behind every ingestion row armed before it and could not keep up with a
+  // busy inbox. It still runs under the shared lane's provider concurrency, the same semaphore, so a
+  // busy inbox's observers cannot starve the replies on it.
   OBSERVE: "observe",
-  // Shared (issue #587): one Chatwoot send per rejected attachment, rare, and the customer already
-  // waited out the channel's own failure report, so a tick's wait adds nothing felt.
+  // Shared: one Chatwoot send per rejected attachment, rare, and the customer already waited out
+  // the channel's own failure report, so a tick's wait adds nothing felt.
   MEDIA_TEXT_FALLBACK: "shared",
-  // Shared (issue #794): one per knowledge source, every ten minutes, one paginated fetch and a
-  // reconcile. What it creates is embedded by RAG_INGEST jobs, which are the ones that spend.
+  // Shared: one per knowledge source, every ten minutes, one paginated fetch and a reconcile. What
+  // it creates is embedded by RAG_INGEST jobs, which are the ones that spend.
   KNOWLEDGE_SOURCE_SYNC: "shared",
-  // Shared, for the DELIVERY_SWEEP reasons (issue #817): a cadence of minutes by design, since a
-  // delivery is not stranded until nothing has moved it for five, and one indexed query per tenant.
+  // Shared, for the DELIVERY_SWEEP reasons: a cadence of minutes by design, since a delivery is not
+  // stranded until nothing has moved it for five, and one indexed query per tenant.
   INBOUND_SWEEP: "shared",
   // Shared, for the DELIVERY_RECOVERY reasons: the event already waited out the sweep's staleness
   // window, and what it may spend is a model turn, capped by the shared lane's provider concurrency.
   INBOUND_REDISPATCH: "shared",
   // Shared: a delayed judgement of one conversation, a handful of Chatwoot reads and no model.
   NOTHING_TO_ANSWER: "shared",
+  // Shared, and neither reason applies. Cadence: the proposal waits in SCREENING for a person who
+  // reads the queue in minutes, not seconds. Budget: one model call per proposal, under the shared
+  // lane's provider concurrency like any other recovery-shaped call.
+  SUGGESTION_REVIEW: "shared",
+  CLIENT_ANON_SWEEP: "shared",
+  // One UPDATE over the tenant's overdue requests, at a cadence of hours by design.
+  DOCUMENT_APPROVAL_EXPIRY: "shared",
+  DOCUMENT_APPROVAL_OUTCOME: "shared",
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: "shared",
 };
 
-// Whether ONE job of this kind spends capacity at an external provider that the rest of the product
-// is also queueing for. A separate question from the lane, deliberately: the lane says which tick
-// drains it, this says how many may run at once inside that tick, and a single flag answering both
-// would be wrong exactly where they diverge (issue #180 review).
-//
-// It exists because making the shared drain concurrent created a BUDGET problem inside a lane —
-// twenty due follow-ups start twenty nudges, and with the default AGENT_MODEL_CONCURRENCY they can
-// hold every permit in the process-wide model semaphore while a customer's reply waits behind a
-// proactive one. The serial drain took at most one permit; that was its one virtue.
-//
-// RAG_INGEST is here for a different provider and a sharper reason: `embedTexts` does not go through
-// that semaphore at all, so nothing else bounds it. Twenty documents due at once (a bulk import, a
-// reindex) meant twenty embedding batches in flight, provider rate limits, and documents landing in
-// FAILED for no reason a reader could see.
-//
-// A kind NOT listed here is bounded only by the batch size, which is the point: HEARTBEAT and the
-// sweeps do a query and finish, and making them queue behind a nudge is the head-of-line blocking
-// this lane just stopped doing.
+// Which pool each kind's handler draws its connections from (src/lib/pool-class.ts). "main" is the
+// pool of customer turns; "background" is the pool of work nobody is waiting on this second, sized on
+// its own (BACKGROUND_POOL_MAX) so a burst of it, or background transactions stuck behind a lock,
+// cannot take the connections a customer reply needs. The scheduler's own claims and outcome writes
+// stay on the main pool: one short statement per job, and a DEBOUNCE claim must never wait behind a
+// background job. Exhaustive, so a new kind does not compile until it is placed.
+export const JOB_POOL: Record<SchedulerJobKind, PoolClass> = {
+  // Main: the flush IS the customer's turn.
+  DEBOUNCE: "main",
+  // Main: it answers a customer whose message was stranded and who has been waiting at least the
+  // sweep's staleness window; behind a stuck background pool that customer would wait on unbounded.
+  // It cannot flood the main pool: it is provider-spending, so it runs under the shared lane's
+  // provider concurrency, a fraction of the model budget.
+  DELIVERY_RECOVERY: "main",
+  // Main, for the DELIVERY_RECOVERY reasons: a lost inbound event re-dispatched, which may run the
+  // agent's turn for a customer who already waited, under the same provider bound.
+  INBOUND_REDISPATCH: "main",
+  // Main: the text a customer receives in place of an attachment the channel refused; they already
+  // waited out the channel's failure report.
+  MEDIA_TEXT_FALLBACK: "main",
+  // Background: proactive messages at a scheduled time. Nobody is waiting on them this second, and a
+  // sweep can arm many at once, which is the burst that must not take the turns' connections.
+  FOLLOWUP: "background",
+  SNOOZED_FOLLOWUP: "background",
+  REDIRECT_FOLLOWUP: "background",
+  APPOINTMENT_REMINDER: "background",
+  // Background: it tells the customer what a person decided, minutes after the decision.
+  DOCUMENT_APPROVAL_OUTCOME: "background",
+  // Background: a turn drains the ingestion it needs before invoking (../../graph/ingest-drain.ts),
+  // inline and on the turn's own pool (RunClaimedOptions.poolClass), so the scheduler's run is the
+  // backstop.
+  INGEST_MESSAGE: "background",
+  INGEST_FALLBACK: "background",
+  // Background: sweeps, retention, compaction, the observer, syncs and polls. None answers anyone.
+  FOLLOWUP_SWEEP: "background",
+  WEBHOOK_RETRY: "background",
+  RAG_INGEST: "background",
+  HEARTBEAT: "background",
+  FLOWLOG_SWEEP: "background",
+  MEMORY_COMPACT: "background",
+  // A summary no turn waits on: the turn lists the conversation as pending until it lands.
+  OTHER_INBOX_SUMMARY: "background",
+  // The sweep itself; the stored deliveries it admits run on main (src/modules/chatwoot/delivery-queue.ts).
+  DELIVERY_SWEEP: "background",
+  RECONCILE_SWEEP: "background",
+  SPEND_CEILING_POLL: "background",
+  OCCURRENCE_ROUND: "background",
+  OCCURRENCE_SWEEP: "background",
+  DASHBOARD_LOG_FACTS_BACKFILL: "background",
+  // Background: it repairs a conversation's status; no reply is sent.
+  TAKEOVER_RECOVERY: "background",
+  // Background: it reads a page of messages and arms an ingest job; no reply is sent.
+  HUMAN_REPLY_RECOVERY: "background",
+  OBSERVE: "background",
+  KNOWLEDGE_SOURCE_SYNC: "background",
+  INBOUND_SWEEP: "background",
+  NOTHING_TO_ANSWER: "background",
+  SUGGESTION_REVIEW: "background",
+  DOCUMENT_APPROVAL_EXPIRY: "background",
+  // Background: it deletes anonymous conversations nobody touched for days; no reply is sent.
+  CLIENT_ANON_SWEEP: "background",
+};
+
+// Whether ONE job of this kind spends capacity at an external provider the rest of the product also
+// queues for. Separate from the lane: the lane says which tick drains it, this says how many may run
+// at once inside that tick (sharedProviderConcurrency), so twenty due follow-ups cannot hold every
+// model permit while a customer's reply waits. RAG_INGEST is here because `embedTexts` bypasses the
+// model semaphore, so nothing else bounds its embedding batches. A kind marked false is bounded only
+// by the batch size, so HEARTBEAT and the sweeps never queue behind a nudge.
 export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   FOLLOWUP: true,
   APPOINTMENT_REMINDER: true,
@@ -142,26 +182,30 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   FLOWLOG_SWEEP: false,
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   // No model, no embedding: it appends to a checkpointer channel and writes one row.
   INGEST_MESSAGE: false,
+  INGEST_FALLBACK: false,
   // It reads and writes rows and emits log lines. Answering the stranded message would make this
-  // true, and that is exactly why answering is not done here (issue #295): the sweep arms a
-  // DELIVERY_RECOVERY per row it declares lost, and that kind carries the spend.
+  // true, which is why the sweep arms a DELIVERY_RECOVERY per lost row and that kind carries the spend.
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   // It asks Langfuse, not a model provider: no tokens, no embeddings.
   SPEND_CEILING_POLL: false,
+  // Its model calls (canonical names, grouping) queue for the same provider as a customer's turn.
+  OCCURRENCE_ROUND: true,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
   // It runs the delivery path, which runs a real agent turn: a model call, and whatever tools the
   // turn decides to use. The whole reason it is a kind of its own rather than work the sweep does
   // inline.
   DELIVERY_RECOVERY: true,
-  // The other half of why it is not the same kind as the one above (issue #439): it re-runs the
-  // TAKEOVER and nothing else — a fence, a claim, a toggle and a reconcile — and never reaches a
-  // model. Folded into DELIVERY_RECOVERY it would take a permit from the semaphore a customer's turn
-  // queues on, to make two HTTP calls.
+  // Not folded into DELIVERY_RECOVERY: it re-runs only the takeover (a fence, a claim, a toggle and
+  // a reconcile) and never reaches a model, so it must not take a permit from the semaphore a
+  // customer's turn queues on.
   TAKEOVER_RECOVERY: false,
-  // It reads one page of messages and arms an ingest job. The MODEL is spent later, by whatever turn
-  // reads the thread next — and by then the append is just another message in the channel, which is
-  // the whole point of the ingestion being a job rather than a turn (issue #194).
+  // It reads one page of messages and arms an ingest job. The model is spent later, by whatever turn
+  // reads the thread next, where the append is just another message in the channel.
   HUMAN_REPLY_RECOVERY: false,
   // One model call per tick, on the agent's own model.
   OBSERVE: true,
@@ -177,19 +221,22 @@ export const JOB_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   // flag is about what ONE job may do.
   INBOUND_REDISPATCH: true,
   NOTHING_TO_ANSWER: false,
+  SUGGESTION_REVIEW: true,
+  CLIENT_ANON_SWEEP: false,
+  DOCUMENT_APPROVAL_EXPIRY: false,
+  DOCUMENT_APPROVAL_OUTCOME: true,
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: true,
 };
 
-// How many OBSERVE rows one shared tick claims (issue #621): enough to keep the provider bound busy
-// for about one tick, and no more. One observation is two short model calls, measured at 3.0s p50
-// and 3.7s p90 in production, so `concurrency` of them finish in about 3.5s and four rounds fit
-// inside the 15s default interval. A tick that overruns its interval does not start the next one
-// late, it SKIPS it (the worker's non-overlap guard), so claiming more than fits halves the rate
-// instead of raising it.
-//
-// THE ROUNDS ARE THE WHOLE TICK'S, not the observe lane's (PR review, round 1): the fixed batch and
-// the traffic share go through the same bound, so every provider-spending row they already claimed
-// takes a slot from those four rounds. Never below one round, so a tick full of follow-ups still
-// moves the labels, and never below one row, for the floor `sharedProviderConcurrency` keeps.
+// How many OBSERVE rows one SHARED tick claims, when it is the one draining the lane (a caller of
+// `runSchedulerTick` with no fast drain beside it; `startScheduler` runs the drain and the shared
+// tick then leaves the lane alone): enough to keep the provider bound busy for about one
+// tick. An observation is two short model calls (a few seconds), so about four rounds of `concurrency`
+// fit in the 15s default interval; a tick that overruns SKIPS the next one (the worker's non-overlap
+// guard), so claiming more halves the rate. The rounds are the WHOLE tick's: provider-spending rows
+// already claimed (`alreadyGated`) take slots from them. Never below one round, so a tick full of
+// follow-ups still moves the labels.
 export function observeClaimLimit(
   concurrency: number,
   alreadyGated = 0,
@@ -207,15 +254,11 @@ export function sharedProviderConcurrency(budget: number): number {
   return Math.max(1, Math.min(Math.floor(budget / 4), Math.max(1, budget - 1)));
 }
 
-// Whether a finished job's row is DELETED rather than marked DONE. Almost nothing wants this: a
-// DONE row is the record that the work happened, and every other kind keys its dedupeKey to a unit
-// of work that recurs (a conversation's follow-up, a thread's compaction), so the row count is
-// bounded by units and re-arming reuses it.
-//
-// INGEST_MESSAGE is the exception because its key names ONE MESSAGE — it has to, or the second
-// message of a burst would overwrite the first — so its rows are bounded by traffic and nothing
-// reuses them. Nothing sweeps `scheduler_jobs` either, so left DONE they accumulate forever, along
-// with the unique and status indexes over them.
+// Whether a finished job's row is DELETED rather than marked DONE. Almost nothing wants this: a DONE
+// row records that the work happened, and most kinds key their dedupeKey to a recurring unit (a
+// conversation's follow-up, a thread's compaction), so re-arming reuses it. INGEST_MESSAGE's key
+// names ONE MESSAGE (or a burst's second message would overwrite the first), so its rows follow
+// traffic and nothing reuses them: left DONE they would wait for JOB_DONE_RETENTION_MS below.
 export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   FOLLOWUP: false,
   FOLLOWUP_SWEEP: false,
@@ -227,9 +270,17 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   REDIRECT_FOLLOWUP: false,
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   INGEST_MESSAGE: true,
+  // Its key names one message too. A redelivery after it ran arms it again, which only arms an append
+  // the ingest dedupe refuses.
+  INGEST_FALLBACK: true,
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   SPEND_CEILING_POLL: false,
+  OCCURRENCE_ROUND: false,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
   // Same reason as INGEST_MESSAGE, and the same shape: the key names ONE ledger row — it has to, or
   // a second stranded delivery would overwrite the first — so nothing ever reuses the row and the
   // count is bounded by how many deliveries have ever been stranded. What the record of the work is
@@ -261,24 +312,73 @@ export const JOB_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   // (`retireNothingToAnswer`); only a row retired mid-run stays, as a DONE tombstone the next arm
   // reuses.
   NOTHING_TO_ANSWER: true,
+  // KEPT on DONE, because the kind registers a dead-letter hook (it releases a SCREENING item) and the
+  // revoke's generic death line is reserved for kinds without one. One row per proposal the agent
+  // made, which is far below traffic.
+  SUGGESTION_REVIEW: false,
+  CLIENT_ANON_SWEEP: false,
+  // One row per request, and a finished expiry is never read again: the request row is the record.
+  DOCUMENT_APPROVAL_EXPIRY: true,
+  DOCUMENT_APPROVAL_OUTCOME: true,
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: false,
 };
 
-// Whether the NUMBER of rows of this kind follows inbound traffic, rather than a population the
-// install controls. A third question about a kind, and the reason it is not the lane's: everything
-// here shares one tick, and one FIFO batch of a fixed size.
-//
-// Every other kind is bounded by something that does not scale with how much a contact writes — one
-// per agent, per appointment, per closed attendance, per retry. INGEST_MESSAGE is one per MESSAGE the
-// agent did not answer, so a busy fleet can arm more of them per tick than the batch can hold. Being
-// armed for `now`, they are also the oldest rows, so a claim ordered by run_at fills every batch with
-// them and never reaches an appointment reminder — a kind that exists to arrive BEFORE something —
-// no matter how long it waits.
-//
-// The answer is not a lane of its own. Ingestion's tick latency does not matter at all: every reader
-// of a memory thread drains it before reading (../../graph/ingest-drain.ts), so the tick is a
-// backstop for threads nobody touches, and a lane would only add a worker flag that an install can
-// leave off. What it needs is a CAP — the shared tick claims these separately, with a share of the
-// batch, so the fixed-rate kinds always have the rest.
+// How long a DONE row is kept before the retention pass deletes it (src/modules/flowlog/retention.ts),
+// or null to keep it for good. A DONE row with no failure budget left on it (`attempts = 0`) reads
+// the same as no row to every arm but `once`. What else reads a DONE row by key is work settling on
+// it (a claim being finished, the observer's refusal and resolve marks), which is minutes; the week
+// adds room for support questions. Kept for good: the `once` kinds, whose DONE row is the dedupe, and
+// a kind whose DONE row is a sweep's watermark. DEAD rows are never deleted (docs/scheduler.md).
+const DONE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const JOB_DONE_RETENTION_MS: Record<SchedulerJobKind, number | null> = {
+  FOLLOWUP: DONE_RETENTION_MS,
+  FOLLOWUP_SWEEP: DONE_RETENTION_MS,
+  WEBHOOK_RETRY: DONE_RETENTION_MS,
+  RAG_INGEST: DONE_RETENTION_MS,
+  HEARTBEAT: DONE_RETENTION_MS,
+  FLOWLOG_SWEEP: DONE_RETENTION_MS,
+  APPOINTMENT_REMINDER: DONE_RETENTION_MS,
+  REDIRECT_FOLLOWUP: DONE_RETENTION_MS,
+  DEBOUNCE: DONE_RETENTION_MS,
+  MEMORY_COMPACT: DONE_RETENTION_MS,
+  OTHER_INBOX_SUMMARY: DONE_RETENTION_MS,
+  INGEST_MESSAGE: DONE_RETENTION_MS,
+  INGEST_FALLBACK: DONE_RETENTION_MS,
+  DELIVERY_SWEEP: DONE_RETENTION_MS,
+  RECONCILE_SWEEP: DONE_RETENTION_MS,
+  SPEND_CEILING_POLL: DONE_RETENTION_MS,
+  OCCURRENCE_ROUND: DONE_RETENTION_MS,
+  OCCURRENCE_SWEEP: DONE_RETENTION_MS,
+  DASHBOARD_LOG_FACTS_BACKFILL: DONE_RETENTION_MS,
+  DELIVERY_RECOVERY: DONE_RETENTION_MS,
+  TAKEOVER_RECOVERY: DONE_RETENTION_MS,
+  HUMAN_REPLY_RECOVERY: DONE_RETENTION_MS,
+  OBSERVE: DONE_RETENTION_MS,
+  // Armed `once`: the DONE row is the memory that the text already went out (see JOB_DELETE_ON_DONE).
+  MEDIA_TEXT_FALLBACK: null,
+  KNOWLEDGE_SOURCE_SYNC: DONE_RETENTION_MS,
+  INBOUND_SWEEP: DONE_RETENTION_MS,
+  // Armed `once`: the DONE row is what keeps the next sweep pass from arming the same attempt.
+  INBOUND_REDISPATCH: null,
+  NOTHING_TO_ANSWER: DONE_RETENTION_MS,
+  // Armed `once`, beside the item it reviews: deleted, a re-arm would review a decided item again.
+  SUGGESTION_REVIEW: null,
+  CLIENT_ANON_SWEEP: DONE_RETENTION_MS,
+  DOCUMENT_APPROVAL_EXPIRY: DONE_RETENTION_MS,
+  DOCUMENT_APPROVAL_OUTCOME: DONE_RETENTION_MS,
+  // The snoozed sweep's watermark: the last run's start, which keeps an unchanged conversation out of
+  // the next pass (`snoozedSweepSelectionSql`). One row per conversation.
+  SNOOZED_FOLLOWUP: null,
+};
+
+// Whether the NUMBER of rows of this kind follows inbound traffic rather than a population the
+// install controls. Such rows are armed for `now`, so they are the oldest, and a claim ordered by
+// run_at would fill every fixed-size batch with them and never reach an appointment reminder. The
+// shared tick claims them separately, with a share of the batch, so the fixed-rate kinds keep the
+// rest. Ingestion needs no lane of its own: every reader of a memory thread drains it first
+// (../../graph/ingest-drain.ts), so the tick is only a backstop and a lane would only add a worker
+// flag an install can leave off.
 export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   FOLLOWUP: false,
   FOLLOWUP_SWEEP: false,
@@ -290,24 +390,23 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   APPOINTMENT_REMINDER: false,
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   INGEST_MESSAGE: true,
+  INGEST_FALLBACK: true,
   // One row per tenant, re-armed forever. Bounded by the install's tenant count, not by traffic.
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   // One row per tenant with the ceiling on, re-armed forever. Bounded by the install's tenant
   // count, not by traffic.
   SPEND_CEILING_POLL: false,
-  // One row per DELIVERY the sweep declared lost, and a single sweep pass can declare a whole batch
-  // of them at once — the deploy that stranded them stranded every delivery that was in flight. They
-  // are armed for `now`, so they are also the oldest rows, which is the exact shape that fills every
-  // batch and starves a reminder that exists to arrive BEFORE something.
-  //
-  // THE COST OF THIS ANSWER, stated because the two kinds in this share want opposite things from
-  // it: the claim is FIFO on `run_at`, so a recovery waits behind whatever ingestion rows were armed
-  // before it — and ingestion's own tick latency explicitly does not matter (a turn drains its
-  // thread before reading), while a recovery's does. FIFO bounds it — a recovery only ever waits for
-  // work older than itself — and past `MAX_RECOVERY_AGE_MS` the recovery is discarded, which is the
-  // right answer for a different reason: a reply that late is stale whatever delayed it. Reserving
-  // capacity here would be mechanism for a backlog nobody has measured.
+  OCCURRENCE_ROUND: false,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
+  // One row per DELIVERY the sweep declared lost, and one pass can declare a whole batch (a deploy
+  // strands every delivery in flight), armed for `now`: the shape that starves a reminder. The cost:
+  // the claim is FIFO on `run_at`, so a recovery waits behind ingestion rows armed before it, but
+  // only behind older work, and past `MAX_RECOVERY_AGE_MS` it is discarded, since a reply that late
+  // is stale whatever delayed it.
   DELIVERY_RECOVERY: true,
   // Armed by the same pass, from the same deploy, off the same traffic: one row per delivery that
   // was carrying a colleague's reply when the process died. Fewer than of the kind above — most
@@ -322,15 +421,13 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // traffic — one per stranded delivery that was carrying a colleague's reply. The two are armed
   // together and neither waits on the other: they answer different questions about the same row.
   HUMAN_REPLY_RECOVERY: true,
-  // FALSE now that it has a lane of its own (issue #621), which is DEBOUNCE's answer for DEBOUNCE's
-  // reason: its row count does follow traffic, one row per observed conversation re-armed by every
-  // burst, but no claim that holds a fixed-rate kind ever holds it, so there is nothing for it to
-  // starve. The traffic share is what it left, not what protects the reminders from it.
+  // FALSE because it has a lane of its own, which is DEBOUNCE's answer: its rows do follow traffic
+  // (one per observed conversation, re-armed by every burst), but no claim that holds a fixed-rate
+  // kind ever holds it, so there is nothing for it to starve.
   OBSERVE: false,
   // One per REJECTED attachment, which is a small fraction of traffic on a normal day and ALL of the
   // audio traffic during a media-upload outage, when every voice reply fails the same way. Armed for
-  // `now`, so they are the oldest rows of the batch too: the population and the shape are the
-  // recoveries' above, and so is the answer (review round 8).
+  // `now`, so they are the oldest rows of the batch too: the recoveries' shape, and their answer.
   MEDIA_TEXT_FALLBACK: true,
   // One per knowledge source, whatever the traffic.
   KNOWLEDGE_SOURCE_SYNC: false,
@@ -339,25 +436,66 @@ export const JOB_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   INBOUND_REDISPATCH: true,
   // One per conversation that received a blank message.
   NOTHING_TO_ANSWER: true,
+  // One per proposal, and proposals follow the conversations the agent and the observer read.
+  SUGGESTION_REVIEW: true,
+  CLIENT_ANON_SWEEP: false,
+  // One per request, and requests follow the conversations the agent answers.
+  DOCUMENT_APPROVAL_EXPIRY: true,
+  // One per decided or expired request, and an expiry arms a whole overdue backlog at once.
+  DOCUMENT_APPROVAL_OUTCOME: true,
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: false,
 };
 
-// WHAT ONE KIND'S DEATH MEANS TO THE OPERATOR, at the only moment the scheduler can state it
-// (issue #356). Read by the generic dead-letter announcement in ./worker.ts.
-//
-// A Record over SchedulerJobKind, like its three neighbours above, and for the sharper reason here:
-// the thing this issue is about is a kind reaching DEAD with nobody having decided what that means.
-// A default would cover today's twelve and hand the thirteenth the same silence in a new shape —
-// this does not compile until the new kind has been asked the question.
-//
-// The rule the answers follow: `error` where the system accepted work and lost it, `warn` where the
-// operator has their own way back to it. Nothing is `info`, because `AlertChannel.minLevel` does not
-// accept `info` and a line nobody can subscribe to is not an announcement.
-//
-// Every answer here is currently `error`, and that is a result rather than a default — one entry was
-// `warn` until a review round showed the reasoning behind it was about the wrong failure (see
-// RAG_INGEST). A table where the answers agree is not a table that could be replaced by a default:
-// the default would hand the thirteenth kind an answer nobody chose, and the RAG_INGEST entry is the
-// evidence that the answer is not obvious even for the twelve that exist.
+// The order the traffic drain claims in, lowest first and oldest by created_at within a rank. It only
+// shows under a backlog, which is when it matters: a customer's lost message or a conversation held
+// by the wrong side outranks memory ingestion (every turn drains its own thread first), and both
+// outrank a delayed judgement of a blank message. Read only for JOB_TRAFFIC_PROPORTIONAL kinds;
+// exhaustive so a new kind does not compile until it is placed.
+export const JOB_TRAFFIC_RANK: Record<SchedulerJobKind, number> = {
+  DELIVERY_RECOVERY: 0,
+  TAKEOVER_RECOVERY: 0,
+  HUMAN_REPLY_RECOVERY: 0,
+  MEDIA_TEXT_FALLBACK: 0,
+  INBOUND_REDISPATCH: 0,
+  INGEST_MESSAGE: 1,
+  INGEST_FALLBACK: 1,
+  SUGGESTION_REVIEW: 1,
+  NOTHING_TO_ANSWER: 2,
+  // The expiry only moves a status the approval already enforces by `expiresAt`.
+  DOCUMENT_APPROVAL_EXPIRY: 1,
+  // A decided document is a customer waiting for it, and a person watching for the note: with the
+  // recoveries.
+  DOCUMENT_APPROVAL_OUTCOME: 0,
+  FOLLOWUP: 1,
+  FOLLOWUP_SWEEP: 1,
+  SNOOZED_FOLLOWUP: 1,
+  WEBHOOK_RETRY: 1,
+  DEBOUNCE: 1,
+  RAG_INGEST: 1,
+  HEARTBEAT: 1,
+  FLOWLOG_SWEEP: 1,
+  APPOINTMENT_REMINDER: 1,
+  REDIRECT_FOLLOWUP: 1,
+  MEMORY_COMPACT: 1,
+  OTHER_INBOX_SUMMARY: 1,
+  DELIVERY_SWEEP: 1,
+  RECONCILE_SWEEP: 1,
+  SPEND_CEILING_POLL: 1,
+  OCCURRENCE_ROUND: 1,
+  OCCURRENCE_SWEEP: 1,
+  DASHBOARD_LOG_FACTS_BACKFILL: 1,
+  OBSERVE: 1,
+  KNOWLEDGE_SOURCE_SYNC: 1,
+  INBOUND_SWEEP: 1,
+  CLIENT_ANON_SWEEP: 1,
+};
+
+// What one kind's death means to the operator, read by the generic dead-letter announcement in
+// ./worker.ts. Exhaustive with no default, so a new kind does not compile until someone decides it.
+// The rule: `error` where the system accepted work and lost it, `warn` where the operator has their
+// own way back to it. Nothing is `info`: `AlertChannel.minLevel` does not accept it, and a line
+// nobody can subscribe to is not an announcement.
 export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // A lead that will never be followed up, and nothing on the conversation says so.
   FOLLOWUP: "error",
@@ -365,20 +503,15 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   FOLLOWUP_SWEEP: "error",
   // The retry drain for outbound deliveries; without it a subscriber's events stop arriving.
   WEBHOOK_RETRY: "error",
-  // Registers its own hook (../debounce/handler.ts), which announces where a burst's loss is
-  // actually felt: a private note on the customer's own conversation, by #71's decision, and not a
-  // trail line at all. This is the level of the GENERIC line that stands in when nothing registered
-  // one — a real state, since `registerDebounceHandler` runs only under DEBOUNCE_WORKER_ENABLED
-  // while the scheduler's reaper can still reap a stale DEBOUNCE claim. A burst that is never
-  // answered is a customer waiting on nobody, so it is not an advisory.
+  // Registers its own hook (../debounce/handler.ts), which announces a lost burst as a private note
+  // on the customer's conversation. This is the level of the GENERIC line that stands in when nothing
+  // registered one (`registerDebounceHandler` runs only under DEBOUNCE_WORKER_ENABLED, while the
+  // reaper can still reap a stale DEBOUNCE claim). An unanswered burst is a customer waiting on nobody.
   DEBOUNCE: "error",
-  // NOT the recoverable case, which is the one this entry was written for and got wrong. A document
-  // whose INDEXING failed is stamped FAILED by ../rag/documents.ts, which announces it itself at
-  // `warn` — the knowledge-base page shows it with a re-index in reach. What reaches THIS line is
-  // the other half: a throw before that catch is entered (the scoped load, `resolveEmbeddingStatus`)
-  // propagates out of the handler, so after five of them the job is DEAD while the document is still
-  // PENDING — and `retryDocument` refuses anything that is not FAILED or UNINDEXED with a 409. The
-  // operator has no way back to it at all.
+  // An indexing failure is stamped FAILED by ../rag/documents.ts, which announces it at `warn` with
+  // a re-index in reach. What reaches here is a throw before that catch (the scoped load,
+  // `resolveEmbeddingStatus`): the job dies while the document is still PENDING, and
+  // `retryDocument` refuses anything not FAILED or UNINDEXED, so the operator has no way back.
   RAG_INGEST: "error",
   // Self-rescheduling: one death ends the loop, and outbound heartbeats stop for good.
   HEARTBEAT: "error",
@@ -393,29 +526,29 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // attendance, and the one this job was carrying is gone. The stand-in must not undercut the line
   // it stands in for.
   MEMORY_COMPACT: "error",
+  // A summary the next turn arms again; until then the conversation is listed without content.
+  OTHER_INBOX_SUMMARY: "warn",
   // A message the turn will never see. The customer wrote and is waiting.
   INGEST_MESSAGE: "error",
-  // Self-rescheduling: its death is stranded deliveries going unreported from then on, which is the
-  // silence #282 had just finished closing.
+  INGEST_FALLBACK: "error",
+  // Self-rescheduling: its death is stranded deliveries going unreported from then on.
   DELIVERY_SWEEP: "error",
+  RECONCILE_SWEEP: "error",
   // Self-rescheduling, and the handler never throws (a failing Langfuse is written on the row),
   // so a death here is the loop itself gone: the ceiling keeps deciding on a figure frozen at the
   // last poll, under-refusing by everything spent since, and nothing on the console moves.
   SPEND_CEILING_POLL: "error",
-  // The one `warn` here, and it is the rule above applied rather than an exception to it: the
-  // operator has their own way back to this work, twice over. The sweep already announced this exact
-  // delivery at `error` when it declared the row DEAD, and the row is still in the
-  // `WHERE status = 'DEAD'` worklist that #228 exists to produce. What died is the AUTOMATIC second
-  // attempt, which leaves the state exactly as the sweep left it — already paged, still listed. A
-  // second `error` would be the same customer message waking somebody twice, which is how a channel
-  // stops being read.
+  OCCURRENCE_ROUND: "warn",
+  OCCURRENCE_SWEEP: "warn",
+  // `warn`: the figures stay right, read from the flow log as before the facts; only slower.
+  DASHBOARD_LOG_FACTS_BACKFILL: "warn",
+  // `warn`: what died is the automatic second attempt. The customer's message going unanswered is the
+  // delivery's own `error` line, which the recovery writes when it ends with the row still DEAD and its
+  // dead-letter hook writes when it dies (../chatwoot/recover-delivery.ts, `announceDeadRecovery`).
   DELIVERY_RECOVERY: "warn",
-  // `warn`, and by the same rule read the other way round: nothing paged anybody about this row in
-  // the first place, because nothing was lost to page about — the sweep closed it PROCESSED and
-  // wrote no loss line. What dies with the job is a conversation left `pending` on the bot after a
-  // person answered on it: the state every install had for the whole life of issue #430, and one the
-  // NEXT reply from that person takes over on its own. An `error` here would announce, at the level
-  // of a customer's lost message, something that self-heals.
+  // `warn`: nothing was lost to page about (the sweep closed the row PROCESSED with no loss line).
+  // What dies is a conversation left `pending` on the bot after a person answered on it, which that
+  // person's next reply takes over on its own; an `error` would announce something that self-heals.
   TAKEOVER_RECOVERY: "warn",
   // `warn`, by the rule its neighbour reads the other way round: what dies with the job is the
   // SECOND attempt at an append the receiver already reported losing, at `error`, on the
@@ -433,8 +566,7 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // source records the failure where the operator reads it. A failed run does not reach here at all
   // (the handler records it and reschedules); only a throw that escapes the handler does.
   KNOWLEDGE_SOURCE_SYNC: "warn",
-  // Self-rescheduling: its death is stranded inbound events going unretried from then on, which is
-  // the whole of issue #817 back again, silently.
+  // Self-rescheduling: its death is stranded inbound events going unretried from then on, silently.
   INBOUND_SWEEP: "error",
   // `error`, and not the recovery family's `warn`, because nothing announced this loss before the
   // job died: the sender got a 2xx, the row is still PENDING or PROCESSING, and no line said so. A
@@ -445,31 +577,119 @@ export const JOB_DEATH_LEVEL: Record<SchedulerJobKind, FlowLevel> = {
   // The conversation stays pending with nobody on it, exactly as before this job existed, and
   // nobody else will notice: this is the alert.
   NOTHING_TO_ANSWER: "warn",
+  // `warn`: the dead-letter hook releases the item to the pending list unreviewed, so nothing is
+  // lost; what died is the dedup a person now does by eye.
+  SUGGESTION_REVIEW: "warn",
+  CLIENT_ANON_SWEEP: "error",
+  // `warn`: approval refuses an overdue request by its expiresAt whatever its status says, so what
+  // died is the status label, not the rule.
+  DOCUMENT_APPROVAL_EXPIRY: "warn",
+  DOCUMENT_APPROVAL_OUTCOME: "error",
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: "error",
 };
 
-// HOW FAR APART ONE KIND'S RETRIES ARE, as the base of `backoffMs` in ./service.ts (issue #744).
-// `MAX_ATTEMPTS` is 5, so a failing job gets four backoffs before it is DEAD, each between half and
-// all of `base * 2^attempt`. The jitter is a fixed function of the attempt, so the ladder is too: at
-// the 2s base the four add up to 37 seconds, which is the 39 measured once the tick is counted. That
-// is enough for a blip, which is what every kind below that keeps it is retrying against.
-//
-// The recovery family is the exception, and for the reason it exists at all. Each of the three is
-// armed ONCE, by the sweep pass that found the stranded delivery, and nothing arms it again: the
-// sweep reads PENDING and PROCESSING, and the row it armed from is DEAD or PROCESSED by then
-// (./chatwoot/delivery-sweep.ts). So the job's own ladder is the only thing that outlasts a Chatwoot
-// that went away, and the commonest way to go away is a restart, which takes longer than 39 seconds.
-// Measured on issue #728: the five tries of a `HUMAN_REPLY_RECOVERY` ran from 22:44:11 to 22:44:50,
-// the account came back right after, and the reply never reached the memory.
-//
-// At a one-minute base the same four add up to 18 minutes. Not more attempts at the same
-// spacing, which would spend a longer outage just as fast; and no longer than that, because the
-// work is already late — the sweep only declares a delivery stranded after ten minutes without
-// movement — and `MAX_RECOVERY_AGE_MS` discards a delivery recovery at six hours regardless. What a
-// longer ladder costs is a later dead-letter line, and all three announce at `warn` (above) because
-// the operator already has the loss on record.
-//
-// Exhaustive over SchedulerJobKind like its neighbours, so a new kind does not compile until someone
-// has asked whether its retries are against a blip or against an outage.
+// What a kind's death costs, in the words the operator reads on the dead-letter line and in its
+// alert, ahead of the raw error: a bare "statement timeout" reads as noise while a tenant's follow-ups
+// have stopped. Exhaustive, so a new kind does not compile until someone writes what losing it means.
+export const JOB_DEATH_CONSEQUENCE: Record<SchedulerJobKind, string> = {
+  FOLLOWUP: "this conversation's inactivity follow-up will not be sent",
+  FOLLOWUP_SWEEP:
+    "no new follow-up will be armed for this tenant until the sweep runs again",
+  WEBHOOK_RETRY: "a subscriber's outbound webhook events stop being retried",
+  DEBOUNCE: "a customer's message burst will not be answered",
+  RAG_INGEST: "a knowledge document stays unindexed with no way to retry it",
+  HEARTBEAT: "outbound webhook heartbeats stop",
+  FLOWLOG_SWEEP: "flow log retention stops and the table grows without bound",
+  APPOINTMENT_REMINDER: "the customer will not be reminded of the appointment",
+  REDIRECT_FOLLOWUP: "the channel redirect follow-up will not be sent",
+  MEMORY_COMPACT: "this attendance's memory summary is lost",
+  OTHER_INBOX_SUMMARY:
+    "the other-inbox summary stays empty until the next turn arms it again",
+  INGEST_MESSAGE: "a customer message will never reach the agent",
+  INGEST_FALLBACK: "a customer message will never reach the agent",
+  DELIVERY_SWEEP: "stranded Chatwoot deliveries stop being recovered",
+  RECONCILE_SWEEP: "conversation state stops being reconciled with Chatwoot",
+  DELIVERY_RECOVERY: "the automatic second attempt at a delivery is gone",
+  TAKEOVER_RECOVERY:
+    "a conversation a person answered may stay pending on the bot",
+  HUMAN_REPLY_RECOVERY: "the second attempt at appending a human reply is gone",
+  SPEND_CEILING_POLL:
+    "the spend ceiling keeps deciding on the last figure it polled",
+  OCCURRENCE_ROUND: "an occurrence monitor round did not run",
+  OCCURRENCE_SWEEP: "occurrence monitors stop being swept",
+  DASHBOARD_LOG_FACTS_BACKFILL:
+    "the dashboard keeps reading this tenant's handoff, silence and follow-up figures from the flow log, slower, until a restart arms the backfill again",
+  OBSERVE: "a conversation's labels were not refreshed",
+  MEDIA_TEXT_FALLBACK:
+    "the text standing in for a lost customer reply was lost too",
+  KNOWLEDGE_SOURCE_SYNC: "the knowledge source keeps its last synced content",
+  INBOUND_SWEEP: "stranded inbound events stop being retried",
+  INBOUND_REDISPATCH: "an accepted inbound event will never be processed",
+  NOTHING_TO_ANSWER: "a pending conversation stays with nobody on it",
+  SUGGESTION_REVIEW: "the suggestion goes to the pending list unreviewed",
+  CLIENT_ANON_SWEEP: "expired anonymous client sessions stop being cleared",
+  DOCUMENT_APPROVAL_EXPIRY: "an overdue approval request keeps its old status",
+  DOCUMENT_APPROVAL_OUTCOME:
+    "the customer will not be told the approval decision",
+  SNOOZED_FOLLOWUP: "this snoozed conversation's follow-up will not be sent",
+};
+
+// Kinds that must never stay DEAD: one row per tenant that reschedules itself forever, whose death
+// stops a whole class of work for the tenant and that only a restart could revive, and then with the
+// budget already spent. Past the budget such a row backs off and keeps announcing each
+// failure instead (./service.ts `failJob`, ./worker.ts). True for every kind armed as one fixed
+// dedupe key per tenant (or per monitor) with `rearm: "same-work"` that reschedules itself on every
+// pass; false for a unit of work, which must still die or it retries without end, and for a sweep that
+// spends a provider per run (OCCURRENCE_ROUND), whose retry every few minutes would bill forever.
+export const JOB_NEVER_DEAD: Record<SchedulerJobKind, boolean> = {
+  FOLLOWUP: false,
+  FOLLOWUP_SWEEP: true,
+  WEBHOOK_RETRY: false,
+  DEBOUNCE: false,
+  RAG_INGEST: false,
+  HEARTBEAT: true,
+  FLOWLOG_SWEEP: true,
+  APPOINTMENT_REMINDER: false,
+  REDIRECT_FOLLOWUP: false,
+  MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
+  INGEST_MESSAGE: false,
+  INGEST_FALLBACK: false,
+  DELIVERY_SWEEP: true,
+  RECONCILE_SWEEP: true,
+  DELIVERY_RECOVERY: false,
+  TAKEOVER_RECOVERY: false,
+  HUMAN_REPLY_RECOVERY: false,
+  SPEND_CEILING_POLL: true,
+  OCCURRENCE_ROUND: false,
+  OCCURRENCE_SWEEP: true,
+  DASHBOARD_LOG_FACTS_BACKFILL: true,
+  OBSERVE: false,
+  MEDIA_TEXT_FALLBACK: false,
+  KNOWLEDGE_SOURCE_SYNC: false,
+  INBOUND_SWEEP: true,
+  INBOUND_REDISPATCH: false,
+  NOTHING_TO_ANSWER: false,
+  SUGGESTION_REVIEW: false,
+  CLIENT_ANON_SWEEP: true,
+  DOCUMENT_APPROVAL_EXPIRY: false,
+  DOCUMENT_APPROVAL_OUTCOME: false,
+  SNOOZED_FOLLOWUP: false,
+};
+
+// The longest a never-dead kind waits between attempts once past its budget: long enough not to
+// hammer whatever is failing, short enough that the work resumes within minutes of the cause going.
+export const NEVER_DEAD_MAX_BACKOFF_MS = 5 * 60_000;
+
+// The base of `backoffMs` in ./service.ts for one kind's retries. With `MAX_ATTEMPTS` 5 a failing
+// job gets four backoffs, each between half and all of `base * 2^attempt`: 37 seconds in all at the
+// 2s base, enough for a blip. The recovery family uses one minute (about 18 minutes in all): each is
+// armed ONCE by the sweep pass that found the stranded delivery and nothing re-arms it
+// (./chatwoot/delivery-sweep.ts), so this ladder is what must outlast a Chatwoot restart (more tries
+// at the same spacing would spend a longer outage just as fast). Longer would
+// only delay the dead-letter line: the work is already late, and `MAX_RECOVERY_AGE_MS` discards a
+// delivery recovery at six hours. Exhaustive, so a new kind does not compile until it is placed.
 export const JOB_RETRY_BASE_MS: Record<SchedulerJobKind, number> = {
   FOLLOWUP: 2_000,
   FOLLOWUP_SWEEP: 2_000,
@@ -481,9 +701,15 @@ export const JOB_RETRY_BASE_MS: Record<SchedulerJobKind, number> = {
   APPOINTMENT_REMINDER: 2_000,
   REDIRECT_FOLLOWUP: 2_000,
   MEMORY_COMPACT: 2_000,
+  OTHER_INBOX_SUMMARY: 2_000,
   INGEST_MESSAGE: 2_000,
+  INGEST_FALLBACK: 2_000,
   DELIVERY_SWEEP: 2_000,
+  RECONCILE_SWEEP: 2_000,
   SPEND_CEILING_POLL: 2_000,
+  OCCURRENCE_ROUND: 2_000,
+  OCCURRENCE_SWEEP: 2_000,
+  DASHBOARD_LOG_FACTS_BACKFILL: 2_000,
   DELIVERY_RECOVERY: 60_000,
   TAKEOVER_RECOVERY: 60_000,
   HUMAN_REPLY_RECOVERY: 60_000,
@@ -496,6 +722,12 @@ export const JOB_RETRY_BASE_MS: Record<SchedulerJobKind, number> = {
   INBOUND_REDISPATCH: 60_000,
   // The judgement is already half an hour late by design; a minute between retries changes nothing.
   NOTHING_TO_ANSWER: 60_000,
+  SUGGESTION_REVIEW: 2_000,
+  CLIENT_ANON_SWEEP: 2_000,
+  DOCUMENT_APPROVAL_EXPIRY: 2_000,
+  DOCUMENT_APPROVAL_OUTCOME: 2_000,
+  // The snoozed ladder is the same kind of work as FOLLOWUP: one nudge per row.
+  SNOOZED_FOLLOWUP: 2_000,
 };
 
 export function kindsInLane(

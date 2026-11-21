@@ -5,23 +5,17 @@ import { encryptJson } from "@/api/lib/crypto";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRow } from "../utils/flowlog";
 
-// The eager-media stages (`stt`, `vision`) are the ONLY inbox-source flow lines that used to be
-// written with no conversation, agent or inbox: `runEagerMedia`'s context carried a threadId and
-// nothing else. `flowlog/read.ts` filters on conversationId (and has no threadId filter), so the
-// console's own route into a turn's trail — /logs?conversationId=<id> — could never show the voice
-// note that failed on that conversation.
-//
-// Asked where it is CONSUMED, not where it is defined: the fixture drives the real receiver
-// (processChatwootDelivery), so the call site has to hand `runEagerMedia` the ids for the row to
-// carry them. Building the context by hand would pass with the call site still passing nothing.
-//
-// Deterministic and offline by construction: the agent's STT is enabled with NO credentialRef, so
-// the service takes its `no_credential` skip — which emits the stage line — before it loads a
-// Chatwoot client or reaches a provider. And the delivery is a `message_updated` carrying late
-// audio, which runs eager media WITHOUT arming a turn, so no model is ever asked for.
+// The eager-media stages (`stt`, `vision`) must carry the conversation, agent and inbox:
+// `flowlog/read.ts` filters on conversationId (it has no threadId filter), so the console's route
+// into a turn's trail (/logs?conversationId=<id>) shows the failed voice note only when the row has it.
+// Driven through the real receiver (processChatwootDelivery), so it is the call site that has to hand
+// `runEagerMedia` the ids. Offline by construction: STT is enabled with NO credentialRef, so the
+// service takes its `no_credential` skip (which emits the line) before any client or provider, and a
+// `message_updated` with late audio runs eager media WITHOUT arming a turn.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -38,8 +32,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -52,8 +46,8 @@ const CONV_ID = 9711;
 const TEST_INBOX_ID = 4412;
 const TEST_CONV_ID = 9712;
 // The sparse-payload fixture: a conversation on the production inbox whose late-media event names
-// no inbox at all, so the runtime — and the inbox the STT config resolves against — can only come
-// from the stored row (issue #209 review, round 4).
+// no inbox at all, so the runtime, and the inbox the STT config resolves against, can only come from
+// the stored row.
 const SPARSE_CONV_ID = 9713;
 const AGENT_BOT_ID = 77;
 
@@ -133,10 +127,9 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
 
     // `runEagerMedia` has a SECOND call site, on the answer path: a test-mode agent whose episode is
     // already activated passes the gate and only then gets its media analysed. It hands over the same
-    // three ids from a different expression (`rt?.agentId ?? null`), so it is a separate rule and
-    // needs its own measurement — with the ids of the first fixture it would pass on the wrong row.
-    // Debounce is on so the delivery arms a job instead of running a turn: the ids are the subject
-    // here, not the answer.
+    // three ids from a different expression (`rt?.agentId ?? null`), so it needs its own fixture: with
+    // the first one's ids it would pass on the wrong row. Debounce is on so the delivery arms a job
+    // instead of running a turn.
     const testAgent = await suDb.agent.create({
       data: {
         tenantId,
@@ -282,6 +275,7 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
     for (let i = 0; i < 200 && !row; i++) {
       row =
         (await flowLogRow(suDb, {
+          orderBy: { id: "asc" },
           where: { tenantId, threadId, stage: "stt" },
           select: { conversationId: true, agentId: true, inboxId: true },
         })) ?? undefined;
@@ -368,6 +362,7 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
     for (let i = 0; i < 200 && !row; i++) {
       row =
         (await flowLogRow(suDb, {
+          orderBy: { id: "asc" },
           where: { tenantId, threadId, stage: "stt" },
           select: { conversationId: true, agentId: true, inboxId: true },
         })) ?? undefined;
@@ -379,9 +374,9 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
     expect(row.inboxId).toBe(inboxDbId);
   });
 
-  // On an OBSERVER's route (issue #476) the runtime is the observer's, and so is the media: the
-  // STT and vision configs used to resolve from `Inbox.agentId`, which on an inbox a human team
-  // answers is nobody — a voice note on such an inbox was never transcribed for the observer.
+  // NOTE: On an OBSERVER's route the runtime is the observer's, and so is the media: resolving STT and
+  // vision from `Inbox.agentId` is nobody on an inbox a human team answers, and the observer's voice
+  // note would never be transcribed.
   test("on an observer's route the media resolves against the observer, not the inbox's responder", async () => {
     const OBSERVER_BOT_ID = 78;
     const OBS_INBOX_ID = 4413;
@@ -488,6 +483,7 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
     for (let i = 0; i < 200 && !row; i++) {
       row =
         (await flowLogRow(suDb, {
+          orderBy: { id: "asc" },
           where: { tenantId, threadId, stage: "stt" },
           select: { agentId: true, inboxId: true },
         })) ?? undefined;
@@ -623,22 +619,21 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
       },
     });
     const threadId = `${tenantId}:${instanceId}:${OBS_CONV_ID}`;
-    await new Promise((r) => setTimeout(r, 300));
+    // The delivery awaited its eager media, and `flowLogRow` settles every tracked write first.
     expect(
       await flowLogRow(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, threadId, stage: "stt" },
         select: { agentId: true },
       }),
     ).toBeNull();
   });
 
-  // THE SAME STAND-DOWN, ON THE UPDATE THAT BRINGS THE AUDIO (issue #478 review, round 3). Where the
-  // binding is newer than the event, the check cannot answer from the clocks and looks for the
-  // responder's own delivery of this message in the ledger — which it can only do if the event NAMES
-  // the message. A `message_updated` is not a creation, so it was named nothing and the check
-  // returned "not covered" without looking: the observer's pass then transcribed an audio the
-  // responder's route was already transcribing, two provider bills and two writes racing into the
-  // same attachment.
+  // NOTE: The same stand-down, on the update that brings the audio. Where the binding is newer than the event,
+  // the check cannot answer from the clocks and looks for the responder's own delivery of this message
+  // in the ledger, which it can do only if the event NAMES the message. A `message_updated` has to name
+  // it too, or the check answers "not covered" without looking and the observer transcribes an audio the
+  // responder's route is already transcribing (two provider bills, two writes racing into one attachment).
   test("beside a responder, the observer stands down on the update that brings the audio too", async () => {
     const OBSERVER_BOT_ID = 81;
     const RESPONDER_BOT_ID = 82;
@@ -777,9 +772,10 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
       },
     });
     const threadId = `${tenantId}:${instanceId}:${OBS_CONV_ID}`;
-    await new Promise((r) => setTimeout(r, 300));
+    // The delivery awaited its eager media, and `flowLogRow` settles every tracked write first.
     expect(
       await flowLogRow(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, threadId, stage: "stt" },
         select: { agentId: true },
       }),
@@ -861,6 +857,7 @@ describe.skipIf(!dbUp)("the eager-media flow context", () => {
     for (let i = 0; i < 200 && !row; i++) {
       row =
         (await flowLogRow(suDb, {
+          orderBy: { id: "asc" },
           where: { tenantId, threadId, stage: "stt" },
           select: { conversationId: true, agentId: true, inboxId: true },
         })) ?? undefined;

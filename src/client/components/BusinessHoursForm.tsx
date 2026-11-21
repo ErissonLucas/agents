@@ -72,18 +72,13 @@ export interface BusinessHoursFormProps {
     timezone: string;
     windows: Window[];
     // Required, not optional: the form PATCHes this field unconditionally, so a caller that omits it
-    // initializes to [] and silently deletes every holiday the operator had. Three call sites build
-    // this object; making it required is what stops a fourth from repeating that.
+    // initializes to [] and silently deletes every holiday the operator had.
     exceptions: Exception[];
   };
   onSaved: (id: string, name: string) => void;
   onCancel: () => void;
 }
 
-// Extracted form for creating or editing a business-hours schedule. Used by
-// BusinessHoursPanel (via modal) and SchedulePicker (inline create/edit).
-// When rendered inside a <Modal>, calls useUnsavedChanges so the modal's
-// discard-confirmation guard fires automatically on dirty state.
 // The keys of the body this form writes. The window and exception lists are refused per element
 // (`refused body.windows.0`), which lands on the list they belong to: see placeRefusal.
 const HOURS_FIELDS = ["name", "timezone", "windows", "exceptions"] as const;
@@ -147,9 +142,8 @@ export function BusinessHoursForm({
     );
   }
 
-  // Each field edits independently. A crossed/equal range (start >= end) is left
-  // as the operator typed it and simply flagged invalid (yellow + message), which
-  // blocks the save until they fix it — no surprising counterpart auto-adjust.
+  // A crossed or equal range stays as typed and is flagged invalid, which blocks the save.
+  // Auto-adjusting the other end instead would silently change a value the operator did not touch.
   function setStart(i: number, value: string) {
     if (!TIME_RE.test(value)) return; // ignore a cleared/partial time input
     setWindows((prev) =>
@@ -256,8 +250,8 @@ export function BusinessHoursForm({
         onSaved(data.businessHours.id, data.businessHours.name);
       }
     } catch (e) {
-      // The fixed sentence this replaces said "check the timezone" for every refusal this write can
-      // answer, a duplicate name included: the confident wrong pointer #224 is about.
+      // The toast names what the server refused (a duplicate name included). A fixed "check the
+      // timezone" sentence would point the operator at the wrong field.
       const toast = held(e);
       if (toast) showToast(toast, "error");
     } finally {
@@ -290,10 +284,10 @@ export function BusinessHoursForm({
 
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <span className="font-medium text-sm text-text-secondary">
+          <span className="text-text-secondary text-sm font-medium">
             {t("hours.windows", "Windows")}
             {refusal.at("windows", windows) && (
-              <span className="ml-2 font-normal text-error text-xs">
+              <span className="text-error ml-2 text-xs font-normal">
                 {refusal.at("windows", windows)}
               </span>
             )}
@@ -313,7 +307,7 @@ export function BusinessHoursForm({
           </Button>
         </div>
         {windows.length === 0 ? (
-          <p className="text-sm text-text-muted">
+          <p className="text-text-muted text-sm">
             {t("hours.alwaysOpen", "No windows = always open.")}
           </p>
         ) : (
@@ -382,10 +376,10 @@ export function BusinessHoursForm({
 
       <div className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <span className="font-medium text-sm text-text-secondary">
+          <span className="text-text-secondary text-sm font-medium">
             {t("hours.exceptions", "Holidays and closures")}
             {refusal.at("exceptions", exceptions) && (
-              <span className="ml-2 font-normal text-error text-xs">
+              <span className="text-error ml-2 text-xs font-normal">
                 {refusal.at("exceptions", exceptions)}
               </span>
             )}
@@ -452,7 +446,7 @@ export function BusinessHoursForm({
                   aria-label={t("hours.exceptionLabel", "Name")}
                   className="min-w-32 flex-1"
                 />
-                <label className="flex items-center gap-1 text-text-secondary text-xs">
+                <label className="text-text-secondary flex items-center gap-1 text-xs">
                   <input
                     type="checkbox"
                     checked={e.recurring === true}
@@ -475,7 +469,7 @@ export function BusinessHoursForm({
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {e.ranges.length === 0 ? (
-                  <span className="text-sm text-text-muted">
+                  <span className="text-text-muted text-sm">
                     {t("hours.exceptionClosed", "Closed all day")}
                   </span>
                 ) : (

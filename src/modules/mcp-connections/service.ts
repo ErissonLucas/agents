@@ -1,10 +1,19 @@
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
 import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
-import { buildConnConfig } from "@/graph/tools/mcp";
-import { AppError, ConflictError, NotFoundError } from "@/lib/errors";
+import {
+  buildConnConfig,
+  discoverMcpServer,
+  httpErrorCode,
+} from "@/graph/tools/mcp";
+import {
+  AppError,
+  ConflictError,
+  NotFoundError,
+  quotingReason,
+} from "@/lib/errors";
 import {
   hasSafeStdioCommandChars,
   isMcpStdioLauncher,
@@ -21,11 +30,19 @@ import {
   undisclosedMoved,
 } from "@/modules/audit/projection";
 import { auditMutation, projectionMoved } from "@/modules/audit/service";
+import {
+  credentialHeaderName,
+  type McpHeaders,
+  mcpHeadersInput,
+  mcpHeadersProblem,
+  readMcpHeaders,
+} from "@/modules/mcp-connections/headers";
 import { ensureFreshGoogleAccessToken } from "@/modules/vault/google-oauth";
 import { ensureFreshMcpAccessToken } from "@/modules/vault/mcp-oauth";
 import { isManagedOAuthKind } from "@/modules/vault/secret-types";
 import {
   readableVaultRef,
+  readVaultRefFacts,
   readVaultRefId,
   requireVaultRef,
   tryResolveVaultEntry,
@@ -45,6 +62,7 @@ export interface McpConnectionDto {
   url: string | null;
   command: string | null;
   credentialRef: string | null;
+  headers: McpHeaders;
   enabled: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -57,6 +75,7 @@ const SELECT = {
   url: true,
   command: true,
   credentialRef: true,
+  headers: true,
   enabled: true,
   createdAt: true,
   updatedAt: true,
@@ -69,47 +88,35 @@ function toDto(r: {
   url: string | null;
   command: string | null;
   credentialRef: string | null;
+  headers: unknown;
   enabled: boolean;
   createdAt: Date;
   updatedAt: Date;
 }): McpConnectionDto {
-  // The spread is what made this the easiest of the four to miss: `credentialRef` reached the
-  // reader because nobody named it. It is handed out only where it NAMES an entry — `requireVaultRef`
-  // has guarded both writers since #126 (dc6c467a) and this module predates that, so a row can hold
-  // a value no resolver ever matched, and `mcp_connection_list` returns this DTO under a scope
-  // narrower than the console's (issue #438).
+  // NOTE: `credentialRef` is handed out only where it NAMES an entry: rows can predate
+  // `requireVaultRef` and hold a value no resolver matches, and `mcp_connection_list` returns this DTO
+  // under a scope narrower than the console's.
   return {
     ...r,
     id: String(r.id),
     credentialRef: readableVaultRef(r.credentialRef),
+    headers: readMcpHeaders(r.headers),
   };
 }
 
-// What the audit row carries.
-//
-// Same two halves as the other four families: identity, policy and shape are PROJECTED, everything
-// else is listed in `UNDISCLOSED` below and compared without being carried. A column in neither
-// half changes without the row noticing, and `projectionMoved` then suppresses the write entirely.
-//
-// `url` is REDACTED to its origin. An MCP endpoint accepts any absolute URL, and userinfo, a path
-// segment and a query parameter are all places a token is actually carried — this row is
-// append-only and readable by every tenant admin, so it would outlive the correction. `command` is
-// projected as its LAUNCHER (`bunx`/`uvx`) for the same reason: a stdio invocation carries its
-// arguments, and an argument is where a self-hosted server's key goes. Both whole values are
-// compared, so a change to either is still visible as a change.
-//
-// The RAW `credentialRef` is compared as well as projected, and that is not belt-and-braces: two
-// different opaque values both project as `{ref: null, opaque: true}`, so swapping one for the
-// other would move nothing. `requireVaultRef` has refused that spelling on the way in since #126,
-// which makes it a legacy row rather than a reachable write — but the fence answers for columns and
-// not for what today's writer happens to allow, and listing it costs one line.
-// `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
+// What the audit row carries: identity, policy and shape are PROJECTED, the rest is in `UNDISCLOSED`
+// and compared without being carried (a column in neither changes without writing a row). `url` is
+// redacted to its origin and `command` projected as its launcher (`bunx`/`uvx`): both can carry a
+// token on an append-only row every tenant admin reads; both whole values are still compared. The raw
+// `credentialRef` is compared too, since two opaque values project identically and legacy rows can
+// hold them. `tests/modules/audit-config-families.test.ts` holds the fence over this model's columns.
 function auditProjection(r: {
   name: string;
   transport: string;
   url: string | null;
   command: string | null;
   credentialRef: string | null;
+  headers: unknown;
   enabled: boolean;
 }) {
   const cred = refForAudit(r.credentialRef);
@@ -121,6 +128,7 @@ function auditProjection(r: {
       r.command === null ? null : stdioCommandLauncher(r.command),
     credentialRef: cred.ref,
     credentialRefOpaque: cred.opaque,
+    headerNames: Object.keys(readMcpHeaders(r.headers)).sort(),
     enabled: r.enabled,
   };
 }
@@ -128,8 +136,9 @@ function auditProjection(r: {
 // The columns the projection above may not publish, compared and never carried
 // (`@/modules/audit/projection`). All three are in BOTH halves: the row shows the URL's origin, the
 // stdio launcher and the readable ref, and the comparison sees the whole value, so a token moved
-// inside a path or an argument still records that the connection changed.
-const UNDISCLOSED = ["url", "command", "credentialRef"] as const;
+// inside a path or an argument still records that the connection changed. `headers` shows its
+// names only: a value is a template, but an operator can still type a literal key into one.
+const UNDISCLOSED = ["url", "command", "credentialRef", "headers"] as const;
 
 export const mcpConnectionCreateSchema = z
   .object({
@@ -138,6 +147,7 @@ export const mcpConnectionCreateSchema = z
     url: z.string().url().max(2000).nullish(),
     command: z.string().min(1).max(2000).nullish(),
     credentialRef: z.string().min(1).max(128).nullish(),
+    headers: mcpHeadersInput.optional(),
     enabled: z.boolean().optional(),
   })
   .strict();
@@ -203,6 +213,51 @@ async function assertTransportValid(effective: {
   await assertSafeOutboundUrl(effective.url);
 }
 
+export function assertHeadersFit(
+  headers: Record<string, unknown>,
+  transport: string,
+  credentialHeader: string | null,
+): asserts headers is McpHeaders {
+  const problem = mcpHeadersProblem(headers, transport, credentialHeader);
+  if (problem) {
+    const error = new AppError(
+      `invalid headers: ${problem.message}`,
+      400,
+      "errors.mcpHeadersInvalid",
+      { reason: problem.message },
+      "headers",
+    );
+    throw quotingReason(error, problem);
+  }
+}
+
+async function credentialHeaderFor(
+  db: ScopedDb,
+  ref: string | null,
+): Promise<string | null> {
+  if (!ref) return null;
+  const entry = await readVaultRefFacts(db, ref);
+  return credentialHeaderName(true, entry?.kind, entry?.paramName);
+}
+
+// The half of the headers check that needs the credential: a declared header may not be the one the
+// credential is sent in. Exported for the MCP dry run, which asks it of the state the write would
+// leave; the write asks it again inside its transaction.
+export async function assertMcpConnectionHeadersFit(
+  ctx: TenantContext,
+  state: {
+    headers: Record<string, unknown>;
+    transport: string;
+    credentialRef: string | null;
+  },
+  base: PrismaClient = basePrisma,
+): Promise<void> {
+  const credentialHeader = await runScopedOn(base, ctx, (db) =>
+    credentialHeaderFor(db, state.credentialRef),
+  );
+  assertHeadersFit(state.headers, state.transport, credentialHeader);
+}
+
 export async function listMcpConnections(
   ctx: TenantContext,
   base: PrismaClient = basePrisma,
@@ -251,22 +306,20 @@ async function assertNameFree(
   }
 }
 
-// Everything `createMcpConnection` refuses about an input WITHOUT reading the database, as one
-// call, so the MCP dry run can answer with the verdict the apply will (issue #490). See the note on
-// `assertAgentCreatable`. Async only because `assertTransportValid` is; it makes no query.
+// Everything `createMcpConnection` refuses about an input WITHOUT reading the database, as one call,
+// so the MCP dry run answers with the apply's verdict. Async only because `assertTransportValid` is;
+// it makes no query.
 export async function assertMcpConnectionCreatable(input: McpConnectionCreate) {
   const data = parseInput(mcpConnectionCreateSchema, input);
   await assertTransportValid(data);
+  const headers = data.headers ?? {};
+  assertHeadersFit(headers, data.transport, null);
   return data;
 }
 
-// Same split, same caveat as `assertToolNameAvailable`: ADVISORY. It reads outside the write's
-// transaction, so a name free here can be taken before the apply arrives; `assertNameFree` inside
-// the tx stays the authority. It exists so the preview refuses the reuse the operator actually
-// makes, instead of promising a connection the apply will not create (#490).
-// `exceptId` for the update path: a connection keeping its own name is not a collision, and
-// omitting it would make every rename-to-itself preview refuse a write that succeeds — the inverse
-// divergence, which is just as wrong.
+// ADVISORY, like `assertToolNameAvailable`: it reads outside the write's transaction, so
+// `assertNameFree` inside the tx stays the authority; this lets the preview refuse the common reuse.
+// `exceptId` for the update path: a connection keeping its own name is not a collision.
 export async function assertMcpConnectionNameAvailable(
   ctx: TenantContext,
   name: string,
@@ -289,6 +342,12 @@ export async function createMcpConnection(
     const credentialRef = data.credentialRef
       ? await requireVaultRef(db, data.credentialRef, "credentialRef")
       : null;
+    const headers = data.headers ?? {};
+    assertHeadersFit(
+      headers,
+      data.transport,
+      await credentialHeaderFor(db, credentialRef),
+    );
     const row = await db.mcpServerConnection.create({
       data: {
         tenantId,
@@ -297,6 +356,7 @@ export async function createMcpConnection(
         url: data.url ?? null,
         command: data.command ?? null,
         credentialRef,
+        headers,
         enabled: data.enabled ?? true,
       },
       select: SELECT,
@@ -310,25 +370,29 @@ export async function createMcpConnection(
   });
 }
 
-// Everything `updateMcpConnection` decides before it writes: the schema, that the row exists, and
-// that the MERGED transport/url/command is coherent and reachable. Split out so the MCP preview can
-// ask the same question the apply asks (#490) — the merge is the point, since a patch that only
-// moves the url is judged against the transport already stored.
-// The judgement `updateMcpConnection` makes about a patch, against a snapshot the CALLER supplies.
-// The snapshot is a parameter rather than a read of its own so the MCP preview can validate and
-// render from the same row: reading it twice means a concurrent write can land between the two, and
-// the preview then describes a diff against one state while having approved another (#490).
+// The judgement `updateMcpConnection` makes about a patch (schema, and that the MERGED
+// transport/url/command is coherent and reachable), against a snapshot the CALLER supplies so the MCP
+// preview validates and renders from the same row; reading twice could approve one state and
+// describe another.
 export async function assertMcpConnectionUpdatable(
   patch: McpConnectionUpdate,
-  current: { transport: string; url: string | null; command: string | null },
+  current: {
+    transport: string;
+    url: string | null;
+    command: string | null;
+    headers: unknown;
+  },
 ): Promise<McpConnectionUpdate> {
   const data = parseInput(mcpConnectionUpdateSchema, patch);
+  const transport = data.transport ?? current.transport;
   // Re-validate the merged result (SSRF/DNS outside the tx).
   await assertTransportValid({
-    transport: data.transport ?? current.transport,
+    transport,
     url: data.url !== undefined ? data.url : current.url,
     command: data.command !== undefined ? data.command : current.command,
   });
+  const headers = data.headers ?? readMcpHeaders(current.headers);
+  assertHeadersFit(headers, transport, null);
   return data;
 }
 
@@ -341,7 +405,7 @@ export async function updateMcpConnection(
   const current = await runScopedOn(base, ctx, (db) =>
     db.mcpServerConnection.findUnique({
       where: { id },
-      select: { transport: true, url: true, command: true },
+      select: { transport: true, url: true, command: true, headers: true },
     }),
   );
   if (!current) {
@@ -365,6 +429,17 @@ export async function updateMcpConnection(
     const credentialRef = data.credentialRef
       ? await requireVaultRef(db, data.credentialRef, "credentialRef")
       : null;
+    const headers = data.headers ?? readMcpHeaders(snapshot.headers);
+    assertHeadersFit(
+      headers,
+      data.transport ?? snapshot.transport,
+      await credentialHeaderFor(
+        db,
+        data.credentialRef !== undefined
+          ? credentialRef
+          : snapshot.credentialRef,
+      ),
+    );
     await db.mcpServerConnection.update({
       where: { id },
       data: {
@@ -375,6 +450,7 @@ export async function updateMcpConnection(
           ? { command: data.command ?? null }
           : {}),
         ...(data.credentialRef !== undefined ? { credentialRef } : {}),
+        ...(data.headers !== undefined ? { headers } : {}),
         ...(data.enabled !== undefined ? { enabled: data.enabled } : {}),
       },
     });
@@ -532,6 +608,98 @@ export interface DiscoveredMcp {
   instructions: string | null;
 }
 
+// How long the console's discovery waits for the server: under the ~30s after which the HTTP
+// client gives up on the request, so a server that hangs answers with a reason instead of a
+// dropped connection. The connection still closes when the SDK's own request timeout fires.
+const DISCOVERY_TIMEOUT_MS = 20_000;
+
+class DiscoveryTimeout extends Error {}
+
+function withDiscoveryTimeout<T>(
+  work: Promise<T>,
+  ms = DISCOVERY_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new DiscoveryTimeout(`${ms / 1000}`)), ms);
+  });
+  return Promise.race([work, expired]).finally(() => clearTimeout(timer));
+}
+
+// Error codes the runtime gives a request that never reached a server (Bun's and Node's spellings).
+const UNREACHABLE_CODES = new Set([
+  "ConnectionRefused",
+  "ECONNREFUSED",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "FailedToOpenSocket",
+]);
+
+function unreachable(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 5; depth++) {
+    const code = (cur as { code?: unknown }).code;
+    if (typeof code === "string" && UNREACHABLE_CODES.has(code)) return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+// A failed discovery is the MCP server's failure, not ours: 502 with a sentence the console shows
+// as is, by kind (credential refused, an HTTP status, no answer in time, not reachable, anything
+// else). The upstream error's own text stays in the log, since a response body can echo the
+// request URL and the credential in its query.
+function discoveryError(err: unknown): AppError {
+  if (err instanceof AppError) return err;
+  if (err instanceof DiscoveryTimeout) {
+    const seconds = Number(err.message);
+    return new AppError(
+      `the MCP server did not answer within ${seconds}s`,
+      502,
+      "errors.mcpDiscoveryTimeout",
+      { seconds },
+    );
+  }
+  // Only an HTTP error status counts; a JSON-RPC error carries a negative protocol code
+  // (-32601) in the same field, and that is a malformed exchange, not an HTTP answer.
+  const code = httpErrorCode(err);
+  const status = code !== null && code >= 400 && code < 600 ? code : null;
+  if (status === 401 || status === 403) {
+    return new AppError(
+      `the MCP server refused the credential (HTTP ${status})`,
+      502,
+      "errors.mcpDiscoveryAuth",
+      { status },
+    );
+  }
+  if (status !== null) {
+    return new AppError(
+      `the MCP server answered HTTP ${status}`,
+      502,
+      "errors.mcpDiscoveryHttp",
+      { status },
+    );
+  }
+  if (unreachable(err)) {
+    return new AppError(
+      "could not reach the MCP server",
+      502,
+      "errors.mcpDiscoveryUnreachable",
+    );
+  }
+  return new AppError(
+    "the MCP server could not be listed",
+    502,
+    "errors.mcpDiscoveryFailed",
+  );
+}
+
+export const __discoveryForTest = { discoveryError, withDiscoveryTimeout };
+
 export async function discoverMcpTools(
   ctx: TenantContext,
   id: bigint,
@@ -584,50 +752,36 @@ export async function discoverMcpTools(
     }
   }
 
-  const connConfig = await buildConnConfig(
-    {
-      connId: id,
-      name: sel.name,
-      transport: sel.transport,
-      url: sel.url,
-      command: sel.command,
-      secret,
-      credentialBaseUrl: sel.credentialBaseUrl,
-      credentialKind: sel.kind,
-      credentialParamName: sel.paramName,
-      enabledTools: [],
-    },
-    { stdioEnabled: config.mcpStdioEnabled },
-  );
-  const client = new MultiServerMCPClient({
-    throwOnLoadError: true,
-    prefixToolNameWithServerName: false,
-    additionalToolNamePrefix: "",
-    useStandardContentBlocks: true,
-    mcpServers: { [sel.name]: connConfig },
+  const target = {
+    connId: id,
+    name: sel.name,
+    transport: sel.transport,
+    url: sel.url,
+    command: sel.command,
+    secret,
+    credentialBaseUrl: sel.credentialBaseUrl,
+    credentialKind: sel.kind,
+    credentialParamName: sel.paramName,
+    enabledTools: [],
+  };
+  const connConfig = await buildConnConfig(target, {
+    stdioEnabled: config.mcpStdioEnabled,
   });
-  try {
-    const tools = await client.getTools();
-    // Best-effort: the server's native `instructions` (MCP initialize result) for the UI scope hint.
-    let instructions: string | null = null;
-    try {
-      const raw = (await client.getClient(sel.name))?.getInstructions();
-      instructions = typeof raw === "string" && raw.trim() ? raw.trim() : null;
-    } catch {
-      instructions = null;
-    }
-    return {
-      instructions,
-      tools: tools.map((t) => ({
-        name: t.name,
-        description:
-          typeof t.description === "string" && t.description.length > 0
-            ? t.description
-            : null,
-        args: summarizeToolArgs((t as { schema?: unknown }).schema),
-      })),
-    };
-  } finally {
-    await client.close().catch(() => {});
-  }
+  const { tools, instructions } = await withDiscoveryTimeout(
+    discoverMcpServer(target, connConfig),
+  ).catch((err: unknown) => {
+    logger.warn({ err, mcp: sel.name }, "mcp discovery failed");
+    throw discoveryError(err);
+  });
+  return {
+    instructions,
+    tools: tools.map((t) => ({
+      name: t.name,
+      description:
+        typeof t.description === "string" && t.description.length > 0
+          ? t.description
+          : null,
+      args: summarizeToolArgs((t as { schema?: unknown }).schema),
+    })),
+  };
 }

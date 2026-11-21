@@ -7,6 +7,7 @@ import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { xmlAttr } from "@/lib/xml";
 import { readAppointmentReminderConfig } from "@/modules/appointments/settings";
 import type { Schedule } from "@/modules/business-hours/hours";
+import { CALENDAR_CONFIG_RANGES } from "@/modules/integrations/calendar-config-ranges";
 import {
   bookingWindow,
   type CalendarSource,
@@ -19,37 +20,21 @@ import {
 } from "./calendar-slots";
 import {
   type IntegrationSelection,
+  mutedToolpackCtx,
   registerToolpack,
   type Toolpack,
   type ToolpackCtx,
   type ToolSpec,
 } from "./types";
 
-// Google Calendar OUTBOUND toolpack. The agent lists/creates/updates events and checks availability on
-// an ALLOWLIST of calendars bound to the integration instance config (default the connected account's
-// "primary"), so a prompt-injection cannot redirect reads/writes to a calendar outside that set. The
-// OAuth access token comes from the vault by reference (kind `google_oauth`); prepare.ts's
-// resolveCredential auto-refreshes it and hands us a fresh bearer — it never reaches the model / a tool
-// arg / the return / the trace.
-//
-// Per-CUSTOMER isolation (a clinic's ONE shared calendar serves MANY WhatsApp contacts): every event
-// the agent creates is stamped with `extendedProperties.private.secv4Contact = "<tenantId>:<contactDbId>"`
-// — a value INJECTED from the trusted context, never a model arg. Listing filters server-side by that
-// private property AND re-verifies each returned event's stamp (defense in depth), so a customer only
-// ever sees their OWN appointments; updating re-fetches the event and refuses if the stamp does not
-// match. Availability uses freeBusy (busy windows only, zero details), so other customers' bookings
-// count as busy without leaking anything. Fail-closed: with no contact in scope (playground) the
-// per-contact tools refuse instead of falling back to "all events".
-//
-// Security invariants (mirror asaas.ts):
-//   - the set of operable calendars (`calendarIds`) + `timeZone` are bound to the INSTANCE CONFIG; a
-//     tool's optional `calendarId` arg is validated against the allowlist, fail-closed (with a single
-//     allowed calendar the arg is not even exposed and that calendar is used; with several the model
-//     picks by name or id IN the set);
-//   - the per-customer stamp is bound to ctx.contactDbId, never a tool arg;
-//   - the bearer token flows ONLY into the Authorization header;
-//   - the origin is a fixed constant (never interpolated); SSRF-guarded anyway;
-//   - https-only, no redirects, bounded timeout + response.
+// Google Calendar OUTBOUND toolpack: events and availability on an ALLOWLIST of calendars from the
+// instance config (`calendarIds`, default "primary"; `timeZone` too); a `calendarId` arg is
+// validated against it, fail-closed. The vault OAuth bearer (kind `google_oauth`, refreshed by
+// prepare.ts) goes ONLY into the Authorization header. Per-CUSTOMER isolation: each event carries a
+// private stamp from ctx.contactDbId (never a model arg), listing filters and re-verifies it,
+// updates refuse a foreign stamp, availability reads freeBusy only, and with no contact in scope
+// the per-contact tools refuse. Fixed origin (SSRF-guarded anyway), https-only, no redirects,
+// bounded.
 
 const GCAL_ORIGIN = "https://www.googleapis.com/calendar/v3";
 const TIMEOUT_MS = 12_000;
@@ -65,15 +50,10 @@ const MAX_BLOCKING_CALENDARS = 10;
 // event and freeBusy query to São Paulo so the agent's "14:00" is unambiguous.
 const DEFAULT_TIME_ZONE = "America/Sao_Paulo";
 
-// The private-event key carrying the owning contact's stamp. Keys in extendedProperties.private are
-// visible/queryable ONLY by our OAuth app, never by other apps or the customer.
-//
-// FROZEN through the brand rename, deliberately. These two keys are stamped on REAL events living
-// in customers' calendars, and the list fence filters server-side by
-// `privateExtendedProperty=secv4Contact=<stamp>` — Google takes ONE such filter per request, so
-// accepting a second key name would mean two listings plus a merge on every read, forever, or a
-// backfill we cannot run on self-hosted instances. They are also the only pre-rename identifiers
-// no human ever sees. Do NOT rename them outside the 2.0 cut.
+// The private-event key carrying the owning contact's stamp, visible only to our OAuth app. FROZEN
+// through the brand rename: it is stamped on real events in customers' calendars, and Google takes
+// ONE private-property filter per request, so a second key name would mean two listings per read or
+// a backfill self-hosted instances cannot run. Do NOT rename it outside the 2.0 cut.
 const SECV4_CONTACT_KEY = "secv4Contact";
 
 // The private-event key recording the attendance-confirmation timestamp (set by
@@ -114,12 +94,46 @@ function resolveBlockingCalendarIds(config: Record<string, unknown>): string[] {
   return Array.from(new Set(ids));
 }
 
-// NOTE: whether calendar_create_event asks Google for a Meet room. ON by default: an agent that books a
+// Whether calendar_create_event asks Google for a Meet room. ON by default: an agent that books a
 // "call" must hand the customer a real meeting room, not the calendar page (htmlLink). Operators who
 // use the calendar purely as a busy-block turn it off in the integration config. When the connected
 // account cannot create Meet rooms, Google keeps the event and just omits the conference (no error).
 function resolveCreateMeetLink(config: Record<string, unknown>): boolean {
   return config.createMeetLink !== false;
+}
+
+// Whether calendar_create_event invites the customer, and where the address comes from. OFF unless
+// the operator picked a mode: an operator who never promised an invite must not start sending Google
+// emails on upgrade. "contact" reads the contact's email from Chatwoot at call time; "agent" lets the
+// model pass the address the customer gave in the conversation. Any other value is off.
+type InviteMode = "contact" | "agent" | null;
+function resolveInviteMode(config: Record<string, unknown>): InviteMode {
+  const v = config.inviteCustomer;
+  return v === "contact" || v === "agent" ? v : null;
+}
+
+// One address, shaped like one. A list ("a@x.com, b@y.com") fails the shape, which is the point: an
+// event carries at most one invited customer.
+const EMAIL_SHAPE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+
+// Whether an event already has guests. Update and cancel notify them (sendUpdates=all) by this, not
+// by the current config: an invite sent while the mode was on still sits in the customer's calendar
+// after the operator turns it off, and a move or a cancel they are not told about leaves it stale.
+function hasAttendees(ev: Record<string, unknown>): boolean {
+  return Array.isArray(ev.attendees) && ev.attendees.length > 0;
+}
+
+// A muted turn (an observer's) never speaks to the customer, and Google's emails go out by a door
+// the Chatwoot mute never sees. So on one, the create invites nobody and a move or a cancel notifies
+// nobody: the calendar still changes, the platform just does not announce it (docs/chatwoot.md,
+// "Observation").
+function mutedTurn(ctx: ToolpackCtx): boolean {
+  return mutedToolpackCtx(ctx);
+}
+
+// The query a move or a cancel carries: guests are told, unless this turn may not speak.
+function notifyQuery(ev: Record<string, unknown>, ctx: ToolpackCtx): string {
+  return hasAttendees(ev) && !mutedTurn(ctx) ? "?sendUpdates=all" : "";
 }
 
 // Friendly labels (calendar id → human name, e.g. "Dr. Ana"), captured when the operator picks
@@ -253,12 +267,9 @@ function pickCalendarId(
   };
 }
 
-// Which calendars an AVAILABILITY query covers (issue #100). Same fencing as pickCalendarId for an
-// explicit arg; the difference is the no-arg case, which used to be refused ("set calendarId") and
-// now means EVERY allowed calendar. That refusal is what forced a clinic's agent to call this tool
-// once per professional and merge the results itself, spending the turn's tool budget on arithmetic
-// the runtime does deterministically. Booking, rescheduling and cancelling deliberately keep the
-// old rule: those act on ONE calendar, chosen after the customer picks a professional.
+// Which calendars an AVAILABILITY query covers. Same fencing as pickCalendarId for an explicit arg,
+// but no arg means EVERY allowed calendar, so one call answers "who is free first?". Booking,
+// rescheduling and cancelling keep the single-calendar rule: they act on the professional chosen.
 function pickAvailabilityCalendars(
   allowed: string[],
   labels: Record<string, string>,
@@ -283,9 +294,10 @@ function resolveTimeZone(config: Record<string, unknown>): string {
 // default, then the toolpack default.
 const DEFAULT_SLOT_MINUTES = 30;
 const DEFAULT_GRANULARITY_MINUTES = 15;
-const MIN_GRAIN_MINUTES = 5;
-const MAX_SLOT_MINUTES = 480;
-const MAX_GRANULARITY_MINUTES = 240;
+const MIN_GRAIN_MINUTES = CALENDAR_CONFIG_RANGES.slotDurationMinutes.min;
+const MAX_SLOT_MINUTES = CALENDAR_CONFIG_RANGES.slotDurationMinutes.max;
+const MAX_GRANULARITY_MINUTES =
+  CALENDAR_CONFIG_RANGES.slotGranularityMinutes.max;
 // Availability is queried one day at a time: cap the range so the (now unsampled) slot list stays small
 // and the model pages through longer searches itself, a day per call.
 const MAX_AVAILABILITY_RANGE_MS = 24 * 60 * 60 * 1000;
@@ -363,7 +375,8 @@ function resolveSlotGranularity(config: Record<string, unknown>): number {
 }
 
 function resolveMinLead(config: Record<string, unknown>): number {
-  return clampMinutes(config.minLeadMinutes, 0, 100_000, 0);
+  const { min, max } = CALENDAR_CONFIG_RANGES.minLeadMinutes;
+  return clampMinutes(config.minLeadMinutes, min, max, 0);
 }
 
 // The integration's chosen availability schedule (a BusinessHours id), bound to config. Null ⇒ the
@@ -393,15 +406,15 @@ function eventStamp(ev: Record<string, unknown>): string | null {
 }
 
 // A Calendar start/end, always a timed RFC3339 `dateTime` carrying the config/default timeZone.
-// All-day has no shape here since #345: an appointment is judged against the bookable slots of a
-// day, a whole day is never one of them, and the write tools refuse a bare date before reaching this.
+// All-day has no shape here: a whole day is never a bookable slot, and the write tools refuse a
+// bare date before reaching this.
 function toEventTime(value: string, timeZone: string): Record<string, string> {
   return { dateTime: value.trim(), timeZone };
 }
 
 // PATCH merges what we send, so a patch carrying only `dateTime` leaves the event's existing `date`
-// in place — and Google rejects an event holding both (HTTP 400). An all-day event created before
-// #345 can still be MOVED onto a bookable slot, so the patch has to clear the `date` it replaces.
+// in place, and Google rejects an event holding both (HTTP 400). An older all-day event can still
+// be MOVED onto a bookable slot, so the patch has to clear the `date` it replaces.
 function toEventTimePatch(
   value: string,
   timeZone: string,
@@ -464,8 +477,8 @@ async function gcalFetch(
   const assertSafe = ctx.assertSafe ?? assertSafeOutboundUrl;
   await assertSafe(url);
   const doFetch = ctx.fetchImpl ?? fetch;
-  // The cap is on what is READ, not a slice of what was already read: `.text()` buffers the whole
-  // body before any limit applies (#464).
+  // The cap is on what is READ, not a slice of what was already read: `.text()` buffers the
+  // whole body before any limit applies.
   const { res, body } = await fetchBounded(
     url,
     {
@@ -509,20 +522,16 @@ const NO_CONTACT =
 const FOREIGN_EVENT =
   "That appointment is not associated with this customer, so it cannot be read or changed here.";
 
-// NOTE: zod-optional but never optional in practice, for the tools that ACT on one calendar: the arg
-// is only ever EXPOSED when the integration allows several (calendarArgSchema), and then one of them
-// must be named or pickCalendarId refuses. What the model reads here is only what it needs to fill
-// the argument; the console's own explanation of WHY the arg can be absent is operator text and
-// lives in the frontend, translated, at `toolpackArgNote` (issue #118).
+// Zod-optional but never optional in practice for the tools that ACT on one calendar: the arg is
+// only EXPOSED when the integration allows several (calendarArgSchema), and then pickCalendarId
+// requires one. The console's explanation of why it can be absent lives in the frontend, at
+// `toolpackArgNote`.
 const CALENDAR_ID_DESC =
   "Which calendar to act on: name or id of one of the calendars in `<allowed_calendars>`.";
 
-// NOTE: Availability is the ONE tool where omitting this is not a mistake but the default, and the
-// arg description is where that has to be said. The tool description already says so, but the model
-// decides whether to fill an optional field while reading the field, and "Which calendar to act on"
-// there reads as an instruction to pick one: the arg text would be arguing against the tool text,
-// with a list of valid values in sight (the inverse of the #98 failure, where an optional arg with
-// NO valid value in sight invited the model to invent one).
+// Availability is the ONE tool where omitting this is the default, and the arg description has to
+// say so: the model decides whether to fill an optional field while reading the field, and "Which
+// calendar to act on" there would read as an instruction to pick one.
 const AVAILABILITY_CALENDAR_ID_DESC =
   'OPTIONAL, and usually omitted. Leave it out to search EVERY calendar in `<allowed_calendars>` at once, which is what answers "who is free first?" or "any <specialty> tomorrow?" in one call; each returned slot names the calendar that can take it. Pass it (name or id) ONLY when the customer has already chosen a professional, or when they asked about that one specifically.';
 
@@ -591,6 +600,12 @@ const CREATE_EVENT_SCHEMA = z.object({
   end: z.string().min(1).describe("End, same format as start."),
   description: z.string().max(2000).optional().describe("Event details."),
   calendarId: z.string().optional().describe(CALENDAR_ID_DESC),
+  attendeeEmail: z
+    .string()
+    .optional()
+    .describe(
+      "The customer's email address, exactly as they gave it in this conversation, to send them the calendar invite. One address only; omit it when the customer has not given one.",
+    ),
 });
 
 const UPDATE_EVENT_SCHEMA = z.object({
@@ -711,10 +726,8 @@ function buildListEventsTool(
 // A busy interval, as both the freeBusy answer and the blocking-calendar reader express it.
 type BusyWindow = { start: string; end: string };
 
-// The availability read, shared by the tool that ANSWERS "when can I come?" and the tools that WRITE
-// the answer down. Extracted for issue #345: the write path has to judge a requested time against
-// the same busy windows the availability path uses, and a second copy of this reader is how the two
-// would start disagreeing about what "busy" means.
+// The availability read, shared by the tool that answers "when can I come?" and the tools that
+// WRITE the answer down, so both judge a requested time against the same busy windows.
 type BusySources =
   | { ok: true; sources: CalendarSource[]; unreadable: string[] }
   | { ok: false; refusal: string | ToolFailure };
@@ -728,14 +741,14 @@ async function readBusySources(
   token: string,
   ctx: ToolpackCtx,
 ): Promise<BusySources> {
-  // NOTE: freeBusy takes N calendars per request and keys the answer by id, so the whole clinic
+  // freeBusy takes N calendars per request and keys the answer by id, so the whole clinic
   // costs at most five requests (see FREEBUSY_BATCH_SIZE and MAX_AGGREGATE_CALENDARS), not one
   // per professional the way the model had to do it before.
   const batches: string[][] = [];
   for (let i = 0; i < calendarIds.length; i += FREEBUSY_BATCH_SIZE) {
     batches.push(calendarIds.slice(i, i + FREEBUSY_BATCH_SIZE));
   }
-  // NOTE: allSettled, not all: gcalFetch THROWS on a timeout or a network error, and a single
+  // allSettled, not all: gcalFetch THROWS on a timeout or a network error, and a single
   // rejection would discard every batch that answered fine. Non-2xx already degraded per batch;
   // a thrown one has to degrade the same way or the contract is a coin flip on failure mode.
   // Concurrency needs no separate bound: MAX_AGGREGATE_CALENDARS caps this at five requests.
@@ -757,7 +770,7 @@ async function readBusySources(
       ),
     ),
   );
-  // NOTE: A batch that failed contributes no entries, so its calendars fall through the same
+  // A batch that failed contributes no entries, so its calendars fall through the same
   // "unreadable" path as a calendar Google refused individually. Only a total failure surfaces
   // the HTTP status, which keeps the single-batch case answering exactly as it always did.
   const calendars: Record<string, unknown> = {};
@@ -796,7 +809,7 @@ async function readBusySources(
       ),
     };
   }
-  // NOTE: Per-calendar outcome. freeBusy answers 200 and reports a calendar it could not read as a
+  // Per-calendar outcome. freeBusy answers 200 and reports a calendar it could not read as a
   // per-calendar `errors` array (a revoked share, a deleted calendar), so the failure is INSIDE a
   // successful response. Such a calendar is dropped, never carried with an empty busy list: empty
   // busy means "free all day", and offering a professional whose bookings we cannot see is a
@@ -857,8 +870,8 @@ async function readBlockingWindows(
   // nothing but that same calendar: its own bookings already arrive via freeBusy, and reading it
   // as a blocker would turn its transparent events into blocks of itself. With siblings in the
   // query it MUST be read, because a calendar can be operable and still carry closures its
-  // siblings have to respect. Dropping it whenever it appeared in the query (an earlier revision
-  // of this change) made an all-day closure on a doubly-listed calendar invisible to everyone.
+  // siblings have to respect. Dropping it whenever it appears in the query would make an all-day
+  // closure on a doubly-listed calendar invisible to everyone.
   const out: Array<{ id: string; windows: BusyWindow[] }> = [];
   const blocking = blockingIds.filter((id) =>
     sources.some((s) => s.calendarId !== id),
@@ -1024,8 +1037,7 @@ function buildCheckAvailabilityTool(
         granularityMinutes: resolveSlotGranularity(sel.config),
         minLeadMinutes,
         // NOTE: Only when aggregating. The multiplication this bounds does not exist with one calendar,
-        // and what a single-calendar instance returns is not this change's to alter: capping it would
-        // shorten a list operators have been reading since before the feature existed.
+        // and capping a single-calendar result would shorten a list operators already rely on.
         maxSlots:
           sources.length > 1 ? MAX_SLOT_ENTRIES : Number.POSITIVE_INFINITY,
       });
@@ -1079,8 +1091,8 @@ function timedInstantMs(value: string, timeZone: string): number | null {
 }
 
 // A Calendar start/end the booking rule can judge: a real instant, not an all-day date. All-day is
-// refused rather than exempted — availability never offers a whole day, so exempting it would leave
-// the one shape of write that skips the rule entirely (issue #345).
+// refused rather than exempted, since availability never offers a whole day and an exemption would
+// be the one write that skips the rule.
 const NOT_A_TIMED_EVENT =
   "An appointment needs a start and end time, not a whole day. Pass ISO 8601 timestamps with an offset (e.g. 2026-06-20T14:00:00-03:00).";
 const UNREADABLE_TIME =
@@ -1212,6 +1224,55 @@ async function judgeWrite(opts: {
   return { ok: false, refusal: notBookableMessage(verdict.alternatives) };
 }
 
+// The address the create invites, or why none. A missing or unreadable address never blocks the
+// booking: the slot is what the customer asked for, and the reply says nobody was invited so the
+// agent does not promise an email that will not come.
+async function resolveInvitee(
+  mode: InviteMode,
+  agentEmail: string | null,
+  ctx: ToolpackCtx,
+): Promise<{ email: string | null; notSent: string | null }> {
+  if (mode === null) return { email: null, notSent: null };
+  if (mode === "agent") {
+    return agentEmail
+      ? { email: agentEmail, notSent: null }
+      : { email: null, notSent: "no attendeeEmail was given" };
+  }
+  let email: string | null;
+  try {
+    email = (await ctx.readContactEmail?.())?.trim() || null;
+  } catch (err) {
+    logger.warn({ err }, "gcal: contact email read failed");
+    return {
+      email: null,
+      notSent: "the contact's email could not be read from Chatwoot",
+    };
+  }
+  // Google refuses the whole insert over a malformed attendee, so an address that is not one books
+  // the slot without an invite instead of losing it.
+  return email && EMAIL_SHAPE.test(email)
+    ? { email, notSent: null }
+    : { email: null, notSent: "the contact has no email address" };
+}
+
+// The create's arguments as the model sees them: attendeeEmail exists only in "agent" mode, so in
+// the other modes a prompt has nowhere to put an address.
+function createArgSchema(allowed: string[], mode: InviteMode): z.ZodTypeAny {
+  const schema =
+    mode === "agent"
+      ? CREATE_EVENT_SCHEMA
+      : CREATE_EVENT_SCHEMA.omit({ attendeeEmail: true });
+  return calendarArgSchema(schema, allowed);
+}
+
+function inviteDescription(mode: InviteMode): string {
+  if (mode === "contact")
+    return " The customer is invited at the email on their contact record and Google emails them the invite (invitedEmail in the reply); when the reply has inviteNotSent, nobody was invited, so do not promise an invite. To invite an address the customer just gave, save it on the contact first, then create the appointment.";
+  if (mode === "agent")
+    return " Pass attendeeEmail with the email the customer gave in this conversation and Google emails them the invite (invitedEmail in the reply). Without it, nobody is invited.";
+  return "";
+}
+
 function buildCreateEventTool(
   sel: IntegrationSelection,
   ctx: ToolpackCtx,
@@ -1222,6 +1283,7 @@ function buildCreateEventTool(
   const meetEnabled = resolveCreateMeetLink(sel.config);
   const blockingIds = resolveBlockingCalendarIds(sel.config);
   const businessHoursId = resolveBusinessHoursId(sel.config);
+  const inviteMode = mutedTurn(ctx) ? null : resolveInviteMode(sel.config);
   return failableTool(
     async (input: {
       summary: string;
@@ -1229,9 +1291,19 @@ function buildCreateEventTool(
       end: string;
       description?: string;
       calendarId?: string;
+      attendeeEmail?: string;
     }) => {
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
+      // Checked before anything leaves, so a refused address books nothing. The arg only exists in
+      // "agent" mode (createArgSchema), so in the others it never reaches here.
+      const agentEmail = input.attendeeEmail?.trim() || null;
+      if (agentEmail !== null && !EMAIL_SHAPE.test(agentEmail)) {
+        ctx.onNoEffect?.("calendar_create_event");
+        return toolFailure(
+          "attendeeEmail must be one email address. Nothing was booked; ask the customer for their email again, or book without it.",
+        );
+      }
       const token = await resolveToken(sel, ctx);
       if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
@@ -1251,6 +1323,7 @@ function buildCreateEventTool(
         excludeBusy: null,
       });
       if (!judged.ok) return judged.refusal;
+      const invite = await resolveInvitee(inviteMode, agentEmail, ctx);
       const body: Record<string, unknown> = {
         summary: input.summary,
         start: toEventTime(input.start, timeZone),
@@ -1258,6 +1331,7 @@ function buildCreateEventTool(
         ...(input.description ? { description: input.description } : {}),
         // Owner stamp injected from context, never from the model: locks this appointment to the contact.
         extendedProperties: { private: { [SECV4_CONTACT_KEY]: stamp } },
+        ...(invite.email ? { attendees: [{ email: invite.email }] } : {}),
         // NOTE: a Meet room for the appointment. requestId MUST be unique per event: Google returns the
         // SAME room for a reused id, which would put different leads in one meeting.
         ...(meetEnabled
@@ -1271,12 +1345,17 @@ function buildCreateEventTool(
             }
           : {}),
       };
+      // Without conferenceDataVersion=1 the API IGNORES conferenceData in silence — no error,
+      // no room. Easy to lose in a refactor; pinned by tests. Without sendUpdates=all Google adds the
+      // attendee and emails nobody, so the customer never learns of the invite.
+      const query = new URLSearchParams();
+      if (meetEnabled) query.set("conferenceDataVersion", "1");
+      if (invite.email) query.set("sendUpdates", "all");
+      const qs = query.size > 0 ? `?${query}` : "";
       let res: GcalResponse;
       try {
         res = await gcalFetch(
-          // NOTE: without conferenceDataVersion=1 the API IGNORES conferenceData in silence — no error,
-          // no room. Easy to lose in a refactor; pinned by tests.
-          `/calendars/${encodeURIComponent(calendarId)}/events${meetEnabled ? "?conferenceDataVersion=1" : ""}`,
+          `/calendars/${encodeURIComponent(calendarId)}/events${qs}`,
           { method: "POST", token, body },
           ctx,
         );
@@ -1318,11 +1397,10 @@ function buildCreateEventTool(
           logger.warn({ err }, "gcal: meet-link re-read failed");
         }
       }
-      // Tell the platform an appointment now stands here (best-effort; unwired on the playground).
-      // The reminder POLICY is read from THIS integration's config and is what the toggle decides;
-      // the RECORD is written either way, because the follow-up pause, the console indicator and the
-      // agent's own prompt read it and none of them is about sending a reminder (issue #376).
-      // startISO from the canonical response, then the input.
+      // Tell the platform an appointment now stands here (best-effort; unwired on the
+      // playground). The reminder POLICY comes from THIS integration's config; the RECORD is
+      // written either way, because the follow-up pause, the console indicator and the agent's
+      // prompt read it. startISO from the canonical response, then the input.
       const startISO = flattenTime(data.start) ?? input.start;
       const apptCfg = readAppointmentReminderConfig(sel.config);
       if (ctx.appointmentBooked && startISO) {
@@ -1342,15 +1420,19 @@ function buildCreateEventTool(
           calendarLabel: labels[calendarId] ?? null,
         });
       }
-      return JSON.stringify(projectEvent(data));
+      return JSON.stringify({
+        ...projectEvent(data),
+        ...(invite.email ? { invitedEmail: invite.email } : {}),
+        ...(invite.notSent ? { inviteNotSent: invite.notSent } : {}),
+      });
     },
     {
       name: "calendar_create_event",
       description: withCalendarContext(
-        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end, as ISO 8601 with an offset (e.g. 2026-06-20T14:00:00-03:00). The requested time is CHECKED against the same availability calendar_check_availability answers with — the service hours, the appointment length, the start times the business offers, the minimum notice and the existing bookings — and a time that tool would not have offered is refused, with the bookable times of that day in the refusal so you can offer one instead. So book a slot exactly as availability returned it: never round it, shift it or invent a time in between. Returns the created appointment's id and links${meetEnabled ? "; share meetLink (the Google Meet room) with the customer — htmlLink is only the calendar page" : ""}.`,
+        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end, as ISO 8601 with an offset (e.g. 2026-06-20T14:00:00-03:00). The requested time is CHECKED against the same availability calendar_check_availability answers with — the service hours, the appointment length, the start times the business offers, the minimum notice and the existing bookings — and a time that tool would not have offered is refused, with the bookable times of that day in the refusal so you can offer one instead. So book a slot exactly as availability returned it: never round it, shift it or invent a time in between. Returns the created appointment's id and links${meetEnabled ? "; share meetLink (the Google Meet room) with the customer — htmlLink is only the calendar page" : ""}.${inviteDescription(inviteMode)}`,
         calendarContextXml(allowed, labels),
       ),
-      schema: calendarArgSchema(CREATE_EVENT_SCHEMA, allowed),
+      schema: createArgSchema(allowed, inviteMode),
     },
   );
 }
@@ -1396,7 +1478,7 @@ function buildUpdateEventTool(
       let owner: GcalResponse;
       try {
         owner = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties,start,end`,
+          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties,start,end,attendees`,
           { method: "GET", token },
           ctx,
         );
@@ -1412,14 +1494,10 @@ function buildUpdateEventTool(
       }
       const ownerEv = (owner.json ?? {}) as Record<string, unknown>;
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
-      // A move is judged by the same rule a create is (issue #345). Only a move: an edit that leaves
-      // start and end alone changes nothing availability has an opinion about, and paying a read to
-      // rename an appointment would be a request for nothing.
-      //
-      // "A move" is the INSTANTS differing, not the fields being present. A caller that resends the
-      // times it already has while changing the summary is renaming, and judging that would refuse
-      // the rename because the appointment is now in the past, or inside the minimum notice, or
-      // outside service hours the operator changed after it was booked.
+      // A move is judged by the same rule a create is, and only a move. "A move" is the
+      // INSTANTS differing, not the fields being present: a caller resending the current times
+      // while renaming would otherwise be refused for a past time, the minimum notice, or
+      // since-changed service hours.
       const currentStart = flattenTime(ownerEv.start);
       const currentEnd = flattenTime(ownerEv.end);
       const nextStart = input.start ?? currentStart;
@@ -1477,7 +1555,7 @@ function buildUpdateEventTool(
       let res: GcalResponse;
       try {
         res = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}`,
+          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}${notifyQuery(ownerEv, ctx)}`,
           { method: "PATCH", token, body },
           ctx,
         );
@@ -1554,7 +1632,7 @@ function buildCancelEventTool(
       let owner: GcalResponse;
       try {
         owner = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties`,
+          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}?fields=extendedProperties,attendees`,
           { method: "GET", token },
           ctx,
         );
@@ -1573,7 +1651,7 @@ function buildCancelEventTool(
       let res: GcalResponse;
       try {
         res = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}`,
+          `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(input.eventId)}${notifyQuery(ownerEv, ctx)}`,
           { method: "DELETE", token },
           ctx,
         );
@@ -1584,7 +1662,7 @@ function buildCancelEventTool(
         );
       }
       // 204 No Content is the success shape; 410 Gone means it was already cancelled (idempotent).
-      // BOTH retire the local record, and 410 is the one that used to slip past: the appointment is
+      // BOTH retire the local record, 410 included, which is easy to miss: the appointment is
       // gone in Google either way, and leaving the record behind keeps the follow-up paused and the
       // appointment in the agent's prompt until its start passes. The ownership gate has already run
       // by here — the owner fetch succeeded and its stamp matched — so this is known to be THIS

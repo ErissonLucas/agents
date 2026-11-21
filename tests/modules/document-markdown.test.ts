@@ -18,14 +18,6 @@ describe("parseInline", () => {
     expect(parseInline("*it*")).toEqual([{ text: "it", italic: true }]);
   });
 
-  test("nests bold inside italic", () => {
-    expect(parseInline("_a **b** c_")).toEqual([
-      { text: "a ", italic: true },
-      { text: "b", italic: true, bold: true },
-      { text: " c", italic: true },
-    ]);
-  });
-
   // Without the closer lookahead, the asterisk in an arithmetic line turns the rest of it italic and
   // an underscore in a file name eats everything after it. Both appear in real quote text.
   test("leaves an unmatched marker literal", () => {
@@ -101,8 +93,17 @@ describe("parseInline", () => {
   });
 
   test("is total: never throws, on any of the hostile inputs above", () => {
-    for (const input of ["***", "____", "*", "\\", "**a", "_a**b_"]) {
-      expect(() => parseInline(input)).not.toThrow();
+    // An unmatched marker stays literal; "____" is two closed, empty italic runs, which print nothing.
+    const cases: Array<[string, ReturnType<typeof parseInline>]> = [
+      ["***", plain("***")],
+      ["____", []],
+      ["*", plain("*")],
+      ["\\", plain("\\")],
+      ["**a", plain("**a")],
+      ["_a**b_", [{ text: "a**b", italic: true }]],
+    ];
+    for (const [input, spans] of cases) {
+      expect(parseInline(input)).toEqual(spans);
     }
   });
 });

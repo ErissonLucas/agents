@@ -2,6 +2,8 @@ import {
   Bot,
   ChevronLeft,
   ChevronRight,
+  MessageSquare,
+  Phone,
   Plus,
   RadioTower,
   Search,
@@ -14,6 +16,7 @@ import {
   Badge,
   Button,
   Card,
+  ChoiceCards,
   DataBoundary,
   EmptyState,
   FilterPills,
@@ -33,6 +36,7 @@ import { api } from "@/client/lib/api";
 import { apiErrorMessage } from "@/client/lib/apiError";
 import { providerLabel } from "@/client/lib/providerLabels";
 import { formatDateTime, formatRelativeTime } from "@/client/lib/utils";
+import { CALL_LLMS, readCallsConfig } from "@/modules/voice-call/settings";
 
 // Types derived from the Eden treaty — never hand-declared (see docs/eden-treaty.md).
 type AgentsData = Awaited<ReturnType<typeof api.api.v1.agents.get>>["data"];
@@ -46,6 +50,15 @@ const PAGE_SIZE = 20;
 // The one key the create body carries. The import next to it sends a whole bundle under `export`,
 // and its refusals are about elements inside that file rather than about an input on this page.
 const CREATE_AGENT_FIELDS = ["name"] as const;
+
+type AgentKind = "text" | "voice";
+
+/**
+ * Whether the create modal offers the call agent. When it does not, a new agent is a text agent;
+ * call agents that already exist keep their editor, badge and inbox picker, and the API still
+ * creates one with `kind: "voice"`.
+ */
+const OFFER_VOICE_AGENT = false;
 
 export function AgentsPage() {
   const { t, i18n } = useTranslation();
@@ -62,6 +75,7 @@ export function AgentsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [name, setName] = useState("");
+  const [kind, setKind] = useState<AgentKind>("text");
   const refusal = useFieldRefusal(
     createModal.isOpen ? CREATE_AGENT_FIELDS : [],
   );
@@ -131,6 +145,7 @@ export function AgentsPage() {
 
   function openCreate() {
     setName("");
+    setKind("text");
     // The component outlives the dialog, so a mark from the last session is still held here.
     refusal.clear();
     createModal.open();
@@ -182,7 +197,7 @@ export function AgentsPage() {
   async function create() {
     if (!name.trim()) return;
     setCreating(true);
-    const sent = { name: name.trim() };
+    const sent = { name: name.trim(), kind };
     try {
       const { data, error: err } = await api.api.v1.agents.post(sent);
       if (err || !data) throw err ?? new Error("no data");
@@ -206,12 +221,12 @@ export function AgentsPage() {
     <PageContainer className="flex flex-col gap-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <Bot className="h-6 w-6 text-accent" aria-hidden="true" />
+          <Bot className="text-accent h-6 w-6" aria-hidden="true" />
           <div>
-            <h1 className="font-semibold text-text-primary text-xl">
+            <h1 className="text-text-primary text-xl font-semibold">
               {t("agents.title", "Agents")}
             </h1>
-            <p className="mt-0.5 text-sm text-text-muted">
+            <p className="text-text-muted mt-0.5 text-sm">
               {t(
                 "agents.subtitle",
                 "Build and configure each AI agent: prompt, model, tools and behavior.",
@@ -247,7 +262,7 @@ export function AgentsPage() {
         <div className="flex flex-col gap-3">
           <div className="relative min-w-0 flex-1">
             <Search
-              className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted"
+              className="text-text-muted pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2"
               aria-hidden="true"
             />
             <input
@@ -256,7 +271,7 @@ export function AgentsPage() {
               onChange={(e) => setSearch(e.target.value)}
               placeholder={t("agents.search", "Search by name…")}
               aria-label={t("agents.search", "Search by name…")}
-              className="w-full rounded-lg border border-border bg-bg-tertiary py-2 pr-4 pl-9 text-text-primary placeholder-text-placeholder focus:border-border-focus focus:outline-none"
+              className="border-border-hover bg-bg-tertiary text-text-primary placeholder-text-placeholder focus:border-border-focus focus:ring-accent-soft h-8 w-full rounded-md border pr-2.5 pl-8 text-sm transition-colors focus:ring-2 focus:outline-none"
             />
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3">
@@ -326,16 +341,19 @@ export function AgentsPage() {
         ) : (
           <div className="flex flex-col gap-3">
             {agents.map((a, i) => {
-              const label = modelLabel(a.modelConfig);
+              const calls = a.kind === "voice" && readCallsConfig(a.settings);
+              const label = calls
+                ? `${providerLabel(calls.provider, t)} · ${CALL_LLMS.find((m) => m.id === calls.llm)?.label ?? calls.llm}`
+                : modelLabel(a.modelConfig);
               return (
                 <Link key={a.id} to={`/agents/${a.id}`} className="block">
-                  <Card className="flex items-center justify-between gap-4 transition-colors hover:bg-bg-hover">
-                    <span className="w-6 shrink-0 text-right text-text-muted text-xs tabular-nums">
+                  <Card className="hover:bg-bg-hover flex items-center justify-between gap-4 transition-colors">
+                    <span className="text-text-muted w-6 shrink-0 text-right text-xs tabular-nums">
                       {(page - 1) * PAGE_SIZE + i + 1}
                     </span>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-center gap-2">
-                        <span className="truncate font-medium text-text-primary">
+                        <span className="text-text-primary truncate font-medium">
                           {a.name}
                         </span>
                         <Badge variant={a.enabled ? "success" : "secondary"}>
@@ -345,13 +363,22 @@ export function AgentsPage() {
                         </Badge>
                         {a.mode === "test" && <TestModeBadge state="agent" />}
                         {a.mode === "monitoring" && <MonitoringBadge />}
+                        {a.kind === "voice" && (
+                          <Badge
+                            variant="secondary"
+                            className="flex items-center gap-1"
+                          >
+                            <Phone className="h-3 w-3" aria-hidden="true" />
+                            {t("agents.kindVoiceBadge", "Calls")}
+                          </Badge>
+                        )}
                         {a.outOfHours && <OutOfHoursBadge />}
                       </div>
-                      <p className="mt-0.5 truncate text-text-muted text-xs">
+                      <p className="text-text-muted mt-0.5 truncate text-xs">
                         {label || t("agents.noModel", "No model configured")}
                       </p>
                       {a.inboxes.length > 0 && (
-                        <p className="mt-0.5 flex items-center gap-1 truncate text-text-muted text-xs">
+                        <p className="text-text-muted mt-0.5 flex items-center gap-1 truncate text-xs">
                           <RadioTower
                             className="h-3 w-3 shrink-0"
                             aria-hidden="true"
@@ -361,7 +388,7 @@ export function AgentsPage() {
                           </span>
                         </p>
                       )}
-                      <p className="mt-0.5 truncate text-text-muted text-xs">
+                      <p className="text-text-muted mt-0.5 truncate text-xs">
                         {t("agents.createdRelative", "Created {{when}}", {
                           when: formatRelativeTime(a.createdAt, i18n.language),
                         })}
@@ -381,7 +408,7 @@ export function AgentsPage() {
                       </p>
                     </div>
                     <ChevronRight
-                      className="h-5 w-5 shrink-0 text-text-muted"
+                      className="text-text-muted h-5 w-5 shrink-0"
                       aria-hidden="true"
                     />
                   </Card>
@@ -445,23 +472,63 @@ export function AgentsPage() {
           </div>
         }
       >
-        <FormField
-          label={t("agents.name", "Name")}
-          required
-          description={t(
-            "agents.createHint",
-            "You'll configure the prompt, model and tools next.",
+        <div className="flex flex-col gap-4">
+          {OFFER_VOICE_AGENT && (
+            <FormField
+              label={t("agents.kind", "What it answers")}
+              description={t(
+                "agents.kindHint",
+                "The type is set at creation. For the other one, create another agent.",
+              )}
+            >
+              <ChoiceCards
+                value={kind}
+                onChange={setKind}
+                aria-label={t("agents.kind", "What it answers")}
+                className="sm:grid-cols-2"
+                options={[
+                  {
+                    value: "text",
+                    icon: MessageSquare,
+                    title: t("agents.kindText", "Messages"),
+                    hint: t(
+                      "agents.kindTextHint",
+                      "Answers conversations by text, and by voice note when audio replies are on.",
+                    ),
+                    testId: "kind-text",
+                  },
+                  {
+                    value: "voice",
+                    icon: Phone,
+                    title: t("agents.kindVoice", "WhatsApp calls"),
+                    hint: t(
+                      "agents.kindVoiceHint",
+                      "Talks by voice with whoever calls your WhatsApp. You will need a key from a voice provider.",
+                    ),
+                    testId: "kind-voice",
+                  },
+                ]}
+              />
+            </FormField>
           )}
-          error={refusal.at("name", name.trim())}
-        >
-          <Input
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") create();
-            }}
-          />
-        </FormField>
+          <FormField
+            label={t("agents.name", "Name")}
+            required
+            description={t(
+              "agents.createHint",
+              "You'll configure the prompt, model and tools next.",
+            )}
+            error={refusal.at("name", name.trim())}
+          >
+            <Input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") create();
+              }}
+            />
+          </FormField>
+        </div>
       </Modal>
     </PageContainer>
   );

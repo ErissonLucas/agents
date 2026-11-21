@@ -47,8 +47,9 @@ export const mockTenantCreate = mock<() => Promise<MockTenantEntity>>();
 export const mockQueryRaw =
   mock<() => Promise<Array<Record<string, number>>>>();
 export const mockExecuteRaw = mock<() => Promise<number>>();
+export const mockEndedSessionCount = mock<() => Promise<number>>();
 
-// NOTE: one place to keep the default async return values so declarations
+// One place to keep the default async return values so declarations
 // and `resetPrismaMocks` can't drift out of sync. `mockReset()` clears the
 // impl, which would leave the mock returning `undefined` and silently break
 // any test that relied on the default.
@@ -63,14 +64,15 @@ function applyDefaultPrismaMockImplementations() {
   mockTenantCreate.mockImplementation(() => Promise.resolve(mockTenant));
   mockQueryRaw.mockImplementation(() => Promise.resolve([{ 1: 1 }]));
   mockExecuteRaw.mockImplementation(() => Promise.resolve(1));
+  mockEndedSessionCount.mockImplementation(() => Promise.resolve(0));
 }
 
 applyDefaultPrismaMockImplementations();
 
 // THE ENTITY KEEPS THE SESSION'S SHAPE, one tenant and one role, because that is what every test
 // states ("an admin of tenant 1", "a fleet administrator"). The schema stores it as a PERSON with a
-// membership per tenant (issue #756), so the reads the code makes are answered in that shape: the
-// fleet role becomes `isSuperAdmin`, and a tenant role becomes the one membership. The mock functions
+// membership per tenant, so the reads the code makes are answered in that shape: the fleet role
+// becomes `isSuperAdmin`, and a tenant role becomes the one membership. The mock functions
 // themselves stay what the tests configure and assert on.
 export interface MockPersonRow
   extends Omit<MockUserEntity, "role" | "tenantId"> {
@@ -98,10 +100,16 @@ export function asPersonRow(
   };
 }
 
+// The memberships of the person the last read returned: a read that loads them in a call of their
+// own (the session lookup under a metrics deadline, src/api/lib/auth.ts) gets the same ones.
+let lastPerson: MockPersonRow | null | undefined;
+
 const personRead =
   <A extends unknown[]>(fn: (...args: A) => Promise<MockUser>) =>
-  async (...args: A) =>
-    asPersonRow(await fn(...args));
+  async (...args: A) => {
+    lastPerson = asPersonRow(await fn(...args));
+    return lastPerson;
+  };
 
 interface PrismaMockClient {
   user: {
@@ -115,6 +123,13 @@ interface PrismaMockClient {
   tenant: {
     findFirst: typeof mockTenantFindFirst;
     create: typeof mockTenantCreate;
+  };
+  endedSession: {
+    count: typeof mockEndedSessionCount;
+    findMany: (...args: unknown[]) => Promise<unknown>;
+  };
+  tenantUser: {
+    findMany: (...args: unknown[]) => Promise<unknown>;
   };
   $queryRaw: typeof mockQueryRaw;
   $executeRaw: typeof mockExecuteRaw;
@@ -139,6 +154,14 @@ export const prismaMock: PrismaMockClient = {
     findFirst: mockTenantFindFirst,
     create: mockTenantCreate,
   },
+  // The session's own ended-session read, under a metrics deadline (src/api/lib/auth.ts): not ended.
+  endedSession: {
+    count: mockEndedSessionCount,
+    findMany: () => Promise.resolve([]),
+  },
+  tenantUser: {
+    findMany: () => Promise.resolve(lastPerson?.memberships ?? []),
+  },
   $queryRaw: mockQueryRaw,
   $executeRaw: mockExecuteRaw,
   // NOTE: Interactive-transaction form only: invoke the callback with the same
@@ -149,8 +172,13 @@ export const prismaMock: PrismaMockClient = {
   $extends: () => prismaMock,
 };
 
+// Both pools a request can authenticate through (the metrics routes use their own) answer from the
+// same mock.
 export function setupPrismaMock() {
   mock.module("@/api/lib/prisma", () => ({
+    default: prismaMock,
+  }));
+  mock.module("@/api/lib/prisma-metrics", () => ({
     default: prismaMock,
   }));
 }
@@ -166,5 +194,6 @@ export function resetPrismaMocks() {
   mockTenantCreate.mockReset();
   mockQueryRaw.mockReset();
   mockExecuteRaw.mockReset();
+  mockEndedSessionCount.mockReset();
   applyDefaultPrismaMockImplementations();
 }

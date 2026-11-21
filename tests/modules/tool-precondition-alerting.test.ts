@@ -9,34 +9,38 @@ import {
 import type { ToolPrecondition } from "@/modules/agents/tool-preconditions";
 import type { FlowContext } from "@/modules/flowlog/service";
 import { writeFlowEvent } from "@/modules/flowlog/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { flowLogCount } from "../utils/flowlog";
 
-// PR #378 states, in its body and in the seam's own header, that a precondition refusing a call does
-// NOT page an alert channel — the rule doing its job is the system working, not an incident. That
-// sentence had no number behind it, and reading the CHANNEL's minLevel gate alone
-// (`LEVEL_RANK[ch.minLevel] > rank`) suggests the opposite: `info` ranks 0, so a channel at minLevel
-// `info` would pass it. The gate that actually decides is one level up, at the EMITTER
-// (`level === "warn" || level === "error"`), so an info event never reaches the dispatcher at all.
-//
-// Measured here against a real database, with a channel deliberately configured BELOW what the
-// console can produce (it offers warn|error, default error) — the strongest case, and one the MCP
-// schema (`z.enum(FLOW_LEVELS)`) can actually create.
+// A precondition refusing a call does NOT page an alert channel: the rule doing its job is not an
+// incident. The CHANNEL's minLevel gate alone suggests otherwise (`info` ranks 0), but the EMITTER
+// decides first (`level === "warn" || level === "error"`), so an info event never reaches the
+// dispatcher. Run against a real database with a channel at minLevel `info`, below what the console
+// offers but creatable through MCP (`z.enum(FLOW_LEVELS)`): the strongest case. The dispatcher runs
+// on the APP role, as in production, so RLS fences the channels it reads to this file's tenant; the
+// superuser only seeds and counts.
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
 let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
 if (appUrl && suUrl) {
   try {
     su = new PrismaClient({
       adapter: new PrismaPg({ connectionString: suUrl }),
     });
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
     await su.$queryRaw`SELECT 1`;
+    await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
+const appDb = app as PrismaClient;
 
 describe.skipIf(!dbUp)("a precondition refusal does not page anyone", () => {
   let tenantId = 0n;
@@ -66,18 +70,19 @@ describe.skipIf(!dbUp)("a precondition refusal does not page anyone", () => {
       await suDb.tenant.delete({ where: { id: tenantId } }).catch(() => {});
     }
     await su?.$disconnect();
+    await app?.$disconnect();
   });
 
   const flow = (): FlowContext => ({
     tenantId,
     turnId: crypto.randomUUID(),
-    // `inbox`, not `playground`: real traffic is the only source that pages at all, so measuring on
+    // NOTE: `inbox`, not `playground`: real traffic is the only source that pages at all, so
     // playground would prove nothing about the claim.
     source: "inbox",
-    base: suDb,
+    base: appDb,
   });
 
-  // NOTE: Built by the PRODUCTION constructor, not written out here. A hand-written literal would keep
+  // Built by the PRODUCTION constructor, not written out here. A hand-written literal would keep
   // passing after the mapping it is supposed to measure was changed — the level is exactly the field
   // under test, so a second copy of it is the one thing this file must not contain.
   const cond: ToolPrecondition = {
@@ -95,7 +100,7 @@ describe.skipIf(!dbUp)("a precondition refusal does not page anyone", () => {
     const ctx = flow();
     const { delivered } = await writeFlowEvent(
       ctx,
-      preconditionFlowEvent({ tool, cond, reason: "unmet" }),
+      preconditionFlowEvent({ tool, unmet: [cond], reason: "unmet" }),
     );
     expect(delivered).toBe(true);
 
@@ -108,20 +113,17 @@ describe.skipIf(!dbUp)("a precondition refusal does not page anyone", () => {
     );
   });
 
-  // Round 5 of PR #378: this refusal used to be indistinguishable from the one above. A pool timeout
-  // refuses EVERY guarded call for as long as it lasts, and the only trace was an `info`/`ok` line
-  // saying the rule had fired — an agent whose tools all went quiet, with nothing to alert on.
-  //
-  // It doubles as the positive control the previous test needs: without a line that DOES page,
-  // "no alert" passes just as well against a channel that never matches, a stage allowlist that
-  // excludes `tool`, or a dispatcher that is not wired at all.
+  // NOTE: a pool timeout refuses EVERY guarded call while it lasts, so it must page, unlike the
+  // refusal above. It doubles as that test's positive control: without a line that DOES page, "no
+  // alert" passes against a channel that never matches, a stage allowlist without `tool`, or a
+  // dispatcher not wired at all.
   test("a state read that FAILED does page, and that is what makes the check above non-vacuous", async () => {
     const before = await suDb.alertDelivery.count({ where: { tenantId } });
     await writeFlowEvent(
       flow(),
       preconditionFlowEvent({
         tool,
-        cond,
+        unmet: [cond],
         reason: "unreadable",
         err: new Error("connection terminated"),
       }),

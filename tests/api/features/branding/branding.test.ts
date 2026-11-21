@@ -5,7 +5,7 @@ import {
   toDto,
 } from "@/api/features/branding/branding.service";
 
-// Footer-link white-labeling (issue #4): the sanitizers are the single gate between operator
+// Footer-link white-labeling: the sanitizers are the single gate between operator
 // input and an href/mailto: in every visitor's sidebar, so they are pinned here. The write
 // validation errors throw BEFORE any DB access, so they run without Postgres. The
 // updateBrandingColors block is Full-only: in the Free edition that module is the
@@ -88,6 +88,8 @@ describe("toDto footer-link fields (defense in depth on read)", () => {
     logoLightKey: null,
     faviconDarkKey: null,
     faviconLightKey: null,
+    markDarkKey: null as string | null,
+    markLightKey: null as string | null,
     siteUrl: null as string | null,
     supportEmail: null as string | null,
     hideGithubLink: false,
@@ -116,5 +118,11 @@ describe("toDto footer-link fields (defense in depth on read)", () => {
     expect(dto.siteUrl).toBeNull();
     expect(dto.supportEmail).toBeNull();
     expect(dto.hideGithubLink).toBe(false);
+  });
+
+  test("reports which icon variants are stored, apart from the favicon", () => {
+    const dto = toDto({ ...row, markDarkKey: "mark-dark-abc.png" });
+    expect(dto.mark).toEqual({ dark: true, light: false });
+    expect(dto.favicon).toEqual({ dark: false, light: false });
   });
 });

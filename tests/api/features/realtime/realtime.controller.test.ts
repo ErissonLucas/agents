@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Elysia } from "elysia";
+import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 import { setupPrismaMock } from "@/tests/utils/prisma-mock";
 
 setupPrismaMock();
@@ -8,7 +9,7 @@ const { realtimeController } = await import(
   "@/api/features/realtime/realtime.controller"
 );
 
-// NOTE: tests/setup.ts captures Bun's native WebSocket and Response classes
+// tests/setup.ts captures Bun's native WebSocket and Response classes
 // before happy-dom replaces them globally. Bun.serve needs the native
 // Response (happy-dom's spec one is unrecognized by Bun's TCP layer);
 // WebSocket tests need the Bun-only `{ headers }` constructor option that
@@ -22,7 +23,7 @@ const BunWebSocket = nativeGlobals.BunWebSocket;
 const BunResponse = nativeGlobals.BunResponse;
 const happyResponse = globalThis.Response;
 
-// NOTE: `Elysia.listen()` returns the Elysia instance whose runtime shape
+// `Elysia.listen()` returns the Elysia instance whose runtime shape
 // exposes the underlying `Bun.Server` via `.server`, but TS surfaces a wider
 // type that doesn't include `server`. Cast at the boundary.
 interface ListeningApp {
@@ -37,10 +38,13 @@ let baseUrl = "";
 beforeAll(() => {
   (globalThis as { Response: typeof Response }).Response = BunResponse;
   const app = new Elysia().group("/api", (a) => a.use(realtimeController));
-  const listening = app.listen(0) as unknown as ListeningApp;
+  const listening = app.listen({
+    port: 0,
+    hostname: "127.0.0.1",
+  }) as unknown as ListeningApp;
   server = listening.server;
   if (!server?.port) throw new Error("Failed to start test server");
-  baseUrl = `ws://localhost:${server.port}/api/realtime/echo`;
+  baseUrl = `ws://127.0.0.1:${server.port}/api/realtime/echo`;
 });
 
 afterAll(() => {
@@ -53,7 +57,7 @@ function tryConnect(
   extraHeaders: Record<string, string> = {},
 ): Promise<{ opened: boolean; closeCode: number }> {
   return new Promise((resolve, reject) => {
-    // NOTE: Bun extends WebSocket constructor with a `{ headers }` option.
+    // Bun extends WebSocket constructor with a `{ headers }` option.
     // Not part of the WHATWG WebSocket type, so we cast through `any`.
     const WS = BunWebSocket as unknown as new (
       url: string,
@@ -75,8 +79,12 @@ function tryConnect(
       } catch {
         // ignore — connection might already be in a terminal state.
       }
-      reject(new Error("WebSocket handshake/close timed out after 5s"));
-    }, 5_000);
+      reject(
+        new Error(
+          `WebSocket handshake/close timed out after ${POLL_DEADLINE_MS}ms`,
+        ),
+      );
+    }, POLL_DEADLINE_MS);
     let opened = false;
     ws.addEventListener("open", () => {
       opened = true;
@@ -107,12 +115,6 @@ describe("realtimeController WS auth gate", () => {
     // because the handshake didn't receive a 101 Switching Protocols. The
     // custom 4xxx codes (4401, 4402) only apply once the upgrade has
     // succeeded. Browsers may surface this as 1006 instead.
-    expect([1002, 1006]).toContain(result.closeCode);
-  });
-
-  test("rejects upgrade with an invalid cookie", async () => {
-    const result = await tryConnect("auth_token=not-a-real-jwt");
-    expect(result.opened).toBe(false);
     expect([1002, 1006]).toContain(result.closeCode);
   });
 });

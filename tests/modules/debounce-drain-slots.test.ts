@@ -19,12 +19,13 @@ import {
   enqueueJob,
   reapStaleJobs,
 } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #807, on real rows and through the real interval: a DEBOUNCE job whose run never settles
-// must not stop the lane from claiming the next due job, of another tenant, and the row of the job
-// still in flight must not be run a second time when it becomes claimable again — by a re-arm (a
-// message arriving during the flush upserts the same row back to PENDING) or by the reaper. The
-// run itself is injected; the claim, the rows, the re-arm and the reap are the production ones.
+// A DEBOUNCE job whose run never settles must not stop the lane from claiming the next due job, of
+// another tenant, and the row still in flight must not run a second time when it becomes claimable
+// again: by a re-arm (a message arriving during the flush upserts the same row back to PENDING) or
+// by the reaper. The run itself is injected; the claim, the rows, the re-arm and the reap are the
+// production ones.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -42,8 +43,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -51,14 +52,13 @@ const suDb = su as PrismaClient;
 
 let tenantA = 0n;
 let tenantB = 0n;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const past = () => new Date(Date.now() - 1_000);
 
 async function until(cond: () => boolean, ms = 3_000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (cond()) return true;
-    await sleep(10);
+    await Bun.sleep(10);
   }
   return cond();
 }
@@ -148,6 +148,13 @@ describe.skipIf(!dbUp)("debounce drain: slots instead of batches", () => {
     const runs: bigint[] = [];
     let rowA = 0n;
     const runsOf = (id: bigint) => runs.filter((r) => r === id).length;
+    // Claims that have returned, which is how the test counts drains that had their chance at a row.
+    let claimsDone = 0;
+    const claim: NonNullable<DebounceTickDeps["claim"]> = async (...args) => {
+      const out = await claimMine(...args);
+      claimsDone += 1;
+      return out;
+    };
     const run = async (job: ClaimedJob) => {
       runs.push(job.id);
       if (job.id === rowA && runsOf(rowA) === 1) await aSettled;
@@ -161,7 +168,7 @@ describe.skipIf(!dbUp)("debounce drain: slots instead of batches", () => {
         base: appDb,
         intervalMs: 20,
         slots: 5,
-        deps: { claim: claimMine, run },
+        deps: { claim, run },
       });
       expect(await until(() => runsOf(rowA) === 1)).toBe(true);
       expect(await statusOf(rowA)).toBe("CLAIMED");
@@ -175,7 +182,10 @@ describe.skipIf(!dbUp)("debounce drain: slots instead of batches", () => {
       // settles.
       await makeClaimableAgain(rowA);
       expect(await statusOf(rowA)).toBe("PENDING");
-      await sleep(200);
+      // Four more claims, so at least three STARTED after A was due again (one may have been under way):
+      // a claim without the exclusion would have taken it.
+      const claimableAt = claimsDone;
+      expect(await until(() => claimsDone >= claimableAt + 4)).toBe(true);
       expect(runsOf(rowA)).toBe(1);
 
       releaseA();

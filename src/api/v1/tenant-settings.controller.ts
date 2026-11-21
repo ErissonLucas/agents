@@ -1,6 +1,8 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
+import { tRanged } from "@/api/lib/ranged";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import config from "@/config";
 import {
   ForbiddenError,
   NotFoundError,
@@ -10,6 +12,7 @@ import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
 import { TEMPLATE_MESSAGE_MAX } from "@/modules/agents/text-caps";
 import { testLangfuseConnection } from "@/modules/analytics/langfuse-test";
+import { APPROVAL_LINK_TEMPLATE_MAX } from "@/modules/documents/approval-link";
 import {
   clearCompanyLogo,
   LOGO_CONTENT_TYPE,
@@ -23,30 +26,33 @@ import {
   PRICE_OVERRIDE_RATE_MAX,
   PRICE_OVERRIDES_MAX,
 } from "@/modules/pricing/overrides";
-import { spendCeilingUsage } from "@/modules/spend-ceiling/service";
 import {
-  SPEND_CEILING_NOTICE_COOLDOWN_MAX_SECONDS,
-  SPEND_CEILING_USD_MAX,
-} from "@/modules/spend-ceiling/settings";
+  getProactiveBreakerStatus,
+  resumeProactiveBreaker,
+} from "@/modules/proactive-breaker/service";
+import { FIXED_LIMIT_RANGE } from "@/modules/proactive-breaker/settings";
+import { spendCeilingUsage } from "@/modules/spend-ceiling/service";
+import { SPEND_CEILING_RANGES } from "@/modules/spend-ceiling/settings";
 import {
   getTenantSettings,
+  LANGFUSE_SAMPLE_RATE_RANGE,
+  type LangfuseSettings,
+  updateApprovalLink,
   updateCompanySettings,
   updateEmbeddingSettings,
   updateLangfuse,
   updatePriceOverrides,
+  updateProactiveBreakerSettings,
   updateSpendCeiling,
 } from "@/modules/tenant-settings/service";
 
-// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
-// src/api/locales/*.json from these lines and prunes anything nothing references, and
-// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
-// throw site rather than an English sentence on a pt-BR caller's screen.
+// The error catalog this controller's routes answer with (`bun i18n:extract` reads these lines).
+// translate('errors.invalidApprovalLinkTemplate', "The approval link must be a full address starting with https:// or http://, with {id} where the request's id goes.")
 // translate('errors.invalidCredentialKind', 'This setting requires a credential of kind {{kind}}.')
 
 // Per-tenant feature settings (TENANT_ADMIN). Embedding (provider/model/credential for RAG) and
 // Langfuse (tracing) configs live in Tenant.settings. Secret VALUES are never returned. The langfuse
-// credential is now a standard vault entry (kind `langfuse`) created via the vault UI — this endpoint
-// only stores the reference. GET exposes `credentialRef` (the picker needs it to show the selection).
+// credential is a vault entry (kind `langfuse`); this endpoint only stores the reference. GET exposes `credentialRef` (the picker needs it to show the selection).
 
 function ctxOrThrow(ctx: TenantContext | null): TenantContext {
   if (!ctx) throw new ForbiddenError();
@@ -55,12 +61,30 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
 }
 
 // translate('errors.invalidPriceOverride', 'Price row {{row}} is not valid: {{reason}}')
+// translate('errors.priceOverrideModelRequired', 'model: a model name is required for this provider')
+// translate('errors.priceOverrideDuplicate', 'model: duplicate provider and model')
+// translate('errors.priceOverrideValidatorSaid', '{{field}}: the validator answered "{{detail}}"')
 function rateField(what: string) {
   return t.Number({
     minimum: 0,
     maximum: PRICE_OVERRIDE_RATE_MAX,
     description: `USD per million tokens: ${what}`,
   });
+}
+
+/**
+ * The Langfuse block as GET and PUT return it, with the deployment's rate beside the tenant's so the
+ * console can show what an empty rate follows.
+ */
+export function langfuseView(langfuse: LangfuseSettings) {
+  return {
+    enabled: langfuse.enabled,
+    credentialRef: langfuse.credentialRef,
+    sendContent: langfuse.sendContent,
+    debug: langfuse.debug,
+    sampleRate: langfuse.sampleRate,
+    defaultSampleRate: config.langfuse.sampleRate,
+  };
 }
 
 export const tenantSettingsController = new Elysia({
@@ -71,27 +95,29 @@ export const tenantSettingsController = new Elysia({
   .get(
     "/",
     async ({ tenantContext }) => {
-      const { embedding, langfuse, company, spendCeiling, priceOverrides } =
-        await getTenantSettings(ctxOrThrow(tenantContext));
+      const {
+        embedding,
+        langfuse,
+        company,
+        spendCeiling,
+        priceOverrides,
+        approvalLink,
+      } = await getTenantSettings(ctxOrThrow(tenantContext));
       return {
         instance: instanceIdentity,
         embedding,
         company,
+        approvalLink,
         spendCeiling,
         priceOverrides,
-        langfuse: {
-          enabled: langfuse.enabled,
-          credentialRef: langfuse.credentialRef,
-          sendContent: langfuse.sendContent,
-          debug: langfuse.debug,
-        },
+        langfuse: langfuseView(langfuse),
       };
     },
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Get tenant settings",
-        "Returns the tenant's embedding, Langfuse, company-profile and token-ceiling settings.",
+        "Returns the tenant's embedding, Langfuse, company-profile, approval-link and token-ceiling settings.",
       ),
       response: errors(401, 403, 404),
     },
@@ -146,12 +172,7 @@ export const tenantSettingsController = new Elysia({
       const langfuse = await updateLangfuse(ctxOrThrow(tenantContext), body);
       return {
         instance: instanceIdentity,
-        langfuse: {
-          enabled: langfuse.enabled,
-          credentialRef: langfuse.credentialRef,
-          sendContent: langfuse.sendContent,
-          debug: langfuse.debug,
-        },
+        langfuse: langfuseView(langfuse),
       };
     },
     {
@@ -179,6 +200,14 @@ export const tenantSettingsController = new Elysia({
               "Debug mode: also send the full tool schemas to every trace (heavy; tool names are always sent).",
           }),
         ),
+        sampleRate: t.Optional(
+          t.Nullable(
+            tRanged(LANGFUSE_SAMPLE_RATE_RANGE, {
+              description:
+                "Share of turns traced, from 0 to 1. A turn is traced whole or not at all. null follows the deployment's LANGFUSE_SAMPLE_RATE (returned as defaultSampleRate).",
+            }),
+          ),
+        ),
       }),
       detail: doc(
         "Update Langfuse settings",
@@ -199,7 +228,7 @@ export const tenantSettingsController = new Elysia({
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Get spend-ceiling usage",
-        "Dollars spent this calendar month per traffic source (as Langfuse last costed them), against the configured ceiling, with the snapshot's health (when it was last refreshed, whether the poll is failing) and the reconciliation against the local ledger (calls Langfuse priced at zero). Returned for both sources whether or not a ceiling is set, so the number is available to whoever has to pick one.",
+        "Dollars spent this calendar month per traffic source, as the usage ledger priced the calls, against the configured ceiling, with the figure's health (when it was last refreshed, whether the poll is failing) and the calls no price covered, by model. Returned for both sources whether or not a ceiling is set, so the number is available to whoever has to pick one.",
       ),
       response: errors(401, 403, 404),
     },
@@ -220,19 +249,21 @@ export const tenantSettingsController = new Elysia({
           t.Boolean({ description: "Whether the spend ceiling is enforced." }),
         ),
         monthlyInboxUsd: t.Optional(
-          t.Number({
-            minimum: 0,
-            maximum: SPEND_CEILING_USD_MAX,
+          tRanged(SPEND_CEILING_RANGES.monthlyUsd, {
             description:
-              "Dollars (USD, as Langfuse costs the month's calls) allowed per calendar month for customer traffic, rounded to the cent. 0 = no ceiling on this half.",
+              "Dollars (USD, as the usage ledger prices the month's calls) allowed per calendar month for customer traffic, rounded to the cent. 0 = no ceiling on this half.",
           }),
         ),
         monthlyPlaygroundUsd: t.Optional(
-          t.Number({
-            minimum: 0,
-            maximum: SPEND_CEILING_USD_MAX,
+          tRanged(SPEND_CEILING_RANGES.monthlyUsd, {
             description:
               "The same, for playground traffic. Kept apart so testing cannot silence the agent for customers.",
+          }),
+        ),
+        monthlyClientUsd: t.Optional(
+          tRanged(SPEND_CEILING_RANGES.monthlyUsd, {
+            description:
+              "The same, for client channel traffic (the users of host applications that embed the agent). Kept apart so a host cannot silence the agent for the inbox, or the other way round.",
           }),
         ),
         overCeilingMessage: t.Optional(
@@ -248,17 +279,13 @@ export const tenantSettingsController = new Elysia({
           }),
         ),
         noticeCooldownSeconds: t.Optional(
-          t.Integer({
-            minimum: 0,
-            maximum: SPEND_CEILING_NOTICE_COOLDOWN_MAX_SECONDS,
+          tRanged(SPEND_CEILING_RANGES.noticeCooldownSeconds, {
             description:
               "Cooldown on the customer copy and the operator note. Never on the verdict, which is evaluated every message.",
           }),
         ),
         warnAtPercent: t.Optional(
-          t.Integer({
-            minimum: 0,
-            maximum: 100,
+          tRanged(SPEND_CEILING_RANGES.warnAtPercent, {
             description:
               "Warn through the alert channels once usage crosses this percentage of a ceiling. 0 = no warning.",
           }),
@@ -269,6 +296,73 @@ export const tenantSettingsController = new Elysia({
         "Updates the tenant's monthly spend ceiling.",
       ),
       response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .get(
+    "/proactive-breaker",
+    async ({ tenantContext }) => ({
+      instance: instanceIdentity,
+      proactiveBreaker: await getProactiveBreakerStatus(
+        ctxOrThrow(tenantContext),
+      ),
+    }),
+    {
+      detail: doc(
+        "Get the proactive breaker",
+        "The account-wide breaker for proactive messages: its mode (`auto`, `fixed` or `off`), the limit in force and, for the automatic one, the peak it came from; the proactive messages counted toward it now; and whether it is tripped, since when and at what count. Readable by every member of the account, since the console shows a banner on every page while it is tripped.",
+      ),
+      response: errors(401, 403, 404),
+    },
+  )
+  .put(
+    "/proactive-breaker",
+    async ({ tenantContext, body }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      await updateProactiveBreakerSettings(ctx, body);
+      return {
+        instance: instanceIdentity,
+        proactiveBreaker: await getProactiveBreakerStatus(ctx),
+      };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      body: t.Object({
+        mode: t.Optional(
+          t.Union([t.Literal("auto"), t.Literal("fixed"), t.Literal("off")], {
+            description:
+              "`auto`: 3x the account's largest 24h proactive volume of the last 30 days, never below 1,000. `fixed`: the `limit` below. `off`: no breaker.",
+          }),
+        ),
+        limit: t.Optional(
+          t.Union([
+            tRanged(FIXED_LIMIT_RANGE, {
+              description:
+                "Proactive messages per 24 hours for the whole account, used when `mode` is `fixed` and kept otherwise.",
+            }),
+            t.Null(),
+          ]),
+        ),
+      }),
+      detail: doc(
+        "Set the proactive breaker",
+        "Changes the breaker's mode or fixed limit. Changing the limit does not reopen a tripped breaker; resume does.",
+      ),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .post(
+    "/proactive-breaker/resume",
+    async ({ tenantContext }) => ({
+      instance: instanceIdentity,
+      proactiveBreaker: await resumeProactiveBreaker(ctxOrThrow(tenantContext)),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Resume proactive messages",
+        "Reopens a tripped breaker. The count toward the limit starts again from zero. On an open breaker it changes nothing.",
+      ),
+      response: errors(401, 403, 404),
     },
   )
   .put(
@@ -347,6 +441,37 @@ export const tenantSettingsController = new Elysia({
         "Probes the Langfuse instance with the supplied keys without saving them.",
       ),
       response: errors(400, 401, 403, 422),
+    },
+  )
+  .put(
+    "/approval-link",
+    async ({ tenantContext, body }) => ({
+      instance: instanceIdentity,
+      approvalLink: await updateApprovalLink(ctxOrThrow(tenantContext), body),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      body: t.Object({
+        mode: t.Union(
+          [t.Literal("console"), t.Literal("custom"), t.Literal("none")],
+          {
+            description:
+              "Where the link at the end of an approval request's private note points: `console` (the request's page in this console, the default), `custom` (urlTemplate) or `none` (the note carries no link; it is still written).",
+          },
+        ),
+        urlTemplate: t.Optional(
+          t.String({
+            maxLength: APPROVAL_LINK_TEMPLATE_MAX,
+            description:
+              "For `custom`: a full https:// or http:// address with `{id}` where the request's id goes, e.g. `https://app.example.com/documents?approval={id}`. Empty with `custom` stores `console`. Absent keeps the saved template, so `{mode}` alone switches the mode.",
+          }),
+        ),
+      }),
+      detail: doc(
+        "Set the approval note link",
+        "Sets where the link in an approval request's Chatwoot private note points. Applies to the next note written, including notes about requests opened before the change.",
+      ),
+      response: errors(400, 401, 403, 404, 422),
     },
   )
   .put(
@@ -441,17 +566,10 @@ export const tenantSettingsController = new Elysia({
       return new Response(new Uint8Array(logo.data), {
         headers: {
           "Content-Type": LOGO_CONTENT_TYPE[ext],
-          // NOT STORED AT ALL, which is the only answer that holds for every principal.
-          //
-          // The URL carries just `logoVersion`, a millisecond timestamp, so two tenants uploading in
-          // the same millisecond share it. `private` keeps proxies out but not the ONE browser that
-          // saw both tenants, and `Vary: X-Tenant-Id` — the first fix here — only discriminates for
-          // a SUPER_ADMIN: that header selects a tenant for nobody else, so it is absent on both
-          // requests when a browser signs out of tenant A and into tenant B, and the cache replays
-          // A's letterhead without B's scoped read ever running.
-          //
-          // What the cache bought was one small image per remount inside a minute. That is not a
-          // trade worth making against a tenant seeing another tenant's asset.
+          // NOTE: not stored at all. `logoVersion` (a millisecond timestamp) can collide across
+          // tenants, `private` does not separate tenants inside ONE browser, and `Vary: X-Tenant-Id`
+          // only helps a SUPER_ADMIN (nobody else sends the header, so after signing into another
+          // tenant the cache would replay the previous tenant's logo). A refetch per remount is cheap.
           "Cache-Control": "private, no-store",
         },
       });

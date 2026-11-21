@@ -3,11 +3,13 @@ import {
   Bot,
   ChevronRight,
   Eye,
+  FileClock,
   MessagesSquare,
   Search,
   User,
+  X,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Link, useSearchParams } from "react-router";
 import {
@@ -57,11 +59,11 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
     <li>
       <Link
         to={`/conversations/${c.id}`}
-        className="flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-hover"
+        className="hover:bg-bg-hover flex items-center justify-between gap-4 rounded-lg px-3 py-2.5 transition-colors"
       >
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="truncate font-medium text-text-primary">
+            <span className="text-text-primary truncate font-medium">
               {c.contact?.name ??
                 t("conversations.unknownContact", "Unknown contact")}
             </span>
@@ -76,6 +78,15 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
               </Badge>
             )}
             {c.outOfHours && <OutOfHoursBadge />}
+            {c.awaitingApproval && (
+              <Badge variant="warning" className="flex items-center gap-1">
+                <FileClock className="h-3 w-3" aria-hidden="true" />
+                {t(
+                  "conversations.awaitingApproval",
+                  "Document awaiting approval",
+                )}
+              </Badge>
+            )}
             {c.observerNames.length > 0 && (
               <Badge variant="secondary" className="flex items-center gap-1">
                 <Eye className="h-3 w-3" aria-hidden="true" />
@@ -88,19 +99,19 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
               </Badge>
             )}
           </div>
-          <p className="mt-0.5 truncate text-text-muted text-xs">
+          <p className="text-text-muted mt-0.5 truncate text-xs">
             {c.inbox?.name ?? t("conversations.noInbox", "No inbox")}
             {when ? ` · ${when}` : ""}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-1.5 text-text-secondary text-xs">
+        <div className="text-text-secondary flex shrink-0 items-center gap-1.5 text-xs">
           {active && (
             <span
-              className="flex items-center gap-1 text-accent"
+              className="text-accent flex items-center gap-1"
               aria-live="polite"
             >
               <span
-                className="h-1.5 w-1.5 animate-pulse rounded-full bg-accent"
+                className="bg-accent-solid h-1.5 w-1.5 animate-pulse rounded-full"
                 aria-hidden="true"
               />
               {t("conversations.working", "Working…")}
@@ -116,12 +127,12 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
             </>
           ) : (
             <>
-              <Bot className="h-3.5 w-3.5 text-accent" aria-hidden="true" />
+              <Bot className="text-accent h-3.5 w-3.5" aria-hidden="true" />
               {c.agentName ?? t("conversations.assignee.ai", "AI")}
             </>
           )}
           <ChevronRight
-            className="h-4 w-4 text-text-muted"
+            className="text-text-muted h-4 w-4"
             aria-hidden="true"
           />
         </div>
@@ -130,7 +141,11 @@ function ConversationRow({ c, active }: { c: Conversation; active: boolean }) {
   );
 }
 
-// NOTE: Static keys so the skeleton rows don't key off the array index.
+// How often a row flagged as awaiting approval is asked again while the list stays open. An object so
+// a test can shorten it.
+export const flagRefresh = { ms: 30_000 };
+
+// Static keys so the skeleton rows don't key off the array index.
 const CONV_SKELETON_KEYS = [
   "conv-0",
   "conv-1",
@@ -176,10 +191,19 @@ export function ConversationsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(false);
   const [status, setStatus] = useState("");
-  // The agent filter lives in the URL (issue #607), so a view narrowed to one persona can be linked
-  // and survives a reload. Empty means every agent.
+  // The agent filter lives in the URL, so a view narrowed to one persona can be linked and
+  // survives a reload. Empty means every agent.
   const [searchParams, setSearchParams] = useSearchParams();
   const agentId = searchParams.get("agentId") ?? "";
+  // A dashboard figure's conversations (its window of creation, inbox and outcome), when the list
+  // was opened from one. The agent filter above then reads as the dashboard's.
+  const createdSince = searchParams.get("createdSince") ?? "";
+  const createdUntil = searchParams.get("createdUntil") ?? "";
+  const inboxId = searchParams.get("inboxId") ?? "";
+  const outcome = searchParams.get("outcome") ?? "";
+  const fromDashboard = Boolean(
+    createdSince || createdUntil || inboxId || outcome,
+  );
   const setAgentId = useCallback(
     (next: string) =>
       setSearchParams(
@@ -213,12 +237,32 @@ export function ConversationsPage() {
     return () => clearTimeout(id);
   }, [search]);
 
+  const drillQuery = useMemo(
+    () => ({
+      ...(createdSince ? { createdSince } : {}),
+      ...(createdUntil ? { createdUntil } : {}),
+      ...(inboxId ? { inboxId } : {}),
+      ...(outcome ? { outcome } : {}),
+    }),
+    [createdSince, createdUntil, inboxId, outcome],
+  );
+  const outcomeLabel: Record<string, string> = {
+    all: t("conversations.drill.all", "every conversation"),
+    involved: t("conversations.drill.involved", "handled by the agent"),
+    resolved_by_agent: t(
+      "conversations.drill.resolved",
+      "resolved by the agent",
+    ),
+    handoff: t("conversations.drill.handoff", "handed over to a person"),
+  };
+
   const fetchConversations = useCallback(async () => {
     const { data, error: err } = await api.api.v1.conversations.get({
       query: {
         ...(status ? { status } : {}),
         ...(debouncedSearch ? { q: debouncedSearch } : {}),
         ...(agentId ? { agentId } : {}),
+        ...drillQuery,
       },
     });
     if (err || !data) {
@@ -228,7 +272,7 @@ export function ConversationsPage() {
     setError(false);
     setConversations(data.conversations);
     setNextCursor(data.nextCursor);
-  }, [status, debouncedSearch, agentId]);
+  }, [status, debouncedSearch, agentId, drillQuery]);
 
   // Append the next page (older conversations), de-duping by id since a live re-sort may have
   // pulled a row into an earlier page meanwhile.
@@ -241,6 +285,7 @@ export function ConversationsPage() {
           ...(status ? { status } : {}),
           ...(debouncedSearch ? { q: debouncedSearch } : {}),
           ...(agentId ? { agentId } : {}),
+          ...drillQuery,
           cursor: nextCursor,
         },
       });
@@ -253,7 +298,7 @@ export function ConversationsPage() {
     } finally {
       setLoadingMore(false);
     }
-  }, [nextCursor, status, debouncedSearch, agentId]);
+  }, [nextCursor, status, debouncedSearch, agentId, drillQuery]);
 
   useEffect(() => {
     let active = true;
@@ -278,14 +323,78 @@ export function ConversationsPage() {
     };
   }, [fetchConversations]);
 
+  // A conversation event can come with an approval decided, opened or expired, and the row's flag is
+  // not in the event: it is asked again, for that conversation alone.
+  // Only the latest read per conversation is applied: two events close together ask twice, and the
+  // older answer arriving last would put back a flag the newer one cleared.
+  const flagReads = useRef(new Map<string, number>());
+  // The conversations with a flag read still out: the slow clock skips them, so a read slower than
+  // the clock is answered instead of being superseded on every tick.
+  const flagInFlight = useRef(new Set<string>());
+  const refreshAwaitingApproval = useCallback(
+    async (conversationId: string) => {
+      const read = (flagReads.current.get(conversationId) ?? 0) + 1;
+      flagReads.current.set(conversationId, read);
+      flagInFlight.current.add(conversationId);
+      try {
+        const { data } = await api.api.v1["document-approvals"].get({
+          query: { conversationId, waiting: "true", limit: "1" },
+        });
+        if (!data || flagReads.current.get(conversationId) !== read) return;
+        const awaiting = data.requests.length > 0;
+        setConversations((prev) =>
+          prev.map((c) =>
+            c.id === conversationId && c.awaitingApproval !== awaiting
+              ? { ...c, awaitingApproval: awaiting }
+              : c,
+          ),
+        );
+      } catch {
+        // The flag stays as the list last read it; the next event or load asks again.
+      } finally {
+        if (flagReads.current.get(conversationId) === read) {
+          flagInFlight.current.delete(conversationId);
+        }
+      }
+    },
+    [],
+  );
+
+  // A flagged row is also read again on a slow clock: a decision does not always leave an event (no
+  // bot left to write the note), and the flag must not outlive the request it stands for.
+  // The clock runs while anything is flagged and reads which rows are through a ref: tied to the list
+  // itself, every live event that re-sorts it would restart the clock before it ever fired.
+  const flaggedIds = useRef<string[]>([]);
+  flaggedIds.current = conversations
+    .filter((c) => c.awaitingApproval)
+    .map((c) => c.id);
+  const anyFlagged = flaggedIds.current.length > 0;
+  useEffect(() => {
+    if (!anyFlagged) return;
+    const timer = setInterval(() => {
+      for (const id of flaggedIds.current) {
+        if (!flagInFlight.current.has(id)) void refreshAwaitingApproval(id);
+      }
+    }, flagRefresh.ms);
+    return () => clearInterval(timer);
+  }, [anyFlagged, refreshAwaitingApproval]);
+
   // Live updates on the active tenant's channel. Known rows merge in place (and
   // re-sort by recency); an unknown id (a brand-new conversation) triggers a
   // lightweight refetch so it appears without a full reload.
   useTenantEvents({
     onConversation: (event) => {
+      void refreshAwaitingApproval(event.conversationId);
       setConversations((prev) => {
         const current = prev.find((c) => c.id === event.conversationId);
         if (!current) {
+          void fetchConversations();
+          return prev;
+        }
+        // Narrowed to an outcome (a dashboard figure's conversations), a change can move a row out
+        // of the list (a reopen, a person taking over) and the event does not carry what decides
+        // it, so the server answers again instead of the row being merged in place.
+        if (outcome && outcome !== "all") {
           void fetchConversations();
           return prev;
         }
@@ -347,12 +456,12 @@ export function ConversationsPage() {
     <PageContainer className="flex flex-col gap-6">
       <header className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <MessagesSquare className="h-6 w-6 text-accent" aria-hidden="true" />
+          <MessagesSquare className="text-accent h-6 w-6" aria-hidden="true" />
           <div>
-            <h1 className="font-semibold text-text-primary text-xl">
+            <h1 className="text-text-primary text-xl font-semibold">
               {t("conversations.title", "Conversations")}
             </h1>
-            <p className="mt-0.5 text-sm text-text-muted">
+            <p className="text-text-muted mt-0.5 text-sm">
               {t(
                 "conversations.subtitle",
                 "Live conversations with their assignment status (AI or a human).",
@@ -364,7 +473,7 @@ export function ConversationsPage() {
 
       <div className="relative min-w-0">
         <Search
-          className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted"
+          className="text-text-muted pointer-events-none absolute top-1/2 left-2.5 h-4 w-4 -translate-y-1/2"
           aria-hidden="true"
         />
         <input
@@ -379,7 +488,7 @@ export function ConversationsPage() {
             "conversations.search",
             "Search by contact or conversation #…",
           )}
-          className="w-full rounded-lg border border-border bg-bg-tertiary py-2 pr-4 pl-9 text-text-primary placeholder-text-placeholder focus:border-border-focus focus:outline-none"
+          className="border-border-hover bg-bg-tertiary text-text-primary placeholder-text-placeholder focus:border-border-focus focus:ring-accent-soft h-8 w-full rounded-md border pr-2.5 pl-8 text-sm transition-colors focus:ring-2 focus:outline-none"
         />
       </div>
 
@@ -404,6 +513,54 @@ export function ConversationsPage() {
             </option>
           )}
         </Select>
+      )}
+
+      {fromDashboard && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="border-border bg-bg-tertiary text-text-secondary inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs">
+            {t("conversations.drill.label", "From the dashboard: {{outcome}}", {
+              outcome: outcomeLabel[outcome || "all"] ?? outcome,
+            })}
+            {createdSince && createdUntil
+              ? ` · ${t(
+                  "conversations.drill.range",
+                  "started {{from}} to {{to}}",
+                  {
+                    from: new Date(createdSince).toLocaleDateString(),
+                    to: new Date(
+                      new Date(createdUntil).getTime() - 1,
+                    ).toLocaleDateString(),
+                  },
+                )}`
+              : ""}
+            <button
+              type="button"
+              onClick={() =>
+                setSearchParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev);
+                    for (const k of [
+                      "createdSince",
+                      "createdUntil",
+                      "inboxId",
+                      "outcome",
+                    ])
+                      next.delete(k);
+                    return next;
+                  },
+                  { replace: true },
+                )
+              }
+              aria-label={t(
+                "conversations.drill.clear",
+                "Clear the dashboard filter",
+              )}
+              className="text-text-muted hover:text-text-primary"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </span>
+        </div>
       )}
 
       <FilterPills
@@ -439,7 +596,7 @@ export function ConversationsPage() {
         errorLabel={t("conversations.error", "Could not load conversations.")}
         skeleton={<ConversationsSkeleton />}
         empty={
-          <p className="px-4 py-10 text-center text-sm text-text-muted">
+          <p className="text-text-muted px-4 py-10 text-center text-sm">
             {t("conversations.empty", "No conversations yet.")}
           </p>
         }

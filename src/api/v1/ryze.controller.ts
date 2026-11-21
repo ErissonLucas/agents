@@ -47,7 +47,14 @@ const attributeBag = (what: string) =>
   t.Optional(
     t.Record(
       t.String(),
-      t.Union([t.String({ maxLength: 1000 }), t.Number(), t.Boolean()]),
+      t.Union([
+        t.String({ maxLength: 1000 }),
+        t.Number({
+          minimum: -1_000_000_000_000,
+          maximum: 1_000_000_000_000,
+        }),
+        t.Boolean(),
+      ]),
       {
         description: `Custom attributes merged into the ${what}'s before the message goes (keys A-Z a-z 0-9 _ -, up to 64; at most 50; a string value up to 1000 characters). Keys not named keep their value.`,
       },

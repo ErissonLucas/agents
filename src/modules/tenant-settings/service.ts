@@ -3,10 +3,22 @@ import { z } from "zod";
 import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
 import type { AuditAction } from "@/lib/audit/actions";
-import { AppError } from "@/lib/errors";
+import {
+  AppError,
+  phrase,
+  quotingReason,
+  type TranslatedParam,
+} from "@/lib/errors";
+import { numberRange } from "@/lib/number-range";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { markUndisclosed, redactEndpoint } from "@/modules/audit/projection";
 import { auditMutation } from "@/modules/audit/service";
-import { unprintableProblem } from "@/modules/documents/printable";
+import {
+  type ApprovalLinkSettings,
+  normalizeApprovalLink,
+  parseApprovalLinkSettings,
+} from "@/modules/documents/approval-link";
+import { unprintablePhrase } from "@/modules/documents/printable";
 import {
   forgetPriceOverrides,
   type PriceOverride,
@@ -14,6 +26,15 @@ import {
   priceOverridesSchema,
   readPriceOverrides,
 } from "@/modules/pricing/overrides";
+import {
+  breakerLockKey,
+  clearTripForOff,
+} from "@/modules/proactive-breaker/service";
+import {
+  type ProactiveBreakerConfig,
+  proactiveBreakerSettingsSchema,
+  readProactiveBreakerConfig,
+} from "@/modules/proactive-breaker/settings";
 import { syncTenantSpendPoll } from "@/modules/spend-ceiling/arm";
 import {
   readSpendCeilingConfig,
@@ -54,6 +75,9 @@ export const EMBEDDING_DEFAULTS: EmbeddingSettings = {
   baseURL: null,
 };
 
+// The share of a tenant's turns traced to Langfuse.
+export const LANGFUSE_SAMPLE_RATE_RANGE = numberRange(0, 1);
+
 export const langfuseSettingsSchema = z.object({
   enabled: z.boolean(),
   // Vault ref of a `langfuse`-kind secret holding { publicKey, secretKey } (never inline here).
@@ -64,6 +88,12 @@ export const langfuseSettingsSchema = z.object({
   // Debug mode: also send the full tool schemas to every trace (heavy; off by default). Tool names
   // always travel regardless of this flag.
   debug: z.boolean(),
+  // Share of turns traced, 0 to 1. null follows the deployment's LANGFUSE_SAMPLE_RATE.
+  sampleRate: z
+    .number()
+    .min(LANGFUSE_SAMPLE_RATE_RANGE.min)
+    .max(LANGFUSE_SAMPLE_RATE_RANGE.max)
+    .nullable(),
 });
 export type LangfuseSettings = z.infer<typeof langfuseSettingsSchema>;
 
@@ -72,6 +102,7 @@ export const LANGFUSE_DEFAULTS: LangfuseSettings = {
   credentialRef: null,
   sendContent: false,
   debug: false,
+  sampleRate: null,
 };
 
 // The tenant's own identity as it appears on a document it issues: the letterhead. Lives here
@@ -177,6 +208,7 @@ export interface TenantSettingsDto {
   company: CompanySettings;
   spendCeiling: SpendCeilingConfig;
   priceOverrides: PriceOverridesBlock;
+  approvalLink: ApprovalLinkSettings;
 }
 
 export async function getTenantSettings(
@@ -196,6 +228,7 @@ export async function getTenantSettings(
       spendCeiling: readSpendCeilingConfig(raw),
       // The runtime's reader too, for the same reason: what the console lists is what prices a call.
       priceOverrides: readPriceOverrides(raw),
+      approvalLink: parseApprovalLinkSettings(raw),
     };
   });
 }
@@ -211,25 +244,14 @@ function sides<T>(
   return (before, after) => ({ before: of(before), after: of(after) });
 }
 
-// Read, merge and write in ONE transaction, with the tenant row locked.
+// Read, merge and write in ONE transaction, with the tenant row locked. Every block lives in one JSON
+// column that several routes write (the profile text and the logo upload most visibly), so separate
+// transactions would let the later commit discard the earlier one. The merge gets the raw settings
+// inside the lock, never a pre-lock snapshot.
 //
-// Every settings block lives in a single JSON column, so this is a read-modify-write of a value
-// several writers share — the two halves of the company profile most visibly, since the console
-// edits its text fields and uploads its logo through different routes. Reading in one transaction
-// and writing in another lets two writers each merge into the value they read and the later commit
-// discard the earlier one: a profile save that erases the logo which finished uploading a moment
-// before, with both requests answering success.
-//
-// The merge runs INSIDE the lock and is handed the raw settings, so what it merges into is what is
-// about to be written and never a snapshot from before someone else's write.
-//
-// The audit row is written here, under the same lock and in the same transaction, for the same
-// reason the merge is: this is the one place that holds both the value being replaced and the value
-// replacing it. Every block writer goes through here, so none of them can ship without a record.
-// `project` is handed the raw settings both times, so each caller decides in ONE function what its
-// block's trail says, and a block whose projection would carry a secret cannot accidentally get the
-// default (a credential is a `vault:<id>` reference here, never a value; that is the vault rule this
-// column has been held to since #124).
+// The audit row is written here too, the one place holding both the replaced and the replacing value,
+// so no block writer ships without a record. Each caller's `project` decides what its trail says (a
+// credential is a `vault:<id>` reference here, never a value).
 async function patchBlock<
   T extends
     | EmbeddingSettings
@@ -237,14 +259,22 @@ async function patchBlock<
     | CompanySettings
     | SpendCeilingStored
     | SpendCeilingLegacyStored
-    | PriceOverridesBlock,
+    | PriceOverridesBlock
+    | ProactiveBreakerConfig
+    | ApprovalLinkSettings,
 >(
   ctx: TenantContext,
   base: PrismaClient,
-  key: "embedding" | "langfuse" | "company" | "spendCeiling" | "priceOverrides",
-  // Handed BOTH states, the one being replaced and the one replacing it, so a block can report what
-  // MOVED without carrying what it holds. The company profile is the block that needs the
-  // difference: see `sides` below for the shape the other three use.
+  key:
+    | "embedding"
+    | "langfuse"
+    | "company"
+    | "spendCeiling"
+    | "priceOverrides"
+    | "proactiveBreaker"
+    | "approvalLink",
+  // Handed both states, so a block can report what moved without carrying what it holds (the
+  // company profile needs the difference; see `sides` for the shape the others use).
   audit: {
     action: AuditAction;
     target: string;
@@ -253,14 +283,20 @@ async function patchBlock<
       after: Record<string, unknown>,
     ) => { before: unknown; after: unknown };
   },
-  // Last so it stays a trailing callback at every call site. May be async, so a caller that has to
-  // read or do something UNDER THE LOCK, before the commit, can do it here. The logo upload is the
-  // one: it needs the key it is about to supersede, and the block it reads outside the lock is
-  // already stale by the time it writes.
+  // Last so it stays a trailing callback. May be async to read under the lock before the commit: the
+  // logo upload needs the key it supersedes, and a read outside the lock is already stale.
   merge: (raw: Record<string, unknown>) => T | Promise<T>,
+  // Runs in the same transaction after the write, for state that has to move with the setting.
+  afterWrite?: (db: ScopedDb, value: T) => Promise<void>,
+  // An advisory lock taken BEFORE the tenant row: a block whose state another path locks first and
+  // then writes rows referencing the tenant (the proactive breaker) takes it in that same order, or
+  // the two wait on each other.
+  lockFirst?: string,
 ): Promise<T> {
   const tenantId = requireTenantId(ctx);
   return runScopedOn(base, ctx, async (db) => {
+    if (lockFirst)
+      await db.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${lockFirst})::bigint)`;
     await db.$queryRaw`SELECT 1 FROM "tenants" WHERE "id" = ${tenantId} FOR UPDATE`;
     const raw = await readRawSettings(db, tenantId);
     const value = await merge(raw);
@@ -269,6 +305,7 @@ async function patchBlock<
       where: { id: tenantId },
       data: { settings: settings as Prisma.InputJsonValue },
     });
+    if (afterWrite) await afterWrite(db, value);
     await auditMutation(db, ctx, {
       action: audit.action,
       target: audit.target,
@@ -278,14 +315,10 @@ async function patchBlock<
   });
 }
 
-// The ref rule and the KIND rule for the embedding key, in one place so the MCP preview can ask them
-// (#490). Resolving the ref answers neither: `resolveSecretRef` only checks that the entry exists,
-// and `tenant_settings_update` previewed "will wire" for a `google_oauth` (which does not yield a
-// plain string) and an `mcp_env` (which is `neverOutbound`) that the apply refuses (#510, review
-// round 2).
-//
-// ADVISORY when the preview calls it, authoritative when the write does: it reads outside the
-// write's transaction, so a kind changed in between still answers there.
+// The ref rule and the KIND rule for the embedding key, in one place so the MCP preview can ask them.
+// Resolving the ref answers neither: it only checks the entry exists (a `google_oauth` or `mcp_env`
+// entry resolves and is still refused). Advisory for the preview, authoritative for the write: it
+// reads outside the write's transaction.
 export async function assertEmbeddingCredentialUsable(
   ctx: TenantContext,
   ref: string,
@@ -301,16 +334,10 @@ export async function updateEmbeddingSettings(
   patch: Partial<EmbeddingSettings>,
   base: PrismaClient = basePrisma,
 ): Promise<EmbeddingSettings> {
-  // The same boundary every other ref column has been held to since #124: `vault:<id>`, in this
-  // tenant, canonically spelled. Nothing checked this one, so a PATCH carrying a vault entry NAME
-  // stored it and indexing then failed with no credential the operator could see was wrong (#254).
-  // The block holds one field, so naming it IS changing it — there is no unrelated save to protect
-  // here, unlike the agent's bags.
-  //
-  // `…For` and not the plain ref check: this key is read as a plain string and POSTed to the
-  // embedding provider, and this module's own comment in rag/documents.ts already said the kind was
-  // never checked — an operator picking the Chatwoot credential here got every chunk of their
-  // knowledge base POSTed at the Chatwoot host. Issue #471.
+  // `vault:<id>`, in this tenant, canonically spelled, like every other ref column; a stored
+  // entry NAME fails indexing with nothing visibly wrong. `…For` checks the kind too: this key is
+  // POSTed to the embedding provider as a plain string, so a wrong kind (the Chatwoot credential)
+  // would send the knowledge base to that host. The block holds one field, so naming it IS changing it.
   const incoming = patch.credentialRef;
   const credentialRef =
     incoming == null
@@ -339,7 +366,7 @@ export async function updateEmbeddingSettings(
       // feature ships (configurable dimension + provider registry). Only the
       // credential is honored; provider/model/baseURL from the patch are ignored. Unlocking = restore
       // the `{ ...current, ...patch }` merge.
-      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      // biome-ignore lint/plugin/require-parse-input: not caller input, the STORED block merged with the patch, so a failure here is not necessarily the caller's
       return embeddingSettingsSchema.parse({
         ...EMBEDDING_DEFAULTS,
         credentialRef:
@@ -356,16 +383,15 @@ export interface LangfuseUpdateInput {
   credentialRef?: string | null;
   sendContent?: boolean;
   debug?: boolean;
+  // null goes back to the deployment's default. Absent = keep current.
+  sampleRate?: number | null;
 }
 
 // Updates the langfuse block. credentialRef, when provided non-null, is validated against the vault
 // (must exist and be kind "langfuse"). null clears it.
-// The ref rule and the KIND rule, in one place so the MCP preview can ask them (#490). Resolving the
-// ref is not asking the second one: `vault:<id>` names an entry of any kind, and `tenant_settings_update`
-// previewed "will wire" for a generic credential the apply refuses to store (#510).
-//
-// ADVISORY when the preview calls it, authoritative when the write does: it reads outside the write's
-// transaction, so a kind changed in between still answers there.
+// The ref rule and the KIND rule, in one place so the MCP preview can ask them: `vault:<id>` names
+// an entry of any kind. Advisory for the preview, authoritative for the write (it reads outside the
+// write's transaction).
 export async function assertLangfuseCredentialUsable(
   ctx: TenantContext,
   ref: string,
@@ -405,13 +431,9 @@ export async function updateLangfuse(
     if (input.credentialRef === null) {
       credentialRef = null;
     } else {
-      // Validate: ref must resolve, in this tenant, and be a langfuse-kind entry.
-      // NOTE: requireVaultRef rather than tryResolveVaultEntry, which answered "not found" for two
-      // values that are something else. A lenient spelling (`vault:007`) resolved and was then
-      // stored verbatim, where it compares unequal against the id list the credential picker builds
-      // and reports a working credential as unavailable; and an entry created empty on purpose
-      // (credential_create) was refused for having no secret yet, which is the one case the write
-      // boundary admits deliberately. Both are the ref rule, so both answer to the ref check (#254).
+      // NOTE: requireVaultRef rather than tryResolveVaultEntry: a lenient spelling (`vault:007`) must be
+      // canonicalized or it compares unequal against the picker's id list, and an entry created empty on
+      // purpose is admitted by the write boundary.
       credentialRef = await assertLangfuseCredentialUsable(
         ctx,
         input.credentialRef,
@@ -437,12 +459,13 @@ export async function updateLangfuse(
           credentialRef: b.credentialRef,
           sendContent: b.sendContent,
           debug: b.debug,
+          sampleRate: b.sampleRate,
         };
       }),
     },
     (raw) => {
       const live = parseLangfuseSettings(raw);
-      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      // biome-ignore lint/plugin/require-parse-input: not caller input, the STORED block merged with the patch, so a failure here is not necessarily the caller's
       return langfuseSettingsSchema.parse({
         enabled: input.enabled ?? live.enabled,
         // The live value when this request did not mention one, like every other field here.
@@ -452,13 +475,59 @@ export async function updateLangfuse(
             : live.credentialRef,
         sendContent: input.sendContent ?? live.sendContent,
         debug: input.debug ?? live.debug,
+        sampleRate:
+          input.sampleRate !== undefined ? input.sampleRate : live.sampleRate,
       });
     },
   );
-  // A Langfuse save changes what the spend ceiling's poll would find (#426, review round 15): a
-  // credential added or removed is learned now, not at the next period.
-  await syncTenantSpendPoll(requireTenantId(ctx), base);
   return next;
+}
+
+export interface ApprovalLinkUpdateInput {
+  mode: ApprovalLinkSettings["mode"];
+  // Absent keeps the saved template, so switching the mode alone does not lose it.
+  urlTemplate?: string;
+}
+
+// The link at the end of an approval request's private note (documents/approval-link.ts). The
+// template is checked against the mode it is saved with, inside the lock, where the kept one is read.
+export async function updateApprovalLink(
+  ctx: TenantContext,
+  input: ApprovalLinkUpdateInput,
+  base: PrismaClient = basePrisma,
+): Promise<ApprovalLinkSettings> {
+  return patchBlock(
+    ctx,
+    base,
+    "approvalLink",
+    {
+      action: "tenant_settings.approval_link_set",
+      target: "tenant_settings:approvalLink",
+      // NOTE: the template's host only: a path or query may carry a token, and the trail keeps it.
+      // A change the redaction hides is marked on both sides, so the row still says something moved.
+      project: (before, after) => {
+        const b = parseApprovalLinkSettings(before);
+        const a = parseApprovalLinkSettings(after);
+        const shown = (l: ApprovalLinkSettings) => ({
+          mode: l.mode,
+          urlTemplate: l.urlTemplate ? redactEndpoint(l.urlTemplate) : "",
+        });
+        const hidden =
+          b.urlTemplate !== a.urlTemplate &&
+          shown(b).urlTemplate === shown(a).urlTemplate;
+        return {
+          before: hidden ? markUndisclosed(shown(b)) : shown(b),
+          after: hidden ? markUndisclosed(shown(a)) : shown(a),
+        };
+      },
+    },
+    (raw) =>
+      normalizeApprovalLink({
+        mode: input.mode,
+        urlTemplate:
+          input.urlTemplate ?? parseApprovalLinkSettings(raw).urlTemplate,
+      }),
+  );
 }
 
 export type CompanyUpdateInput = Partial<
@@ -479,15 +548,18 @@ export async function updateCompanySettings(
   // misspelled on every document the tenant ever issues, and nobody would see it happen.
   for (const [field, value] of Object.entries(patch)) {
     if (typeof value !== "string") continue;
-    const problem = unprintableProblem(value, field);
+    const problem = unprintablePhrase(value, field);
     if (problem)
-      throw new AppError(
+      throw quotingReason(
+        new AppError(
+          problem.message,
+          400,
+          "errors.invalidCompanyField",
+          { reason: problem.message },
+          // NOTE: the key of the patch, which is the name the console's company form uses for the input.
+          field,
+        ),
         problem,
-        400,
-        "errors.invalidCompanyField",
-        { reason: problem },
-        // NOTE: the key of the patch, which is the name the console's company form uses for the input.
-        field,
       );
   }
   return patchBlock(
@@ -497,21 +569,15 @@ export async function updateCompanySettings(
     {
       action: "tenant_settings.company_set",
       target: "tenant_settings:company",
-      // WHICH fields moved, and never what they hold. This block is the operator's own identity, and
-      // for a sole trader that is a CPF, a home address and a personal phone: `AuditEntry` forbids
-      // PII in the clear because a tenant admin reads these rows, and unlike the profile itself a row
-      // KEEPS the value after the profile that held it was corrected or cleared. Counted rather than
-      // assumed before choosing: of the 32 distinct fields every other audited action projects, not
-      // one is a person's document, address, phone or email.
-      //
-      // Keys and not an allowlist of the safe ones, so a field added to `companySettingsSchema` later
-      // cannot arrive projected in the clear by default. The current value is always readable from
-      // `GET /v1/tenant-settings`; what a trail owes is who changed it and when.
+      // NOTE: WHICH fields moved, never what they hold: for a sole trader this block is a CPF, a home address
+      // and a personal phone, `AuditEntry` forbids PII in the clear, and a row keeps the value after the
+      // profile is corrected. Keys rather than an allowlist of safe fields, so a field added later cannot
+      // arrive in the clear by default. The current value is readable from `GET /v1/tenant-settings`.
       project: (before, after) => {
         const b = parseCompanySettings(before);
         const a = parseCompanySettings(after);
         // No exclusion for the logo half: `CompanyUpdateInput` omits both of its fields and the merge
-        // carries them over, so they cannot differ here. A guard against it survived being deleted.
+        // carries them over, so they cannot differ here.
         const changed = (
           Object.keys(COMPANY_DEFAULTS) as (keyof CompanySettings)[]
         ).filter((k) => b[k] !== a[k]);
@@ -519,7 +585,7 @@ export async function updateCompanySettings(
       },
     },
     (raw) =>
-      // not-caller-input: the STORED block merged with the patch; the patch's own fields are refused above with errors.invalidCompanyField
+      // biome-ignore lint/plugin/require-parse-input: not caller input, the STORED block merged with the patch; the patch's own fields are refused above with errors.invalidCompanyField
       companySettingsSchema.parse({ ...parseCompanySettings(raw), ...patch }),
   );
 }
@@ -575,7 +641,7 @@ export async function setCompanyLogoKey(
     async (raw) => {
       const current = parseCompanySettings(raw);
       await publish?.(current);
-      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      // biome-ignore lint/plugin/require-parse-input: not caller input, the STORED block merged with the patch, so a failure here is not necessarily the caller's
       return companySettingsSchema.parse({
         ...current,
         logoKey,
@@ -584,6 +650,41 @@ export async function setCompanyLogoKey(
         logoVersion: Math.max(now, current.logoVersion + 1),
       });
     },
+  );
+}
+
+// Updates the account-wide proactive breaker's configuration (docs/proactive-breaker.md). Validated on
+// the way in, so a limit typed as -5 or 1.5 is a 422 rather than a guard silently read as the default.
+// A fixed mode needs a number, and the number is kept when switching away so switching back restores
+// it. Changing the limit never reopens a tripped breaker: only a resume does.
+export async function updateProactiveBreakerSettings(
+  ctx: TenantContext,
+  patch: Partial<ProactiveBreakerConfig>,
+  base: PrismaClient = basePrisma,
+): Promise<ProactiveBreakerConfig> {
+  return patchBlock(
+    ctx,
+    base,
+    "proactiveBreaker",
+    {
+      action: "tenant_settings.proactive_breaker_set",
+      target: "tenant_settings:proactiveBreaker",
+      project: sides(readProactiveBreakerConfig),
+    },
+    (raw) => {
+      const merged = { ...readProactiveBreakerConfig(raw), ...patch };
+      const parsed = proactiveBreakerSettingsSchema.safeParse(merged);
+      if (!parsed.success)
+        throw new AppError(
+          `proactive breaker: ${parsed.error.issues[0]?.message ?? "invalid"}`,
+          422,
+        );
+      return parsed.data;
+    },
+    async (db, value) => {
+      if (value.mode === "off") await clearTripForOff(db, requireTenantId(ctx));
+    },
+    breakerLockKey(requireTenantId(ctx)),
   );
 }
 
@@ -608,23 +709,17 @@ export async function updateSpendCeiling(
     {
       action: "tenant_settings.spend_ceiling_set",
       target: "tenant_settings:spendCeiling",
-      // THE NUMBERS THEMSELVES, because they are what the trail is about: this block decides whether
-      // the agent answers a customer at all, and "somebody moved the ceiling" is unanswerable without
-      // saying from what to what. None of them is a secret or PII — a token count, a percentage, two
-      // switches and a cooldown.
-      //
-      // The customer-facing sentence is the exception, and it is FINGERPRINTED rather than quoted:
-      // it is free text an operator writes, so quoting it would paste a paragraph into every row for
-      // a field the console reads back in full anyway. A bare "set" cannot answer the question the
-      // trail is actually asked — one sentence replaced by another read as unchanged on both sides —
-      // so what goes in is a short digest, which differs exactly when the text differs and carries
-      // none of it back. `null` stays `null`, because "cleared" is a state and not a value.
+      // NOTE: The numbers themselves: this block decides whether the agent answers at all, and none of them is a
+      // secret or PII. The customer-facing sentence is fingerprinted, not quoted: free text would paste a
+      // paragraph into every row, while a bare "set" would read one sentence replaced by another as
+      // unchanged. `null` stays `null`, because "cleared" is a state.
       project: sides((raw) => {
         const b = readSpendCeilingConfig(raw);
         return {
           enabled: b.enabled,
           monthlyInboxUsd: b.monthlyInboxUsd,
           monthlyPlaygroundUsd: b.monthlyPlaygroundUsd,
+          monthlyClientUsd: b.monthlyClientUsd,
           warnAtPercent: b.warnAtPercent,
           handoffEnabled: b.handoffEnabled,
           noticeCooldownSeconds: b.noticeCooldownSeconds,
@@ -642,20 +737,20 @@ export async function updateSpendCeiling(
       const current = readSpendCeilingConfig(raw);
       // What is stored is the schema's output: the dollar fields and not the token ones, which is
       // how a save in dollars retires a block written in tokens (`legacyTokens`).
-      // not-caller-input: the STORED block merged with the patch, so a failure here is not necessarily the caller's
+      // biome-ignore lint/plugin/require-parse-input: not caller input, the STORED block merged with the patch, so a failure here is not necessarily the caller's
       const stored = spendCeilingSettingsSchema.parse({ ...current, ...patch });
-      // ...unless the patch names no dollar field and the block is still in tokens: the console saves
-      // the whole block, but the API takes partial patches, and an operator changing only the
-      // customer's sentence has not seen the new unit. Merging against the synthesized zeroes would
-      // store a dollar block and drop the one warning that the old ceiling is no longer enforced
-      // (review round 1). The token keys stay until a patch names a dollar figure.
+      // ...unless the patch names no dollar field and the block is still in tokens: a partial API
+      // patch (say, only the sentence) would otherwise store a dollar block of synthesized zeroes and drop
+      // the warning that the old ceiling is no longer enforced.
       const touchesUsd =
         patch.monthlyInboxUsd !== undefined ||
-        patch.monthlyPlaygroundUsd !== undefined;
+        patch.monthlyPlaygroundUsd !== undefined ||
+        patch.monthlyClientUsd !== undefined;
       if (current.legacyTokens && !touchesUsd) {
         const {
           monthlyInboxUsd: _inbox,
           monthlyPlaygroundUsd: _playground,
+          monthlyClientUsd: _client,
           ...rest
         } = stored;
         return {
@@ -667,33 +762,44 @@ export async function updateSpendCeiling(
       return stored;
     },
   );
-  // The poll that keeps the figure fresh follows the switch: armed while the ceiling is on, cancelled
-  // when it is off (issue #426). Best-effort inside, so it never fails the save.
+  // NOTE: the poll follows the switch (armed while on, cancelled when off). Best-effort, so it never
+  // fails the save.
   await syncTenantSpendPoll(requireTenantId(ctx), base);
   return readSpendCeilingConfig({ spendCeiling: next });
 }
 
-// The tenant's own prices (issue #865). The whole list is replaced on every save: it is edited as a
-// table on one screen, and a partial patch of a list has no key to merge on but the pair itself.
-//
-// Validated here and not only at the route: two rows for the same provider and model would leave
-// "which one priced this call" to list order, so the save refuses them with the row that repeats.
-// The write's validation, shared by the console's route and the MCP tool (a preview included), so
-// both refuse the same list with the same message.
+// The tenant's own prices. The whole list is replaced on every save: it is edited as one table, and
+// a list has no key to merge on but the pair itself. Validated here, not only at the route, so the
+// console and the MCP tool (preview included) refuse the same list: two rows for one provider and
+// model would leave the price to list order.
 export function parsePriceOverrides(overrides: unknown): PriceOverride[] {
   const parsed = priceOverridesSchema.safeParse(overrides);
   if (!parsed.success) {
     const issue = parsed.error.issues[0];
     const row = typeof issue?.path[0] === "number" ? issue.path[0] + 1 : 1;
     // The field too, so a caller that sent several rates learns which one was refused.
-    const field = issue?.path.slice(1).join(".");
-    const reason = `${field ? `${field}: ` : ""}${issue?.message ?? "invalid"}`;
-    throw new AppError(
-      `price row ${row} is not valid: ${reason}`,
-      422,
-      "errors.invalidPriceOverride",
-      { row, reason },
-      "priceOverrides",
+    const field = issue?.path.slice(1).join(".") || "priceOverrides";
+    // Ours carry their own phrase (`priceOverridesSchema`); zod's built-in checks answer in zod's
+    // English, quoted as the validator's words rather than read as part of our sentence.
+    const own = (issue as { params?: { phrase?: TranslatedParam } } | undefined)
+      ?.params?.phrase;
+    const detail = (issue?.message ?? "invalid").replaceAll("`", "'");
+    const reason =
+      own ??
+      phrase(
+        "errors.priceOverrideValidatorSaid",
+        `${field}: the validator answered "${detail}"`,
+        { field, detail },
+      );
+    throw quotingReason(
+      new AppError(
+        `price row ${row} is not valid: ${reason.message}`,
+        422,
+        "errors.invalidPriceOverride",
+        { row, reason: reason.message },
+        "priceOverrides",
+      ),
+      reason,
     );
   }
   return parsed.data;

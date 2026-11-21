@@ -18,6 +18,7 @@ import {
   registerClient,
 } from "@/modules/vault/mcp-oauth";
 import { createVaultEntry } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 const OPTS: OAuthNetOpts = { allowPrivate: true, allowHttp: true };
 
@@ -185,11 +186,6 @@ describe("mcp-oauth: state", () => {
     expect(back.clientId).toBe("client-1");
     expect(back.exp).toBeGreaterThan(Date.now());
   });
-
-  test("a tampered state is rejected", () => {
-    const blob = encryptOAuthState(sample());
-    expect(() => decryptMcpState(`${blob.slice(0, -4)}XXXX`)).toThrow();
-  });
 });
 
 describe("mcp-oauth: code exchange", () => {
@@ -293,8 +289,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 

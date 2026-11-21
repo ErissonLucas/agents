@@ -1,30 +1,35 @@
 /// <reference lib="dom" />
 
 import { afterEach, expect, test } from "bun:test";
-import { fileURLToPath } from "node:url";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useState } from "react";
 import { MemoryRouter } from "react-router";
+import type { ToolPreconditionRow } from "@/client/pages/agents/types";
+import { CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES } from "@/graph/tools/channel-natives";
 
-// A WATCHER'S TOOLS TAB OFFERS ONLY WHAT ITS TURN CAN RUN (issue #568, review round 30).
-//
-// The monitoring turn builds its Chatwoot client MUTED, and the assembly then drops every tool whose
-// whole point is to put something in front of the customer: the two natives the catalog flags, the
-// document tools, and a toolpack's delivery tools. A grant for one of those is a control that cannot
-// fire — the same class of dead configuration this issue refused at the API, arriving through the
-// editor instead. Grants already saved are left alone: flipping the mode back returns the agent.
+// A WATCHER'S TOOLS TAB OFFERS ONLY WHAT ITS TURN CAN RUN. The monitoring turn builds its Chatwoot
+// client MUTED, and the assembly drops every tool whose point is to put something in front of the
+// customer: the two natives the catalog flags, the document tools, and a toolpack's delivery tools.
+// A grant for one of those is a control that cannot fire. Grants already saved are left alone:
+// flipping the mode back returns the agent.
 
-const { ToolGrantsEditor, offeredPackTools } = await import(
+const { ToolGrantsEditor } = await import(
   "@/client/pages/agents/ToolGrantsEditor"
 );
 const { ToolsTab } = await import("@/client/pages/agents/ToolsTab");
 const { ToastProvider } = await import("@/client/components/Toast");
 const { AuthProvider } = await import("@/client/contexts/AuthContext");
 const { ThemeProvider } = await import("@/client/contexts/ThemeContext");
-const {
-  NATIVE_TOOL_NAMES,
-  RAG_TOOL_NAMES,
-  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
-} = await import("@/graph/tools/catalog");
+const { NATIVE_TOOL_NAMES, RAG_TOOL_NAMES } = await import(
+  "@/graph/tools/catalog"
+);
 
 const realFetch = globalThis.fetch;
 const json = (body: unknown) =>
@@ -71,9 +76,22 @@ const CATALOG = {
   ],
 };
 
-function renderEditor(observing: boolean) {
+// The editor with its catalog and grants as props: fixed by default, or held by the caller.
+function Editor({
+  observing,
+  catalog = CATALOG,
+  grants = GRANTED,
+  onChange = () => undefined,
+  onCatalogChange = () => undefined,
+}: {
+  observing: boolean;
+  catalog?: unknown;
+  grants?: unknown;
+  onChange?: (grants: unknown) => void;
+  onCatalogChange?: () => void | Promise<void>;
+}) {
   const noop = () => undefined;
-  return render(
+  return (
     <MemoryRouter>
       <ThemeProvider>
         <AuthProvider>
@@ -88,19 +106,10 @@ function renderEditor(observing: boolean) {
                 labelInstructions: null,
                 updateKanbanInstructions: null,
               }}
-              catalog={CATALOG as never}
-              // The integration is GRANTED, and expanded, so its tool list is on screen.
-              grants={
-                [
-                  {
-                    source: "INTEGRATION",
-                    integrationInstanceId: "9",
-                    enabledTools: ["drive_find_file", "drive_send_file"],
-                  },
-                ] as never
-              }
-              onChange={noop}
-              onCatalogChange={noop}
+              catalog={catalog as never}
+              grants={grants as never}
+              onChange={onChange as never}
+              onCatalogChange={onCatalogChange as never}
               transferWithSummary={false}
               setTransferWithSummary={noop}
               handoff={{
@@ -122,10 +131,17 @@ function renderEditor(observing: boolean) {
                 mergeContacts: false,
                 resolveOrigin: false,
                 subjectTemplate: "",
+                openingTemplate: "",
+                noteTemplate: "",
+                carryMode: "off",
+                carryFileTypes: ["image", "file"],
+                carryMaxFiles: 10,
               }}
               setCrossInboxCase={noop}
               sendImage={{ allowedHosts: "" }}
               setSendImage={noop}
+              resolveConversation={{ assignLabels: [] }}
+              setResolveConversation={noop}
               setCustomAttributeInstructions={noop}
               labelInstructions=""
               protectedLabels=""
@@ -134,6 +150,10 @@ function renderEditor(observing: boolean) {
               setAllowedLabels={noop}
               outsideAllowedLabels="refuse"
               setOutsideAllowedLabels={noop}
+              labelRemoval="any"
+              setLabelRemoval={noop}
+              writableAttributes={{ conversation: [], contact: [], task: [] }}
+              setWritableAttributes={noop}
               setLabelInstructions={noop}
               updateKanbanTaskInstructions=""
               setUpdateKanbanTaskInstructions={noop}
@@ -149,8 +169,21 @@ function renderEditor(observing: boolean) {
           </ToastProvider>
         </AuthProvider>
       </ThemeProvider>
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+// The integration is GRANTED, and expanded, so its tool list is on screen.
+const GRANTED = [
+  {
+    source: "INTEGRATION",
+    integrationInstanceId: "9",
+    enabledTools: ["drive_find_file", "drive_send_file"],
+  },
+];
+
+function renderEditor(observing: boolean) {
+  return render(<Editor observing={observing} />);
 }
 
 afterEach(() => {
@@ -184,37 +217,83 @@ test("an agent that only observes is not offered the tools its turn would refuse
   expect(screen.queryAllByText("Find file").length).toBeGreaterThan(0);
 });
 
+// The other place a pack's tools are decided: an integration created from inside this editor is
+// granted on the spot, and a watcher is granted only what it would have been offered.
+async function grantOnCreate(observing: boolean): Promise<unknown> {
+  const created = {
+    ...(CATALOG.integrationInstances[0] as Record<string, unknown>),
+    id: "77",
+  };
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const url = String(input);
+    if (url.includes("/api/auth/me")) {
+      return json({ user: { id: "1", email: "a@b.c", role: "ADMIN" } });
+    }
+    if (url.includes("/integrations/catalog")) {
+      return json({
+        catalog: [{ catalogType: "GOOGLE_DRIVE", kind: "TOOLPACK", tools: [] }],
+      });
+    }
+    if (url.includes("/integrations/instances")) {
+      return json({ id: "77", routeToken: null });
+    }
+    return json({});
+  }) as typeof fetch;
+  let granted: unknown = null;
+  function Live() {
+    const [catalog, setCatalog] = useState<Record<string, unknown>>({
+      ...CATALOG,
+      integrationInstances: [],
+    });
+    const [grants, setGrants] = useState<unknown[]>([]);
+    return (
+      <Editor
+        observing={observing}
+        catalog={catalog}
+        grants={grants}
+        onChange={(next) => {
+          granted = next;
+          setGrants(next as unknown[]);
+        }}
+        onCatalogChange={() =>
+          setCatalog((c) => ({ ...c, integrationInstances: [created] }))
+        }
+      />
+    );
+  }
+  render(<Live />);
+  const section = await waitFor(() => {
+    const el = document.getElementById("tools-integrations");
+    if (!el) throw new Error("the integrations section is not drawn");
+    return el;
+  });
+  fireEvent.click(within(section).getByRole("button", { name: /New/ }));
+  const dialog = await screen.findByRole("dialog");
+  const save = within(dialog).getByRole("button", { name: "Save" });
+  await waitFor(() => expect(save.hasAttribute("disabled")).toBe(false));
+  fireEvent.click(save);
+  await waitFor(() => expect(granted).not.toBeNull());
+  return granted;
+}
+
 test("both places a pack's tools are decided read one predicate", async () => {
-  // The auto-grant that fires when an integration is created inside this editor is not reachable
-  // from a test without driving the creation modal, and it is exactly the site that was filtering
-  // nothing. So the two sites share a function instead of a repeated expression, and this asks that
-  // function directly — a mutant would have to re-introduce the duplicate to get past it.
-  const tools = [
-    { name: "drive_find_file" },
-    { name: "drive_send_file", deliversToCustomer: true },
-  ];
-  expect(offeredPackTools(tools, true).map((x) => x.name)).toEqual([
-    "drive_find_file",
+  expect(await grantOnCreate(true)).toEqual([
+    {
+      source: "INTEGRATION",
+      integrationInstanceId: "77",
+      enabledTools: ["drive_find_file"],
+    },
   ]);
-  expect(offeredPackTools(tools, false).map((x) => x.name)).toEqual([
-    "drive_find_file",
-    "drive_send_file",
+});
+
+test("...and an agent that answers is granted the whole pack on creation", async () => {
+  expect(await grantOnCreate(false)).toEqual([
+    {
+      source: "INTEGRATION",
+      integrationInstanceId: "77",
+      enabledTools: ["drive_find_file", "drive_send_file"],
+    },
   ]);
-  expect(offeredPackTools(tools, undefined)).toHaveLength(2);
-  // ...and the source of both call sites names it. Read from the file rather than deduced: this is
-  // the assertion that a second, hand-rolled filter cannot pass (review round 31).
-  const src = await Bun.file(
-    fileURLToPath(
-      new URL(
-        "../../src/client/pages/agents/ToolGrantsEditor.tsx",
-        import.meta.url,
-      ),
-    ),
-  ).text();
-  expect(src.match(/offeredPackTools\(inst\.tools, observing\)/g)).toHaveLength(
-    2,
-  );
-  expect(src.includes("deliversToCustomer)")).toBe(true);
 });
 
 test("...and an agent that answers is offered all of them", async () => {
@@ -229,12 +308,12 @@ test("...and an agent that answers is offered all of them", async () => {
   expect(screen.queryAllByText("Documents").length).toBeGreaterThan(0);
 });
 
-// THE OTHER HALF OF THE SAME SCREEN (review round 40). The grant cards stopped offering what a muted
-// turn strips; the preconditions block beside them, and the section index on the left, were still
-// drawn from the unfiltered catalog.
+// THE OTHER HALF OF THE SAME SCREEN. Besides the grant cards, the preconditions block beside them
+// and the section index on the left leave out what a muted turn strips.
 function renderToolsTab(
   observing: boolean,
-  rows: { tool: string; scope: string; key: string; value: string }[] = [],
+  rows: ToolPreconditionRow[] = [],
+  voice = false,
 ) {
   const noop = () => undefined;
   return render(
@@ -245,6 +324,7 @@ function renderToolsTab(
             <ToolsTab
               agentId="1"
               observing={observing}
+              voice={voice}
               catalog={CATALOG as never}
               grants={[] as never}
               onChange={noop}
@@ -270,10 +350,17 @@ function renderToolsTab(
                 mergeContacts: false,
                 resolveOrigin: false,
                 subjectTemplate: "",
+                openingTemplate: "",
+                noteTemplate: "",
+                carryMode: "off",
+                carryFileTypes: ["image", "file"],
+                carryMaxFiles: 10,
               }}
               setCrossInboxCase={noop}
               sendImage={{ allowedHosts: "" }}
               setSendImage={noop}
+              resolveConversation={{ assignLabels: [] }}
+              setResolveConversation={noop}
               refusals={{
                 handoffInstructions: null,
                 kanbanInstructions: null,
@@ -290,10 +377,27 @@ function renderToolsTab(
               setAllowedLabels={noop}
               outsideAllowedLabels="refuse"
               setOutsideAllowedLabels={noop}
+              labelRemoval="any"
+              setLabelRemoval={noop}
+              writableAttributes={{ conversation: [], contact: [], task: [] }}
+              setWritableAttributes={noop}
               updateKanbanTaskInstructions=""
               setUpdateKanbanTaskInstructions={noop}
               toolPreconditions={rows as never}
               setToolPreconditions={noop}
+              choiceCheck={{
+                provider: "",
+                model: "",
+                credentialRef: "",
+                baseURL: "",
+              }}
+              setChoiceCheck={noop}
+              agentModel={{
+                provider: "openai",
+                credentialRef: "",
+                baseURL: "",
+              }}
+              choiceCheckCredBaseUrl={null}
               mcpTools={{}}
               setMcpTools={noop}
               mcpInstructions={{}}
@@ -315,7 +419,10 @@ function renderToolsTab(
 }
 
 // The empty row is what an operator adding a guard sees, and its select is the list of choices.
-const EMPTY_ROW = { tool: "", scope: "conversation", key: "", value: "" };
+const EMPTY_ROW = {
+  tool: "",
+  conditions: [{ scope: "conversation" as const, key: "", equals: "" }],
+};
 
 test("a watcher is not offered a precondition on a tool its turn would strip", async () => {
   stubAuth();
@@ -379,4 +486,24 @@ test("the section index carries no link to a block the watcher does not draw", a
     ),
   );
   expect(screen.queryAllByRole("link", { name: "Documents" })).toHaveLength(0);
+});
+
+// A call's tools run with no transcript, so a customer_choice rule would refuse every call: the tab
+// offers neither the kind nor the judge's model on a voice agent.
+test("a voice agent is offered neither the customer's choice nor the judge's model", async () => {
+  stubAuth();
+  const choiceOpt = () =>
+    screen.queryAllByRole("option", {
+      name: "the customer has chosen the values of the call",
+    });
+  const { unmount } = renderToolsTab(false, [EMPTY_ROW], true);
+  await waitFor(() =>
+    expect(screen.queryAllByText("Tool preconditions").length).toBeGreaterThan(
+      0,
+    ),
+  );
+  expect(choiceOpt()).toHaveLength(0);
+  unmount();
+  renderToolsTab(false, [EMPTY_ROW]);
+  await waitFor(() => expect(choiceOpt()).toHaveLength(1));
 });

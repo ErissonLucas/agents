@@ -3,14 +3,19 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   FormField,
-  Input,
+  NumberInput,
   Select,
   Switch,
   SwitchField,
   Textarea,
 } from "@/client/components";
 import { api } from "@/client/lib/api";
+import {
+  CHANNEL_REDIRECT_RANGES,
+  delayRange,
+} from "@/modules/agents/number-ranges";
 import type { RedirectDelayUnit } from "@/modules/channel-redirect/service";
+import { FieldSize } from "./CallFloor";
 import { Section, SectionNav } from "./SectionNav";
 import { TabActionBar } from "./TabActionBar";
 
@@ -62,9 +67,8 @@ function DelayField({
   return (
     <FormField label={label} description={description} group>
       <div className="flex items-stretch gap-2">
-        <Input
-          type="number"
-          min={1}
+        <NumberInput
+          range={delayRange(unit)}
           value={value}
           onChange={(e) => onValueChange(e.target.value)}
           className="w-24 text-sm"
@@ -292,16 +296,16 @@ export function ChannelRedirectTab({
         <SectionNav sections={sections} />
         <div className="flex min-w-0 grow flex-col gap-4">
           {/* Top: the master switch + the one-paragraph story of the whole flow. */}
-          <div className="flex flex-col gap-3 rounded-xl border border-border bg-bg-secondary p-4">
+          <div className="border-border bg-bg-secondary flex flex-col gap-3 rounded-xl border p-4">
             <div className="flex items-start justify-between gap-4">
               <div className="min-w-0">
-                <h2 className="font-semibold text-base text-text-primary">
+                <h2 className="text-text-primary text-base font-semibold">
                   {t(
                     "editor.channelRedirect.title",
                     "WhatsApp → website chat redirect",
                   )}
                 </h2>
-                <p className="mt-1 text-sm text-text-muted">
+                <p className="text-text-muted mt-1 text-sm">
                   {t(
                     "editor.channelRedirect.intro",
                     "Receive the lead on WhatsApp, reply with an automatic link that sends them to your website chat, and handle the conversation there, with no per-message WhatsApp cost.",
@@ -322,7 +326,7 @@ export function ChannelRedirectTab({
           {/* Item 4: enabled but an inbox is missing → the redirect can't run. Also surfaced as a
               config-health warning at the top of the editor (deep-links back to this tab). */}
           {missingInbox && (
-            <div className="flex items-start gap-2 rounded-md border border-warning bg-warning-soft px-3 py-2 text-sm text-warning">
+            <div className="border-warning bg-warning-soft text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-sm">
               <TriangleAlert
                 className="mt-0.5 h-4 w-4 shrink-0"
                 aria-hidden="true"
@@ -467,7 +471,7 @@ export function ChannelRedirectTab({
               </p>
             )}
             {(widgetHealth === "invalid" || widgetHealth === "missing") && (
-              <p className="flex items-start gap-1.5 text-warning text-xs">
+              <p className="text-warning flex items-start gap-1.5 text-xs">
                 <TriangleAlert
                   className="mt-0.5 h-3.5 w-3.5 shrink-0"
                   aria-hidden="true"
@@ -591,10 +595,8 @@ export function ChannelRedirectTab({
                   "How many times the link may be re-sent before going silent. 0-10.",
                 )}
               >
-                <Input
-                  type="number"
-                  min={0}
-                  max={10}
+                <NumberInput
+                  range={CHANNEL_REDIRECT_RANGES.maxResends}
                   value={cr.maxResends}
                   onChange={(e) => setCr({ ...cr, maxResends: e.target.value })}
                 />
@@ -657,6 +659,10 @@ export function ChannelRedirectTab({
                         "E.g.: ask if the customer is still interested and offer to help them continue.",
                       )}
                     />
+                    <FieldSize
+                      text={cr.chatFollowupInstructions}
+                      sentWith="redirectFollowUp"
+                    />
                   </FormField>
                 </div>
               )}
@@ -664,7 +670,7 @@ export function ChannelRedirectTab({
 
             {/* Step 4b — re-send the link on WhatsApp if still idle: the crucial recovery. The lead may
                 have left the chat, where a chat nudge can't reach them; WhatsApp can. Fixed message, not AI. */}
-            <div className="flex flex-col gap-4 border-border border-t pt-4">
+            <div className="border-border flex flex-col gap-4 border-t pt-4">
               <SwitchField
                 checked={cr.waFollowupEnabled}
                 onCheckedChange={(v) => setCr({ ...cr, waFollowupEnabled: v })}
@@ -726,7 +732,7 @@ export function ChannelRedirectTab({
             </div>
 
             {/* Step 4c — fixed closing message on both the chat + WhatsApp before resolving. */}
-            <div className="flex flex-col gap-4 border-border border-t pt-4">
+            <div className="border-border flex flex-col gap-4 border-t pt-4">
               <SwitchField
                 checked={cr.closingEnabled}
                 onCheckedChange={(v) => setCr({ ...cr, closingEnabled: v })}

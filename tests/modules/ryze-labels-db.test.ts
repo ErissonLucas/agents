@@ -16,6 +16,7 @@ import {
 } from "@/modules/ryze/labels";
 import { receiveRyzeWebhook } from "@/modules/ryze/receiver";
 import { connectRyzeGateway } from "@/modules/ryze/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { outboundUrl } from "../utils/outbound";
 
 // WhatsApp Business labels on a RyzeAPI number against the database: the catalog and its import
@@ -38,8 +39,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

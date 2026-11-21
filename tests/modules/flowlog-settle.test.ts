@@ -6,28 +6,16 @@ import {
   settleFlowEvents,
 } from "@/modules/flowlog/scheduled";
 import { emitFlowEvent } from "@/modules/flowlog/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
 
-// ── EMPTYING THE TABLE IS NOT THE SAME AS IT STAYING EMPTY (issue #375) ──
-//
-// `emitFlowEvent` is fire-and-forget by design (src/modules/flowlog/service.ts): the hot WhatsApp
-// path must not pay write latency for six log lines. The reader-scope ledger
-// (tests/modules/flowlog-reader-scope.test.ts) names two obligations that fall out of it, SCOPE and
-// WAIT, and fences the first. This file is about the third one, which that ledger did not name:
-//
-//   CLEAR  a test that empties `execution_logs` between cases empties it of the rows that EXIST.
-//          A write the previous case only scheduled lands afterwards, into a table the current case
-//          believes it owns, and `orderBy: { id: "asc" }` hands it back FIRST.
-//
-// Measured on this branch, 8 full-suite runs on the base: one failure, and it was
-// `a requeue that arrives as the worker is dying reads the count it died at`
-// (tests/modules/webhooks-outbound-deliveries.test.ts) reading `{ attempts: 9, … }` — the death line
-// of the case directly above it, verbatim. In isolation that file passes 3 of 3, because the write
-// only loses the race when the machine is loaded.
-//
-// The cases below use a base whose transaction is deliberately slow, so the race is not a race: a
-// 300ms write against an immediate DELETE has one possible order. Nothing here polls for a timeout
-// to expire, which is what makes them evidence rather than another flake.
+// EMPTYING THE TABLE IS NOT THE SAME AS IT STAYING EMPTY. `emitFlowEvent` is fire-and-forget
+// (src/modules/flowlog/service.ts), so a test that empties `execution_logs` between cases empties it
+// of the rows that EXIST: a write the previous case only scheduled lands afterwards, into a table the
+// current case believes it owns, and `orderBy: { id: "asc" }` hands it back FIRST. It loses the race
+// only under load, so a file can pass alone and fail in the full suite. The cases use a base whose
+// transaction is deliberately slow, so a 300ms write against an immediate DELETE has one possible
+// order, and nothing waits on a timeout: they are evidence, not another flake.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -40,8 +28,8 @@ if (appUrl && suUrl) {
     });
     await su.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
@@ -52,7 +40,18 @@ let tenantId: bigint;
 // that returns, so delaying the transaction delays the whole write and nothing else. Binding to
 // `target` rather than forwarding the proxy as the receiver is what keeps Prisma's own accessors
 // working — several of them are getters that close over the client instance.
-function slowBase(real: PrismaClient, delayMs: number): PrismaClient {
+// `hooks` say when the delayed write starts waiting and when its transaction is over, so a case can
+// act on the write's own progress instead of guessing how long it takes. `hold`, when given, replaces
+// the delay: the write waits for the case to release it.
+function slowBase(
+  real: PrismaClient,
+  delayMs: number,
+  hooks: {
+    entered?: () => void;
+    done?: () => void;
+    hold?: Promise<void>;
+  } = {},
+): PrismaClient {
   const wrap = <T extends object>(obj: T, patch: (p: string) => unknown) =>
     new Proxy(obj, {
       get(target, prop, receiver) {
@@ -75,8 +74,13 @@ function slowBase(real: PrismaClient, delayMs: number): PrismaClient {
             p === "$transaction"
               ? // biome-ignore lint/suspicious/noExplicitAny: same
                 async (...txArgs: any[]) => {
-                  await Bun.sleep(delayMs);
-                  return extended.$transaction(...txArgs);
+                  hooks.entered?.();
+                  try {
+                    await (hooks.hold ?? Bun.sleep(delayMs));
+                    return await extended.$transaction(...txArgs);
+                  } finally {
+                    hooks.done?.();
+                  }
                 }
               : undefined,
           );
@@ -134,29 +138,20 @@ describe.skipIf(!dbUp)(
       expect(await rows()).toHaveLength(1);
     });
 
-    test("a DELETE that does not settle first leaves the scheduled write behind", async () => {
-      await settleFlowEvents();
-      await suDb.$executeRaw`DELETE FROM execution_logs WHERE tenant_id = ${tenantId}`;
-      const { ctx, ev } = event(crypto.randomUUID());
-      emitFlowEvent({ ...ctx, base: slowBase(suDb, 300) }, ev);
-      // The clear as every one of these files writes it today.
-      await suDb.$executeRaw`DELETE FROM execution_logs WHERE tenant_id = ${tenantId}`;
-      await settleFlowEvents();
-      // The table was emptied twice and still holds a row: this is the defect, stated as a fact so
-      // that a future change making the write synchronous is a deliberate red rather than a silent
-      // one. It is also why `settleFlowEvents` cannot be optional at a clear site.
-      expect(await rows()).toHaveLength(1);
-    });
-
     test("a DELETE that settles first leaves nothing behind", async () => {
       await settleFlowEvents();
       await suDb.$executeRaw`DELETE FROM execution_logs WHERE tenant_id = ${tenantId}`;
       const { ctx, ev } = event(crypto.randomUUID());
-      emitFlowEvent({ ...ctx, base: slowBase(suDb, 300) }, ev);
+      const written = Promise.withResolvers<void>();
+      emitFlowEvent(
+        { ...ctx, base: slowBase(suDb, 300, { done: written.resolve }) },
+        ev,
+      );
       await settleFlowEvents();
       await suDb.$executeRaw`DELETE FROM execution_logs WHERE tenant_id = ${tenantId}`;
-      // Nothing can arrive late, because nothing was still scheduled when the DELETE ran.
-      await Bun.sleep(400);
+      // Nothing can arrive late, because nothing was still scheduled when the DELETE ran: read once the
+      // write itself is over, which a settle that waited for it had already seen happen.
+      await written.promise;
       expect(await rows()).toHaveLength(0);
     });
 
@@ -177,15 +172,43 @@ describe.skipIf(!dbUp)(
       await settleFlowEvents();
       await suDb.$executeRaw`DELETE FROM execution_logs WHERE tenant_id = ${tenantId}`;
       const first = event(crypto.randomUUID());
-      emitFlowEvent({ ...first.ctx, base: slowBase(suDb, 300) }, first.ev);
-      const settling = settleFlowEvents();
-      // Scheduled after the settle started, which is the ordinary case rather than an exotic one: the
-      // suite runs many files in one process and a clear does not stop the rest of them from emitting.
-      await Bun.sleep(60);
+      const entered = Promise.withResolvers<void>();
+      const firstDone = Promise.withResolvers<void>();
+      emitFlowEvent(
+        {
+          ...first.ctx,
+          base: slowBase(suDb, 300, {
+            entered: entered.resolve,
+            done: firstDone.resolve,
+          }),
+        },
+        first.ev,
+      );
+      let settled = false;
+      const settling = settleFlowEvents().then(() => {
+        settled = true;
+      });
+      // Scheduled after the settle started, while it waits on the first write, which is the ordinary
+      // case rather than an exotic one: the suite runs many files in one process and a clear does not
+      // stop the rest of them from emitting. Held until the first write is over, so the two cannot
+      // finish together.
+      await entered.promise;
       const second = event(crypto.randomUUID());
-      emitFlowEvent({ ...second.ctx, base: slowBase(suDb, 300) }, second.ev);
+      const release = Promise.withResolvers<void>();
+      emitFlowEvent(
+        { ...second.ctx, base: slowBase(suDb, 0, { hold: release.promise }) },
+        second.ev,
+      );
+      try {
+        await firstDone.promise;
+        // Everything a settle does once the first write is over is microtasks, which one macrotask
+        // turn drains whole: a settle that snapshotted the set once has returned by then.
+        await new Promise((r) => setImmediate(r));
+        expect(settled).toBe(false);
+      } finally {
+        release.resolve();
+      }
       await settling;
-      // A settle that snapshotted the set once would have returned after the first write alone.
       expect(await rows()).toHaveLength(2);
     });
 

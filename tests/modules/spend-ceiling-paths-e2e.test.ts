@@ -24,20 +24,16 @@ import {
   extractInboundFile,
   extractPlaygroundFile,
 } from "@/modules/vision/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// The two paths the webhook gate does NOT stand in front of (issue #146).
-//
-// The playground is a second ledger with a second ceiling: an operator testing a prompt in a loop is
-// the cheapest way to discover there was no ceiling at all, and the point of keeping the numbers
-// apart is that spending the playground one must never silence the agent for customers. Here the
-// refusal THROWS, because the operator is looking at the screen.
-//
-// Vision is the one billed call that runs BEFORE any turn gate decides anything: it reads the
-// incoming attachment while the webhook is still working out whether the agent even owns the
-// conversation (the same asymmetry #316 measured for attribution). So it asks for itself, and it
-// skips rather than throws, because the webhook must never be stranded on it.
+// The two paths the webhook gate does NOT stand in front of. The playground is a second ledger with
+// a second ceiling, kept apart so that spending it never silences the agent for customers; its
+// refusal THROWS, because the operator is looking at the screen. Vision is the one billed call that
+// runs BEFORE any turn gate decides anything (it reads the incoming attachment while the webhook is
+// still working out whether the agent owns the conversation), so it asks for itself, and it skips
+// rather than throws, because the webhook must never be stranded on it.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -55,8 +51,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -77,7 +73,7 @@ async function setCeiling(
   });
 }
 
-// The month's figure, as the poll would have written it (issue #426): the gate reads the snapshot,
+// The month's figure, as the poll would have written it: the gate reads the snapshot,
 // never the ledger, so what a test seeds is the snapshot. The number is dollars.
 async function spend(source: string, usd: number) {
   const monthStart = new Date(
@@ -110,7 +106,7 @@ async function refusal(
   }
 }
 
-// A Chatwoot that SERVES the attachment, because the inbound gate now sits after the download: the
+// A Chatwoot that SERVES the attachment, because the inbound gate sits after the download: the
 // download is what tells that path the file's type, and a ceiling asked before it would be refusing
 // a call that an unsupported type was going to stop anyway. What the assertion moves to is the
 // PROVIDER — the billed call the ceiling exists in front of — so `providerCalls` is the count that
@@ -344,6 +340,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
         credentialRef: visionRef,
         baseURL: null,
         extractionPrompt: "descreva",
+        maxOutputTokens: null,
+        reasoningEffort: null,
       },
       base: appDb,
       deps: s.deps,
@@ -375,6 +373,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
         credentialRef: visionRef,
         baseURL: null,
         extractionPrompt: "descreva",
+        maxOutputTokens: null,
+        reasoningEffort: null,
       },
       base: appDb,
       flow: { tenantId, turnId, source: "inbox", base: appDb },
@@ -384,6 +384,7 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     expect(s.providerCalls).toEqual([]);
     await settleFlowEvents();
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { turnId },
       select: { stage: true, detail: true },
     });
@@ -394,11 +395,11 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     await clearFlowLog(suDb, { tenantId });
   });
 
-  // AND THE SAME FOR A FILE READABLE BY TYPE AND UNREADABLE IN FACT. A HEIC this provider does not
-  // take is converted, and a broken one fails that conversion and is skipped in a month with budget
-  // to spare — so `spend_ceiling` in a spent one names a cause that was not operative. This is the
-  // case the type check above cannot answer: `image/heic` IS a vision kind, and only the decoder
-  // finds out (PR #707 review round 8).
+  // NOTE: and the same for a file readable by type and unreadable in fact. A HEIC this provider
+  // does not take is converted, and a broken one fails that conversion and is skipped in a month
+  // with budget to spare, so `spend_ceiling` in a spent one names a cause that was not operative.
+  // This is the case the type check above cannot answer: `image/heic` IS a vision kind, and only
+  // the decoder finds out.
   test("a HEIC that cannot be converted, over the ceiling, is skipped as convert_failed", async () => {
     await setCeiling({ enabled: true, monthlyInboxUsd: 1000 });
     await spend("inbox", 1200);
@@ -418,6 +419,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
         credentialRef: visionRef,
         baseURL: null,
         extractionPrompt: "descreva",
+        maxOutputTokens: null,
+        reasoningEffort: null,
       },
       base: appDb,
       flow: { tenantId, turnId, source: "inbox", base: appDb },
@@ -427,6 +430,7 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     expect(s.providerCalls).toEqual([]);
     await settleFlowEvents();
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { turnId },
       select: { stage: true, detail: true },
     });
@@ -517,6 +521,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
         credentialRef: visionRef,
         baseURL: null,
         extractionPrompt: "descreva",
+        maxOutputTokens: null,
+        reasoningEffort: null,
       },
       base: appDb,
       flow: { tenantId, turnId, source: "inbox", base: appDb },
@@ -528,6 +534,7 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     // rather than a poll: polling for the absence would only spend the timeout before answering.
     await settleFlowEvents();
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { turnId },
       select: { stage: true, status: true, detail: true },
     });
@@ -572,6 +579,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
           credentialRef: visionRef,
           baseURL: null,
           extractionPrompt: "descreva",
+          maxOutputTokens: null,
+          reasoningEffort: null,
         },
         base: appDb,
         flow: { tenantId, turnId, source: "inbox", base: appDb },
@@ -581,6 +590,7 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     expect(s.providerCalls.length).toBe(1);
     await settleFlowEvents();
     const rows = await flowLogRows(suDb, {
+      orderBy: { id: "asc" },
       where: { turnId, stage: "spend_ceiling" },
       select: { level: true, status: true, detail: true },
     });
@@ -591,8 +601,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
     await clearFlowLog(suDb, { tenantId });
   });
 
-  // THE CONTROL, and what it has to reach moved with the gate. Reaching the DOWNLOAD proves nothing
-  // now: the download runs above the ceiling either way, so a test that stopped there would be
+  // NOTE: the control. Reaching the DOWNLOAD proves nothing: the download runs above the ceiling
+  // either way, so a test that stopped there would be
   // green with the gate refusing everything. The billed call is the thing the ceiling stands in
   // front of, so that is what a tenant under its ceiling has to get to.
   test("vision under the ceiling is not stopped by the gate", async () => {
@@ -614,6 +624,8 @@ describe.skipIf(!dbUp)("the spend ceiling on the playground and vision", () => {
           credentialRef: visionRef,
           baseURL: null,
           extractionPrompt: "descreva",
+          maxOutputTokens: null,
+          reasoningEffort: null,
         },
         base: appDb,
         deps: s.deps,

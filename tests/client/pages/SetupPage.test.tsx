@@ -8,9 +8,11 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import * as AuthModule from "@/client/contexts/AuthContext";
+import * as ThemeModule from "@/client/contexts/ThemeContext";
 import { withI18n } from "@/tests/utils/i18n";
+import { stubExports } from "@/tests/utils/module-stub";
 
 const mockLogin = mock((_: unknown) => {});
 const mockRefresh = mock(async () => {});
@@ -22,23 +24,21 @@ let authState: {
   refresh: typeof mockRefresh;
 };
 
-mock.module("@/client/contexts/AuthContext", () => ({
+stubExports(AuthModule, {
   useAuth: () => authState,
-  AuthProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
-mock.module("@/client/contexts/ThemeContext", () => ({
+stubExports(ThemeModule, {
   useThemedAsset: (path: string) => ({ src: path }),
   // NOTE: `useTheme` is consumed transitively by the components barrel
-  // (`@/client/components`) that SetupPage imports from, so the mock must
-  // surface it even if SetupPage itself never reads the hook.
+  // (`@/client/components`) that SetupPage imports from, so the stub must
+  // cover it even if SetupPage itself never reads the hook.
   useTheme: () => ({
     theme: "dark",
     resolvedTheme: "dark",
     setTheme: () => {},
   }),
-  ThemeProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 const { SetupPage } = await import("@/client/pages/SetupPage");
 const { ToastProvider } = await import("@/client/components/Toast");
@@ -103,7 +103,7 @@ describe("SetupPage", () => {
   test("captures the ?token= query param and strips it from the URL", async () => {
     renderAt("/setup?token=abc123");
 
-    // NOTE: The token is held in component state and shown in the field, but
+    // The token is held in component state and shown in the field, but
     // the URL is cleaned on mount so it does not linger in history or in
     // Referer headers.
     const tokenInput = screen.getByLabelText("Setup token") as HTMLInputElement;
@@ -112,6 +112,31 @@ describe("SetupPage", () => {
     await waitFor(() => {
       expect(screen.getByTestId("location-search").textContent).toBe("");
     });
+  });
+
+  test("the token is not a password field, and the admin passwords still are", () => {
+    renderAt("/setup?token=abc123");
+    const token = screen.getByLabelText("Setup token") as HTMLInputElement;
+    expect(token.type).toBe("text");
+    expect(token.getAttribute("autocomplete")).toBe("off");
+    expect(token.getAttribute("data-1p-ignore")).toBe("");
+    expect(token.getAttribute("data-lpignore")).toBe("true");
+    expect(token.getAttribute("data-bwignore")).toBe("");
+    expect(token.getAttribute("data-form-type")).toBe("other");
+
+    const passwords = [
+      screen.getByLabelText("Password"),
+      screen.getByLabelText("Confirm Password"),
+    ] as HTMLInputElement[];
+    expect(passwords.map((p) => p.type)).toEqual(["password", "password"]);
+    expect(passwords.map((p) => p.getAttribute("autocomplete"))).toEqual([
+      "new-password",
+      "new-password",
+    ]);
+    expect(passwords.map((p) => p.getAttribute("data-1p-ignore"))).toEqual([
+      null,
+      null,
+    ]);
   });
 });
 

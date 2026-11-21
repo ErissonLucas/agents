@@ -8,24 +8,17 @@ import {
   replaceAgentToolSelections,
 } from "@/modules/agents/service";
 import { deleteCodeTool } from "@/modules/code-tools/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { until } from "@/tests/utils/poll";
 
 // The gap between "this grant names a tool that exists" and the insert that points at it.
-//
-// `replaceAgentToolSelections` reads every target, then deletes the old selection rows and writes
-// the new ones. Nothing holds the targets still across those two steps, and nothing can cheaply:
-// the sources span five tables, and the namespace lock the tool services take is keyed to the tool
-// NAMESPACE, so it would cover two of them and leave MCP connections, integrations and knowledge
-// bases exactly as they are. So the race is not closed here; it is ANSWERED. A target deleted in
-// the gap is the same event as a target that was never there, and the caller gets the not-found the
-// read itself would have given a moment earlier instead of a 500 (round 31).
-//
-// Measured before the fix, on a real insert: PrismaClientKnownRequestError, code P2003, constraint
-// `agent_tool_selections_code_tool_definition_id_fkey`. Nothing in the API maps P2003, so it left
-// the console with a generic failure and the operator with no idea which tool went away.
-//
-// The race here is REAL, not simulated: the delete commits on a second connection, in the window
-// between the check and the insert, held open by a query extension on the writer's own client. What
-// the extension supplies is the TIMING; every row and every statement is the production path's.
+// `replaceAgentToolSelections` reads every target, then rewrites the selection rows, and nothing
+// cheap holds the targets still in between: the sources span five tables, and the tool services'
+// namespace lock covers two. So the race is ANSWERED, not closed: a target deleted in the gap is the
+// same event as one that was never there, and the caller gets the read's not-found instead of a 500
+// from an unmapped P2003 (`agent_tool_selections_code_tool_definition_id_fkey`). The race is REAL: the
+// delete commits on a second connection inside the window, held open by a query extension on the
+// writer's client, which supplies only the TIMING.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -35,6 +28,8 @@ let app: PrismaClient | undefined;
 // A SECOND app connection, because the deadlock below needs two transactions open at once and one
 // client's transaction is one connection.
 let app2: PrismaClient | undefined;
+// The racing delete's connections carry this name, so a case can see that delete waiting on a lock.
+const DELETER = `grant-target-delete-${process.pid}`;
 if (appUrl && suUrl) {
   try {
     su = new PrismaClient({
@@ -46,17 +41,38 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     app2 = new PrismaClient({
-      adapter: new PrismaPg({ connectionString: appUrl }),
+      adapter: new PrismaPg({
+        connectionString: appUrl,
+        application_name: DELETER,
+      }),
     });
     await app2.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
 const appDb2 = app2 as PrismaClient;
+
 const suDb = su as PrismaClient;
+
+// Lets the racing delete reach the lock it will wait on: parked on a lock, as the ordering has it, or
+// over (refused or done) without waiting, which the assertions then read.
+async function deleteWaitsOrEnds(deleting: Promise<unknown>): Promise<void> {
+  let over = false;
+  void deleting.finally(() => {
+    over = true;
+  });
+  await until("the delete parked on a lock, or over", async () => {
+    if (over) return true;
+    const [row] = await suDb.$queryRaw<{ n: bigint }[]>`
+      SELECT count(*)::bigint AS n FROM pg_stat_activity
+       WHERE datname = current_database() AND application_name = ${DELETER}
+         AND wait_event_type = 'Lock'`;
+    return Number(row?.n ?? 0) > 0;
+  });
+}
 
 describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
   let tenantId = 0n;
@@ -130,7 +146,7 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
     expect((err as AppError).translationKey).toBe("errors.codeToolNotFound");
   });
 
-  // The same answer for a source that has nothing to do with code tools, because the fix is one
+  // NOTE: The same answer for a source that has nothing to do with code tools, because the answer is one
   // rule over the whole insert and not a code-tool special case.
   test("an HTTP tool deleted in the same window answers for ITS source", async () => {
     const ag = await agent();
@@ -159,15 +175,12 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
     );
   });
 
-  // The other half of the same window, and the one a not-found cannot answer. The delete takes the
-  // namespace lock, then the tool row FOR UPDATE, then cascades into the selection rows. This path
-  // used to take the agent row, delete the selection rows and only then ask the foreign key for the
-  // tool row -- so each transaction held what the other needed next, and PostgreSQL resolved it by
-  // killing one: `40P01 deadlock detected`, a 500 on whichever lost, and no P2003 for the mapping
-  // above to catch (round 34). Ordering both behind the namespace lock is what removes the cycle.
-  //
-  // The interleaving is forced, not waited for: the delete starts INSIDE the save's insert, and the
-  // pause is long enough for it to reach the lock it will wait on.
+  // NOTE: The other half of the same window, which a not-found cannot answer. The delete takes the namespace
+  // lock, then the tool row FOR UPDATE, then cascades into the selection rows. A save that took the
+  // agent row and deleted selection rows before its foreign key asked for the tool row would hold what
+  // the delete needs next, and PostgreSQL would kill one (`40P01 deadlock detected`, a 500 with no
+  // P2003 to map). Ordering both behind the namespace lock removes the cycle. Forced, not waited for:
+  // the delete starts INSIDE the save's insert, and the pause lets it reach the lock it will wait on.
   test("a delete racing a save deadlocks with neither", async () => {
     const ag = await agent();
     const doomed = await suDb.codeToolDefinition.create({
@@ -209,7 +222,7 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
               () => undefined,
               (e: unknown) => e,
             );
-            await new Promise((r) => setTimeout(r, 400));
+            await deleteWaitsOrEnds(deleting);
             return query(args);
           },
         },
@@ -229,26 +242,25 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
       (e: unknown) => e,
     );
     const deleted = await deleting;
-    // 40P01 is the database's, and Prisma wraps it as P2039 with the code in the message, so the
-    // assertion reads the text rather than a code that would pass on any other failure.
-    const deadlocked = (e: unknown) =>
-      e instanceof Error && /40P01|deadlock/i.test(e.message);
-    expect([saved && String(saved), deadlocked(saved)]).toEqual([
-      saved && String(saved),
-      false,
-    ]);
-    expect([deleted && String(deleted), deadlocked(deleted)]).toEqual([
-      deleted && String(deleted),
-      false,
-    ]);
+    // The save holds the lock, so it lands whole; the delete then goes, and its cascade takes the
+    // doomed grant. Neither fails, so a 40P01 (or any other error) shows here as its own text.
+    expect(saved === undefined ? "saved" : String(saved)).toBe("saved");
+    expect(deleted === undefined ? "deleted" : String(deleted)).toBe("deleted");
+    const grants = await suDb.agentToolSelection.findMany({
+      where: { agentId: ag.id },
+      select: { codeToolDefinitionId: true },
+    });
+    expect(grants.map((g) => g.codeToolDefinitionId)).toEqual([kept.id]);
+    expect(
+      await suDb.codeToolDefinition.findUnique({ where: { id: doomed.id } }),
+    ).toBeNull();
   }, 30_000);
 
-  // The third path that writes selection rows, and the one whose ids come from ANOTHER agent: a
-  // clone reads the source's grants and writes them under a new agent. A tool deleted between the
-  // two leaves the copy pointing at a row that is gone, the foreign key refuses it, and because the
-  // clone is one transaction the operator loses the agent and not the grant (round 35). The same
-  // lock orders it: the delete either goes first, and its cascade takes the source grant with it so
-  // there is nothing to copy, or it waits.
+  // NOTE: The third path that writes selection rows, and the one whose ids come from ANOTHER agent: a clone
+  // reads the source's grants and writes them under a new agent. A tool deleted between the two would
+  // leave the copy pointing at a row that is gone, and because the clone is one transaction the
+  // operator would lose the agent, not just the grant. The same lock orders it: the delete either goes
+  // first, and its cascade takes the source grant with it, or it waits.
   test("a clone racing a delete of what it copies still produces an agent", async () => {
     const src = await agent();
     const tool = await suDb.codeToolDefinition.create({
@@ -280,7 +292,7 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
               () => undefined,
               (e: unknown) => e,
             );
-            await new Promise((r) => setTimeout(r, 400));
+            await deleteWaitsOrEnds(deleting);
             return query(args);
           },
         },
@@ -291,11 +303,23 @@ describe.skipIf(!dbUp)("a grant target deleted mid-save", () => {
       (a) => a,
       (e: unknown) => e,
     );
-    await deleting;
-    expect([
-      cloned instanceof Error ? String(cloned) : "ok",
-      cloned instanceof Error,
-    ]).toEqual([cloned instanceof Error ? String(cloned) : "ok", false]);
+    const deleted = await deleting;
+    expect(cloned instanceof Error ? String(cloned) : "cloned").toBe("cloned");
+    expect(deleted === undefined ? "deleted" : String(deleted)).toBe("deleted");
+    // The copy exists under its new name, and the delete's cascade left it no grant to the tool.
+    const copy = await suDb.agent.findUnique({
+      where: { id: BigInt((cloned as { id: string }).id) },
+      select: { name: true },
+    });
+    expect(copy?.name).toBe("copy");
+    expect(
+      await suDb.agentToolSelection.count({
+        where: { codeToolDefinitionId: tool.id },
+      }),
+    ).toBe(0);
+    expect(
+      await suDb.codeToolDefinition.findUnique({ where: { id: tool.id } }),
+    ).toBeNull();
   }, 30_000);
 
   // The control, and it is what keeps the catch from becoming "answer not-found whenever the write

@@ -116,14 +116,10 @@ export async function upsertGoogleUser(
     if (byEmail.googleId && byEmail.googleId !== profile.sub) {
       throw new GoogleIdMismatchError();
     }
-    // NOTE: An elevated row (TENANT_ADMIN/SUPER_ADMIN) that has never logged in is
-    // almost always one an operator pre-created via `bun set-admin <email>`. Allowing
-    // first-time Google linking on such a row would let anyone holding
-    // email_verified=true for that address (e.g. a Workspace admin or insider) take over
-    // the account. Require at least one password login to prove inbox control before
-    // Google linking becomes available for elevated accounts.
-    // An account is elevated if it is SUPER_ADMIN or administers ANY tenant (issue #756): the block
-    // protects the account, and one account now carries every membership.
+    // NOTE: an elevated account (SUPER_ADMIN, or admin of ANY tenant, since one account carries
+    // every membership) that never logged in was almost always pre-created by `bun set-admin`.
+    // First-time Google linking there would let anyone holding email_verified=true for that address
+    // (a Workspace admin, an insider) take it over, so one password login must come first.
     if (isAdminAnywhere(byEmail) && byEmail.lastLoginAt === null) {
       throw new GoogleAdminLinkBlockedError();
     }
@@ -147,7 +143,7 @@ export async function upsertGoogleUser(
     throw new GoogleEmailDomainNotAllowedError();
   }
 
-  // NOTE: a self-signup user must join a tenant; with none provisioned there is nothing
+  // A self-signup user must join a tenant; with none provisioned there is nothing
   // to join, so treat it like closed registration rather than create a tenant-less row.
   const tenantId = await resolveDefaultTenantId();
   if (tenantId === null) {

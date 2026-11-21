@@ -19,14 +19,15 @@ import { clearContactAuthState } from "@/modules/contact-auth/state";
 import { settleFlowEvents } from "@/modules/flowlog/scheduled";
 import { followUpHandler } from "@/modules/followups/handlers";
 import { clearSpendCeilingFlights } from "@/modules/spend-ceiling/notice";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// The spend ceiling, wired end to end through processChatwootDelivery (issue #146). The rule is
+// The spend ceiling, wired end to end through processChatwootDelivery. The rule is
 // pinned without a database in ./spend-ceiling-decide.test.ts; what these pin is that it reaches the
 // process boundary: over the ceiling the MODEL IS NEVER INVOKED, the configured sentence leaves as
 // the persona, the conversation opens for humans, and the operator gets a note that names the
-// numbers. Under it, the turn runs exactly as before.
+// numbers. Under it, the turn runs normally.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -44,8 +45,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -113,7 +114,7 @@ async function setCeiling(
   });
 }
 
-// The month's figure, as the poll would have written it (issue #426): the gate reads the snapshot,
+// The month's figure, as the poll would have written it: the gate reads the snapshot,
 // never the ledger, so what a test seeds is the snapshot. The number is dollars.
 async function spend(source: string, usd: number) {
   const monthStart = new Date(
@@ -164,6 +165,8 @@ async function deliverCustomerMessage(params: {
   // The message body. Blank (with no attachment) is a message that renders to nothing for the agent,
   // which the turn skips before any billed call.
   content?: string;
+  // An email's Subject header, which the mailbox writes into `content_attributes.email`.
+  subject?: string;
   // A Prisma client that misbehaves in a named way, for the tests about what a gate does when a read
   // it depends on cannot answer.
   base?: PrismaClient;
@@ -175,6 +178,9 @@ async function deliverCustomerMessage(params: {
     content: params.content ?? "oi, preciso de ajuda",
     message_type: "incoming",
     private: false,
+    ...(params.subject
+      ? { content_attributes: { email: { subject: params.subject } } }
+      : {}),
     conversation: {
       id: params.convId,
       inbox_id: INBOX,
@@ -226,7 +232,7 @@ async function deliverCustomerMessage(params: {
 }
 
 // The gate's line. `emitFlowEvent` returns before its row exists, so the write is SETTLED rather
-// than polled for (#375): a poll would answer the "is it there" cases and spend its whole timeout
+// than polled for: a poll would answer the "is it there" cases and spend its whole timeout
 // on the one case that asserts a line is ABSENT, which is the assertion below that matters most.
 async function ceilingRows(convId: number, onSecond = false) {
   await settleFlowEvents();
@@ -370,12 +376,11 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(note).toContain("1.000");
   });
 
-  // Issue #750: A FIAÇÃO, e não o construtor. A chave da ocasião nomeia o episódio de silêncio, e a
-  // cerca passou a datar esse episódio pela MAIS RECENTE entre a fala do cliente e a nossa. Quem
-  // passa o valor é o handler, e um handler que continue passando só a coluna do cliente dá a dois
-  // episódios distintos uma chave só: dentro da janela de duas horas do teto, o segundo perde a linha
-  // de erro e o alerta para o primeiro — dois clientes sem resposta, um no registro. Aqui o segundo
-  // episódio nasce sem mensagem nova do cliente, que é exatamente o caso que a issue admite.
+  // NOTE: a fiação, e não o construtor. A chave da ocasião nomeia o episódio de silêncio, datado
+  // pela MAIS RECENTE entre a fala do cliente e a nossa, e quem passa o valor é o handler. Um
+  // handler que passasse só a coluna do cliente daria a dois episódios uma chave só: dentro da
+  // janela de duas horas do teto, o segundo perderia a linha de erro e o alerta para o primeiro.
+  // Aqui o segundo episódio nasce sem mensagem nova do cliente.
   test("dois episódios separados só pela nossa resposta são duas ocasiões (pelo handler)", async () => {
     await setCeiling({ enabled: true, monthlyInboxUsd: 1000 });
     await spend("inbox", 1200);
@@ -462,6 +467,82 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(await ceilingRows(CONV)).toHaveLength(2);
   });
 
+  // A closing step left without instructions reaches no model and spends nothing, so the ceiling has
+  // nothing to refuse: the conversation is closed, and nothing about the ceiling is announced.
+  test("an empty closing step over the ceiling still closes, and announces nothing", async () => {
+    await setCeiling({ enabled: true, monthlyInboxUsd: 1000 });
+    await spend("inbox", 1200);
+    const CONV = 9440;
+    await seedConversation(CONV);
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        followUpArmedAt: new Date(Date.now() - 10 * 3_600_000),
+        settings: {
+          debounce: { enabled: false },
+          split: { enabled: false },
+          followUp: {
+            enabled: true,
+            steps: [
+              { delayValue: 60, delayUnit: "minutes", instructions: "" },
+              {
+                delayValue: 60,
+                delayUnit: "minutes",
+                instructions: "",
+                resolve: true,
+              },
+            ],
+          },
+        },
+      },
+    });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: CONV },
+      data: {
+        lastEventAt: new Date(Date.now() - 5 * 3_600_000),
+        lastInboundAt: new Date(Date.now() - 5 * 3_600_000),
+        lastRepliedMessageId: 1,
+        lastFollowUpAt: new Date(Date.now() - 2 * 3_600_000),
+      },
+    });
+    const s = stubChatwoot();
+    const makeClientComSonda = async (cfg: { botToken: string }) => {
+      const c = (await s.makeClient(cfg)) as unknown as Record<string, unknown>;
+      c.getConversation = async () => ({
+        id: CONV,
+        status: "pending",
+        meta: {},
+      });
+      return c as unknown as ChatwootClient;
+    };
+    const result = await followUpHandler(
+      {
+        id: -1n,
+        tenantId,
+        kind: "FOLLOWUP",
+        payload: {
+          threadId: `${tenantId}:${instanceId}:${CONV}`,
+          stepIndex: 1,
+        },
+        attempts: 0,
+        claimSeq: 0,
+      },
+      appDb,
+      {
+        makeClient: makeClientComSonda as never,
+        makeModel: () => {
+          throw new Error("an empty closing step must not reach the model");
+        },
+        checkpointer: new MemorySaver(),
+        persistUsage: async () => {},
+      },
+    );
+    expect(result).toEqual({ outcome: "done" });
+    expect(s.statusToggles).toEqual([[CONV, "resolved"]]);
+    expect(s.sent.filter((m) => m.conversationId === CONV)).toEqual([]);
+    expect(await ceilingRows(CONV)).toHaveLength(0);
+  });
+
   // ONE LINE PER REFUSED OCCASION, and for a proactive nudge the occasion is the JOB, not the
   // attempt. `over-ceiling` is a repairable refusal, so its caller reschedules it every fifteen
   // minutes for two hours (`nudge-retry.ts`): announcing per attempt paged the alert channels eight
@@ -526,18 +607,9 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(await ceilingRows(9410)).toHaveLength(2);
   });
 
-  // THE COMMAND, LANDING BETWEEN THE GATE AND THE LINE. `stillWanted` is asked before any model
-  // spend, but the ceiling verdict underneath it is two database reads deep, and a `/reset` retiring
-  // the job inside that window leaves the nudge announcing a refusal about work that will not
-  // happen: `over` is `error` severity, so the line pages the alert channels, and the announcement
-  // claims the occasion window as it decides — swallowing the one a later, real refusal needs.
-  //
-  // Driven through the injected ask, which is exactly the seam the scheduler uses: yes to the first
-  // question (there was work to do), no to the one after the verdict (the command landed in
-  // between). Counting the asks is what makes this measure the SECOND one rather than the first.
-  // Issue #818 (review round 1). An operator's event over a person is a note written without a
-  // model, so it spends nothing and the ceiling has nothing to refuse: over the budget the person
-  // still gets the report, which the receptor otherwise marks processed and loses.
+  // NOTE: an operator's event over a person is a note written without a model, so it spends nothing
+  // and the ceiling has nothing to refuse: over the budget the person still gets the report, which
+  // the receptor would otherwise mark processed and lose.
   test("an operator event over a person is noted even over the ceiling, with no model", async () => {
     await setCeiling({ enabled: true, monthlyInboxUsd: 1000 });
     await spend("inbox", 1200);
@@ -582,6 +654,12 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(await ceilingRows(9480)).toEqual([]);
   });
 
+  // NOTE: the command, landing between the gate and the line. The ceiling verdict under
+  // `stillWanted` is two database reads deep, and a `/reset` retiring the job inside that window
+  // would have the nudge announce an `error` refusal about work that will not happen, claiming the
+  // occasion window a later, real refusal needs. Driven through the scheduler's injected ask: yes to
+  // the first question, no to the one after the verdict; counting the asks makes this measure the
+  // SECOND one.
   test("a nudge retired while the ceiling was being read announces nothing", async () => {
     await setCeiling({ enabled: true, monthlyInboxUsd: 1000 });
     await spend("inbox", 1200);
@@ -691,15 +769,33 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(await ceilingRows(9419)).toEqual([]);
   });
 
-  // A PROBE THAT COULD NOT ANSWER IS NOT AN AGENT THAT CANNOT RUN. The ceiling fails OPEN when the
-  // CEILING is unreadable, so a customer is never silenced by our own database hiccup — but here the
-  // verdict is read and says `over`, and the runnable probe is only the escape hatch from it. An
-  // unreadable escape hatch must not open, or a pool timeout would let the turn spend past a budget
-  // the operator capped, which is the one outcome this gate exists to prevent.
-  //
-  // The probe is told apart from every other agent read by its SELECT: it is the only one that asks
-  // for `modelConfig`, and the context load above it asks for `mode`. Without that discrimination
-  // the fixture would break the load instead, and the gate under test would never run.
+  // The other side: an email whose whole request is its subject is a message the agent reads, so
+  // the gate refuses it like any other, rather than taking it for one that renders to nothing.
+  test("an email whose only words are its subject is refused like any other message", async () => {
+    await setCeiling({
+      enabled: true,
+      monthlyInboxUsd: 100,
+      overCeilingMessage: OVER_COPY,
+    });
+    await spend("inbox", 500);
+    await seedConversation(9422);
+    const s = stubChatwoot();
+    await deliverCustomerMessage({
+      convId: 9422,
+      makeClient: s.makeClient,
+      content: "",
+      subject: "Reembolso do pedido",
+    });
+    expect(s.publicOn(9422).map((m) => m.content)).toEqual([OVER_COPY]);
+    expect(await ceilingRows(9422)).toHaveLength(1);
+  });
+
+  // NOTE: a probe that could not answer is not an agent that cannot run. The ceiling fails OPEN
+  // when the CEILING is unreadable, but here the verdict says `over` and the runnable probe is only
+  // the escape hatch from it: an unreadable escape hatch must not open, or a pool timeout would let
+  // the turn spend past a budget the operator capped. The probe is told apart from every other
+  // agent read by its SELECT (the only one asking for `modelConfig`; the context load above asks
+  // for `mode`), or the fixture would break the load instead and the gate would never run.
   test("a runnable probe that cannot be read leaves the refusal standing", async () => {
     await setCeiling({
       enabled: true,
@@ -779,9 +875,8 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     await spend("inbox", 500);
     await seedConversation(9412);
     const warmUp = stubChatwoot();
-    // One delivery first, and it is not decoration: the mirror UPSERTS the contact, and two
-    // concurrent inserts of a contact that does not exist yet race to a unique violation that has
-    // nothing to do with this gate. Measured as a 2-in-5 flake before this line existed. With the
+    // NOTE: one delivery first: the mirror UPSERTS the contact, and two concurrent inserts of a
+    // contact that does not exist yet race to a unique violation unrelated to this gate. With the
     // row already there both deliveries take the update path, and what is left racing is the thing
     // under test.
     await deliverCustomerMessage({
@@ -848,12 +943,11 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
     expect(await ceilingRows(9413)).toHaveLength(0);
   });
 
-  // AND THE CLAIM ANSWERS IT ONE STEP EARLIER THAN THE WATERMARK DOES (issue #452). The watermark
-  // used to be advanced by the post gate itself, immediately before the send; now the gate claims in
-  // its own column there and the watermark is written only after the turn returns. Read off the
-  // watermark alone, this guard would go blind for the whole of that stretch and tell a customer the
-  // agent cannot answer a message the other route was already sending a reply for. It reads the
-  // ANSWERED FLOOR — max(watermark, claim) — so it closes at the instant it always closed.
+  // NOTE: the claim answers it one step earlier than the watermark does. The post gate claims in its
+  // own column immediately before the send, and the watermark is written only after the turn
+  // returns; read off the watermark alone, this guard would go blind for that stretch and tell a
+  // customer the agent cannot answer a message the other route is already replying to. It reads the
+  // ANSWERED FLOOR, max(watermark, claim).
   test("a message the other route has claimed but not yet marked handled is not refused", async () => {
     await setCeiling({
       enabled: true,
@@ -943,9 +1037,13 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
       makeClient: s.makeClient,
       allowModel: true,
     });
-    const publics = s.publicOn(9403).map((m) => m.content);
-    expect(publics).not.toContain(OVER_COPY);
-    expect(publics.length).toBeGreaterThan(0);
+    // NOTE: the agent's own reply and nothing of the ceiling's: no copy, handoff, note or line.
+    expect(s.publicOn(9403).map((m) => m.content)).toEqual([
+      "Claro, posso ajudar.",
+    ]);
+    expect(s.statusToggles.filter(([c]) => c === 9403)).toEqual([]);
+    expect(s.notesOn(9403)).toEqual([]);
+    expect(await ceilingRows(9403)).toEqual([]);
   });
 
   // The playground's own spending must not be able to silence customers, which is the entire reason
@@ -965,7 +1063,13 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
       makeClient: s.makeClient,
       allowModel: true,
     });
-    expect(s.publicOn(9404).map((m) => m.content)).not.toContain(OVER_COPY);
+    // NOTE: the agent's own reply and nothing of the ceiling's: no copy, handoff, note or line.
+    expect(s.publicOn(9404).map((m) => m.content)).toEqual([
+      "Claro, posso ajudar.",
+    ]);
+    expect(s.statusToggles.filter(([c]) => c === 9404)).toEqual([]);
+    expect(s.notesOn(9404)).toEqual([]);
+    expect(await ceilingRows(9404)).toEqual([]);
   });
 
   // The verdict is evaluated on every message; the COPY is not. Ten people writing in after the
@@ -1008,7 +1112,12 @@ describe.skipIf(!dbUp)("the spend ceiling (webhook e2e)", () => {
       makeClient: s.makeClient,
       allowModel: true,
     });
-    expect(s.publicOn(9406).map((m) => m.content)).not.toContain(OVER_COPY);
+    // NOTE: the agent's own reply and nothing of the ceiling's: no copy, handoff, note or line.
+    expect(s.publicOn(9406).map((m) => m.content)).toEqual([
+      "Claro, posso ajudar.",
+    ]);
+    expect(s.statusToggles.filter(([c]) => c === 9406)).toEqual([]);
     expect(s.notesOn(9406)).toEqual([]);
+    expect(await ceilingRows(9406)).toEqual([]);
   });
 });

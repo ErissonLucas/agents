@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import type { BaseMessage } from "@langchain/core/messages";
 import { FakeListChatModel } from "@langchain/core/utils/testing";
 import { MemorySaver } from "@langchain/langgraph";
@@ -6,34 +6,28 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import { contactInboxThreadId } from "@/graph/checkpointer";
+import * as inflight from "@/graph/inflight";
+import { isTurnRunning } from "@/graph/inflight";
+import * as ingestDrain from "@/graph/ingest-drain";
 import { OPERATOR_EVENT_NOTE_PREFIX, runAgentNudge } from "@/graph/nudge";
 import { runAgentTurn } from "@/graph/runtime";
 import { clearTurnOwning, markTurnOwning } from "@/graph/thread-claim";
 import { buildThreadStateGraph } from "@/graph/thread-state";
+import { withKeyedQueue } from "@/lib/locks";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
+import { until } from "../utils/poll";
 import { SlowReplyModel } from "../utils/scripted-models";
-import { codeOnly } from "../utils/source-text";
+import { countCalls, pendingAcross, waitsForTheThread } from "../utils/waiting";
 
-// ── O DISCRIMINANTE DA RODADA (issue #689) ──
-//
-// Um invoke do LangGraph é um read-modify-write do canal inteiro, então de dois que se sobrepõem no
-// mesmo thread o que termina em SEGUNDO salva o que carregou e desfaz o primeiro. A #658 fechou isso
-// para o turno reativo, fazendo o segundo esperar; o nudge chama `markTurnOwning` direto, e a
-// reivindicação CONTA em vez de excluir.
-//
-// A isenção do nudge está escrita em ../../src/graph/runtime.ts em tantas palavras: "overlapping
-// turns are legitimate where nobody is waiting on a single answer (a nudge beside a reactive turn)".
-// A medição da issue refuta a premissa — a mensagem proativa foi ENTREGUE ao cliente e o canal
-// terminou sem ela. Quem entrega deve uma resposta única, e o critério do próprio ../../src/graph/
-// thread-claim.ts ("A caller that must NOT join — one that owes a customer a single reply — waits
-// for the thread with `waitForTurnToClear`") condena o nudge de hoje.
-//
-// Este arquivo mede as duas metades separadas de propósito: que o nudge ESPERA (o mecanismo, que é
-// o que o conserto instala) e que a mensagem entregue SOBREVIVE no canal (a consequência, que é o
-// que o cliente perde). Um conserto que passe só na primeira instalou uma espera que não protege
-// nada.
+// Um invoke do LangGraph é um read-modify-write do canal inteiro: de dois que se sobrepõem no mesmo
+// thread, o que termina em SEGUNDO salva o que carregou e desfaz o primeiro. O nudge deve ao
+// cliente uma resposta única, então pelo critério de ../../src/graph/thread-claim.ts ele não entra
+// junto: espera o thread com `waitForTurnToClear`. Este arquivo testa as duas metades separadas de
+// propósito: que o nudge ESPERA (o mecanismo) e que a mensagem entregue SOBREVIVE no canal (a
+// consequência, o que o cliente perde). Uma espera que passe só na primeira não protege nada.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -51,8 +45,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -111,19 +105,6 @@ async function channelOf(
   return messages.map((m) =>
     typeof m.content === "string" ? m.content : JSON.stringify(m.content),
   );
-}
-
-// O símbolo que separa "ainda esperando" de "terminou": um `Promise.race` contra um timer responde
-// a pergunta sem depender de o nudge ter terminado com um desfecho específico.
-const AINDA_ESPERANDO = Symbol("o nudge ainda não terminou");
-
-async function terminouEm<T>(p: Promise<T>, ms: number) {
-  return Promise.race([
-    p,
-    new Promise<typeof AINDA_ESPERANDO>((r) =>
-      setTimeout(() => r(AINDA_ESPERANDO), ms),
-    ),
-  ]);
 }
 
 describe.skipIf(!dbUp)(
@@ -207,9 +188,9 @@ describe.skipIf(!dbUp)(
       await appDb.$disconnect();
     });
 
-    // O MECANISMO. Um invoke mais velho segura o thread; o nudge tem que ficar parado até ele soltar,
-    // e não apenas "não estourar". A espera é o que o conserto instala, e sem ela as duas asserções
-    // abaixo passam por acidente: o nudge termina antes do timer porque nunca esperou nada.
+    // NOTE: O MECANISMO. Um invoke mais velho segura o thread; o nudge tem que ficar parado até ele
+    // soltar, e não apenas "não estourar". Sem a espera as duas asserções abaixo passam por
+    // acidente: o nudge termina antes do timer porque nunca esperou nada.
     test("um nudge encontra o thread ocupado e espera soltar", async () => {
       const contactInboxId = 8901;
       await seedConv(8901, contactInboxId);
@@ -236,7 +217,7 @@ describe.skipIf(!dbUp)(
         },
       });
 
-      expect(await terminouEm(nudge, 400)).toBe(AINDA_ESPERANDO);
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
       // E NADA FOI ENTREGUE ENQUANTO ESPERAVA. Uma espera colocada depois do envio protegeria o canal
       // e deixaria o cliente com a mensagem de um turno que nem começou.
       expect(s.messages).toHaveLength(0);
@@ -246,13 +227,11 @@ describe.skipIf(!dbUp)(
       expect(s.messages).toHaveLength(1);
     }, 15_000);
 
-    // A CONSEQUÊNCIA, que é o que a issue mediu e o que o cliente perde. Reproduz o cenário s5 do
-    // holdout da #658: um turno reativo lento começa, o nudge dispara em cima dele, o nudge entrega
-    // rápido, e o reativo termina por último salvando o canal que carregou — sem a mensagem proativa.
-    //
-    // Feito com o turno reativo DE VERDADE em vez de um invoke simulado: o que apaga é o
-    // read-modify-write que o `graph.invoke` faz, e simulá-lo com `updateState` mede outra coisa (o
-    // reducer do canal APPENDA, então um update nunca apagaria nada e o teste passaria vazio).
+    // NOTE: A CONSEQUÊNCIA, o que o cliente perde: um turno reativo lento começa, o nudge dispara
+    // em cima dele e entrega rápido, e o reativo termina por último salvando o canal que carregou,
+    // sem a mensagem proativa. Usa o turno reativo DE VERDADE: o que apaga é o read-modify-write do
+    // `graph.invoke`, e simulá-lo com `updateState` testa outra coisa (o reducer do canal faz
+    // append, então um update nunca apagaria nada e o teste passaria vazio).
     test("a mensagem entregue sobrevive ao turno reativo que a sobrepôs", async () => {
       const contactInboxId = 8902;
       await seedConv(8902, contactInboxId);
@@ -302,8 +281,10 @@ describe.skipIf(!dbUp)(
         },
       });
 
-      // Em cima do turno reativo, como a medição da issue: ele já reivindicou o thread.
-      await new Promise((r) => setTimeout(r, 300));
+      // NOTE: Em cima do turno reativo, que já reivindicou o thread.
+      await until("o turno reativo com o thread", () =>
+        isTurnRunning(graphThreadId),
+      );
       const s = stub();
       const nudge = runAgentNudge({
         tenantId,
@@ -321,8 +302,8 @@ describe.skipIf(!dbUp)(
       await Promise.all([turno, nudge]);
       // A entrega aconteceu: o cliente leu RESP-N.
       expect(s.messages.map(([, t]) => t)).toEqual(["RESP-N"]);
-      // A PROVA: o thread lembra dela. Hoje o canal termina sem RESP-N, porque o invoke do reativo
-      // terminou em segundo e salvou o canal de antes do nudge.
+      // A PROVA: o thread lembra dela. Sem a espera o canal termina sem RESP-N, porque o invoke
+      // do reativo termina em segundo e salva o canal de antes do nudge.
       const canal = await channelOf(checkpointer, graphThreadId);
       expect(canal.some((t) => t.includes("RESP-N"))).toBe(true);
     }, 30_000);
@@ -356,10 +337,10 @@ describe.skipIf(!dbUp)(
         nudge: { source: "followup", kind: "inactivity", step: 1 },
         base: appDb,
         deps: {
-          // O PRIMEIRO É LENTO DE PROPÓSITO. A fila `ingest:` serializa a seção da
+          // NOTE: O PRIMEIRO É LENTO DE PROPÓSITO. A fila `ingest:` serializa a seção da
           // reivindicação, não o invoke: com os dois modelos instantâneos o perdedor acaba antes de
           // o vencedor começar a escrever, e o teste passaria mesmo com a devolução arrancada. Um
-          // invoke de 1,5 s põe os dois de fato em cima um do outro, que é o estado medido.
+          // invoke de 1,5 s põe os dois de fato em cima um do outro.
           makeModel: () => new SlowReplyModel("RESP-A", 1_500) as never,
           makeClient: a.makeClient,
           checkpointer,
@@ -372,9 +353,9 @@ describe.skipIf(!dbUp)(
         nudge: { source: "followup", kind: "inactivity", step: 2 },
         base: appDb,
         deps: {
-          // OS DOIS LENTOS, e o segundo um pouco menos: quem vence a corrida da reivindicação não
-          // é determinístico, e com um modelo instantâneo o desfecho do mutante dependia de quem
-          // tivesse vencido. Com os dois lentos o invoke que termina por último é sempre o de 1,5 s,
+          // NOTE: OS DOIS LENTOS, e o segundo um pouco menos: quem vence a corrida da reivindicação não
+          // é determinístico, e com um modelo instantâneo o desfecho sem a devolução dependeria de
+          // quem vencesse. Com os dois lentos o invoke que termina por último é sempre o de 1,5 s,
           // qualquer que seja a ordem de reivindicação, e sem a devolução do hold ele sempre salva
           // um canal carregado antes da escrita do outro.
           makeModel: () => new SlowReplyModel("RESP-B", 1_200) as never,
@@ -385,9 +366,20 @@ describe.skipIf(!dbUp)(
       });
 
       // Os dois estão na espera, e é a liberação que os solta juntos.
-      expect(await terminouEm(Promise.all([nudgeA, nudgeB]), 400)).toBe(
-        AINDA_ESPERANDO,
+      // Two waiters poll the same thread, so six more asks with neither settled is both of them
+      // in the wait.
+      const asks = countCalls(
+        inflight,
+        "isTurnRunning",
+        (id: string) => id === graphThreadId,
       );
+      try {
+        expect(
+          await pendingAcross(Promise.race([nudgeA, nudgeB]), asks.count, 6),
+        ).toBe(true);
+      } finally {
+        asks.restore();
+      }
       await clearTurnOwning(owner, appDb, terceiro);
       await Promise.all([nudgeA, nudgeB]);
 
@@ -400,11 +392,10 @@ describe.skipIf(!dbUp)(
       expect(canal.some((t) => t.includes("RESP-B"))).toBe(true);
     }, 30_000);
 
-    // O PORTÃO DO OUTRO LADO DA ESPERA (#688 aplicada aqui, achado da rodada 1 de review da #689). A
-    // espera abre uma janela de minutos entre o `canMessagePre` e o invoke, e a re-checagem que já
-    // existia fica DEPOIS da geração: ela suprime o envio e não desfaz uma etiqueta escrita nem uma
-    // chamada HTTP que as ferramentas do modelo fizeram. Uma pessoa que assume a conversa durante a
-    // espera tem que parar o turno ANTES de o modelo rodar.
+    // NOTE: O PORTÃO DO OUTRO LADO DA ESPERA. A espera abre uma janela de minutos entre o
+    // `canMessagePre` e o invoke, e a re-checagem pós-geração só suprime o envio: não desfaz uma
+    // etiqueta escrita nem uma chamada HTTP que as ferramentas do modelo fizeram. Uma pessoa que
+    // assume a conversa durante a espera tem que parar o turno ANTES de o modelo rodar.
     test("quem assume a conversa durante a espera para o turno antes do modelo", async () => {
       const contactInboxId = 8907;
       await seedConv(8907, contactInboxId);
@@ -434,7 +425,7 @@ describe.skipIf(!dbUp)(
         },
       });
 
-      expect(await terminouEm(nudge, 300)).toBe(AINDA_ESPERANDO);
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
       // A pessoa assume DENTRO da espera. O espelho é o que a webhook de atribuição escreve.
       await suDb.conversation.updateMany({
         where: {
@@ -453,6 +444,7 @@ describe.skipIf(!dbUp)(
       expect(modelo.calls).toBe(0);
       // E o portão escreve a linha do vocabulário compartilhado, para o operador que filtra por ela.
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: {
           tenantId,
           stage: "handoff",
@@ -464,8 +456,8 @@ describe.skipIf(!dbUp)(
       ).toContain("taken_over");
     }, 15_000);
 
-    // agents#818, rodada 3 de review: o mesmo portão com um evento do operador. Quem assumiu recebe
-    // o relatório como veio, em nota privada, em vez de o evento sumir como `stale`.
+    // NOTE: O mesmo portão com um evento do operador: quem assumiu recebe o relatório como veio, em
+    // nota privada, em vez de o evento sumir como `stale`.
     test("quem assume durante a espera recebe o evento do operador como nota", async () => {
       const contactInboxId = 8931;
       await seedConv(8931, contactInboxId);
@@ -496,7 +488,7 @@ describe.skipIf(!dbUp)(
           persistUsage: async () => {},
         },
       });
-      expect(await terminouEm(nudge, 300)).toBe(AINDA_ESPERANDO);
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
       await suDb.conversation.updateMany({
         where: {
           tenantId,
@@ -515,11 +507,10 @@ describe.skipIf(!dbUp)(
       ]);
     }, 15_000);
 
-    // "NÃO DEU PARA VERIFICAR" NÃO É "UMA PESSOA ASSUMIU" — achado da rodada 2 de review, e ele
-    // atravessa o `.catch` do portão sem tocá-lo. No modo `requireLiveBotOwnership` a sonda engole a
-    // falha por dentro e responde `unavailable`; dobrar isso em "não é nosso" faria uma
-    // indisponibilidade do Chatwoot encerrar o episódio, que é o fail-closed que derrubou a
-    // fazer-ai/agents#684 voltando por uma porta que não lança.
+    // NOTE: "NÃO DEU PARA VERIFICAR" NÃO É "UMA PESSOA ASSUMIU", e isso atravessa o `.catch` do
+    // portão sem tocá-lo. No modo `requireLiveBotOwnership` a sonda engole a falha por dentro e
+    // responde `unavailable`; dobrar isso em "não é nosso" faria uma indisponibilidade do Chatwoot
+    // encerrar o episódio, um fail-closed que entra por uma porta que não lança.
     test("a sonda live indisponível no portão deixa o turno seguir", async () => {
       const contactInboxId = 8908;
       await seedConv(8908, contactInboxId);
@@ -560,7 +551,7 @@ describe.skipIf(!dbUp)(
         },
       });
 
-      expect(await terminouEm(nudge, 300)).toBe(AINDA_ESPERANDO);
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
       await clearTurnOwning(owner, appDb, invokeMaisVelho);
       await nudge;
 
@@ -571,10 +562,119 @@ describe.skipIf(!dbUp)(
       expect(s.messages).toHaveLength(0);
     }, 15_000);
 
-    // O TETO. Passado ele o nudge segue ao lado de quem está lá, que é o comportamento de hoje e
-    // portanto não é uma regressão — mas ali a entrega PODE não ser lembrada, e é a única porta por
-    // onde o defeito desta issue ainda passa depois do conserto. Então ela não sai calada: uma linha
-    // de flowlog diz em tantas palavras o que acabou de acontecer, no lugar onde o operador procura.
+    // NOTE: A ESPERA, A BARREIRA E A FILA, NESTA ORDEM. O turno esperado solta o thread tomando a
+    // MESMA chave `ingest:<thread>` (o rollback dele faz isso na saída), então um nudge que esperasse
+    // dentro da fila travaria quem ele espera. E a barreira vem depois da espera: drenada antes, ela
+    // lê um thread que fica velho pelos minutos da espera.
+    test("a espera fica fora da fila do thread, e a barreira drena depois dela", async () => {
+      const contactInboxId = 8912;
+      await seedConv(8912, contactInboxId);
+      const graphThreadId = contactInboxThreadId(
+        tenantId,
+        instanceId,
+        contactInboxId,
+      );
+      const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+      const invokeMaisVelho = await markTurnOwning(owner, appDb);
+
+      let solto = false;
+      const drenagens: boolean[] = [];
+      const real = ingestDrain.drainPendingIngest;
+      const drain = spyOn(ingestDrain, "drainPendingIngest").mockImplementation(
+        (...args: Parameters<typeof real>) => {
+          drenagens.push(solto);
+          return real(...args);
+        },
+      );
+      try {
+        const s = stub();
+        const nudge = runAgentNudge({
+          tenantId,
+          threadId: `${tenantId}:${instanceId}:8912`,
+          nudge: { source: "followup", kind: "inactivity", step: 1 },
+          base: appDb,
+          deps: {
+            makeModel: () => new FakeListChatModel({ responses: ["Oi!"] }),
+            makeClient: s.makeClient,
+            checkpointer: new MemorySaver(),
+            persistUsage: async () => {},
+          },
+        });
+        expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
+
+        // O turno mais velho sai pela fila do thread, como o rollback dele sai.
+        await withKeyedQueue(`ingest:${graphThreadId}`, async () => {
+          solto = true;
+          await clearTurnOwning(owner, appDb, invokeMaisVelho);
+        });
+        expect(await nudge).toBe("messaged");
+        expect(drenagens.length).toBeGreaterThan(0);
+        expect(drenagens.every((depoisDeSoltar) => depoisDeSoltar)).toBe(true);
+      } finally {
+        drain.mockRestore();
+      }
+    }, 15_000);
+
+    // NOTE: O PORTÃO PÓS-ESPERA FALHA ABERTO no espelho também: fechado, uma leitura que falha ali
+    // viraria desistência para TODO nudge que esperou, e a sonda pós-modelo já segura o envio.
+    test("a leitura de posse que falha depois da espera deixa o turno seguir", async () => {
+      const contactInboxId = 8911;
+      await seedConv(8911, contactInboxId);
+      const graphThreadId = contactInboxThreadId(
+        tenantId,
+        instanceId,
+        contactInboxId,
+      );
+      const owner = { tenantId, instanceId, contactInboxId, graphThreadId };
+      const invokeMaisVelho = await markTurnOwning(owner, appDb);
+
+      // A leitura de posse do espelho passa enquanto o run começa e quebra quando o turno mais velho
+      // solta o thread, que é quando o portão pós-espera pergunta.
+      let quebrada = false;
+      let falhas = 0;
+      const base = appDb.$extends({
+        query: {
+          conversation: {
+            async findUnique({ args, query }) {
+              const select = (args as { select?: Record<string, unknown> })
+                .select;
+              if (quebrada && select?.assigneeType && select?.resolvedBy) {
+                falhas += 1;
+                throw new Error("banco fora do ar");
+              }
+              return query(args);
+            },
+          },
+        },
+      }) as unknown as PrismaClient;
+      const s = stub();
+      const modelo = new SlowReplyModel("RESP-N", 0);
+      const nudge = runAgentNudge({
+        tenantId,
+        threadId: `${tenantId}:${instanceId}:8911`,
+        nudge: { source: "followup", kind: "inactivity", step: 1 },
+        base,
+        deps: {
+          makeModel: () => modelo as never,
+          makeClient: s.makeClient,
+          checkpointer: new MemorySaver(),
+          persistUsage: async () => {},
+        },
+      });
+
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
+      quebrada = true;
+      await clearTurnOwning(owner, appDb, invokeMaisVelho);
+      await nudge.catch(() => undefined);
+
+      // A PROVA: a leitura quebrou no portão e o turno rodou mesmo assim.
+      expect(falhas).toBeGreaterThan(0);
+      expect(modelo.calls).toBeGreaterThan(0);
+    }, 15_000);
+
+    // NOTE: O TETO. Passado ele o nudge segue ao lado de quem está lá, e ali a entrega PODE não ser
+    // lembrada: é a única porta por onde a sobreposição ainda passa. Então ela não sai calada: uma
+    // linha de flowlog diz o que acabou de acontecer, no lugar onde o operador procura.
     test("passado o teto o nudge segue, e a entrega que pode ser esquecida é declarada", async () => {
       const contactInboxId = 8903;
       await seedConv(8903, contactInboxId);
@@ -612,6 +712,7 @@ describe.skipIf(!dbUp)(
       // Pelo superusuário: o papel de runtime tem RLS e uma leitura sem contexto de tenant
       // devolve zero linhas em silêncio, que é a armadilha do CLAUDE.md.
       const rows = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, threadId: `${tenantId}:${instanceId}:8903` },
       });
       const aviso = rows.filter((r) => {
@@ -628,15 +729,13 @@ describe.skipIf(!dbUp)(
       ).toContain("may not survive");
     }, 15_000);
 
-    // A OCASIÃO NÃO É ENTREGUE DUAS VEZES POR CAUSA DA ESPERA. O teto (305 s) é MAIOR que a janela do
-    // reaper do scheduler (`staleMs` de 300 s, src/modules/scheduler/worker.ts), então uma espera no
-    // teto atravessa o reaper: a linha volta a PENDING, outro tick a reivindica — o que bumpa o
-    // `claim_seq` — e o mesmo nudge roda de novo enquanto o primeiro ainda espera. A espera é nova,
-    // logo a travessia é nova, logo isto tem que ser medido e não herdado.
-    //
-    // O que segura é a cerca que já existia: o `stillWanted(true)` do nudge fica DEPOIS da espera, no
-    // site da reivindicação, e responde pelo `claim_seq`. Este teste prova a posição, não o predicado
-    // — a retirada é encenada no instante em que a reivindicação do segundo handler aconteceria.
+    // NOTE: A OCASIÃO NÃO É ENTREGUE DUAS VEZES POR CAUSA DA ESPERA. O teto (305 s) é MAIOR que a
+    // janela do reaper do scheduler (`staleMs` de 300 s, src/modules/scheduler/worker.ts), então
+    // uma espera no teto atravessa o reaper: a linha volta a PENDING, outro tick a reivindica (o
+    // que incrementa o `claim_seq`) e o mesmo nudge roda de novo enquanto o primeiro espera. Quem
+    // segura é o `stillWanted(true)` do nudge, DEPOIS da espera, que responde pelo `claim_seq`.
+    // Este teste prova a posição, não o predicado: a retirada é encenada no instante da
+    // reivindicação do segundo handler.
     test("uma ocasião reivindicada de novo durante a espera não é entregue duas vezes", async () => {
       const contactInboxId = 8904;
       await seedConv(8904, contactInboxId);
@@ -666,7 +765,7 @@ describe.skipIf(!dbUp)(
         },
       });
 
-      expect(await terminouEm(nudge, 300)).toBe(AINDA_ESPERANDO);
+      expect(await waitsForTheThread(nudge, graphThreadId)).toBe(true);
       reivindicadaDeNovo = true;
       await clearTurnOwning(owner, appDb, invokeMaisVelho);
 
@@ -676,63 +775,3 @@ describe.skipIf(!dbUp)(
     }, 15_000);
   },
 );
-
-// ── A CERCA NASCE NA ROTA QUE REVELOU O DEFEITO ──
-//
-// As duas metades acima medem o comportamento. O que elas não pegam é o laço sendo desmontado de um
-// jeito que ainda passa nos dois testes: um símbolo próprio em cada arquivo (que volta a deixar os
-// dois laços divergirem sem ninguém notar), a espera indo para DENTRO da fila (que passa verde e
-// mata de fome exatamente o turno que ela espera — a lição da rodada 4 de review da #658), ou a
-// devolução do hold saindo do lugar.
-describe("o laço da espera é o mesmo nos dois turnos", () => {
-  test("nenhum dos dois declara o próprio sentinela", async () => {
-    for (const f of ["src/graph/nudge.ts", "src/graph/runtime.ts"]) {
-      const src = codeOnly(await Bun.file(f).text());
-      // Declarar significa divergir: dois símbolos com o mesmo nome não são o mesmo valor, e o
-      // `!==` de um laço contra o sentinela do outro é sempre verdadeiro.
-      expect(src).not.toMatch(/WAIT_AGAIN\s*=\s*Symbol/);
-      expect(src).toMatch(/WAIT_AGAIN/);
-    }
-  });
-
-  // A ESPERA, A BARREIRA E A FILA, NESTA ORDEM. Esperar dentro da fila trava quem está sendo
-  // esperado (o rollback do turno anterior toma a MESMA chave na saída), e drenar antes da espera lê
-  // um thread que fica velho pelos minutos da espera (#194, e ./runtime.ts diz as duas no mesmo
-  // lugar).
-  test("no nudge a espera vem antes da barreira, e a barreira antes da fila", async () => {
-    const src = codeOnly(await Bun.file("src/graph/nudge.ts").text());
-    const espera = src.indexOf("waitForTurnToClear(");
-    const barreira = src.indexOf("drainPendingIngest(");
-    const fila = src.indexOf("withKeyedQueue(");
-    expect(espera).toBeGreaterThanOrEqual(0);
-    expect(espera).toBeLessThan(barreira);
-    expect(barreira).toBeLessThan(fila);
-  });
-
-  // O PORTÃO PÓS-ESPERA FALHA ABERTO, e isto é cerca e não gosto: foi o fail-closed que derrubou a
-  // tentativa anterior do lado reativo (fazer-ai/agents#684, revertida). Uma leitura que falha ali
-  // vira desistência para TODO nudge que esperou, e a sonda pós-modelo ainda segura o envio.
-  test("a leitura de posse que falha deixa o nudge seguir", async () => {
-    const src = codeOnly(await Bun.file("src/graph/nudge.ts").text());
-    const i = src.indexOf("botOwnsItNowDetailed().catch(");
-    expect(i).toBeGreaterThanOrEqual(0);
-    // O catch devolve posse, em vez de devolver o oposto ou relançar.
-    expect(src.slice(i, src.indexOf("});", i))).toInclude("ours: true");
-  });
-
-  // A devolução do hold fica DEPOIS da declaração que adquire e ANTES de qualquer escrita: é a
-  // declaração, e não a leitura acima dela, que vê dois começos simultâneos.
-  test("no nudge o hold é devolvido logo depois da declaração que adquire", async () => {
-    const src = codeOnly(await Bun.file("src/graph/nudge.ts").text());
-    const adquire = src.indexOf("markTurnOwning(owner, base)");
-    const devolve = src.indexOf("return WAIT_AGAIN;");
-    const escreve = src.indexOf("conversationDividerMessage(");
-    expect(adquire).toBeGreaterThanOrEqual(0);
-    expect(adquire).toBeLessThan(devolve);
-    expect(devolve).toBeLessThan(escreve);
-    // E ela devolve de verdade, em vez de só sair do laço com o hold na mão: um hold guardado
-    // impede a liberação do vencedor de chegar a zero.
-    const trecho = src.slice(adquire, devolve);
-    expect(trecho).toInclude("clearTurnOwning(owner, base, giveBack)");
-  });
-});

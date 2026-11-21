@@ -26,6 +26,7 @@ import {
   MCP_STDIO_LAUNCHERS,
   parseStdioCommand,
 } from "@/lib/mcp-launchers";
+import { KvEditor, type KvRow, kvToObj, objToKv } from "./ToolEditModal";
 
 // Derived from the vault treaty response; never hand-mirrored (see docs/eden-treaty.md).
 type VaultEntry = NonNullable<
@@ -44,6 +45,7 @@ function emptyForm() {
     launcher: DEFAULT_MCP_STDIO_LAUNCHER as string,
     args: "",
     credentialRef: "",
+    headerRows: [] as KvRow[],
     enabled: true,
   };
 }
@@ -63,6 +65,9 @@ function bodyOf(form: Form) {
       ? composeStdioCommand(form.launcher, form.args.trim()) || null
       : null,
     credentialRef: form.credentialRef || null,
+    headers: isStdio
+      ? {}
+      : (kvToObj(form.headerRows) as Record<string, string>),
     enabled: form.enabled,
   };
 }
@@ -80,7 +85,7 @@ const MCP_FIELDS = ["name", "transport", "credentialRef"] as const;
 // the URL for the other, never both. Both stay in the BODY, so declaring both would put a refusal
 // about the one that is hidden onto a control that is not there.
 const MCP_STDIO_FIELDS = [...MCP_FIELDS, "command"] as const;
-const MCP_URL_FIELDS = [...MCP_FIELDS, "url"] as const;
+const MCP_URL_FIELDS = [...MCP_FIELDS, "url", "headers"] as const;
 
 // Per-launcher args placeholder (the package + its flags; the launcher itself is the Select).
 function argsPlaceholder(launcher: string): string {
@@ -168,6 +173,7 @@ export function McpEditModal({
           launcher: parsed.launcher,
           args: parsed.args,
           credentialRef: c.credentialRef ?? "",
+          headerRows: objToKv(c.headers ?? {}),
           enabled: c.enabled,
         };
         setForm(initial);
@@ -194,9 +200,9 @@ export function McpEditModal({
     setFormError(null);
     const body = bodyOf(form);
     setSaving(true);
-    // Measured live, and it is why this modal is wired: a second connection under a name already
-    // taken answers 409 "mcp connection name already in use", and the banner said "check the
-    // URL/command" — the wrong input, named confidently (#329).
+    // A second connection under a taken name answers 409 "mcp connection name already in use";
+    // the refusal is placed on the field the server names, so a generic banner cannot blame the
+    // URL/command instead.
     const fallback = t("mcp.saveError", "Could not save.");
     const held = (e: unknown) =>
       refusal.capture(e, fallback, body, bodyOf(formRef.current));
@@ -235,7 +241,7 @@ export function McpEditModal({
       ? mcpStdioEnabled && form.args.trim()
       : form.url.trim() || !!mcpCredBaseUrl);
 
-  // NOTE: baseline is captured on open (create defaults / loaded server); null while the edit fetch
+  // Baseline is captured on open (create defaults / loaded server); null while the edit fetch
   // is in flight.
   const isDirty =
     formBaseline.current !== null &&
@@ -276,9 +282,9 @@ export function McpEditModal({
       ) : (
         <div className="flex flex-col gap-4">
           {sharedNotice && editId && (
-            <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+            <div className="border-warning bg-warning-soft text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs">
               <AlertTriangle
-                className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                className="text-warning mt-0.5 h-4 w-4 shrink-0"
                 aria-hidden="true"
               />
               <span>
@@ -322,9 +328,9 @@ export function McpEditModal({
           {isStdio ? (
             <>
               {!mcpStdioEnabled && (
-                <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+                <div className="border-warning bg-warning-soft text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs">
                   <AlertTriangle
-                    className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                    className="text-warning mt-0.5 h-4 w-4 shrink-0"
                     aria-hidden="true"
                   />
                   <span>
@@ -415,9 +421,9 @@ export function McpEditModal({
               defaultCreateType={isStdio ? "mcp_env" : "mcp_oauth"}
               defaultCreateBaseUrl={mcpCredBaseUrl ?? form.url}
               onEntryChange={(entry: VaultEntry | null) => {
-                // NOTE: the DIALABLE base (#504). This value LOCKS the connection URL field and
-                // fills it, so a stray base on a kind that carries none would show the operator an
-                // endpoint the runtime ignores — and let Save pass with `form.url` empty.
+                // The DIALABLE base. This value LOCKS the connection URL field and fills it, so a
+                // stray base on a kind that carries none would show an endpoint the runtime ignores, and
+                // let Save pass with `form.url` empty.
                 const credUrl = dialableBaseUrl(entry?.kind, entry?.baseUrl);
                 setMcpCredBaseUrl(credUrl);
                 if (credUrl) {
@@ -432,6 +438,28 @@ export function McpEditModal({
               ariaLabel={t("mcp.credential", "Credential")}
             />
           </FormField>
+          {!isStdio && (
+            <FormField
+              label={t("mcp.headers", "Headers")}
+              group
+              help={t(
+                "mcp.headersHelp",
+                "Request headers sent on every tool call to this server, as name -> value. A value may use the conversation variables an HTTP tool header accepts: {{contact_id}}, {{contact_phone}}, {{contact_identifier}}, {{conversation_id}}, {{inbox_id}} and the rest.\n\nEach variable is filled from the conversation when the tool is called, never by the model; one the conversation has no value for is sent empty, and a character outside printable ASCII is sent UTF-8 percent-encoded.\n\nTool discovery (tools/list) carries none of these headers, since it runs outside any conversation. Network transports only, and the credential's own header always wins.",
+              )}
+              error={refusal.at("headers", current.headers)}
+            >
+              <KvEditor
+                rows={form.headerRows}
+                onChange={(headerRows) => setForm({ ...form, headerRows })}
+                params={[]}
+                includeSecret={false}
+                aiFields={[]}
+                keyPlaceholder={t("tools.headerKey", "Header")}
+                addLabel={t("tools.addHeader", "Add header")}
+                contextOnly
+              />
+            </FormField>
+          )}
           <SwitchField
             checked={form.enabled}
             onCheckedChange={(v) => setForm({ ...form, enabled: v })}

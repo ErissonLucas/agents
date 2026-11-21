@@ -1,26 +1,51 @@
 import { initSetupState } from "@/api/features/auth/setup.service";
 import { setPublisher } from "@/api/features/realtime/realtime.service";
 import logger, { configForBootLog } from "@/api/lib/logger";
+import ackPrisma from "@/api/lib/prisma-ack";
 import app from "@/app";
 import config from "@/config";
 import {
-  assertRuntimeRoleIsNotSuperuser,
-  RuntimeIsolationError,
-} from "@/lib/db-guard";
+  startCheckpointReconciler,
+  stopCheckpointReconciler,
+} from "@/graph/checkpoint-reconcile";
+import {
+  startCheckpointRetention,
+  stopCheckpointRetention,
+} from "@/graph/checkpoint-retention";
+import { assertConnectionBudget } from "@/lib/db-budget";
+import { checkRuntimeRoleAtBoot } from "@/lib/db-guard";
+import { checkSessionZoneAtBoot } from "@/lib/db-session-zone";
+import { releaseProcessLease, startProcessLease } from "@/lib/process-lease";
+import { installShutdownHandlers } from "@/lib/shutdown";
+import { runWithWorkLabel } from "@/lib/work-label";
+import {
+  ensureAllLogFactsBackfills,
+  registerLogFactsBackfillHandler,
+} from "@/modules/analytics/log-facts";
 import { registerAppointmentReminderHandler } from "@/modules/appointments/reminders";
 import { registerRedirectFollowUpHandlers } from "@/modules/channel-redirect/followup";
+import { drainStoredChatwootDeliveries } from "@/modules/chatwoot/delivery-queue";
 import {
   ensureAllDeliverySweeps,
   registerDeliverySweepHandler,
+  startDeadClaimSweep,
+  stopDeadClaimSweep,
 } from "@/modules/chatwoot/delivery-sweep";
+import {
+  ensureAllReconcileSweeps,
+  registerReconcileSweepHandler,
+} from "@/modules/chatwoot/reconcile-sweep";
 import { registerDeliveryRecoveryHandler } from "@/modules/chatwoot/recover-delivery";
 import { registerHumanReplyRecoveryHandler } from "@/modules/chatwoot/recover-human-reply";
 import { registerTakeoverRecoveryHandler } from "@/modules/chatwoot/recover-takeover";
+import { enableRouteTokenRewarm } from "@/modules/chatwoot/webhook";
 import { registerDebounceHandler } from "@/modules/debounce/handler";
 import {
   startDebounceWorker,
   stopDebounceWorker,
 } from "@/modules/debounce/worker";
+import { registerDocumentApprovalExpiryHandler } from "@/modules/documents/approval";
+import { registerDocumentApprovalOutcomeHandler } from "@/modules/documents/approval-outcome";
 import {
   startAlertWorker,
   stopAlertWorker,
@@ -33,17 +58,26 @@ import {
   ensureAllTenantSweeps,
   registerFollowUpHandlers,
 } from "@/modules/followups/handlers";
+import {
+  startInstanceHealthSampler,
+  stopInstanceHealthSampler,
+} from "@/modules/instance-health/sampler";
 import { registerMemoryHandlers } from "@/modules/memory/compact";
 import {
   startCompactionWorker,
   stopCompactionWorker,
 } from "@/modules/memory/worker";
 import { registerObserveHandler } from "@/modules/observe/job";
+import { ensureAllOccurrenceRounds } from "@/modules/occurrences/arm";
+import { registerOccurrenceRoundHandler } from "@/modules/occurrences/round";
+import { registerOccurrenceSweepHandler } from "@/modules/occurrences/sweep";
+import { registerOtherInboxSummaryHandler } from "@/modules/other-inboxes/summary-job";
 import { registerRagIngestHandler } from "@/modules/rag/documents";
 import {
   ensureAllKnowledgeSourceSyncs,
   registerKnowledgeSourceHandler,
 } from "@/modules/rag/source";
+import { registerSuggestionReviewHandler } from "@/modules/rag/suggestion-review";
 import { startScheduler, stopScheduler } from "@/modules/scheduler/worker";
 import { ensureAllSpendPolls } from "@/modules/spend-ceiling/arm";
 import { registerSpendPollHandler } from "@/modules/spend-ceiling/poll";
@@ -59,7 +93,7 @@ import {
 
 const MAX_PORT_ATTEMPTS = 10;
 
-// NOTE: Postgres 42501 (insufficient_privilege) surfaces nested inside Prisma's
+// Postgres 42501 (insufficient_privilege) surfaces nested inside Prisma's
 // DriverAdapterError; walk the cause chain instead of trusting one shape.
 function isPermissionDenied(error: unknown): boolean {
   let current: unknown = error;
@@ -69,6 +103,14 @@ function isPermissionDenied(error: unknown): boolean {
     current = e.cause;
   }
   return false;
+}
+
+// NOTE: Fail fast, before the port is bound, when this replica's pools can open more connections than
+// a database server accepts (src/lib/db-budget.ts). A server that does not answer only warns, like
+// the runtime role check below, and does not hide another server's refusal.
+for (const { line, checked } of await assertConnectionBudget()) {
+  if (checked) logger.info("Connection budget %s", line);
+  else logger.warn("Connection budget %s (DB unavailable?); continuing", line);
 }
 
 let port = config.port;
@@ -105,23 +147,13 @@ for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
   }
 }
 
-// NOTE: Fail fast if the runtime DB connection cannot uphold isolation. Any refusal the guard makes
-// hard-crashes the process (correct: crash-loop until it is fixed); a DB-unavailable error only
-// warns, since initSetupState below already tolerates a boot-time outage.
-//
-// Caught on the BASE class, never on one refusal by name: the guard grew a second one
-// (`FleetPolicyMismatchError`, for a database restored under another name) and a `instanceof
-// SuperuserRuntimeError` here swallowed it as an outage, leaving the process serving with every
-// cross-tenant read answering zero rows.
-try {
-  await assertRuntimeRoleIsNotSuperuser();
-} catch (error) {
-  if (error instanceof RuntimeIsolationError) throw error;
-  logger.warn(
-    { error },
-    "Could not verify the runtime DB role (DB unavailable?); continuing",
-  );
-}
+// NOTE: Fail fast if the runtime DB connection cannot uphold isolation; an outage only warns
+// (src/lib/db-guard.ts, checkRuntimeRoleAtBoot).
+await checkRuntimeRoleAtBoot();
+
+// NOTE: Fail fast if any pool's session is not in UTC, which shifts every `now()` against a
+// timestamp column; an outage only warns (src/lib/db-session-zone.ts).
+await checkSessionZoneAtBoot();
 
 if (config.env === "production" && config.ssrf.allowPrivateTargets) {
   logger.warn(
@@ -168,48 +200,74 @@ if (config.schedulerWorker.enabled) {
   registerRagIngestHandler();
   registerHeartbeatHandler();
   registerFlowlogRetentionHandler();
+  registerLogFactsBackfillHandler();
   registerAppointmentReminderHandler();
   registerRedirectFollowUpHandlers();
   registerMemoryHandlers();
+  registerOtherInboxSummaryHandler();
   registerObserveHandler();
+  registerSuggestionReviewHandler();
+  registerDocumentApprovalExpiryHandler();
+  registerDocumentApprovalOutcomeHandler();
   registerDeliverySweepHandler();
+  registerReconcileSweepHandler();
   registerDeliveryRecoveryHandler();
   registerTakeoverRecoveryHandler();
   registerHumanReplyRecoveryHandler();
   registerSpendPollHandler();
+  registerOccurrenceRoundHandler();
+  registerOccurrenceSweepHandler();
   registerKnowledgeSourceHandler();
   registerInboundSweepHandlers();
   startScheduler();
   // Arm the per-tenant execution-log retention sweep for every existing tenant (best-effort: a
   // boot-time DB outage just means the sweep arms on the next restart).
-  void ensureAllFlowlogSweeps().catch((error) =>
+  void runWithWorkLabel("boot", ensureAllFlowlogSweeps).catch((error) =>
     logger.warn({ error }, "Failed to arm flowlog retention sweeps"),
+  );
+  // Fill the dashboard's log facts of every tenant still reading its figures from the flow log.
+  void runWithWorkLabel("boot", ensureAllLogFactsBackfills).catch((error) =>
+    logger.warn({ error }, "Failed to arm dashboard log facts backfills"),
   );
   // Arm the per-tenant follow-up sweep for every existing tenant so follow-ups self-heal after the
   // sweep's row is lost (DB reset, external truncate). Same best-effort discipline as above.
-  void ensureAllTenantSweeps().catch((error) =>
+  void runWithWorkLabel("boot", ensureAllTenantSweeps).catch((error) =>
     logger.warn({ error }, "Failed to arm follow-up sweeps"),
   );
-  // Arm the per-tenant recovery sweep for Chatwoot deliveries stranded on PROCESSING (issue #228).
-  // A deploy is both the thing that strands them and the thing that runs this, so the boot arm is
-  // what makes the recovery reach the rows the restart itself created.
-  void ensureAllDeliverySweeps().catch((error) =>
+  // NOTE: Arm the per-tenant recovery sweep for Chatwoot deliveries stranded on PROCESSING. A deploy
+  // both strands them and runs this, so the boot arm is what reaches the rows the restart created.
+  void runWithWorkLabel("boot", ensureAllDeliverySweeps).catch((error) =>
     logger.warn({ error }, "Failed to arm Chatwoot delivery sweeps"),
   );
-  // Arm the per-tenant sweep for inbound deliveries stranded between the ack and the dispatch (issue
-  // #817), for every tenant with an inbound surface. Same reason as the Chatwoot sweep above: a
-  // deploy is what strands them.
-  void ensureAllInboundSweeps().catch((error) =>
+  // NOTE: Arm the per-tenant reconciliation from Chatwoot: what an outage kept from reaching the ledger
+  // is found by reading Chatwoot, and a boot is when an outage has just ended.
+  void runWithWorkLabel("boot", ensureAllReconcileSweeps).catch((error) =>
+    logger.warn({ error }, "Failed to arm Chatwoot reconcile sweeps"),
+  );
+  // NOTE: Arm the per-tenant sweep for inbound deliveries stranded between the ack and the dispatch,
+  // for every tenant with an inbound surface: a deploy strands them too.
+  void runWithWorkLabel("boot", ensureAllInboundSweeps).catch((error) =>
     logger.warn({ error }, "Failed to arm inbound delivery sweeps"),
   );
-  // Arm the per-tenant spend ceiling poll for every tenant whose ceiling is on (issue #426), so a
-  // row lost to a reset is not a ceiling deciding on a figure frozen at its last poll.
-  // Knowledge sources (issue #794): each gets its perpetual sync row back, due one interval out.
-  void ensureAllKnowledgeSourceSyncs().catch((error) =>
+  // NOTE: Each knowledge source gets its perpetual sync row back, due one interval out.
+  void runWithWorkLabel("boot", ensureAllKnowledgeSourceSyncs).catch((error) =>
     logger.warn({ error }, "Failed to arm knowledge source syncs"),
   );
-  void ensureAllSpendPolls().catch((error) =>
+  // NOTE: Arm the spend ceiling poll for every tenant whose ceiling is on, so a row lost to a reset
+  // is not a ceiling deciding on a figure frozen at its last poll.
+  void runWithWorkLabel("boot", ensureAllSpendPolls).catch((error) =>
     logger.warn({ error }, "Failed to arm spend ceiling polls"),
+  );
+  // NOTE: The pass that deletes the checkpoints of threads whose owner is gone: a
+  // teardown sweeps only what exists while it runs, and a turn that writes after it leaves rows
+  // nothing points at.
+  startCheckpointReconciler();
+  // NOTE: The pass that keeps, of every live thread, only the checkpoint the saver resumes from: a
+  // thread keeps every checkpoint it wrote, each with a copy of the whole conversation.
+  startCheckpointRetention();
+  // NOTE: Every account whose occurrence monitor is on gets its round back.
+  void runWithWorkLabel("boot", ensureAllOccurrenceRounds).catch((error) =>
+    logger.warn({ error }, "Failed to arm occurrence rounds"),
   );
 }
 
@@ -217,6 +275,11 @@ if (config.schedulerWorker.enabled) {
 // Single-replica discipline (globalThis singleton + reentrancy guard); off on extra replicas.
 if (config.alertWorker.enabled) {
   startAlertWorker();
+  // NOTE: The instance health sampler rides the same flag: it is what enqueues instance alerts, and
+  // two replicas sampling would alert twice.
+  void startInstanceHealthSampler().catch((error) =>
+    logger.warn({ error }, "Failed to start the instance health sampler"),
+  );
 }
 
 // NOTE: Dedicated fast worker for DEBOUNCE jobs (inbound message coalescing). Separate cadence from
@@ -227,7 +290,7 @@ if (config.debounceWorker.enabled) {
   startDebounceWorker();
 }
 
-// NOTE: Dedicated worker for MEMORY_COMPACT jobs (attendance compaction). The mirror image of the
+// NOTE: Dedicated worker for MEMORY_COMPACT and OTHER_INBOX_SUMMARY jobs (summaries). The mirror image of the
 // debounce lane: not fast, but long — a summary is a model call with a 60s ceiling, and compaction
 // fires for every agent on every closed attendance, so on the scheduler's serial lane a batch of
 // them would delay the jobs a customer feels. `registerMemoryHandlers` is idempotent, so registering
@@ -235,25 +298,48 @@ if (config.debounceWorker.enabled) {
 // itself is disabled.
 if (config.compactionWorker.enabled) {
   registerMemoryHandlers();
+  registerOtherInboxSummaryHandler();
   startCompactionWorker();
 }
 
-// NOTE: reached through the EventEmitter surface because `process.on("SIGTERM", …)` no longer
-// type-checks. @types/node 25 declares `Process extends InternalEventEmitter<ProcessEventMap>`, so
-// the signal handlers are INHERITED from an event map rather than declared as overloads, and
-// bun-types 1.4.0 augments `NodeJS.Process` with an explicit `on(event: "memoryPressure", …)`. A
-// member declared on the interface shadows the inherited one, so `on` narrows to "memoryPressure"
-// alone. Measured against this tsconfig: the literal call, `node:process`, a `NodeJS.Signals` cast,
-// `addListener` and `once` all fail; only the EventEmitter surface compiles. Upstream bug in
-// bun-types, not in this code — drop the cast once it declares these as overloads.
-const processEvents = process as NodeJS.EventEmitter;
-for (const signal of ["SIGTERM", "SIGINT"] as const) {
-  processEvents.on(signal, () => {
+// NOTE: The Chatwoot deliveries a previous process acked and never got to: a customer message goes to
+// the delivery recovery now, any other event is processed from the body its row stored. Every replica
+// serves the webhook, so this runs whatever the worker flags; a row another live replica still holds
+// goes to whichever CAS lands first, and the loser skips.
+void runWithWorkLabel("boot", () =>
+  drainStoredChatwootDeliveries({ minAgeMs: 0 }),
+).catch((error) =>
+  logger.warn({ error }, "Failed to drain stored Chatwoot deliveries"),
+);
+
+// NOTE: This process's lease, renewed on the ack's pool so a drained main pool cannot make a live
+// process look dead, and the pass that settles what a dead process claimed. Every replica
+// runs both: a web replica's death is found by the leader, the leader's by whatever starts next.
+void startProcessLease(ackPrisma)
+  .catch((error) => logger.warn({ error }, "Failed to start the process lease"))
+  .finally(() => startDeadClaimSweep());
+
+// A full route-token cache invalidation looks the dropped tokens up again, so a bot nobody retired
+// keeps an entry to serve if the lookup starts failing (src/modules/chatwoot/route-token-cache.ts).
+enableRouteTokenRewarm();
+
+// SIGTERM/SIGINT stop the lanes, drain the work in flight up to SHUTDOWN_DRAIN_MS, then exit.
+installShutdownHandlers({
+  stop: () => {
     stopOutboundWorker();
     stopScheduler();
     stopDebounceWorker();
     stopCompactionWorker();
     stopAlertWorker();
-    process.exit(0);
-  });
-}
+    stopDeadClaimSweep();
+    stopCheckpointReconciler();
+    stopCheckpointRetention();
+    stopInstanceHealthSampler();
+  },
+  boundMs: config.shutdown.drainMs,
+  // The lease goes last, after the drain: what this process still holds will not finish, and deleting
+  // the lease lets another process settle it at its next pass instead of a lease's lifetime later.
+  exit: (code) => {
+    void releaseProcessLease().finally(() => process.exit(code));
+  },
+});

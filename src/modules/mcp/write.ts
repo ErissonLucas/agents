@@ -25,6 +25,7 @@ import {
 import {
   type BehaviorSettingsPatch,
   mergeBehaviorSettings,
+  mergeBlock,
   readBehaviorSettings,
 } from "@/modules/agents/behavior-settings";
 import { configHealthAfterWrite } from "@/modules/agents/config-health-read";
@@ -33,13 +34,21 @@ import {
   SETTINGS_CREDENTIAL_PATHS,
 } from "@/modules/agents/credential-paths";
 import {
+  assertCredentialRefsUsable,
+  assertDecisionActionArgsUsable,
   assertPromptSize,
+  assertReferenceKnowledgeBasesUsable,
+  assertResolveLabelsNotProtected,
+  assertSettingsClosedValues,
   assertSettingsContactAuthRule,
+  assertSettingsContactFields,
   assertSettingsDebugWindow,
   assertSettingsModelFallback,
   assertSettingsProtectedLabels,
+  assertSettingsRemovedFields,
   assertSettingsReplyGate,
   assertSettingsRetiredLabelKeys,
+  assertSettingsReviseToolCalls,
   assertSettingsTextSizes,
   assertSettingsToolPreconditions,
   getAgent,
@@ -51,7 +60,12 @@ import { type AuditEntry, recordAudit } from "@/modules/audit/service";
 import type { LoadChatwootClientDeps } from "@/modules/chatwoot/instance";
 import type { ListAccountsDeps } from "@/modules/chatwoot/management";
 import { readDebugModes } from "@/modules/flowlog/debug-mode";
+import {
+  assertServiceWindowTemplatesUsable,
+  assertSettingsServiceWindow,
+} from "@/modules/service-window/save";
 import { getTenantSettings } from "@/modules/tenant-settings/service";
+import { getSecretType } from "@/modules/vault/secret-types";
 import {
   assertPendingVaultEntryCreatable,
   assertVaultNameAvailable,
@@ -61,18 +75,16 @@ import {
   tryResolveVaultSecret,
   vaultNameByRef,
 } from "@/modules/vault/service";
+import { keepCallsSystemFields } from "@/modules/voice-call/settings";
 import { vaultCreateUrl, vaultFillUrl } from "./console-links";
 import { hasScope, type VerifiedToken } from "./oauth/tokens";
 
-// MCP write tools — the privileged half of the MCP surface, gated by the hardened-spec guardrails:
-//   - scope: mcp:write is REQUIRED (the token's role already filtered scopes at /authorize);
-//   - tenant fence: the token MUST be scoped to a tenant (a tenant-less SUPER_ADMIN token cannot
-//     write blind — it must target a tenant), and the write is fenced to that tenant by RLS/
-//     asSuperAdmin (the tool args never carry a tenant — anti-IDOR);
-//   - dry-run by DEFAULT: every tool previews a field-level diff and applies NOTHING unless the
-//     caller passes dry_run:false explicitly (preview-before-apply);
-//   - audit: a successful apply appends an AuditLog row (actorType "mcp"), before/after
-//     allowlist-projected and length-bounded (never the raw model config / secrets).
+// MCP write tools, the privileged half of the MCP surface (docs/mcp.md):
+//   - scope: mcp:write is REQUIRED;
+//   - tenant fence: the token MUST target a tenant, and the write is fenced to it by RLS/
+//     asSuperAdmin (the tool args never carry a tenant: anti-IDOR);
+//   - dry-run by DEFAULT: nothing is applied unless the caller passes dry_run:false;
+//   - audit: a successful apply appends an AuditLog row, allowlist-projected and length-bounded.
 
 export type WriteResult =
   | { ok: true; data: Record<string, unknown> }
@@ -90,23 +102,17 @@ export interface WriteDeps {
   // than answering from its arguments (`inbox_remove`: the write refuses a live inbox, so a preview
   // that cannot ask would approve what the apply rejects). Defaults to the real SSRF-validated one.
   makeClient?: LoadChatwootClientDeps["makeClient"];
-  // NOTE: injectable account-list probe, for the same reason as `makeClient` one line up and with
-  // the same lesson behind it. `deployment_set_accounts` measures its input against the accounts the
-  // deployment reports, so a preview that cannot reach that list falls through to the fallback cap
-  // and approves ids the apply refuses — the #490 divergence, reintroduced by a dep the transport
-  // could not thread (#503).
+  // NOTE: injectable account-list probe, for the same reason: `deployment_set_accounts` checks its
+  // input against the accounts the deployment reports, and a preview that cannot reach that list
+  // would approve ids the apply refuses.
   fetchProfile?: ListAccountsDeps["fetchProfile"];
+  // NOTE: injectable account read, for the identity `deployment_set_accounts` checks claims by.
+  fetchAccount?: ListAccountsDeps["fetchAccount"];
 }
 
-// The one id parser for every MCP surface, read and write alike.
-//
-// The pattern, not just the throw. `BigInt("")` is 0n and `BigInt(" 17 ")` is 17n, so an id a caller
-// typed wrong does not fail — it becomes a VALID id for some other row, and a write with dry_run
-// false then edits or deletes that one. An id is a run of digits or a mistake worth reporting.
-//
-// One function because it was eight, byte for byte, and a defect fixed in one of eight copies is a
-// defect fixed nowhere: the round that added this rule to the READ parser left the seven writes
-// exactly as they were.
+// The one id parser for every MCP surface, read and write alike. `BigInt("")` is 0n and
+// `BigInt(" 17 ")` is 17n, so a mistyped id would become a VALID id for some other row, and a write
+// would edit that one. An id is a run of digits or a mistake worth reporting.
 export function parseMcpId(raw: string, label: string): bigint | WriteResult {
   // Range as well as spelling. `BigInt` is arbitrary precision, so an id past 2^63-1 parses here and
   // is refused by POSTGRES when the query binds it — a tool call that answers with a database error
@@ -129,7 +135,7 @@ export function diffFields(
   return out;
 }
 
-// NOTE: service-layer ZodErrors must surface as a tool result (err), never bubble raw into the
+// Service-layer ZodErrors must surface as a tool result (err), never bubble raw into the
 // MCP SDK's generic exception envelope.
 function zodIssuesMessage(e: ZodError): string {
   return `validation failed: ${e.issues
@@ -339,22 +345,22 @@ export async function credentialCreate(
   if ("ok" in ctx) return ctx;
 
   const kind = args.kind ?? "generic";
+  const fillHint = getSecretType(kind)?.fillHint;
   const preview = {
     name: args.name,
     kind,
     status: "pending",
     baseUrl: args.base_url ?? null,
     paramName: args.param_name ?? null,
+    ...(fillHint ? { fillHint } : {}),
   };
 
   // dry-run is the default: create ONLY when dry_run is explicitly false.
   if (args.dry_run !== false) {
-    // NOTE: everything `createPendingVaultEntry` decides about its input — the name, the kind
-    // against the catalog, the connect-flow kinds that cannot be created pending, a required base
-    // URL, and the param name the kind has no use for (#488) — asked here before the preview
-    // answers. The apply below reaches the core, which asks it again; the pure function in the
-    // middle is what keeps the transport's `WriteResult` and the domain's `AppError` from drifting
-    // into two different verdicts (#490).
+    // NOTE: everything `createPendingVaultEntry` decides about its input (the name, the kind
+    // against the catalog, connect-flow kinds that cannot be pending, a required base URL, an
+    // unused param name), asked through the same pure function the core uses, so the two verdicts
+    // cannot drift.
     try {
       const { name, kind } = assertPendingVaultEntryCreatable({
         name: args.name,
@@ -394,6 +400,7 @@ export async function credentialCreate(
       kind,
       status: "pending",
       fillAt: vaultFillUrl(ctx.tenantId, id),
+      ...(fillHint ? { fillHint } : {}),
     });
   } catch (e) {
     if (e instanceof AppError) return err(e.message);
@@ -475,17 +482,10 @@ export interface AgentSettingsGetArgs {
   agent_id: string;
 }
 
-// THE READ RETURNS WHAT THE WRITE ACCEPTS, down to the field.
-//
-// `readGuardrailsConfig` gives both directions the same shape, which is right for the runtime (it
-// filters by direction at use, in activeChecks) and wrong for a CONTRACT: three of those fields do
-// nothing under `input`, and the write now refuses them. Returning them here would hand a caller a
-// document that the very next `agent_settings_set` rejects — trading a silent no-op for a 400 on
-// someone who changed nothing, which is worse.
-//
-// Projected at this boundary rather than in the reader, so the console and the runtime keep the
-// uniform shape they are built on. The pair is asserted in
-// tests/modules/agent-settings-mcp-parity.test.ts.
+// The read returns what the write accepts, down to the field: three guardrail fields do nothing
+// under `input` and the write refuses them, so returning them would hand back a document the next
+// `agent_settings_set` rejects. Projected here, not in the reader, so the console and the runtime
+// keep their uniform shape (pinned by tests/modules/agent-settings-mcp-parity.test.ts).
 function dropOutputOnlyInputFields(
   settings: ReturnType<typeof readBehaviorSettings>,
 ): ReturnType<typeof readBehaviorSettings> {
@@ -533,11 +533,8 @@ export async function agentSettingsGet(
         slot.holder[slot.key] = await vaultNameByRef(ctx, ref, base);
       }
     }
-    // The unified debug-mode warning (#58). An agent connected over MCP reads this surface to find
-    // out how this agent is configured, and "something is recording more than the default" is part
-    // of that answer — including the tenant-level switch, which lives on another surface entirely
-    // and is exactly what an operator forgets. One extra read on a non-hot path buys not having a
-    // second copy of the same condition here.
+    // The unified debug-mode warning, including the tenant-level switch that lives on another
+    // surface; one extra read here avoids a second copy of the condition.
     const debugModes = readDebugModes(
       agent.settings,
       await getTenantSettings(ctx, base),
@@ -579,17 +576,9 @@ export async function agentSettingsSet(
   const agentId = parseMcpId(args.agent_id, "agent_id");
   if (typeof agentId !== "bigint") return agentId;
 
-  // FROM THE SCHEMA, not from a list beside it. This was seventeen `if (args.X !== undefined)` lines
-  // and the eighteenth block went in without one: `modelFallback` was published in this tool's
-  // schema, accepted by the parser, and then dropped here — a fallback-only call answered "no
-  // updatable fields" and a call that also touched some other block succeeded while silently
-  // ignoring the fallback. That is the seventh time in this change that a new block reached one
-  // registration point and not the next, so this one stops being a place a block can be forgotten:
-  // the keys ARE the schema's keys, and the refusal below names the same set.
-  //
-  // The cast is what a per-key copy costs, and it is safe for a reason worth stating: the keys come
-  // from `BEHAVIOR_PATCH_SHAPE` itself and `args` was parsed against that same shape, so every value
-  // reaching `patch[k]` has already been checked by the schema that defines `patch`'s own type.
+  // The keys come FROM THE SCHEMA, not from a list beside it, so a block published in the
+  // schema cannot be dropped here; the refusal below names the same set. The cast is safe: `args`
+  // was parsed against `BEHAVIOR_PATCH_SHAPE`, the shape that defines `patch`'s own type.
   const patch: BehaviorSettingsPatch = {};
   const patchable = Object.keys(
     BEHAVIOR_PATCH_SHAPE,
@@ -600,40 +589,9 @@ export async function agentSettingsSet(
       (patch as Record<string, unknown>)[key] = value;
     }
   }
-  // NOTE: `__proto__` IS LOST IN TRANSIT, and this is the note that says so rather than a guard that
-  // pretends otherwise. It survives JSON.parse as an own property and is then dropped inside zod's
-  // loose-object rebuild, in the SDK's own argument parse, before this function is entered — so a
-  // rule or tombstone named that way never reaches the write boundary and the call answers ok.
-  //
-  // Round 9 refused an empty tool map to catch it. That was worse than the hole: a default agent
-  // returns `toolGuidance: {}` and `toolPreconditions: {}` from agent_settings_get, so echoing the
-  // config back — the documented partial-patch round trip — was refused for an unrelated edit. And
-  // it did not even close the hole, since `__proto__` alongside a real entry leaves a NON-empty map.
-  //
-  // What is left is the honest boundary, and it is narrow on purpose:
-  //   * the name is gone before any of our code runs, so it cannot be refused by name;
-  //   * the zod shapes that see the raw value (z.custom, z.preprocess) cannot be published in the
-  //     JSON Schema, and docs/mcp.md forbids a constraint the two ends read differently;
-  //   * reaching the raw request means changing registerTenantTool for all ~107 tools.
-  // The runtime is already defended (#378 keys these maps null-prototype and looks up with
-  // Object.hasOwn), `__proto__` is not the name of any tool, and a rule under it would be inert and
-  // reported by the unmatched-precondition line. tests/modules/agent-settings-mcp-parity.test.ts
-  // pins the CURRENT behaviour so a future SDK or zod change is noticed rather than assumed.
-  //
-  // AND THE DELETE HALF OF IT IS MOOT, which was measured rather than assumed. Losing a WRITE under
-  // this name costs nothing (there was never anything to name); losing a DELETE would matter, but
-  // only if such an entry could exist to begin with — a caller able to READ a rule and never remove
-  // it. It cannot:
-  //   * REST create/update parse `settings` with `z.record`, so the key is gone there too, and what
-  //     does reach assertSettingsToolPreconditions is refused as a non-native name;
-  //   * an agent IMPORT copies the bag verbatim past both (its `settings` is a record of
-  //     `z.unknown()`, so block keys are passed by reference) and carries the key all the way to the
-  //     `agent.create` call — and Prisma's own JSON rebuild drops it before Postgres. Nothing else
-  //     writes `agents.settings`; there is no raw-SQL path.
-  // So the row can never hold one, and `agent_settings_get` can never return one. Both halves are
-  // pinned: tests/modules/tool-keyed-unwritable.test.ts for zod, and the `__proto__` case in
-  // tests/modules/agent-transfer.test.ts, which asserts on the RAW jsonb — the day Prisma keeps the
-  // key, that goes red and this note is what says why it mattered.
+  // NOTE: a `__proto__` key is lost before this function runs (zod's loose-object rebuild in the
+  // SDK's argument parse drops it), so it cannot be refused by name. No stored bag can hold one
+  // either, so there is nothing to delete; docs/mcp.md has the reasoning and the tests that pin it.
   if (Object.keys(patch).length === 0) {
     // `filter`, not `slice`: the astral-cap sweep reads every bare `.slice(` in src/ as a possible
     // surrogate cut, and a list of keys is not worth an entry in that registry.
@@ -695,34 +653,102 @@ export async function agentSettingsSet(
     assertSettingsTextSizes(patch, current.settings);
     assertSettingsDebugWindow(patch, current.settings);
     assertSettingsModelFallback(patch, current.settings, "merge");
-    // NOTE: On the PATCH and before the merge, for the same reason as the three above, and for one more
-    // that is specific to this block: its reader is a FILTER. A condition that does not parse is
-    // DROPPED rather than defaulted, so by the time the merged bag exists the bad entry is simply
-    // absent — there is nothing left to refuse, and the call would answer ok having replaced a
-    // working guard with nothing. Measured on this branch: `key: " "` passes the schema, and the
-    // rule the operator had was gone.
+    // NOTE: on the PATCH and before the merge, as above, and also because this reader is a FILTER:
+    // a condition that does not parse is DROPPED, so after the merge the call would answer ok
+    // having replaced a working guard with nothing.
     assertSettingsToolPreconditions(patch, current.settings);
-    // Same reason: the contactAuth reader drops a rule it cannot parse (issue #646).
+    // NOTE: same reason: the contactAuth reader drops a rule it cannot parse.
     assertSettingsContactAuthRule(patch, current.settings);
-    // SAME REASON, one door further: the retired taxonomy keys are refused on the REST write, and
-    // without this line MCP was the way past it. `mergeBehaviorSettings` normalizes each touched
-    // block through its reader, and the reader no longer knows these keys, so by the time
-    // `updateAgent` sees the bag the groups are gone — dry run and apply both answer ok for
-    // configuration that does nothing, which is the precise silence issue #568 set out to end.
-    // Asked about the PATCH, not the merged bag, because the patch is the only place the key still
-    // exists.
+    // NOTE: same reason (the reader drops a writable field outside context), but asked of the block as
+    // it will be stored: a patch naming only `writable` is checked against the stored `context`.
+    if (patch.contactFields) {
+      const stored = (current.settings as Record<string, unknown> | null)
+        ?.contactFields;
+      assertSettingsContactFields(
+        {
+          contactFields: {
+            ...(stored && typeof stored === "object" ? stored : {}),
+            ...patch.contactFields,
+          },
+        },
+        current.settings,
+      );
+    }
+    // NOTE: same reason: `mergeBehaviorSettings` normalizes through readers that no longer know the
+    // retired taxonomy keys, so they would vanish and both halves answer ok for configuration that
+    // does nothing. Asked of the PATCH, the only place the key still exists.
     assertSettingsRetiredLabelKeys(patch);
+    assertSettingsRemovedFields(patch);
+    // NOTE: same reason: the service window's reader drops an unknown kind, a bad offset and a
+    // malformed choice, so after the merge `templates.followup: { name: "" }` would remove the
+    // override and answer ok.
+    if (patch.serviceWindow) {
+      const stored = (current.settings as Record<string, unknown> | null)
+        ?.serviceWindow;
+      assertSettingsServiceWindow(
+        {
+          serviceWindow: mergeBlock(
+            stored && typeof stored === "object"
+              ? (stored as Record<string, unknown>)
+              : {},
+            patch.serviceWindow as Record<string, unknown>,
+          ),
+        },
+        current.settings,
+      );
+    }
     assertSettingsProtectedLabels(patch, current.settings);
+    // A delay's range follows its unit, which the arguments cannot publish and a patch may name only
+    // half of: asked of the raw block before the merge, whose readers would clamp `40` under a stored
+    // `days` to 30 and answer ok.
+    for (const block of [
+      "followUp",
+      "snoozedFollowUp",
+      "channelRedirect",
+    ] as const) {
+      if (patch[block] === undefined) continue;
+      const stored = (current.settings as Record<string, unknown> | null)?.[
+        block
+      ];
+      assertSettingsClosedValues(
+        {
+          [block]: {
+            ...(stored && typeof stored === "object" ? stored : {}),
+            ...patch[block],
+          },
+        },
+        current.settings,
+      );
+    }
     const nextBag = mergeBehaviorSettings(
       (current.settings ?? {}) as Record<string, unknown>,
       patch,
     );
+    // The server-owned id on the voice provider, as the apply keeps it (`updateAgent`): the preview's
+    // diff would otherwise promise a change the write ignores.
+    keepCallsSystemFields(nextBag, current.settings);
+    // On the MERGED bag, not the patch: fields merge within a block, so a stored fence survives a
+    // patch that touches the same block, and the preview must refuse what the apply would.
+    assertResolveLabelsNotProtected(nextBag);
+    // The blocks refined only whole (monitoring's decisions block, guardrails' classifier against
+    // its actions) are asked merged here, where the preview can refuse what the apply's write
+    // boundary would.
+    for (const block of ["monitoring", "guardrails"] as const) {
+      if (patch[block] !== undefined) {
+        assertSettingsClosedValues(
+          { [block]: nextBag[block] },
+          current.settings,
+        );
+      }
+    }
+    // The rewrite's cap against the agent's turn limit, which may come from the stored bag or this
+    // same patch: only the merged bag holds both.
+    assertSettingsReviseToolCalls(nextBag, current.settings);
     // NOTE: the merged bag, not the patch: a patch that only flips `enabled` keeps the stored label.
     assertSettingsReplyGate(nextBag, current.settings);
-    // NOTE: PROJECTED, like the read — the same question asked in a third place. A client is expected to
+    // PROJECTED, like the read — the same question asked in a third place. A client is expected to
     // reuse the preview's `after` (that is what a dry run is for), so a diff carrying the fields the
-    // write refuses hands back a document that the apply rejects. Fixing `agent_settings_get` alone
-    // left this one, which is the shape of miss this PR is about.
+    // write refuses hands back a document that the apply rejects.
     const afterPreview = dropOutputOnlyInputFields(
       readBehaviorSettings(nextBag),
     );
@@ -736,8 +762,32 @@ export async function agentSettingsSet(
     }
     const diff = diffFields(beforeProj, afterProj);
 
-    // dry-run is the default: apply ONLY when dry_run is explicitly false.
+    // dry-run is the default: apply ONLY when dry_run is explicitly false. The credential kinds are
+    // asked first, as the apply asks them, so the preview refuses what the apply refuses.
     if (args.dry_run !== false) {
+      await assertCredentialRefsUsable(ctx, { settings: nextBag }, base, {
+        settings: current.settings,
+      });
+      await assertDecisionActionArgsUsable(
+        ctx,
+        nextBag,
+        current.settings,
+        base,
+      );
+      await assertReferenceKnowledgeBasesUsable(
+        ctx,
+        nextBag,
+        current.settings,
+        base,
+      );
+      await assertServiceWindowTemplatesUsable(
+        ctx,
+        agentId,
+        nextBag,
+        current.settings,
+        {},
+        base,
+      );
       return ok({ dryRun: true, target, diff });
     }
 
@@ -799,10 +849,8 @@ export async function tenantUpdate(
     const target = `tenant:${tenantId}`;
 
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       assertTenantUpdatable(patch);
       const previewAfter = {
         name: patch.name ?? current.name,
@@ -842,7 +890,7 @@ export interface BrandingSetArgs {
 // branding_set: update the GLOBAL app identity colors. This is FLEET-level (NOT tenant-scoped), so
 // unlike the other write tools it does not require/accept a tenant target — it requires the
 // mcp:admin scope, the privileged tier only SUPER_ADMIN tokens hold (the role check below is
-// defense-in-depth, in case mcp:admin is ever granted more broadly). Logo/favicon are uploaded via
+// defense-in-depth, in case mcp:admin is ever granted more broadly). Logo/favicon/mark are uploaded via
 // branding_asset_set (below). The apply is audited at the fleet level (tenant_id NULL). Dry-run by default.
 export async function brandingSet(
   principal: VerifiedToken,
@@ -892,10 +940,8 @@ export async function brandingSet(
 
     // dry-run is the default: apply ONLY when dry_run is explicitly false.
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       assertBrandingColorsUpdatable(update);
       const previewAfter = {
         brandName:
@@ -975,7 +1021,7 @@ export interface BrandingAssetSetArgs {
   dry_run?: boolean;
 }
 
-// branding_asset_set: upload a GLOBAL branding asset (logo/favicon) over MCP. Same fleet-level gate as
+// branding_asset_set: upload a GLOBAL branding asset (logo/favicon/mark) over MCP. Same fleet-level gate as
 // branding_set (mcp:admin + SUPER_ADMIN). The image arrives base64-encoded; we rebuild a Blob — which
 // satisfies setBrandingAsset's structural { type, size, arrayBuffer() } — so the SAME service validation
 // (MIME allowlist + per-kind size cap) and disk+DB write run, no multipart needed. All the cheap
@@ -992,8 +1038,8 @@ export async function brandingAssetSet(
   if (principal.role !== "SUPER_ADMIN") {
     return err("forbidden: global branding requires a SUPER_ADMIN token");
   }
-  if (args.kind !== "logo" && args.kind !== "favicon") {
-    return err('invalid kind: expected "logo" or "favicon"');
+  if (args.kind !== "logo" && args.kind !== "favicon" && args.kind !== "mark") {
+    return err('invalid kind: expected "logo", "favicon" or "mark"');
   }
   if (args.variant !== "dark" && args.variant !== "light") {
     return err('invalid variant: expected "dark" or "light"');

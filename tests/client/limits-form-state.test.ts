@@ -6,8 +6,8 @@ import {
 import { readLimitsConfig } from "@/modules/agents/limits";
 
 // The Behavior save REPLACES the `limits` block, so a key this pair drops is DELETED from the agent's
-// bag on the next save. `retrySilence` (issue #885) has no control on the tab, and an operator who
-// turned it off through the API would get it back on by saving an unrelated setting.
+// bag on the next save. `retrySilence` has no control on the tab, and an operator who turned it off
+// through the API would get it back on by saving an unrelated setting.
 
 describe("limits form ↔ stored round trip", () => {
   test("every stored key survives the trip, the retry switch included", () => {
@@ -16,12 +16,16 @@ describe("limits form ↔ stored round trip", () => {
         maxToolCalls: 7,
         maxHistoryTokens: 12_000,
         retrySilence: false,
+        maxTurnsPerHour: 7,
+        maxProactivePerDay: 4,
       },
     };
     expect(limitsToStored(limitsToForm(stored))).toEqual({
       maxToolCalls: 7,
       maxHistoryTokens: 12_000,
       retrySilence: false,
+      maxTurnsPerHour: 7,
+      maxProactivePerDay: 4,
     });
   });
 
@@ -36,11 +40,29 @@ describe("limits form ↔ stored round trip", () => {
       maxToolCalls: 10,
       maxHistoryTokens: null,
       retrySilence: true,
+      maxTurnsPerHour: 60,
+      maxProactivePerDay: 10,
     });
   });
 
-  test("an emptied ceiling field is stored as off", () => {
-    const form = { ...limitsToForm({}), maxHistoryTokens: "" };
-    expect(limitsToStored(form).maxHistoryTokens).toBeNull();
+  test("a key never set shows the default of 60, not an empty field", () => {
+    expect(limitsToForm({}).maxTurnsPerHour).toBe("60");
+  });
+
+  test("an emptied turn limit is stored as 0, which reads back as no limit", () => {
+    const form = { ...limitsToForm({}), maxTurnsPerHour: "" };
+    const stored = limitsToStored(form);
+    expect(stored.maxTurnsPerHour).toBe(0);
+    expect(readLimitsConfig({ limits: stored }).maxTurnsPerHour).toBe(0);
+    expect(limitsToForm({ limits: stored }).maxTurnsPerHour).toBe("");
+  });
+
+  test("an emptied proactive limit is stored as 0, which reads back as no limit", () => {
+    expect(limitsToForm({}).maxProactivePerDay).toBe("10");
+    const form = { ...limitsToForm({}), maxProactivePerDay: "" };
+    const stored = limitsToStored(form);
+    expect(stored.maxProactivePerDay).toBe(0);
+    expect(readLimitsConfig({ limits: stored }).maxProactivePerDay).toBe(0);
+    expect(limitsToForm({ limits: stored }).maxProactivePerDay).toBe("");
   });
 });

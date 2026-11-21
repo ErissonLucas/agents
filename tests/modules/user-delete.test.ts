@@ -8,9 +8,10 @@ import {
   UserNotInScopeError,
 } from "@/api/features/admin/admin.service";
 import type { TenantContext } from "@/lib/tenancy";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { personData } from "@/tests/utils/person";
 
-// The caller, as the principal the delete now records itself under (#400): its tenant is the scope
+// The caller, as the principal the delete records itself under: its tenant is the scope
 // the target has to fall inside, and its user is the one the self-delete guard compares against.
 const actor = (tenantId: bigint, userId: bigint): TenantContext => ({
   tenantId,
@@ -36,8 +37,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;

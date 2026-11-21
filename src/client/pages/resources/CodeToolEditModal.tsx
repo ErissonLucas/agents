@@ -1,6 +1,6 @@
 import type { TFunction } from "i18next";
 import { AlertTriangle } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
@@ -12,6 +12,7 @@ import {
   ModalCancelButton,
   type ModalController,
   Skeleton,
+  Switch,
   scopeKeyLabel,
   Textarea,
   useModalController,
@@ -38,16 +39,12 @@ import {
   type CodeToolTestTarget,
 } from "./CodeToolTestModal";
 
-// Create/edit an operator-authored code tool (issue #363): a JavaScript function body the agent
-// calls with typed arguments, the sibling of ToolEditModal for the kind whose "wiring" is code
-// rather than an HTTP request. The model only ever supplies arguments; the operator owns the label,
-// the required description, the typed input schema and the body. The identifier the agent calls is
-// derived from the label by `normalizeToolName`, exactly like an HTTP tool, so it is shown live and
-// never typed.
-//
-// Invalid code is SAVED, not refused: the static check (lib/code-tool-syntax.ts) answers alongside
-// the row as a WARNING, and a body that does not parse fails at call time as the operator's failure.
-// So the syntax warning never disables Save, and a half-typed body can always be saved and reopened.
+// Create/edit an operator-authored code tool: a JavaScript function body the agent calls with typed
+// arguments, the sibling of ToolEditModal for the kind whose "wiring" is code. The model only ever
+// supplies arguments; the operator owns the label, description, input schema and body. The
+// identifier is derived from the label by `normalizeToolName`, like an HTTP tool's, so it is shown
+// live and never typed. Invalid code is SAVED with a WARNING (lib/code-tool-syntax.ts) and fails at
+// call time, so the warning never disables Save and a half-typed body can always be saved.
 
 // The row this modal edits comes from the GET-BY-ID, not from the list: the list does not carry the
 // body (it is up to 20k characters per row and nothing browsing a list reads it), and the body is
@@ -65,17 +62,12 @@ type CodeToolsData = Awaited<
 export type CodeToolListed = NonNullable<CodeToolsData>["tools"][number];
 
 // A starter body that shows the contract at a glance; the operator replaces it. Empty would do (Save
-// gates on non-empty code), but the shape is the thing a first-time author most needs to see.
-//
-// Its comments are the first console text an author of a code tool reads, so they are TRANSLATED
-// like everything else on this screen. The code around them is not: `return` is the language's word,
-// not ours. Shipped in English since #517 and caught in a browser against a pt-BR console.
+// gates on non-empty code), but the shape is the thing a first-time author most needs to see. Its
+// comments are the first text an author reads, so they are TRANSLATED; the code around them is not.
 export function starterCode(t: TFunction): string {
-  // One line, and it is the one thing that cannot be discovered from the editor: the key that opens
-  // the list. Everything the two lines here used to say (what `input` and `context` hold, that the
-  // answer is a `return`, that console output rides along) is in that list, in the `?` beside the
-  // field, and in the completion's own descriptions. Repeating it in the body made the first thing
-  // an author reads a paragraph about the body they are about to delete.
+  // One line: the key that opens the completion list, the one thing the editor cannot reveal.
+  // What `input` and `context` hold is in that list, in the `?` beside the field, and in the
+  // completions' descriptions, not in a body the author is about to delete.
   const hint = t(
     "codeTools.starterHint",
     "{{hotkey}} lists the variables available here.",
@@ -90,6 +82,7 @@ function emptyForm(t: TFunction) {
     description: "",
     aiFields: [] as AiFieldRow[],
     code: starterCode(t),
+    silenceTruncationAlert: false,
   };
 }
 
@@ -104,6 +97,7 @@ export function formFromCodeTool(tool: CodeTool): CodeToolForm {
       (tool.inputSchema ?? {}) as Record<string, unknown>,
     ),
     code: tool.code,
+    silenceTruncationAlert: tool.silenceTruncationAlert,
   };
 }
 
@@ -118,6 +112,7 @@ export function payloadOfCodeTool(form: CodeToolForm) {
     description: form.description.trim(),
     inputSchema: schemaFromAiFields(form.aiFields),
     code: form.code,
+    silenceTruncationAlert: form.silenceTruncationAlert,
     // No `enabled` here, and its absence is the point. Which agents may call the tool is decided by
     // the GRANT, on the agent, which is the whole control the console offers for the HTTP tool this
     // kind is the sibling of (`payloadOf` in ToolEditModal sends no `enabled` either). Sending the
@@ -176,6 +171,7 @@ export function CodeToolEditModal({
   const { t } = useTranslation();
   const { showToast } = useToast();
   const [form, setForm] = useState(() => emptyForm(t));
+  const silenceClipId = useId();
   // The CURRENT form, readable from inside a request that started before it: the operator can type
   // during the save, and a refusal about a value they have already replaced belongs in the banner
   // rather than under a box that no longer holds it.
@@ -208,6 +204,9 @@ export function CodeToolEditModal({
     setFormError(null);
     setLoadError(false);
     setSyntaxWarnings([]);
+    // NOTE: A save from a previous opening may still be out, and its `finally` is fenced to that opening,
+    // so it can no longer clear the flag this one reads.
+    setSaving(false);
     const payloadId = modal.payload?.id;
     // This opening, told apart from the next one. The GET below outlives the dialog it was started
     // for: close it while the request is out, reopen on another tool (or on create), and the old
@@ -246,9 +245,8 @@ export function CodeToolEditModal({
         }
       })();
     } else {
-      // Reset here too: the session token now drops the previous opening's answer, and that answer
-      // is what used to clear this flag on its way out — leaving the create form skeletonized
-      // forever if it never arrived. Every state this handler sets belongs to THIS opening.
+      // NOTE: Reset here too: the session token drops the previous opening's answer, so that answer can
+      // no longer clear this flag. Every state this handler sets belongs to THIS opening.
       setLoadingForm(false);
       const initial = emptyForm(t);
       setForm(initial);
@@ -290,8 +288,8 @@ export function CodeToolEditModal({
   }, [form.code, modal.isOpen]);
 
   async function save() {
-    // The opening this save belongs to. Dismissal is blocked while the request is out (the Modal's
-    // `onCloseRequest` below), so this is defence in depth rather than the only guard. Every
+    // The opening this save belongs to. Dismissal is blocked while the request is out (`busy` on the
+    // Modal below), so this is defence in depth rather than the only guard. Every
     // continuation reached after the await still checks it, `finally` included: `setSaving(false)`
     // belonging to a previous opening would leave the reopened form disabled with nothing running,
     // for as long as the first request takes to answer (docs/modals.md).
@@ -310,9 +308,7 @@ export function CodeToolEditModal({
         if (sessionRef.current === session) setFormError(held(err));
         return;
       }
-      // Dismissed and reopened while this was out: the row was written, and it is the CALLER's list
-      // that has to hear about it, not the dialog now on screen.
-      // Dismissed and reopened while this was out: the row was written, and it is the CALLER's list
+      // NOTE: Dismissed and reopened while this was out: the row was written, and it is the CALLER's list
       // that has to hear about it, not the dialog now on screen.
       if (sessionRef.current !== session) {
         onSaved?.({ id: data.tool.id, name: data.tool.name }, !editId);
@@ -392,7 +388,7 @@ export function CodeToolEditModal({
         // and for a reason of the same shape (docs/modals.md): dismissing mid-request and reopening
         // offers a second Save for a write that is already on its way, and the operator reads the
         // second one's `codeToolNameTaken` as a name conflict with someone else's tool.
-        onCloseRequest={saving ? () => {} : undefined}
+        busy={saving}
         title={
           editId
             ? t("codeTools.editTitle", "Edit code tool")
@@ -424,9 +420,9 @@ export function CodeToolEditModal({
         ) : (
           <div className="flex flex-col gap-4">
             {sharedNotice && editId && (
-              <div className="flex items-start gap-2 rounded-lg border border-warning bg-warning-soft px-3 py-2 text-text-primary text-xs">
+              <div className="border-warning bg-warning-soft text-text-primary flex items-start gap-2 rounded-lg border px-3 py-2 text-xs">
                 <AlertTriangle
-                  className="mt-0.5 h-4 w-4 shrink-0 text-warning"
+                  className="text-warning mt-0.5 h-4 w-4 shrink-0"
                   aria-hidden="true"
                 />
                 <span>
@@ -457,9 +453,9 @@ export function CodeToolEditModal({
                 placeholder={t("codeTools.namePlaceholder", "Look up CPF")}
               />
               {form.label.trim() && (
-                <p className="mt-1 flex flex-wrap items-center gap-1 text-text-muted text-xs">
+                <p className="text-text-muted mt-1 flex flex-wrap items-center gap-1 text-xs">
                   <span>{t("codeTools.identifierPreview", "Identifier:")}</span>
-                  <code className="rounded bg-bg-tertiary px-1 py-0.5 font-mono">
+                  <code className="bg-bg-tertiary rounded px-1 py-0.5 font-mono">
                     {normalizeToolName(form.label)}
                   </code>
                 </p>
@@ -544,7 +540,7 @@ export function CodeToolEditModal({
               />
             </FormField>
             {warningText && (
-              <p className="-mt-2 text-warning text-xs">{warningText}</p>
+              <p className="text-warning -mt-2 text-xs">{warningText}</p>
             )}
 
             <div className="-mt-2 flex flex-wrap items-center gap-x-2 gap-y-1">
@@ -562,6 +558,38 @@ export function CodeToolEditModal({
                   "Runs it once with arguments you supply, and shows what the agent would receive.",
                 )}
               </span>
+            </div>
+
+            <div className="border-border flex items-center justify-between gap-3 rounded-md border p-3">
+              <div className="flex items-center gap-1.5">
+                <label
+                  htmlFor={silenceClipId}
+                  data-clickable="true"
+                  className="text-text-primary text-sm"
+                >
+                  {t(
+                    "codeTools.silenceTruncationAlert",
+                    "Don't alert when the result is cut",
+                  )}
+                </label>
+                <HelpPopover
+                  content={t(
+                    "codeTools.silenceTruncationAlertHelp",
+                    "Turn this on when the cut is expected, like a list that always returns more than the agent reads.\n\nThe cut is still recorded in the logs, as information, and no longer reaches the alert channels.\n\nAn error thrown by the code, or a limit, still alerts.",
+                  )}
+                  label={t(
+                    "codeTools.silenceTruncationAlert",
+                    "Don't alert when the result is cut",
+                  )}
+                />
+              </div>
+              <Switch
+                id={silenceClipId}
+                checked={form.silenceTruncationAlert}
+                onCheckedChange={(v) =>
+                  setForm((f) => ({ ...f, silenceTruncationAlert: v }))
+                }
+              />
             </div>
           </div>
         )}

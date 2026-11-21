@@ -1,13 +1,17 @@
-import { Trash2 } from "lucide-react";
+import { Eye, FlaskConical, MessagesSquare, Trash2 } from "lucide-react";
+import { useContext } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Button,
   Card,
+  type ChoiceCardOption,
+  ChoiceCards,
   CredentialPicker,
   FormField,
   Input,
   Modal,
   ModelPicker,
+  NumberInput,
   Select,
   SwitchField,
   useModalController,
@@ -15,13 +19,21 @@ import {
 import { useActiveTenantName } from "@/client/hooks/useActiveTenantName";
 import { credentialCompat } from "@/client/lib/credentialCompat";
 import { providerLabel } from "@/client/lib/providerLabels";
-import { cn } from "@/client/lib/utils";
 import { isValidHttpUrl } from "@/client/lib/validation";
-import { MODEL_PROVIDERS } from "@/graph/model-config";
+import { MODEL_PROVIDERS, TEMPERATURE_RANGE } from "@/graph/model-config";
 import { PROVIDER_DEFAULT_MODEL } from "@/graph/model-defaults";
 import { REASONING_EFFORTS } from "@/graph/openai-reasoning";
+import {
+  PROVIDERS_WITH_PROMPT_CACHE,
+  PROVIDERS_WITH_PROMPT_CACHE_1H,
+} from "@/graph/prompt-cache";
 import { AGENT_MODES, type AgentMode } from "@/modules/agents/mode";
 import type { Schedule } from "@/modules/business-hours/hours";
+import {
+  CallFloorContext,
+  CallFloorLine,
+  InstructionsTokens,
+} from "./CallFloor";
 import { CapabilityMap } from "./CapabilityMap";
 import { PromptPanel } from "./PromptPanel";
 import { TabActionBar } from "./TabActionBar";
@@ -35,6 +47,11 @@ interface ModelState {
   temperature: string;
   // Empty = never chosen, which is not the same as "none": the provider's own default stays.
   reasoningEffort: string;
+  // Prompt caching (anthropic, openrouter). Empty = not set: `auto`, a 5m prefix, and a conversation
+  // that follows the prefix.
+  promptCache: string;
+  promptCacheTtl: string;
+  promptCacheConversationTtl: string;
 }
 
 interface GeneralTabProps {
@@ -59,8 +76,8 @@ interface GeneralTabProps {
   saving: boolean;
   onSave: () => void;
   onDiscard: () => void;
-  // Absent for a watcher (issue #494): the bar then shows no playground entry, the way the tab
-  // itself is not drawn for one.
+  // Absent for a watcher: the bar then shows no playground entry, the way the tab itself is not drawn
+  // for one.
   onOpenPlayground?: () => void;
   // Opens the strong-confirm delete flow (owned by the editor page). Rendered as a danger zone at
   // the end of this tab instead of a header button.
@@ -75,6 +92,20 @@ interface GeneralTabProps {
   // Resolved tool set, for the read-only capability map / agent graph shown at the bottom of this tab.
   catalog?: ToolCatalog;
   grants?: GrantState[];
+  // A monitoring agent's choice of engine (agents#1224), drawn right under Mode, ahead of what it
+  // decides. With `decides` the agent decides with questions and rules: the instructions and the
+  // Model card are not drawn and the `classifier` card takes the Model card's place. A Save pressed
+  // while the setup cannot be written is the page's to answer (saveAttempt.ts).
+  watcher?: {
+    engineCards: React.ReactNode;
+    decides: boolean;
+    classifier: React.ReactNode;
+  };
+  // A voice agent: it has no chat model, so the `voiceCard` (key, voice and the model
+  // that speaks, on the voice provider) takes the Model card's place, and monitoring is not a mode it has.
+  // `instructionsNote` is what the voice settings ask of the instructions (numbers in words, for a
+  // voice model that reads them as written), shown where the instructions are written.
+  voice?: { voiceCard: React.ReactNode; instructionsNote?: string | null };
 }
 
 export function GeneralTab({
@@ -102,28 +133,109 @@ export function GeneralTab({
   availability,
   catalog,
   grants,
+  watcher,
+  voice,
 }: GeneralTabProps) {
   const { t } = useTranslation();
   const tenantName = useActiveTenantName();
   const promptModal = useModalController();
 
+  const decides = watcher?.decides ?? false;
+  const callFloor = useContext(CallFloorContext);
+  // Only where the Model card is drawn: a field the operator cannot see cannot block the save.
   const modelBaseUrlInvalid =
+    !decides &&
+    !voice &&
     model.provider === "openai-compatible" &&
     !modelCredBaseUrl &&
     !isValidHttpUrl(model.baseURL);
 
+  // The instructions sit in Identity for an agent that answers; a watcher's come after the engine
+  // cards, since the engine decides whether it has any.
+  const instructions = decides ? null : (
+    <FormField label={t("editor.systemPrompt", "Agent instructions")} group>
+      <PromptPanel
+        value={systemPrompt}
+        onChange={setSystemPrompt}
+        previewVars={previewVars}
+        availability={availability}
+        companyFallback={tenantName}
+        agentFallback={name}
+        onExpand={() => promptModal.open()}
+      />
+      {promptError && <p className="text-error mt-1 text-xs">{promptError}</p>}
+      {voice?.instructionsNote && (
+        <p className="text-text-muted mt-1 text-xs">{voice.instructionsNote}</p>
+      )}
+      {/* What these instructions cost every call, where they are written (also next to the history
+          ceiling, on Behavior). Absent for a voice agent, which has no estimate to show. */}
+      <InstructionsTokens draftPrompt={systemPrompt} />
+      <CallFloorLine floor={callFloor} draftPrompt={systemPrompt} />
+    </FormField>
+  );
+
+  // Mode decides whether the agent ever speaks to a customer and which tabs exist, so each card
+  // says what the agent does in it and the consequence that matters (agents#1254).
+  const modeIcon = {
+    test: FlaskConical,
+    production: MessagesSquare,
+    monitoring: Eye,
+  };
+  const modeOptions: ChoiceCardOption<AgentMode>[] = AGENT_MODES.filter(
+    (m) => !voice || m !== "monitoring",
+  ).map((m) => ({
+    value: m,
+    icon: modeIcon[m],
+    testId: `mode-${m}`,
+    title:
+      m === "test"
+        ? t("editor.modeTest", "Test")
+        : m === "monitoring"
+          ? t("editor.modeMonitoring", "Monitoring")
+          : t("editor.modeProduction", "Production"),
+    hint: voice
+      ? m === "test"
+        ? t(
+            "editor.modeTestHintVoice",
+            "Calls keep ringing your team. Try the agent with a call from the Playground.",
+          )
+        : t(
+            "editor.modeProductionHintVoice",
+            "Once saved, answers every call to the inboxes it is bound to on Channels.",
+          )
+      : m === "test"
+        ? t(
+            "editor.modeTestHint",
+            "Stays silent until the customer sends /teste, so it is safe to try on a real inbox.",
+          )
+        : m === "monitoring"
+          ? t(
+              "editor.modeMonitoringHint",
+              "Never answers: reads and classifies every message. The tabs for answering leave the editor.",
+            )
+          : t(
+              "editor.modeProductionHint",
+              "Answers every customer who writes to its inboxes.",
+            ),
+  }));
+
   return (
-    <div className="flex grow flex-col gap-4">
+    <div className="flex grow flex-col gap-4" data-problems-root="general">
       <Card className="flex flex-col gap-4">
         <div>
-          <h3 className="font-medium text-sm text-text-primary">
+          <h3 className="text-text-primary text-sm font-medium">
             {t("editor.identitySection", "Identity")}
           </h3>
           <p className="text-text-muted text-xs">
-            {t(
-              "editor.identitySectionHint",
-              "Name, system prompt and whether the agent is active.",
-            )}
+            {watcher || voice
+              ? t(
+                  "editor.identitySectionHintDecisions",
+                  "Name, mode and whether the agent is active.",
+                )
+              : t(
+                  "editor.identitySectionHint",
+                  "Name, system prompt and whether the agent is active.",
+                )}
           </p>
         </div>
         <div className="flex items-end gap-4">
@@ -142,182 +254,257 @@ export function GeneralTab({
             className="h-10 shrink-0"
           />
         </div>
-        <FormField
-          label={t("editor.mode", "Mode")}
-          description={t(
-            "editor.modeHint",
-            "A test agent stays silent in a conversation until the customer sends /teste; production answers normally; monitoring receives and remembers every message and never answers.",
-          )}
-          group
-        >
-          <div className="inline-flex self-start rounded-lg border border-border bg-bg-tertiary p-0.5">
-            {AGENT_MODES.map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMode(m)}
-                aria-pressed={mode === m}
-                className={cn(
-                  "rounded-md px-4 py-1.5 font-medium text-sm transition-colors",
-                  mode === m
-                    ? "bg-accent text-accent-foreground"
-                    : "text-text-secondary hover:text-text-primary",
-                )}
-              >
-                {m === "test"
-                  ? t("editor.modeTest", "Test")
-                  : m === "monitoring"
-                    ? t("editor.modeMonitoring", "Monitoring")
-                    : t("editor.modeProduction", "Production")}
-              </button>
-            ))}
-          </div>
-        </FormField>
-        <FormField label={t("editor.systemPrompt", "Agent instructions")} group>
-          <PromptPanel
-            value={systemPrompt}
-            onChange={setSystemPrompt}
-            previewVars={previewVars}
-            availability={availability}
-            companyFallback={tenantName}
-            agentFallback={name}
-            onExpand={() => promptModal.open()}
+        <FormField label={t("editor.mode", "Mode")} group>
+          <ChoiceCards
+            value={mode}
+            onChange={setMode}
+            aria-label={t("editor.mode", "Mode")}
+            className={voice ? "sm:grid-cols-2" : "sm:grid-cols-3"}
+            options={modeOptions}
           />
-          {promptError && (
-            <p className="mt-1 text-error text-xs">{promptError}</p>
-          )}
         </FormField>
+        {!watcher && !voice && instructions}
       </Card>
 
-      <Card id="general-model" className="flex scroll-mt-4 flex-col gap-4">
-        <div>
-          <h3 className="font-medium text-sm text-text-primary">
-            {t("editor.modelSection", "Model")}
-          </h3>
-          <p className="text-text-muted text-xs">
-            {t("editor.modelSectionHint", "Which LLM powers this agent.")}
-          </p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <FormField label={t("editor.provider", "Provider")}>
-            <Select
-              value={model.provider}
-              onChange={(e) => {
-                const provider = e.target.value;
-                // Switching provider invalidates the previous model id, so jump to the new
-                // provider's default instead of carrying a foreign id (or clearing the form).
-                setModel({
-                  ...model,
-                  provider,
-                  model: PROVIDER_DEFAULT_MODEL[provider] ?? "",
-                });
-              }}
-            >
-              <option value="">{t("editor.selectProvider", "Select…")}</option>
-              {MODEL_PROVIDERS.map((p) => (
-                <option key={p} value={p}>
-                  {providerLabel(p, t)}
+      {/* A voice agent does not answer until it has a provider and a key, so that card comes before
+          the instructions instead of below a tall editor. */}
+      {voice?.voiceCard}
+      {watcher?.engineCards}
+      {(watcher || voice) && instructions && (
+        <Card className="flex flex-col gap-4">{instructions}</Card>
+      )}
+
+      {voice ? null : decides ? (
+        watcher?.classifier
+      ) : (
+        <Card id="general-model" className="flex scroll-mt-4 flex-col gap-4">
+          <div>
+            <h3 className="text-text-primary text-sm font-medium">
+              {t("editor.modelSection", "Model")}
+            </h3>
+            <p className="text-text-muted text-xs">
+              {t("editor.modelSectionHint", "Which LLM powers this agent.")}
+            </p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FormField label={t("editor.provider", "Provider")}>
+              <Select
+                value={model.provider}
+                onChange={(e) => {
+                  const provider = e.target.value;
+                  // Switching provider invalidates the previous model id, so jump to the new
+                  // provider's default instead of carrying a foreign id (or clearing the form).
+                  setModel({
+                    ...model,
+                    provider,
+                    model: PROVIDER_DEFAULT_MODEL[provider] ?? "",
+                  });
+                }}
+              >
+                <option value="">
+                  {t("editor.selectProvider", "Select…")}
                 </option>
-              ))}
-            </Select>
-          </FormField>
-          <FormField label={t("editor.model", "Model")} group>
-            <ModelPicker
-              value={model.model}
-              onChange={(v) => setModel({ ...model, model: v })}
-              provider={model.provider}
-              credentialRef={model.credentialRef || undefined}
-              baseURL={modelCredBaseUrl ?? (model.baseURL || undefined)}
-              aria-label={t("editor.model", "Model")}
-            />
-          </FormField>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <FormField
-            label={t("editor.credential", "API key")}
-            error={modelCredentialError}
-            group
-          >
-            <CredentialPicker
-              value={model.credentialRef}
-              onChange={(v) => setModel({ ...model, credentialRef: v })}
-              required={model.provider !== "openai-compatible"}
-              compatibleTypes={credentialCompat.model(model.provider)}
-              defaultCreateType={credentialCompat.model(model.provider)[0]}
-              testBaseUrl={modelCredBaseUrl ? undefined : model.baseURL}
-              ariaLabel={t("editor.credential", "API key")}
-            />
-          </FormField>
-          <FormField
-            label={t("editor.temperature", "Temperature")}
-            description={t("editor.temperatureHint", "0-2 (optional)")}
-          >
-            <Input
-              type="number"
-              min={0}
-              max={2}
-              step={0.1}
-              value={model.temperature}
-              onChange={(e) =>
-                setModel({ ...model, temperature: e.target.value })
+                {MODEL_PROVIDERS.map((p) => (
+                  <option key={p} value={p}>
+                    {providerLabel(p, t)}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+            <FormField label={t("editor.model", "Model")} group>
+              <ModelPicker
+                value={model.model}
+                onChange={(v) => setModel({ ...model, model: v })}
+                provider={model.provider}
+                credentialRef={model.credentialRef || undefined}
+                baseURL={modelCredBaseUrl ?? (model.baseURL || undefined)}
+                aria-label={t("editor.model", "Model")}
+              />
+            </FormField>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <FormField
+              label={t("editor.credential", "API key")}
+              error={modelCredentialError}
+              group
+            >
+              <CredentialPicker
+                value={model.credentialRef}
+                onChange={(v) => setModel({ ...model, credentialRef: v })}
+                required={model.provider !== "openai-compatible"}
+                compatibleTypes={credentialCompat.model(model.provider)}
+                defaultCreateType={credentialCompat.model(model.provider)[0]}
+                testBaseUrl={modelCredBaseUrl ? undefined : model.baseURL}
+                ariaLabel={t("editor.credential", "API key")}
+              />
+            </FormField>
+            <FormField
+              label={t("editor.temperature", "Temperature")}
+              description={t("editor.temperatureHint", "0-2 (optional)")}
+            >
+              <NumberInput
+                range={TEMPERATURE_RANGE}
+                step={0.1}
+                optional
+                value={model.temperature}
+                onChange={(e) =>
+                  setModel({ ...model, temperature: e.target.value })
+                }
+              />
+            </FormField>
+          </div>
+          {model.provider === "openai" && (
+            <FormField
+              label={t("editor.reasoningEffort", "Reasoning effort")}
+              description={t(
+                "editor.reasoningEffortHint",
+                "How much the model thinks before answering. Reasoning models only (o-series, gpt-5, gpt-6); more effort means slower, costlier answers.",
+              )}
+            >
+              <Select
+                value={model.reasoningEffort}
+                onChange={(e) =>
+                  setModel({ ...model, reasoningEffort: e.target.value })
+                }
+              >
+                <option value="">
+                  {t("editor.reasoningEffortDefault", "Provider default")}
+                </option>
+                {REASONING_EFFORTS.map((e) => (
+                  <option key={e} value={e}>
+                    {e}
+                  </option>
+                ))}
+              </Select>
+            </FormField>
+          )}
+          {(PROVIDERS_WITH_PROMPT_CACHE as readonly string[]).includes(
+            model.provider,
+          ) && (
+            <div className="grid gap-4 sm:grid-cols-3">
+              <FormField
+                label={t("editor.promptCache", "Prompt cache")}
+                help={t(
+                  "editor.promptCacheHelp",
+                  "Reuses the instructions and the conversation from one call to the next at a tenth of the input price. On OpenRouter it only applies to Claude models.",
+                )}
+              >
+                <Select
+                  value={model.promptCache}
+                  onChange={(e) =>
+                    setModel({ ...model, promptCache: e.target.value })
+                  }
+                >
+                  <option value="">
+                    {t("editor.promptCacheAuto", "Automatic")}
+                  </option>
+                  <option value="off">
+                    {t("editor.promptCacheOff", "Off")}
+                  </option>
+                </Select>
+              </FormField>
+              {model.promptCache !== "off" &&
+                (PROVIDERS_WITH_PROMPT_CACHE_1H as readonly string[]).includes(
+                  model.provider,
+                ) && (
+                  <>
+                    <FormField
+                      label={t("editor.promptCacheTtl", "Instructions cache")}
+                      help={t(
+                        "editor.promptCacheTtlHelp",
+                        "Shared by every conversation. 1 hour only pays off when the agent goes more than 5 minutes without a call.",
+                      )}
+                    >
+                      <Select
+                        value={model.promptCacheTtl}
+                        onChange={(e) =>
+                          setModel({ ...model, promptCacheTtl: e.target.value })
+                        }
+                      >
+                        <option value="">
+                          {t("editor.promptCache5m", "5 minutes")}
+                        </option>
+                        <option value="1h">
+                          {t("editor.promptCache1h", "1 hour")}
+                        </option>
+                      </Select>
+                    </FormField>
+                    <FormField
+                      label={t(
+                        "editor.promptCacheConversationTtl",
+                        "Conversation cache",
+                      )}
+                      help={t(
+                        "editor.promptCacheConversationTtlHelp",
+                        "How long one customer's history stays cached between their messages.",
+                      )}
+                      description={t(
+                        "editor.promptCacheConversationTtlRequires",
+                        "1 hour needs the instructions cache at 1 hour.",
+                      )}
+                    >
+                      <Select
+                        value={model.promptCacheConversationTtl}
+                        onChange={(e) =>
+                          setModel({
+                            ...model,
+                            promptCacheConversationTtl: e.target.value,
+                          })
+                        }
+                      >
+                        <option value="">
+                          {t(
+                            "editor.promptCacheConversationSame",
+                            "Same as instructions",
+                          )}
+                        </option>
+                        <option value="5m">
+                          {t("editor.promptCache5m", "5 minutes")}
+                        </option>
+                        <option
+                          value="1h"
+                          disabled={model.promptCacheTtl !== "1h"}
+                        >
+                          {t("editor.promptCache1h", "1 hour")}
+                        </option>
+                      </Select>
+                    </FormField>
+                  </>
+                )}
+            </div>
+          )}
+          {model.provider === "openai-compatible" && (
+            <FormField
+              label={t("editor.baseURL", "Base URL")}
+              description={
+                modelCredBaseUrl
+                  ? t(
+                      "editor.baseURLFromCredential",
+                      "Defined by the selected credential.",
+                    )
+                  : t(
+                      "editor.baseURLHint",
+                      "Required for OpenAI-compatible providers.",
+                    )
               }
-            />
-          </FormField>
-        </div>
-        {model.provider === "openai" && (
-          <FormField
-            label={t("editor.reasoningEffort", "Reasoning effort")}
-            description={t(
-              "editor.reasoningEffortHint",
-              "How much the model thinks before answering. Reasoning models only (o-series, gpt-5, gpt-6); more effort means slower, costlier answers.",
-            )}
-          >
-            <Select
-              value={model.reasoningEffort}
-              onChange={(e) =>
-                setModel({ ...model, reasoningEffort: e.target.value })
+              error={
+                modelBaseUrlInvalid && model.baseURL.trim()
+                  ? t("common.invalidUrl", "Must be a valid http(s) URL.")
+                  : null
               }
             >
-              <option value="">
-                {t("editor.reasoningEffortDefault", "Provider default")}
-              </option>
-              {REASONING_EFFORTS.map((e) => (
-                <option key={e} value={e}>
-                  {e}
-                </option>
-              ))}
-            </Select>
-          </FormField>
-        )}
-        {model.provider === "openai-compatible" && (
-          <FormField
-            label={t("editor.baseURL", "Base URL")}
-            description={
-              modelCredBaseUrl
-                ? t(
-                    "editor.baseURLFromCredential",
-                    "Defined by the selected credential.",
-                  )
-                : t(
-                    "editor.baseURLHint",
-                    "Required for OpenAI-compatible providers.",
-                  )
-            }
-            error={
-              modelBaseUrlInvalid && model.baseURL.trim()
-                ? t("common.invalidUrl", "Must be a valid http(s) URL.")
-                : null
-            }
-          >
-            <Input
-              value={modelCredBaseUrl ?? model.baseURL}
-              onChange={(e) => setModel({ ...model, baseURL: e.target.value })}
-              disabled={!!modelCredBaseUrl}
-              placeholder="https://api.provider.com/v1"
-            />
-          </FormField>
-        )}
-      </Card>
+              <Input
+                value={modelCredBaseUrl ?? model.baseURL}
+                onChange={(e) =>
+                  setModel({ ...model, baseURL: e.target.value })
+                }
+                disabled={!!modelCredBaseUrl}
+                placeholder="https://api.provider.com/v1"
+              />
+            </FormField>
+          )}
+        </Card>
+      )}
 
       {catalog && grants && (
         <CapabilityMap catalog={catalog} grants={grants} agentName={name} />
@@ -332,9 +519,9 @@ export function GeneralTab({
         onOpenPlayground={onOpenPlayground}
       />
 
-      <Card className="flex flex-col gap-3 border-error/40">
+      <Card className="border-error/40 flex flex-col gap-3">
         <div>
-          <h3 className="font-medium text-error text-sm">
+          <h3 className="text-error text-sm font-medium">
             {t("editor.dangerZone", "Danger zone")}
           </h3>
           <p className="text-text-muted text-xs">

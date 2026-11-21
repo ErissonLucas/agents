@@ -1,13 +1,22 @@
-import { describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { fileURLToPath } from "node:url";
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { MemorySaver } from "@langchain/langgraph";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient } from "@/../generated/prisma/client";
+import { encryptJson } from "@/api/lib/crypto";
 import type { ResolvedModelConfig } from "@/graph/models";
-import { buildModelAndGraph, buildSpeechNormalizer } from "@/graph/prepare";
+import {
+  buildModelAndGraph,
+  buildSpeechNormalizer,
+  loadAgentConfig,
+} from "@/graph/prepare";
+import { runScopedOn } from "@/lib/tenancy";
 import { TTS_DEFAULTS } from "@/modules/tts/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { codeOnly } from "@/tests/utils/source-text";
 import { makeConfig } from "../utils/agent-config";
+import { seedChatwootInstance } from "../utils/chatwoot";
 
 describe("buildModelAndGraph — effective baseURL resolution", () => {
   function captureModel() {
@@ -64,7 +73,12 @@ describe("buildModelAndGraph — effective baseURL resolution", () => {
       makeModel,
       checkpointer: new MemorySaver(),
     });
-    expect(getCaptured()?.baseURL).toBeUndefined();
+    const captured = getCaptured();
+    expect(captured).toMatchObject({
+      provider: "openai",
+      model: "gpt-4o-mini",
+    });
+    expect(captured).toHaveProperty("baseURL", undefined);
   });
 });
 
@@ -252,13 +266,10 @@ describe("buildSpeechNormalizer", () => {
     expect(getCaptured()).toBeNull();
   });
 
-  // The operator pointed the rewrite at its own credential and that credential is gone. Reaching for
-  // the AGENT's key would be a silent substitution onto a provider that may not even accept it, so
-  // the rewrite is skipped and the audio goes out from the raw text.
-  //
-  // NOTE: the provider is named on purpose. A dedicated credential without one is refused by the
-  // resolution itself, which would make this pass without the vault lookup ever mattering — a green
-  // test proving the wrong guard.
+  // NOTE: The rewrite's own credential is gone. Reaching for the AGENT's key would be a silent
+  // substitution onto a provider that may not accept it, so the rewrite is skipped and the audio
+  // goes out from the raw text. The provider is named on purpose: a dedicated credential without one
+  // is refused by the resolution itself, which would pass without the vault lookup mattering.
   test("skips entirely when its own credential did not resolve", () => {
     const { makeModel, getCaptured } = captureModel();
     const cfg = makeConfig({
@@ -297,28 +308,131 @@ describe("buildSpeechNormalizer", () => {
   });
 });
 
-// The observability block is the ONE block the playground's draft overrides do not reach, and the
-// reason is what the two kinds of setting are. Every other override changes how the agent BEHAVES —
-// prompt, model, tools, guardrails — and the playground exists to try those unsaved. This one
-// changes what the platform STORES about the run, and a draft that widened it would record the
-// customer's tool values, or full-size rows, from a switch the operator never committed and can
-// close the tab on, while the console's own warning reads the saved settings and says "Save to
-// apply" (issue #58).
-describe("prepare — a draft cannot widen what is recorded", () => {
-  test("the draft's observability block is ignored, the saved one decides", () => {
-    const source = readFileSync(
-      new URL("../../src/graph/prepare.ts", import.meta.url),
-      "utf8",
-    );
-    // Read off the saved bag by name, never through the effective one every other block uses.
-    expect(source).toContain("readObservabilityConfig(agent.settings)");
-    expect(source).not.toContain("readObservabilityConfig(effSettings)");
-  });
+const appUrl = process.env.TEST_APP_DATABASE_URL;
+const suUrl = process.env.MIGRATION_DATABASE_URL;
+let dbUp = false;
+let su: PrismaClient | undefined;
+let app: PrismaClient | undefined;
+if (appUrl && suUrl) {
+  try {
+    su = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: suUrl }),
+    });
+    await su.$queryRaw`SELECT 1`;
+    app = new PrismaClient({
+      adapter: new PrismaPg({ connectionString: appUrl }),
+    });
+    await app.$queryRaw`SELECT 1`;
+    dbUp = true;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
+  }
+}
+const suDb = su as PrismaClient;
+const appDb = app as PrismaClient;
+let obsTenantId = 0n;
+let obsInstanceId = 0n;
+let obsAgentId = 0n;
 
-  // AND NOWHERE ELSE READS IT ITS OWN WAY. Checking `prepare.ts` alone missed the file beside it:
-  // `runPlaygroundFollowup` had its own `readObservabilityConfig(settings)` on the DRAFT bag, so
-  // turning the tool-values switch on without saving recorded the customer's values on a simulated
-  // follow-up while the console said "Save to apply". Proving one call site is not proving the rule.
+beforeAll(async () => {
+  if (!dbUp) return;
+  obsTenantId = (
+    await suDb.tenant.create({
+      data: { name: "Obs", slug: `prepare-obs-${process.pid}` },
+    })
+  ).id;
+  obsInstanceId = (
+    await seedChatwootInstance(suDb, {
+      tenantId: obsTenantId,
+      accountId: 1,
+      baseUrl: "https://chat.example.com",
+      adminToken: encryptJson("ADMIN"),
+    })
+  ).id;
+  const keyId = (
+    await suDb.vaultEntry.create({
+      data: {
+        tenantId: obsTenantId,
+        name: "llm-key",
+        secret: encryptJson("sk-test"),
+      },
+      select: { id: true },
+    })
+  ).id;
+  obsAgentId = (
+    await suDb.agent.create({
+      data: {
+        tenantId: obsTenantId,
+        name: "Obs",
+        systemPrompt: "p",
+        modelConfig: {
+          provider: "openai",
+          model: "gpt-4o-mini",
+          credentialRef: `vault:${keyId}`,
+        },
+      },
+    })
+  ).id;
+});
+
+afterAll(async () => {
+  if (dbUp && obsTenantId) {
+    await suDb.tenant.delete({ where: { id: obsTenantId } });
+  }
+  await app?.$disconnect();
+  await su?.$disconnect();
+});
+
+// The observability block is the ONE block the playground's draft overrides do not reach. Every
+// other override changes how the agent BEHAVES (prompt, model, tools, guardrails), and the
+// playground exists to try those unsaved. This one changes what the platform STORES about the run:
+// a draft that widened it would record the customer's tool values, or full-size rows, from a switch
+// the operator never committed, while the console's warning reads the saved settings and says
+// "Save to apply".
+describe("prepare — a draft cannot widen what is recorded", () => {
+  // Both directions, so neither "always off" nor "always the draft" passes: the saved switch is on
+  // while the draft turns it off, and the other way round.
+  test.skipIf(!dbUp)(
+    "the draft's observability block is ignored, the saved one decides",
+    async () => {
+      const recorded = async (saved: boolean, draft: boolean) => {
+        await suDb.agent.update({
+          where: { id: obsAgentId },
+          data: { settings: { observability: { logToolValues: saved } } },
+        });
+        const cfg = await runScopedOn(
+          appDb,
+          { tenantId: obsTenantId, userId: null, role: "TENANT_ADMIN" },
+          (db) =>
+            loadAgentConfig(
+              db,
+              {
+                tenantId: obsTenantId,
+                instanceId: obsInstanceId,
+                conversationId: 1,
+                agentId: obsAgentId,
+                threadId: `${obsTenantId}:${obsInstanceId}:1`,
+              },
+              {
+                ignoreDisabled: true,
+                overrides: {
+                  settings: { observability: { logToolValues: draft } },
+                },
+              },
+            ),
+        );
+        return cfg?.logToolValues;
+      };
+      expect({
+        savedOffDraftOn: await recorded(false, true),
+        savedOnDraftOff: await recorded(true, false),
+      }).toEqual({ savedOffDraftOn: false, savedOnDraftOff: true });
+    },
+  );
+
+  // NOTE: Nowhere else reads it its own way. A second reader on the DRAFT bag (a playground
+  // follow-up, say) records the customer's tool values from an unsaved switch while the console says
+  // "Save to apply", so proving one call site is not proving the rule.
   test("every reader of the block is one of the four that may have one", async () => {
     const files = new Bun.Glob("src/**/*.{ts,tsx}");
     const found: string[] = [];
@@ -326,14 +440,14 @@ describe("prepare — a draft cannot widen what is recorded", () => {
       fileURLToPath(new URL("../../", import.meta.url)),
     )) {
       if (f.endsWith("modules/flowlog/settings.ts")) continue; // the definition
-      // Through the scan, so a comment naming the reader is not counted as a call to it (#424).
+      // Through the scan, so a comment naming the reader is not counted as a call to it.
       const src = codeOnly(
         await Bun.file(new URL(`../../${f}`, import.meta.url)).text(),
       );
       if (src.includes("readObservabilityConfig(")) found.push(f);
     }
-    // The turn's own read, the settings DTO, the shared derivation, and the console's form pair.
-    // A fifth entry is a fifth answer to the same question, and the last one was a defect.
+    // NOTE: The turn's own read, the settings DTO, the shared derivation, and the console's form
+    // pair. A fifth entry is a fifth answer to the same question.
     expect(found.sort()).toEqual([
       "src/client/pages/agents/observabilityFormState.ts",
       "src/graph/prepare.ts",

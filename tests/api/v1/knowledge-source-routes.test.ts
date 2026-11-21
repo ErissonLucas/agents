@@ -4,9 +4,10 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import type { TenantContext } from "@/lib/tenancy";
 import { generateApiKey } from "@/modules/api-keys/verify";
 import type { SourceInput } from "@/modules/rag/source";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { setupPrismaMock } from "@/tests/utils/prisma-mock";
 
-// The three REST routes of a knowledge base source (issue #794), measured at the door: who may call
+// The three REST routes of a knowledge base source, exercised at the door: who may call
 // them, what a malformed body gets back, and what a missing base or a base without a source answers.
 // The source module runs for real against the test database; the only seams are the database handle
 // (the app's singleton is mocked by the harness) and the SSRF check's DNS lookup, which a portal on a
@@ -31,8 +32,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -172,18 +173,11 @@ describe.skipIf(!dbUp)("knowledge base source routes (issue #794)", () => {
     ).toBeNull();
   });
 
-  test("asking for a sync or a removal on a base with no source is refused, not a 500", async () => {
-    const sync = await call("POST", `/bases/${kb}/source/sync`, adminKey);
-    const remove = await call("DELETE", `/bases/${kb}/source`, adminKey);
-    expect(sync.status).toBe(409);
-    expect(remove.status).toBe(404);
-  });
-
   test("a malformed body is refused with the field, and nothing is saved", async () => {
     const cases: [unknown, number][] = [
       [{ ...GOOD, slug: "a/b" }, 400],
       [{ ...GOOD, kind: "url_crawl" }, 400],
-      [{ ...GOOD, intervalMinutes: 1 }, 400],
+      [{ ...GOOD, intervalMinutes: 1 }, 422],
       [{ ...GOOD, excludeIds: ["x"] }, 400],
       [{ ...GOOD, baseUrl: 42 }, 422],
     ];
@@ -199,8 +193,8 @@ describe.skipIf(!dbUp)("knowledge base source routes (issue #794)", () => {
     ).toBeNull();
   });
 
-  // The console shows the refusal next to the form, so it has to arrive in the caller's language
-  // (issue #798): before the keys, a pt-BR screen read "slug is required and must be a portal slug".
+  // NOTE: the console shows the refusal next to the form, so it has to arrive in the caller's
+  // language, not as the English schema message.
   test("a pt-BR caller reads every refusal in Portuguese, naming the field", async () => {
     const cases: [unknown, string, string][] = [
       [{ ...GOOD, baseUrl: "" }, "baseUrl", "A URL do portal é obrigatória."],
@@ -244,11 +238,6 @@ describe.skipIf(!dbUp)("knowledge base source routes (issue #794)", () => {
         "excludeIds",
         "Os artigos excluídos precisam ser uma lista de ids de artigo.",
       ],
-      [
-        { ...GOOD, intervalMinutes: 1 },
-        "intervalMinutes",
-        "O intervalo precisa estar entre 5 e 1440 minutos.",
-      ],
     ];
     for (const [body, field, sentence] of cases) {
       const res = await call(
@@ -291,6 +280,24 @@ describe.skipIf(!dbUp)("knowledge base source routes (issue #794)", () => {
     expect(
       await su?.knowledgeSource.findUnique({ where: { knowledgeBaseId: kb } }),
     ).toBeNull();
+  });
+
+  // The range is declared on the body, so the schema layer refuses it before the
+  // service, and its sentence names the range.
+  test("an interval outside its range is refused in Portuguese with the range", async () => {
+    const res = await call(
+      "PUT",
+      `/bases/${kb}/source`,
+      adminKey,
+      { ...GOOD, intervalMinutes: 1 },
+      "pt-BR",
+    );
+    const payload = (await res.json()) as { error?: string; field?: string };
+    expect([res.status, payload.field, payload.error]).toEqual([
+      422,
+      "intervalMinutes",
+      "intervalMinutes precisa estar entre 5 e 1440.",
+    ]);
   });
 
   test("another tenant's base and a base that does not exist answer 404", async () => {

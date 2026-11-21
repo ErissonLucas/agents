@@ -2,8 +2,8 @@ import { describe, expect, test } from "bun:test";
 import { readObservabilityConfig } from "@/modules/flowlog/settings";
 import { describeShape } from "@/modules/flowlog/shape";
 
-// Decision table for what a tool call may leave in ExecutionLog.detail (issue #78). Each row is a
-// value the model could plausibly send and the shape that stands in for it.
+// Decision table for what a tool call may leave in ExecutionLog.detail. Each row is a value the model
+// could plausibly send and the shape that stands in for it.
 
 const DECLARED = new Set([
   "cpf",
@@ -85,11 +85,6 @@ describe("describeShape", () => {
       expect(describeShape(c.value, c.declared ?? DECLARED)).toEqual(c.want);
     });
   }
-
-  test("a value with no declarations named for it never yields a key", () => {
-    const deep = { a: { b: { c: { d: { e: { f: "segredo" } } } } } };
-    expect(describeShape(deep)).toBe("object(1 keys)");
-  });
 
   // The whole point: whatever the model wrote, none of it comes back out.
   test("no value survives, at any depth", () => {

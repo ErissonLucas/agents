@@ -1,25 +1,10 @@
 import { NATIVE_TOOL_NAMES } from "@/graph/tools/catalog";
 import { clipText } from "@/lib/text";
 
-// Caps on the operator-authored free text stored inside `agent.settings`, and the one place that
-// knows where that text lives.
-//
-// Each of these fields is read through a clamp (readToolInstructions, readGuardrailsConfig,
-// readVisionConfig, readFollowUpConfig), which is the right thing for a bag that can hold anything:
-// a malformed row must never reach the model unbounded. What the clamp cannot do is tell the person
-// who wrote the text. The row keeps every character, the editor hydrates from the row, and only the
-// copy handed to the model is short — so a transfer policy cut after "escalate only after two failed
-// attempts," reads as a complete rule everywhere the operator can look.
-//
-// So the readers keep clamping (defense for what is already stored), the write boundary refuses the
-// text a write INTRODUCES or CHANGES (`assertSettingsTextSizes`, so nobody loses text without being
-// told, and see collectOversizedTextChanges for why it has to be only that), the importer clamps and
-// warns (a bundle authored elsewhere should not be rejected whole, but the operator hears about it),
-// and the editor declares the cap on the field itself.
-//
-// Deliberately NOT here: the list-shaped caps (guardrails competitors, follow-up labels, appointment
-// reminder offsets). Those bound how MANY entries are kept, and an entry that gets dropped is visible
-// as a missing row rather than as a sentence that ends early.
+// Caps on the operator-authored free text inside `agent.settings`, and where that text lives. The
+// readers clamp (a clamp is silent: the row keeps every character), so the write boundary refuses what
+// a write introduces or changes, the importer clamps and warns, and the editor shows the cap.
+// List-shaped caps (how MANY entries) are not here: a dropped entry is visible, a cut sentence is not.
 export const TOOL_INSTRUCTIONS_MAX = 1500;
 export const CUSTOM_POLICY_MAX = 2000;
 export const TEMPLATE_MESSAGE_MAX = 2000;
@@ -35,6 +20,19 @@ export const SIGNATURE_MAX = 500;
 // Not a text cap: how many follow-up steps readFollowUpConfig keeps. It lives here because the walker
 // below has to stop where the reader stops — text in a step the reader discards is text nothing reads.
 export const FOLLOW_UP_MAX_STEPS = 10;
+// A step's delay when the stored one is missing or unreadable, in minutes. The runtime reader and the
+// console's step mapper both default to it, so a save that rewrites a step does not change its delay.
+export const FOLLOW_UP_DEFAULT_DELAY_VALUE = 60;
+// The longest cadence label the snoozed reader keeps; longer ones are clipped, so two labels sharing
+// this prefix are one label to it.
+export const SNOOZED_CADENCE_LABEL_MAX = 100;
+// Not a text cap either: how many cadences readSnoozedFollowUpConfig keeps, here for the same reason.
+// Each labeled cadence is a label the team picks by hand, so a handful is the whole useful range. The
+// default cadence (`label: null`) does not count against the labeled ones: the list holds the default
+// plus up to 10 labeled, so the reader reads at most 11 entries and the walker stops at the same place.
+export const SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES = 10;
+export const SNOOZED_FOLLOW_UP_MAX_CADENCES =
+  SNOOZED_FOLLOW_UP_MAX_LABELED_CADENCES + 1;
 
 export interface OversizedText {
   // Dotted path into the settings bag, e.g. `handoff.instructions`. It is what the operator reads in
@@ -144,7 +142,7 @@ function cappedFields(settings: unknown): CappedField[] {
         `guardrails.${dir}.templateMessage`,
         TEMPLATE_MESSAGE_MAX,
       );
-      // The hand-over sentence (issue #704): the same customer-facing copy as the template.
+      // NOTE: The hand-over sentence: the same customer-facing copy as the template.
       add(
         d,
         "handoffMessage",
@@ -167,14 +165,13 @@ function cappedFields(settings: unknown): CappedField[] {
       }
     }
   }
-  // The operator's closing line (issue #599). Customer-facing copy like the two above, and clamped
-  // by readSignatureConfig the same way.
+  // The operator's closing line, customer-facing copy clamped by readSignatureConfig.
   const signature = bagOf(root.signature);
   if (signature) {
     add(signature, "text", "signature.text", SIGNATURE_MAX);
   }
-  // The notice the model reads on an audio turn and the note on `reply_as_text` (issue #859): a
-  // paragraph of guidance each, like a native tool's note, so the same ceiling.
+  // The audio-turn notice and the `reply_as_text` note are a paragraph of guidance each, like
+  // a native tool's note, so the same ceiling.
   const tts = bagOf(root.tts);
   if (tts) {
     add(tts, "spokenNoticeText", "tts.spokenNoticeText", TOOL_INSTRUCTIONS_MAX);
@@ -206,22 +203,31 @@ function cappedFields(settings: unknown): CappedField[] {
       FOLLOW_UP_INSTRUCTIONS_MAX,
     );
   });
+  // The snoozed ladder's steps are the same steps, under the same cap, per cadence.
+  const snoozed = bagOf(root.snoozedFollowUp);
+  (Array.isArray(snoozed?.cadences) ? snoozed.cadences : [])
+    .slice(0, SNOOZED_FOLLOW_UP_MAX_CADENCES)
+    .forEach((rawCadence, c) => {
+      const cadence = bagOf(rawCadence);
+      (Array.isArray(cadence?.steps) ? cadence.steps : [])
+        .slice(0, FOLLOW_UP_MAX_STEPS)
+        .forEach((raw, i) => {
+          const step = bagOf(raw);
+          if (!step) return;
+          add(
+            step,
+            "instructions",
+            `snoozedFollowUp.cadences[${c}].steps[${i}].instructions`,
+            FOLLOW_UP_INSTRUCTIONS_MAX,
+          );
+        });
+    });
   return out;
 }
 
-// The oversized text this write is responsible for: what it introduces, or changes.
-//
-// A value already stored over the cap is NOT the write's problem, and refusing it was a dead end
-// rather than a stricter rule. Every field carrying one can be unreachable in the editor: a
-// native-tool note the editor has no control for at all (`private_note`, `resolve_conversation`), or
-// a section whose fields only render once it is switched on (guardrails, vision, follow-up) or once
-// the tool is granted. The refusal named the field correctly and the operator still had nothing to
-// shorten — on every tab, on every save, permanently. The reader clamps that value on the way to the
-// model, which is the only place the length ever mattered.
-//
-// Compared by path, so an unchanged field is unchanged no matter what else moved in the bag. The one
-// place a path can shift under a value is a follow-up step list that gets reordered, and there the
-// operator is by definition inside the section that renders the field.
+// The oversized text this write introduces or changes, compared by path. A value already stored over
+// the cap is left to the reader's clamp: its field may not render in the editor (no control, or a
+// section switched off), and refusing it would block every save with nothing the operator can shorten.
 export function collectOversizedTextChanges(
   next: unknown,
   previous: unknown,
@@ -232,11 +238,8 @@ export function collectOversizedTextChanges(
   const out: OversizedText[] = [];
   for (const f of cappedFields(next)) {
     if (f.value.length <= f.max) continue;
-    // Compared trimmed, measured raw, and the asymmetry is the point. The cap counts what the
-    // browser counts (`maxLength` is over the raw value), while "did this write touch the text" has
-    // to ignore what every reader already discards: the editor trims these fields when it serializes
-    // the form, so an untouched legacy value with surrounding whitespace comes back as a different
-    // string and would read as an edit nobody made.
+    // NOTE: Compared trimmed, measured raw: the cap counts what the browser's `maxLength` counts, while
+    // the editor trims on save, so an untouched legacy value with whitespace must not read as an edit.
     if (stored.get(f.path) === f.value.trim()) continue;
     out.push({ path: f.path, length: f.value.length, max: f.max });
   }

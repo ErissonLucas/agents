@@ -1,23 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-// ── EVERY UNIT OF WORK THAT DIES PERMANENTLY SAYS SO, AND THE COUNT STAYS AT ZERO (issue #356) ──
+// ── EVERY UNIT OF WORK THAT DIES PERMANENTLY SAYS SO, AND THE COUNT STAYS AT ZERO ──
 //
-// Four buses can reach a terminal failure state, and the history of this repo is the count of silent
-// ones going down by one at a time without anything recording how many were left: #196 gave the
-// compaction its line, #318 the unrouted delivery, #317 the dropped command, #325 the dead outbound
-// delivery, #282 the stranded one. Five rounds, five sites, one question.
-//
-// So the acceptance criterion is not a checklist in an issue body — that is satisfied by halves with
-// nothing going red. It is this sweep, and it asks two things:
-//
-//   1. the function that writes a terminal status also announces it;
-//   2. the SET of write sites is exactly the one below, so a sixth bus cannot be added silently.
-//
-// A source sweep, because the alternative (a runtime assertion) can only fire on a path a test
-// already drives, and the whole failure mode here is the path nobody thought to drive. This one
-// replaces the narrower fence #325 left behind (`webhooks-outbound-dead-fence.test.ts`): the
-// outbound module's entry below is what carries that property now, and the same question asked in
-// two files is how the two answers start to differ.
+// The census (docs/logs.md): (1) the function that writes a terminal status also announces it; (2)
+// the SET of write sites is exactly the one below, so a new bus cannot be added silently. A source
+// sweep, because a runtime assertion only fires on a path a test already drives, and the failure
+// mode is the path nobody drives. It is the only fence for the outbound module's dead delivery too:
+// the same question asked in two files is how the two answers start to differ.
 
 const SRC = "src";
 
@@ -93,39 +82,57 @@ const CENSUS: Record<string, string> = {
     "an outbound delivery the bus gave up on (#325)",
   "src/modules/flowlog/alert-worker.ts:finalizeDead":
     "an alert the bus gave up on — the one that cannot alert about itself (#356)",
+  // No tenant flow log to land in: the channel itself is listed as failing, with the error, on the
+  // instance screen that owns it.
+  "src/modules/instance-health/worker.ts:finalizeDead":
+    "ANNOUNCES ELSEWHERE: listInstanceAlertChannels marks the channel failing on /admin/instance-health (#1331)",
   "src/modules/webhooks/inbound/service.ts:persistFailed":
     "an authenticated payload the receptor cannot process (#356)",
   "src/modules/webhooks/inbound/service.ts:processInboundDelivery":
     "an inbound delivery past its processing budget (#356)",
+  "src/modules/webhooks/inbound/service.ts:consultBack":
+    "a notice whose lookup cannot build an event; announced in the same function with emitDeadLetter (#1609)",
   "src/modules/rag/documents.ts:runIngestJobForTenant":
     "a document that will never be indexed; the second line is the same fact broadcast live (#356)",
-  "src/modules/chatwoot/delivery-sweep.ts:record":
-    "a delivery stranded by a process death (#282)",
+  // Writes DEAD together with the recovery it owes, in one transaction, and leaves the line to its
+  // only caller: `record` decided the verdict, and reports it once this returns "won".
+  "src/modules/chatwoot/delivery-sweep.ts:finishDead":
+    "ANNOUNCES ELSEWHERE: ./delivery-sweep.ts record, its only caller (#282)",
+  // Creates the DEAD row a lost message never got, together with its recovery, and leaves the line to
+  // its caller, which writes it only when this returns true: a message already in the ledger was
+  // announced by whoever wrote that row.
+  "src/modules/chatwoot/reconcile-sweep.ts:handOver":
+    "ANNOUNCES ELSEWHERE: ./reconcile-sweep.ts reconcileInbox, via lineFor (#1124)",
+  "src/modules/chatwoot/webhook.ts:handToRecovery":
+    "a live turn the database pool never served, handed to its recovery at once (#1122)",
   // The one entry here that is not a death. It RESTORES the verdict `record` already reached and
   // already announced: a recovery that claimed the row out of `DEAD` and then could not answer —
   // the delivery path threw, the turn threw, or the turn withheld its reply — puts it back, so the
   // next attempt finds a row it can claim instead of one that reads as somebody else's. Announcing
   // the RESTORE would page a second time about a message the loss line already reported, which is
-  // how an alert channel stops being read (#295). The FAILURE to restore is a different event and
+  // how an alert channel stops being read. The FAILURE to restore is a different event and
   // does page, from inside this same helper: from `PROCESSED` nothing revisits the row.
   "src/modules/chatwoot/recover-delivery.ts:putRowBack":
     "ALREADY ANNOUNCED: ./delivery-sweep.ts record, when this row was first declared DEAD",
-  // The two that announce ELSEWHERE, and the only exemptions here. Both are CAS writes in the
+  // The two scheduler writes that announce ELSEWHERE. Both are CAS writes in the
   // scheduler's service layer, and neither can announce from where it sits: what a dead job means is
   // decided per kind by a registry only the worker holds, and both roads converge on the worker's
-  // `dispatchDeadLetter`, which announces for every kind since #356. The complementary sweep that
-  // every reaper calls `announceReaped` lives in memory-dead-letter.test.ts.
+  // `dispatchDeadLetter`, which announces for every kind. The complementary sweep that every reaper
+  // calls `announceReaped` lives in ./memory-dead-letter.test.ts.
   "src/modules/scheduler/service.ts:failJob":
     "ANNOUNCES ELSEWHERE: ../scheduler/worker.ts dispatchDeadLetter",
-  "src/modules/scheduler/service.ts:reapStaleJobs":
-    "ANNOUNCES ELSEWHERE: ../scheduler/worker.ts dispatchDeadLetter, via announceReaped",
+  "src/modules/scheduler/service.ts:reapSql":
+    "ANNOUNCES ELSEWHERE: ../scheduler/worker.ts dispatchDeadLetter, via reapStaleJobs and announceReaped",
 };
 const ANNOUNCES_ELSEWHERE = new Set([
+  "src/modules/instance-health/worker.ts:finalizeDead",
   "src/modules/scheduler/service.ts:failJob",
-  "src/modules/scheduler/service.ts:reapStaleJobs",
+  "src/modules/scheduler/service.ts:reapSql",
   // Not "announces elsewhere" but "was announced ALREADY", which lands in the same set because the
   // question this asks is whether the write reaches an operator, and this one's already did.
   "src/modules/chatwoot/recover-delivery.ts:putRowBack",
+  "src/modules/chatwoot/delivery-sweep.ts:finishDead",
+  "src/modules/chatwoot/reconcile-sweep.ts:handOver",
 ]);
 
 async function sweepSrc(): Promise<{ key: string; announces: boolean }[]> {

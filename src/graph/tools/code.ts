@@ -1,46 +1,27 @@
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import logger from "@/api/lib/logger";
 import type { PreconditionState } from "@/modules/agents/tool-preconditions";
+import type { SideEffectErrorReporter } from "@/modules/integrations/toolpacks/types";
+import { MODEL_RESPONSE_CHAR_LIMIT } from "@/modules/tool-definitions/response-template";
 import { DEFAULT_TIMEZONE } from "../time";
 import {
   CODE_TOOL_CONTEXT_MAX_CHARS,
   CODE_TOOL_INPUT_MAX_CHARS,
-  formatSandboxResult,
+  renderSandboxResult,
   runSandboxedCode,
+  type SandboxCut,
   type SandboxOutcome,
 } from "./code-sandbox";
 import { markEffectFree } from "./effect-free";
 import { failableTool, toolFailure } from "./failure";
 import { parseToolInputSchema, sanitizeToolName } from "./http";
 
-// Operator-authored code tools (issue #363): a JavaScript function body the operator wrote once in
-// the console, with a name, a description and a typed input schema, that the agent calls with
-// arguments. The body runs in the sandbox (code-sandbox.ts) as `function (input, context)` and
-// answers with `return`; the model supplies `input` and nothing else. The kind exists because a
-// verdict left to the model is periodically wrong even when every number it holds is right, and
-// because a body the MODEL wrote per turn only moved that error into the authorship (measured on
-// PR #485: 2 of 6 CPF algorithms written by gpt-4o-mini were wrong, each returning a confident
-// `false`). A rule written once by the tenant is where the rule stops varying.
-//
-// What the body sees besides `input`: `context`, the same variables an HTTP tool's `{{context}}`
-// placeholders read (conversation_id, message_id, contact_*, inbox_*, company_name, agent_name)
-// plus the two attribute bags a precondition reads at call time (`conversationAttributes`,
-// `contactAttributes` — modules/agents/tool-preconditions.ts is the one vocabulary for both, and
-// reconciling there rather than growing a second one is what that file asks for). The bags are read
-// when the tool is CALLED, not when the turn is built: the customer gives the value,
-// `set_custom_attribute` writes it, and the code tool that reads it runs in the same turn.
-//
-// Not in the same BATCH, though, and the limit is the same one a precondition over those bags has:
-// `ToolNode` runs one message's tool calls with `Promise.all`, so a `set_custom_attribute` and a
-// code tool the model emitted TOGETHER race, and the read can land first. What holds is ordering
-// between steps — the model reads the write's result and calls the tool in its next message.
-//
-// A failure of the body — it does not parse, it throws, it hits a limit — is the OPERATOR's, not
-// the model's: the model cannot rewrite the body, and a rule that fails silently is the failure this
-// kind exists to remove. So it is a ToolFailure (failure.ts): the model reads a short sentence and
-// answers without the tool, the flow log records the call at warn with the reason as its first
-// line, and the alert channels carry it to the operator. `unavailable` (the sandbox itself could
-// not start) is a failure for the same reason. Only a value is a normal result.
+// Operator-authored code tools: a JavaScript body written once in the console, run in the sandbox
+// (code-sandbox.ts) as `function (input, context)`. The model supplies `input` only, since a rule
+// the model applies or writes per turn varies. `context` adds the two precondition attribute bags,
+// read when CALLED so an earlier step's `set_custom_attribute` is seen (not one in the same batch:
+// `ToolNode` runs those with `Promise.all`). A body failure or an unavailable sandbox is the
+// OPERATOR's, so it is a ToolFailure (failure.ts). Design: docs/graph.md, `src/graph/tools/code.ts`.
 
 export interface LoadedCodeToolDef {
   name: string;
@@ -49,6 +30,8 @@ export interface LoadedCodeToolDef {
   inputSchema: unknown;
   // The body of `function (input, context) { … }`.
   code: string;
+  // A clip of what the model reads goes to the flow log at `info` instead of paging at `warn`.
+  silenceTruncationAlert?: boolean;
 }
 
 export interface CodeToolDeps {
@@ -60,6 +43,9 @@ export interface CodeToolDeps {
   loadState?: () => Promise<PreconditionState>;
   // Injectable for tests: the sandbox itself.
   run?: typeof runSandboxedCode;
+  // The turn's side-effect line (prepare.ts): a clip of what the model reads is reported through
+  // it, as an HTTP tool reports its own.
+  onSideEffectError?: SideEffectErrorReporter;
 }
 
 export interface CodeToolRun {
@@ -67,6 +53,9 @@ export interface CodeToolRun {
   // The text the model reads, for a value; the failure sentence, otherwise.
   text: string;
   failed: boolean;
+  // What was cut from `text` on its way to the model, and the length of the value or message cut.
+  cut?: SandboxCut[];
+  chars?: number;
 }
 
 // The sentence every failure ends with: what the model should do about a tool it cannot use. The
@@ -141,18 +130,61 @@ export async function runCodeToolDefinition(
       failed: true,
     };
   }
+  const rendered = renderSandboxResult(outcome);
+  const clip = {
+    cut: rendered.cut,
+    ...(rendered.chars !== undefined ? { chars: rendered.chars } : {}),
+  };
   if (outcome.kind === "value") {
-    return { outcome, text: formatSandboxResult(outcome), failed: false };
+    return { outcome, text: rendered.text, failed: false, ...clip };
   }
   // The reason on the first line (the flow log keeps it as the cause), the body's own console
   // output after it, for the operator reading the trace.
-  const [reason, ...rest] = formatSandboxResult(outcome).split("\n");
+  const [reason, ...rest] = rendered.text.split("\n");
   const tail = rest.length > 0 ? `\n${rest.join("\n")}` : "";
   return {
     outcome,
     text: `${def.name} failed: ${reason} This is the tool's own code, which its author has to fix. ${WITHOUT_IT}${tail}`,
     failed: true,
+    ...clip,
   };
+}
+
+// The line an HTTP tool writes when it clips (`response_clipped`), so alert channels hear a code
+// tool's cut the same way: the model reads `…[truncated]` as the end of the data, and a dropped
+// console block leaves no mark in its text at all.
+function reportClip(
+  def: LoadedCodeToolDef,
+  r: CodeToolRun,
+  deps: CodeToolDeps,
+): void {
+  const cut = r.cut ?? [];
+  const what = cut
+    .map((c) =>
+      c === "value"
+        ? `the returned value was ${r.chars} characters`
+        : c === "message"
+          ? `the error message was ${r.chars} characters`
+          : c === "output"
+            ? "the console output was cut to the room the result left"
+            : "the console output was left out, with no room after the result",
+    )
+    .join("; ");
+  deps.onSideEffectError?.({
+    tool: def.name,
+    phase: "response_clipped",
+    ...(def.silenceTruncationAlert ? { level: "info" as const } : {}),
+    detail: {
+      kind: "code",
+      limit: MODEL_RESPONSE_CHAR_LIMIT,
+      cut,
+      ...(r.chars !== undefined ? { chars: r.chars } : {}),
+      ...(def.silenceTruncationAlert ? { silenced: true } : {}),
+    },
+    err: new Error(
+      `${what}, past the model's limit of ${MODEL_RESPONSE_CHAR_LIMIT}; return a summary of what the agent needs instead of the whole payload`,
+    ),
+  });
 }
 
 export function buildCodeTool(
@@ -162,6 +194,7 @@ export function buildCodeTool(
   return failableTool(
     async (input: Record<string, unknown>) => {
       const r = await runCodeToolDefinition(def, input ?? {}, deps);
+      if (r.cut && r.cut.length > 0) reportClip(def, r, deps);
       return r.failed ? toolFailure(r.text) : r.text;
     },
     {
@@ -179,10 +212,8 @@ export function buildCodeTools(
   defs: LoadedCodeToolDef[],
   deps: CodeToolDeps = {},
 ): StructuredToolInterface[] {
-  // EFFECT-FREE BY CONSTRUCTION, and marked so the observer's tick can tell (review round 33). The
-  // body runs in a fresh QuickJS interpreter with no fetch, no process, no require, no timers and
-  // no reach into this thread's globals (code-sandbox.ts): it computes and RETURNS, and there is
-  // nothing for a second run to duplicate. Marked on the object rather than by name, for the reason
-  // effect-free.ts gives: an operator names these tools, so the name is not identity.
+  // NOTE: effect-free by construction (the sandbox has no fetch, process, require, timers or thread
+  // globals), so a second run duplicates nothing. Marked on the object, not by name, because an
+  // operator names these tools (effect-free.ts).
   return defs.map((d) => markEffectFree(buildCodeTool(d, deps)));
 }

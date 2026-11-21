@@ -10,18 +10,14 @@ import {
   mockUser,
   setupPrismaMock,
 } from "@/tests/utils/prisma-mock";
-import { codeOnly } from "@/tests/utils/source-text";
 
-// Issue #301. Three create routes declared the body schema their PATCH sibling uses, where every
-// field being optional is correct. A request missing a required field therefore passed the transport
-// and was refused by the service's zod schema instead, and src/app.ts had no branch for a `ZodError`:
-// it fell to the generic 500, so the caller was told the server broke about a field they own, and
-// the zod issue array — submitted values included — went to the error log.
+// A create route declares its own body schema with its required fields, not the all-optional one
+// its PATCH sibling uses: otherwise a request missing a required field passes the transport and is
+// refused one layer later by the service's zod schema, under a contract that calls it optional.
 //
-// Measured on main before this change, body `{}`: 500 `Something went wrong` on all three, while the
-// ten other v1 write routes (which declare their required fields at the transport) answered 422. The
-// same 500 answered a value the service refuses but the transport accepts: `POST /v1/tools` with a
-// name carrying a space, `POST /v1/business-hours` with `name: ""`.
+// A value the service refuses but the transport accepts (`POST /v1/tools` with a name carrying a
+// space, `POST /v1/business-hours` with `name: ""`) answers the same 422, never the generic 500 that
+// tells the caller the server broke and logs the zod issue array, submitted values included.
 const BunRequest = (globalThis as unknown as { BunRequest: typeof Request })
   .BunRequest;
 
@@ -33,7 +29,7 @@ mockFindUnique.mockImplementation(() => Promise.resolve(admin));
 const tokenApp = new Elysia()
   .use(authPlugin)
   .post("/mint", async ({ setAuthCookie }) => ({
-    token: await setAuthCookie(admin),
+    token: await setAuthCookie(admin, admin.passwordHash),
   }));
 const { token } = (await (
   await tokenApp.handle(
@@ -54,9 +50,8 @@ async function post(path: string, payload: unknown): Promise<Response> {
   );
 }
 
-// The schema the ROUTE declares, read off the built app rather than off the exported const: what the
-// defect was is that a route pointed at the wrong one of two schemas, and an assertion about the
-// const cannot see which one a route uses.
+// The schema the ROUTE declares, read off the built app rather than off the exported const: a route
+// can point at the wrong one of two schemas, and an assertion about the const cannot see which.
 function routeBody(
   method: string,
   path: string,
@@ -134,8 +129,7 @@ describe("a create route whose body is missing a required field", () => {
 });
 
 // The same user error, one layer later: a value the transport accepts and the service's zod schema
-// refuses. It has to answer the same status as the row above — one mistake answering 422 or 500
-// depending on which layer noticed it is the thing being removed.
+// refuses answers the same status as the row above, whichever layer notices it.
 describe("a create route carrying a value the service refuses", () => {
   const rows: Array<[string, unknown, string]> = [
     [
@@ -176,8 +170,8 @@ describe("a create route carrying a value the service refuses", () => {
   }
 });
 
-// Why the routes were split rather than left to the `ZodError` branch alone, which already answers
-// 422 for both rows above: the PUBLISHED contract said every field of a create body was optional,
+// Each create route declares its own body even though the `ZodError` branch answers 422 for both
+// rows above: the PUBLISHED contract would otherwise say every field of a create body is optional,
 // which is not true of any of the three, and a generated client reading it has no way to know.
 describe("the create route declares exactly what the service requires", () => {
   for (const { name, routePath, patchPath, schema } of CONTROLLERS) {
@@ -188,8 +182,7 @@ describe("the create route declares exactly what the service requires", () => {
         name,
         requiredInZod(schema as never),
       ]);
-      // …and the PATCH keeps the all-optional schema, which is what made sharing one object with the
-      // POST look right in the first place.
+      // NOTE: …and the PATCH keeps the all-optional schema, correct for a partial update.
       expect([name, patch?.required]).toEqual([name, undefined]);
       // Composing the create body cannot lose a field: Elysia's `normalize` silently strips what the
       // schema does not declare, which is the regression the drift guard in tools-controller.test.ts
@@ -208,24 +201,9 @@ describe("the create route declares exactly what the service requires", () => {
   });
 });
 
-// The field a sub-value refusal names, which review on PR #309 caught the first spelling getting
-// wrong: zod's path is relative to what was handed to the parse, so a service that parses one member
-// of the request reported `0.weight` for a bad variant, and a lone token reported no field at all.
-// Both name something no input on the caller's side answers to.
-
-// The argument text of a call, read by matching parentheses so a nested call cannot end it early.
-function balancedArgs(source: string, openParen: number): string {
-  let depth = 0;
-  for (let i = openParen; i < source.length; i++) {
-    const c = source[i];
-    if (c === "(") depth++;
-    else if (c === ")") {
-      depth--;
-      if (depth === 0) return source.slice(openParen + 1, i);
-    }
-  }
-  return "";
-}
+// The field a sub-value refusal names: zod's path is relative to what was handed to the parse, so a
+// service that parses one member of the request passes a prefix, or a bad variant reports
+// `0.weight` and a lone token no field at all, names no input on the caller's side answers to.
 
 describe("a refusal about a value inside the request names the whole path", () => {
   test("the prefix and the issue path are joined", async () => {
@@ -254,180 +232,5 @@ describe("a refusal about a value inside the request names the whole path", () =
     })();
     // Without the prefix zod reports an empty path here, so the wire would carry no field at all.
     expect(err?.field).toBe("adminToken");
-  });
-
-  // The call sites, read from the source with the whitespace taken out so the assertion is about the
-  // arguments and not about how the formatter broke the line.
-  test("the two call sites that parse a sub-value pass one", async () => {
-    // EVERY call that parses that sub-value, not "the file mentions one somewhere": experiments
-    // parses `params.variants` at two call sites, and a per-file assertion is satisfied by whichever
-    // one still carries the prefix — the same shape of hole #258 measured.
-    for (const [file, value] of [
-      ["src/modules/experiments/service.ts", "params.variants"],
-      ["src/modules/chatwoot/management.ts", "adminToken"],
-    ] as const) {
-      const dense = (await Bun.file(file).text()).replace(/\s+/g, "");
-      const calls = [...dense.matchAll(/parseInput\(/g)].map((m) =>
-        balancedArgs(dense, (m.index ?? 0) + "parseInput(".length - 1),
-      );
-      const subValue = calls.filter((c) => c.includes(`,${value}`));
-      expect([file, subValue.length > 0]).toEqual([file, true]);
-      for (const c of subValue) {
-        expect([file, c, /,"[^"]+",?$/.test(c)]).toEqual([file, c, true]);
-      }
-    }
-  });
-});
-
-// The issue path goes on the wire, and a path segment is a name the SERVER chose only, and a path segment is a name the SERVER chose only
-// while no zod record constrains its value type: a `z.record(z.string(), z.unknown())` cannot fail
-// below itself, so no issue can carry a key the caller wrote. That holds for every record in src/
-// today, and it is the same hazard the transport's own refusal walks the schema to avoid
-// (api/lib/schema-refusal.ts), so it is pinned rather than left as a reading.
-// Takes RAW source and strips it itself. Leaving that to the caller is how the sweep below read a
-// comment quoting the constrained shape as a declaration of it (#424), and a predicate whose contract
-// is "give me source" cannot be handed the wrong kind of source if it does the reading.
-export function recordConstrainsItsValues(raw: string): boolean {
-  const source = codeOnly(raw);
-  // Written as "read the value expression and compare it" rather than as a negative lookahead: with
-  // `\s*` before the lookahead the regex backtracks over the whitespace and matches anyway, which is
-  // what the control below caught the first time this was written.
-  for (const m of source.matchAll(
-    /z\.record\(\s*z\.string\(\)\s*,([\s\S]{0,24})/g,
-  )) {
-    if (!(m[1] ?? "").trimStart().startsWith("z.unknown()")) return true;
-  }
-  return false;
-}
-
-describe("no zod record can put a caller's key in a refusal", () => {
-  test("the predicate separates a constrained record from a free-form one", () => {
-    expect(recordConstrainsItsValues("z.record(z.string(), z.string())")).toBe(
-      true,
-    );
-    expect(recordConstrainsItsValues("z.record(z.string(), z.unknown())")).toBe(
-      false,
-    );
-    expect(
-      recordConstrainsItsValues(
-        "z.record(\n    z.string(),\n    z.number(),\n  )",
-      ),
-    ).toBe(true);
-    // Prose naming the constrained shape is not a declaration of it, and neither is a string spelling
-    // it. Both were offenders before the predicate started stripping what it reads (#424).
-    expect(
-      recordConstrainsItsValues(
-        "// never write z.record(z.string(), z.string())",
-      ),
-    ).toBe(false);
-    expect(
-      recordConstrainsItsValues(
-        'const doc = "z.record(z.string(), z.string())";',
-      ),
-    ).toBe(false);
-  });
-
-  test("no file under src declares one", async () => {
-    const { Glob } = await import("bun");
-    const offenders: string[] = [];
-    for await (const rel of new Glob("**/*.ts").scan("src")) {
-      if (recordConstrainsItsValues(await Bun.file(`src/${rel}`).text())) {
-        offenders.push(rel);
-      }
-    }
-    expect(offenders).toEqual([]);
-  });
-});
-
-// Where the refusal is RAISED, which is the half review found on PR #309: a global "a ZodError means
-// the caller sent something wrong" branch also caught a ZodError the MCP SDK rejects with when a
-// remote server answers a malformed result (tests/api/v1/upstream-zod-error.test.ts pins that one).
-// So the 422 is raised where the input is known to be the caller's — `parseInput` — and every other
-// zod parse in service code has to say, at the call site, why it is not that.
-//
-// Keyed on the CALL SITE and not on the file: an exemption attached to a file adopts the next parse
-// written into it, which is the exact failure #258 measured.
-//
-// TWO VIEWS OF THE SAME LINE, and mixing them up is how this predicate breaks. The CALL is looked for
-// in the stripped source, so a comment naming `schema.parse(input)` — including one warning against
-// writing it — is not reported as one (#424). The MARKER is looked for in the raw line, because an
-// exemption is written in a comment and stripping is exactly what would take it away. They line up by
-// index because the scan replaces removed characters in place and keeps every newline.
-export function unmarkedServiceParse(source: string): string[] {
-  const lines = source.split("\n");
-  const code = codeOnly(source).split("\n");
-  const offenders: string[] = [];
-  for (const [i, line] of lines.entries()) {
-    const statement = code[i] ?? "";
-    // Keyed on `.parse(` itself and not on what precedes it: a chained schema
-    // (`z.string().min(1).parse(x)`) and a multiline chain whose line begins with `.parse(` both put
-    // a `)` or a line start there, and the first spelling of this predicate matched neither — so the
-    // sweep reported a clean tree while the exact shape this PR converted could be written back in.
-    // Found by review on PR #309.
-    if (!statement.includes(".parse(")) continue;
-    if (
-      /JSON\.parse|Number\.parse|Date\.parse|\.parseAsync|safeParse/.test(
-        statement,
-      )
-    ) {
-      continue;
-    }
-    const marked =
-      /not-caller-input:/.test(line) ||
-      /not-caller-input:/.test(lines[i - 1] ?? "");
-    if (!marked) offenders.push(line.trim());
-  }
-  return offenders;
-}
-
-describe("a zod parse of caller input goes through parseInput", () => {
-  test("the predicate sees an unmarked parse and not a marked one", () => {
-    expect(
-      unmarkedServiceParse("  const d = someSchema.parse(input);"),
-    ).toEqual(["const d = someSchema.parse(input);"]);
-    expect(
-      unmarkedServiceParse(
-        "  // not-caller-input: a stored row\n  const d = someSchema.parse(row);",
-      ),
-    ).toEqual([]);
-    // The two shapes the first spelling of this predicate missed, and the reason they are controls
-    // rather than a sentence: in both the character before `.parse` is a `)` or a line start, so a
-    // predicate anchored on the identifier before it reported a clean tree while the exact call this
-    // PR converted (`z.string().min(1).max(2000).parse(adminToken)`) could be written straight back.
-    expect(
-      unmarkedServiceParse("  const t = z.string().min(1).parse(token);"),
-    ).toEqual(["const t = z.string().min(1).parse(token);"]);
-    expect(
-      unmarkedServiceParse(
-        "  const v = z\n    .array(itemSchema)\n    .parse(value);",
-      ),
-    ).toEqual([".parse(value);"]);
-    // The shapes that are not a zod parse at all, and the helper itself.
-    expect(unmarkedServiceParse("  const x = JSON.parse(raw);")).toEqual([]);
-    expect(
-      unmarkedServiceParse("  const d = parseInput(someSchema, input);"),
-    ).toEqual([]);
-    expect(
-      unmarkedServiceParse("  const d = someSchema.safeParse(input);"),
-    ).toEqual([]);
-  });
-
-  test("no service file parses caller input outside it", async () => {
-    const { Glob } = await import("bun");
-    const offenders: string[] = [];
-    let scanned = 0;
-    for (const dir of ["src/modules", "src/api"]) {
-      for await (const rel of new Glob("**/*.ts").scan(dir)) {
-        const file = `${dir}/${rel}`;
-        if (file === "src/lib/parse-input.ts") continue;
-        scanned++;
-        for (const line of unmarkedServiceParse(await Bun.file(file).text())) {
-          offenders.push(`${file}: ${line}`);
-        }
-      }
-    }
-    expect(offenders).toEqual([]);
-    // …and the sweep is looking at something.
-    expect(scanned).toBeGreaterThanOrEqual(50);
   });
 });

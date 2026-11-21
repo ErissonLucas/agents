@@ -1,5 +1,6 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
+import { tRanged } from "@/api/lib/ranged";
 import { confirmStepUp, STEP_UP_PASSWORD_DESCRIPTION } from "@/api/lib/step-up";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import { optionalDbId, requireDbId } from "@/lib/db-id";
@@ -10,6 +11,7 @@ import {
   TenantTargetRequiredError,
 } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
+import { CHATWOOT_ID_RANGE } from "@/lib/number-range";
 import type { TenantContext } from "@/lib/tenancy";
 import {
   bindInbox,
@@ -30,12 +32,13 @@ import {
   reconnectInbox,
   removeChatwootInstance,
   removeInbox,
-  rotateChatwootDeploymentToken,
   setConnectedAccounts,
   softDisconnectChatwootInstance,
   syncInboxes,
   unobserveInbox,
+  updateChatwootDeployment,
 } from "@/modules/chatwoot/management";
+import { bindInboxVoiceAgent } from "@/modules/voice-call/inboxes";
 
 // The error catalog this controller's routes answer with. `bun i18n:extract` materialises
 // src/api/locales/*.json from these lines and prunes anything nothing references, and
@@ -43,14 +46,17 @@ import {
 // throw site rather than an English sentence on a pt-BR caller's screen.
 // translate('errors.chatwootAccountDisconnected', 'This account is disconnected. Reconnect it before assigning an agent.')
 // translate('errors.chatwootAccountTaken', 'This Chatwoot account is already connected to another tenant; one account belongs to a single tenant.')
-// NOTE: the bind and the REbind refuse differently, and so do the two confirmations. One key per
-// pair would answer "the confirmation does not match" to someone who typed the domain, with no
-// way to tell which of the two fields they got wrong.
+// NOTE: the bind and the rebind refuse differently, and so do the two confirmations: one key per
+// pair would not tell the operator which of the two fields they got wrong.
 // translate('errors.chatwootBindFailed', 'The bot could not be synced with Chatwoot.')
+// translate('errors.chatwootDeploymentNothingToChange', 'Nothing to change: send a new base URL, admin token, webhookBaseUrl or publicUrl.')
+// translate('errors.chatwootDifferentInstallation', 'This URL points to another Chatwoot; to switch instances, create a new connection.')
+// translate('errors.chatwootDeploymentChanged', 'The connection changed while the new address was being checked; try again.')
 // translate('errors.inboxGoneRemote', 'This inbox no longer exists in Chatwoot. Remove its mirror.')
+// translate('errors.inboxHasForeignAgentBot', 'This inbox is answered by the Agent Bot "{{bot}}", which is not from this instance. Binding replaces it, and unbinding later does not bring it back.')
+// translate('errors.inboxAgentBotUnreadable', 'Could not read which Agent Bot answers this inbox on Chatwoot. If another one is attached, binding replaces it, and unbinding later does not bring it back.')
 // translate('errors.agentAlreadyObserves', 'This agent already observes this inbox. Remove it as an observer before making it the answering agent.')
 // translate('errors.observerNotMonitoring', 'Only an agent in monitoring mode can observe an inbox.')
-// translate('errors.inboxAlreadyObserved', 'This inbox already has an observer. Remove it before adding another.')
 // translate('errors.observeTakenBack', 'This observe was undone while the attachment was still in flight. Try again.')
 // translate('errors.observeRacedAnother', 'Another observe of this inbox was in flight and did not complete. Try again.')
 // translate('errors.agentIsResponder', 'This agent already answers this inbox; it cannot observe it too.')
@@ -61,9 +67,10 @@ import {
 // translate('errors.chatwootDeploymentNotFound', 'No Chatwoot deployment is connected.')
 // translate('errors.chatwootDifferentDeployment', 'This tenant is already connected to a different Chatwoot deployment. Disconnect it first to switch servers.')
 // translate('errors.chatwootInstanceNotFound', 'Chatwoot instance not found.')
-// NOTE: the account bound and the cap are two answers to one question -- which accounts this
-// deployment can be asked for -- and they are separate keys because they send the operator to
-// different places: one to the account list, the other to a retry once Chatwoot answers again.
+// translate('errors.chatwootRemovalReconnected', 'This Chatwoot account was reconnected while it was being removed; remove it again to finish.')
+// translate('errors.chatwootRemovalTurnRunning', 'A conversation of this Chatwoot account is being answered right now; remove it again in a moment to finish.')
+// NOTE: the account bound and the cap are separate keys because they send the operator to
+// different places: one to the account list, the other to a smaller request.
 // translate('errors.chatwootAccountNotOnDeployment', 'This Chatwoot deployment does not report account(s) {{accounts}}. Pick from the accounts its token can reach.')
 // translate('errors.chatwootTooManyAccounts', 'Too many accounts in one request ({{count}}); at most {{max}} accounts can be set at once.')
 // translate('errors.chatwootProfileFailed', 'Chatwoot could not be reached with the URL and token provided.')
@@ -71,6 +78,11 @@ import {
 // translate('errors.inboxNotFound', 'Inbox not found.')
 // translate('errors.inboxStillExists', 'This inbox still exists in Chatwoot. Delete it there first.')
 // translate('errors.chatwootInboxProbeFailed', 'Could not confirm with Chatwoot that this inbox was deleted.')
+// translate('errors.voiceInboxNotWhatsapp', 'Only a WhatsApp inbox takes calls.')
+// translate('errors.voiceInboxNotConnector', 'Only a WhatsApp inbox on the fazer.ai connector takes calls.')
+// translate('errors.voiceAgentRequired', 'Only a calls agent answers calls.')
+// translate('errors.voiceInboxChatwootUnreachable', 'The binding was saved, but Chatwoot could not be reached. Saving any calls agent again retries it.')
+// translate('errors.voiceAgentNotResponder', 'A calls agent does not answer messages. Choose it under Calls agent.')
 
 // Chatwoot instance + inbox management (per-tenant). TENANT_ADMIN. SEPARATE from the public webhook
 // receiver controller (same /v1/chatwoot prefix; no path overlap: /instances* + /inboxes* here vs
@@ -111,12 +123,19 @@ export const chatwootAdminController = new Elysia({
   .post(
     "/deployment",
     async ({ tenantContext, body }) => {
-      const b = body as { baseUrl: string; adminToken: string };
+      const b = body as {
+        baseUrl: string;
+        adminToken: string;
+        webhookBaseUrl?: string | null;
+        publicUrl?: string | null;
+      };
       return {
         instance: instanceIdentity,
         ...(await connectChatwootDeployment(ctxOrThrow(tenantContext), {
           baseUrl: b.baseUrl,
           adminToken: b.adminToken,
+          webhookBaseUrl: b.webhookBaseUrl,
+          publicUrl: b.publicUrl,
         })),
       };
     },
@@ -135,6 +154,18 @@ export const chatwootAdminController = new Elysia({
           description:
             "Chatwoot admin/user access token; encrypted at rest, never returned.",
         }),
+        webhookBaseUrl: t.Optional(
+          t.Union([t.String(), t.Null()], {
+            description:
+              "The base this Chatwoot calls the agents on (each bot's webhook). Empty or null means PUBLIC_URL; set it to the agents' private address when the Chatwoot reaches them on a private network.",
+          }),
+        ),
+        publicUrl: t.Optional(
+          t.Union([t.String(), t.Null()], {
+            description:
+              "The address people open this Chatwoot on, used for the links the console and case notes print. Empty or null means the base URL.",
+          }),
+        ),
       }),
       response: errors(400, 401, 403, 404, 409, 422, 502),
     },
@@ -143,26 +174,52 @@ export const chatwootAdminController = new Elysia({
   .patch(
     "/deployment",
     async ({ tenantContext, body }) => {
-      const b = body as { adminToken: string };
+      const b = body as {
+        baseUrl?: string;
+        adminToken?: string;
+        webhookBaseUrl?: string | null;
+        publicUrl?: string | null;
+      };
       return {
         instance: instanceIdentity,
-        deployment: await rotateChatwootDeploymentToken(
+        deployment: await updateChatwootDeployment(
           ctxOrThrow(tenantContext),
-          b.adminToken,
+          b,
         ),
       };
     },
     {
       requireRole: "SUPER_ADMIN",
       detail: doc(
-        "Rotate deployment token",
-        "Replace the deployment's admin token. Affects every account under it.",
+        "Edit Chatwoot deployment",
+        "Move the deployment to a new base URL of the same Chatwoot (a domain change), replace its admin token (affects every account under it) and/or set its two optional addresses. A new base URL is refused unless it answers as the same Chatwoot: the same user behind the token and every connected account under its id. A new webhook base moves the deployment's live bots onto it.",
       ),
       body: t.Object({
-        adminToken: t.String({
-          minLength: 1,
-          description: "New admin token; encrypted at rest, never returned.",
-        }),
+        baseUrl: t.Optional(
+          t.String({
+            minLength: 1,
+            description:
+              "A new address of the same Chatwoot. Passes the connection's SSRF check (SSRF_INTERNAL_TARGETS included) and is verified with the token (the new one when sent, else the saved one); another Chatwoot is refused with 422 and nothing is written. Agent Bots keep their webhook.",
+          }),
+        ),
+        adminToken: t.Optional(
+          t.String({
+            minLength: 1,
+            description: "New admin token; encrypted at rest, never returned.",
+          }),
+        ),
+        webhookBaseUrl: t.Optional(
+          t.Union([t.String(), t.Null()], {
+            description:
+              "The base this Chatwoot calls the agents on (each bot's webhook). Empty or null means PUBLIC_URL; set it to the agents' private address when the Chatwoot reaches them on a private network.",
+          }),
+        ),
+        publicUrl: t.Optional(
+          t.Union([t.String(), t.Null()], {
+            description:
+              "The address people open this Chatwoot on, used for the links the console and case notes print. Empty or null means the base URL.",
+          }),
+        ),
       }),
       response: errors(400, 401, 403, 404, 422, 502),
     },
@@ -172,8 +229,11 @@ export const chatwootAdminController = new Elysia({
   // re-type the deployment domain AND confirm with their password (step-up). Irreversible.
   .delete(
     "/deployment",
-    async ({ tenantContext, body }) => {
+    async ({ tenantContext, body, request, server }) => {
       const ctx = ctxOrThrow(tenantContext);
+      // Every account is emptied in batches that outlast the server's idle timeout, as in the account
+      // removal below.
+      server?.timeout(request, 0);
       const b = body as { confirmDomain: string; password?: string };
       const { deployment } = await getChatwootDeployment(ctx);
       if (!deployment) {
@@ -254,7 +314,7 @@ export const chatwootAdminController = new Elysia({
         "Connect the selected accounts (syncing their inboxes) and soft-disconnect the de-selected ones, keeping their history.",
       ),
       body: t.Object({
-        accountIds: t.Array(t.Integer(), {
+        accountIds: t.Array(tRanged(CHATWOOT_ID_RANGE), {
           description: "The Chatwoot account ids that should be connected.",
         }),
       }),
@@ -308,8 +368,11 @@ export const chatwootAdminController = new Elysia({
   // name (or id) AND the acting user's password. Irreversible.
   .post(
     "/instances/:id/remove",
-    async ({ tenantContext, params, body }) => {
+    async ({ tenantContext, params, body, request, server }) => {
       const ctx = ctxOrThrow(tenantContext);
+      // A large account is emptied in batches that outlast the server's idle timeout, and nothing is
+      // sent until they end; without lifting it the console shows a failure while the removal goes on.
+      server?.timeout(request, 0);
       const b = body as { confirmName: string; password?: string };
       const id = requireDbId(params.id);
       const instance = await getChatwootInstance(ctx, id);
@@ -391,7 +454,7 @@ export const chatwootAdminController = new Elysia({
       return {
         instance: instanceIdentity,
         statuses: reconciled.inboxes,
-        // Keyed `${inboxId}:${agentId}`, one entry per observer binding.
+        // NOTE: keyed `${inboxId}:${agentId}`, one entry per observer binding.
         observerStatuses: reconciled.observers,
       };
     },
@@ -429,7 +492,7 @@ export const chatwootAdminController = new Elysia({
     },
   )
   // Live agents + teams for the handoff-targeting picker, scoped to the accounts the agent serves
-  // (via its bound inboxes). `accounts` lists those accounts: 0 ⇒ no inbox bound, 1 ⇒ agents/teams
+  // (via the inboxes it answers or observes). `accounts` lists those accounts: 0 ⇒ no inbox bound, 1 ⇒ agents/teams
   // populated from that account, ≥2 ⇒ ambiguous (pinned disabled in the editor). Agents/teams are
   // account-scoped, so a pinned target only makes sense within a single account.
   .get(
@@ -525,7 +588,10 @@ export const chatwootAdminController = new Elysia({
   .patch(
     "/inboxes/:id",
     async ({ tenantContext, params, body }) => {
-      const b = body as { agentId?: string | null };
+      const b = body as {
+        agentId?: string | null;
+        replaceForeignBot?: boolean;
+      };
       const agentId = optionalDbId(b.agentId, "agentId") ?? null;
       return {
         instance: instanceIdentity,
@@ -533,6 +599,9 @@ export const chatwootAdminController = new Elysia({
           ctxOrThrow(tenantContext),
           requireDbId(params.id),
           agentId,
+          {},
+          undefined,
+          { replaceForeignBot: b.replaceForeignBot === true },
         ),
       };
     },
@@ -540,7 +609,7 @@ export const chatwootAdminController = new Elysia({
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Bind inbox to agent",
-        "Set or clear which agent answers an inbox. Binding lazily provisions the instance's Agent Bot and connects it to the inbox on Chatwoot; unbinding disconnects it. Unbinding an inbox that was deleted in Chatwoot still succeeds: there is no bot left to disconnect. 502 means Chatwoot was unreachable.",
+        "Set or clear which agent answers an inbox. Binding lazily provisions the instance's Agent Bot and connects it to the inbox on Chatwoot; unbinding disconnects it. Unbinding an inbox that was deleted in Chatwoot still succeeds: there is no bot left to disconnect. 409 with field replaceForeignBot means the inbox is answered by an Agent Bot this instance does not own, or the attached bot could not be read: binding replaces it and unbinding later does not bring it back, so send replaceForeignBot: true to confirm. 502 means Chatwoot was unreachable.",
       ),
       params: t.Object({
         id: t.String({ description: "Inbox id (BigInt string)." }),
@@ -550,11 +619,47 @@ export const chatwootAdminController = new Elysia({
           description:
             "Agent id (BigInt string) to bind, or null to unbind the inbox.",
         }),
+        replaceForeignBot: t.Optional(
+          t.Boolean({
+            description:
+              "Confirms replacing an Agent Bot this instance does not own (or one that could not be read). Without it, such a bind answers 409.",
+          }),
+        ),
+      }),
+      response: errors(400, 401, 403, 404, 409, 422, 502),
+    },
+  )
+  // The VOICE binding: the voice agent that answers the inbox's calls, beside the
+  // responder above, which answers its messages.
+  .put(
+    "/inboxes/:id/voice-agent",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      ...(await bindInboxVoiceAgent(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        optionalDbId((body as { agentId: string | null }).agentId, "agentId") ??
+          null,
+      )),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Set the voice agent of an inbox",
+        "Set or clear (`agentId: null`) which voice agent answers the inbox's WhatsApp calls, and write it to the fazer.ai Chatwoot: the inbox's call audio goes to this deployment, and only an enabled voice agent in production takes the calls (otherwise they ring the human agents). Independent of the agent that answers the inbox's messages. 422 for an inbox that is not WhatsApp or an agent that is not a voice agent; 502 when Chatwoot could not be written (the binding is kept, and saving the agent writes it again).",
+      ),
+      params: t.Object({
+        id: t.String({ description: "Inbox id (BigInt string)." }),
+      }),
+      body: t.Object({
+        agentId: t.Union([t.String(), t.Null()], {
+          description: "Voice agent id (BigInt string), or null to unbind.",
+        }),
       }),
       response: errors(400, 401, 403, 404, 422, 502),
     },
   )
-  // The OBSERVER binding (issue #476): a monitoring agent attached to the inbox on the fork as an
+  // The OBSERVER binding: a monitoring agent attached to the inbox on the fork as an
   // observer, receiving every event on its own route and answering nothing. Independent of the
   // responder above; an inbox can carry several observers.
   .post(

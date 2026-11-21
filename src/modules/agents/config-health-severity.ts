@@ -1,20 +1,8 @@
 import type { ConfigIssueKey } from "@/modules/agents/config-health";
 
-// How bad each configuration warning is, for a caller that has to DECIDE something with it. The
-// editor never needed this: a person reads the sentence and judges. An automated onboarding cannot,
-// and "is this agent healthy" is not a yes/no — it finishes with a list, and the only useful next
-// question is whether to stop or to note it and carry on.
-//
-// The three levels are not a scale of annoyance. Each answers a different question about what the
-// customer experiences RIGHT NOW, and every key below is placed by the consequence its own block in
-// config-health.ts already names, never by how alarming the sentence sounds:
-//
-//   blocking   The agent does not answer, or it answers without a protection whose switch reads
-//              "on". Nothing else about the install matters while one of these is live.
-//   degraded   The agent answers. A feature the operator turned on does not run, silently, so the
-//              install delivers less than it was configured to.
-//   advisory   Nothing is off. Two settings contradict each other, or text already stored is longer
-//              than its reader keeps. The operator picks; there is no wrong state to repair.
+// How bad each configuration warning is, for a caller that must decide whether to stop, placed by
+// what the customer experiences now: `blocking` (no answer, or an answer without a protection that
+// reads "on"), `degraded` (a feature that is on does not run), `advisory` (nothing is off; a choice).
 export type ConfigIssueSeverity = "blocking" | "degraded" | "advisory";
 
 // Exhaustive BY TYPE rather than by a default, which is the whole point of the Record: a new
@@ -31,10 +19,12 @@ const SEVERITY: Record<ConfigIssueKey, ConfigIssueSeverity> = {
   modelNoEndpoint: "blocking",
   // An endpoint that is stated and undialable: every request goes to an address nothing answers.
   modelBadEndpoint: "blocking",
+  // A decisions observer without its classifier key decides nothing, as a language-model watcher
+  // without its model observes nothing.
+  decisions: "blocking",
   // Fail-open: the analysis is skipped and every message is delivered as if it had been screened.
   guardrails: "blocking",
-  // The same consequence, except measured rather than deduced: those turns already went out
-  // unscreened.
+  // The same consequence, observed rather than deduced: those turns already went out unscreened.
   guardrailsFailing: "blocking",
   // The gate fails closed, so the agent goes silent for every contact.
   contactAuth: "blocking",
@@ -45,8 +35,14 @@ const SEVERITY: Record<ConfigIssueKey, ConfigIssueSeverity> = {
   tts: "degraded",
   // Best-effort at runtime: the audio still goes out, unrewritten.
   ttsNormalize: "degraded",
+  // The reply still goes out, as text, on the day the primary voice fails.
+  ttsFallback: "degraded",
   // The attendance is never summarized, and nothing goes back for it later.
   memoryModel: "degraded",
+  // Suggestions still reach the queue, unreviewed.
+  suggestionReviewModel: "degraded",
+  // The agent still answers; every choice-guarded tool is refused.
+  choiceCheckModel: "degraded",
   // The one override whose whole purpose is the day the primary fails.
   modelFallback: "degraded",
   vision: "degraded",
@@ -78,3 +74,15 @@ export const SEVERITY_ORDER: readonly ConfigIssueSeverity[] = [
   "degraded",
   "advisory",
 ];
+
+// Issues ordered worst-first, for a list a person reads top-down. Stable, so issues of one severity
+// keep the order they came in.
+export function worstFirst<T extends { key: ConfigIssueKey }>(
+  issues: readonly T[],
+): T[] {
+  return issues.toSorted(
+    (a, b) =>
+      SEVERITY_ORDER.indexOf(severityOf(a.key)) -
+      SEVERITY_ORDER.indexOf(severityOf(b.key)),
+  );
+}

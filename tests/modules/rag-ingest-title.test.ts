@@ -17,22 +17,20 @@ import {
 import { EMBEDDING_DIM } from "@/modules/rag/embeddings";
 import { getJobHandler } from "@/modules/scheduler/worker";
 import { updateEmbeddingSettings } from "@/modules/tenant-settings/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
-// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+// TENANT_ADMIN, the role that tells `runScopedOn` the id never came from outside.
 const ctxOf = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: null,
   role: "TENANT_ADMIN",
 });
 
-// Issue #857: a document's title is part of what its chunks are embedded from.
-//
-// A help center article's title is the question the customer asks, and its body often never restates
-// it. Embedding the body alone made "the activation e-mail never arrives" miss the article of that
-// name. The vector of every chunk is computed over the title and the chunk; the chunk stored and read
-// by the agent is still the chunk alone. The double below records every input the ingest sends to the
-// embedding endpoint, which is what these tests assert on.
+// A document's title is part of what its chunks are embedded from: a help center article's title is
+// the question the customer asks, and its body often never restates it. The vector of every chunk is
+// computed over the title and the chunk; the chunk stored and read by the agent is the chunk alone.
+// The double below records every input the ingest sends to the embedding endpoint.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -50,8 +48,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -104,14 +102,15 @@ let savedAllowPrivate = false;
 
 beforeAll(() => {
   if (!dbUp) return;
-  // The fixture below is a loopback embedding endpoint reached through the REAL ingest path, and
-  // `embedCompatible` now runs the SSRF guard on the operator-configured URL before fetching — which
+  // NOTE: the fixture below is a loopback embedding endpoint reached through the REAL ingest path,
+  // and `embedCompatible` runs the SSRF guard on the operator-configured URL before fetching, which
   // refuses 127.0.0.1 under NODE_ENV=test, exactly as it would in production. Same save/restore the
   // mcp-oauth suite uses for its own loopback fixture; reaching a private endpoint for real is the
   // operator's explicit SSRF_ALLOW_PRIVATE_TARGETS opt-in, and it is not what this suite is about.
   savedAllowPrivate = config.ssrf.allowPrivateTargets;
   config.ssrf.allowPrivateTargets = true;
   embedServer = Bun.serve({
+    hostname: "127.0.0.1",
     port: 0,
     async fetch(req) {
       const url = new URL(req.url);
@@ -153,7 +152,7 @@ async function seedTenant(slug: string): Promise<{ id: bigint; kb: bigint }> {
     data: { name: slug, slug: `${slug}-${process.pid}` },
   });
   tenants.push(t.id);
-  // NOTE: the credential carries the baseURL (resolveEmbeddingStatus reads it off the secret), which is
+  // The credential carries the baseURL (resolveEmbeddingStatus reads it off the secret), which is
   // what points the ingest at the double above without unlocking the settings block.
   const cred = await suDb.vaultEntry.create({
     data: {
@@ -216,7 +215,7 @@ async function readDoc(tenantId: bigint, id: bigint) {
   );
 }
 
-// What search actually reads. The document row is not the answer to this issue — the chunks are.
+// What search actually reads: the chunks, not the document row.
 async function readChunks(tenantId: bigint, id: bigint): Promise<string[]> {
   const rows = await suDb.$queryRaw<{ content: string }[]>`
     SELECT content FROM knowledge_chunks

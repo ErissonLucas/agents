@@ -21,9 +21,12 @@ interface DynamicRoute {
   };
 }
 
-// NOTE: Static routes are matched by exact prefix during the walk, so adding a
+// Static routes are matched by exact prefix during the walk, so adding a
 // new page here makes it appear automatically in the trail.
 // t('nav.agents', 'Agents')
+// t('nav.dashboards', 'Dashboards')
+// t('breadcrumbs.dataSources', 'Data sources')
+// t('breadcrumbs.dashboard', 'Loading…')
 // t('editor.tab.general', 'General')
 // t('editor.tab.model', 'Model')
 // t('editor.tab.tools', 'Tools')
@@ -46,9 +49,21 @@ interface DynamicRoute {
 // t('admin.tabBranding', 'Branding')
 // t('settings.title', 'Settings')
 // t('settings.profile', 'Profile')
-// t('settings.appearance', 'Appearance')
+// t('settings.security', 'Security')
+// t('settings.preferences', 'Preferences')
+// t('settings.mcp', 'MCP')
 const STATIC_ROUTES: StaticRoute[] = [
   { path: "/agents", labelKey: "nav.agents", defaultLabel: "Agents" },
+  {
+    path: "/dashboards",
+    labelKey: "nav.dashboards",
+    defaultLabel: "Dashboards",
+  },
+  {
+    path: "/dashboards/_sources",
+    labelKey: "breadcrumbs.dataSources",
+    defaultLabel: "Data sources",
+  },
   { path: "/resources", labelKey: "nav.resources", defaultLabel: "Components" },
   {
     path: "/resources/tools",
@@ -110,13 +125,23 @@ const STATIC_ROUTES: StaticRoute[] = [
     defaultLabel: "Profile",
   },
   {
-    path: "/settings/appearance",
-    labelKey: "settings.appearance",
-    defaultLabel: "Appearance",
+    path: "/settings/security",
+    labelKey: "settings.security",
+    defaultLabel: "Security",
+  },
+  {
+    path: "/settings/preferences",
+    labelKey: "settings.preferences",
+    defaultLabel: "Preferences",
+  },
+  {
+    path: "/settings/mcp",
+    labelKey: "settings.mcp",
+    defaultLabel: "MCP",
   },
 ];
 
-// NOTE: Dynamic routes are matched when a prefix has no static entry. The
+// Dynamic routes are matched when a prefix has no static entry. The
 // resolver receives the RegExp match so it can surface the captured segment
 // (e.g. a user email) as the default label.
 // Tab segment → its editor label (defaults mirror editor.tab.* in the locales).
@@ -143,6 +168,14 @@ const DYNAMIC_ROUTES: DynamicRoute[] = [
   {
     pattern: /^\/agents\/([^/]+)$/,
     resolve: () => ({ labelKey: "breadcrumbs.agent", defaultLabel: "Agent" }),
+  },
+  // A dashboard's slug, with its name arriving the same way; until it does, the crumb says so.
+  {
+    pattern: /^\/dashboards\/([^/]+)$/,
+    resolve: () => ({
+      labelKey: "breadcrumbs.dashboard",
+      defaultLabel: "Loading…",
+    }),
   },
   {
     pattern: /^\/agents\/[^/]+\/([^/]+)$/,
@@ -194,7 +227,7 @@ export function buildBreadcrumbs(
     });
   }
 
-  // NOTE: the isLast flag above is based on the raw segment index, so a path
+  // The isLast flag above is based on the raw segment index, so a path
   // like `/settings/unknown` still marks the `settings` crumb as non-last and
   // keeps it clickable. Override the final *matched* crumb to always be
   // non-navigable — the user is already there as far as breadcrumbs care.

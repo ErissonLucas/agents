@@ -4,6 +4,7 @@ import {
   beforeEach,
   describe,
   expect,
+  spyOn,
   test,
 } from "bun:test";
 import type { BindToolsInput } from "@langchain/core/language_models/chat_models";
@@ -17,6 +18,7 @@ import { encryptJson } from "@/api/lib/crypto";
 import type { TenantContext } from "@/lib/tenancy";
 import {
   clearMediaAnnotations,
+  mediaAnnotationFor,
   stashMediaAnnotation,
 } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
@@ -25,22 +27,19 @@ import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
 import { reengageConversation } from "@/modules/conversations/reengage";
 import { extractMessageVisuals } from "@/modules/vision/extract-message";
+import * as visionService from "@/modules/vision/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogCount } from "../utils/flowlog";
 
-// ISSUE #864: A PICTURE IN AN EMAIL BODY NEVER REACHES VISION.
+// A PICTURE IN AN EMAIL BODY REACHES VISION.
 //
-// Chatwoot's mailbox keeps an inline image INSIDE the body instead of making it an attachment: a
-// blob URL in `content_attributes.email.html_content.full` when the HTML references it by `cid:`,
-// or `<img src="<blob url>">` appended to `text_content.full` when the mail has no HTML at all
-// (Apple Mail on iPhone). The message carries no attachment, the vision pass reads attachments
-// only, and the agent answers "I can't see the attachment" to a customer who sent one — on one
-// production mailbox, 2,397 of the 4,197 email messages that declared an attachment in 14 days.
-//
-// Measured at the two places the pass is consumed: the turn that re-reads the thread (REST page,
-// real extraction with a fake provider, the model's input captured), and the webhook's eager pass
-// (the delivered event, counted by vision stage lines with no credential, as in
-// vision-every-attachment.test.ts).
+// Chatwoot's mailbox keeps an inline image INSIDE the body, not as an attachment: a blob URL in
+// `content_attributes.email.html_content.full` when the HTML references it by `cid:`, or
+// `<img src="<blob url>">` appended to `text_content.full` when the mail has no HTML (Apple Mail on
+// iPhone). Asserted where the pass is consumed: the turn that re-reads the thread (REST page, fake
+// provider, the model's input captured), and the webhook's eager pass (vision stage lines with no
+// credential, as in ./vision-every-attachment.test.ts).
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -57,8 +56,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -389,6 +388,39 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
     expect(provider.calls).toBe(1);
   });
 
+  test("a blob written with the connection's public address is read through its base; another host is not", async () => {
+    await setVision(true);
+    const inst = await suDb.chatwootInstance.findUniqueOrThrow({
+      where: { id: instanceId },
+      select: { deploymentId: true },
+    });
+    await suDb.chatwootDeployment.update({
+      where: { id: inst.deploymentId },
+      data: { publicUrl: "https://desk.example.com" },
+    });
+    try {
+      const path = "/rails/active_storage/blobs/redirect/sig41--x/print.png";
+      const out = await reengage(
+        1089,
+        {
+          content: "Olha o erro:",
+          content_attributes: emailBag({
+            html: `<div>Olha o erro:<img src="https://desk.example.com${path}"><img src="https://other.example.com${path.replace("sig41", "sig42")}"></div>`,
+          }),
+        },
+        { texts: ["Print de uma tela de erro."] },
+      );
+      expect(out.downloads).toEqual([`${HOST}${path}`]);
+      expect(out.turn).toContain("Print de uma tela de erro.");
+      expect(provider.calls).toBe(1);
+    } finally {
+      await suDb.chatwootDeployment.update({
+        where: { id: inst.deploymentId },
+        data: { publicUrl: null },
+      });
+    }
+  });
+
   test("the pasted shape: every Chatwoot blob in the HTML is read, the remote logo is not fetched", async () => {
     await setVision(true);
     const out = await reengage(
@@ -624,7 +656,8 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
     );
     expect(provider.calls).toBe(0);
     expect(out.turn).toContain("Segue o documento");
-    expect(out.turn).toContain(unreadMarker(1));
+    expect(out.turn).toContain('<anexos-nao-lidos quantidade="1">');
+    expect(out.turn).toContain('motivo="falha"');
   });
 
   test("an attachment already read does not keep a distinct body image from being read", async () => {
@@ -750,7 +783,8 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
       { types: { [svg]: "image/svg+xml" } },
     );
     expect(provider.calls).toBe(0);
-    expect(out.turn).toContain(unreadMarker(1));
+    expect(out.turn).toContain('<anexos-nao-lidos quantidade="1">');
+    expect(out.turn).toContain('motivo="formato"');
   });
 
   test("an email with no text whose only body image is an ornament does not ask for a resend", async () => {
@@ -822,6 +856,246 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
     // The first batch only: the ornaments gave their slots back, and the refusal took them.
     expect(asked).toBe(1);
     expect(downloads.length).toBe(8);
+  });
+
+  test("a passed deadline stops the body images that were still to be read", async () => {
+    await setVision(true);
+    const icons = Array.from({ length: 40 }, (_, i) =>
+      blob(560 + i, `d${i}.png`),
+    );
+    const downloads: string[] = [];
+    const deadline = new AbortController();
+    deadline.abort();
+    await extractMessageVisuals({
+      tenantId,
+      instanceId,
+      conversationId: 1048,
+      messageId: 1,
+      visuals: icons.map((dataUrl, i) => ({
+        id: null,
+        dataUrl,
+        name: `d${i}.png`,
+        imageDescription: null,
+        extractedText: null,
+      })),
+      cfg: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${visionKeyId}`,
+      } as never,
+      base: appDb,
+      deps: {
+        makeClient: stub({
+          page: [],
+          sizes: Object.fromEntries(
+            icons.map((u) => [u, [144, 144] as [number, number]]),
+          ),
+          downloads,
+          metaWrites: [],
+        }),
+        fetchImpl: visionFetch(["não deveria ler"]),
+      },
+      signal: deadline.signal,
+    });
+    // A deadline already passed starts no download at all.
+    expect(downloads.length).toBe(0);
+  });
+
+  test("a passed deadline also stops the downloads that only sort out ornaments", async () => {
+    await setVision(true);
+    const fotos = Array.from({ length: 40 }, (_, i) =>
+      blob(610 + i, `f${i}.png`),
+    );
+    const downloads: string[] = [];
+    const deadline = new AbortController();
+    deadline.abort();
+    await extractMessageVisuals({
+      tenantId,
+      instanceId,
+      conversationId: 1050,
+      messageId: 1,
+      visuals: fotos.map((dataUrl, i) => ({
+        id: null,
+        dataUrl,
+        name: `f${i}.png`,
+        imageDescription: null,
+        extractedText: null,
+      })),
+      cfg: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${visionKeyId}`,
+      } as never,
+      base: appDb,
+      deps: {
+        makeClient: stub({ page: [], sizes: {}, downloads, metaWrites: [] }),
+        fetchImpl: visionFetch(["não deveria ler"]),
+      },
+      signal: deadline.signal,
+    });
+    // Nothing is read, and nothing past the cap is downloaded to classify it.
+    expect(downloads.length).toBe(0);
+  });
+
+  test("a deadline passing while a body image past the cap is downloaded cuts that download", async () => {
+    await setVision(true);
+    const fotos = Array.from({ length: 9 }, (_, i) =>
+      blob(680 + i, `g${i}.png`),
+    );
+    const ninth = fotos[8];
+    const deadline = new AbortController();
+    let cut: boolean | undefined;
+    const client = {
+      servesUrl: () => true,
+      downloadAttachment: async (
+        dataUrl: string,
+        opts?: { signal?: AbortSignal },
+      ) => {
+        if (dataUrl === ninth) {
+          deadline.abort();
+          cut = opts?.signal?.aborted;
+        }
+        return { bytes: png(1200, 1600), contentType: "image/png" };
+      },
+      updateAttachmentMeta: async () => ({}),
+    } as unknown as ChatwootClient;
+    await extractMessageVisuals({
+      tenantId,
+      instanceId,
+      conversationId: 1052,
+      messageId: 1,
+      visuals: fotos.map((dataUrl, i) => ({
+        id: null,
+        dataUrl,
+        name: `g${i}.png`,
+        imageDescription: null,
+        extractedText: null,
+      })),
+      cfg: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${visionKeyId}`,
+      } as never,
+      base: appDb,
+      deps: {
+        makeClient: async () => client,
+        fetchImpl: visionFetch(Array.from({ length: 8 }, () => "foto")),
+      },
+      signal: deadline.signal,
+    });
+    expect(cut).toBe(true);
+  });
+
+  test("a message the deadline cut halfway keeps what was read and names what was not", async () => {
+    await setVision(true);
+    const lida = blob(660, "lida.png");
+    const cortada = blob(661, "cortada.png");
+    const deadline = new AbortController();
+    // The first file's read is over, its result settled, before the deadline passes on the second.
+    const firstRead = Promise.withResolvers<void>();
+    const realRead = visionService.readInboundFile;
+    const reads = spyOn(visionService, "readInboundFile").mockImplementation(
+      (p: Parameters<typeof realRead>[0]) => {
+        const reading = realRead(p);
+        if (p.attachmentId === 660)
+          void reading.then(
+            () => firstRead.resolve(),
+            () => firstRead.resolve(),
+          );
+        return reading;
+      },
+    );
+    const fetchImpl = visionFetch(["Um comprovante."]);
+    const client = {
+      servesUrl: () => true,
+      downloadAttachment: async (dataUrl: string) => {
+        // The second file is still downloading when the deadline passes.
+        if (dataUrl === cortada) {
+          await firstRead.promise;
+          deadline.abort();
+        }
+        return { bytes: png(1200, 1600), contentType: "image/png" };
+      },
+      updateAttachmentMeta: async () => ({}),
+    } as unknown as ChatwootClient;
+    const r = await extractMessageVisuals({
+      tenantId,
+      instanceId,
+      conversationId: 1051,
+      messageId: 661,
+      visuals: [
+        {
+          id: 660,
+          dataUrl: lida,
+          name: "lida.png",
+          imageDescription: null,
+          extractedText: null,
+        },
+        {
+          id: 661,
+          dataUrl: cortada,
+          name: "cortada.png",
+          imageDescription: null,
+          extractedText: null,
+        },
+      ],
+      cfg: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${visionKeyId}`,
+      } as never,
+      base: appDb,
+      deps: {
+        makeClient: async () => client,
+        fetchImpl,
+      },
+      signal: deadline.signal,
+    }).finally(() => reads.mockRestore());
+    expect(provider.calls).toBe(1);
+    expect(r?.attachmentsUnread).toBe(1);
+    const nota = mediaAnnotationFor(tenantId, instanceId, 661);
+    expect(nota?.imageDescription).toContain("Um comprovante.");
+    expect(nota?.attachmentsUnread).toBe(1);
+  });
+
+  test("a passed deadline starts no provider call for an attachment", async () => {
+    await setVision(true);
+    const url = blob(600, "foto.png");
+    const deadline = new AbortController();
+    deadline.abort();
+    const r = await extractMessageVisuals({
+      tenantId,
+      instanceId,
+      conversationId: 1049,
+      messageId: 1,
+      visuals: [
+        {
+          id: 600,
+          dataUrl: url,
+          name: "foto.png",
+          imageDescription: null,
+          extractedText: null,
+        },
+      ],
+      cfg: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${visionKeyId}`,
+      } as never,
+      base: appDb,
+      deps: {
+        makeClient: stub({
+          page: [],
+          sizes: { [url]: [800, 600] },
+          downloads: [],
+          metaWrites: [],
+        }),
+        fetchImpl: visionFetch(["não deveria ler"]),
+      },
+      signal: deadline.signal,
+    });
+    expect(provider.calls).toBe(0);
+    expect(r?.attachmentsUnread).toBe(1);
   });
 
   test("a file whose read failed is read again by the next delivery that asks", async () => {
@@ -946,7 +1220,8 @@ describe.skipIf(!dbUp)("a picture in an email body reaches vision", () => {
       } as never,
       { fail: new Set([broken]) },
     );
-    expect(out.turn).toContain(unreadMarker(1));
+    expect(out.turn).toContain('<anexos-nao-lidos quantidade="1">');
+    expect(out.turn).toContain('motivo="falha"');
   });
 
   test("a body of ornaments only is not downloaded again by the next turn", async () => {

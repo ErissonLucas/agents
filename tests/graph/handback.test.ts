@@ -6,6 +6,7 @@ import {
   humanAgentMessage,
   humanHandbackMessage,
   memoryHeadMessage,
+  undeliveredProactiveNote,
 } from "@/graph/markers";
 import { HANDOFF_DONE_PREFIX } from "@/graph/tools/catalog";
 
@@ -65,10 +66,9 @@ const impostor = () => [
   }),
 ];
 
-// THE DECISION, on its own and as a table (issue #457). It is derived from the channel rather than
-// from a column, so the table IS the specification: every case below is a shape the thread really
-// takes, and the previous design needed a stamp in five different writers to answer the same
-// question — each of them a place to observe a takeover and forget to record it.
+// THE DECISION, on its own and as a table. It is derived from the channel rather than from a column,
+// so the table IS the specification: every case below is a shape the thread really takes. A stored
+// stamp would need five writers to agree, each a place to observe a takeover and forget to record it.
 describe("does the turn owe a hand-back note", () => {
   test("an ordinary conversation owes nothing", () => {
     expect(
@@ -79,8 +79,8 @@ describe("does the turn owe a hand-back note", () => {
     ).toBe(false);
   });
 
-  // The reporter's case: the agent transferred, and whether or not anybody replied the thread still
-  // reads as if a person were handling it.
+  // NOTE: The agent transferred, and whether or not anybody replied the thread still reads as if a
+  // person were handling it.
   test("a handoff nobody answered still owes one", () => {
     expect(
       owesHandbackNote([new HumanMessage("quero uma pessoa"), ...handoff()]),
@@ -94,6 +94,26 @@ describe("does the turn owe a hand-back note", () => {
         humanAgentMessage(42, "Oi, aqui é a Ana."),
       ]),
     ).toBe(true);
+  });
+
+  // A proactive draft noted because a person held the conversation tells the model a person holds it;
+  // handed back without a word, the next turn still needs the note. A window note says no such thing.
+  test("a proactive draft noted while a person held the conversation owes one", () => {
+    expect(
+      owesHandbackNote([
+        new HumanMessage("oi"),
+        undeliveredProactiveNote(42, "n1", "held", "Seu pagamento caiu."),
+      ]),
+    ).toBe(true);
+  });
+
+  test("a proactive draft noted for the closed window owes nothing", () => {
+    expect(
+      owesHandbackNote([
+        new HumanMessage("oi"),
+        undeliveredProactiveNote(42, "n1", "window", "Lembrete de amanhã."),
+      ]),
+    ).toBe(false);
   });
 
   // IDEMPOTENT WITH NO BOOKKEEPING, which is the whole reason this reads backwards: the note sitting
@@ -191,10 +211,10 @@ describe("does the turn owe a hand-back note", () => {
     ).toBe(false);
   });
 
-  // COMPACTION CARRIES THE EVIDENCE (issue #457, review round 8). A conversation resolved while a
-  // person still held it is summarized away — handoff result, human messages and all — and the raw
-  // form the two cases above read is simply gone. The head that replaced it says what the stretch
-  // ended in, so the first turn after the thread resumes still owes the note.
+  // NOTE: COMPACTION CARRIES THE EVIDENCE. A conversation resolved while a person still held it is
+  // summarized away (handoff result, human messages and all), so the raw form the two cases above
+  // read is gone. The head that replaces it says what the stretch ended in, so the first turn after
+  // the thread resumes still owes the note.
   test("a memory head that replaced a human stretch owes one", () => {
     expect(
       owesHandbackNote([

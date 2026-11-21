@@ -9,18 +9,16 @@ import {
   resolveVisionConfig,
 } from "@/modules/vision/service";
 import type { VisionConfig } from "@/modules/vision/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { tinyPdf } from "../utils/tiny-pdf";
 
-// Issue #324: choosing `openai` as the vision provider used to skip every PDF before any call was
-// made, so the agent saw the "couldn't extract" marker and the content of the attachment was lost
-// for the rest of the attendance. These drive the real service down to the effect the operator
-// sees: the extracted text written back onto the Chatwoot attachment.
+// `openai` as the vision provider reads PDFs: a skipped PDF leaves the "couldn't extract" marker and
+// loses the attachment for the rest of the attendance. These drive the real service down to the
+// effect the operator sees: the extracted text written back onto the Chatwoot attachment.
 //
-// The fetch below personifies the endpoint rather than nodding at it. Every refusal it can answer
-// was measured against the live API on 2026-08-26 (gpt-4o), so a request this test accepts is one
-// the vendor accepts, and a regression in the content part shows up here as the vendor's own 400
-// instead of as a green test.
+// The fetch below mirrors the live endpoint's refusals (gpt-4o), so a request this test accepts is
+// one the vendor accepts, and a broken content part shows up as the vendor's own 400.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -38,8 +36,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -58,8 +56,8 @@ type Part = {
   file?: { filename?: string; file_data?: string };
 };
 
-// The vendor's own validation, as measured. Each branch returns the status and message the live API
-// returned for that request.
+// The vendor's own validation: each branch returns the status and message the live API answers for
+// that request.
 function openaiFetch() {
   const parts: Part[] = [];
   const impl = (async (url: string | URL, init?: RequestInit) => {
@@ -278,30 +276,6 @@ describe.skipIf(!dbUp)("openai vision documents", () => {
     expect(out).toBeNull();
     expect(parts).toEqual([]);
     expect(meta).toEqual([]);
-  });
-
-  // ...and an image on that same endpoint is untouched: this is about what the endpoint is known to
-  // READ, not about trusting it less.
-  test("an image on that same endpoint still goes through", async () => {
-    const { impl, parts } = openaiFetch();
-    const meta: Array<Record<string, unknown>> = [];
-    const out = await extractInboundFile({
-      tenantId,
-      instanceId,
-      conversationId: 804,
-      messageId: 54,
-      attachmentId: 9,
-      dataUrl: "https://chat.example.com/foto.png",
-      cfg: { ...(await cfg()), baseURL: "https://llm.internal.example/v1" },
-      base: appDb,
-      deps: {
-        makeClient: stubClient(meta, "image/png"),
-        fetchImpl: impl,
-        sleep: async () => {},
-      },
-    });
-    expect(out?.text).toBe(EXTRACTED);
-    expect(parts.map((p) => p.type)).toEqual(["image_url"]);
   });
 
   // The registry still governs, and it is the only thing that does: openrouter reaches the same

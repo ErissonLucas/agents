@@ -1,21 +1,26 @@
 import basePrisma from "@/api/lib/prisma";
 import { AppError } from "@/lib/errors";
+import { parseInput } from "@/lib/parse-input";
 import {
-  assertAccountsClaimable,
-  assertAccountsSelectable,
   assertBindTargetNotObserving,
   assertDeploymentConnectable,
   assertDeploymentNotSwitching,
   assertInboxBindable,
   assertInboxReconnectable,
   bindInbox,
+  chatwootDeploymentUpdateSchema,
   connectChatwootDeployment,
   getChatwootInstance,
+  type InboxBotReading,
+  type ListAccountsDeps,
   listChatwootAccounts,
   listDeploymentAccounts,
   listInboxes,
   observeInbox,
+  planAccountClaims,
+  previewChatwootDeploymentUpdate,
   previewInboxRemoval,
+  readInboxBotForBind,
   readObserveTarget,
   reconcileInboxBots,
   reconnectInbox,
@@ -25,7 +30,12 @@ import {
   softDisconnectChatwootInstance,
   syncInboxes,
   unobserveInbox,
+  updateChatwootDeployment,
 } from "@/modules/chatwoot/management";
+import {
+  bindInboxVoiceAgent,
+  checkVoiceBinding,
+} from "@/modules/voice-call/inboxes";
 import type { VerifiedToken } from "./oauth/tokens";
 import {
   adminGate,
@@ -56,6 +66,10 @@ export interface DeploymentConnectArgs {
   // provisioning, or the user has it). Used in-band but kept out of the audit (metadata only). REST
   // parity: POST /v1/chatwoot/deployment also takes the token inline.
   admin_token: string;
+  // The base this Chatwoot calls the agents on, and the address people open it on. Optional; null or
+  // empty means the default (PUBLIC_URL, and base_url). REST parity: the same fields on the POST.
+  webhook_base_url?: string | null;
+  public_url?: string | null;
   dry_run?: boolean;
 }
 
@@ -73,29 +87,44 @@ export async function deploymentConnect(
   if (!args.admin_token) return err("admin_token is required");
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // The core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       const data = await assertDeploymentConnectable({
         baseUrl: args.base_url,
         adminToken: args.admin_token,
+        webhookBaseUrl: args.webhook_base_url,
+        publicUrl: args.public_url,
       });
-      // ADVISORY, unlike the line above it: this one READS. It passes the base URL that line
-      // NORMALIZED, because that is what the write compares against and what it stores — asking
-      // with the raw string would call a connect to the same server a switch (#490).
+      // NOTE: ADVISORY, since this one READS. It takes the base URL the line above NORMALIZED,
+      // which is what the write compares and stores; the raw string would call a reconnect a
+      // switch.
       await assertDeploymentNotSwitching(ctx, data.baseUrl, base);
       return ok({
         dryRun: true,
         action: "connect",
         resource: "chatwoot_deployment",
         // The raw token is never echoed back, not even in the preview.
-        preview: { baseUrl: args.base_url, adminToken: "(redacted)" },
+        preview: {
+          baseUrl: args.base_url,
+          adminToken: "(redacted)",
+          // Only what the call sends: an omitted field keeps the stored value, null resets it.
+          ...(data.webhookBaseUrl !== undefined
+            ? { webhookBaseUrl: data.webhookBaseUrl }
+            : {}),
+          ...(data.publicUrl !== undefined
+            ? { publicUrl: data.publicUrl }
+            : {}),
+        },
       });
     }
     const result = await connectChatwootDeployment(
       ctx,
-      { baseUrl: args.base_url, adminToken: args.admin_token },
+      {
+        baseUrl: args.base_url,
+        adminToken: args.admin_token,
+        webhookBaseUrl: args.webhook_base_url,
+        publicUrl: args.public_url,
+      },
       {},
       base,
     );
@@ -138,6 +167,78 @@ export async function deploymentRotateToken(
   }
 }
 
+// Edit the connection (REST parity: PATCH /v1/chatwoot/deployment): a new base URL of the same
+// Chatwoot, the admin token and the two optional addresses. The preview asks what the apply asks; a
+// new webhook base moves the live bots on apply.
+export async function deploymentUpdate(
+  principal: VerifiedToken,
+  args: {
+    base_url?: string;
+    admin_token?: string;
+    webhook_base_url?: string | null;
+    public_url?: string | null;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps & ListAccountsDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = adminGate(principal);
+  if ("ok" in ctx) return ctx;
+  if (
+    args.base_url === undefined &&
+    args.admin_token === undefined &&
+    args.webhook_base_url === undefined &&
+    args.public_url === undefined
+  ) {
+    return err(
+      "send base_url, admin_token, webhook_base_url and/or public_url",
+    );
+  }
+  try {
+    const input = {
+      ...(args.base_url !== undefined ? { baseUrl: args.base_url } : {}),
+      ...(args.admin_token !== undefined
+        ? { adminToken: args.admin_token }
+        : {}),
+      webhookBaseUrl: args.webhook_base_url,
+      publicUrl: args.public_url,
+    };
+    if (args.dry_run !== false) {
+      const data = parseInput(chatwootDeploymentUpdateSchema, input);
+      // The same refusals the apply makes (no connection, an unchanged address with nothing else, a
+      // refused address or token), asked read-only.
+      const { baseUrl: movedTo } = await previewChatwootDeploymentUpdate(
+        ctx,
+        data,
+        deps,
+        base,
+      );
+      return ok({
+        dryRun: true,
+        action: "update",
+        resource: "chatwoot_deployment",
+        // The raw token is never echoed back, not even in the preview.
+        preview: {
+          ...(movedTo !== null ? { baseUrl: movedTo } : {}),
+          ...(data.adminToken !== undefined
+            ? { adminToken: "(redacted)" }
+            : {}),
+          ...(data.webhookBaseUrl !== undefined
+            ? { webhookBaseUrl: data.webhookBaseUrl }
+            : {}),
+          ...(data.publicUrl !== undefined
+            ? { publicUrl: data.publicUrl }
+            : {}),
+        },
+      });
+    }
+    const deployment = await updateChatwootDeployment(ctx, input, deps, base);
+    return ok({ dryRun: false, applied: true, deployment });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
 // List the accounts the deployment's STORED token can reach (no token re-entry).
 export async function deploymentListAccounts(
   principal: VerifiedToken,
@@ -168,28 +269,15 @@ export async function deploymentSetAccounts(
   const target = "chatwoot_deployment:accounts";
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
-      await assertAccountsClaimable(ctx, args.account_ids, base);
-      // NOTE: ADVISORY, like the claim check above it: the list lives on the operator's Chatwoot and
-      // can move between the preview and the apply, which asks again inside its own sequence. What
-      // it buys is that an id this deployment cannot operate is refused here instead of being
-      // previewed as a connection the apply then declines (#490, #503).
-      let reported: number[] | null = null;
-      try {
-        reported = (
-          await listDeploymentAccounts(
-            ctx,
-            { fetchProfile: deps.fetchProfile },
-            base,
-          )
-        ).map((a) => a.id);
-      } catch {
-        // probe failed — the core applies the same fallback cap for itself
-      }
-      assertAccountsSelectable([...new Set(args.account_ids)], reported);
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
+      // ADVISORY: the account list and the claims can move before the apply, which asks again.
+      await planAccountClaims(
+        ctx,
+        args.account_ids,
+        { fetchProfile: deps.fetchProfile, fetchAccount: deps.fetchAccount },
+        base,
+      );
       return ok({
         dryRun: true,
         action: "set_accounts",
@@ -201,7 +289,11 @@ export async function deploymentSetAccounts(
     const accounts = await setConnectedAccounts(
       ctx,
       args.account_ids,
-      { fetchProfile: deps.fetchProfile, makeClient: deps.makeClient },
+      {
+        fetchProfile: deps.fetchProfile,
+        fetchAccount: deps.fetchAccount,
+        makeClient: deps.makeClient,
+      },
       base,
     );
     return ok({ dryRun: false, applied: true, accounts });
@@ -295,6 +387,98 @@ export async function instanceSyncInboxes(
 
 export async function inboxBind(
   principal: VerifiedToken,
+  args: {
+    inbox_id: string;
+    agent_id?: string | null;
+    replace_foreign_bot?: boolean;
+    dry_run?: boolean;
+  },
+  deps: WriteDeps = {},
+): Promise<WriteResult> {
+  const base = deps.base ?? basePrisma;
+  const ctx = gate(principal);
+  if ("ok" in ctx) return ctx;
+  const inboxId = parseMcpId(args.inbox_id, "inbox_id");
+  if (typeof inboxId !== "bigint") return inboxId;
+  let agentId: bigint | null = null;
+  if (args.agent_id !== undefined && args.agent_id !== null) {
+    const parsed = parseMcpId(args.agent_id, "agent_id");
+    if (typeof parsed !== "bigint") return parsed;
+    agentId = parsed;
+  }
+  try {
+    const inboxes = await listInboxes(ctx, base);
+    const current = inboxes.find((i) => i.id === String(inboxId));
+    if (!current) return err("inbox not found");
+    const target = `inbox:${inboxId}`;
+    if (args.dry_run !== false) {
+      // The core's own two questions past existence: the account is still connected, and the
+      // agent being bound exists. `listInboxes` above answers neither.
+      const { inbox } = await assertInboxBindable(ctx, inboxId, agentId, base);
+      // NOTE: the apply refuses an agent that already OBSERVES this inbox, so the preview asks too.
+      if (agentId !== null) {
+        await assertBindTargetNotObserving(ctx, inboxId, agentId, base);
+      }
+      // The apply replaces whatever bot answers the inbox, so the preview names it: a bot this
+      // instance does not own is dropped, and unbinding later does not bring it back.
+      const replaces =
+        agentId !== null && String(agentId) !== current.agentId
+          ? await readInboxBotForBind(
+              ctx,
+              inbox,
+              { makeClient: deps.makeClient },
+              base,
+            )
+          : null;
+      return ok({
+        dryRun: true,
+        action: "bind",
+        target,
+        currentAgentId: current.agentId,
+        newAgentId: agentId === null ? null : String(agentId),
+        ...(replaces ? { currentAgentBot: replaces } : {}),
+        ...replacementWarning(replaces),
+        note: "Binding provisions/connects the agent's bot on the inbox (calls Chatwoot).",
+      });
+    }
+    const updated = await bindInbox(
+      ctx,
+      inboxId,
+      agentId,
+      { makeClient: deps.makeClient },
+      base,
+      { replaceForeignBot: args.replace_foreign_bot === true },
+    );
+    return ok({ dryRun: false, applied: true, target, inbox: updated });
+  } catch (e) {
+    return failOf(e);
+  }
+}
+
+// What the preview adds when the apply would drop a bot this instance does not own, or one it could
+// not read: the apply refuses without `replace_foreign_bot`, so the preview says so up front.
+function replacementWarning(reading: InboxBotReading | null) {
+  if (reading?.kind === "foreign") {
+    const bot = reading.botName ?? `#${reading.botId}`;
+    return {
+      requiresReplaceForeignBot: true,
+      warning: `This inbox is answered by the Agent Bot "${bot}", which is not from this instance. Applying replaces it, and unbinding later does not bring it back; apply with replace_foreign_bot true to confirm.`,
+    };
+  }
+  if (reading?.kind === "unreadable") {
+    return {
+      requiresReplaceForeignBot: true,
+      warning:
+        "Could not read which Agent Bot answers this inbox. If another one is attached, applying replaces it, and unbinding later does not bring it back; apply with replace_foreign_bot true to confirm.",
+    };
+  }
+  return {};
+}
+
+// The CALLS binding: which voice agent answers an inbox's WhatsApp calls, beside its text agent. The
+// preview asks the core's refusals without its locks (`checkVoiceBinding`).
+export async function inboxBindVoice(
+  principal: VerifiedToken,
   args: { inbox_id: string; agent_id?: string | null; dry_run?: boolean },
   deps: WriteDeps = {},
 ): Promise<WriteResult> {
@@ -315,34 +499,26 @@ export async function inboxBind(
     if (!current) return err("inbox not found");
     const target = `inbox:${inboxId}`;
     if (args.dry_run !== false) {
-      // NOTE: the core's own two questions past existence — the account is still connected, and the
-      // agent being bound exists. `listInboxes` above answers neither, and the preview approved a
-      // bind the apply refuses with a 409 (#510).
-      await assertInboxBindable(ctx, inboxId, agentId, base);
-      // The apply refuses an agent that already OBSERVES this inbox (issue #476 review, round 25),
-      // and a preview that approves it hands the caller a confident yes followed by a 422.
-      if (agentId !== null) {
-        await assertBindTargetNotObserving(ctx, inboxId, agentId, base);
-      }
+      await checkVoiceBinding(ctx, inboxId, agentId, base);
       return ok({
         dryRun: true,
-        action: "bind",
+        action: "bind_voice",
         target,
-        currentAgentId: current.agentId,
-        newAgentId: agentId === null ? null : String(agentId),
-        note: "Binding provisions/connects the agent's bot on the inbox (calls Chatwoot).",
+        currentVoiceAgentId: current.voiceAgentId,
+        newVoiceAgentId: agentId === null ? null : String(agentId),
+        note: "Binding writes the inbox's calls to Chatwoot.",
       });
     }
-    const updated = await bindInbox(ctx, inboxId, agentId, {}, base);
-    return ok({ dryRun: false, applied: true, target, inbox: updated });
+    const bound = await bindInboxVoiceAgent(ctx, inboxId, agentId, {}, base);
+    return ok({ dryRun: false, applied: true, target, ...bound });
   } catch (e) {
     return failOf(e);
   }
 }
 
-// The OBSERVER binding (issue #476): attach a monitoring agent to an inbox as an observer, or
-// detach it. Same preview shape as `inboxBind`; the apply provisions/attaches the agent's bot on
-// Chatwoot (or detaches it) and records the observer list before and after.
+// The OBSERVER binding: attach a monitoring agent to an inbox as an observer, or detach it. Same
+// preview shape as `inboxBind`; the apply provisions/attaches the agent's bot on Chatwoot (or
+// detaches it) and records the observer list before and after.
 export async function inboxObserve(
   principal: VerifiedToken,
   args: { inbox_id: string; agent_id: string; dry_run?: boolean },
@@ -427,10 +603,9 @@ export async function inboxRemove(
       name: inbox.name,
       chatwootInboxId: inbox.chatwootInboxId,
       agentId: inbox.agentId,
-      // THE WATCHERS THE CASCADE WILL TAKE (issue #476 review, round 50). `InboxObserver` cascades on
-      // the inbox's foreign key, so this removal discards bindings the caller never named — and those
-      // bindings are what refuse the agent's mode change and its deletion elsewhere. A preview that
-      // omits them shows a removal smaller than the one it is approving.
+      // NOTE: the watchers the cascade will take. `InboxObserver` cascades on the inbox's foreign
+      // key, and those bindings are what refuse the agent's mode change and deletion elsewhere, so
+      // a preview without them shows a smaller removal than the one it approves.
       observerAgentIds: inbox.observerAgentIds,
     };
     if (args.dry_run !== false) {
@@ -465,10 +640,8 @@ export async function inboxReconnect(
   const target = `inbox:${inboxId}`;
   try {
     if (args.dry_run !== false) {
-      // NOTE: the core's own question, asked before the preview answers it. It sits INSIDE the
-      // branch rather than above it because the apply reaches the core, which asks it again —
-      // and several of these read a row or resolve DNS, so above the branch is a second lookup
-      // that can even disagree with the first (#490).
+      // NOTE: the core's own question, asked INSIDE the branch because the apply reaches the core,
+      // which asks it again; above the branch it would be a second lookup that can disagree.
       await assertInboxReconnectable(ctx, inboxId, base);
       return ok({
         dryRun: true,
@@ -503,8 +676,8 @@ export async function inboxReconcile(
   }
   try {
     const reconciled = await reconcileInboxBots(ctx, {}, base);
-    // `status` stays the flat responder map it has always been — a caller reading `status[inboxId]`
-    // is not broken by the observers arriving beside it, under their own key (issue #476).
+    // NOTE: `status` stays the flat responder map; observers arrive beside it under their own key,
+    // so a caller reading `status[inboxId]` is not broken.
     return ok({
       dryRun: false,
       applied: true,

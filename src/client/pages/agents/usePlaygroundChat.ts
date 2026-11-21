@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "@/client/lib/api";
+import {
+  holdInFlight,
+  holdWhile,
+  useHeldDraft,
+} from "@/client/lib/unsavedGuard";
 
 // Shape of the playground response, derived from the Eden treaty (never hand-declared — see
 // docs/eden-treaty.md).
@@ -10,7 +15,7 @@ type PlaygroundData = NonNullable<
   >["data"]
 >;
 
-// What a turn spent, as the provider reported it (issue #839): the same numbers as its ledger rows.
+// What a turn spent, as the provider reported it: the same numbers as its ledger rows.
 export type PlaygroundUsage = PlaygroundData["usage"];
 
 // How long a turn took and how much of that was model time. Live turns only: the ledger keeps no
@@ -35,6 +40,8 @@ export function addUsage(
     promptTokens: a.promptTokens + b.promptTokens,
     cachedReadTokens: a.cachedReadTokens + b.cachedReadTokens,
     cacheCreationTokens: a.cacheCreationTokens + b.cacheCreationTokens,
+    cacheCreation1hTokens:
+      (a.cacheCreation1hTokens ?? 0) + (b.cacheCreation1hTokens ?? 0),
     completionTokens: a.completionTokens + b.completionTokens,
     costUsd: a.costUsd + b.costUsd,
     unpricedCalls: a.unpricedCalls + b.unpricedCalls,
@@ -54,6 +61,7 @@ export const NO_USAGE: PlaygroundUsage = {
   promptTokens: 0,
   cachedReadTokens: 0,
   cacheCreationTokens: 0,
+  cacheCreation1hTokens: 0,
   completionTokens: 0,
   byNode: {},
   costUsd: 0,
@@ -85,7 +93,7 @@ export type PlaygroundTurn =
       pending?: boolean;
     }
   // `turnId`: the turn the failure ended, when the server named it, for the link to its lines on the
-  // Logs page (issue #841).
+  // Logs page.
   | { role: "error"; text: string; turnId?: string }
   | {
       role: "note";
@@ -202,27 +210,14 @@ function loadSim(agentId: string): PersistedSim {
   };
 }
 
-// The one definition of what an agent turn LOOKS like, shared by every path that produces one: the
-// text turn, the file turn, the voice note, the follow-up, and the reload that rebuilds them from
-// the server. The rule it carries — a turn the guardrail emptied renders as a NOTE carrying the
-// verdict, never as a bubble reading "(no reply)" — used to be written once per call site, and the
-// two media paths were born without it (issue #136): a suppressed file turn showed an empty bubble
-// live and a note after a reload. A bubble reads as the agent having had nothing to say, which is
-// precisely the distinction the transcript store exists to keep.
-//
-// NOTE: `silent` has no reload counterpart, and that predates this hook's guardrail work: a
-// follow-up the agent declined leaves an empty AI message, which the rebuild drops by design. Only
-// turns the guardrail acted on get a stored note.
 // The app's catch-all answer to an unhandled failure outside development (`src/app.ts`). It says
 // nothing the generic sentence does not, so it is not shown as if it were the server's reason.
 const UNHANDLED_PLACEHOLDER = "Something went wrong";
 
-// What a failed playground call tells the operator (issue #841). The server's own reason when the
-// call carried one: a refusal's JSON `error`, or a plain-text body, which is the unhandled failure's
-// detail in development. Otherwise a sentence that says what is known and nothing more: the old one
-// pointed at the model's configuration on every failure, and the failure that prompted this was a
-// database error with the model configured. A call that never got an answer is a failure to reach
-// the server, which is a different thing to tell the operator.
+// What a failed playground call tells the operator: the server's own reason when the call carried
+// one (a refusal's JSON `error`, or a plain-text body, the unhandled failure's detail in
+// development). Otherwise only what is known: an answer without a reason, or a failure to reach the
+// server, never a guess at the model's configuration.
 export function playgroundFailure(
   err: unknown,
   t: (key: string, fallback: string) => string,
@@ -244,9 +239,9 @@ export function playgroundFailure(
         : undefined;
   const turnId =
     typeof body?.turnId === "string" && body.turnId ? body.turnId : undefined;
-  // A request that never reached the server is not an answer, even though the client hands it back
-  // as one: Eden turns a failed `fetch` into an error of status 503 whose value is the fetch's own
-  // TypeError (measured against a closed port), so its presence says nothing about the server.
+  // A request that never reached the server is not an answer, even though the client hands it
+  // back as one: Eden turns a failed `fetch` into a 503 error whose value is the fetch's own
+  // TypeError, so its presence says nothing about the server.
   const answered = !!err && !(value instanceof Error);
   const text =
     reason ??
@@ -262,6 +257,11 @@ export function playgroundFailure(
   return turnId ? { text, turnId } : { text };
 }
 
+// The one definition of what an agent turn LOOKS like, shared by every path that produces one (text,
+// file, voice note, follow-up, and the reload that rebuilds them). A turn the guardrail emptied
+// renders as a NOTE carrying the verdict, never as a "(no reply)" bubble, which would read as the
+// agent having had nothing to say. `silent` has no reload counterpart: a declined follow-up leaves
+// an empty AI message, which the rebuild drops by design.
 export function agentTurn(
   t: (key: string, fallback: string) => string,
   r: {
@@ -270,6 +270,8 @@ export function agentTurn(
     suppressed?: boolean;
     // The agent itself chose to send nothing (follow-up only; no verdict to show).
     silent?: boolean;
+    // A closing step that only labels and resolves: no model was reached (follow-up only).
+    closesOnly?: boolean;
     followup?: boolean;
     audioUrl?: string;
     trace: PlaygroundData["trace"];
@@ -284,8 +286,8 @@ export function agentTurn(
   };
   if (r.suppressed) {
     // A hand-over with no message to the customer empties the reply too, and it is a different
-    // outcome from a suppression: the case would reach a person (issue #704). Read off the verdict,
-    // which a reload restores with the turn.
+    // outcome from a suppression: the case would reach a person. Read off the verdict, which a reload
+    // restores with the turn.
     const handedOff = r.trace.some(
       (e) => e.type === "guardrail" && e.outcome === "handed-off",
     );
@@ -302,6 +304,16 @@ export function agentTurn(
             "Nothing would be sent: the guardrail acted on this turn.",
           ),
       trace: r.trace,
+    };
+  }
+  if (r.closesOnly) {
+    return {
+      role: "note",
+      ...usage,
+      text: t(
+        "playground.followup.closesOnly",
+        "Follow-up: this step sends no message; it only applies the labels and resolves the conversation.",
+      ),
     };
   }
   if (r.silent) {
@@ -325,6 +337,55 @@ export function agentTurn(
   };
 }
 
+// Opening an agent's screen starts a new session; a reload of a tab that had a saved session open
+// brings that one back. `pagehide` writes the marker, and the next mount takes it only when this
+// document is a reload of the URL that wrote it: `pagehide` also fires when the tab leaves for
+// another document, and in-app navigation never fires it. docs/playground.md.
+export const PLAYGROUND_RESUME_KEY = "@app:playground-resume";
+
+function writeResumeMarker(agentId: string, threadId: string): void {
+  try {
+    sessionStorage.setItem(
+      PLAYGROUND_RESUME_KEY,
+      JSON.stringify({ agentId, threadId, href: location.href }),
+    );
+  } catch {
+    // storage unavailable → the reload opens a new session
+  }
+}
+
+function dropResumeMarker(): void {
+  try {
+    sessionStorage.removeItem(PLAYGROUND_RESUME_KEY);
+  } catch {
+    // storage unavailable → there is no marker to drop
+  }
+}
+
+function documentIsReloadOf(href: unknown): boolean {
+  const nav = performance.getEntriesByType("navigation")[0] as
+    | PerformanceNavigationTiming
+    | undefined;
+  return nav?.type === "reload" && nav.name === href;
+}
+
+// Reads and removes the marker, returning the thread only when it was left by this agent in the
+// document this one reloaded.
+function takeResumeMarker(agentId: string): string | undefined {
+  try {
+    const raw = sessionStorage.getItem(PLAYGROUND_RESUME_KEY);
+    sessionStorage.removeItem(PLAYGROUND_RESUME_KEY);
+    const m = raw ? (JSON.parse(raw) as Record<string, unknown>) : null;
+    return m?.agentId === agentId &&
+      typeof m.threadId === "string" &&
+      documentIsReloadOf(m.href)
+      ? m.threadId
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // All playground chat state + actions for ONE agent, in a single hook so the editor tab and the
 // floating popup can share the SAME conversation: lift this hook into the parent (AgentEditorPage)
 // and the state survives switching between them. `getDraft` (when provided) is read at send time so
@@ -341,9 +402,9 @@ export function usePlaygroundChat(
   );
   getDraftRef.current = opts.getDraft;
   const [turns, setTurns] = useState<PlaygroundTurn[]>([]);
-  // The open session's total (issue #839). Always the ledger's, re-read after every turn rather than
-  // grown from the replies: a turn can fail after a call it was billed for, and the ledger is the
-  // one place that has it. The per-turn line comes from the reply.
+  // The open session's total, always the ledger's, re-read after every turn rather than grown
+  // from the replies: a turn can fail after a call it was billed for, and the ledger is the one place
+  // that has it. The per-turn line comes from the reply.
   const [sessionUsage, setSessionUsage] = useState<PlaygroundUsage>(NO_USAGE);
   const [input, setInput] = useState("");
   const [sending, setSending] = useState(false);
@@ -352,6 +413,9 @@ export function usePlaygroundChat(
   const [extracting, setExtracting] = useState(false);
   const [recordState, setRecordState] = useState<RecordState>("idle");
   const [recordStream, setRecordStream] = useState<MediaStream | null>(null);
+  // Between stop() and the browser's `stop` event the recording is neither running nor being
+  // transcribed yet, and it is still the operator's, even if the editor unmounts meanwhile.
+  const releaseFinalizing = useRef<(() => void) | null>(null);
   const [sessions, setSessions] = useState<PlaygroundSessionMeta[]>([]);
   const [loadingSession, setLoadingSession] = useState(false);
   // Manual "reply with audio" toggle: forces TTS on every turn regardless of the agent's mode.
@@ -467,6 +531,11 @@ export function usePlaygroundChat(
 
   const busy = sending || followingUp || transcribing || extracting;
   const recording = recordState !== "idle";
+  // What the composer holds while it is on screen: typed text and a recording running or paused.
+  // Every write holds by itself in the API client (holdingWrites), and a file or a stopped recording
+  // holds from the moment it leaves the composer until its last request (holdWhile, holdInFlight), so
+  // both keep holding after the editor unmounts.
+  useHeldDraft(input.trim() !== "" || recording);
   const hasConversation = turns.some(
     (x) => x.role === "user" || x.role === "assistant",
   );
@@ -522,6 +591,11 @@ export function usePlaygroundChat(
   useEffect(() => {
     const urls = objectUrlsRef.current;
     return () => {
+      // Stopping the tracks ends a live recording, and its `stop` event uploads it after this
+      // unmount; the hold covers that gap as stopRecording does.
+      const rec = mediaRecorderRef.current;
+      if (rec && rec.state !== "inactive")
+        releaseFinalizing.current ??= holdInFlight();
       for (const track of streamRef.current?.getTracks() ?? []) track.stop();
       for (const url of urls) URL.revokeObjectURL(url);
     };
@@ -570,8 +644,8 @@ export function usePlaygroundChat(
               suppressed: rt.suppressed,
               followup: rt.followup,
               ...(ttsM ? { audioUrl: mediaUrl(ttsM.id) } : {}),
-              // The ledger's rows for this turn (issue #839): the same line the turn had live, less
-              // its timing, which the ledger does not keep.
+              // NOTE: The ledger's rows for this turn: the same line the turn had live, less its timing, which
+              // the ledger does not keep.
               ...(rt.usage ? { usage: rt.usage } : {}),
               trace: rt.trace,
               sources: rt.sources,
@@ -604,22 +678,54 @@ export function usePlaygroundChat(
     [agentId, newSession],
   );
 
-  // On mount (per agent), load history and resume the most recent session so a tab switch / reload
-  // doesn't lose the conversation.
+  // The session a reload brought this mount back to (PLAYGROUND_RESUME_KEY), taken out of storage
+  // when the mount happens, so leaving before it opens leaves nothing for the next mount. Held until
+  // the session is open, so a reload before then writes it back. A ref, because StrictMode's
+  // replayed effect keeps it and a real unmount does not.
+  const resumeRef = useRef<{ threadId: string | undefined } | null>(null);
+
+  // On mount (per agent), load the history list, and reopen a session only when this mount follows
+  // a reload that had one open.
   // biome-ignore lint/correctness/useExhaustiveDependencies: load once per agent mount
   useEffect(() => {
+    resumeRef.current ??= { threadId: takeResumeMarker(agentId) };
     let cancelled = false;
     void (async () => {
       const { data } = await api.api.v1
         .agents({ id: agentId })
         .playground.sessions.get();
-      if (cancelled || !data) return;
-      setSessions(data.sessions);
-      const latest = data.sessions[0];
-      if (latest && !cancelled) await loadSession(latest.threadId);
+      if (cancelled) return;
+      const resume = resumeRef.current?.threadId;
+      try {
+        if (!data) return;
+        setSessions(data.sessions);
+        if (resume) await loadSession(resume);
+      } finally {
+        resumeRef.current = { threadId: undefined };
+      }
     })();
     return () => {
       cancelled = true;
+    };
+  }, [agentId]);
+
+  useEffect(() => {
+    const onPageHide = () => {
+      const tid = sessionSaved.current
+        ? threadId.current
+        : resumeRef.current?.threadId;
+      if (tid) writeResumeMarker(agentId, tid);
+    };
+    // A page restored from the back-forward cache never remounts, so the marker its pagehide
+    // wrote would otherwise be taken by the next in-app visit to this agent.
+    const onPageShow = (e: PageTransitionEvent) => {
+      if (e.persisted) dropResumeMarker();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    window.addEventListener("pageshow", onPageShow);
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      window.removeEventListener("pageshow", onPageShow);
     };
   }, [agentId]);
 
@@ -718,6 +824,7 @@ export function usePlaygroundChat(
           text: data.reply,
           suppressed: data.suppressed,
           silent: data.silent,
+          closesOnly: data.closesOnly,
           followup: true,
           trace: data.trace,
           sources: data.sources,
@@ -777,7 +884,7 @@ export function usePlaygroundChat(
   //   1) /file/extract → kind + content (fast) → render it under the file;
   //   2) /file (with that extraction) → the agent reply. Passing the extraction back skips a second
   //      vision round trip, so step 2 isn't slowed by re-extracting.
-  const sendFile = useCallback(
+  const sendFileNow = useCallback(
     async (file: File) => {
       if (notReady || busy || recording) return;
       const wasNew = !sessionSaved.current;
@@ -819,8 +926,8 @@ export function usePlaygroundChat(
         }
         kind = data.kind;
         extracted = data.extracted;
-        // The read is billed to the session it is sent into, so the turn below runs on the thread
-        // the extraction named, and its line counts the read with the reply (issue #839).
+        // NOTE: The read is billed to the session it is sent into, so the turn below runs on the thread
+        // the extraction named, and its line counts the read with the reply.
         threadId.current = data.threadId;
         extractUsage = data.usage;
         extractTiming = data.timing;
@@ -900,6 +1007,12 @@ export function usePlaygroundChat(
       ensureThread,
     ],
   );
+  // The API client holds each request; this holds the gaps between them: the file read into the
+  // multipart body before the first one, and the session total read between the two writes.
+  const sendFile = useCallback(
+    (file: File) => holdWhile(() => sendFileNow(file)),
+    [sendFileNow],
+  );
 
   // ---- Recording (mic → transcribe → turn) ----
   const releaseStream = useCallback(() => {
@@ -938,7 +1051,7 @@ export function usePlaygroundChat(
   //   1) /audio/transcribe → transcription (fast) → render it immediately;
   //   2) /audio (with that transcription) → the agent reply. Passing the transcription back skips a
   //      second STT round trip, so step 2 isn't slowed by re-transcribing.
-  const sendRecording = useCallback(
+  const sendRecordingNow = useCallback(
     async (blob: Blob) => {
       if (blob.size === 0) return;
       const wasNew = !sessionSaved.current;
@@ -1035,6 +1148,11 @@ export function usePlaygroundChat(
       ensureThread,
     ],
   );
+  // Same as sendFile: the recording is read into the multipart body before its first request.
+  const sendRecording = useCallback(
+    (blob: Blob) => holdWhile(() => sendRecordingNow(blob)),
+    [sendRecordingNow],
+  );
 
   const startRecording = useCallback(async () => {
     if (busy || recording || notReady) return;
@@ -1064,18 +1182,22 @@ export function usePlaygroundChat(
       if (ev.data.size > 0) audioChunksRef.current.push(ev.data);
     };
     rec.onstop = () => {
+      const release = releaseFinalizing.current;
+      releaseFinalizing.current = null;
       releaseStream();
       // A cancel set canceledRef before stop(): discard the recording (don't transcribe/send),
       // even though stop()'s trailing dataavailable repopulated the chunks.
       if (canceledRef.current) {
         canceledRef.current = false;
         audioChunksRef.current = [];
+        release?.();
         return;
       }
       const blob = new Blob(audioChunksRef.current, {
         type: rec.mimeType || "audio/webm",
       });
       void sendRecording(blob);
+      release?.();
     };
     rec.start();
     setRecordState("recording");
@@ -1099,7 +1221,10 @@ export function usePlaygroundChat(
 
   const stopRecording = useCallback(() => {
     const rec = mediaRecorderRef.current;
-    if (rec && rec.state !== "inactive") rec.stop(); // → onstop → sendRecording
+    if (rec && rec.state !== "inactive") {
+      releaseFinalizing.current ??= holdInFlight();
+      rec.stop(); // → onstop → sendRecording
+    }
     setRecordState("idle");
   }, []);
 

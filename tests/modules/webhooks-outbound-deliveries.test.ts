@@ -10,10 +10,11 @@ import {
   requeueWebhookDelivery,
 } from "@/modules/webhooks/outbound/deliveries";
 import { processOutboundBatch } from "@/modules/webhooks/outbound/worker";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "@/tests/utils/flowlog";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { until } from "@/tests/utils/poll";
 
-// ── THE DELIVERY LEDGER AS A SUPPORTED SURFACE (issue #305) ──
+// ── THE DELIVERY LEDGER AS A SUPPORTED SURFACE ──
 // Integration, real DB, real RLS: every call goes through `runScopedOn` exactly as the controller
 // and the MCP tools reach it, so a cross-tenant read fails here the way it would in production
 // rather than the way a mocked client would let it.
@@ -38,8 +39,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -85,9 +86,7 @@ async function seed(
   return row.id;
 }
 
-// The state the requeue undid, as the trail recorded it from inside the lock. It used to travel
-// back on the return value, for the MCP tool to record one layer up; the row is the same evidence
-// read where it now lives.
+// The state the requeue undid, as the trail recorded it from inside the lock.
 async function requeueAudit(id: bigint) {
   return suDb.auditLog.findFirst({
     where: {
@@ -105,25 +104,17 @@ async function clearDeliveries() {
   );
 }
 
-// The emit is fire-and-forget, so the line lands after the call returned. Poll for it rather than
-// sleeping a fixed amount: a fixed sleep is either flaky or slow and never says which.
-async function webhookLines(expected: number, waitMs = POLL_DEADLINE_MS) {
-  const deadline = Date.now() + waitMs;
-  for (;;) {
-    // flowlog-scope: tenant-wide — the subject is HOW MANY lines a requeue writes, so scoping the
-    // read to a turn would answer a different question and stay green with a second row present.
-    // Scoping it to the requeued delivery would immunise this one assertion and leave every other
-    // clear site in the tree exposed, which is why issue #375 was answered at the clear instead: the
-    // tenant is this file's own, and `clearFlowLog` settles the scheduled writes before deleting, so
-    // the table is empty of the previous case's line AND of the one it had not written yet.
-    const rows = await flowLogRows(suDb, {
-      where: { tenantId, stage: "webhook" },
-      orderBy: { id: "asc" },
-    });
-    if (rows.length >= expected) return rows;
-    if (Date.now() > deadline) return rows;
-    await Bun.sleep(50);
-  }
+// The emit is fire-and-forget, so the line lands after the call returned; `flowLogRows` settles the
+// scheduled writes before it reads, so one read sees every line the call owed, and no line it did not.
+async function webhookLines() {
+  // flowlog-scope: tenant-wide. The subject is HOW MANY lines a requeue writes, so a turn-scoped read
+  // stays green with a second row present. Scoping to the delivery would immunise only this read,
+  // so the fence is at the clear: the tenant is this file's own, and `clearFlowLog` settles the
+  // scheduled writes before deleting, emptying the previous case's line AND its unwritten one.
+  return flowLogRows(suDb, {
+    where: { tenantId, stage: "webhook" },
+    orderBy: { id: "asc" },
+  });
 }
 
 describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
@@ -369,9 +360,9 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
     });
 
     test("a requeue keeping the attempt count would buy ONE post, which is why it resets", async () => {
-      // The measurement behind the design, run as a test so it cannot quietly stop being true:
-      // `finalizeFailure` gives up at attempts + 1 >= MAX_ATTEMPTS, so a row put back at 8 dies on
-      // the first failure while the same row put back at 0 earns a fresh ladder.
+      // NOTE: the reason a requeue resets attempts: `finalizeFailure` gives up at attempts + 1 >=
+      // MAX_ATTEMPTS, so a row put back at 8 dies on the first failure and one put back at 0 earns a
+      // fresh ladder.
       await clearDeliveries();
       const withCount = await seed({ status: "DEAD", attempts: 8 });
       await suDb.outboundWebhookDelivery.update({
@@ -407,27 +398,40 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
       await clearDeliveries();
       await clearFlowLog(suDb, { tenantId });
       const id = await seed({ status: "SENDING", attempts: 7 });
+      const locked = Promise.withResolvers<void>();
+      const commit = Promise.withResolvers<void>();
       const holder = suDb.$transaction(
         async (tx) => {
           await tx.$executeRawUnsafe(
             `UPDATE outbound_webhook_deliveries SET status = 'DEAD', attempts = 8 WHERE id = ${id}`,
           );
-          await Bun.sleep(500);
+          locked.resolve();
+          await commit.promise;
         },
-        { timeout: 10_000 },
+        { timeout: 30_000 },
       );
-      await Bun.sleep(120);
-      const [, requeued] = await Promise.all([
-        holder,
-        requeueWebhookDelivery(ctx(), id, appDb),
-      ]);
+      holder.catch(locked.reject);
+      await locked.promise;
+      const requeue = requeueWebhookDelivery(ctx(), id, appDb);
+      // The holder commits only once the requeue is parked on the held row, so what the requeue reads
+      // after the wait is what the worker left, with no window guessed in milliseconds.
+      await until("the requeue parked on the held delivery", async () => {
+        const [found] = await suDb.$queryRawUnsafe<{ n: bigint }[]>(
+          `SELECT count(*) AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND pid <> pg_backend_pid()
+              AND wait_event_type = 'Lock' AND query ILIKE '%outbound_webhook_deliveries%'`,
+        );
+        return (found?.n ?? 0n) > 0n;
+      });
+      commit.resolve();
+      const [, requeued] = await Promise.all([holder, requeue]);
       expect(requeued.status).toBe("PENDING");
       expect(requeued.attempts).toBe(0);
       expect((await requeueAudit(id))?.before).toEqual({
         status: "DEAD",
         attempts: 8,
       });
-      const [line] = await webhookLines(1);
+      const [line] = await webhookLines();
       expect(line?.detail).toMatchObject({
         action: "requeued",
         attemptsBefore: 8,
@@ -494,16 +498,13 @@ describe.skipIf(!dbUp)("outbound webhook delivery ledger", () => {
     test("the requeue writes one info line that keeps the count the row died at", async () => {
       await clearDeliveries();
       await clearFlowLog(suDb, { tenantId });
-      // The alert table too, and it is not housekeeping: the assertion at the end of this case is
-      // that an `info` line pages NOBODY, read tenant-wide because an alert delivery carries no link
-      // back to the delivery that caused it. Two cases above, a 500 drives a delivery to DEAD, whose
-      // `error` line does dispatch an alert. That case's row was reaching this read all along; it
-      // only stopped being invisible once the clear started waiting for the writes it had scheduled,
-      // so this assertion had been passing because the alert had not landed yet.
+      // NOTE: not housekeeping: this case asserts an `info` line pages NOBODY, read tenant-wide since
+      // an alert delivery has no link to its delivery. A case above drives a delivery to DEAD, whose
+      // `error` line dispatches an alert that lands here once its scheduled write settles.
       await suDb.alertDelivery.deleteMany({ where: { tenantId } });
       const id = await seed({ status: "DEAD", attempts: 8 });
       await requeueWebhookDelivery(ctx(), id, appDb);
-      const [line, ...rest] = await webhookLines(1);
+      const [line, ...rest] = await webhookLines();
       expect(rest).toHaveLength(0);
       expect(line?.level).toBe("info");
       expect(line?.status).toBe("ok");

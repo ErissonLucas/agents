@@ -8,9 +8,13 @@ import { sanitizeBranding } from "@/lib/branding";
 describe("sanitizeBranding (server-side)", () => {
   test("keeps allowlisted keys with valid color tokens", () => {
     expect(
-      sanitizeBranding({ accent: "#ff0000", primary: "oklch(0.6 0.2 20)" }),
-    ).toEqual({ accent: "#ff0000", primary: "oklch(0.6 0.2 20)" });
+      sanitizeBranding({
+        accent: "#ff0000",
+        accentSolid: "oklch(0.6 0.2 20)",
+      }),
+    ).toEqual({ accent: "#ff0000", accentSolid: "oklch(0.6 0.2 20)" });
   });
+
   test("drops unknown keys and invalid values (anti-injection)", () => {
     expect(
       sanitizeBranding({

@@ -9,7 +9,7 @@ import {
   type ToolpackCtx,
 } from "@/modules/integrations/toolpacks/types";
 
-// A fetch stub whose handler decides the response per request — Drive flows mix JSON (metadata)
+// A fetch stub whose handler decides the response per request: Drive flows mix JSON (metadata)
 // with binary (download), so a single canned body would not do.
 function routerFetch(handler: (url: string, init: RequestInit) => Response) {
   const calls: Array<{ url: string; init: RequestInit }> = [];
@@ -79,7 +79,11 @@ function fakeChatwoot(conversationId = 5) {
       return null;
     },
   } as unknown as ChatwootClient;
-  return { chatwoot: { client, conversationId }, sent };
+  const delivered = { count: 0 };
+  const onSent = () => {
+    delivered.count++;
+  };
+  return { chatwoot: { client, conversationId, onSent }, sent, delivered };
 }
 
 describe("google drive toolpack — allowlist (fail-closed)", () => {
@@ -278,13 +282,28 @@ describe("google drive toolpack — send file", () => {
       bytes: 5,
       caption: "Segue o manual",
     });
+    // NOTE: The file reached the customer, so the turn is told it spoke (and counts toward the limit).
+    expect(cw.delivered.count).toBe(1);
+  });
+
+  // The caption is the model's text, rendered by Chatwoot as Liquid, so it goes escaped.
+  test("the caption reaches the conversation literally", async () => {
+    const { impl } = routerFetch(
+      driveHandler(
+        { name: "manual.pdf", mimeType: "application/pdf", size: "5" },
+        5,
+      ),
+    );
+    const cw = fakeChatwoot(42);
+    const tool = sendTool(baseCtx({ fetchImpl: impl, chatwoot: cw.chatwoot }));
+    await tool?.invoke({ fileId: "f1", caption: "Manual de {{contact.name}}" });
+    expect(cw.sent[0]?.caption).toBe("Manual de {{ '{{' }}contact.name}}");
   });
 
   test("a file whose declared size is over the cap is refused without reading a byte", async () => {
-    // Review round 1 of #464. Capping the READ made the Content-Length check happen after 15 MB had
-    // already been pulled, and on a slow link that read can spend the whole 12s budget — turning
-    // "that file is too large" into a generic download failure for a file the headers already ruled
-    // out. What is asserted is that the producer is never pulled.
+    // The Content-Length check runs before the read. Checking after the capped read would pull
+    // 15 MB first, and on a slow link that spends the whole 12s budget, turning "too large" into a
+    // generic download failure for a file the headers already ruled out.
     let pulled = 0;
     const { impl } = routerFetch((url: string) => {
       if (!url.includes("alt=media") && !url.includes("/export"))
@@ -309,15 +328,16 @@ describe("google drive toolpack — send file", () => {
     const tool = sendTool(baseCtx({ fetchImpl: impl, chatwoot: cw.chatwoot }));
     const out = (await tool?.invoke({ fileId: "f1" })) as string;
     expect(out).toContain("too large");
-    // A stream fills its own queue once before anyone reads it, so ONE pull is the source's doing
-    // and not ours. Reading to the 15 MB cap would take 240 of these.
+    // NOTE: a stream fills its own queue once before anyone reads it, so ONE pull is the source's
+    // doing and not ours. Reading to the 15 MB cap would take 240 of these.
     expect(pulled).toBeLessThanOrEqual(1);
     expect(cw.sent).toHaveLength(0);
+    expect(cw.delivered.count).toBe(0);
   });
 
   test("a non-2xx download does not have its error page read", async () => {
-    // Same reason, the other cheap refusal: nothing here reads a Drive error page, so pulling one
-    // is a read the bound has to cover for no one's benefit.
+    // The other cheap refusal: nothing here reads a Drive error page, so pulling one is a read
+    // the bound has to cover for no one's benefit.
     let pulled = 0;
     const { impl } = routerFetch((url: string) => {
       if (!url.includes("alt=media") && !url.includes("/export"))
@@ -343,11 +363,8 @@ describe("google drive toolpack — send file", () => {
   });
 
   test("a file over the cap is refused, even when the server understates its size", async () => {
-    // The refusal path had no test at all. It also had no BOUND: `arrayBuffer()` buffered the whole
-    // body and `byteLength` refused it afterwards, so an honest Content-Length was the only thing
-    // keeping a large file out of memory (#464). What is asserted here is the refusal; that the
-    // read now stops at the cap is asserted on the reader itself, in tests/lib/outbound.test.ts,
-    // where the producer can be watched.
+    // This asserts the refusal; that the read stops at the cap is asserted on the reader itself,
+    // in tests/lib/outbound.test.ts, where the producer can be watched.
     const OVER = 15 * 1024 * 1024 + 1;
     const { impl } = routerFetch((url: string) =>
       url.includes("alt=media") || url.includes("/export")
@@ -359,6 +376,7 @@ describe("google drive toolpack — send file", () => {
     const out = (await tool?.invoke({ fileId: "f1" })) as string;
     expect(out).toContain("too large");
     expect(cw.sent).toHaveLength(0);
+    expect(cw.delivered.count).toBe(0);
   });
 
   test("Google-apps doc is exported to PDF (name + mime adjusted)", async () => {
@@ -388,25 +406,11 @@ describe("google drive toolpack — send file", () => {
     expect(out).toContain("not available in this context");
     expect(calls).toHaveLength(0);
   });
-
-  test("a file above the size cap is refused (suggest a link)", async () => {
-    const { impl } = routerFetch((url) => {
-      if (url.includes("alt=media")) {
-        return binaryResponse(1, 20 * 1024 * 1024);
-      }
-      return json(200, { name: "big.zip", mimeType: "application/zip" });
-    });
-    const cw = fakeChatwoot();
-    const tool = sendTool(baseCtx({ fetchImpl: impl, chatwoot: cw.chatwoot }));
-    const out = (await tool?.invoke({ fileId: "f1" })) as string;
-    expect(out).toContain("too large");
-    expect(cw.sent).toHaveLength(0);
-  });
 });
 
-// NOTE: Integration failures must reach the flow log as failures (issue #40): invoked as a
-// tool_call, network/credential failures return a ToolMessage with status "error" (same friendly
-// content the model already saw).
+// Integration failures must reach the flow log as failures: invoked as a tool_call,
+// network/credential failures return a ToolMessage with status "error" (same friendly content the
+// model already saw).
 describe("google drive toolpack — integration failures are marked (issue #40)", () => {
   test("network failure and missing credential return ToolMessage status error", async () => {
     const boom = (async () => {
@@ -443,10 +447,10 @@ describe("google drive toolpack — integration failures are marked (issue #40)"
 });
 
 describe("a muted turn is not offered the delivery tool", () => {
-  // The observer runs the ordinary toolset (issue #568), and `drive_send_file` ends in a Chatwoot
-  // send the muted client refuses — after downloading the file from Google, which costs real time
-  // and quota. Declared on the pack's own spec (`deliversToCustomer`) and filtered at the one build
-  // seam, so a pack added later states it where its tools are already listed.
+  // The observer runs the ordinary toolset, and `drive_send_file` ends in a Chatwoot send the muted
+  // client refuses, after downloading the file from Google (real time and quota). Declared on the
+  // pack's own spec (`deliversToCustomer`) and filtered at the one build seam, so a pack added later
+  // states it where its tools are already listed.
   function ctxWithMute(muted: boolean): ToolpackCtx {
     return baseCtx({
       chatwoot: {

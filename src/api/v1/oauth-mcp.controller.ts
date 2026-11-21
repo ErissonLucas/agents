@@ -337,7 +337,7 @@ export const oauthMcpCallbackController = new Elysia({
         }
         // The role held in the STATE's tenant, not the callback request's: this navigation carries no
         // tenant selector, so the session runs under the person's default membership, which need not
-        // be the tenant the flow was started from (issue #756).
+        // be the tenant the flow was started from.
         const stateTenantId = parseDbId(state.tenantId);
         const roleThere =
           stateTenantId === null ? null : roleInTenant(user, stateTenantId);
@@ -363,6 +363,7 @@ export const oauthMcpCallbackController = new Elysia({
           opts: defaultNetOpts(),
         });
 
+        // biome-ignore lint/plugin/no-bigint-cast: an id out of OAuth state this server signed and has already verified, minted from a row's own id.
         const entryId = BigInt(state.entryId);
         // Load by id directly (we have the exact id from signed state). asSuperAdmin so the read is
         // tenant-agnostic; the cred is rebound to the state's tenant on write below.

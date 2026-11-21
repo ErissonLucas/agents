@@ -34,6 +34,26 @@ jobs:
           || (github.event_name != 'schedule' && !(github.repository == 'fazer-ai/agents-pro' && github.event_name == 'push')))
     uses: ./.github/workflows/changed-code.yml
 
+  # A squash merge lands the tree this workflow already passed on the PR, and running the four shards again
+  # on it measures nothing new (already-tested.yml says how the PR's run is found and why it can be
+  # trusted). Only on the master, the one repo whose pushes to main come from merged PRs: agents-pro
+  # and the public agents receive mirror pushes that no PR run of their own tested, so there `skip`
+  # stays empty and nothing changes. It needs `changes` so that a docs-only push, which runs nothing
+  # anyway, does not pay for the lookup either.
+  already-tested:
+    needs: changes
+    if: >-
+      github.event_name == 'push'
+      && github.repository == 'fazer-ai/agents-master'
+      && needs.changes.outputs.code == 'true'
+    uses: ./.github/workflows/already-tested.yml
+    with:
+      workflow: test
+      suites: 'test ('
+    permissions:
+      actions: read
+      contents: read
+
   test:
     # agents-pro only ever receives mirror pushes of a tree this master already tested, and the
     # stripped Pro tree is lint + build-checked by `check:editions` before it is mirrored. Its own
@@ -42,8 +62,11 @@ jobs:
     # agents (public, free) keeps running on push as the visible proof of green.
     # No CI while the PR is a draft: the autonomous loop opens its PRs as drafts and marks them ready
     # once the review loop is clean, so the suite runs on the final HEAD, not on every fix push.
-    needs: changes
-    if: needs.changes.outputs.code == 'true'
+    needs: [changes, already-tested]
+    if: >-
+      !cancelled()
+      && needs.changes.outputs.code == 'true'
+      && needs.already-tested.outputs.skip != 'true'
     runs-on: ubuntu-latest
 
     strategy:
@@ -66,12 +89,12 @@ jobs:
     #   - src/app.ts exported ONE Elysia instance and three files mutated it.
     #   - `mock.module` on a module whose teardown handed the registry back the namespace
     #     `await import()` returned, which is the object the rewrite already changed in place. Six
-    #     files; tests/lib/module-mock-undo.test.ts now refuses the shape.
+    #     files; biome-plugins/no-module-mock-live-namespace.grit now refuses the shape.
     #   - `mock.module("react-i18next", …)` in nine client test files, each freezing `i18n.language`
     #     at a literal for every file downstream. Replaced by a per-file instance delivered through
     #     `I18nextProvider` (tests/utils/i18n.tsx).
     #   - an unfenced `runSchedulerTick` draining rows other files had enqueued
-    #     (tests/modules/scheduler-tenant-fence.test.ts).
+    #     (biome-plugins/require-tenant-on-scheduler-drain.grit).
     #
     # Every one of them failed in a DIFFERENT file than the one at fault, which is why three of the
     # four are now static sweeps rather than notes.
@@ -88,7 +111,10 @@ jobs:
     # buys the same wall clock by adding runners instead of dividing one.
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        # Pinned to one build of the tag deployments pull (`pg17`, here 17.12), so the suite measures the
+        # planner they run: a minor can change a plan tests/modules/scoped-index-plans.test.ts reads. Move
+        # it forward when the tag moves, in every workflow at once (tests/tooling/postgres-image-pin.test.ts).
+        image: pgvector/pgvector:pg17@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
         env:
           POSTGRES_PASSWORD: postgres
         ports:
@@ -148,8 +174,32 @@ jobs:
       - name: Provision Test Database
         run: bun run db:test:setup
 
+      # The deadline goes on the command line: under `--shard` bun applies the preload's
+      # `jest.setTimeout` to the first file of the process only, and every later file ran with bun's
+      # 5 s default. A `timeout` under `[test]` in bunfig.toml is ignored there too. The number is the
+      # one `tests/setup.ts` sets, read from the same constant and printed, so the log says which
+      # deadline the shard ran under.
       - name: Run Tests
-        run: bun test --shard=${{ matrix.shard }}/4
+        run: |
+          timeout_ms=$(bun -e 'console.log((await import("./tests/utils/timeouts.ts")).TEST_TIMEOUT_MS)')
+          echo "per-test timeout: ${timeout_ms} ms"
+          bun test --shard=${{ matrix.shard }}/4 --timeout "$timeout_ms"
+
+  # Evidence for `already-tested`, once the four shards passed (mark-tested.yml: a job of its own, no checkout,
+  # no PR code). `!cancelled()` because a skip propagates through `needs` transitively:
+  # `already-tested`, skipped on every pull request, would otherwise skip this job too.
+  mark-tested:
+    needs: [test]
+    if: >-
+      !cancelled()
+      && github.event_name == 'pull_request'
+      && github.repository == 'fazer-ai/agents-master'
+      && needs.test.result == 'success'
+    uses: ./.github/workflows/mark-tested.yml
+    with:
+      workflow: test
+    permissions:
+      contents: read
 
   # THE REQUIRED CONTEXT IS THIS JOB, NOT THE SHARDS, and that is measurement rather than taste.
   # On agents-pro, where the condition above already skips this matrix on push, a skipped MATRIX job

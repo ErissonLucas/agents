@@ -14,15 +14,11 @@ import { makeConfig } from "../utils/agent-config";
 
 // WHAT THE FACTORY IS ASKED FOR, which is the half of this feature no behavioural test can see.
 //
-// The bounds are the design, not a tuning detail: measured live against a real endpoint (issue
-// #143), the same 503 turn costs 82.071ms and loses the customer's reply with LangChain's default
-// six retries, and 2.563ms with an answer with them capped at one. A fallback built behind the
-// default would be a fallback that arrives after the customer has gone — and every test in the
-// suite would still be green, because the answer eventually arrives either way.
-//
-// So this reads the ResolvedModelConfig handed to `createChatModel`, and it reads it on BOTH agents:
-// an install that names no fallback has to be handed a config with no bounds at all, or this change
-// would have quietly rewritten the retry behaviour of every install that never asked for it.
+// The bounds are the design, not a tuning detail: against a real endpoint, a 503 turn behind
+// LangChain's default six retries takes ~82s and loses the reply, while one attempt fails over in
+// ~2.5s. Every behavioural test stays green either way, because the answer eventually arrives. So
+// this reads the ResolvedModelConfig handed to `createChatModel`, on BOTH agents: an install with no
+// fallback must get no bounds at all, or its retry behaviour would change without it asking.
 
 class Quiet extends BaseChatModel {
   constructor() {
@@ -55,6 +51,7 @@ const FALLBACK = {
   model: "claude-haiku-4-5",
   credentialRef: "vault:9",
   baseURL: null,
+  timeoutMs: null,
 };
 
 describe("what the model factory is asked to build", () => {
@@ -85,6 +82,16 @@ describe("what the model factory is asked to build", () => {
     const fb = seen.find((m) => m.provider === "anthropic");
     expect(fb?.model).toBe("claude-haiku-4-5");
     expect(fb?.apiKey).toBe("sk-fallback");
+  });
+
+  test("the agent's fallback timeout is the ceiling both models are built with", async () => {
+    const seen = await configsHandedToTheFactory(
+      makeConfig({
+        modelFallback: { ...FALLBACK, timeoutMs: 20_000 },
+        modelFallbackApiKey: "sk-fallback",
+      }),
+    );
+    expect(seen.map((m) => m.timeoutMs)).toEqual([20_000, 20_000]);
   });
 
   // The agent's sampling DOES carry, unlike the two sibling overrides, and that is a decision rather

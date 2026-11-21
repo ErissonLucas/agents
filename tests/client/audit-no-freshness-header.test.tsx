@@ -1,38 +1,23 @@
 /// <reference lib="dom" />
 
-// The trail-wide newest row is IN THE RESPONSE and must not be ON THE PAGE.
-//
-// `latestAt` stays on the wire for the REST and MCP transports, so the type still offers it and
-// nothing in the compiler objects to printing it. What was removed is the affordance: a "Trail
-// recorded up to" line above the filters, which duplicated the first card when unfiltered and, when
-// filtered, invited a comparison against a record's own `updatedAt` — a comparison that finds a bug
-// rather than a state, because the audit row is written inside the mutation's transaction and there
-// is no ingestion lag for a freshness line to report. #526.
-//
-// Asserted as ABSENCE OF THE VALUE rather than absence of a label, so it survives a rewording: the
-// stub answers with an instant that appears nowhere else on the page.
+// The trail-wide newest row is IN THE RESPONSE and must not be ON THE PAGE. `latestAt` stays on the
+// wire for REST and MCP, so the type still offers it. A freshness line has nothing to report: the
+// audit row is written inside the mutation's transaction, so there is no ingestion lag.
+// Asserted as absence of the VALUE, not of a label, so it survives a rewording.
 
-import {
-  afterEach,
-  beforeEach,
-  expect,
-  mock,
-  setSystemTime,
-  test,
-} from "bun:test";
+import { afterEach, beforeEach, expect, setSystemTime, test } from "bun:test";
 import { TooltipProvider } from "@radix-ui/react-tooltip";
 import { cleanup, render, waitFor } from "@testing-library/react";
-import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { ToastProvider } from "@/client/components";
+import * as AuthModule from "@/client/contexts/AuthContext";
+import { stubExports } from "@/tests/utils/module-stub";
 
-// The page reads the principal's role to decide whether to offer the scope selector (#520). These
-// files are not about that, so the mock hands it the ordinary operator: a TENANT_ADMIN, which is
-// the role every assertion below was written against.
-mock.module("@/client/contexts/AuthContext", () => ({
+// The page reads the principal's role to decide whether to offer the scope selector. These files
+// are not about that, so the stub hands it an ordinary TENANT_ADMIN.
+stubExports(AuthModule, {
   useAuth: () => ({ user: { role: "TENANT_ADMIN" } }),
-  AuthProvider: ({ children }: { children: ReactNode }) => children,
-}));
+});
 
 const { AuditPage } = await import("@/client/pages/AuditPage");
 
@@ -73,9 +58,8 @@ afterEach(() => {
 });
 
 test("the trail-wide newest row is not printed anywhere", async () => {
-  // The rows carry a `<Tooltip>`, and Radix's Root refuses to mount without a provider under this
-  // harness. The app supplies one on its own (verified live: the trigger reaches `delayed-open` and
-  // the content renders); this is the same wrapper `KnowledgeDocsBlock.test.tsx` already uses.
+  // The rows carry a `<Tooltip>`, and Radix's Root refuses to mount without a provider under
+  // this harness (the app supplies its own).
   const view = render(
     <ToastProvider>
       <TooltipProvider>

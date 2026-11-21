@@ -1,71 +1,54 @@
-// Per-agent observability knobs, read from `agent.settings.observability` (Json, additive).
-// Mirrors readLimitsConfig / readDebounceConfig.
-//
-// `logToolValues` decides what a tool call leaves in `ExecutionLog.detail`: OFF (the default) stores
-// each argument and result as its SHAPE (`{ cpf: "string(11)" }`, see shape.ts), which is what keeps
-// that column's documented promise of carrying no message text or PII; ON stores the values the model
-// actually sent.
-//
-// It is per AGENT rather than per instance because that matches how it gets used: turn it on for the
-// one agent whose tool calls are misbehaving, reproduce, turn it off. The blast radius is that
-// agent's log lines instead of every conversation in the deployment.
-//
-// The default is what the promise requires, and the switch is not gated by edition: taking the values
-// away by default and then charging to see them again would leave the Free edition with no way at all
-// to find out what the model passed to a tool, which the conversation does not show either.
-//
-// `fullDetailUntil` is a SECOND, independent knob, and the two are deliberately not merged. They
-// answer different questions: `logToolValues` decides whether the customer's PII is stored at all,
-// and `fullDetailUntil` decides how much of a string that was already allowed to be stored survives
-// the write. Merging them would mean an operator asking "was my attribute block injected?" starts
-// storing CPFs as a side effect, which is the opposite of what they asked for (issue #58).
+import { inRange } from "@/lib/number-range";
+import { OBSERVABILITY_RANGES } from "@/modules/agents/number-ranges";
 
-// How far ahead the debug mode may be armed. It is a bound on what a caller may SEND, and it is the
-// whole reason the expiry is automatic rather than advisory: without it an operator arms the mode
-// for the year 2099 and the "expiry" never arrives. A day is the size of the thing being debugged —
-// an operator reproduces, reads and turns it off inside one sitting — and it bounds the damage of
-// forgetting to one day of full-size rows inside the 30-day retention window
-// (`src/modules/flowlog/retention.ts`).
+// Per-agent observability knobs, read from `agent.settings.observability` (Json, additive), like
+// readLimitsConfig / readDebounceConfig.
 //
-// It lives HERE rather than beside the schema that enforces it because the console renders the
-// number too, and `src/modules/agents/settings-schema.ts` reaches server-only modules: importing it
-// from a component pulls `tts/providers.ts` into the browser bundle, which
-// `tests/client/bundle-boundary.test.ts` refuses.
+// `logToolValues` OFF (the default) stores each tool argument and result as its SHAPE (shape.ts),
+// which keeps `ExecutionLog.detail` free of message text and PII; ON stores the values. Per agent
+// so the blast radius is the agent being debugged, and not gated by edition, since it is the only
+// way to see what the model passed to a tool. `fullDetailUntil` (how much of an allowed string
+// survives) is a separate knob, deliberately not merged with the PII one.
+
+// How far ahead the debug mode may be armed: without a bound the automatic expiry is advisory (arm
+// it until 2099). A day fits one debugging sitting and caps a forgotten mode at a day of full-size
+// rows. It lives here, not beside its schema, because the console renders it and settings-schema.ts
+// reaches server-only modules (`tests/client/bundle-boundary.test.ts` refuses that import).
 export const FULL_DETAIL_MAX_HOURS = 24;
 
-// What the console actually arms, which is deliberately SHORTER than the ceiling. The deadline is
-// chosen in the browser and judged against the server's clock, so arming for exactly the maximum
-// makes any forward disagreement at all push the value past the bound — and the reader then refuses
-// it silently, as a switch that turns on in the browser and never arms anything. The console takes
-// the server's clock for this (`src/client/lib/serverClock.ts`, read off the `Date` header of
-// responses the page already makes), so what the gap absorbs is what that leaves: one-second header
-// resolution, the transfer time, and whatever the machine drifts while the editor stays open. Half
-// the ceiling is far more than any of those and still leaves a debugging window longer than any
-// sitting, so the margin costs nothing worth reclaiming.
+// What the console arms, deliberately SHORTER than the ceiling: the deadline is chosen in the
+// browser and judged on the server's clock, and a value past the bound is silently refused. Half
+// the ceiling absorbs header resolution, transfer time and drift (`src/client/lib/serverClock.ts`)
+// at no real cost.
 export const FULL_DETAIL_ARM_HOURS = FULL_DETAIL_MAX_HOURS / 2;
+
+// The durable counterpart of the debug window: how many days this agent's full turn
+// detail (each tool result whole, the audited system prompt whole) is kept beside the cut log lines,
+// in its own tables (`full-detail.ts`). Off unless set, in `OBSERVABILITY_RANGES` when set, and the
+// effective window is also never longer than `FLOWLOG_RETENTION_DAYS`: past it the log line the
+// detail hangs from is gone and nothing could read it.
+// What the console proposes when the switch is turned on.
+export const FULL_DETAIL_RETENTION_DEFAULT_DAYS = 14;
 
 export interface ObservabilityConfig {
   logToolValues: boolean;
-  // The debug mode of issue #58: while on, this agent's flow lines keep their `detail` strings whole
-  // instead of cutting them at `MAX_STRING`. Derived, never stored — see `fullDetailUntil` below.
+  // The debug mode: while on, this agent's flow lines keep their `detail` strings whole instead of
+  // cutting them at `MAX_STRING`. Derived, never stored; see `fullDetailUntil` below.
   fullDetail: boolean;
   // When the mode ends, as stored. Kept on the config (rather than collapsed into the boolean) so a
   // reader can SAY when it expires: the console's warning and the MCP surface both need the instant,
   // not just the flag, and an operator who is told "on until 14:30" does not have to guess.
   // Null whenever the mode is off, whatever the reason (absent, malformed, or already past).
   fullDetailUntil: Date | null;
+  // How many days this agent keeps its full turn detail, or null when it keeps none (the default).
+  // Not a debug mode: it is meant to stay on, so it does not light the "recording more" warning.
+  fullDetailRetentionDays: number | null;
 }
 
-// The debug mode is stored as the INSTANT IT ENDS, not as a boolean with an expiry beside it. That
-// is what makes the automatic expiry of #58 real rather than advisory: there is no representable
-// state where the mode is on and nobody said when it stops, no writer can turn it on without
-// declaring the end, and a process that was down when the window closed comes back with the mode
-// already off, because nothing had to run for it to expire. The cost is that the value has to be
-// re-armed to keep debugging, which is the behaviour the issue asked for ("warning does not stop
-// anyone from forgetting").
-//
-// `now` is injected rather than read here so a caller that already has the turn's instant uses the
-// same one for every read of it, and so the boundary is testable at all.
+// The debug mode is stored as the INSTANT IT ENDS, not a boolean with an expiry: no state is on
+// without an end, and a process that was down when the window closed comes back with it off. `now`
+// is injected so a caller reuses the turn's instant for every read, and so the boundary is
+// testable.
 export function readObservabilityConfig(
   settings: unknown,
   now: Date = new Date(),
@@ -74,6 +57,7 @@ export function readObservabilityConfig(
     logToolValues: false,
     fullDetail: false,
     fullDetailUntil: null,
+    fullDetailRetentionDays: null,
   };
   if (!settings || typeof settings !== "object") return def;
   const o = (settings as Record<string, unknown>).observability;
@@ -86,28 +70,27 @@ export function readObservabilityConfig(
       (o as Record<string, unknown>).logToolValues === "true",
     fullDetail: on,
     fullDetailUntil: on ? until : null,
+    fullDetailRetentionDays: readRetentionDays(
+      (o as Record<string, unknown>).fullDetailRetentionDays,
+    ),
   };
 }
 
-// WHETHER A STORED DEADLINE IS A WINDOW THAT IS OPEN RIGHT NOW.
-//
-// One function because there are two callers and the rule must not fork: this reader, and
-// `debugModesFrom`, which re-judges an already-read config against a later instant so the console's
-// warning stops claiming the mode is on the moment the window closes under an open editor.
-//
-// TWO comparisons, and the second is the one that makes the bound real.
-//
-// Strictly greater on the near side: an instant that has arrived is spent. The comparison is on
-// the stored end, so a clock that jumps forward closes the window early and never extends it.
-//
-// And the far side, because a schema can only bound what a CALLER SENDS. `settings` is an
-// arbitrary bag over REST, over the import path, and in the database itself, so a value the
-// schema would refuse still lands there — and `2099-01-01` would then arm the mode forever,
-// which is precisely the state the automatic expiry exists to make unreachable. A deadline
-// further out than the longest window that may be armed is not a deadline anyone could have set,
-// so it reads as OFF, like every other value this reader cannot make sense of. Note it is
-// deliberately not CLAMPED to `now + FULL_DETAIL_MAX_HOURS`: clamping would renew the window on
-// every read, turning "too far ahead" into "permanently on" — the opposite of the refusal.
+// A whole number of days inside the range, or null. Anything else reads as OFF: the bag arrives
+// unvalidated from the database and from imports, and keeping nothing is the side that cannot fill a
+// disk; the write boundary refuses such a value with its own sentence (settings-schema.ts).
+export function readRetentionDays(value: unknown): number | null {
+  return typeof value === "number" &&
+    inRange(value, OBSERVABILITY_RANGES.fullDetailRetentionDays)
+    ? value
+    : null;
+}
+
+// Whether a stored deadline is a window open right now; shared with `debugModesFrom` so the rule
+// does not fork. Strictly greater on the near side (an instant that has arrived is spent). On the
+// far side a deadline beyond `FULL_DETAIL_MAX_HOURS` from now reads as OFF: `settings` arrives
+// unvalidated over REST, import and the database, and clamping instead would renew the window on
+// every read.
 export function isFullDetailWindowOpen(until: Date | null, now: Date): boolean {
   return (
     until !== null &&
@@ -126,6 +109,7 @@ export function isFullDetailWindowOpen(until: Date | null, now: Date): boolean {
 export interface StorableObservability {
   logToolValues: boolean;
   fullDetailUntil: string | null;
+  fullDetailRetentionDays: number | null;
 }
 
 export function storableObservability(
@@ -134,18 +118,13 @@ export function storableObservability(
   return {
     logToolValues: cfg.logToolValues,
     fullDetailUntil: cfg.fullDetailUntil?.toISOString() ?? null,
+    fullDetailRetentionDays: cfg.fullDetailRetentionDays,
   };
 }
 
-// An ISO 8601 instant that NAMES ITS OFFSET. Both halves are load-bearing:
-//
-// - the offset, because the same text otherwise means different moments in different deployments.
-//   `Date.parse` accepts `08/26/2026 10:00` and resolves it against the SERVER's local timezone, so
-//   one value armed from one console would land hours apart on two installations. The field is
-//   documented as an ISO instant; this is what makes the documentation true rather than hopeful.
-// - the shape check before the parse, because `Date.parse` COERCES. A one-element array coerces to
-//   its element, so `["2026-08-26T10:00:00Z"]` parses to a perfectly ordinary instant and would arm
-//   the mode from a value nothing in the system ever writes.
+// An ISO 8601 instant that NAMES ITS OFFSET: `Date.parse` resolves an offset-less value against the
+// server's timezone, and it coerces (a one-element array parses as its element), so the shape is
+// checked before the parse.
 const ISO_INSTANT =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/;
 

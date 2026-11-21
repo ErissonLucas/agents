@@ -1,15 +1,28 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { type StructuredToolInterface, tool } from "@langchain/core/tools";
+import { convertToOpenAITool } from "@langchain/core/utils/function_calling";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import {
+  hiddenNotesDetail,
+  hiddenNotesThisTurn,
+} from "@/graph/anthropic-progress-notes";
 import { getCheckpointer } from "@/graph/checkpointer";
-import { lastAssistantText, recursionLimitFor } from "@/graph/graph";
-import { sentAtStamp } from "@/graph/markers";
-import type { ModelRetryInfo } from "@/graph/model-limit";
+import {
+  buildDetachedToolset,
+  loadDetachedConfig,
+} from "@/graph/detached-turn";
+import {
+  lastAssistantText,
+  type RevisionPlan,
+  recursionLimitFor,
+} from "@/graph/graph";
+import { playgroundNudgeMarker, sentAtStamp } from "@/graph/markers";
+import type { FallbackFailedInfo, ModelRetryInfo } from "@/graph/model-limit";
 import type { ResolvedModelConfig } from "@/graph/models";
 import { type AgentNudge, renderNudge } from "@/graph/nudge";
 import {
@@ -18,9 +31,9 @@ import {
   buildCallbacks,
   buildModelAndGraph,
   buildSpeechNormalizer,
-  buildToolset,
   loadAgentConfig,
 } from "@/graph/prepare";
+import { GROUNDING_DIRECTIVE } from "@/graph/prompt";
 import { undoRefusedTurn } from "@/graph/refused-turn";
 import {
   customerFacingReply,
@@ -31,14 +44,24 @@ import {
   withoutLoneSilenceTool,
 } from "@/graph/silence";
 import { ToolFlowLogger } from "@/graph/tool-flowlog";
+import { selectionsFromGrants } from "@/graph/tools/assemble";
 import {
   CONVERSATION_NATIVE_TOOL_NAMES,
+  type NativeToolName,
   UTILITY_NATIVE_TOOL_NAMES,
 } from "@/graph/tools/catalog";
-import type { McpLoadDeps } from "@/graph/tools/mcp";
-import { buildSimulatedNativeTools } from "@/graph/tools/native";
-import { logSchemaRefusals } from "@/graph/tools/refusal-log";
+import {
+  nativesWhere,
+  PLAYGROUND_NATIVES,
+} from "@/graph/tools/channel-natives";
+import {
+  buildMcpContextSection,
+  type McpLoadDeps,
+  type McpServerMeta,
+} from "@/graph/tools/mcp";
+import { isReadOnlyTool, markReadOnly } from "@/graph/tools/reads";
 import type { ReplyChoice } from "@/graph/tools/reply-as-text";
+import { normalizeToolName } from "@/graph/tools/toolName";
 import {
   buildPlaygroundTrace,
   buildVisionTraceEntry,
@@ -53,33 +76,53 @@ import { sumTurnUsage, type TurnTiming, type TurnUsage } from "@/graph/usage";
 import { AppError, NotFoundError } from "@/lib/errors";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
-import type { ChatwootClient } from "@/modules/chatwoot/client";
+import { estimateTokens } from "@/lib/token-estimate";
+import { type AgentMode, isMonitoring } from "@/modules/agents/mode";
+import { normalizeGrants, type ToolGrantInput } from "@/modules/agents/service";
 import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { documentToolName } from "@/modules/documents/templates";
+import {
+  emitFallbackAnswered,
+  emitFallbackFailed,
+} from "@/modules/flowlog/fallback-lines";
 import {
   emitFlowEvent,
   type FlowContext,
   withFlowStage,
 } from "@/modules/flowlog/service";
 import {
+  closesWithoutModel,
   readFollowUpConfig,
   stepDelayMinutes,
 } from "@/modules/followups/settings";
 import {
+  buildExternalCheck,
+  type ExternalCallDeps,
+  turnToolCalls,
+} from "@/modules/guardrails/external";
+import {
   buildGuardrailGate,
+  type GuardrailDecision,
   type GuardrailGate,
   guardrailTripped,
+  screenedByOperator,
   screenedText,
 } from "@/modules/guardrails/gate";
+import { buildGroundingGate } from "@/modules/guardrails/grounding-gate";
+import { readMonitoringConfig } from "@/modules/observe/settings";
 import { attachSignature, signatureFor } from "@/modules/signature/service";
 import { assertPlaygroundSpendCeiling } from "@/modules/spend-ceiling/service";
 import { transcribePlaygroundAudio } from "@/modules/stt/service";
+import { normalizeAudioUpload } from "@/modules/stt/upload";
 import { plannedReplyIsAudio, spokenNoticeFor } from "@/modules/tts/modality";
 import { synthesizeReply } from "@/modules/tts/service";
 import { shouldReplyWithAudio } from "@/modules/tts/settings";
 import { logTextInsteadOfAudio, planAudioReply } from "@/modules/tts/speakable";
 import { extractPlaygroundFile } from "@/modules/vision/service";
 import { readVisionConfig } from "@/modules/vision/settings";
+import { invocationDeadlineFetch } from "@/modules/voice-call/invocation-deadline";
+import { CALL_HTTP_TOOL_TIMEOUT_MS } from "@/modules/voice-call/providers/elevenlabs-tools";
+import { type VoiceAgent, voiceAgentFrom } from "@/modules/voice-call/tools";
 import {
   listThreadMedia,
   type PlaygroundMediaKind,
@@ -145,14 +188,14 @@ export interface PlaygroundDeps {
   // The voice provider's fetch, injectable exactly as RuntimeDeps.ttsFetch is on the inbox path:
   // without this seam the playground's audio reply could only ever be exercised against the network.
   ttsFetch?: typeof fetch;
+  // The external check's network half (./guardrails/external.ts). Tests inject.
+  externalCheck?: ExternalCallDeps;
 }
 
 export interface PlaygroundTurnParams {
-  // The REQUEST's context, not an id lifted out of it, and every playground entry point takes the
-  // same. `runScopedOn` verifies an unknown tenant only for a SUPER_ADMIN caller, because the role
-  // is what separates an id that came from outside the process from one it read from a row: this
-  // module used to rebuild a TENANT_ADMIN context here, which told that check the id was internal
-  // and turned a dead console selection into an empty playground instead of a refusal (issue #268).
+  // The REQUEST's context, never one rebuilt from its ids: `runScopedOn` verifies an unknown tenant
+  // only for a caller whose role says the id came from outside, so a rebuilt TENANT_ADMIN context
+  // would turn a dead console selection into an empty playground instead of a refusal.
   ctx: TenantContext;
   agentId: bigint;
   message: string;
@@ -200,7 +243,7 @@ export interface PlaygroundTurnResult {
   ttsMediaId?: string;
   // What the turn spent, as the provider reported it, over every model call it made (the agent and
   // any guardrail, speech normalization or file read on the way): the same numbers its ledger rows
-  // carry (issue #839).
+  // carry.
   usage: TurnUsage;
   // How long the turn took, and how much of it was spent waiting on a model.
   timing: TurnTiming;
@@ -219,17 +262,12 @@ function resolvePlaygroundThread(
     : newPlaygroundThreadId(tenantId, agentId);
 }
 
-// WHAT A FAILED PLAYGROUND TURN TELLS THE OPERATOR (issue #841). A refusal the code raised on purpose
-// (an AppError) already says why, and only gains the turn id, so the console can link the turn's lines
-// on the Logs page. Anything else used to reach the app's catch-all, which answers a bare 500 in plain
-// text, and the console threw the text away and blamed the model. Here it becomes a refusal of its
-// own, under the same rule as the catch-all (`api/lib/unhandled-error.ts`): the error's text reaches
-// the client in development only. In production the operator is told where the cause is instead,
-// which is the server log, where it is written with the turn id so a search for that id finds it, and
-// the Logs page gets a line for the turn saying it failed, in our words, never the error's.
-//
-// The id is READ at failure time, not taken up front, because a file turn only knows its id after it
-// has checked the read id the console sent (`claimReadTurnId`).
+// What a failed playground turn tells the operator. An AppError already says why and only gains the
+// turn id, for the Logs page link. Anything else becomes a refusal under the catch-all's rule
+// (`api/lib/unhandled-error.ts`): the error's text reaches the client in development only; in
+// production the operator is pointed at the server log (written with the turn id) and the Logs page
+// line, in our words. The id is read at failure time: a file turn only knows it after
+// `claimReadTurnId`.
 async function asPlaygroundTurn<T>(
   at: {
     ctx: TenantContext;
@@ -309,8 +347,9 @@ export function toPlaygroundInvokeError(e: unknown): AppError {
 }
 
 // Replaces a tool's execution with an operator-supplied canned result, keeping its model-facing
-// name/description/schema. Applied AFTER the toolset is built, over ANY tool (native/HTTP/MCP/KB), so
-// the agent's behavior can be tested deterministically without a real call. Exported for tests.
+// name/description/schema. Applied over the assembled toolset, ANY tool (native/HTTP/MCP/KB), and
+// before the precondition wrapper, so the agent's behavior can be tested deterministically without a
+// real call and the tool's rules still refuse the canned result. Exported for tests.
 export function applyToolMocks(
   tools: StructuredToolInterface[],
   mocks: Record<string, string> | undefined,
@@ -319,125 +358,49 @@ export function applyToolMocks(
   protocol: ReadonlySet<string> = new Set(),
 ): StructuredToolInterface[] {
   const names = new Set(Object.keys(mocks ?? {}));
-  // NOTE: THE PROTOCOL TOOL IS NOT THE OPERATOR'S TO MOCK, the same exemption and the same reason
-  // `buildSimulatedNativeTools` already makes for it: its RETURN is the whole tool. The runtime
-  // recognises silence by that acknowledgement (`skipReplyRan`), so a canned result under this name
-  // is not read as a decision to stay quiet — the graph asks the model again and the simulation
-  // writes a follow-up production would have stayed silent on, which is the one decision the
-  // playground exists to show (round 12).
-  //
-  // BY IDENTITY, NEVER BY NAME (round 14). The exemption is for OUR tool, asked of `inertToolsFor`,
-  // because a mock is refused only where the return IS the tool. Round 14 gave a second reason — that
-  // with natives revoked the tool under this name is the operator's own, so refusing their mock would
-  // have the playground hit the live endpoint — and #715 retired it: #457 reserves a native name
-  // against every other source even when the native is not built, so no tool of theirs is ever bound
-  // under it. Asking by identity is what kept this right through both readings.
+  // NOTE: the protocol tool is not the operator's to mock: its RETURN is the whole tool (the runtime
+  // recognises silence by `skipReplyRan`), so a canned result would make the simulation write a reply
+  // production stays silent on. By identity, never by name: a native name is reserved against every
+  // other source, so no operator tool is ever bound under it.
   for (const n of protocol) names.delete(n);
   if (names.size === 0) return tools;
-  return tools.map((tl) =>
-    names.has(tl.name)
-      ? tool(async () => mocks?.[tl.name] ?? "", {
-          name: tl.name,
-          description: tl.description,
-          schema: tl.schema,
-        })
-      : tl,
-  );
+  return tools.map((tl) => {
+    if (!names.has(tl.name)) return tl;
+    const mocked = tool(async () => mocks?.[tl.name] ?? "", {
+      name: tl.name,
+      description: tl.description,
+      schema: tl.schema,
+    });
+    // A mocked source keeps whether the factual-grounding rewrite may call it, as it would in
+    // production; the mock never makes a tool that writes read-only.
+    return isReadOnlyTool(tl) ? markReadOnly(mocked) : mocked;
+  });
 }
 
-// Loads the agent config for the playground (ignoring the `enabled` toggle — you test before going
-// live). instance/conversation ids are absent here (dummy 0n/0 → no mirror row), so contact/prompt
-// vars come from `overrides.promptVars` when the operator simulates them. Throws the same
-// not-runnable errors as the turn path (agent missing vs no model credential).
-async function loadPlaygroundConfig(params: {
-  ctx: TenantContext;
-  agentId: bigint;
-  threadId: string;
-  base: PrismaClient;
-  overrides?: AgentConfigOverrides;
-}): Promise<AgentConfig> {
-  const { ctx, agentId, threadId, base } = params;
-  const tenantId = ctx.tenantId as bigint;
-  const loaded = await runScopedOn(base, ctx, (db) =>
-    loadAgentConfig(
-      db,
-      {
-        tenantId,
-        instanceId: 0n,
-        conversationId: 0,
-        agentId,
-        threadId,
-        // The operator just typed it, so the age is "now" (issue #749). Stated rather than left
-        // out: omitted, the variable renders EMPTY here, and the playground is exactly where an
-        // operator goes to find out whether a placeholder they wrote works at all. The literal
-        // rather than a `Date` so the time simulation moves it too — see `prepare.ts`.
-        lastIncomingAt: "now" as const,
-      },
-      { ignoreDisabled: true, overrides: params.overrides },
-    ),
-  );
-  if (!loaded) {
-    // Agent missing OR no model credential configured — distinguish the two for the operator.
-    const exists = await runScopedOn(base, ctx, (db) =>
-      db.agent.findUnique({ where: { id: agentId }, select: { id: true } }),
-    );
-    if (!exists)
-      throw new NotFoundError("agent not found", "errors.agentNotFound");
-    throw new AppError(
-      "agent has no runnable model configured",
-      400,
-      "errors.agentNotRunnable",
-    );
-  }
-  return loaded;
+// The playground's agent config: a detached turn's, which can also leave the chat model unbuilt (a
+// call talks through the voice engine).
+function loadPlaygroundConfig(
+  params: Parameters<typeof loadDetachedConfig>[0],
+): Promise<AgentConfig> {
+  return loadDetachedConfig(params);
 }
 
-// Builds the playground toolset: the CONVERSATION native tools SIMULATED (no real effect; a dummy
-// client satisfies the type and is never called) alongside the real utility/HTTP/MCP/KB tools.
-// Shared by the turn path (then mocks are applied over it) and the tool-listing endpoint.
+// The playground's toolset: a detached turn's, with the natives as the playground map says and the
+// document tools simulated, so the operator sees the agent choose one.
 function buildPlaygroundToolset(
   loaded: AgentConfig,
-  params: {
-    ctx: TenantContext;
-    threadId: string;
-    base: PrismaClient;
-    deps?: PlaygroundDeps;
-    // The turn's telemetry context, so a tool-stage line the toolset produces lands in the Logs page
-    // under source=playground. Without it a precondition refusal is invisible exactly where an
-    // operator goes to find out what their agent does — a refused call never reaches the inner tool,
-    // so ToolFlowLogger sees no run either and there is nothing else to read.
-    flow: FlowContext | undefined;
-    // Where `reply_as_text` records its choice (issue #859). The turn passes the one its delivery
-    // reads; the listing passes a throwaway, so the panel shows the tool the model is offered. Absent
-    // on the simulated follow-up, which, like production's nudge, is never offered the tool.
-    replyChoice: ReplyChoice | undefined;
-  },
+  params: Omit<
+    Parameters<typeof buildDetachedToolset>[1],
+    "natives" | "documents" | "mcp"
+  > & { deps?: PlaygroundDeps },
 ): Promise<StructuredToolInterface[]> {
-  return buildToolset(
-    loaded,
-    {
-      tenantId: params.ctx.tenantId as bigint,
-      instanceId: 0n,
-      base: params.base,
-      client: {} as ChatwootClient,
-      conversationId: 0,
-      threadId: params.threadId,
-      replyChoice: params.replyChoice,
-    },
-    {
-      // Conversation tools (handoff/resolve/…) are SIMULATED (no real effect); utility tools
-      // (calculator, get_current_time) run for real. `allowed` is the agent's own native set.
-      buildNativeTools: (ctx, allowed) =>
-        buildSimulatedNativeTools(ctx, allowed),
-      // A document tool is conversation-scoped for the same reason handoff/resolve are: it needs a
-      // turn to attach the file to. Run for real here it would refuse every call with the message
-      // meant for proactive nudges, so the playground would show behaviour production never
-      // produces. Simulated, the operator sees the agent choose it — which is what they came to see.
-      simulateDocuments: true,
-      mcp: params.deps?.mcp,
-      flow: params.flow,
-    },
-  );
+  const { deps, ...rest } = params;
+  return buildDetachedToolset(loaded, {
+    ...rest,
+    mcp: deps?.mcp,
+    natives: PLAYGROUND_NATIVES,
+    documents: "simulated",
+  });
 }
 
 // Shared load→build tail for both playground entry points. Loads the agent config + the simulated
@@ -469,12 +432,9 @@ async function buildPlaygroundGraph(params: {
     provider: string;
     model: string;
     reason: string;
+    failure: string;
   }) => void;
-  onModelFallbackFailed?: (info: {
-    provider: string;
-    model: string;
-    reason: string;
-  }) => void;
+  onModelFallbackFailed?: (info: FallbackFailedInfo) => void;
   onModelFallbackUnavailable?: (info: {
     provider: string;
     model: string;
@@ -490,45 +450,48 @@ async function buildPlaygroundGraph(params: {
   // reactive turn an agent granted `skip_reply` and nothing else is the operator's own choice, and
   // it is how their agent answers "ok" with silence.
   silenceProtocol?: boolean;
-  // The spoken-reply notice and the choice holder of issue #859, from the turn that will deliver the
-  // reply. Absent on the simulated follow-up, which never answers in audio and, like production's
+  // The spoken-reply notice and the `reply_as_text` choice holder, from the turn that will deliver
+  // the reply. Absent on the simulated follow-up, which never answers in audio and, like production's
   // nudge, is not offered reply_as_text.
   spokenNotice?: () => string | null;
   replyChoice?: ReplyChoice;
+  // The factual-grounding review, built by the caller from the config it resolved.
+  reviewReply?: (turn: BaseMessage[], reply: string) => Promise<string | null>;
+  revisionPlan?: () => RevisionPlan | null;
+  onReplyRevised?: (text: string) => void;
 }) {
   const { ctx, agentId, threadId, base } = params;
   const tenantId = ctx.tenantId as bigint;
   const loaded =
     params.loaded ??
-    (await loadPlaygroundConfig({
+    (await loadDetachedConfig({
       ctx,
       agentId,
       threadId,
       base,
       overrides: params.overrides,
     }));
-  const rawTools = await buildPlaygroundToolset(loaded, {
-    ctx,
-    threadId,
-    base,
-    deps: params.deps,
-    flow: params.flow,
-    replyChoice: params.replyChoice,
-  });
   const toolMocks = params.overrides?.toolMocks;
   // Which names are OURS in this turn's toolset rather than the operator's — the question every rule
   // below asks, and the one a name alone cannot answer.
   const protocol = inertToolsFor(loaded);
-  // AND WRAPPED AGAIN AFTER THE SWAP, because `applyToolMocks` replaces a mocked tool with a fresh
-  // `tool()` built from the original schema: the schema goes on refusing bad arguments and the
-  // wrapper that records the refusal went with the tool it replaced (review round 1). Wrapping is
-  // idempotent, so the tools the operator did not mock keep the single wrapper `buildToolset` gave
-  // them and no refusal is logged twice.
-  const mocked = logSchemaRefusals(
-    applyToolMocks(rawTools, toolMocks, protocol),
-    params.flow,
-    loaded.logToolValues,
-  );
+  // The mocks go in INSIDE the toolset build, before the precondition wrapper: a canned result is
+  // still refused by the operator's rules on that tool, as the real call would be. The schema-refusal
+  // wrapper `buildToolset` puts on last therefore covers the mocked tools too.
+  const mocked = await buildDetachedToolset(loaded, {
+    ctx,
+    threadId,
+    base,
+    mcp: params.deps?.mcp,
+    flow: params.flow,
+    makeModel: params.deps?.makeModel,
+    replaceTools: (assembled) => applyToolMocks(assembled, toolMocks, protocol),
+    replyChoice: params.replyChoice,
+    natives: PLAYGROUND_NATIVES,
+    // NOTE: simulated, so the operator sees the agent choose a document, which is what they came to see.
+    documents: "simulated",
+    proactive: params.silenceProtocol,
+  });
   const tools = params.silenceProtocol
     ? // Same rule production applies, on the same list: a toolset that is nothing but the protocol
       // tool belongs to an agent that is tool-less in practice, and binding it here would simulate a
@@ -546,7 +509,7 @@ async function buildPlaygroundGraph(params: {
   const toolNames = new Set(tools.map((tl) => tl.name));
   const simulatedNames = new Set(
     [
-      ...CONVERSATION_NATIVE_TOOL_NAMES,
+      ...nativesWhere(PLAYGROUND_NATIVES, (s) => s === "simulated"),
       // The document tools the agent was granted, by the name each template produces: they are
       // simulated here too, and a trace that did not say so would read as a document really issued.
       ...loaded.documentSelections.map((d) => documentToolName(d.slug)),
@@ -562,6 +525,9 @@ async function buildPlaygroundGraph(params: {
     onModelFallbackFailed: params.onModelFallbackFailed,
     onModelFallbackUnavailable: params.onModelFallbackUnavailable,
     onHistoryTrim: params.onHistoryTrim,
+    reviewReply: params.reviewReply,
+    revisionPlan: params.revisionPlan,
+    onReplyRevised: params.onReplyRevised,
   });
   // Tag usage as playground so it never pollutes the real dashboard figures (the dashboard
   // defaults to source="inbox"). inboxId is null here (no mirror conversation).
@@ -611,24 +577,42 @@ export async function listPlaygroundTools(params: {
     params.ctx.tenantId as bigint,
     params.agentId,
   );
-  const loaded = await loadPlaygroundConfig({
+  const loaded = await loadDetachedConfig({
     ctx: params.ctx,
     agentId: params.agentId,
     threadId,
     base,
   });
-  const tools = await buildPlaygroundToolset(loaded, {
+  const tools = await buildDetachedToolset(loaded, {
     ctx: params.ctx,
     threadId,
     base,
-    deps: params.deps,
+    mcp: params.deps?.mcp,
     // NOTE: A LISTING, not a turn: nothing here executes a tool, so there is no tool-stage line to
     // write and no FlowContext to write it to. Spelled out rather than omitted because the field is
     // required — the next caller has to answer the same question instead of inheriting a default.
     flow: undefined,
     replyChoice: { textChosen: false },
+    natives: PLAYGROUND_NATIVES,
+    documents: "simulated",
   });
 
+  const classify = toolClassifier(loaded);
+  return tools.map(
+    (tl): PlaygroundToolInfo => ({
+      name: tl.name,
+      description: tl.description ?? "",
+      ...classify(tl.name),
+    }),
+  );
+}
+
+// Which category each tool of a loaded agent falls in, and whether the playground simulates it. Read
+// from the loaded grant name-sets, so the listing and the call-floor estimate cannot disagree on what
+// a tool is.
+function toolClassifier(
+  loaded: AgentConfig,
+): (name: string) => Pick<PlaygroundToolInfo, "category" | "simulated"> {
   const conversation = new Set<string>(CONVERSATION_NATIVE_TOOL_NAMES);
   const utility = new Set<string>(UTILITY_NATIVE_TOOL_NAMES);
   // Simulated here for the same reason the conversation natives are, so the catalog has to say so:
@@ -638,38 +622,258 @@ export async function listPlaygroundTools(params: {
     loaded.documentSelections.map((d) => documentToolName(d.slug)),
   );
   const knowledge = new Set(loaded.ragConfig?.tools ?? []);
-  const http = new Set(loaded.httpToolDefs.map((d) => d.name));
+  // By the name assembly exposes: a legacy row stored as `Consulta_Legada` is offered as
+  // `consulta_legada` (tools/http.ts sanitizeToolName), and a set of stored spellings misses it.
+  const http = new Set(
+    loaded.httpToolDefs.map((d) => normalizeToolName(d.name)),
+  );
   // Runs for real, like an HTTP tool: the sandbox reaches nothing outside the thread, so there is
   // no side effect to simulate, and the operator is here to see what their function returns.
   // Asked before the HTTP set because both kinds share the model's namespace and the service
   // keeps them apart at write time; the assembly would have dropped one of a colliding pair.
-  const code = new Set(loaded.codeToolDefs.map((d) => d.name));
+  const code = new Set(
+    loaded.codeToolDefs.map((d) => normalizeToolName(d.name)),
+  );
   const mcp = new Set(loaded.mcpSelections.flatMap((s) => s.enabledTools));
   const integration = new Set(
     loaded.integrationSelections.flatMap((s) => s.enabledTools),
   );
 
-  return tools.map((tl): PlaygroundToolInfo => {
-    const name = tl.name;
-    const description = tl.description ?? "";
+  return (name) => {
     if (conversation.has(name))
-      return { name, description, category: "native", simulated: true };
-    if (document.has(name))
-      return { name, description, category: "external", simulated: true };
-    if (utility.has(name))
-      return { name, description, category: "utility", simulated: false };
-    if (knowledge.has(name))
-      return { name, description, category: "knowledge", simulated: false };
-    if (code.has(name))
-      return { name, description, category: "code", simulated: false };
-    if (http.has(name))
-      return { name, description, category: "http", simulated: false };
-    if (mcp.has(name))
-      return { name, description, category: "mcp", simulated: false };
+      return {
+        category: "native",
+        simulated: PLAYGROUND_NATIVES[name as NativeToolName] === "simulated",
+      };
+    if (document.has(name)) return { category: "external", simulated: true };
+    if (utility.has(name)) return { category: "utility", simulated: false };
+    if (knowledge.has(name)) return { category: "knowledge", simulated: false };
+    if (code.has(name)) return { category: "code", simulated: false };
+    if (http.has(name)) return { category: "http", simulated: false };
+    if (mcp.has(name)) return { category: "mcp", simulated: false };
     if (integration.has(name))
-      return { name, description, category: "integration", simulated: false };
-    return { name, description, category: "external", simulated: false };
+      return { category: "integration", simulated: false };
+    return { category: "external", simulated: false };
+  };
+}
+
+export interface CallFloorTool {
+  name: string;
+  category: PlaygroundToolCategory;
+  estimatedTokens: number;
+  // For an MCP tool, the grant it came from: the exposed name is namespaced and deduplicated at
+  // assembly, so it cannot be rebuilt from the connection and the tool name on the other side.
+  mcp?: { connectionId: string; tool: string };
+  // For a document tool, its template: the name is derived from a slug the editor does not show.
+  templateId?: string;
+  // For an integration tool, the instance it came from: two instances of one pack share tool names,
+  // and only the first one's tool is offered.
+  integrationInstanceId?: string;
+  // The name the Tools tab shows, for the kinds whose name is the operator's (HTTP, code, document).
+  // Native and pack tools are named by the console's own catalog, in the reader's language.
+  label?: string;
+}
+
+// What every model call of an agent sends before the first line of history (docs/graph.md, History
+// ceiling). `engine: "decisions"` is an observer that classifies through the decisions API and never
+// sends this prompt, so it carries no numbers rather than numbers that describe nothing.
+export type CallFloor =
+  | { engine: "decisions" }
+  | {
+      engine: "llm";
+      // The saved instructions, as typed. The editor counts its own draft instead.
+      instructions: number;
+      // What the runtime appends to them on every call: the grounding rules when the agent can search
+      // the knowledge base, and the block naming each MCP server.
+      instructionsAdded: number;
+      // The same, by part: the Knowledge tab shows what the grounding rules cost next to its switch.
+      instructionsAddedBy: { grounding: number; mcp: number };
+      // Each tool's schema as the model receives it, largest first.
+      tools: CallFloorTool[];
+      total: number;
+    };
+
+// Estimates the call floor from the same toolset a playground turn builds, so a tool counts here
+// exactly when the model is offered it. Loads without the chat model: the estimate needs no key, and
+// an agent whose credential is missing still has a prompt the operator is sizing. What only a
+// conversation supplies (contact attributes, appointments, other-inbox context, late notices) is not
+// in it; the surfaces that show the number say so.
+export async function estimateCallFloor(params: {
+  ctx: TenantContext;
+  agentId: bigint;
+  base?: PrismaClient;
+  deps?: PlaygroundDeps;
+  // The editor's unsaved grant set, measured in place of the saved one: the number moves when a tool
+  // or a knowledge switch is turned on, before the save. Validated as the save validates it, so a set
+  // the save would refuse is refused here too.
+  grants?: ToolGrantInput[];
+  // The editor's unsaved settings, in place of the saved ones: a tool's schema reads them (the handoff
+  // instructions, the writable contact fields), so a draft set measured on saved settings undercounts.
+  settings?: Record<string, unknown>;
+  // The unsaved mode: an observer is offered what an observation is, and one on the decisions engine
+  // sends no prompt at all.
+  mode?: AgentMode;
+}): Promise<CallFloor> {
+  const base = params.base ?? basePrisma;
+  const agent = await runScopedOn(base, params.ctx, (db) =>
+    db.agent.findUnique({
+      where: { id: params.agentId },
+      select: { systemPrompt: true, mode: true, settings: true },
+    }),
+  );
+  if (!agent)
+    throw new NotFoundError("agent not found", "errors.agentNotFound");
+  const mode = params.mode ?? agent.mode;
+  if (
+    isMonitoring(mode) &&
+    readMonitoringConfig(params.settings ?? agent.settings).engine ===
+      "decisions"
+  )
+    return { engine: "decisions" };
+  const threadId = newPlaygroundThreadId(
+    params.ctx.tenantId as bigint,
+    params.agentId,
+  );
+  const draft = params.grants ? normalizeGrants(params.grants) : undefined;
+  const loaded = await runScopedOn(base, params.ctx, async (db) =>
+    loadAgentConfig(
+      db,
+      {
+        tenantId: params.ctx.tenantId as bigint,
+        instanceId: 0n,
+        conversationId: 0,
+        agentId: params.agentId,
+        threadId,
+      },
+      {
+        ignoreDisabled: true,
+        chatModelUnused: true,
+        skipExperiment: true,
+        ...(params.settings
+          ? { overrides: { settings: params.settings } }
+          : {}),
+        ...(draft
+          ? { toolSelections: await selectionsFromGrants(db, draft) }
+          : {}),
+      },
+    ),
+  );
+  if (!loaded)
+    throw new NotFoundError("agent not found", "errors.agentNotFound");
+  // An LLM observer is offered what an observation offers (observe/job.ts): a muted client and no
+  // `reply_as_text`, since it never speaks. Its playground turn is not what it sends in production.
+  const observing = isMonitoring(mode);
+  const tools = await buildPlaygroundToolset(loaded, {
+    ctx: params.ctx,
+    threadId,
+    base,
+    deps: params.deps,
+    // An estimate, not a turn: nothing executes, so there is no tool-stage line to write.
+    flow: undefined,
+    replyChoice: observing ? undefined : { textChosen: false },
+    muted: observing,
+    // A pinned handoff names its target on one account; built as "no account" it reads as foreign and
+    // turns into agent_choice, a larger schema than any conversation on that account is sent.
+    ...(loaded.handoffConfig.mode === "pinned" &&
+    loaded.handoffConfig.targetInstanceId != null
+      ? {
+          // biome-ignore lint/plugin/no-bigint-cast: the operator's saved setting, already a positive integer (readHandoffConfig), not a caller's id
+          instanceId: BigInt(loaded.handoffConfig.targetInstanceId),
+        }
+      : {}),
   });
+  const classify = toolClassifier(loaded);
+  // The operator's display names, read once: the loaded definitions carry only the model-facing name.
+  const labelOf = new Map<string, string>(
+    loaded.documentSelections.map((d) => [documentToolName(d.slug), d.name]),
+  );
+  const httpNames = loaded.httpToolDefs.map((d) => d.name);
+  const codeNames = loaded.codeToolDefs.map((d) => d.name);
+  if (httpNames.length || codeNames.length) {
+    // One after another: both run on the scoped transaction's single connection.
+    const [http, code] = await runScopedOn(base, params.ctx, async (db) => [
+      await db.toolDefinition.findMany({
+        where: { name: { in: httpNames } },
+        select: { name: true, label: true },
+      }),
+      await db.codeToolDefinition.findMany({
+        where: { name: { in: codeNames } },
+        select: { name: true, label: true },
+      }),
+    ]);
+    for (const d of [...http, ...code])
+      labelOf.set(normalizeToolName(d.name), d.label);
+  }
+  const templateOf = new Map(
+    loaded.documentSelections.map((d) => [
+      documentToolName(d.slug),
+      String(d.templateId),
+    ]),
+  );
+  const floorTools = tools
+    .map((tl): CallFloorTool => {
+      const meta = (
+        tl as {
+          metadata?: {
+            mcpServer?: McpServerMeta;
+            mcpTool?: string;
+            integrationInstanceId?: string;
+          };
+        }
+      ).metadata;
+      return {
+        name: tl.name,
+        // By where the tool came from when assembly says so: a name alone can be shared across
+        // sources, and only one of them is offered.
+        category: meta?.mcpServer
+          ? "mcp"
+          : meta?.integrationInstanceId
+            ? "integration"
+            : classify(tl.name).category,
+        estimatedTokens: estimateTokens(
+          JSON.stringify(convertToOpenAITool(tl)),
+        ),
+        ...(meta?.integrationInstanceId
+          ? { integrationInstanceId: meta.integrationInstanceId }
+          : {}),
+        ...(!meta?.mcpServer &&
+        !meta?.integrationInstanceId &&
+        labelOf.has(tl.name)
+          ? { label: labelOf.get(tl.name) }
+          : {}),
+        ...(templateOf.has(tl.name)
+          ? { templateId: templateOf.get(tl.name) }
+          : {}),
+        ...(meta?.mcpServer && meta.mcpTool
+          ? {
+              mcp: {
+                connectionId: meta.mcpServer.connectionId,
+                tool: meta.mcpTool,
+              },
+            }
+          : {}),
+      };
+    })
+    .sort((a, b) => b.estimatedTokens - a.estimatedTokens);
+  const grounded = !!loaded.ragConfig?.tools.includes("search_knowledge");
+  const instructionsAddedBy = {
+    grounding: grounded ? estimateTokens(GROUNDING_DIRECTIVE) : 0,
+    mcp: estimateTokens(buildMcpContextSection(tools) ?? ""),
+  };
+  const instructionsAdded =
+    instructionsAddedBy.grounding + instructionsAddedBy.mcp;
+  const instructions = estimateTokens(agent.systemPrompt);
+  return {
+    engine: "llm",
+    instructions,
+    instructionsAdded,
+    instructionsAddedBy,
+    tools: floorTools,
+    total:
+      instructions +
+      instructionsAdded +
+      floorTools.reduce((sum, t) => sum + t.estimatedTokens, 0),
+  };
 }
 
 // The id of the last AI message in the invoke result (for linking the TTS audio to its turn).
@@ -716,8 +920,8 @@ async function runPlaygroundTurnOnce(
       ? params.threadId
       : newPlaygroundThreadId(tenantId, agentId);
 
-  // One id correlates the ExecutionLog turn, the tool-call logs, the Langfuse trace (item 10) and
-  // the ledger rows (issue #839).
+  // One id correlates the ExecutionLog turn, the tool-call logs, the Langfuse trace and the
+  // ledger rows.
   const turnId = params.turnId ?? crypto.randomUUID();
   // Execution-flow telemetry, tagged source=playground so it never pages an alert channel and stays
   // out of the dashboard's real view (the Logs page can still filter to it). Built before the graph
@@ -730,13 +934,9 @@ async function runPlaygroundTurnOnce(
     threadId,
     base,
   };
-  // WHO IS BEING RUN, resolved before the ceiling is asked. A refusal says that spend was what stood
-  // in the way, and for an agent that does not exist — or has no runnable model — there was never a
-  // provider call to refuse: the same request in a month with budget to spare answers 404 or 400, so
-  // answering 429 in a spent one reports a refusal that did not happen and sends the operator to
-  // look at their budget over a selector that was simply wrong. The read is handed to the graph
-  // below, so asking in this order costs nothing.
-  const loadedConfig = await loadPlaygroundConfig({
+  // The agent is resolved before the spend ceiling is asked: a missing agent or unrunnable
+  // model is a 404/400, never a 429 for a call that could not happen. The read is reused below.
+  const loadedConfig = await loadDetachedConfig({
     ctx,
     agentId,
     threadId,
@@ -748,7 +948,7 @@ async function runPlaygroundTurnOnce(
   // silence the agent for customers, and the two ledgers are already told apart by `source`.
   await assertPlaygroundSpendCeiling({ tenantId, base, flow });
 
-  // The reply's modality, decided once and by production's function (issue #859), with the
+  // The reply's modality, decided once and by production's function, with the
   // operator's "answer in audio" switch standing in for the customer's voice note. No channel: the
   // playground plays the audio itself, in the default container.
   const plannedAudio = plannedReplyIsAudio(loadedConfig.ttsConfig, {
@@ -758,7 +958,30 @@ async function runPlaygroundTurnOnce(
     forceAudio: params.forceAudio,
   });
   const replyChoice: ReplyChoice = { textChosen: false };
+  // Whether the fallback model wrote the reply, for the external check's request.
+  let fallbackAnswered = false;
+  // The model that answered once the fallback took the turn, for the stage's closing line.
+  let answeredBy: { provider: string; model: string } | null = null;
 
+  // The same factual-grounding check the inbox runs; its rows land in the trace after the graph's.
+  const grounding = screensThisTurn(params)
+    ? buildGroundingGate({
+        cfg: loadedConfig.guardrails,
+        reviewer: loadedConfig.groundingReviewer,
+        reference: loadedConfig.groundingReference,
+        flow,
+        logValues: loadedConfig.logToolValues,
+        announce: (r) => {
+          gTrace.push(traceGuardrail(r));
+        },
+        clock: {
+          now: loadedConfig.promptOpts.now,
+          timezone: loadedConfig.timezone,
+        },
+        makeModel: params.deps?.makeModel,
+        langfuseCfg: loadedConfig.langfuseCfg,
+      })
+    : null;
   const { graph, callbacks, loaded, tools, traceLabels } =
     await buildPlaygroundGraph({
       ctx,
@@ -770,6 +993,9 @@ async function runPlaygroundTurnOnce(
       turnId,
       flow,
       loaded: loadedConfig,
+      reviewReply: grounding?.review,
+      revisionPlan: grounding?.revisionPlan,
+      onReplyRevised: grounding?.revised,
       spokenNotice: () =>
         spokenNoticeFor(
           loadedConfig.ttsConfig,
@@ -785,15 +1011,11 @@ async function runPlaygroundTurnOnce(
           model,
           detail: { retriedEmptyResponse: attempt },
         }),
-      onModelFallback: ({ provider, model, reason }) =>
-        emitFlowEvent(flow, {
-          stage: "generate",
-          level: "warn",
-          status: "ok",
-          provider,
-          model,
-          detail: { fallbackReason: reason },
-        }),
+      onModelFallback: (info) => {
+        fallbackAnswered = true;
+        answeredBy = { provider: info.provider, model: info.model };
+        emitFallbackAnswered(flow, "generate", loadedConfig.mc.provider, info);
+      },
       // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
       // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
       // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
@@ -802,15 +1024,8 @@ async function runPlaygroundTurnOnce(
       // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
       // labelled with the primary by construction and would otherwise blame the model that never made
       // the second call. `status` stays "error": the call did fail.
-      onModelFallbackFailed: ({ provider, model, reason }) =>
-        emitFlowEvent(flow, {
-          stage: "generate",
-          level: "info",
-          status: "error",
-          provider,
-          model,
-          detail: { fallbackFailed: reason },
-        }),
+      onModelFallbackFailed: (info) =>
+        emitFallbackFailed(flow, "generate", info),
       onModelFallbackUnavailable: ({ provider, model, reason }) =>
         emitFlowEvent(flow, {
           stage: "generate",
@@ -832,27 +1047,14 @@ async function runPlaygroundTurnOnce(
           },
         }),
     });
-  // Assigned rather than passed at construction: the debug mode is an agent SETTING, and the agent's
-  // settings are what `buildPlaygroundGraph` just read. Every callback above only fires during
-  // `graph.invoke` below, so none of them can emit before this line runs. Playground rows are on the
-  // Logs page like any other, so an operator who turned the mode on for this agent gets the same
-  // answer here as on real traffic (#58).
+  // NOTE: assigned rather than passed at construction: the debug mode is an agent setting, read by
+  // `buildPlaygroundGraph` just now, and every callback above only fires during `graph.invoke`.
   flow.fullDetail = loaded.fullDetail;
 
-  // The SAME gate the inbox path runs (issue #136). Without it the operator read the agent's raw
-  // reply while the customer would have received the template, or nothing at all — the one setting
-  // the playground exists to let them test. Announcements land in the trace instead of a private
-  // note, because there is no conversation here to put a note on.
-  //
-  // The human message id is minted BEFORE the screening, because a blocked turn needs it too: the
-  // media is linked to it, and the input direction returns before the graph produces any message.
-  // Minted for EVERY turn, not only the ones carrying media: it is also the id a transcript note
-  // points at, and the reload places the note next to the message it judged. Left to the reducer,
-  // the id exists but nothing here knows it, and the note ends up with nowhere to go.
-  //
-  // It IS the turn id (issue #839): the ledger rows of this turn carry that id, and the human message
-  // is the one thing every turn leaves in the thread, blocked or not, so a reopened session finds
-  // each turn's usage through it.
+  // The SAME guardrail gate the inbox path runs; announcements land in the trace, since there
+  // is no conversation to put a note on. The human message id is minted before the screening (a
+  // blocked turn links media to it), for every turn (a transcript note points at it), and it IS the
+  // turn id: every turn leaves it in the thread, so a reopened session finds each turn's usage by it.
   const humanId = turnId;
   const saveInboundMedia = async (): Promise<string | undefined> =>
     params.userMedia
@@ -879,7 +1081,16 @@ async function runPlaygroundTurnOnce(
         },
         flow,
         systemPrompt: loaded.systemPrompt,
+        logValues: loaded.logToolValues,
         customerMessage: text,
+        inputContext: async () => {
+          const st = await graph.getState({
+            configurable: { thread_id: threadId },
+          });
+          const msgs = (st?.values as { messages?: unknown } | undefined)
+            ?.messages;
+          return Array.isArray(msgs) ? (msgs as BaseMessage[]) : [];
+        },
         makeModel: params.deps?.makeModel,
         langfuseCfg: loaded.langfuseCfg,
       })
@@ -928,7 +1139,7 @@ async function runPlaygroundTurnOnce(
   // Everything screened before the graph belongs ahead of the graph's own entries in the trace.
   const beforeGraph = gTrace.length;
 
-  // Dated with the instant the playground says it was written, simulation included (issue #755), so
+  // Dated with the instant the playground says it was written, simulation included, so
   // an operator testing "the customer comes back a week later" sees the history the way a real turn
   // would send it.
   const human = new HumanMessage({
@@ -938,11 +1149,20 @@ async function runPlaygroundTurnOnce(
   });
 
   let result: Awaited<ReturnType<typeof graph.invoke>>;
+  // So playground tool calls land in the Logs page, as a real turn's do in runLoadedTurn.
+  const toolLogger = new ToolFlowLogger(flow, {
+    logValues: loaded.logToolValues,
+    tools,
+  });
   try {
     result = await withFlowStage(
       flow,
       "generate",
-      { provider: loaded.mc.provider, model: loaded.mc.model },
+      {
+        provider: loaded.mc.provider,
+        model: loaded.mc.model,
+        labelsOf: () => answeredBy,
+      },
       () =>
         graph.invoke(
           { messages: [human] },
@@ -951,38 +1171,31 @@ async function runPlaygroundTurnOnce(
             configurable: { thread_id: threadId },
             // ToolFlowLogger so playground tool calls land in the Logs page (item 3), same as a
             // real turn does in runLoadedTurn.
-            callbacks: [
-              ...callbacks,
-              new ToolFlowLogger(flow, {
-                logValues: loaded.logToolValues,
-                tools,
-              }),
-            ],
+            callbacks: [...callbacks, toolLogger],
           },
         ),
     );
   } catch (e) {
     if (e instanceof AppError) throw e;
     throw toPlaygroundInvokeError(e);
+  } finally {
+    toolLogger.settle();
   }
-  // OUTPUT direction: screen the reply BEFORE anything renders it, so the TTS below synthesizes the
-  // text that would actually be delivered rather than the one the guardrail took away.
-  // Same rule as the inbox's reactive path (issue #454), and for the same reason: the playground
-  // runs the production toolset over a thread of its own, and a model that reproduces the follow-up's
-  // silence token would otherwise have it rendered as the reply the operator is testing.
+  // Screen the reply BEFORE anything renders it, so the TTS synthesizes what would be delivered.
+  // Same sentinel rule as the inbox's reactive path, so a reproduced silence token is not rendered.
   const draftedTurn = customerFacingReply(lastAssistantText(result.messages));
   const raw = draftedTurn.text;
-  // NOTE: ...and the token must not stay in the THREAD, which emptying the reply does not do. `graph.invoke`
-  // checkpointed the raw message before this line, the playground session is multi-turn on one
-  // thread, and the next turn would read one more sentinel answer — the same compounding the inbox
-  // path rolls back (runtime.ts), on the surface whose whole claim is production fidelity
-  // (`docs/playground.md`). Inline rather than armed for later, unlike the inbox: no claim is held
-  // on this thread (the playground marks none), so the rollback is free to read it now.
-  //
-  // The turn TRACE is built from `result.messages` and keeps the raw token, deliberately: it exists
-  // to show what the model actually produced, and the operator testing an agent that emits the
-  // sentinel needs to see it. What must not survive is the message in the THREAD, which is the copy
-  // the next turn reads back as an example.
+  const hiddenNotes = hiddenNotesThisTurn(result.messages as BaseMessage[]);
+  if (hiddenNotes.length > 0)
+    emitFlowEvent(flow, {
+      stage: "generate",
+      status: "ok",
+      detail: hiddenNotesDetail(hiddenNotes, loaded.logToolValues),
+    });
+  // NOTE: the token must not stay in the THREAD either: the session is multi-turn on one thread and
+  // the next turn would imitate it (runtime.ts rolls back the same way). Inline, since the playground
+  // holds no claim on the thread. The TRACE keeps the raw token deliberately: it shows what the model
+  // produced.
   if (draftedTurn.bySentinel) {
     emitFlowEvent(flow, {
       stage: "generate",
@@ -1013,10 +1226,50 @@ async function runPlaygroundTurnOnce(
       );
     }
   }
-  const outGuard = raw
-    ? await screen("output", raw)
-    : { kind: "not-run" as const };
-  const reply = screenedText(outGuard, raw) ?? "";
+  // A grounding decision stands even with no text: a revise that came back empty is what sets it.
+  // Hand-overs are simulated here, so there is no transfer for it to yield to.
+  const groundingTrip = grounding?.pending() ?? null;
+  const outGuard: GuardrailDecision = groundingTrip
+    ? groundingTrip
+    : raw
+      ? await screen("output", raw)
+      : { kind: "not-run" as const };
+  let reply = screenedText(outGuard, raw) ?? "";
+  // The operator's endpoint, as the inbox asks it: after the built-in screening, on what would go
+  // out, unless that is already the operator's own text. Its line lands in the trace.
+  const external = screensThisTurn(params)
+    ? buildExternalCheck({
+        cfg: loaded.guardrails,
+        ctx: {
+          tenantId,
+          agentId,
+          conversationId: null,
+          chatwootConversationId: null,
+          turnId,
+          customerMessage: text,
+        },
+        secret: loaded.guardrailsExternalSecret,
+        secretMissing: loaded.guardrailsExternalSecretMissing,
+        logValues: loaded.logToolValues,
+        flow,
+        announce: (r) => {
+          gTrace.push(traceGuardrail(r));
+        },
+        deps: params.deps?.externalCheck,
+      })
+    : null;
+  if (external && reply && !screenedByOperator(outGuard)) {
+    const judged = await external({
+      text: reply,
+      attachments: [],
+      model: fallbackAnswered ? "fallback" : "primary",
+      toolCalls: turnToolCalls(
+        result.messages,
+        loaded.guardrails.external.sendToolValues,
+      ),
+    });
+    reply = screenedText(judged, reply) ?? "";
+  }
   const trace: TraceEntry[] = [
     ...gTrace.slice(0, beforeGraph),
     ...buildPlaygroundTrace(result.messages, traceLabels),
@@ -1030,18 +1283,10 @@ async function runPlaygroundTurnOnce(
     params.titleHint ?? text,
   );
 
-  // The checkpointer holds the model's OWN reply, as production's thread does, so a reload would
-  // show the text the guardrail took away and no sign that it acted. Every turn the guardrail RAN
-  // on gets a note, a clean verdict included: the toggle is per turn, so without the clean mark a
-  // reopened session cannot tell an approved reply from one nothing ever screened, which is the
-  // ambiguity the issue is about. `gTrace` empty means it never ran, and writes nothing.
-  //
-  // NOTE: The two stores are not written atomically, and cannot be: `graph.invoke` has already
-  // committed the model's own reply to the checkpointer by the time the screening (a model call)
-  // returns. A second mount reopening this same session in that window rebuilds from the
-  // checkpointer alone and reads the raw reply. Left open deliberately — see `.codex-review-waived`
-  // for what each way of closing it costs, all of them more than a seconds-long window on a
-  // surface one operator drives.
+  // NOTE: the checkpointer holds the model's OWN reply, so every turn the guardrail RAN on gets a
+  // note, clean verdicts included (see turn-notes.ts); empty `gTrace` means it never ran. The two
+  // stores are not written atomically and cannot be: a second mount reopening the session in that
+  // seconds-long window reads the raw reply, left open deliberately (`.codex-review-waived`).
   if (gTrace.length > 0) {
     await savePlaygroundTurnNote(base, {
       ctx,
@@ -1065,7 +1310,7 @@ async function runPlaygroundTurnOnce(
   // TTS reply: the agent's mode decides (mirror/preference), or the manual toggle forces it. Audio
   // is best-effort — synthesis failure falls back to the text reply.
   let ttsMediaId: string | undefined;
-  // The same plan production delivers by (issues #787, #856): the operator hears no URL or e-mail,
+  // The same plan production delivers by: the operator hears no URL or e-mail,
   // and a reply that is only the introduction of its link, or one built to be read (too long, a
   // list, a run of prices), gets no audio. The items stay in `reply`.
   const spoken = planAudioReply(reply ?? "", loaded.ttsConfig);
@@ -1077,8 +1322,8 @@ async function runPlaygroundTurnOnce(
         params.userSentAudio ?? false,
         loaded.contactVoiceReply,
       ));
-  // The model chose text for this reply (issue #859): the same line production writes, and no
-  // synthesis. Checked before the #856 gate, which only measures a reply still going as audio.
+  // The model chose text: the same line production writes, and no synthesis. Checked before
+  // the too-long-for-audio gate, which only measures a reply still going as audio.
   const chosenText = asked && replyChoice.textChosen;
   if (chosenText) {
     emitFlowEvent(flow, {
@@ -1140,14 +1385,9 @@ async function runPlaygroundTurnOnce(
     }
   }
 
-  // SIGNED ONLY HERE, on the way to the operator's screen (issue #599). Not in the thread above,
-  // because production's checkpointer holds the model's own reply and the signature is attached at
-  // delivery; and NOT in the TTS text, for the reason production's audio branch is unsigned — the
-  // operator would hear a spoken "Alex, Minha Empresa" that no customer ever hears, which is the one
-  // divergence the playground exists to avoid.
-  //
-  // Same function production calls, because the question is the same one: the signature is a single
-  // channel-agnostic text, and the playground is where the operator checks what it will look like.
+  // Signed only here, on the way to the operator's screen, by production's own function: not
+  // in the thread (production signs at delivery) and not in the TTS text (production's audio branch
+  // is unsigned). See docs/signature.md.
   const previewSig = signatureFor(
     loaded.signatureConfig,
     loaded.promptVars,
@@ -1192,6 +1432,8 @@ export interface PlaygroundFollowupResult {
   // The agent DID write a follow-up and the guardrail removed it. Mutually exclusive with `silent`:
   // both mean nothing is sent, and only this one has a verdict behind it.
   suppressed: boolean;
+  // The step only applies its labels and resolves, with no model call (see closesWithoutModel).
+  closesOnly: boolean;
   // What the simulated follow-up spent, and how long it took (see PlaygroundTurnResult).
   usage: TurnUsage;
   timing: TurnTiming;
@@ -1236,11 +1478,9 @@ async function runPlaygroundFollowupOnce(
       ? params.threadId
       : newPlaygroundThreadId(tenantId, agentId);
 
-  // One id correlates the tool-call logs and the Langfuse trace for this simulated follow-up; the
-  // entry point minted it, so a failure is reported under the same one (issue #841).
-  // Flow telemetry tagged source=playground (never pages an alert channel, stays out of the
-  // dashboard) so the simulated follow-up's tool calls show up in the Logs page (item 3). Built
-  // before the graph because the graph's retry callback writes to it.
+  // The entry point minted the turn id, so a failure is reported under the same one. Tagged
+  // source=playground (never pages an alert channel, stays out of the dashboard); built before the
+  // graph because the graph's retry callback writes to it.
   const flow: FlowContext = {
     tenantId,
     turnId,
@@ -1249,18 +1489,12 @@ async function runPlaygroundFollowupOnce(
     threadId,
     base,
   };
-  // WHO IS BEING RUN, resolved before the ceiling is asked. A refusal says that spend was what stood
-  // in the way, and for an agent that does not exist — or has no runnable model — there was never a
-  // provider call to refuse: the same request in a month with budget to spare answers 404 or 400, so
-  // answering 429 in a spent one reports a refusal that did not happen and sends the operator to
-  // look at their budget over a selector that was simply wrong. The read is handed to the graph
-  // below, so asking in this order costs nothing.
-  // The SAME widening production applies, because this path renders the SAME directive: it asks the
-  // model to call `skip_reply`, which is operator-revocable, so a simulation without it shows the
-  // operator a follow-up that production would have stayed silent on. One function and not two
-  // copies precisely because there are two renderers of that directive (issue #454, round 3).
+  // The agent is resolved before the spend ceiling is asked: a missing agent or unrunnable
+  // model is a 404/400, never a 429 for a call that could not happen. The read is reused below.
+  // The SAME widening production applies: the directive asks for `skip_reply`, which is
+  // operator-revocable, and without it the simulation replies where production stays silent.
   const loadedConfig = withFollowupSilenceChannel(
-    await loadPlaygroundConfig({
+    await loadDetachedConfig({
       ctx,
       agentId,
       threadId,
@@ -1268,6 +1502,29 @@ async function runPlaygroundFollowupOnce(
       overrides: params.overrides,
     }),
   );
+  // Draft settings (if present) drive the follow-up instructions/delay so the simulation matches
+  // what the operator is editing live; otherwise the saved settings.
+  const agent = await runScopedOn(base, ctx, (db) =>
+    db.agent.findUnique({ where: { id: agentId }, select: { settings: true } }),
+  );
+  const settings = params.overrides?.settings ?? agent?.settings;
+  const followUp = readFollowUpConfig(settings);
+  // The playground previews the FIRST step's message (the simulation has no real schedule). Post
+  // actions (label/resolve) are NOT applied here — there is no real conversation to act on.
+  const firstStep = followUp.steps[0];
+  // A sequence whose only step is an empty closer reaches no model in production, so the preview
+  // does not either: it says what the step does instead of showing a message nobody would get.
+  if (firstStep && closesWithoutModel(firstStep, followUp.steps.length === 1)) {
+    return {
+      reply: "",
+      threadId,
+      trace: [],
+      sources: [],
+      silent: false,
+      suppressed: false,
+      closesOnly: true,
+    };
+  }
   // The playground's token ceiling, before the graph is built and before a single provider call.
   // Its own number, never the inbox one: an operator burning the month testing must not be able to
   // silence the agent for customers, and the two ledgers are already told apart by `source`.
@@ -1294,15 +1551,8 @@ async function runPlaygroundFollowupOnce(
           model,
           detail: { retriedEmptyResponse: attempt },
         }),
-      onModelFallback: ({ provider, model, reason }) =>
-        emitFlowEvent(flow, {
-          stage: "generate",
-          level: "warn",
-          status: "ok",
-          provider,
-          model,
-          detail: { fallbackReason: reason },
-        }),
+      onModelFallback: (info) =>
+        emitFallbackAnswered(flow, "generate", loadedConfig.mc.provider, info),
       // ATTRIBUTION, NOT A SECOND ALARM, which is why this one line is `info` while the failure it
       // describes is an error. The `generate` stage this call sits inside emits its OWN error when the
       // turn throws, and alert coalescing keys on (channel, stage, level): two `generate`/`error` events
@@ -1311,15 +1561,8 @@ async function runPlaygroundFollowupOnce(
       // The stage owns the alarm; this line exists only to say WHICH model died, because the stage is
       // labelled with the primary by construction and would otherwise blame the model that never made
       // the second call. `status` stays "error": the call did fail.
-      onModelFallbackFailed: ({ provider, model, reason }) =>
-        emitFlowEvent(flow, {
-          stage: "generate",
-          level: "info",
-          status: "error",
-          provider,
-          model,
-          detail: { fallbackFailed: reason },
-        }),
+      onModelFallbackFailed: (info) =>
+        emitFallbackFailed(flow, "generate", info),
       onModelFallbackUnavailable: ({ provider, model, reason }) =>
         emitFlowEvent(flow, {
           stage: "generate",
@@ -1344,16 +1587,6 @@ async function runPlaygroundFollowupOnce(
   // Same reason as the turn path above: set after the settings read, before any callback can emit.
   flow.fullDetail = loaded.fullDetail;
 
-  // Draft settings (if present) drive the follow-up instructions/delay so the simulation matches
-  // what the operator is editing live; otherwise the saved settings.
-  const agent = await runScopedOn(base, ctx, (db) =>
-    db.agent.findUnique({ where: { id: agentId }, select: { settings: true } }),
-  );
-  const settings = params.overrides?.settings ?? agent?.settings;
-  const followUp = readFollowUpConfig(settings);
-  // The playground previews the FIRST step's message (the simulation has no real schedule). Post
-  // actions (label/resolve) are NOT applied here — there is no real conversation to act on.
-  const firstStep = followUp.steps[0];
   const summary = params.context?.trim()
     ? clipText(params.context.trim(), 500)
     : `The customer has been inactive for about ${
@@ -1367,6 +1600,13 @@ async function runPlaygroundFollowupOnce(
   };
 
   let result: Awaited<ReturnType<typeof graph.invoke>>;
+  // From the loaded config, which reads this block off the SAVED bag — never from `settings` here,
+  // which is the draft. Recording policy does not follow a draft (see `prepare.ts`), and this line
+  // reading it separately is how the follow-up path came to answer differently from the turn path.
+  const nudgeToolLogger = new ToolFlowLogger(flow, {
+    logValues: loaded.logToolValues,
+    tools,
+  });
   try {
     result = await graph.invoke(
       // HUMAN turn, not SystemMessage: the agent node prepends the only system prompt; a second
@@ -1383,52 +1623,33 @@ async function runPlaygroundFollowupOnce(
               // stays silent.
               followupSilenceChannel(loadedConfig, tools),
             ),
-            // The turn's id, as on a user turn: a reopened session finds the follow-up's usage
-            // through it (issue #839).
+            // NOTE: the turn's id, as on a user turn: a reopened session finds the follow-up's
+            // usage through it.
             id: turnId,
+            additional_kwargs: playgroundNudgeMarker(),
           }),
         ],
       },
       {
         recursionLimit: recursionLimitFor(loadedConfig.maxToolCalls),
         configurable: { thread_id: threadId },
-        callbacks: [
-          ...callbacks,
-          new ToolFlowLogger(flow, {
-            // From the loaded config, which reads this block off the SAVED bag — never from
-            // `settings` here, which is the draft. Recording policy does not follow a draft (see
-            // `prepare.ts`), and this line reading it separately is how the follow-up path came to
-            // answer differently from the turn path for the same agent.
-            logValues: loaded.logToolValues,
-            tools,
-          }),
-        ],
+        callbacks: [...callbacks, nudgeToolLogger],
       },
     );
   } catch (e) {
     if (e instanceof AppError) throw e;
     throw toPlaygroundInvokeError(e);
+  } finally {
+    nudgeToolLogger.settle();
   }
   // Same silence contract as production (runAgentNudge): the skip sentinel / narrated-emptiness is
   // "stayed silent", and a stray sentinel is stripped so it never shows in the simulated reply.
   const draftedNudge = proactiveReply(lastAssistantText(result.messages));
   const drafted = draftedNudge.text;
-  // NOTE: ...and the same rule production applies one line later (`takeBackUndeliveredSilence`): a silent
-  // follow-up that WROTE something left it in the thread, and this playground session is multi-turn
-  // on one thread, so the next simulated turn reads the token back as a sentence the customer was
-  // told. It reaches here only for the agents that cannot bind a tool — everyone else says nothing by
-  // calling `skip_reply`, which leaves no imitable text. Inline rather than armed for later, unlike
-  // the inbox: no claim is held on this thread, so the rollback is free to read it now.
-  //
-  // THE REACTIVE PLAN, and the difference from production is not a choice about what should go. The
-  // proactive plan finds its slice by the nudge MARKER, and this path builds its directive with a
-  // plain `HumanMessage` — `nudgeMessage` stamps a conversation id, and there is no conversation
-  // here. So the proactive plan answers `no-turn-found` and removes nothing. The reactive plan names
-  // the removable part directly: the trailing run of assistant messages, which is exactly the
-  // sentinel answer. The directive stays, as it already does after every simulated follow-up; it is
-  // a human-role instruction, not an assistant turn for the model to imitate. Marking it would be a
-  // fidelity change with its own readers (the trace, `isNudgeTurn`), on a path this issue is not
-  // about.
+  // NOTE: production's `takeBackUndeliveredSilence`, inline: a silent follow-up that WROTE something
+  // left it in this multi-turn thread. The REACTIVE plan, because the proactive one finds its slice by
+  // the nudge marker, which this conversation-less directive lacks; the reactive plan removes the
+  // trailing assistant run, which is exactly the sentinel answer, and the directive stays.
   if (draftedNudge.silent && draftedNudge.wroteText) {
     try {
       const plan = await undoRefusedTurn({
@@ -1451,7 +1672,7 @@ async function runPlaygroundFollowupOnce(
       );
     }
   }
-  // OUTPUT direction only, exactly as the inbox's proactive path (issue #160): a follow-up answers
+  // OUTPUT direction only, exactly as the inbox's proactive path: a follow-up answers
   // no question, so there is no customer message for the relevance check to judge, and the gate
   // drops that check structurally when none is passed. A `silent` verdict reads as silence here for
   // the same reason it does in production — the customer gets nothing either way.
@@ -1466,8 +1687,10 @@ async function runPlaygroundFollowupOnce(
         },
         flow,
         systemPrompt: loaded.systemPrompt,
+        logValues: loaded.logToolValues,
         makeModel: params.deps?.makeModel,
         langfuseCfg: loaded.langfuseCfg,
+        proactive: true,
       })
     : notScreened;
   const outGuard = drafted
@@ -1504,11 +1727,8 @@ async function runPlaygroundFollowupOnce(
   }
   // Bump the session (or create one titled by the first message if the follow-up is the first turn).
   await upsertPlaygroundSession(base, ctx, agentId, threadId, "");
-  // SIGNED LIKE THE REACTIVE TURN ABOVE, because production signs BOTH (issue #599, found in
-  // review). `runAgentNudge` signs the proactive message, so a playground follow-up that came back
-  // bare would be the one surface showing the operator something the customer never receives, which
-  // is the whole reason this surface exists. `attachSignature` is what declines the empty case, so
-  // a silent or suppressed follow-up is left exactly as it was.
+  // Signed like the reactive turn, since `runAgentNudge` signs the proactive message too.
+  // `attachSignature` declines the empty case, so a silent or suppressed follow-up stays as it was.
   const followUpSig = signatureFor(
     loaded.signatureConfig,
     loaded.promptVars,
@@ -1524,36 +1744,8 @@ async function runPlaygroundFollowupOnce(
     sources: collectTraceSources(trace),
     silent,
     suppressed,
+    closesOnly: false,
   };
-}
-
-const MAX_AUDIO_BYTES = 25 * 1024 * 1024;
-
-// Size + type validation and mime normalization for an uploaded voice note, shared by the
-// transcribe-only step and the full audio turn.
-async function normalizeAudioUpload(
-  file: File,
-): Promise<{ bytes: ArrayBuffer; mimeType: string | null }> {
-  if (file.size > MAX_AUDIO_BYTES) {
-    throw new AppError("audio too large", 413, "errors.audioTooLarge");
-  }
-  // NOTE: Bun derives a multipart File's content-type from the filename extension, not the
-  // browser-set `type`. MediaRecorder voice notes are `.webm`, which maps to `video/webm` (webm
-  // is a video-container MIME even when it carries only an audio track), so an audio-only
-  // recording legitimately arrives as `video/webm`. Accept it alongside `audio/*`, then normalize
-  // it so the downstream STT request advertises an audio mime.
-  const rawType = file.type || null;
-  const isAudioLike =
-    !rawType || rawType.startsWith("audio/") || rawType === "video/webm";
-  if (!isAudioLike) {
-    throw new AppError(
-      "unsupported audio type",
-      415,
-      "errors.unsupportedAudioType",
-    );
-  }
-  const mimeType = rawType === "video/webm" ? "audio/webm" : rawType;
-  return { bytes: await file.arrayBuffer(), mimeType };
 }
 
 export interface PlaygroundTranscribeOnlyParams {
@@ -1583,6 +1775,14 @@ export async function runPlaygroundTranscribe(
     base: params.base,
     deps: params.sttDeps,
     settings: params.overrides?.settings,
+    // A step of its own, before any turn exists. No agent on the context: one that names an agent
+    // also has to carry its debug mode, which this step never loads.
+    flow: {
+      tenantId: params.ctx.tenantId as bigint,
+      turnId: crypto.randomUUID(),
+      source: "playground",
+      base: params.base,
+    },
   });
   return { transcription };
 }
@@ -1618,8 +1818,8 @@ export async function runPlaygroundAudioTurn(
   params: PlaygroundAudioParams,
 ): Promise<PlaygroundAudioResult> {
   const { ctx, agentId, file } = params;
-  // The voice note's transcription runs before the turn, so the turn's id and thread are settled
-  // here, and a failure in either step is reported as the same turn (issue #841).
+  // The voice note's transcription runs before the turn, so the turn's id and thread are
+  // settled here, and a failure in either step is reported as the same turn.
   const threadId = resolvePlaygroundThread(
     params.threadId,
     ctx.tenantId as bigint,
@@ -1644,6 +1844,14 @@ export async function runPlaygroundAudioTurn(
               base: params.base,
               deps: params.sttDeps,
               settings: params.overrides?.settings,
+              // The turn's own id and thread; no agent, as in the transcribe-only step.
+              flow: {
+                tenantId: ctx.tenantId as bigint,
+                turnId,
+                source: "playground",
+                threadId,
+                base: params.base,
+              },
             });
 
       // Faithful rendering: the agent sees exactly what production would feed it for a voice note.
@@ -1697,7 +1905,7 @@ export interface PlaygroundExtractOnlyParams {
   ctx: TenantContext;
   agentId: bigint;
   file: File;
-  // The session the file is being sent into, so the read is billed to it (issue #839). Absent or
+  // The session the file is being sent into, so the read is billed to it. Absent or
   // foreign, a fresh thread is minted and returned, and the turn that follows runs on it.
   threadId?: string;
   // Live draft (live-edit popup): its vision config overrides the saved one (test an unsaved key).
@@ -1717,7 +1925,7 @@ export async function runPlaygroundExtract(
   extracted: string;
   threadId: string;
   // The id the read was billed under. The file turn that follows is handed it back, so the read and
-  // the reply are one turn in the ledger as they are on screen (issue #839).
+  // the reply are one turn in the ledger as they are on screen.
   turnId: string;
   usage: TurnUsage;
   timing: TurnTiming;
@@ -1814,7 +2022,7 @@ async function resolveVisionLabel(
 }
 
 // The read's id, when the console hands one back with the file turn, only if it is still a read
-// waiting for its turn (issue #839). The id becomes the turn's human message id, and a message id
+// waiting for its turn. The id becomes the turn's human message id, and a message id
 // the thread already holds would REPLACE that message (the messages reducer merges by id), so an id
 // replayed from an earlier turn is refused, not trusted. What proves it is a pending read: ledger
 // rows on this thread under it, all of them the read's own, and nothing else in the thread under it
@@ -1990,4 +2198,38 @@ async function runPlaygroundFileTurnOnce(
     ...turn,
     trace: [...visionTrace, ...turn.trace],
   };
+}
+
+/**
+ * The agent as a call from the playground hears it: the rendered prompt and the playground's own
+ * toolset (conversation tools simulated, the rest real), narrowed to what a call may use.
+ */
+export async function loadPlaygroundVoiceAgent(
+  ctx: TenantContext,
+  agentId: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<VoiceAgent> {
+  const threadId = newPlaygroundThreadId(ctx.tenantId as bigint, agentId);
+  const loaded = await loadPlaygroundConfig({
+    ctx,
+    agentId,
+    threadId,
+    base,
+    chatModelUnused: true,
+  });
+  // A call delivers no document and waits its own deadline on an HTTP tool, as in production
+  // (`loadVoiceAgent`).
+  const all = await buildPlaygroundToolset(
+    { ...loaded, documentSelections: [] },
+    {
+      ctx,
+      threadId,
+      base,
+      flow: undefined,
+      replyChoice: undefined,
+      httpToolTimeoutMs: CALL_HTTP_TOOL_TIMEOUT_MS,
+      outboundFetch: invocationDeadlineFetch(),
+    },
+  );
+  return voiceAgentFrom(loaded.systemPrompt, all);
 }

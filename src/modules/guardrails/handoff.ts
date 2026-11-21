@@ -1,27 +1,17 @@
 import logger from "@/api/lib/logger";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
-import {
-  type HandoffConfig,
-  pinnedHandoffTarget,
-} from "@/modules/handoff/settings";
+import { assignPinnedTarget } from "@/modules/handoff/assign-pinned";
+import type { HandoffConfig } from "@/modules/handoff/settings";
 
-// THE TRANSFER A GUARDRAIL MAKES (issue #704). The `handoff` action takes a reply the judge refused
-// and gives the case to a person instead of a canned refusal, which matters most where the refused
-// reply was the only one the customer gets that day (an e-mail inbox).
+// The transfer a guardrail makes: the `handoff` action gives the refused reply's case to a person
+// instead of a canned refusal. Same two moves as `handoff_to_human`: status `open` first (it takes the
+// conversation off the bot), then the assignment, best-effort. The target is the agent's own handoff
+// setting (a pinned agent or team, else Chatwoot's routing), never a second one that could disagree.
 //
-// The same two moves `handoff_to_human` makes, in the same order: the status first, because
-// `open` is what takes the conversation off the bot and onto the human queue, and the assignment
-// after it, best-effort, because a routing miss does not put the conversation back. The target is
-// the agent's own handoff setting, never a second one that could disagree with it: a pinned agent
-// or team is assigned, and every other mode leaves it to Chatwoot's routing (there is no model here
-// to pick a name).
-//
-// A transfer the policy asked for that did not land, thrown by a REACTIVE turn so the message stays
-// owed. Every word a turn can return settles something: `blocked` settles the message, and `empty`
-// advances the watermark and dispenses it just the same. A throw is what the flush retries (with its
-// attempts and its dead-letter announcement) and what the direct path leaves unanswered for
-// recovery. The failure note has already been posted, so the operator sees it on the first attempt.
+// A transfer that did not land, thrown by a REACTIVE turn so the message stays owed: `blocked` and
+// `empty` both settle it, while a throw is what the flush retries and the direct path leaves for
+// recovery. The failure note is already posted, so the operator sees it on the first attempt.
 export class GuardrailHandoffFailedError extends Error {
   constructor(direction: "input" | "output") {
     super(`guardrail hand-over (${direction}) did not reach Chatwoot`);
@@ -71,25 +61,14 @@ export async function applyGuardrailHandoff(params: {
       .catch(() => {});
     return false;
   }
-  const target = pinnedHandoffTarget(params.handoff, params.instanceId);
-  let assigned: "agent" | "team" | "routing" | "failed" | "withdrawn" =
-    "routing";
-  if (target && params.stillWanted && !(await params.stillWanted())) {
-    assigned = "withdrawn";
-  } else if (target) {
-    try {
-      if (target.kind === "agent")
-        await client.assignToAgent(conversationId, target.id);
-      else await client.assignTeam(conversationId, target.id);
-      assigned = target.kind;
-    } catch (err) {
-      assigned = "failed";
-      logger.warn(
-        { err, conversationId: String(conversationId) },
-        "guardrail handoff: opened, but the pinned target could not be assigned",
-      );
-    }
-  }
+  const assigned = await assignPinnedTarget({
+    client,
+    conversationId,
+    instanceId: params.instanceId,
+    handoff: params.handoff,
+    stillWanted: params.stillWanted,
+    logLabel: "guardrail handoff",
+  });
   emitFlowEvent(flow, {
     stage: "handoff",
     status: "ok",

@@ -4,17 +4,13 @@ import { SignJWT } from "jose";
 import { PrismaClient } from "@/../generated/prisma/client";
 import config from "@/config";
 import type { TenantContext } from "@/lib/tenancy";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { mockFindUnique, setupPrismaMock } from "@/tests/utils/prisma-mock";
 
-// THE REFUSAL AS THE CALLER RECEIVES IT (#614), through the route rather than the service.
-//
-// `tests/modules/agents.test.ts` proves the rule; it cannot see the half that made the issue: the
-// opt-in travels in the PATCH body, and a controller that parses it and forgets to hand it down
-// leaves every replace refused, while one that never asks leaves every partial bag destroying
-// configuration. Both halves look identical from inside the service.
-//
-// Same wrapper as tests/api/v1/agents-audit-actor.test.ts, and for the same reason: the controller
-// has no way to inject the test database, so the service is WRAPPED (never stubbed) to hand it one.
+// THE REFUSAL AS THE CALLER RECEIVES IT, through the route (tests/modules/agents.test.ts proves the
+// rule). The opt-in travels in the PATCH body: a controller that drops it refuses every replace, one
+// that never asks lets every partial bag destroy configuration, and the service cannot tell them
+// apart. The service is WRAPPED as in tests/api/v1/agents-audit-actor.test.ts to get the test DB.
 
 const BunRequest = (globalThis as unknown as { BunRequest: typeof Request })
   .BunRequest;
@@ -35,8 +31,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -44,18 +40,19 @@ setupPrismaMock();
 
 const service = await import("@/modules/agents/service");
 // A COPY taken before the mock is installed: Bun updates the imported namespace in place, so a
-// wrapper that called `service.updateAgent` by name would call itself.
+// wrapper that called `service.updateAgentAndGrants` by name would call itself.
 const real = { ...service };
 mock.module("@/modules/agents/service", () => ({
   ...real,
-  updateAgent: mock(
+  updateAgentAndGrants: mock(
     async (
       ctx: TenantContext,
       id: bigint,
-      patch: Parameters<typeof service.updateAgent>[2],
+      patch: Parameters<typeof service.updateAgentAndGrants>[2],
+      grants: Parameters<typeof service.updateAgentAndGrants>[3],
       _base: unknown,
-      opts: Parameters<typeof service.updateAgent>[4],
-    ) => real.updateAgent(ctx, id, patch, app, opts),
+      opts: Parameters<typeof service.updateAgentAndGrants>[5],
+    ) => real.updateAgentAndGrants(ctx, id, patch, grants, app, opts),
   ),
 }));
 
@@ -200,11 +197,20 @@ describe.skipIf(!dbUp)("a partial settings bag over the wire", () => {
       where: { id: BigInt(agentId) },
       data: { settings: STORED },
     });
+    const updates = (
+      service.updateAgentAndGrants as unknown as { mock: { calls: unknown[] } }
+    ).mock.calls;
+    const before = updates.length;
+    // A complete bag, which the service would accept, so only the schema can refuse it.
     const res = await patch({
-      settings: { split: { enabled: false } },
+      settings: { ...STORED, split: { enabled: false } },
       settingsMode: "REPLACE",
     });
-    expect(res.status).toBeGreaterThanOrEqual(400);
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { field?: string }).field).toBe(
+      "settingsMode",
+    );
+    expect(updates.length).toBe(before);
     expect(await settingsOf()).toEqual(STORED);
   });
 });

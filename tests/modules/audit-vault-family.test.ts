@@ -10,19 +10,17 @@ import {
   persistRefreshedOAuthSecret,
   updateVaultEntry,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { underConcurrentEdit } from "@/tests/utils/pg-waits";
 
-// THE VAULT FAMILY (issue #444), where only the CREATION of a credential was audited, and only over
-// MCP.
-//
-// Two of its three routes had no action name anywhere. Replacing the value behind a live reference
-// (`PUT /v1/vault/:id`) was invisible on every transport, and deleting a credential was invisible
-// while creating one was recorded. Both are named here.
+// THE VAULT FAMILY: creating, replacing the value behind a live reference (`PUT /v1/vault/:id`) and
+// deleting a credential are all recorded, on every door.
 //
 // This is also the family where the metadata and the thing that authenticates sit in adjacent
 // columns, so the split matters more than usual: `secret` is compared and never carried, `baseUrl`
 // is an operator-typed URL and reaches the row as its origin, and the fence in
-// `tests/modules/audit-config-families.test.ts` reads `prisma/schema.prisma` so a column added to
-// `VaultEntry` later has to be placed rather than forgotten.
+// `tests/modules/audit-config-families.test.ts` moves every `VaultEntry` column through the service,
+// so a column added later has to be placed rather than forgotten.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -42,8 +40,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -177,12 +175,10 @@ describe.skipIf(!dbUp)("the vault family records its own changes", () => {
     expect((await rows("credential.update")).length).toBe(1);
   });
 
-  // The stale-snapshot half, which is what the review round after the first fix found. The gate used
-  // to compare with the value the CALLER decrypted, and that snapshot predates a network round trip
-  // to the provider: two overlapping refreshes of the same expired credential both saw the old
-  // refresh token and both recorded the same rotation. Comparing under the row lock against what is
-  // STORED makes the second one a no-op, which is what "a row only when something changed" means
-  // when two writers are asking.
+  // The value the CALLER decrypted predates a network round trip to the provider, so two
+  // overlapping refreshes of one expired credential both see the old refresh token. Comparing under
+  // the row lock against what is STORED makes the second one a no-op: "a row only when something
+  // changed", with two writers asking.
   test("two refreshes carrying the same rotation record it once", async () => {
     const id = await oauthEntry(`twice${uniq()}`, baseCred);
     const rotated = { ...baseCred, accessToken: "at-2", refreshToken: "rt-2" };
@@ -191,22 +187,51 @@ describe.skipIf(!dbUp)("the vault family records its own changes", () => {
     expect((await rows("credential.update")).length).toBe(1);
   });
 
-  // A source fence, and the same instrument #395 put on `chatwoot/management.ts`: the lock this
-  // module takes on `vault_entries` is what makes "compare, then write" one decision, and a lock
-  // that is missing or in a DIFFERENT mode has no failing test to show it. A mixed mode is the
-  // deadlock: an INSERT of a row whose foreign key points at a locked row takes `KEY SHARE`, which
-  // `FOR UPDATE` conflicts with and `FOR NO KEY UPDATE` does not, so two paths in one module that
-  // disagree can wait on each other over a key nobody was changing.
-  test("every row lock in the vault service takes the same mode", async () => {
-    const src = await Bun.file(
-      new URL("../../src/modules/vault/service.ts", import.meta.url),
-    ).text();
-    // Comments stripped first: this file's own NOTEs name the other mode while explaining it, and a
-    // fence that counts prose reports a mode nobody takes.
-    const code = src.replace(/^\s*\/\/.*$/gm, "");
-    const locks = code.match(/FOR (?:NO KEY )?UPDATE/g) ?? [];
-    expect(locks.length).toBeGreaterThanOrEqual(4);
-    expect(new Set(locks)).toEqual(new Set(["FOR UPDATE"]));
+  // The lock this module takes on `vault_entries` is what makes "compare, then write" one decision.
+  // Each case changes the entry in a superuser transaction, starts the act, and commits only once the
+  // act is parked behind it: read under the lock, the act compares against the committed change;
+  // read first, it compares against the value the change replaced and records a move nobody made.
+  test("every vault mutation compares against the entry a concurrent write committed", async () => {
+    const underEdit = (
+      edit: Parameters<typeof underConcurrentEdit>[1],
+      act: () => Promise<unknown>,
+    ) => underConcurrentEdit(suDb, edit, act);
+
+    const refreshed = await oauthEntry(`race${uniq()}`, baseCred);
+    const rotated = { ...baseCred, refreshToken: "rt-race" };
+    await underEdit(
+      (tx) =>
+        tx.vaultEntry.update({
+          where: { id: refreshed },
+          data: { secret: encryptJson(rotated) },
+        }),
+      () => persistRefreshedOAuthSecret(ctx(), refreshed, rotated, appDb),
+    );
+    expect(await rows()).toEqual([]);
+
+    const name = `race${uniq()}`;
+    const { id } = await createVaultEntry(
+      ctx(),
+      { name, value: SECRET, kind: "openai" },
+      undefined,
+      undefined,
+      appDb,
+    );
+    await clearAudit();
+    await underEdit(
+      (tx) =>
+        tx.vaultEntry.update({ where: { id }, data: { name: `${name}-b` } }),
+      () => updateVaultEntry(ctx(), id, { name: `${name}-b` }, appDb),
+    );
+    expect(await rows()).toEqual([]);
+
+    await underEdit(
+      (tx) =>
+        tx.vaultEntry.update({ where: { id }, data: { name: `${name}-c` } }),
+      () => deleteVaultEntry(ctx(), id, appDb),
+    );
+    const [deleted] = await rows("credential.delete");
+    expect(deleted?.before).toMatchObject({ name: `${name}-c` });
   });
 
   test("the same scopes in another order are not a change", async () => {
@@ -269,8 +294,8 @@ describe.skipIf(!dbUp)("the vault family records its own changes", () => {
     await collect();
   });
 
-  // The action with no name on any transport before this: the only MCP caller of the service is
-  // `langfuse.connect`, which records its own action and not this one.
+  // The only MCP caller of this service is `langfuse.connect`, which records its own action and not
+  // this one, so this test is the one that covers it.
   test("replacing the value behind a live reference is recorded, as a change and not as a value", async () => {
     await clearAudit();
     const name = `u${uniq()}`;
@@ -287,8 +312,8 @@ describe.skipIf(!dbUp)("the vault family records its own changes", () => {
     expect(rest).toEqual([]);
     expect(row?.action).toBe("credential.update");
     expect(row?.target).toBe(`vault:${id}`);
-    // The marker on BOTH sides, the way #394 and #397 do it: it says a write moved something the row
-    // does not show, which is a fact about the change rather than about either end of it.
+    // NOTE: the marker on BOTH sides, as in the other families: it says a write moved something the
+    // row does not show, a fact about the change rather than about either end of it.
     expect(row?.before).toMatchObject({ name, undisclosedChanged: true });
     expect(row?.after).toMatchObject({ name, undisclosedChanged: true });
     await collect();

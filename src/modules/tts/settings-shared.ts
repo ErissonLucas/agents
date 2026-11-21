@@ -1,28 +1,27 @@
-// The part of the TTS configuration the BROWSER also reads, kept apart from the rest for one
-// measured reason: nothing here may import `./providers`.
-//
-// `TTS_PROVIDER_NAMES` is `Object.keys(PROVIDERS)`, so touching `settings.ts` from client code pulls
-// the whole synthesis registry into the bundle. It happened: importing the voice clamp for the agent
-// editor put the ElevenLabs HTTP client and the WAV header writer in `dist/index-*.js` (`grep -c
-// api.elevenlabs.io` went 0 → 1, and the bundle shed 4386 bytes when the import moved here) with
-// no caller for either. The editor needs the shape and the clamps; it has no business shipping the
-// code that talks to the vendors.
+// The part of the TTS configuration the BROWSER also reads. Nothing here may import `./providers`:
+// `TTS_PROVIDER_NAMES` is `Object.keys(PROVIDERS)`, so client code touching `settings.ts` would pull
+// the synthesis registry (the ElevenLabs HTTP client, the WAV writer) into the bundle.
 
+import type { NumberRange } from "@/lib/number-range";
 import { clipText } from "@/lib/text";
+import {
+  TTS_SPEAKABLE_RANGES,
+  TTS_TIMEOUT_RANGES,
+  TTS_VOICE_RANGES,
+} from "@/modules/agents/number-ranges";
+
+const pair = (r: NumberRange) => [r.min, r.max] as const;
 
 export type TtsMode = "never" | "mirror" | "preference";
 
 export const TTS_MODES: TtsMode[] = ["never", "mirror", "preference"];
 
-// Delivery knobs for the synthesis itself: HOW the words are spoken, as opposed to WHICH words the
-// model picked. Every field is nullable and null means "omit it and let the provider decide" — an
-// install that never touches this keeps sending the exact same request body it sent before.
-// Consumed by ElevenLabs (`voice_settings`) and Fish Audio (`prosody.speed`, `latency`); OpenAI's
-// /audio/speech has no equivalent bag, so each provider mapper ignores what it cannot express.
-// NOTE: these live FLAT on TtsConfig, not in a nested object, because mergeBehaviorSettings merges a
-// block shallowly — a nested bag would make a patch of one knob null out the others, breaking the
-// partial-patch contract the REST/MCP transports promise. Grouping happens at the provider boundary
-// (voiceSettingsOf) instead.
+// Delivery knobs for the synthesis itself: HOW the words are spoken. Every field is nullable and null
+// omits it, so an install that never touches this sends an unchanged request body. ElevenLabs
+// consumes them as `voice_settings` and Fish Audio as `prosody.speed` and `latency`; other mappers
+// ignore what they cannot express.
+// Flat on TtsConfig, not nested: mergeBehaviorSettings merges a block shallowly, so a nested bag
+// would null the other knobs on a one-knob patch. Grouping happens in voiceSettingsOf.
 export interface TtsVoiceSettings {
   // 0 = maximum variation (expressive, occasionally unstable), 1 = flat and monotone. The single
   // biggest lever on "sounds robotic": a voice left at a high stability reads a well-written,
@@ -52,9 +51,8 @@ export const VOICE_SETTINGS_DEFAULTS: TtsVoiceSettings = {
   latency: null,
 };
 
-// What an audio check can do with a synthesized reply (issues #779, #802): nothing, record the
-// verdict, or hold a corrupted audio back and synthesize it again. Declared here, and not in
-// config.ts, because the console offers the choice per agent and reads this module.
+// What an audio check can do with a synthesized reply: nothing, record the verdict, or hold a
+// corrupted audio back and synthesize again. Here rather than in config.ts because the console reads it.
 export const TTS_CHECK_MODES = ["off", "shadow", "enforce"] as const;
 export type TtsCheckMode = (typeof TTS_CHECK_MODES)[number];
 
@@ -77,36 +75,54 @@ export interface TtsConfig extends TtsVoiceSettings {
   normalizeModel: string | null;
   normalizeCredentialRef: string | null;
   normalizeBaseURL: string | null;
-  // The audio check for this agent's replies (issue #802). null = the deployment's `TTS_CHECK_MODE`,
-  // which is what every agent saved before this existed means, so an install behaves as it did.
-  // Honoured only while the deployment has a detector (`TTS_CHECK_URL`): with none there is nothing
-  // to call, whatever the agent says.
+  // The audio check for this agent's replies. null = the deployment's `TTS_CHECK_MODE`, so an agent
+  // that never picked behaves as the install does. Honoured only while `TTS_CHECK_URL` is set.
   checkMode: TtsCheckMode | null;
-  // Whether a reply built to be read goes as TEXT even though it would have been audio (issue #856).
-  // OFF by default, so an agent keeps speaking every reply until its operator turns this on. When
-  // on, the limits below decide: past this many characters of speech, with this many list items,
-  // with this many money values or long numbers. Each is the smallest value that sends text, and
-  // null turns that criterion off. Flat, for the mergeBehaviorSettings reason above. See
-  // modules/tts/speakable.ts.
+  // Whether a reply built to be read goes as TEXT though it would have been audio. Off by default.
+  // When on, each limit below is the smallest value that sends text (null turns that criterion off).
+  // Flat, for the mergeBehaviorSettings reason above. See modules/tts/speakable.ts.
   textInstead: boolean;
   textOverChars: number | null;
   textOverListItems: number | null;
   textOverNumbers: number | null;
-  // What the MODEL is told about its reply being spoken (issue #859), both OFF by default so an
-  // upgrade changes nothing. `spokenNotice`: when this turn's reply is planned as a voice note, a
-  // system notice saying so goes at the end of what the model reads; `spokenNoticeText` is the
-  // operator's wording, null = SPOKEN_NOTICE_DEFAULT. `textChoice`: the model is offered
-  // `reply_as_text`, to send this one reply as text when it has to be read; `textChoiceNote` is the
-  // operator's note on when to use it, appended to the tool's description like a native tool's.
+  // What the model is told about its reply being spoken, both off by default. `spokenNotice` appends
+  // a system notice when the reply is planned as a voice note (`spokenNoticeText` null = the default).
+  // `textChoice` offers `reply_as_text`; `textChoiceNote` is appended to its description.
   spokenNotice: boolean;
   spokenNoticeText: string | null;
   textChoice: boolean;
   textChoiceNote: string | null;
+  // How long each attempt may take while a fallback voice is set, the primary's and the fallback's,
+  // in ms. null = TTS_TIMEOUT_DEFAULT_MS. With no fallback, synthesis keeps that default: the knob
+  // exists to hand a slow primary over, like the model fallback's `timeoutMs`.
+  fallbackTimeoutMs: number | null;
+  // The fallback voice, tried once when the primary times out or the provider answers a transient
+  // status (5xx, 429), before the reply goes as text. It exists once `fallbackProvider` is named,
+  // like the model fallback (graph/fallback-settings). Model and voice "" = that provider's default.
+  // A null credential or baseURL inherits the primary's only when the provider is the same: a key
+  // is never sent to another vendor. Flat, for the mergeBehaviorSettings reason above.
+  fallbackProvider: string | null;
+  fallbackModel: string;
+  fallbackVoice: string;
+  fallbackCredentialRef: string | null;
+  fallbackBaseURL: string | null;
 }
 
-// The notice an agent gets when its operator turns it on without writing one (issue #859). Written
-// for the case measured on a production deployment: of 27 voice replies reviewed by hand, 17 were
-// better as text, mostly long answers and lists, and most did not need to be long at all.
+// The provider's own ceiling before this was configurable, kept as the default so an agent that never
+// set one waits exactly as long as it did.
+export const TTS_TIMEOUT_DEFAULT_MS = 60_000;
+
+// The reader's clamp, for a value stored before the schema refused it.
+export const TTS_TIMEOUT_RANGE_MS = pair(TTS_TIMEOUT_RANGES.fallbackTimeoutMs);
+
+export function clampTtsTimeout(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const [min, max] = TTS_TIMEOUT_RANGE_MS;
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+// The notice used when the operator turns it on without writing one: long answers and lists are
+// what most often reads better as text, and most need not be long.
 export const SPOKEN_NOTICE_DEFAULT =
   "[Sistema] Esta resposta será enviada ao cliente como mensagem de voz. Escreva para ser ouvida: curta, sem listas, tabelas nem formatação, com o essencial primeiro. Se o cliente precisar de detalhes para ler ou copiar (valores, passos, links), ofereça mandar por escrito.";
 
@@ -114,10 +130,9 @@ export const SPOKEN_NOTICE_DEFAULT =
 // guidance, and the notice is read on every audio turn.
 export const VOICE_CHOICE_TEXT_MAX = 1500;
 
-// The two switches and their texts (issue #859). A switch is on only when stored as `true`, so an
-// agent saved before it existed keeps its prompt and its toolset byte for byte. A text is kept only
-// when it has something besides whitespace, so a blank one falls back to the default instead of
-// appending an empty block; clamped to the ceiling, like every operator text a reader hands a model.
+// The two switches and their texts. A switch is on only when stored as `true`, so an agent saved
+// without it keeps its prompt and toolset byte for byte. A blank text falls back to the default
+// instead of appending an empty block; texts are clamped like every operator text handed to a model.
 export function readVoiceChoiceSettings(bag: Record<string, unknown>) {
   const text = (v: unknown): string | null => {
     if (typeof v !== "string") return null;
@@ -132,10 +147,9 @@ export function readVoiceChoiceSettings(bag: Record<string, unknown>) {
   };
 }
 
-// The limits a reply is measured against before it is synthesized (issue #856), set from what was
-// measured: of 27 production voice replies reviewed by hand, 17 were better as text, 13 for length
-// past ~450 characters, 8 for a list of 3+ items, 6 for 3+ money values or long numbers. They apply
-// once `textInstead` is on, and each can then be turned off on its own.
+// The limits a reply is measured against before synthesis, sized to what most often reads better as
+// text: length past ~450 characters, a list of 3+ items, 3+ money values or long numbers. They apply
+// once `textInstead` is on, and each can be turned off on its own.
 export const SPEAKABLE_DEFAULTS = {
   textOverChars: 450,
   textOverListItems: 3,
@@ -148,9 +162,9 @@ export const SPEAKABLE_DEFAULTS = {
 // Clamped rather than rejected, like the voice knobs: a limit below these floors would send nearly
 // every reply as text, which is `mode: "never"` with extra steps.
 export const SPEAKABLE_RANGES = {
-  textOverChars: [80, 4000],
-  textOverListItems: [2, 50],
-  textOverNumbers: [2, 50],
+  textOverChars: pair(TTS_SPEAKABLE_RANGES.textOverChars),
+  textOverListItems: pair(TTS_SPEAKABLE_RANGES.textOverListItems),
+  textOverNumbers: pair(TTS_SPEAKABLE_RANGES.textOverNumbers),
 } as const;
 
 export function clampSpeakableLimit(
@@ -162,12 +176,9 @@ export function clampSpeakableLimit(
   return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-// The switch and the limits (issue #856). The switch is on only when stored as `true`, so an agent
-// saved before it existed keeps speaking. For a limit, absent is the default and null is OFF: the
-// two have to stay apart, because an operator who turns the switch on without touching the limits
-// should get them, and one who cleared a field asked for that criterion to stop. Anything else
-// unreadable is the default. Shared with the editor, which hydrates its fields through it so the
-// screen shows what the runtime applies.
+// The switch and the limits. The switch is on only when stored as `true`. For a limit, absent is the
+// default and null is OFF: turning the switch on should bring the defaults, while a cleared field
+// stops that criterion. Shared with the editor, so the screen shows what the runtime applies.
 export function readSpeakableLimits(bag: Record<string, unknown>) {
   const read = (knob: keyof typeof SPEAKABLE_DEFAULTS) => {
     const v = bag[knob];
@@ -201,20 +212,23 @@ export const TTS_DEFAULTS: TtsConfig = {
   spokenNoticeText: null,
   textChoice: false,
   textChoiceNote: null,
+  fallbackTimeoutMs: null,
+  fallbackProvider: null,
+  fallbackModel: "",
+  fallbackVoice: "",
+  fallbackCredentialRef: null,
+  fallbackBaseURL: null,
   ...VOICE_SETTINGS_DEFAULTS,
 };
 
 // Accepted ranges, clamped rather than rejected: a value typed slightly outside the band is an
 // operator overshooting a slider, not a reason to fail the whole settings write.
-// NOTE: `speed` is 0.25-4.0, the band the ElevenLabs REST endpoint accepts. The narrower 0.7-1.2 that
-// their docs also quote belongs to the Agents Platform, not to this endpoint, and clamping to it here
-// would silently turn a deliberate 1.5 into 1.2 with no error and no trace.
-// Source: https://github.com/elevenlabs/skills/blob/main/text-to-speech/references/voice-settings.md
+// The ranges live in modules/agents/number-ranges (where `speed`'s band is sourced).
 const VOICE_SETTING_RANGES = {
-  stability: [0, 1],
-  similarityBoost: [0, 1],
-  style: [0, 1],
-  speed: [0.25, 4],
+  stability: pair(TTS_VOICE_RANGES.stability),
+  similarityBoost: pair(TTS_VOICE_RANGES.similarityBoost),
+  style: pair(TTS_VOICE_RANGES.style),
+  speed: pair(TTS_VOICE_RANGES.speed),
 } as const;
 
 function clamped(v: unknown, [min, max]: readonly [number, number]) {

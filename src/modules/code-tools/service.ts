@@ -28,16 +28,11 @@ import {
   TOOL_LABEL_MAX,
 } from "@/modules/tool-definitions/service";
 
-// Operator-authored code tools (per-tenant), the sibling of tool-definitions/service.ts for the
-// kind whose "wiring" is a JavaScript function body instead of an HTTP request (issue #363). The
-// row is the operator's: name, description, the typed input schema and the body. The model only
-// ever supplies arguments (graph/tools/code.ts). Granting one to an agent is a separate concern
-// (AgentToolSelection, source=CODE).
-//
-// Invalid code is STORED, with a warning: the static check (lib/code-tool-syntax.ts) answers
-// alongside the row and never refuses, and a body that does not parse fails at call time as the
-// operator's failure. A save that refused would lock a half-typed body out of the one place it can
-// be edited.
+// Operator-authored code tools (per-tenant), the sibling of tool-definitions/service.ts for the kind
+// whose wiring is a JavaScript function body. The model only ever supplies arguments
+// (graph/tools/code.ts); granting one to an agent is AgentToolSelection, source=CODE. Invalid code is
+// STORED with a warning (lib/code-tool-syntax.ts never refuses): refusing would lock a half-typed body
+// out of the one place it can be edited.
 
 export interface CodeToolDto {
   id: string;
@@ -47,6 +42,8 @@ export interface CodeToolDto {
   inputSchema: Record<string, unknown>;
   code: string;
   enabled: boolean;
+  // A clip of what the body returns is logged at info instead of paging; false is the default.
+  silenceTruncationAlert: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -67,6 +64,7 @@ const SELECT = {
   inputSchema: true,
   code: true,
   enabled: true,
+  silenceTruncationAlert: true,
   createdAt: true,
   updatedAt: true,
 } as const;
@@ -85,6 +83,7 @@ interface Row {
   inputSchema: unknown;
   code: string;
   enabled: boolean;
+  silenceTruncationAlert: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -97,6 +96,7 @@ function toListDto(r: Omit<Row, "code">): CodeToolListDto {
     description: r.description,
     inputSchema: (r.inputSchema ?? {}) as Record<string, unknown>,
     enabled: r.enabled,
+    silenceTruncationAlert: r.silenceTruncationAlert,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
@@ -111,6 +111,7 @@ function toDto(r: Row): CodeToolDto {
     inputSchema: (r.inputSchema ?? {}) as Record<string, unknown>,
     code: r.code,
     enabled: r.enabled,
+    silenceTruncationAlert: r.silenceTruncationAlert,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
   };
@@ -129,12 +130,14 @@ function auditProjection(r: {
   inputSchema: unknown;
   code: string;
   enabled: boolean;
+  silenceTruncationAlert: boolean;
 }) {
   const schema = r.inputSchema;
   return {
     name: r.name,
     label: r.label,
     enabled: r.enabled,
+    silenceTruncationAlert: r.silenceTruncationAlert,
     inputFieldCount:
       schema && typeof schema === "object" ? Object.keys(schema).length : 0,
   };
@@ -163,6 +166,7 @@ export const codeToolCreateSchema = z
     // something is there.
     code: z.string().min(1).max(SANDBOX_CODE_MAX_CHARS),
     enabled: z.boolean().optional(),
+    silenceTruncationAlert: z.boolean().optional(),
   })
   .strict();
 export type CodeToolCreate = z.infer<typeof codeToolCreateSchema>;
@@ -197,27 +201,22 @@ export async function getCodeTool(
   return toDto(row);
 }
 
-// One namespace reaches the model: a native's name is reserved (#457), and an HTTP tool's name is
-// taken too, since `dropDuplicateToolNames` would otherwise decide which of the two the agent gets
-// with a flow-log line as the only trace. The HTTP service asks this table the same question.
+// One namespace reaches the model: a native's name is reserved, and an HTTP tool's name is taken too,
+// since `dropDuplicateToolNames` would otherwise decide which of the two the agent gets with a flow-log
+// line as the only trace. The HTTP service asks this table the same question.
 async function assertNameFree(
   db: ScopedDb,
   name: string,
   exceptId?: bigint,
-  // The name the row already carries, on an update. A save that does not MOVE the name is not
-  // asking the namespace question — and the console's editor sends the whole row on every save, so
-  // enforcing the newer rules against an unchanged name would refuse an unrelated edit to a tool
-  // that was legal when it was created (there is no migration moving those rows, unlike the
-  // native-name one).
+  // The name the row already carries, on an update. A save that does not MOVE the name skips the
+  // namespace rules: the editor sends the whole row on every save, and newer rules must not refuse an
+  // unrelated edit to a tool that was legal when created.
   currentName?: string,
 ): Promise<void> {
-  // Compared through the DERIVATION, not as text. The row may predate canonicalization on write
-  // (`Search_Knowledge`), the console submits `normalizeToolName(label)` on every save, and the two
-  // spellings are ONE identity to the model. Read as text, that save reads as a rename and meets
-  // the namespace rules added later, which refuse an edit that moved nothing (round 29).
-  // `undefined` is a CREATE, which always asks the namespace question. Not folded into the
-  // comparison: `normalizeToolName("")` answers `"tool"`, so an absent current name would read as
-  // unchanged for a tool actually named `tool`.
+  // Compared through `normalizeToolName`, not as text: a row stored as `Search_Knowledge` and the
+  // console's normalized label are one identity to the model, so the save is not a rename.
+  // `undefined` is a CREATE and always moves; not folded into the comparison because
+  // `normalizeToolName("")` is `"tool"`.
   const moving =
     currentName === undefined ||
     normalizeToolName(name) !== normalizeToolName(currentName);
@@ -262,9 +261,8 @@ function canonicalSchema(raw: unknown): Prisma.InputJsonValue {
   return (shapes.inputSchema ?? {}) as Prisma.InputJsonValue;
 }
 
-// Everything `createCodeTool` decides about its INPUT — the name pattern, the required description,
-// the body's size — before any database is involved. Split out so the MCP preview can ask the same
-// question the apply asks (#490).
+// Everything `createCodeTool` decides about its INPUT (name pattern, required description, body size)
+// before any database is involved, so the MCP preview asks the same question the apply asks.
 export function assertCodeToolCreatable(input: CodeToolCreate): CodeToolCreate {
   assertNoReservedField(input?.inputSchema);
   return parseInput(codeToolCreateSchema, input);
@@ -297,12 +295,10 @@ function assertNoReservedField(rawInputSchema: unknown): void {
   );
 }
 
-// The half of the verdict that has to READ, so the preview can give it too. ADVISORY, and the word
-// is load-bearing: `assertCodeToolCreatable` above judges the input and cannot change its mind,
-// while this runs its own scoped read outside the write's transaction and can be overtaken.
-// `assertNameFree` INSIDE the tx, and the `(tenant_id, name)` unique index under it, are what keep
-// one name to one tool. This only moves the refusal an operator hits almost every time — a native's
-// name, or one an HTTP tool already took — to where they asked the question (#490).
+// The half of the verdict that has to READ, so the preview can give it too. ADVISORY: it runs outside
+// the write's transaction and can be overtaken; `assertNameFree` inside the tx and the
+// `(tenant_id, name)` unique index keep one name to one tool. This only moves the common refusal to
+// where the operator asked the question.
 export async function assertCodeToolNameAvailable(
   ctx: TenantContext,
   name: string,
@@ -340,6 +336,7 @@ export async function createCodeTool(
         inputSchema: canonicalSchema(data.inputSchema),
         code: data.code,
         enabled: data.enabled ?? true,
+        silenceTruncationAlert: data.silenceTruncationAlert ?? false,
       },
       select: SELECT,
     });
@@ -386,6 +383,8 @@ export async function updateCodeTool(
       patchData.inputSchema = canonicalSchema(data.inputSchema);
     if (data.code !== undefined) patchData.code = data.code;
     if (data.enabled !== undefined) patchData.enabled = data.enabled;
+    if (data.silenceTruncationAlert !== undefined)
+      patchData.silenceTruncationAlert = data.silenceTruncationAlert;
     await db.codeToolDefinition.update({ where: { id }, data: patchData });
     const row = await db.codeToolDefinition.findUniqueOrThrow({
       where: { id },
@@ -413,14 +412,10 @@ export async function deleteCodeTool(
   base: PrismaClient = basePrisma,
 ): Promise<void> {
   await runScopedOn(base, ctx, async (db) => {
-    // The namespace lock, before the row, on the DELETE too. Not for the ordering reason the update
-    // gives (this path takes no other lock) but for the window it closes: an import holds this lock
-    // while it resolves a grant and inserts the selection rows, so a delete that commits in between
-    // takes the row out from under a foreign key that has already been read. The insert then fails,
-    // and because the whole import runs in ONE transaction it does not lose a grant, it loses the
-    // agent, the tools and the knowledge bases (issue #221). Serialized behind the lock, the delete
-    // waits and the import reports `codeGrantNotFound`, or the delete goes first and the import
-    // never sees the row (round 30).
+    // NOTE: the namespace lock, before the row, on the DELETE too: an import holds it while resolving
+    // a grant and inserting selection rows, and a delete committing in between would fail the whole
+    // import transaction (agent, tools, knowledge bases). Serialized, the import either reports
+    // `codeGrantNotFound` or never sees the row.
     await lockToolNames(db);
     await db.$queryRaw`SELECT 1 FROM "code_tool_definitions" WHERE "id" = ${id} FOR UPDATE`;
     const current = await db.codeToolDefinition.findUnique({

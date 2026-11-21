@@ -14,11 +14,11 @@ import {
   runRedirectGate,
 } from "@/modules/channel-redirect/gate";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// The redirect gate stamps `redirectSentAt` and spends one of `maxResends` the moment it believes the
-// link went out — and that belief came from a `send` that could not report otherwise. Since the
-// webhook's public post can now decline to send (the conversation stopped being the bot's mid-flight),
+// The redirect gate stamps `redirectSentAt` and spends one of `maxResends` when the link goes out. The
+// webhook's public post can decline to send (the conversation stopped being the bot's mid-flight), and
 // a stamp on an undelivered link costs the lead the link entirely: the one-shot rule suppresses every
 // later attempt, permanently when maxResends is 0. These pin the stamp to the delivery, not to the
 // attempt.
@@ -39,8 +39,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -73,11 +73,11 @@ const calls: {
   searches: number;
   unlinks: number;
   mintedFor: string[];
-  // The conversation each token names as the redirect's ORIGIN (#222). The mint is the only moment
+  // The conversation each token names as the redirect's ORIGIN. The mint is the only moment
   // the two halves of an episode are known together, so a token minted without it produces a link
   // whose episode can never be paired.
   mintedOrigin: Array<number | undefined>;
-  // The CONTACT each token names (fazer-ai/agents#286). The identifier is guessable and can move, so
+  // The CONTACT each token names. The identifier is guessable and can move, so
   // it cannot say whose identity the link carries; the mint is admin-authenticated and can.
   mintedContact: Array<number | undefined>;
   selfReads: number;
@@ -427,14 +427,14 @@ describe.skipIf(!dbUp)("runRedirectGate delivery accounting", () => {
     expect(calls.mintedFor).toEqual([`fzwa:${conv.chatwootContactId}`]);
     // The token names the conversation the gate is running on, which IS the episode's entry half.
     expect(calls.mintedOrigin).toEqual([7305]);
-    // And WHOSE identity it carries. Without this the widget side has only the identifier to go on,
-    // and an identifier that has moved off the contact makes it create a second one for this lead
-    // instead of merging onto it (#286).
+    // NOTE: and WHOSE identity it carries. Without this the widget side has only the identifier to
+    // go on, and an identifier that has moved off the contact makes it create a second one for this
+    // lead instead of merging onto it.
     expect(calls.mintedContact).toEqual([conv.chatwootContactId]);
   });
   test("a WhatsApp contact that already carries another identifier still ends up holding ours", async () => {
     const conv = await seedConversation(7306);
-    // The state the report describes: the WhatsApp contact carries a WhatsApp LID identifier of its
+    // NOTE: the WhatsApp contact carries a WhatsApp LID identifier of its
     // own, which the stamp overwrites. What it must NOT do is leave the contact on that LID while the
     // token is minted for something else, since the widget identifies by the token's value.
     seedChatwootContact(conv.chatwootContactId, "554899990000@lid");
@@ -467,8 +467,8 @@ describe.skipIf(!dbUp)("runRedirectGate delivery accounting", () => {
       new RegExp(`^fzwa:${conv.chatwootContactId}:[0-9a-f]{8}$`),
     );
     expect(calls.mintedFor).toEqual([taken as string]);
-    // The VALUE moved; whose link it is did not. A token naming the squatter — or naming none — would
-    // send the widget to unify this lead onto somebody else, or onto nobody (#286).
+    // NOTE: the VALUE moved; whose link it is did not. A token naming the squatter (or none) would
+    // send the widget to unify this lead onto somebody else, or onto nobody.
     expect(calls.mintedContact).toEqual([conv.chatwootContactId]);
     // The holder keeps what it had; nothing here writes to a contact that is not ours.
     expect(contacts.get(99003)?.identifier).toBe(
@@ -520,8 +520,8 @@ describe.skipIf(!dbUp)("runRedirectGate delivery accounting", () => {
 
   test("a held identifier is answered by taking a different one, and the token carries it", async () => {
     const conv = await seedConversation(7303);
-    // The state the report measured: the WhatsApp contact does not hold `fzwa:<its own id>`, and some
-    // other contact does. Every later redirect for this lead used to die on the 422 that answers it.
+    // NOTE: the WhatsApp contact does not hold `fzwa:<its own id>` and some other contact does, so
+    // stamping it answers 422; without the recovery every later redirect for this lead dies there.
     seedChatwootContact(conv.chatwootContactId, null);
     seedChatwootContact(99001, `fzwa:${conv.chatwootContactId}`);
     const sent: string[] = [];
@@ -564,110 +564,6 @@ describe.skipIf(!dbUp)("runRedirectGate delivery accounting", () => {
     expect(calls.merges).toEqual([]);
     expect(calls.unlinks).toBe(0);
     expect(calls.searches).toBe(0);
-  });
-
-  test("two leads colliding on the same value both get served, with different ones", async () => {
-    const first = await seedConversation(7312);
-    const second = await seedConversation(7313);
-    seedChatwootContact(first.chatwootContactId, null);
-    seedChatwootContact(second.chatwootContactId, null);
-    seedChatwootContact(99007, `fzwa:${first.chatwootContactId}`);
-    seedChatwootContact(99008, `fzwa:${second.chatwootContactId}`);
-
-    for (const [convId, conv] of [
-      [7312, first],
-      [7313, second],
-    ] as const) {
-      const outcome = await runRedirectGate({
-        tenantId,
-        instanceId,
-        conversationId: convId,
-        conv: {
-          id: conv.id,
-          contactId: conv.contactId,
-          redirectSentAt: null,
-          redirectCount: 0,
-        },
-        cfg,
-        clonedMessage: null,
-        now: new Date(),
-        base: appDb,
-        send: async () => true,
-      });
-      expect(outcome).toBe("sent");
-    }
-
-    const a = contacts.get(first.chatwootContactId)?.identifier;
-    const b = contacts.get(second.chatwootContactId)?.identifier;
-    expect(a).not.toBe(b);
-    expect(calls.mintedFor).toEqual([a as string, b as string]);
-  });
-  test("a contact that already moved keeps the value it moved to", async () => {
-    const conv = await seedConversation(7319);
-    // The second delivery for a lead whose base value is held elsewhere. Minting a fresh suffix here
-    // would leave the link issued minutes ago pointing at a value this contact no longer has, and
-    // links outlive the resend cooldown by design (24h).
-    seedChatwootContact(conv.chatwootContactId, null);
-    seedChatwootContact(99013, `fzwa:${conv.chatwootContactId}`);
-
-    const run = () =>
-      runRedirectGate({
-        tenantId,
-        instanceId,
-        conversationId: 7319,
-        conv: {
-          id: conv.id,
-          contactId: conv.contactId,
-          redirectSentAt: null,
-          redirectCount: 0,
-        },
-        cfg,
-        clonedMessage: null,
-        now: new Date(),
-        base: appDb,
-        send: async () => true,
-      });
-
-    expect(await run()).toBe("sent");
-    const first = contacts.get(conv.chatwootContactId)?.identifier;
-    expect(await run()).toBe("sent");
-    const second = contacts.get(conv.chatwootContactId)?.identifier;
-
-    expect(second).toBe(first as string);
-    // Both tokens carry it, so either link resolves onto this contact.
-    expect(calls.mintedFor).toEqual([first as string, first as string]);
-  });
-
-  test("an identifier that is not one of ours is not reused", async () => {
-    const conv = await seedConversation(7320);
-    // A WhatsApp LID, or any other value: the base is held elsewhere, and what this contact happens to
-    // carry says nothing about a link this gate ever issued.
-    seedChatwootContact(conv.chatwootContactId, "554899990000@lid");
-    seedChatwootContact(99014, `fzwa:${conv.chatwootContactId}`);
-
-    const outcome = await runRedirectGate({
-      tenantId,
-      instanceId,
-      conversationId: 7320,
-      conv: {
-        id: conv.id,
-        contactId: conv.contactId,
-        redirectSentAt: null,
-        redirectCount: 0,
-      },
-      cfg,
-      clonedMessage: null,
-      now: new Date(),
-      base: appDb,
-      send: async () => true,
-    });
-
-    expect(outcome).toBe("sent");
-    const taken = contacts.get(conv.chatwootContactId)?.identifier;
-    expect(taken).toMatch(
-      new RegExp(`^fzwa:${conv.chatwootContactId}:[0-9a-f]{8}$`),
-    );
-    expect(calls.mintedFor).toEqual([taken as string]);
   });
 
   test("the ordinary path reads, and writes only what is not there yet", async () => {

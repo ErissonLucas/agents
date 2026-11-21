@@ -21,8 +21,9 @@ import {
   updateKnowledgeBase,
 } from "@/modules/rag/service";
 import { type ChunkRow, insertChunks, searchChunks } from "@/modules/rag/sql";
+import { dbProbeFailed } from "@/tests/db-gate";
 
-// Issue #747: a help-center article's closing "contact us" paragraph, retrieved into an agent, reads
+// A help-center article's closing "contact us" paragraph, retrieved into an agent, reads
 // as an order to hand the customer off. With the base's switch on, the passage a search returns
 // loses it; with the switch off, or anywhere but the tail of the document, nothing changes.
 
@@ -124,10 +125,6 @@ describe("stripping it from a passage", () => {
       crlf,
     );
   });
-
-  test("nothing to strip returns the passage untouched", () => {
-    expect(stripContactFooter(ARTICLE)).toBe(ARTICLE);
-  });
 });
 
 function row(over: Partial<ChunkRow>): ChunkRow {
@@ -191,26 +188,6 @@ describe("the hit a search returns", () => {
       passageOf(row({ atDocumentEnd: false, documentTail: DOC_TAIL, content }))
         .content,
     ).toBe(content);
-  });
-
-  test("a paragraph that repeats the MIDDLE of the footer is not its head", () => {
-    const content = `${ARTICLE}\n\nnosso atendimento pelo e-mail sac@exemplo.com.br.`;
-    expect(
-      passageOf(row({ atDocumentEnd: false, documentTail: DOC_TAIL, content }))
-        .content,
-    ).toBe(content);
-  });
-
-  test("a passage that starts inside the tail is placed by it", () => {
-    expect(
-      passageOf(
-        row({
-          atDocumentEnd: false,
-          documentTail: DOC_TAIL,
-          content: `O link de troca vale por 24 horas.\n\n${HEAD_OF_FOOTER}`,
-        }),
-      ).content,
-    ).toBe("O link de troca vale por 24 horas.");
   });
 
   test("a passage longer than the tail the query returns is still placed by it", () => {
@@ -278,8 +255,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;

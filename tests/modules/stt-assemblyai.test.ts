@@ -45,7 +45,7 @@ describe("AssemblyAI STT", () => {
       { body: { id: "tx-1", status: "completed", text: " olá mundo " } },
     ]);
     const text = await fast({ ...REQ, fetchImpl });
-    expect(text).toBe("olá mundo");
+    expect(text).toEqual({ text: "olá mundo" });
     expect(calls.map((c) => `${c.init.method} ${c.url}`)).toEqual([
       "POST https://api.assemblyai.com/v2/upload",
       "POST https://api.assemblyai.com/v2/transcript",

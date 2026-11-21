@@ -11,16 +11,10 @@ import {
 import { useEffect, useRef } from "react";
 import { MemoryRouter } from "react-router";
 
-// THE TOOL NAME FOLLOWS THE NAME, AND THE OPERATOR CAN STILL OVERRIDE IT.
-//
-// The slug becomes the agent's tool (`send_<slug>`) and used to be derived ONLY at create time, so
-// renaming a template left "Contrato de prestação" behind a tool called `send_orcamento` — with the
-// field showing it, read-only, and nothing saying why. The rule now is the one an operator would
-// guess from watching it once: the name is the source, every keystroke re-derives, and a slug typed
-// by hand survives until the name is edited again.
-//
-// That last clause is the one worth pinning. It is a deliberate asymmetry (the name wins), not an
-// oversight, and it is invisible in the code — one `setSlug` call inside the name's onChange.
+// Renaming a template keeps its tool name, as an MCP or API rename does: the slug becomes the agent's
+// tool (`send_<slug>`), and a prompt that mentions it must not stop working because the template was
+// renamed. The tool name the new name would derive is offered, and taking it is an explicit click
+// that warns what stops working.
 
 const { DocumentTemplateModal } = await import(
   "@/client/pages/resources/documents/DocumentTemplateModal"
@@ -115,14 +109,12 @@ async function open() {
   return (await screen.findByDisplayValue("Orçamento")) as HTMLInputElement;
 }
 
-// By its LABEL, not by the value it happens to hold. The first version matched "an input whose value
-// starts with orcamento" and silently fell back to the first input on the form, so the test typed
-// into the name field and asserted about the tool field — green for the wrong reason, in the one
-// test whose whole point is that the two fields are independent.
+// By its LABEL, not by the value it happens to hold: matching by value can silently fall back to
+// the first input on the form, typing into the name and asserting about the tool field.
 function toolInput(): HTMLInputElement {
-  // Through `htmlFor`, because a <FormField> label POINTS at its control instead of wrapping it: a
-  // wrapping label forwards a click on any non-interactive descendant to the control, which is how
-  // clicking the help `?` came to toggle the field beside it (issue #411).
+  // Through `htmlFor`, because a <FormField> label POINTS at its control instead of wrapping
+  // it: a wrapping label forwards a click on any non-interactive descendant (the help `?`) to the
+  // control.
   const label = Array.from(document.querySelectorAll("label")).find((l) =>
     /ferramenta do agente|agent tool/i.test(l.textContent ?? ""),
   ) as HTMLLabelElement | undefined;
@@ -137,48 +129,45 @@ function slugValue(): string {
   return toolInput().value;
 }
 
-test("renaming the template re-derives the tool name as you type", async () => {
+test("renaming the template keeps the tool name and offers the new one", async () => {
   const name = await open();
 
   fireEvent.change(name, { target: { value: "Contrato de Prestação" } });
 
   await waitFor(() => {
-    expect(slugValue()).toBe("contrato_de_prestacao");
+    expect(document.body.textContent).toContain("send_contrato_de_prestacao");
   });
-  // And the resulting tool name is spelled out, because `contrato_de_prestacao` alone does not tell
-  // the operator what the model is offered.
-  expect(document.body.textContent).toContain("send_contrato_de_prestacao");
+  expect(slugValue()).toBe("orcamento");
 });
 
-test("the save carries the new slug, so the agent's tool is renamed too", async () => {
+test("a rename alone saves the same tool name", async () => {
   const name = await open();
   fireEvent.change(name, { target: { value: "Contrato" } });
-  await waitFor(() => {
-    expect(slugValue()).toBe("contrato");
-  });
 
   fireEvent.click(await screen.findByText(/^(Save|Salvar)$/));
 
   await waitFor(() => {
     expect(patches.length).toBe(1);
   });
-  expect(patches[0]).toMatchObject({ name: "Contrato", slug: "contrato" });
+  expect(patches[0]?.name).toBe("Contrato");
+  expect(patches[0]?.slug ?? "orcamento").toBe("orcamento");
 });
 
-test("a slug typed by hand sticks, until the name is edited again", async () => {
+test("taking the offered tool name warns, and the save carries it", async () => {
   const name = await open();
+  fireEvent.change(name, { target: { value: "Contrato" } });
+  fireEvent.click(await screen.findByText(/send_contrato/));
 
-  fireEvent.change(toolInput(), { target: { value: "proposta_v2" } });
   await waitFor(() => {
-    expect(slugValue()).toBe("proposta_v2");
+    expect(slugValue()).toBe("contrato");
   });
-  // A DIFFERENT name, not the one already in the field: `fireEvent.change` with an unchanged value
-  // dispatches nothing, so re-typing "Orçamento" here asserted that the hand-typed slug survived an
-  // event that never happened.
-  fireEvent.change(name, { target: { value: "Recibo" } });
+  expect(document.body.textContent).toMatch(/send_orcamento/);
+
+  fireEvent.click(await screen.findByText(/^(Save|Salvar)$/));
   await waitFor(() => {
-    expect(slugValue()).toBe("recibo");
+    expect(patches.length).toBe(1);
   });
+  expect(patches[0]).toMatchObject({ name: "Contrato", slug: "contrato" });
 });
 
 test("an unusable slug is refused in the field, and no request is made", async () => {

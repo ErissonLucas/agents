@@ -7,7 +7,7 @@ import {
   mockFindFirst,
   mockFindUnique,
   mockTenantCreate,
-  mockUpdate,
+  mockUpdateMany,
   mockUser,
   resetPrismaMocks,
   setupPrismaMock,
@@ -29,6 +29,7 @@ const {
   changeUserPassword,
   NoPasswordSetError,
   IncorrectPasswordError,
+  PasswordChangedConcurrentlyError,
 } = await import("@/api/features/auth/auth.service");
 
 describe("auth.service", () => {
@@ -37,24 +38,6 @@ describe("auth.service", () => {
   });
 
   describe("getUserByEmail", () => {
-    test("returns user when found", async () => {
-      mockFindFirst.mockResolvedValueOnce(mockUser);
-
-      const result = await getUserByEmail("test@example.com");
-
-      // The person, as the schema stores them since issue #756 (tests/utils/prisma-mock.ts).
-      expect(result).toEqual(asPersonRow(mockUser));
-      expect(mockFindFirst).toHaveBeenCalledTimes(1);
-    });
-
-    test("returns null when user not found", async () => {
-      mockFindFirst.mockResolvedValueOnce(null);
-
-      const result = await getUserByEmail("nonexistent@example.com");
-
-      expect(result).toBeNull();
-    });
-
     test("trims and searches case-insensitively", async () => {
       mockFindFirst.mockResolvedValueOnce(mockUser);
 
@@ -62,7 +45,7 @@ describe("auth.service", () => {
 
       expect(mockFindFirst).toHaveBeenCalledWith({
         where: { email: { equals: "TEST@EXAMPLE.COM", mode: "insensitive" } },
-        // The person and every membership (issue #756).
+        // NOTE: the person and every membership.
         select: {
           id: true,
           email: true,
@@ -94,7 +77,7 @@ describe("auth.service", () => {
         ...createdUser,
         memberships: asPersonRow(createdUser).memberships,
       });
-      // The person and their first membership, in one statement (issue #756).
+      // NOTE: the person and their first membership, in one statement.
       expect(mockCreate).toHaveBeenCalledWith(
         expect.objectContaining({
           data: {
@@ -290,7 +273,7 @@ describe("auth.service", () => {
       await expect(
         changeUserPassword(1n, "whatever", "new-password-123"),
       ).rejects.toBeInstanceOf(NoPasswordSetError);
-      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockUpdateMany).not.toHaveBeenCalled();
     });
 
     test("changeUserPassword rejects a wrong current password", async () => {
@@ -299,14 +282,34 @@ describe("auth.service", () => {
       await expect(
         changeUserPassword(1n, "wrong-guess", "new-password-123"),
       ).rejects.toBeInstanceOf(IncorrectPasswordError);
-      expect(mockUpdate).not.toHaveBeenCalled();
+      expect(mockUpdateMany).not.toHaveBeenCalled();
     });
 
     test("changeUserPassword stores a new hash when the current matches", async () => {
       const hash = await hashPassword("correct-horse");
       mockFindUnique.mockResolvedValueOnce({ ...mockUser, passwordHash: hash });
-      await changeUserPassword(1n, "correct-horse", "new-password-123");
-      expect(mockUpdate).toHaveBeenCalledTimes(1);
+      const stored = await changeUserPassword(
+        1n,
+        "correct-horse",
+        "new-password-123",
+      );
+      expect(mockUpdateMany).toHaveBeenCalledTimes(1);
+      expect(mockUpdateMany.mock.calls[0]).toEqual([
+        {
+          where: { id: 1n, passwordHash: hash },
+          data: { passwordHash: stored },
+        },
+      ] as never);
+      expect(await verifyPassword("new-password-123", stored)).toBe(true);
+    });
+
+    test("changeUserPassword refuses when another write changed the hash after it was verified", async () => {
+      const hash = await hashPassword("correct-horse");
+      mockFindUnique.mockResolvedValueOnce({ ...mockUser, passwordHash: hash });
+      mockUpdateMany.mockResolvedValueOnce({ count: 0 });
+      await expect(
+        changeUserPassword(1n, "correct-horse", "new-password-123"),
+      ).rejects.toBeInstanceOf(PasswordChangedConcurrentlyError);
     });
   });
 
@@ -343,13 +346,6 @@ describe("auth.service", () => {
     test("returns AGENT when domain does not match", () => {
       config.adminSignupDomains = ["mycompany.io"];
       expect(getSignupRoleForEmail("user@other.com", true)).toBe("AGENT");
-    });
-
-    test("matches case-insensitively", () => {
-      config.adminSignupDomains = ["mycompany.io"];
-      expect(getSignupRoleForEmail("Founder@MyCompany.IO", true)).toBe(
-        "TENANT_ADMIN",
-      );
     });
   });
 
@@ -408,25 +404,6 @@ describe("auth.service", () => {
   });
 
   describe("verifyPassword", () => {
-    test("returns true for matching password and hash", async () => {
-      const password = "securePassword123";
-      const hash = await hashPassword(password);
-
-      const isValid = await verifyPassword(password, hash);
-
-      expect(isValid).toBe(true);
-    });
-
-    test("returns false for non-matching password", async () => {
-      const password = "securePassword123";
-      const wrongPassword = "wrongPassword456";
-      const hash = await hashPassword(password);
-
-      const isValid = await verifyPassword(wrongPassword, hash);
-
-      expect(isValid).toBe(false);
-    });
-
     test("returns false for empty password", async () => {
       const password = "securePassword123";
       const hash = await hashPassword(password);

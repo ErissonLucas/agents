@@ -4,10 +4,29 @@ import { existsSync } from "fs";
 import { cp, rename, rm } from "fs/promises";
 import path from "path";
 import pkg from "./package.json" with { type: "json" };
+import { buildId } from "./scripts/lib/build-id";
+import {
+  findNonAbsoluteUrls,
+  rewriteAssetUrlsForCdn,
+} from "./scripts/lib/cdn-assets";
 
 // App version shown in the sidebar footer (item 2). An explicit BUN_PUBLIC_VERSION (e.g. a CI build
 // tag / git sha) wins; otherwise fall back to package.json's version.
 const APP_VERSION = process.env.BUN_PUBLIC_VERSION || pkg.version || "";
+
+// Distribution edition. Defaults to "full" so the master and any plain `bun run build` yield the
+// Full app; the Free derivation flips the fallback to "free" (# @edition-arg).
+const EDITION = process.env.BUN_PUBLIC_EDITION || "free";
+const CDN_URL = process.env.BUN_PUBLIC_CDN_URL || "";
+
+// Names this frontend to the server and to the open tabs (scripts/lib/build-id.ts). Handed the
+// values the bundle is built with, not the raw env, so two builds that resolve the same edition
+// agree however each one was told it.
+const BUILD_ID = await buildId({
+  version: APP_VERSION,
+  cdnUrl: CDN_URL,
+  edition: EDITION,
+});
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`
@@ -153,15 +172,10 @@ const result = await Bun.build({
   },
   define: {
     "process.env.NODE_ENV": JSON.stringify("production"),
-    "process.env.BUN_PUBLIC_CDN_URL": JSON.stringify(
-      process.env.BUN_PUBLIC_CDN_URL || "",
-    ),
+    "process.env.BUN_PUBLIC_CDN_URL": JSON.stringify(CDN_URL),
     "process.env.BUN_PUBLIC_VERSION": JSON.stringify(APP_VERSION),
-    // Distribution edition. Defaults to "full" so the master and any plain `bun run build`
-    // yield the Full app; the Free derivation flips the fallback to "free" (# @edition-arg).
-    "process.env.BUN_PUBLIC_EDITION": JSON.stringify(
-      process.env.BUN_PUBLIC_EDITION || "free",
-    ),
+    "process.env.BUN_PUBLIC_BUILD_ID": JSON.stringify(BUILD_ID),
+    "process.env.BUN_PUBLIC_EDITION": JSON.stringify(EDITION),
   },
   ...cliConfig,
 });
@@ -198,6 +212,35 @@ for (const output of result.outputs) {
     }
   }
 }
+
+const cdnUrl = process.env.BUN_PUBLIC_CDN_URL?.replace(/\/$/, "");
+if (cdnUrl) {
+  const htmlPath = path.join(outdir, "index.html");
+  const html = await Bun.file(htmlPath).text();
+  const { html: rewrittenHtml, rewritten } = rewriteAssetUrlsForCdn(
+    html,
+    cdnUrl,
+  );
+  if (rewritten > 0) {
+    await Bun.write(htmlPath, rewrittenHtml);
+    console.log(
+      `🌐 Pointed ${rewritten} url() reference(s) in index.html at the CDN\n`,
+    );
+  }
+  // NOTE: anything still relative is an asset the CDN rewrite did not reach, which would be served
+  // from the application origin while everything else moves. Failing by name beats shipping that.
+  const missed = findNonAbsoluteUrls(rewrittenHtml);
+  if (missed.length > 0) {
+    throw new Error(
+      `index.html still points at the application origin for: ${missed.join(", ")}`,
+    );
+  }
+}
+
+await Bun.write(
+  path.join(outdir, "build.json"),
+  `${JSON.stringify({ version: APP_VERSION, buildId: BUILD_ID })}\n`,
+);
 
 const assetsSource = path.join(process.cwd(), "public", "assets");
 const assetsDest = path.join(outdir, "assets");

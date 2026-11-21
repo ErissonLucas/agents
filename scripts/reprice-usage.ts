@@ -1,23 +1,24 @@
 #!/usr/bin/env bun
 
 // Re-prices ledger rows (`llm_usage.cost_usd`) with the price table in the tree now, for when the
-// table that priced them was wrong (issue #867). Dry run unless `--apply`.
+// table that priced them was wrong. Dry run unless `--apply`.
 //
 //   bun scripts/reprice-usage.ts --tenant <id|all> --provider <provider> --model <model>
 //     [--from <ISO date>] [--to <ISO date>] [--price-table <litellm@…|none>] [--apply]
 //
-// `--provider` is required because the ledger does not record it and the table cannot infer it
-// (see src/modules/pricing/reprice.ts). `--from` is inclusive and `--to` exclusive. Without
-// `--price-table` the run covers every row something priced; `none` covers the rows written before
-// the column, which no table priced. Each row is priced as the capture would price it now: the
-// tenant's own price first, then what OpenRouter reported (never replaced by the table), then the
-// table.
+// `--provider` is required because the ledger does not record it. `--from` is inclusive, `--to`
+// exclusive; `--price-table none` selects rows no table priced. Pricing order: pricing/reprice.ts.
 
 import { parseArgs } from "node:util";
 import { PrismaPg } from "@prisma/adapter-pg";
+import { withSessionOptions } from "@/lib/session-zone";
 import { PRICE_OVERRIDE_PROVIDERS } from "@/modules/pricing/overrides";
 import { modelRates } from "@/modules/pricing/price";
-import { type RepriceOptions, runReprice } from "@/modules/pricing/reprice";
+import {
+  type RepriceOptions,
+  runReprice,
+  UNMETERED_PRICE_TABLE,
+} from "@/modules/pricing/reprice";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
 import { PrismaClient } from "../generated/prisma/client";
 
@@ -39,9 +40,9 @@ export function parseRepriceArgs(argv: string[]): RepriceOptions {
   });
   if (!values.tenant) throw new UsageError("--tenant <id|all> is required");
   if (!values.provider) throw new UsageError("--provider is required");
-  // An `openai-compatible` server that serves one model under no name writes `model: ""`, and a
-  // tenant's own price can name that empty model (issue #865), so an explicit empty value is a real
-  // target there; everywhere else it is a typo.
+  // NOTE: an `openai-compatible` server that serves one model under no name writes `model: ""`, and
+  // a tenant's own price can name that empty model, so an explicit empty value is a real target
+  // there; everywhere else it is a typo.
   if (values.model === undefined) throw new UsageError("--model is required");
   if (values.model === "" && values.provider !== "openai-compatible")
     throw new UsageError(
@@ -64,6 +65,10 @@ export function parseRepriceArgs(argv: string[]): RepriceOptions {
     throw new UsageError("--from must be before --to");
   const table = values["price-table"];
   if (table === "") throw new UsageError("--price-table needs a value");
+  if (table === UNMETERED_PRICE_TABLE)
+    throw new UsageError(
+      `--price-table ${UNMETERED_PRICE_TABLE}: those calls reported no tokens, so there is nothing to price`,
+    );
   // Only the provider is checked here. Whether the model has a price is per row: a tenant's own
   // price can cover a model the table lacks (an `openai-compatible` server, say), and a row nothing
   // prices is left as it was and counted in the report, never refused up front.
@@ -99,7 +104,7 @@ async function main() {
     process.exit(2);
   }
 
-  // NOTE: the migration/superuser URL, like the other maintenance scripts. The runner enters the
+  // The migration/superuser URL, like the other maintenance scripts. The runner enters the
   // fleet role per batch, so the runtime role's DATABASE_URL reaches every tenant too.
   const url = process.env.MIGRATION_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) {
@@ -107,7 +112,7 @@ async function main() {
     process.exit(1);
   }
   const prisma = new PrismaClient({
-    adapter: new PrismaPg({ connectionString: url }),
+    adapter: new PrismaPg(withSessionOptions(url)),
   });
   try {
     const report = await runReprice(prisma, opts);

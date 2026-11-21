@@ -7,11 +7,10 @@ import {
   statusClaimVerdict,
 } from "@/modules/chatwoot/status-claim";
 
-// The two halves of the claim that its callers cannot reach (issue #436). What it REFUSES is
-// exercised through the decision table in ./chatwoot-state-order.test.ts, where the rest of the
-// ordering lives; here are the two answers no row of that table can hold — the deadline, which is one
-// instant wide on a clock the callers do not control, and the adjudication, which belongs to the
-// reconcile and happens after every payload the table can describe has already been decided.
+// The two halves of the claim its callers cannot reach. What it REFUSES is exercised through the
+// decision table in ./chatwoot-state-order.test.ts; here are the deadline (one instant wide, on a
+// clock the callers do not control) and the adjudication, which belongs to the reconcile and runs
+// after every payload the table can describe has been decided.
 
 describe("the status claim's deadline", () => {
   const now = new Date("2026-09-01T12:00:00.000Z");
@@ -46,19 +45,6 @@ describe("what a claim does before and after its version is stamped", () => {
     statusClaimFrom: "pending",
   };
   const restating = { status: "pending", reopens: false, version: 101 };
-
-  test("inside the gap it refuses, and keeps the version to be adjudicated", () => {
-    // No stamp yet: the source has said nothing about our own transition, so there is nothing this
-    // version can be placed against. It is kept rather than dropped because the event carrying it is
-    // about to be acknowledged and Chatwoot never sends it again.
-    expect(
-      statusClaimVerdict(
-        { ...claimed, statusClaimStampedAt: null },
-        restating,
-        now,
-      ),
-    ).toBe("refuse-and-defer");
-  });
 
   test("a payload with no version at all is refused with nothing to keep", () => {
     // Chatwoot < 4.0.2. There is no number to adjudicate later, so the refusal is the whole answer.

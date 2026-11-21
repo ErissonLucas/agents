@@ -12,29 +12,20 @@ import {
 import { useNavigate } from "react-router";
 import { DiscardDialog } from "@/client/components/DiscardDialog";
 import {
+  afterTrapRelease,
   leaveViaBackTrap,
+  sentinelOnTop,
   useBackGuard,
   useBeforeUnload,
 } from "@/client/lib/unsavedGuard";
 
-// App-wide guard for unsaved page changes. A page registers its dirty flag via
-// `useNavGuard(dirty)`. While any registered page is dirty, this provider
-// intercepts every way out and shows the shared "discard changes?" confirm:
-//   - in-app <a> clicks (sidebar, breadcrumbs, the page's own Back link) — a
-//     capture-phase document listener that pre-empts react-router's own click
-//     handler (which bails when defaultPrevented);
-//   - the browser Back button — via the history sentinel in unsavedGuard;
-//   - the native refresh/tab-close prompt — via beforeunload.
-// Programmatic state-losing actions that are NOT plain <a> navigations (e.g. the
-// header's tenant switch, which persists then does a full reload) route through
-// `useConfirmLeave()` so they are gated by the same dialog instead of relying on
-// the native prompt (which can be canceled AFTER the side effect already ran).
-//
-// In-page navigation that keeps the component mounted (the agent editor's tab
-// bar, where state survives) is deliberately NOT guarded.
-//
-// Modals use their own guard inside <Modal> (see Modal.tsx); this one is only
-// for inline page forms that have no enclosing modal.
+// App-wide guard for unsaved page changes, registered via `useNavGuard(dirty)`. While any page is
+// dirty it intercepts every way out with the shared "discard changes?" confirm: in-app <a> clicks (a
+// capture-phase listener that pre-empts react-router's handler), browser Back (the history sentinel
+// in unsavedGuard) and refresh or tab-close (beforeunload). Programmatic state-losing actions (the
+// tenant switch's full reload) go through `useConfirmLeave()`, since the native prompt can be
+// canceled AFTER the side effect ran. In-page navigation that keeps the component mounted (the
+// agent editor's tab bar) is deliberately NOT guarded. Modals have their own guard (Modal.tsx).
 
 type Pending =
   | { kind: "href"; href: string }
@@ -43,6 +34,7 @@ type Pending =
 
 type NavGuardValue = {
   register: (id: string, dirty: boolean) => void;
+  unregister: (id: string) => void;
   confirmLeave: (run: () => void) => void;
 };
 
@@ -52,22 +44,75 @@ export function NavGuardProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const dirtyIds = useRef<Set<string>>(new Set());
   const [active, setActive] = useState(false);
-  const [pending, setPending] = useState<Pending | null>(null);
-
-  const register = useCallback((id: string, dirty: boolean) => {
-    const ids = dirtyIds.current;
-    if (dirty === ids.has(id)) return;
-    if (dirty) ids.add(id);
-    else ids.delete(id);
-    setActive(ids.size > 0);
+  const [pending, setPendingState] = useState<Pending | null>(null);
+  const pendingRef = useRef<Pending | null>(null);
+  const setPending = useCallback((p: Pending | null) => {
+    pendingRef.current = p;
+    setPendingState(p);
   }, []);
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
 
-  const confirmLeave = useCallback((run: () => void) => {
-    // Read the ref (not `active` state) so this stays correct without being
-    // re-created on every dirty toggle. Clean → run now; dirty → ask first.
-    if (dirtyIds.current.size === 0) run();
-    else setPending({ kind: "fn", run });
-  }, []);
+  // Carry out a leave the operator asked for.
+  const leave = useCallback(
+    (p: Pending) => {
+      setPending(null);
+      if (p.kind === "href")
+        navigateRef.current(p.href, { replace: sentinelOnTop() });
+      else if (p.kind === "back") leaveViaBackTrap();
+      else p.run();
+    },
+    [setPending],
+  );
+
+  // A page that turns clean while the confirm is open (its save landed) has nothing left to discard,
+  // so the leave goes ahead. It is decided once every registration of the same commit has landed (a
+  // form turning dirty in that commit keeps the confirm), and before the guards let go: the Back
+  // trap's own cleanup would otherwise traverse as well, and land one entry past the page.
+  // A held action (a tenant switch's reload, a menu's navigation) waits for the trap to let go instead.
+  const settle = useCallback(() => {
+    const asked = pendingRef.current;
+    const clean = dirtyIds.current.size === 0;
+    if (clean && asked?.kind === "fn") {
+      setPending(null);
+      afterTrapRelease(asked.run);
+    } else if (clean && asked) leave(asked);
+    setActive(!clean);
+  }, [leave, setPending]);
+
+  const register = useCallback(
+    (id: string, dirty: boolean) => {
+      const ids = dirtyIds.current;
+      if (dirty === ids.has(id)) return;
+      if (dirty) ids.add(id);
+      else ids.delete(id);
+      if (ids.size === 0 && pendingRef.current) queueMicrotask(settle);
+      else setActive(ids.size > 0);
+    },
+    [settle],
+  );
+
+  // A page that goes away is not a page that turned clean: nothing was saved or discarded, so a
+  // leave still asked about it is dropped, not carried out.
+  const unregister = useCallback(
+    (id: string) => {
+      const ids = dirtyIds.current;
+      if (!ids.delete(id)) return;
+      if (ids.size === 0) setPending(null);
+      setActive(ids.size > 0);
+    },
+    [setPending],
+  );
+
+  const confirmLeave = useCallback(
+    (run: () => void) => {
+      // Read the ref (not `active` state) so this stays correct without being
+      // re-created on every dirty toggle. Clean → run now; dirty → ask first.
+      if (dirtyIds.current.size === 0) run();
+      else setPending({ kind: "fn", run });
+    },
+    [setPending],
+  );
 
   // Native refresh / tab-close prompt.
   useBeforeUnload(active);
@@ -110,20 +155,16 @@ export function NavGuardProvider({ children }: { children: ReactNode }) {
     };
     document.addEventListener("click", onClick, true);
     return () => document.removeEventListener("click", onClick, true);
-  }, [active]);
+  }, [active, setPending]);
 
   const onKeep = () => setPending(null);
   const onDiscard = () => {
-    const p = pending;
-    setPending(null);
-    if (p?.kind === "href") navigate(p.href);
-    else if (p?.kind === "back") leaveViaBackTrap();
-    else if (p?.kind === "fn") p.run();
+    if (pending) leave(pending);
   };
 
   const value = useMemo(
-    () => ({ register, confirmLeave }),
-    [register, confirmLeave],
+    () => ({ register, unregister, confirmLeave }),
+    [register, unregister, confirmLeave],
   );
 
   return (
@@ -152,7 +193,7 @@ export function useNavGuard(dirty: boolean) {
     ctx?.register(id, dirty);
   }, [ctx, id, dirty]);
   // Clear this page's bit when it unmounts.
-  useEffect(() => () => ctx?.register(id, false), [ctx, id]);
+  useEffect(() => () => ctx?.unregister(id), [ctx, id]);
 }
 
 // Wrap a programmatic, state-losing action (e.g. switching tenant, which does a

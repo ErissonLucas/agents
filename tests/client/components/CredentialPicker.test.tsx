@@ -8,7 +8,14 @@ import {
   expect,
   test,
 } from "bun:test";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import {
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import { CredentialPicker } from "@/client/components/CredentialPicker";
 import { invalidateVault } from "@/client/lib/vaultCache";
 
@@ -91,8 +98,7 @@ describe("CredentialPicker with a noncanonical ref", () => {
 });
 
 // A referenced entry whose secret was never filled. `credential_create` and the vault both produce
-// this on purpose, and until now the only field that said so was the agent's own (config-health), so
-// so an integration wired to one failed as a bare 401 with nothing said anywhere (issue #124).
+// this on purpose; unless the picker says so, an integration wired to one fails as a bare 401.
 describe("CredentialPicker with a pending entry", () => {
   // The sentence shares its element with the Fill control, so match a fragment.
   const warning = /no value yet/;
@@ -120,5 +126,209 @@ describe("CredentialPicker with a pending entry", () => {
     );
     expect(screen.queryAllByText(warning).length).toBe(0);
     expect(screen.queryAllByRole("button", { name: "Fill" }).length).toBe(0);
+  });
+});
+
+// The context lists its own kind first (the classifier's provider kind before a generic key), and the
+// compatible group follows that order, with the vault's name order within a kind. Before this, the
+// group was the vault's name order alone, so a generic key named "a…" sat above the provider's own.
+describe("CredentialPicker ranks the compatible group by the context's kind order", () => {
+  const entry = (id: string, name: string, kind: string): FakeEntry => ({
+    id,
+    name,
+    kind,
+    baseUrl: null,
+    paramName: null,
+    status: "active",
+  });
+
+  test("the provider's own kind first, names in order within each kind, others apart", async () => {
+    // The vault answers in name order, as the server does.
+    vaultEntries = [
+      entry("1", "a-generic", "generic"),
+      entry("2", "b-typesafe", "typesafe"),
+      entry("3", "c-openai", "openai"),
+      entry("4", "d-generic", "generic"),
+      entry("5", "e-typesafe", "typesafe"),
+    ];
+    render(
+      <CredentialPicker
+        value=""
+        onChange={() => {}}
+        ariaLabel="key"
+        compatibleTypes={["typesafe", "generic"]}
+      />,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("key").hasAttribute("disabled")).toBe(false),
+    );
+    fireEvent.pointerDown(screen.getByLabelText("key"), {
+      button: 0,
+      pointerType: "mouse",
+    });
+    await waitFor(() =>
+      expect(screen.queryAllByRole("menu", { hidden: true }).length).toBe(1),
+    );
+    // Each row carries the entry's name and its kind's label; read which entry a row is by name.
+    const known = vaultEntries.map((e) => e.name);
+    const names = within(screen.getByRole("menu", { hidden: true }))
+      .getAllByRole("menuitem", { hidden: true })
+      .map((el) => known.find((n) => (el.textContent ?? "").includes(n)))
+      .filter((n): n is string => !!n);
+    expect(names.join(",")).toBe("b-typesafe,e-typesafe,a-generic,d-generic");
+  });
+});
+
+// A saved ref is not an empty field. While the vault is still being read the trigger used to say
+// "None" for as long as the read took (about a second on a reload), the same word as a field nobody
+// filled; and a read that failed made the ref look deleted. Neither is what the operator saved.
+describe("CredentialPicker with a saved ref the vault has not answered for", () => {
+  const triggerText = () =>
+    (screen.getByLabelText("key").textContent ?? "").trim();
+  const NONE = /^(None|Nenhuma)$/;
+
+  test("says it is loading, never None, until the entry is named", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const stubbed = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes("/api/v1/vault")) await gate;
+      return stubbed(input, init);
+    }) as typeof fetch;
+    render(
+      <CredentialPicker value="vault:7" onChange={() => {}} ariaLabel="key" />,
+    );
+    const whileLoading = triggerText();
+    const busy =
+      document
+        .querySelector('[data-testid="credential-picker-pending"]')
+        ?.getAttribute("aria-busy") ?? null;
+    release();
+    await waitFor(() =>
+      expect(screen.queryAllByText("openai-main").length > 0).toBe(true),
+    );
+    expect(NONE.test(whileLoading)).toBe(false);
+    expect(busy).toBe("true");
+    expect(
+      screen.queryAllByText(/deleted|excluída|no credential|sem credencial/)
+        .length,
+    ).toBe(0);
+  });
+
+  test("a failed read says so, never None and never that the credential was deleted", async () => {
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ error: "boom" }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      })) as unknown as typeof fetch;
+    render(
+      <CredentialPicker value="vault:7" onChange={() => {}} ariaLabel="key" />,
+    );
+    await waitFor(() => expect(/vault|cofre/.test(triggerText())).toBe(true));
+    expect(NONE.test(triggerText())).toBe(false);
+    expect(screen.queryAllByText(/deleted|excluída/).length).toBe(0);
+  });
+
+  test("an empty field still says None once the vault is read", async () => {
+    render(<CredentialPicker value="" onChange={() => {}} ariaLabel="key" />);
+    await waitFor(() => expect(NONE.test(triggerText())).toBe(true));
+  });
+});
+
+// A provider switch made while the vault is still loading is the same switch as one made after it:
+// the selection it leaves behind cannot depend on which of the two the network answered first.
+describe("CredentialPicker when the provider changes", () => {
+  const compatEntry: FakeEntry = {
+    id: "7",
+    name: "oc-main",
+    kind: "openai-compatible",
+    baseUrl: null,
+    paramName: null,
+    status: "active",
+  };
+  const routerEntry: FakeEntry = {
+    id: "8",
+    name: "or-main",
+    kind: "openrouter",
+    baseUrl: null,
+    paramName: null,
+    status: "active",
+  };
+
+  function gateVault() {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const stubbed = globalThis.fetch;
+    globalThis.fetch = (async (
+      input: RequestInfo | URL,
+      init?: RequestInit,
+    ) => {
+      const url = String(input instanceof Request ? input.url : input);
+      if (url.includes("/api/v1/vault")) await gate;
+      return stubbed(input, init);
+    }) as typeof fetch;
+    return () => release();
+  }
+
+  function mount(value: string, types: string[]) {
+    const picks: string[] = [];
+    const view = (t: string[]) => (
+      <CredentialPicker
+        value={value}
+        onChange={(v) => picks.push(v)}
+        compatibleTypes={t}
+        ariaLabel="key"
+      />
+    );
+    const { rerender } = render(view(types));
+    return { picks, switchTo: (t: string[]) => rerender(view(t)) };
+  }
+
+  beforeEach(() => {
+    vaultEntries = [compatEntry, routerEntry];
+  });
+
+  test("a switch before the vault answers picks the new provider's credential", async () => {
+    const release = gateVault();
+    const { picks, switchTo } = mount("vault:7", ["openai-compatible"]);
+    switchTo(["openrouter"]);
+    release();
+    await waitFor(() => expect(picks.join(",")).toBe("vault:8"));
+  });
+
+  test("a switch after the vault answers picks the same one", async () => {
+    const { picks, switchTo } = mount("vault:7", ["openai-compatible"]);
+    await waitFor(() =>
+      expect(screen.queryAllByText("oc-main").length > 0).toBe(true),
+    );
+    switchTo(["openrouter"]);
+    await waitFor(() => expect(picks.join(",")).toBe("vault:8"));
+  });
+
+  test("a cross-type pick is kept when the provider never switches", async () => {
+    const { picks } = mount("vault:8", ["openai-compatible"]);
+    await waitFor(() =>
+      expect(screen.queryAllByText("or-main").length > 0).toBe(true),
+    );
+    expect(picks.join(",")).toBe("");
+  });
+
+  test("a selection that still fits is kept when the switch happens while loading", async () => {
+    const release = gateVault();
+    const { picks, switchTo } = mount("vault:8", ["openai-compatible"]);
+    switchTo(["openrouter"]);
+    release();
+    await waitFor(() =>
+      expect(screen.queryAllByText("or-main").length > 0).toBe(true),
+    );
+    expect(picks.join(",")).toBe("");
   });
 });

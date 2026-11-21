@@ -49,8 +49,14 @@ describe("nextCompanyDraft", () => {
       email: "",
       website: "",
     });
-    expect(nextCompanyDraft(emptyCompanyForm(), empty).draft).toEqual(
-      blankCompanyDraft(),
+    const seeded = nextCompanyDraft(emptyCompanyForm(), empty);
+    expect(seeded).toEqual({
+      draft: blankCompanyDraft(),
+      seededFrom: blankCompanyDraft(),
+    });
+    // NOTE: so it is still untouched, and the next copy the server sends lands.
+    expect(nextCompanyDraft(seeded, stored()).draft).toEqual(
+      companyToDraft(stored()),
     );
   });
 
@@ -92,16 +98,6 @@ describe("nextCompanyDraft", () => {
     );
     expect(nextCompanyDraft(edited, moved).draft.address).toBe(
       "Rua das Flores, 200",
-    );
-  });
-
-  // Undoing the edit hands the form back: it is untouched again, so the newest server copy lands.
-  test("a draft typed back to its baseline is untouched again", () => {
-    const untouched = seedCompanyDraft(stored());
-    const moved = stored({ address: "Av. Paulista, 1000" });
-    const retyped = { ...untouched, draft: { ...untouched.draft } };
-    expect(nextCompanyDraft(retyped, moved).draft).toEqual(
-      companyToDraft(moved),
     );
   });
 

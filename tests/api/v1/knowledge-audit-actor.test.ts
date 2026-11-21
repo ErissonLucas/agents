@@ -5,15 +5,14 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import config from "@/config";
 import type { TenantContext } from "@/lib/tenancy";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { mockFindUnique, setupPrismaMock } from "@/tests/utils/prisma-mock";
 
-// The knowledge family's trail, driven through the console's own doors (issue #396).
+// The knowledge family's trail, driven through the console's own doors.
 //
-// `tests/modules/audit-knowledge-family.test.ts` proves the SERVICES record. This file answers the
-// half it cannot see: whether the twelve mutating routes of `knowledge.controller.ts` reach those
-// services with a principal at all. None of them wrote anything before this, and one of them
-// (`PATCH /documents/:id`) had no MCP twin either, so the console was its ONLY door and it recorded
-// nothing.
+// `tests/modules/audit-knowledge-family.test.ts` proves the SERVICES record. This file proves the
+// half it cannot see: that the twelve mutating routes of `knowledge.controller.ts` reach those
+// services with a principal, including `PATCH /documents/:id`, whose only door is the console.
 
 const BunRequest = (globalThis as unknown as { BunRequest: typeof Request })
   .BunRequest;
@@ -34,8 +33,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -201,6 +200,7 @@ describe.skipIf(!dbUp)("the Knowledge page names who wrote", () => {
       email: "admin@example.com",
       role: "TENANT_ADMIN",
       tenantId: tenantId.toString(),
+      pwd: (await import("@/api/lib/auth")).passwordFingerprint("x"),
     })
       .setProtectedHeader({ alg: "HS256" })
       .setExpirationTime("1h")
@@ -327,7 +327,8 @@ describe.skipIf(!dbUp)("the Knowledge page names who wrote", () => {
         body: JSON.stringify({
           knowledgeBaseId: kbId,
           title: "Outra sugestão",
-          content: PROPOSAL,
+          // NOTE: Another text: the same one would land on the proposal approved above.
+          content: `${PROPOSAL} (outra)`,
         }),
       }),
     );
@@ -365,13 +366,12 @@ describe.skipIf(!dbUp)("the Knowledge page names who wrote", () => {
       "knowledge_document.delete",
       "knowledge.delete",
     ]);
-    // The query flag reaches the service (issue #857): the row records the re-index it asked for.
+    // NOTE: the query flag reaches the service: the row records the re-index it asked for.
     expect(
       all.find((r) => r.action === "knowledge.reindex")?.after,
     ).toMatchObject({ includeIndexed: true });
-    // The whole point of moving the trail down a layer: the console had no `audit` in it, so every
-    // one of these rows exists only because the service writes it, and each names the session that
-    // asked.
+    // NOTE: the controller writes no row itself, so every one of these exists only because the
+    // service writes it, and each names the session that asked.
     for (const r of all) {
       expect(r.actorId).toBe(ADMIN_ID);
       expect(r.actorType).toBe("user");

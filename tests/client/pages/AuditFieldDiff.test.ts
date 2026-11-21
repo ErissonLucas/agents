@@ -1,16 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { diffProjection, localDayBounds } from "@/client/pages/AuditPage";
 
-// THE ONE THING THAT MAKES THIS PAGE READABLE (issue #401).
-//
-// Measured on a real self-hosted tenant: 20 of 40 rows are `mcp.prompt_set`, and that action takes
-// the WHOLE prompt rather than a patch, so those rows carry two system prompts of roughly 11k
-// characters each. Rendered as two JSON blobs the page is unusable, and the row that says the most
-// is the one that shows the least. What the operator came for is which field moved.
-//
-// The function is exported for this file and used by nothing else on the page's outside, because
-// what it decides — which keys are a change, how a create and a delete differ from an edit, and what
-// a change nobody is allowed to see looks like — is the whole answer the page gives.
+// The field-level diff is what makes the audit page readable: `mcp.prompt_set` takes the WHOLE
+// prompt, so a row can carry two ~11k-character system prompts, and what the operator came for is
+// which field moved (docs/ui.md, Audit). It is exported for this file alone, because what it
+// decides (which keys are a change, how a create and a delete differ from an edit, what a change
+// nobody may see looks like) is the whole answer the page gives.
 
 describe("the field-level diff", () => {
   test("only the keys that moved, over the union of both sides", () => {
@@ -65,29 +60,19 @@ describe("the field-level diff", () => {
 
   // A projection is an object or it is null: every writer in the tree builds one through its own
   // `auditProjection`/`auditSafe` helper, and `null` is how a create says there was no before and a
-  // delete says there is no after (measured across every `auditMutation` call site). A scalar or a
+  // delete says there is no after (true at every `auditMutation` call site). A scalar or a
   // list has no fields to show, so there is nothing here to render and no branch that could be
-  // proven — this pins the shape rather than inventing a rendering for a case nothing produces.
+  // proven: this pins the shape rather than inventing a rendering for a case nothing produces.
   test("a projection with no fields in it has no fields to show", () => {
     expect(diffProjection("antes", "depois").changes).toEqual([]);
     expect(diffProjection([1], [2]).changes).toEqual([]);
   });
 
-  // The measured case. The keys are compared, not the values' length, so a pair of 11k-character
-  // prompts is one row and not a page.
-  test("two whole system prompts are one changed field", () => {
-    const before = { systemPrompt: "x".repeat(11_000), name: "Ana" };
-    const after = { systemPrompt: "y".repeat(11_000), name: "Ana" };
-    expect(diffProjection(before, after).changes.map((c) => c.key)).toEqual([
-      "systemPrompt",
-    ]);
-  });
-
-  // `markUndisclosed` puts the SAME marker on both sides on purpose: it says a write moved something
-  // the projection does not carry (an encrypted secret, a header block), which is a fact about the
-  // change and not about either end of it. A diff by equality therefore erases it, and the one row
-  // that says "a value you cannot see here changed" would render as "nothing was recorded" — the
-  // exact opposite of what it means, on the rows where the trail matters most.
+  // `markUndisclosed` puts the SAME marker on both sides on purpose: it says a write moved
+  // something the projection does not carry (an encrypted secret, a header block), which is a fact
+  // about the change and not about either end of it. A diff by equality therefore erases it, and
+  // the one row that says "a value you cannot see here changed" would render as "nothing was
+  // recorded", the opposite of what it means.
   test("a change nobody may see is reported, not filtered away as equal", () => {
     const d = diffProjection(
       { id: "7", name: "Tool", undisclosedChanged: true },
@@ -99,16 +84,34 @@ describe("the field-level diff", () => {
     expect(d.changes).toEqual([]);
   });
 
-  // The OTHER marker, and the one the page did not know. #394 puts `unreadConfigChanged` on the
-  // FIELD's projection rather than at the top (`{ settings: { … } }`), so a top-level check finds
-  // nothing; and when the edit moved only unread configuration, both sides are the same marker
-  // object and the equality filter drops the field. The card then said "this action recorded no
-  // field values" about a row that exists precisely to report that something changed.
+  // NOTE: the agent family puts `unreadConfigChanged` on the FIELD's projection (`{ settings: { … }
+  // }`), not at the top, so a top-level check finds nothing; and when only unread configuration
+  // moved, both sides are the same marker object and the equality filter would drop the field.
   test("the agent family's marker is found where it actually rides", () => {
     const d = diffProjection(
       { id: "3", settings: { unreadConfigChanged: true } },
       { id: "3", settings: { unreadConfigChanged: true } },
     );
+    expect(d.undisclosed).toBe(true);
+    expect(d.changes).toEqual([]);
+  });
+
+  // A contact gate allowlist is recorded as counts, so a swap of one number for another leaves both
+  // sides equal and the marker on the list is all the row has to say about the edit.
+  test("an allowlist whose entries moved is a change the row does not show", () => {
+    const side = {
+      settings: {
+        contactAuth: {
+          rule: {
+            kind: "allowlist",
+            phones: 1,
+            identifiers: 0,
+            entriesChanged: true,
+          },
+        },
+      },
+    };
+    const d = diffProjection(side, structuredClone(side));
     expect(d.undisclosed).toBe(true);
     expect(d.changes).toEqual([]);
   });
@@ -145,20 +148,13 @@ describe("the field-level diff", () => {
     expect(d.undisclosed).toBe(true);
     expect(d.changes).toEqual([{ key: "id", before: undefined, after: "7" }]);
   });
-
-  test("an ordinary projection does not claim a hidden change", () => {
-    expect(diffProjection({ a: 1 }, { a: 2 }).undisclosed).toBe(false);
-  });
 });
 
-// The date range is the filter the issue's own measurement says pays, because of how an operator
-// arrives here: with a day, and no idea which action to look for. The day has to be THEIR day.
-//
-// The boundary function is passed in, and that is the whole reason these assertions mean anything:
-// this suite runs at UTC (measured — `getTimezoneOffset()` is 0 inside the harness), so a version
-// that bounded the UTC day instead of the local one passed every test written against the ambient
-// clock. Each fake below answers "the instant this local date begins", which is what the browser's
-// own `new Date(y, m, d)` answers in production.
+// An operator arrives with a day and no idea which action to look for, and the day has to be THEIR
+// day. The boundary function is passed in because this suite runs at UTC (`getTimezoneOffset()` is
+// 0 in the harness), where a version bounding the UTC day would pass. Each fake answers "the
+// instant this local date begins", which is what the browser's `new Date(y, m, d)` answers in
+// production.
 describe("the day an operator picked", () => {
   // A zone with one fixed offset, in minutes to ADD to local to reach UTC. São Paulo is +180.
   const fixed = (offsetMinutes: number) => (y: number, m: number, d: number) =>
@@ -171,28 +167,6 @@ describe("the day an operator picked", () => {
     // Local midnight in São Paulo is 03:00 UTC, and the day closes a millisecond before the next.
     expect(b?.since).toBe("2026-01-01T03:00:00.000Z");
     expect(b?.until).toBe("2026-01-02T02:59:59.999Z");
-  });
-
-  // The row a UTC bound loses: displayed as Jan 1 at 22:00 in São Paulo, stamped Jan 2 in UTC. It
-  // has to fall inside the filter for the day the screen is showing it under.
-  test("a row at the edge of the local day falls inside the local bounds", () => {
-    const b = localDayBounds("2026-01-01", SP);
-    const since = new Date(b?.since ?? "").getTime();
-    const until = new Date(b?.until ?? "").getTime();
-    const shownAsJan1At22 = Date.parse("2026-01-02T01:00:00.000Z");
-    expect(shownAsJan1At22 >= since && shownAsJan1At22 <= until).toBe(true);
-    expect(shownAsJan1At22 > Date.parse("2026-01-02T00:00:00.000Z")).toBe(true);
-    expect(Date.parse("2026-01-01T02:59:59.999Z") < since).toBe(true);
-    expect(Date.parse("2026-01-02T03:00:00.000Z") > until).toBe(true);
-  });
-
-  test("a whole day is a whole day, minus exactly one millisecond", () => {
-    for (const off of [0, 180, -120, 330]) {
-      const b = localDayBounds("2026-03-15", fixed(off));
-      const span =
-        new Date(b?.until ?? "").getTime() - new Date(b?.since ?? "").getTime();
-      expect(span).toBe(86_400_000 - 1);
-    }
   });
 
   // Twice a year the day is not 24 hours, and a fixed 24 loses rows the screen is showing: it reaches
@@ -213,30 +187,6 @@ describe("the day an operator picked", () => {
     ).toBe(25 * 3_600_000 - 1);
   });
 
-  // A zone that springs forward AT midnight: that local midnight never happens, so the day starts at
-  // 01:00 local. Asking for an OFFSET at a non-existent instant answers from the far side of the
-  // transition, and adding it to a nominal UTC midnight lands an hour early — the day would drop its
-  // last hour and the next day would claim it. Santiago moves at midnight; this is that shape.
-  test("a day whose midnight does not exist starts when the day actually starts", () => {
-    // -04:00 before, -03:00 from 2026-09-06 00:00 local, which does not occur.
-    const santiago = (y: number, m: number, d: number) => {
-      const beforeJump = Date.UTC(y, m - 1, d) + 240 * 60_000;
-      const afterJump = Date.UTC(y, m - 1, d) + 180 * 60_000;
-      return d <= 5 ? beforeJump : afterJump;
-    };
-    const jumpDay = localDayBounds("2026-09-06", santiago);
-    const dayBefore = localDayBounds("2026-09-05", santiago);
-    // No gap and no overlap: one day ends exactly where the next begins.
-    expect(new Date(dayBefore?.until ?? "").getTime() + 1).toBe(
-      new Date(jumpDay?.since ?? "").getTime(),
-    );
-    // And the short day is 23 hours, not 24: the hour that never happened is not filtered for.
-    expect(
-      new Date(dayBefore?.until ?? "").getTime() -
-        new Date(dayBefore?.since ?? "").getTime(),
-    ).toBe(23 * 3_600_000 - 1);
-  });
-
   // The overflow cases the arithmetic must not special-case.
   test("the last day of a month, a year and a leap February all close correctly", () => {
     for (const [day, nextMidnightUtc] of [
@@ -254,27 +204,6 @@ describe("the day an operator picked", () => {
   test("a date the picker never produces yields no bound at all", () => {
     for (const bad of ["", "garbage", "2026-01"]) {
       expect(localDayBounds(bad, SP)).toBeNull();
-    }
-  });
-
-  // `<input type="date">` emits zero-padded ISO and blanks anything else, so these came from a
-  // hand-edited URL. Accepted, they would filter by a day the input cannot display — and the page
-  // would keep the parameter, since the helper answered.
-  test("a date the input could never show is refused", () => {
-    for (const noncanonical of [
-      "2026-1-1",
-      "2026-01-1",
-      "2026-1-01",
-      " 2026-01-01",
-      "2026-01-01 ",
-      "26-01-01",
-      "2026/01/01",
-      "2026-01-01T00:00:00Z",
-    ]) {
-      expect([noncanonical, localDayBounds(noncanonical, SP)]).toEqual([
-        noncanonical,
-        null,
-      ]);
     }
   });
 

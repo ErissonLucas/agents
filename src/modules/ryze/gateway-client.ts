@@ -20,7 +20,7 @@ export function ryzeClientForGateway(gw: RyzeGateway): Promise<RyzeClient> {
   return ryzeClientFactory(gw);
 }
 
-// NOTE: test seam; returns the previous factory.
+// Test seam; returns the previous factory.
 export function setRyzeClientFactory(
   next: (gw: RyzeGateway) => Promise<RyzeClient>,
 ): (gw: RyzeGateway) => Promise<RyzeClient> {

@@ -1,13 +1,9 @@
-// NOTE: normalization of programmatically-authored HTTP tool shapes. The canonical contract (what the
-// runtime executes and the UI produces) is a COMPACT input-schema map — {field: {type, required?,
-// description?, enumValues?, itemType?}} — and {{var}} placeholders in urlTemplate/query/headers/
-// body. API and MCP authors naturally write standard JSON Schema ({properties, required}) and
-// OpenAPI-style single-brace {var} path params instead; both used to be accepted verbatim and then
-// silently never interpolated. This module converts them to the canonical shape. It is called at
-// every write edge (service create/update, MCP tool_create/tool_update preview, agent import) so
-// storage stays canonical, at tool build time so rows stored before this normalization existed
-// self-heal, and by the editor so legacy rows render their real fields.
-// Pure + dependency-free: safe to import from the client bundle.
+// Normalization of programmatically-authored HTTP tool shapes. The canonical contract (what the
+// runtime executes and the UI produces) is a COMPACT input-schema map ({field: {type, required?,
+// description?, enumValues?, itemType?}}) and {{var}} placeholders. API and MCP authors write
+// standard JSON Schema and single-brace {var} path params, which would never interpolate; this
+// converts them. Called at every write edge, at tool build time (so older rows self-heal) and by the
+// editor. Pure and dependency-free: safe to import from the client bundle.
 
 export interface ToolShapePatch {
   urlTemplate?: string;
@@ -23,7 +19,7 @@ export interface NormalizedToolShapes {
   warnings: string[];
 }
 
-// NOTE: conversation/contact context variable names the runtime interpolates (mirror of the
+// conversation/contact context variable names the runtime interpolates (mirror of the
 // httpToolContext built in graph/prepare.ts + the conversation_id/message_id merged at buildToolset
 // time). Used as the write-time allowlist for single-brace normalization.
 export const CONTEXT_VAR_NAMES = [
@@ -33,6 +29,7 @@ export const CONTEXT_VAR_NAMES = [
   "contact_name",
   "contact_email",
   "contact_phone",
+  "contact_identifier",
   "inbox_id",
   "inbox_name",
   "company_name",
@@ -40,8 +37,8 @@ export const CONTEXT_VAR_NAMES = [
 ] as const;
 
 // Names only an HTTP tool's templates can render, and not in `CONTEXT_VAR_NAMES` because a code
-// tool's `context` does not carry them. `conversation_ref` (issue #818) is minted on demand for a
-// tool that names a GENERIC integration, which a code tool, having no network, never is.
+// tool's `context` does not carry them. `conversation_ref` is minted on demand for a tool that names
+// a GENERIC integration, which a code tool, having no network, never is.
 export const HTTP_TOOL_ONLY_VAR_NAMES = ["conversation_ref"] as const;
 
 const JSON_SCHEMA_KEYWORDS = new Set([
@@ -61,7 +58,7 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-// NOTE: parsed JSON can carry an own "__proto__" key; plain assignment on a fresh {} would invoke
+// Parsed JSON can carry an own "__proto__" key; plain assignment on a fresh {} would invoke
 // the inherited setter and silently drop it. Define an own property instead wherever a
 // caller-controlled key lands in an output map.
 function setOwn(
@@ -77,7 +74,7 @@ function setOwn(
   });
 }
 
-// NOTE: a valid compact map has ONLY plain-object values (one FieldSpec per field). Standard JSON Schema
+// A valid compact map has ONLY plain-object values (one FieldSpec per field). Standard JSON Schema
 // is recognized by `properties` being a map of plain objects PLUS a structural marker no compact
 // map can produce: a string `type`, an array `required`, or every top-level key being a JSON Schema
 // keyword. Requiring every `properties` value to be an object protects the pathological compact
@@ -95,7 +92,7 @@ export function isJsonSchemaShape(raw: unknown): boolean {
   );
 }
 
-// NOTE: JSON Schema → compact map. Flat scalar/enum/array-of-scalar properties convert faithfully;
+// JSON Schema → compact map. Flat scalar/enum/array-of-scalar properties convert faithfully;
 // anything deeper (nested properties, anyOf/oneOf, explicit type "object") degrades to the generic
 // "object" field type. The top-level `required` array marks per-field required flags. `warnings`
 // (optional collector) receives notes about lossy conversions.
@@ -180,7 +177,7 @@ export function compactFromJsonSchema(
   return out;
 }
 
-// NOTE: a single-brace {name} that is not part of a {{name}} token. Lookarounds keep {{name}} (and
+// A single-brace {name} that is not part of a {{name}} token. Lookarounds keep {{name}} (and
 // the ambiguous {name}} / {{name} halves) untouched, which also makes the rewrite idempotent.
 const SINGLE_BRACE = /(?<!\{)\{\s*([a-zA-Z0-9_]+)\s*\}(?!\})/g;
 
@@ -202,10 +199,9 @@ function collectUnknownTokens(
 }
 
 // Every {{name}} a tool's templates RENDER: the URL, header values, query values, a raw body, kv body
-// values and legacy fixed fields. ONE reader for the two places that ask (issue #818): the write
-// refuses a tool that renders `{{conversation_ref}}` without naming its integration, and the runtime
-// mints the ref only for a tool that renders it. Two readers would disagree on the shape one of them
-// forgot, and the tool would then be accepted and refuse every call, or mint a ref it never sends.
+// values and legacy fixed fields. ONE reader for both askers: the write refuses a tool rendering
+// `{{conversation_ref}}` without naming its integration, and the runtime mints the ref only for a
+// tool that renders it. Two readers could disagree, leaving a tool accepted that refuses every call.
 const DOUBLE_BRACE = /\{\{\s*([a-zA-Z0-9_]+)\s*\}\}/g;
 
 export function renderedVariableNames(shapes: {
@@ -244,17 +240,9 @@ function fieldNames(schema: unknown): string[] {
   return isPlainObject(schema) ? Object.keys(schema) : [];
 }
 
-// NOTE: normalizes the shapes present in `patch`. `current` supplies the rest of the row on partial
-// updates so the placeholder allowlist sees the effective field set; `extraNames` adds caller-known
-// interpolation names (e.g. the runtime's live context keys). Single-brace {name} is rewritten to
-// {{name}} ONLY when the name is a declared input field, a context variable or "secret" — an
-// unmatched {token} stays literal (it may be legitimate content, e.g. raw JSON) and is reported in
-// `warnings` as a probable typo.
-// `__proto__` cannot be a parameter name, and it has to be refused BEFORE a zod parse: `z.record`
-// builds its result by assignment, so the key hits the prototype setter and is gone by the time
-// `normalizeToolShapes` below could drop it with a warning — the field would simply vanish, and a
-// body reading `input.__proto__` would find the prototype. Only a JSON body can carry it (an object
-// literal sets the prototype instead), so this reads the RAW value a request parsed.
+// `__proto__` cannot be a parameter name, and is refused BEFORE a zod parse: `z.record` assigns, so
+// the key hits the prototype setter and vanishes before `normalizeToolShapes` could warn. Only a JSON
+// body can carry it, so this reads the RAW value a request parsed.
 export function hasReservedFieldName(rawInputSchema: unknown): boolean {
   if (!isPlainObject(rawInputSchema)) return false;
   if (Object.hasOwn(rawInputSchema, "__proto__")) return true;
@@ -267,6 +255,10 @@ export function hasReservedFieldName(rawInputSchema: unknown): boolean {
   return isPlainObject(props) && Object.hasOwn(props, "__proto__");
 }
 
+// Normalizes the shapes present in `patch`; `current` supplies the rest of the row on a partial
+// update and `extraNames` adds caller-known names. Single-brace {name} becomes {{name}} ONLY for a
+// declared field, a context variable or "secret"; any other {token} stays literal (it may be raw
+// JSON) and is reported in `warnings` as a probable typo.
 export function normalizeToolShapes(
   patch: ToolShapePatch,
   current: ToolShapePatch = {},
@@ -292,15 +284,9 @@ export function normalizeToolShapes(
     }
   }
   if (patch.inputSchema !== undefined) {
-    // `__proto__` cannot be a parameter name, and the point of dropping it HERE is that it is
-    // dropped VISIBLY. A field under that name is stored and shown in the console like any other,
-    // and then disappears one layer down: `parseToolInputSchema` builds the zod shape by assigning
-    // into an object, so the name hits the prototype setter and the tool advertises no such
-    // parameter — and even a null-prototype shape would not save it, because zod's own result
-    // object drops the key on parse (measured, both). Silent for an HTTP tool since #457; a code
-    // tool would read `input.__proto__` and find the prototype.
-    // `Object.hasOwn`, not `in`: every plain object inherits `__proto__` from Object.prototype, and
-    // `in` would warn about a schema that never named it.
+    // NOTE: `__proto__` is dropped HERE so that it is dropped VISIBLY: one layer down, the zod shape
+    // loses it to the prototype setter (and zod's result drops it anyway), so the tool would
+    // advertise no such parameter. `Object.hasOwn`, not `in`, since every object inherits it.
     if (
       isPlainObject(effectiveSchema) &&
       Object.hasOwn(effectiveSchema, "__proto__")
@@ -403,7 +389,7 @@ export function normalizeToolShapes(
   return { shapes, warnings };
 }
 
-// NOTE: read-side convenience for consumers that only care about the input schema (e.g. the
+// Read-side convenience for consumers that only care about the input schema (e.g. the
 // editor): returns the compact map, converting a JSON-Schema-shaped value when needed.
 export function normalizeInputSchemaShape(
   raw: unknown,

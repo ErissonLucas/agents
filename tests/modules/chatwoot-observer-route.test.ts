@@ -1,24 +1,25 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
-import { encryptJson } from "@/api/lib/crypto";
+import { decryptJson, encryptJson } from "@/api/lib/crypto";
 import { chatwootThreadId, contactInboxThreadId } from "@/graph/checkpointer";
-import { ingestDedupeKey } from "@/graph/ingest-job";
+import { ingestDedupeKey, ingestFallbackKey } from "@/graph/ingest-job";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import {
   processChatwootDelivery,
   recordAndProcessChatwootDelivery,
 } from "@/modules/chatwoot/webhook";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRows } from "../utils/flowlog";
 
-// A delivery on an OBSERVER's route (issue #476). The same inbox can have a responder of ours and
-// an observer of ours, and Chatwoot delivers every event to each on its own route; what is asserted
-// is that the observer's route takes the monitoring path with the OBSERVER's runtime — nothing
-// posted, no flush — and that it touches nothing the responder's route owns: the handled watermark
-// and the responder's own ledger row. On an inbox nobody of ours answers, the observer remembers
-// nothing, since the only reader of that memory is a responder's turn (issue #620), and it keeps the
-// watermark, so a responder bound later does not answer the whole observed backlog as one burst.
+// A delivery on an OBSERVER's route. The same inbox can have a responder of ours and an observer of
+// ours, and Chatwoot delivers every event to each on its own route; the observer's route takes the
+// monitoring path with the OBSERVER's runtime (nothing posted, no flush) and touches nothing the
+// responder's route owns: the handled watermark and the responder's own ledger row. On an inbox
+// nobody of ours answers, the observer remembers nothing (the only reader of that memory is a
+// responder's turn) and keeps the watermark, so a responder bound later does not answer the whole
+// observed backlog as one burst.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -36,8 +37,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -47,15 +48,17 @@ const SHARED_INBOX = 84;
 const OBSERVED_ONLY_INBOX = 85;
 const RESPONDER_BOT = 24;
 const OBSERVER_BOT = 25;
+// The bot of the watcher `withSecondWatcher` adds beside the observer, which stays the memory owner.
+const SECOND_WATCHER_BOT = 963;
 let tenantId = 0n;
 let instanceId = 0n;
 let responderId = 0n;
 let observerId = 0n;
 let deliverySeq = 0;
 let messageSeq = 84_000;
-// A QUE CONVERSA CADA MENSAGEM PERTENCE, registrado onde a mensagem NASCE, que é o único lugar onde
-// isso é sabido sem inferência. É o que deixa uma asserção perguntar pela LINHA da mensagem sem
-// repetir o número da conversa em vinte e oito lugares (issue #731).
+// A QUE CONVERSA CADA MENSAGEM PERTENCE, registrado onde a mensagem NASCE, o único lugar onde isso é
+// sabido sem inferência. Deixa uma asserção perguntar pela LINHA da mensagem sem repetir o número da
+// conversa em cada caso.
 const convOfMessage = new Map<number, number>();
 let stamp = Math.floor(Date.now() / 1000);
 
@@ -151,6 +154,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       "contacts",
       "inbox_observers",
       "inboxes",
+      "vault_entries",
       "chatwoot_agent_bots",
       "agents",
       "chatwoot_instances",
@@ -229,10 +233,19 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     // comes back through. `claimedAt` is stamped by that claim, which is what made the row able to
     // match itself in the sibling count.
     replay?: { routeAgentBotId: number; claimedAt: Date },
+    // The SAME message on another route (Chatwoot fans one event to every bot), its attachments, and
+    // what the receiver is handed to reach the provider and report the ingestion.
+    extra: {
+      messageId?: number;
+      attachments?: unknown[];
+      deps?: Parameters<typeof processChatwootDelivery>[0]["deps"];
+      onIngest?: Parameters<typeof processChatwootDelivery>[0]["onIngest"];
+    } = {},
   ): Promise<{ messageId: number; deliveryRowId: bigint }> {
     deliverySeq += 1;
-    messageSeq += 1;
-    convOfMessage.set(messageSeq, convId);
+    if (extra.messageId === undefined) messageSeq += 1;
+    const messageId = extra.messageId ?? messageSeq;
+    convOfMessage.set(messageId, convId);
     // The receipt doubles as the emission for a case that names one: an event our row received an
     // hour ago was emitted at least that long ago too.
     const conv = conversation(convId, inboxId, held, receivedAt) as Record<
@@ -242,11 +255,14 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     if (sparse) delete conv.inbox_id;
     const n = normalizeChatwootEvent({
       event: "message_created",
-      id: messageSeq,
+      id: messageId,
       private: false,
       content,
       message_type: "incoming",
       sender: { id: 99, name: "Cliente", type: null },
+      ...(extra.attachments === undefined
+        ? {}
+        : { attachments: extra.attachments }),
       conversation: conv,
     });
     if (!n) throw new Error("payload did not normalize");
@@ -262,7 +278,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
           ? {}
           : {
               conversationId: convId,
-              inboundMessageId: messageSeq,
+              inboundMessageId: messageId,
               routeAgentBotId: replay.routeAgentBotId,
               routeObserved: true,
               claimedAt: replay.claimedAt,
@@ -280,8 +296,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       ...(replay === undefined
         ? {}
         : { routeObserved: true, claimFrom: "DEAD" as const }),
+      ...(extra.deps === undefined ? {} : { deps: extra.deps }),
+      ...(extra.onIngest === undefined ? {} : { onIngest: extra.onIngest }),
     });
-    return { messageId: messageSeq, deliveryRowId: delivery.id };
+    return { messageId, deliveryRowId: delivery.id };
   }
 
   function customerFacing() {
@@ -294,17 +312,11 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     );
   }
 
-  // "FOI ARMADA INGESTÃO PARA ESTA MENSAGEM" PERGUNTA PELA LINHA DELA, não pelo tamanho da população
-  // (issue #731). A população de `INGEST_MESSAGE` de um tenant não é estável por desenho: concluir o
-  // job apaga a linha (`JOB_DELETE_ON_DONE`) e `drainPendingIngest` drena as pendentes de uma thread
-  // a partir de três lugares do produto. Um delta sobre ela afirma sobre um número que o produto move
-  // de propósito, e erra nos dois sentidos — fica vermelho por causa de uma linha de outra mensagem,
-  // e fica VERDE com a linha da própria mensagem dentro da tabela, desde que o total não se mexa.
-  //
-  // A THREAD É A DO CONTACT-INBOX, e o construtor certo é `contactInboxThreadId`. Este arquivo também
-  // importa `chatwootThreadId`, do mesmo módulo, para a chave de OBSERVE; montada com ele, a pergunta
-  // responde "não armada" para tudo e faz os treze sites negativos passarem por construção, que é o
-  // falso verde de volta pela porta dos fundos.
+  // "FOI ARMADA INGESTÃO PARA ESTA MENSAGEM" PERGUNTA PELA LINHA DELA, não pelo tamanho da
+  // população: concluir o job apaga a linha (`JOB_DELETE_ON_DONE`) e `drainPendingIngest` drena as
+  // pendentes de uma thread, então um delta sobre a população erra nos dois sentidos. A THREAD É A DO
+  // CONTACT-INBOX (`contactInboxThreadId`); montada com `chatwootThreadId`, a chave de OBSERVE, a
+  // pergunta responde "não armada" para tudo e os casos negativos passam por construção.
   function threadOf(convId: number) {
     return contactInboxThreadId(tenantId, instanceId, 84_000 + convId);
   }
@@ -327,6 +339,35 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     });
   }
 
+  // A watcher that left the append to the memory owner leaves a FALLBACK behind, a job of its own
+  // kind that is no memory line: it arms the append minutes later, and only if none is queued.
+  async function fallbackArmed(messageId: number) {
+    const convId = convOfMessage.get(messageId) as number;
+    const row = await suDb.schedulerJob.findFirst({
+      where: {
+        tenantId,
+        kind: "INGEST_FALLBACK",
+        dedupeKey: ingestFallbackKey(threadOf(convId), messageId),
+      },
+      select: { runAt: true, payload: true },
+    });
+    // It names the event that armed it and the two routes: the ledger stands in for it only once the
+    // owner's route settled that event as often as the arming route received it.
+    const p = (row?.payload ?? {}) as {
+      event?: unknown;
+      ownerBotId?: unknown;
+      watcherBotId?: unknown;
+    };
+    return (
+      row !== null &&
+      row.runAt.getTime() > Date.now() + 60_000 &&
+      typeof p.event === "string" &&
+      // Every fallback here is the second watcher's, beside the first as owner.
+      p.ownerBotId === OBSERVER_BOT &&
+      p.watcherBotId === SECOND_WATCHER_BOT
+    );
+  }
+
   // SOB QUAL AGENTE a linha foi armada, lido do campo da própria linha.
   function agentOf(row: { payload: unknown } | null) {
     return (row?.payload as { agentId?: string } | undefined)?.agentId;
@@ -345,8 +386,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
   }
 
   // WHICH ROUTE the delivery took, as its own claim recorded it. On an inbox nobody of ours answers
-  // the observer's route remembers nothing (issue #620), so this is the witness a case about routing
-  // reads there, where it used to count the memory the route armed.
+  // the observer's route remembers nothing, so this is the witness a case about routing reads there.
   async function routeObservedOf(deliveryRowId: bigint) {
     return (
       await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
@@ -393,10 +433,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
 
     expect(customerFacing()).toEqual([]);
     expect(await jobs("DEBOUNCE")).toEqual([]);
-    // The thread is the contact-inbox's, shared with the responder, whose own route appends this
-    // message (its turn, or its continuous ingestion). An append from here doubled it.
-    // A pergunta é pela linha DESTA mensagem: `toEqual([])` sobre a leitura falava da população
-    // inteira do tenant, então uma linha de outra mensagem decidia este veredito (issue #731).
+    // NOTE: The thread is the contact-inbox's, shared with the responder, whose own route appends
+    // this message (its turn, or its continuous ingestion); an append from here would double it.
+    // Asked about THIS message's row, not the tenant's whole population.
     expect(await ingestArmedFor(messageId)).toBe(false);
     const conv = await row(1);
     expect(conv?.lastHandledMessageId).toBeNull();
@@ -418,14 +457,15 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     ).toBe("PROCESSING");
     expect(
       await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, stage: "handoff", conversationId: conv?.id },
       }),
     ).toEqual([]);
   });
 
-  // Nothing reads the contact-inbox thread on this inbox: a person answers it, and the observer's
-  // tick reads the conversation from Chatwoot. Appending there was a job per message claimed from the
-  // share the observations wait on (issue #620). The watermark is still this route's, and the
+  // NOTE: Nothing reads the contact-inbox thread on this inbox: a person answers it, and the
+  // observer's tick reads the conversation from Chatwoot. Appending there would claim a job per
+  // message from the share the observations wait on. The watermark is still this route's, and the
   // verdict is still armed.
   test("on an inbox nobody of ours answers: NOT remembered, and the watermark is still the observer's to keep", async () => {
     requests.length = 0;
@@ -460,9 +500,8 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     ).toEqual({ status: "PROCESSED", routeRemembers: false });
   });
 
-  // THE SWITCH IS NOT WHAT DECIDES IT: a row-backed observer ignores its mode (issue #476 review,
-  // round 19), and an observer whose mode reads as one that ingests continuously still has nobody
-  // to remember for here.
+  // NOTE: THE SWITCH IS NOT WHAT DECIDES IT: a row-backed observer ignores its mode, and an observer
+  // whose mode reads as one that ingests continuously still has nobody to remember for here.
   test("on an inbox nobody of ours answers, an observer whose mode ingests continuously still remembers nothing", async () => {
     requests.length = 0;
     await suDb.agent.update({
@@ -557,6 +596,1036 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
+  test("beside other watchers, the memory is filed under the first of them, whichever route arms it", async () => {
+    requests.length = 0;
+    const SECOND_BOT = 962;
+    const second = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Segunda observadora (memória)",
+        systemPrompt: "…",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+        settings: { memory: { compaction: { enabled: false } } },
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId: second.id,
+        chatwootAgentBotId: SECOND_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `obr-route-${SECOND_BOT}-${process.pid}`,
+        name: "Segunda observadora (memória)",
+      },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: SHARED_INBOX },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId: second.id },
+    });
+    await suDb.agent.update({
+      where: { id: responderId },
+      data: { enabled: false },
+    });
+    try {
+      expect(second.id > observerId).toBe(true);
+      // The later watcher's route arms first: the row is still the first watcher's.
+      const { messageId } = await deliver(SECOND_BOT, 47, SHARED_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      expect(agentOf(await ingestRowFor(messageId))).toBe(String(observerId));
+    } finally {
+      await suDb.agent.update({
+        where: { id: responderId },
+        data: { enabled: true },
+      });
+      await suDb.inboxObserver.deleteMany({
+        where: { tenantId, inboxId: inbox.id, agentId: second.id },
+      });
+    }
+  });
+
+  // ONE WRITER beside other watchers. With the responder not remembering, only the memory
+  // owner's route runs the media pass and appends; another watcher's route stands down from both, but
+  // only where the owner received the message: attached before the emission by the clock margin, or
+  // with its own delivery of the message already in the ledger. Otherwise that route keeps it.
+  async function withSecondWatcher(
+    ownerAttachedAt: Date,
+    body: (ctx: { secondBot: number; secondId: bigint }) => Promise<void>,
+    settings: { owner?: object; second?: object } = {},
+  ) {
+    const SECOND_BOT = SECOND_WATCHER_BOT;
+    const second = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Segunda observadora (escritor único)",
+        systemPrompt: "…",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+        settings: settings.second ?? {},
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId: second.id,
+        chatwootAgentBotId: SECOND_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `obr-route-${SECOND_BOT}-${process.pid}`,
+        name: "Segunda observadora (escritor único)",
+      },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: SHARED_INBOX },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId: second.id },
+    });
+    const ownerRow = { tenantId, inboxId: inbox.id, agentId: observerId };
+    const before = await suDb.inboxObserver.findFirstOrThrow({
+      where: ownerRow,
+      select: { attachedAt: true },
+    });
+    const ownerBefore = await suDb.agent.findUniqueOrThrow({
+      where: { id: observerId },
+      select: { settings: true },
+    });
+    await suDb.inboxObserver.updateMany({
+      where: ownerRow,
+      data: { attachedAt: ownerAttachedAt },
+    });
+    // The owner's bot row dates its coverage too (a re-provisioned bot never got what came before it):
+    // last written no later than the attach, as a bot provisioned for that attach would be.
+    await suDb.$executeRaw`UPDATE chatwoot_agent_bots SET updated_at = ${ownerAttachedAt} WHERE tenant_id = ${tenantId} AND agent_id = ${observerId}`;
+    if (settings.owner !== undefined) {
+      await suDb.agent.update({
+        where: { id: observerId },
+        data: { settings: settings.owner },
+      });
+    }
+    await suDb.agent.update({
+      where: { id: responderId },
+      data: { enabled: false },
+    });
+    try {
+      expect(second.id > observerId).toBe(true);
+      await body({ secondBot: SECOND_BOT, secondId: second.id });
+    } finally {
+      await suDb.agent.update({
+        where: { id: responderId },
+        data: { enabled: true },
+      });
+      await suDb.agent.update({
+        where: { id: observerId },
+        data: { settings: ownerBefore.settings ?? {} },
+      });
+      await suDb.inboxObserver.updateMany({
+        where: ownerRow,
+        data: { attachedAt: before.attachedAt },
+      });
+      await suDb.inboxObserver.deleteMany({
+        where: { tenantId, inboxId: inbox.id, agentId: second.id },
+      });
+      await suDb.chatwootAgentBot.deleteMany({
+        where: { tenantId, agentId: second.id },
+      });
+    }
+  }
+
+  const HOUR_AGO = () => new Date(Date.now() - 60 * 60_000);
+  const OPEN_HUMAN = { assigneeType: "User" as const, status: "open" };
+
+  test("beside other watchers, an owner attached before the message: the other watcher's route stands down, and only the owner's arms the append", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      const seen: string[] = [];
+      // The later watcher's route arrives FIRST: it neither arms nor appends.
+      const { messageId } = await deliver(
+        secondBot,
+        501,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).toEqual(["queued"]);
+      expect(await fallbackArmed(messageId)).toBe(true);
+      // The owner's own delivery of the same message is the one that writes.
+      await deliver(
+        OBSERVER_BOT,
+        501,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { messageId, onIngest: (o) => seen.push(o) },
+      );
+      expect(seen[1]).not.toBe("covered");
+      // The owner's own append runs now; the fallback beside it finds that append queued when it runs.
+      expect(await fallbackArmed(messageId)).toBe(true);
+      expect(agentOf(await ingestRowFor(messageId))).toBe(String(observerId));
+    });
+  });
+
+  test("beside other watchers, an owner attached inside the clock margin whose delivery is already in the ledger: the other watcher's route stands down", async () => {
+    await withSecondWatcher(
+      new Date(Date.now() - 60_000),
+      async ({ secondBot }) => {
+        const seen: string[] = [];
+        const { messageId, deliveryRowId } = await deliver(
+          OBSERVER_BOT,
+          502,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+        );
+        // What the receipt records on the owner's row (`recordAndProcessChatwootDelivery`): the
+        // conversation, the message and the bot it arrived on, which the sibling read names.
+        await suDb.chatwootWebhookDelivery.update({
+          where: { id: deliveryRowId },
+          data: {
+            conversationId: 502,
+            inboundMessageId: messageId,
+            routeAgentBotId: OBSERVER_BOT,
+          },
+        });
+        expect(agentOf(await ingestRowFor(messageId))).toBe(String(observerId));
+        await deliver(
+          secondBot,
+          502,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { messageId, onIngest: (o) => seen.push(o) },
+        );
+        // Its fallback leaves the owner's own arm as it was: queued now, the owner's. The fallback
+        // drops itself on the owner's settled delivery when it comes due (../graph/ingest-job.test.ts).
+        expect(seen).toEqual(["queued"]);
+        expect(await fallbackArmed(messageId)).toBe(true);
+        expect(agentOf(await ingestRowFor(messageId))).toBe(String(observerId));
+      },
+    );
+  });
+
+  test("beside other watchers, an owner attached after the message and with no delivery of it: the other watcher's route keeps the message", async () => {
+    await withSecondWatcher(new Date(), async ({ secondBot }) => {
+      const seen: string[] = [];
+      // Emitted an hour before the owner was attached: Chatwoot never fanned it to the owner.
+      const { messageId, deliveryRowId } = await deliver(
+        secondBot,
+        503,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        HOUR_AGO(),
+        undefined,
+        { onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).not.toContain("covered");
+      expect(await ingestRowFor(messageId)).not.toBeNull();
+      expect(await fallbackArmed(messageId)).toBe(false);
+      // It stated `false` at the claim, as a watcher that may delegate, and writing says `true`.
+      expect(
+        (
+          await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+            where: { id: deliveryRowId },
+            select: { routeRemembers: true },
+          })
+        ).routeRemembers,
+      ).toBe(true);
+    });
+  });
+
+  // A provider that counts its calls, a Chatwoot client that records what the pass writes back on
+  // the attachment (where the words live), and an STT config naming a real vault key.
+  async function sttHarness() {
+    const key = await suDb.vaultEntry.create({
+      data: { tenantId, name: "stt-key-1129", secret: encryptJson("sk-test") },
+      select: { id: true },
+    });
+    const sttOn = {
+      stt: {
+        enabled: true,
+        provider: "openai",
+        credentialRef: `vault:${key.id}`,
+      },
+    };
+    const provider = (text: string, during?: () => Promise<void>) => {
+      const calls = { n: 0 };
+      const fetchImpl = (async () => {
+        calls.n++;
+        await during?.();
+        return new Response(JSON.stringify({ text }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch;
+      return { calls, fetchImpl };
+    };
+    // What the pass writes back on the attachment, which is where the words live.
+    const writtenBack: string[] = [];
+    const client = new Proxy(
+      {
+        downloadAttachment: async () => ({
+          bytes: new Uint8Array([0x4f, 0x67, 0x67, 0x53]),
+          contentType: "audio/ogg",
+        }),
+        getMessages: async () => ({ payload: [] }),
+        updateAttachmentMeta: async (...args: unknown[]) => {
+          writtenBack.push(JSON.stringify(args));
+          return {};
+        },
+      } as Record<string, unknown>,
+      {
+        // NOTE: not a thenable, or awaiting the client would never resolve.
+        get: (target, prop: string) =>
+          prop === "then" ? undefined : (target[prop] ?? (async () => ({}))),
+      },
+    );
+    const makeClient = (async () => client) as never;
+    const audio = (id: number) => [
+      {
+        id,
+        file_type: "audio",
+        data_url: `https://chat.observer-route.example/a/${id}.ogg`,
+      },
+    ];
+    return { key, sttOn, provider, makeClient, writtenBack, audio };
+  }
+
+  test("beside other watchers, a voice note the other watcher reads first is read once, and only the owner's route appends it", async () => {
+    const { key, sttOn, provider, makeClient, audio } = await sttHarness();
+    try {
+      await withSecondWatcher(
+        HOUR_AGO(),
+        async ({ secondBot }) => {
+          const ownerStt = provider("palavras do dono");
+          // While its own pass runs, the other watcher's row already says it remembers nothing, so no
+          // route electing it as owner meanwhile reads its claim's intent as the append.
+          let rememberedDuringPass: boolean | null | undefined;
+          const otherStt = provider("palavras da outra", async () => {
+            rememberedDuringPass = (
+              await suDb.chatwootWebhookDelivery.findFirst({
+                where: { tenantId, status: "PROCESSING" },
+                orderBy: { id: "desc" },
+                select: { routeRemembers: true },
+              })
+            )?.routeRemembers;
+          });
+          const { messageId } = await deliver(
+            secondBot,
+            504,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              attachments: audio(11_291),
+              deps: {
+                makeClient,
+                sttFetch: otherStt.fetchImpl,
+                sleep: async () => {},
+              },
+            },
+          );
+          // Its own pass runs, for its own observation; the append is left to the owner.
+          expect(otherStt.calls.n).toBe(1);
+          expect(await fallbackArmed(messageId)).toBe(true);
+          expect(rememberedDuringPass).toBe(false);
+          await deliver(
+            OBSERVER_BOT,
+            504,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              messageId,
+              attachments: audio(11_291),
+              deps: {
+                makeClient,
+                sttFetch: ownerStt.fetchImpl,
+                sleep: async () => {},
+              },
+            },
+          );
+          // The owner's pass reuses the words this process already read: one provider call in all.
+          expect(ownerStt.calls.n + otherStt.calls.n).toBe(1);
+          expect(agentOf(await ingestRowFor(messageId))).toBe(
+            String(observerId),
+          );
+        },
+        { owner: sttOn, second: sttOn },
+      );
+    } finally {
+      await suDb.vaultEntry.deleteMany({ where: { id: key.id } });
+    }
+  });
+
+  // The owner decides what memory holds: an owner whose STT cannot run (no key) remembers the voice
+  // note as unheard even after the other watcher transcribed it in this same process.
+  test("beside other watchers, an owner that cannot transcribe does not take the words the other watcher read", async () => {
+    const { key, sttOn, provider, makeClient, audio } = await sttHarness();
+    try {
+      await withSecondWatcher(
+        HOUR_AGO(),
+        async ({ secondBot }) => {
+          const otherStt = provider("palavras da outra");
+          const ownerStt = provider("palavras do dono");
+          const { messageId } = await deliver(
+            secondBot,
+            506,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              attachments: audio(11_292),
+              deps: {
+                makeClient,
+                sttFetch: otherStt.fetchImpl,
+                sleep: async () => {},
+              },
+            },
+          );
+          expect(otherStt.calls.n).toBe(1);
+          await deliver(
+            OBSERVER_BOT,
+            506,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              messageId,
+              attachments: audio(11_292),
+              deps: {
+                makeClient,
+                sttFetch: ownerStt.fetchImpl,
+                sleep: async () => {},
+              },
+            },
+          );
+          expect(ownerStt.calls.n).toBe(0);
+          const row = await ingestRowFor(messageId);
+          expect(agentOf(row)).toBe(String(observerId));
+          const text = decryptJson<string>(
+            String(
+              (
+                await suDb.schedulerJob.findFirstOrThrow({
+                  where: {
+                    tenantId,
+                    kind: "INGEST_MESSAGE",
+                    dedupeKey: ingestDedupeKey(threadOf(506), messageId),
+                  },
+                  select: { payloadSecret: true },
+                })
+              ).payloadSecret,
+            ),
+          );
+          expect(text).not.toContain("palavras da outra");
+        },
+        // The owner has no STT settings at all: enabled by default, with no key to run it.
+        { second: sttOn },
+      );
+    } finally {
+      await suDb.vaultEntry.deleteMany({ where: { id: key.id } });
+    }
+  });
+
+  test("beside other watchers, a colleague's reply keeps its path: the other watcher's route still appends it", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      deliverySeq += 1;
+      messageSeq += 1;
+      convOfMessage.set(messageSeq, 505);
+      const replyId = messageSeq;
+      const n = normalizeChatwootEvent({
+        event: "message_created",
+        id: replyId,
+        private: false,
+        content: "Oi! Vou verificar seu pedido agora.",
+        message_type: "outgoing",
+        sender: { id: 5, name: "Ana", type: "user" },
+        conversation: conversation(505, SHARED_INBOX, OPEN_HUMAN),
+      });
+      if (!n) throw new Error("payload did not normalize");
+      const delivery = await suDb.chatwootWebhookDelivery.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          deliveryId: `obr-${process.pid}-${deliverySeq}`,
+          event: "message_created",
+          status: "PENDING",
+        },
+        select: { id: true },
+      });
+      await processChatwootDelivery({
+        tenantId,
+        instanceId,
+        deliveryRowId: delivery.id,
+        agentBotId: secondBot,
+        normalized: n,
+        base: appDb,
+      });
+      expect(await ingestArmedFor(replyId)).toBe(true);
+    });
+  });
+
+  test("beside other watchers, an owner whose bot row is gone receives nothing: the other watcher's route keeps the message", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      const ownerBot = await suDb.chatwootAgentBot.findFirstOrThrow({
+        where: { tenantId, agentId: observerId },
+      });
+      await suDb.chatwootAgentBot.delete({ where: { id: ownerBot.id } });
+      try {
+        const seen: string[] = [];
+        const { messageId } = await deliver(
+          secondBot,
+          506,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { onIngest: (o) => seen.push(o) },
+        );
+        expect(seen).not.toContain("covered");
+        expect(await ingestRowFor(messageId)).not.toBeNull();
+        expect(await fallbackArmed(messageId)).toBe(false);
+      } finally {
+        await suDb.chatwootAgentBot.create({ data: ownerBot });
+      }
+    });
+  });
+
+  test("beside other watchers, a conversation the owner's bot holds: its delivery folds nothing in, so the other watcher's route keeps the message", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      const seen: string[] = [];
+      const { messageId } = await deliver(
+        secondBot,
+        507,
+        SHARED_INBOX,
+        {
+          assigneeType: "AgentBot",
+          assigneeId: OBSERVER_BOT,
+          status: "pending",
+        },
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).not.toContain("covered");
+      expect(await ingestRowFor(messageId)).not.toBeNull();
+      expect(await fallbackArmed(messageId)).toBe(false);
+    });
+  });
+
+  test("beside other watchers, an owner whose own gate refuses the conversation: the other watcher still transcribes for its observation, and the append stays the owner's", async () => {
+    const { key, sttOn, provider, makeClient, writtenBack, audio } =
+      await sttHarness();
+    try {
+      await withSecondWatcher(
+        HOUR_AGO(),
+        async ({ secondBot }) => {
+          const ownerStt = provider("palavras do dono");
+          const otherStt = provider("palavras da outra");
+          const seen: string[] = [];
+          const { messageId } = await deliver(
+            secondBot,
+            508,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              attachments: audio(11_292),
+              deps: {
+                makeClient,
+                sttFetch: otherStt.fetchImpl,
+                sleep: async () => {},
+              },
+              onIngest: (o) => seen.push(o),
+            },
+          );
+          expect(otherStt.calls.n).toBe(1);
+          expect(writtenBack.join("\n")).toContain("palavras da outra");
+          expect(seen).toEqual(["queued"]);
+          expect(await fallbackArmed(messageId)).toBe(true);
+          await deliver(
+            OBSERVER_BOT,
+            508,
+            SHARED_INBOX,
+            OPEN_HUMAN,
+            false,
+            "",
+            undefined,
+            undefined,
+            {
+              messageId,
+              attachments: audio(11_292),
+              deps: {
+                makeClient,
+                sttFetch: ownerStt.fetchImpl,
+                sleep: async () => {},
+              },
+            },
+          );
+          expect(ownerStt.calls.n).toBe(0);
+          expect(agentOf(await ingestRowFor(messageId))).toBe(
+            String(observerId),
+          );
+        },
+        { owner: { ...sttOn, ...REFUSING_GATE }, second: sttOn },
+      );
+    } finally {
+      await suDb.vaultEntry.deleteMany({ where: { id: key.id } });
+    }
+  });
+
+  test("beside other watchers, an owner switched off when its own delivery ran and back on since: the other watcher's route keeps the message", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      await suDb.agent.update({
+        where: { id: observerId },
+        data: { enabled: false },
+      });
+      let messageId = 0;
+      try {
+        const owned = await deliver(
+          OBSERVER_BOT,
+          509,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+        );
+        messageId = owned.messageId;
+        await suDb.chatwootWebhookDelivery.update({
+          where: { id: owned.deliveryRowId },
+          data: {
+            conversationId: 509,
+            inboundMessageId: messageId,
+            routeAgentBotId: OBSERVER_BOT,
+          },
+        });
+        expect(
+          (
+            await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+              where: { id: owned.deliveryRowId },
+              select: { routeRemembers: true },
+            })
+          ).routeRemembers,
+        ).toBe(false);
+      } finally {
+        await suDb.agent.update({
+          where: { id: observerId },
+          data: { enabled: true },
+        });
+      }
+      const seen: string[] = [];
+      await deliver(
+        secondBot,
+        509,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { messageId, onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).not.toContain("covered");
+      expect(await ingestRowFor(messageId)).not.toBeNull();
+      expect(await fallbackArmed(messageId)).toBe(false);
+    });
+  });
+
+  test("beside other watchers, a route the list no longer names does not stand down for the watcher left first", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      const inbox = await suDb.inbox.findFirstOrThrow({
+        where: { tenantId, chatwootInboxId: SHARED_INBOX },
+        select: { id: true },
+      });
+      const ownerRow = await suDb.inboxObserver.findFirstOrThrow({
+        where: { tenantId, inboxId: inbox.id, agentId: observerId },
+      });
+      // The second watcher stands down for the owner, and its claim says it remembers.
+      const seen: string[] = [];
+      const second = await deliver(
+        secondBot,
+        510,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).toEqual(["queued"]);
+      expect(await fallbackArmed(second.messageId)).toBe(true);
+      await suDb.chatwootWebhookDelivery.update({
+        where: { id: second.deliveryRowId },
+        data: {
+          conversationId: 510,
+          inboundMessageId: second.messageId,
+          routeAgentBotId: secondBot,
+        },
+      });
+      // The owner is taken off the inbox before its own delivery runs: it still arrives on its route.
+      await suDb.inboxObserver.delete({ where: { id: ownerRow.id } });
+      try {
+        await deliver(
+          OBSERVER_BOT,
+          510,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { messageId: second.messageId, onIngest: (o) => seen.push(o) },
+        );
+        expect(seen[1]).toBe("queued");
+        expect(await ingestRowFor(second.messageId)).not.toBeNull();
+      } finally {
+        await suDb.inboxObserver.create({ data: ownerRow });
+      }
+    });
+  });
+
+  test("beside three watchers, a watcher that left the append to the owner is never taken for one that wrote it", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot, secondId }) => {
+      const THIRD_BOT = 964;
+      const third = await suDb.agent.create({
+        data: {
+          tenantId,
+          name: "Terceira observadora",
+          systemPrompt: "…",
+          modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+          enabled: true,
+          mode: "monitoring",
+        },
+      });
+      await suDb.chatwootAgentBot.create({
+        data: {
+          tenantId,
+          chatwootInstanceId: instanceId,
+          agentId: third.id,
+          chatwootAgentBotId: THIRD_BOT,
+          accessToken: encryptJson("BOT"),
+          webhookSecret: encryptJson("S"),
+          webhookRouteTokenHash: `obr-route-${THIRD_BOT}-${process.pid}`,
+          name: "Terceira observadora",
+        },
+      });
+      const inbox = await suDb.inbox.findFirstOrThrow({
+        where: { tenantId, chatwootInboxId: SHARED_INBOX },
+        select: { id: true },
+      });
+      await suDb.inboxObserver.create({
+        data: { tenantId, inboxId: inbox.id, agentId: third.id },
+      });
+      try {
+        expect(third.id > secondId).toBe(true);
+        // The second watcher leaves the append to the first, and says it wrote nothing.
+        const second = await deliver(secondBot, 511, SHARED_INBOX, OPEN_HUMAN);
+        await suDb.chatwootWebhookDelivery.update({
+          where: { id: second.deliveryRowId },
+          data: {
+            conversationId: 511,
+            inboundMessageId: second.messageId,
+            routeAgentBotId: secondBot,
+          },
+        });
+        expect(
+          (
+            await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
+              where: { id: second.deliveryRowId },
+              select: { routeRemembers: true },
+            })
+          ).routeRemembers,
+        ).toBe(false);
+        // The first is switched off before the third's delivery: the third elects the second, whose
+        // row says it remembered nothing, so the third keeps the message.
+        await suDb.agent.update({
+          where: { id: observerId },
+          data: { enabled: false },
+        });
+        const seen: string[] = [];
+        await deliver(
+          THIRD_BOT,
+          511,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { messageId: second.messageId, onIngest: (o) => seen.push(o) },
+        );
+        expect(seen).not.toContain("covered");
+        expect(await ingestRowFor(second.messageId)).not.toBeNull();
+      } finally {
+        await suDb.agent.update({
+          where: { id: observerId },
+          data: { enabled: true },
+        });
+        await suDb.inboxObserver.deleteMany({
+          where: { tenantId, inboxId: inbox.id, agentId: third.id },
+        });
+        await suDb.chatwootAgentBot.deleteMany({
+          where: { tenantId, agentId: third.id },
+        });
+      }
+    });
+  });
+
+  test("beside other watchers, an owner that left the message to a responder switched off since: the other watcher's route keeps it", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      // The responder remembers while the owner's delivery runs: the owner leaves it the message.
+      await suDb.agent.update({
+        where: { id: responderId },
+        data: { enabled: true },
+      });
+      const owned = await deliver(OBSERVER_BOT, 512, SHARED_INBOX, OPEN_HUMAN);
+      await suDb.chatwootWebhookDelivery.update({
+        where: { id: owned.deliveryRowId },
+        data: {
+          conversationId: 512,
+          inboundMessageId: owned.messageId,
+          routeAgentBotId: OBSERVER_BOT,
+        },
+      });
+      expect(await ingestRowFor(owned.messageId)).toBeNull();
+      // Switched off before its own delivery, which then remembers nothing.
+      await suDb.agent.update({
+        where: { id: responderId },
+        data: { enabled: false },
+      });
+      const answered = await deliver(
+        RESPONDER_BOT,
+        512,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { messageId: owned.messageId },
+      );
+      await suDb.chatwootWebhookDelivery.update({
+        where: { id: answered.deliveryRowId },
+        data: {
+          conversationId: 512,
+          inboundMessageId: owned.messageId,
+          routeAgentBotId: RESPONDER_BOT,
+        },
+      });
+      const seen: string[] = [];
+      await deliver(
+        secondBot,
+        512,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        { messageId: owned.messageId, onIngest: (o) => seen.push(o) },
+      );
+      expect(seen).not.toContain("covered");
+      expect(await ingestRowFor(owned.messageId)).not.toBeNull();
+      expect(await fallbackArmed(owned.messageId)).toBe(false);
+    });
+  });
+
+  test("beside other watchers, an owner whose delivery is still deciding covers the message: the other watcher's route does not append", async () => {
+    await withSecondWatcher(
+      new Date(Date.now() - 60_000),
+      async ({ secondBot }) => {
+        messageSeq += 1;
+        const messageId = messageSeq;
+        convOfMessage.set(messageId, 513);
+        // The owner's delivery of the same message, claimed and still between its claim and its
+        // decision: its claim states nothing yet.
+        await suDb.chatwootWebhookDelivery.create({
+          data: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            deliveryId: `obr-${process.pid}-owner-deciding`,
+            event: "message_created",
+            status: "PROCESSING",
+            conversationId: 513,
+            inboundMessageId: messageId,
+            routeAgentBotId: OBSERVER_BOT,
+            routeObserved: true,
+            routeRemembers: null,
+            claimedAt: new Date(),
+          },
+        });
+        const seen: string[] = [];
+        await deliver(
+          secondBot,
+          513,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { messageId, onIngest: (o) => seen.push(o) },
+        );
+        expect(seen).toEqual(["queued"]);
+        expect(await fallbackArmed(messageId)).toBe(true);
+      },
+    );
+  });
+
+  test("beside other watchers, an owner whose bot was replaced after the message: the other watcher's route keeps it", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      // Re-provisioned a moment ago (a new Chatwoot id), reattached without moving the owner's
+      // attach: an event emitted half an hour ago never reached the bot the owner has now.
+      const ownerBot = await suDb.chatwootAgentBot.findFirstOrThrow({
+        where: { tenantId, agentId: observerId },
+        select: { id: true, name: true },
+      });
+      await suDb.chatwootAgentBot.update({
+        where: { id: ownerBot.id },
+        data: { name: `${ownerBot.name} ` },
+      });
+      try {
+        const seen: string[] = [];
+        const { messageId } = await deliver(
+          secondBot,
+          514,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          new Date(Date.now() - 30 * 60_000),
+          undefined,
+          { onIngest: (o) => seen.push(o) },
+        );
+        expect(seen).not.toContain("covered");
+        expect(await ingestRowFor(messageId)).not.toBeNull();
+        expect(await fallbackArmed(messageId)).toBe(false);
+      } finally {
+        await suDb.chatwootAgentBot.update({
+          where: { id: ownerBot.id },
+          data: { name: ownerBot.name },
+        });
+      }
+    });
+  });
+
+  test("beside other watchers, an owner whose only delivery of the message is a later update does not cover its creation", async () => {
+    // Attached after the message was created: the owner never got that creation, only a later update
+    // of the same message.
+    await withSecondWatcher(
+      new Date(Date.now() - 60_000),
+      async ({ secondBot }) => {
+        messageSeq += 1;
+        const messageId = messageSeq;
+        convOfMessage.set(messageId, 515);
+        await suDb.chatwootWebhookDelivery.create({
+          data: {
+            tenantId,
+            chatwootInstanceId: instanceId,
+            deliveryId: `obr-${process.pid}-owner-update`,
+            event: "message_updated",
+            status: "PROCESSED",
+            conversationId: 515,
+            inboundMessageId: messageId,
+            routeAgentBotId: OBSERVER_BOT,
+            routeObserved: true,
+            routeRemembers: null,
+            claimedAt: new Date(),
+          },
+        });
+        const seen: string[] = [];
+        await deliver(
+          secondBot,
+          515,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          HOUR_AGO(),
+          undefined,
+          { messageId, onIngest: (o) => seen.push(o) },
+        );
+        expect(seen).not.toContain("covered");
+        expect(await ingestRowFor(messageId)).not.toBeNull();
+        expect(await fallbackArmed(messageId)).toBe(false);
+      },
+    );
+  });
+
+  test("beside other watchers, an owner switched off before its own delivery: the other watcher's fallback keeps the message queued", async () => {
+    await withSecondWatcher(HOUR_AGO(), async ({ secondBot }) => {
+      const { messageId } = await deliver(
+        secondBot,
+        516,
+        SHARED_INBOX,
+        OPEN_HUMAN,
+      );
+      expect(await fallbackArmed(messageId)).toBe(true);
+      await suDb.agent.update({
+        where: { id: observerId },
+        data: { enabled: false },
+      });
+      try {
+        await deliver(
+          OBSERVER_BOT,
+          516,
+          SHARED_INBOX,
+          OPEN_HUMAN,
+          false,
+          undefined,
+          undefined,
+          undefined,
+          { messageId },
+        );
+        // The owner folded nothing in; the fallback is still there to do it.
+        expect(await fallbackArmed(messageId)).toBe(true);
+      } finally {
+        await suDb.agent.update({
+          where: { id: observerId },
+          data: { enabled: true },
+        });
+      }
+    });
+  });
+
   // The persona bot deleted out-of-band on Chatwoot leaves the binding standing and the responder's
   // route dead — the state the console shows as "missing", with a Reconnect beside it. Standing
   // down for a delivery that never comes would lose the message from memory entirely.
@@ -590,9 +1659,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // Chatwoot picks a message's webhook recipients when it EMITS the event, so a responder bound
+  // NOTE: Chatwoot picks a message's webhook recipients when it EMITS the event, so a responder bound
   // afterwards gets no delivery for it. Standing down there would omit the message from memory for
-  // good: nothing scans a settled observer row again (issue #476 review, round 31).
+  // good: nothing scans a settled observer row again.
   test("beside a responder bound after this message: remembered here, because no delivery of its own was ever fanned", async () => {
     requests.length = 0;
     const received = new Date(Date.now() - 60_000);
@@ -831,16 +1900,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // ...AND A `true` THE SIBLING HAS NOT FINISHED ACTING ON DOES NOT SILENCE THIS ROUTE (PR review,
-  // round 15). The claim writes that value from the runtime it resolved, and the ingestion it
-  // promises happens later in the same execution: a responder switched off in between, and then
-  // crashing or failing to enqueue, leaves a row saying it remembers a reply it never folded in. No
-  // sweep repairs that one — a takeover recovery does not carry the reply body — so the reply is
-  // gone from the only memory holding it, permanently, on the strength of an intent.
-  //
-  // Only on the REPLY column, because there being wrong toward ingesting costs an append the dedup
-  // window catches, while on an inbound message it can append one the responder's turn is about to
-  // answer, which nothing catches.
+  // NOTE: ...AND A `true` THE SIBLING HAS NOT FINISHED ACTING ON DOES NOT SILENCE THIS ROUTE. The
+  // claim writes that value before the ingestion it promises: a responder switched off in between,
+  // then crashing or failing to enqueue, leaves a row claiming a reply it never folded in, and no
+  // sweep repairs it (a takeover recovery does not carry the reply body). Only on the REPLY column:
+  // there, erring toward ingesting costs an append the dedup window catches, while on an inbound
+  // message it can append one the responder's turn is about to answer, which nothing catches.
   test("a reply whose sibling only INTENDED to remember is remembered here", async () => {
     requests.length = 0;
     await suDb.inbox.updateMany({
@@ -920,12 +1985,11 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // ...AND THAT HOLDS WITH THE RESPONDER STILL ON (PR review, round 17). Answering `null` for an
-  // unfinished reply sibling fell back to the responder's CURRENT mode, and that mode reads
-  // "remembers" for exactly the responder this is about: one that was on when it claimed and is on
-  // now. The sibling crashing a moment later leaves the reply in nobody's memory, permanently. So
-  // the answer is `false` — the only thing actually known — and being early costs an append the
-  // shared dedupe key and the `human_agent` window refuse.
+  // NOTE: ...AND THAT HOLDS WITH THE RESPONDER STILL ON. Falling back to the responder's CURRENT
+  // mode for an unfinished reply sibling reads "remembers" for exactly this responder, and the
+  // sibling crashing a moment later leaves the reply in nobody's memory. So the answer is `false`,
+  // the only thing actually known, and being early costs an append the shared dedupe key and the
+  // `human_agent` window refuse.
   test("a reply whose sibling is still working is remembered here even with the responder on", async () => {
     requests.length = 0;
     await suDb.inbox.updateMany({
@@ -987,9 +2051,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       // The responder is production and enabled the whole time: the mode reading would have silenced
       // this route, and the sibling's own unfinished state is what does not.
       expect(await ingestArmedFor(replyId)).toBe(true);
-      // ...AND FILED UNDER THE RESPONDER (issue #742). Its own delivery arms the same job when it
-      // finishes, and the later arm replaces the payload: armed here under the observer, whose
-      // compaction settings summarise the attendance was decided by which route got there last.
+      // NOTE: ...AND FILED UNDER THE RESPONDER. Its own delivery arms the same job when it finishes
+      // and the later arm replaces the payload, so arming here under the observer would let the
+      // route that got there last decide whose compaction settings summarise the attendance.
       expect(
         (
           (await ingestRowFor(replyId))?.payload as
@@ -1005,10 +2069,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // WHOSE MEMORY IT IS, when the responder does not hold it (issue #742). The observer's route
-  // appends the reply either way; filed under the responder only while that responder remembers
-  // continuously, so a switched-off one or one in `test` leaves it under the observer. And the
-  // compaction the payload carries is the owner's.
+  // NOTE: WHOSE MEMORY IT IS, when the responder does not hold it. The observer's route appends the
+  // reply either way; filed under the responder only while that responder remembers continuously,
+  // so a switched-off one or one in `test` leaves it under the observer. And the compaction the
+  // payload carries is the owner's.
   test("a colleague's reply beside a responder is filed under whoever remembers it", async () => {
     const { settings, mode } = await suDb.agent.findUniqueOrThrow({
       where: { id: responderId },
@@ -1145,8 +2209,8 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       expect(messageId).toBe(sharedMessage);
       expect(customerFacing()).toEqual([]);
       expect(await ingestArmedFor(messageId)).toBe(true);
-      // The responder never received it, so it holds no part of this append: the observer's own
-      // agent, as before (issue #742).
+      // NOTE: The responder never received it, so it holds no part of this append: filed under the
+      // observer's own agent.
       expect(
         (
           (await ingestRowFor(messageId))?.payload as
@@ -1188,10 +2252,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // THE RESOLUTION NOW STANDS BEFORE THE CLAIM, so a transient failure there rejects with the row
-  // still PENDING and its role unsaid — the webhook long since acknowledged, and no caller left to
-  // ask again. A handful of attempts is what separates "the pool was briefly exhausted" from a
-  // message the recovery will refuse.
+  // NOTE: THE RESOLUTION STANDS BEFORE THE CLAIM, so a transient failure there rejects with the row
+  // still PENDING and its role unsaid, the webhook long since acknowledged and no caller left to ask
+  // again. A handful of attempts separates "the pool was briefly exhausted" from a message the
+  // recovery will refuse.
   test("a transient failure resolving the route is retried, and the delivery still records its role", async () => {
     requests.length = 0;
     let failures = 0;
@@ -1268,8 +2332,8 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       where: { id: delivery.id },
       select: { routeObserved: true, status: true },
     });
-    // The role is stated and the delivery settled, which is the pair a spent resolution loses. On
-    // this inbox the route remembers nothing (issue #620), so the memory is no witness here.
+    // NOTE: The role is stated and the delivery settled, the pair a spent resolution loses. On this
+    // inbox the route remembers nothing, so the memory is no witness here.
     expect(row.routeObserved).toBe(true);
     expect(row.status).toBe("PROCESSED");
     expect(await ingestArmedFor(messageSeq)).toBe(false);
@@ -1308,12 +2372,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     ).toBe(false);
   });
 
-  // THE REPLAY NEVER RESTATES THE ROLE DOWNWARD. The recovery validates the observer's bot before it
-  // dispatches; this resolution runs after that, so a bot reprovisioned or deleted in between leaves
-  // no observer runtime on a row the ledger says was a watcher's. Restating `false` from that
-  // reading hands the row to the inbox's own derivation, and on a human-owned conversation the
-  // responder path settles it PROCESSED with nobody having remembered the message — and with the
-  // role that would have sent it back overwritten (issue #476 review, round 53).
+  // NOTE: THE REPLAY NEVER RESTATES THE ROLE DOWNWARD. The recovery validates the observer's bot
+  // before it dispatches and this resolution runs after, so a bot reprovisioned or deleted between
+  // them leaves no observer runtime on a row the ledger says was a watcher's. Restating `false`
+  // would hand the row to the inbox's own derivation, and on a human-owned conversation the
+  // responder path settles it PROCESSED with nobody having remembered the message, overwriting the
+  // role that would have sent it back.
   test("a replay whose observer runtime is gone is left DEAD, not restated as the responder", async () => {
     requests.length = 0;
     const bot = await suDb.chatwootAgentBot.findFirstOrThrow({
@@ -1534,8 +2598,8 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
   });
 
   // ...but a monitoring bot that HOLDS the conversation is on the assigned bot's route, not an
-  // observer's: the fork delivers to the conversation's assignee bot too, and a bot that used to be
-  // the inbox's responder keeps holding what it was assigned. Read as an observer's, that route
+  // observer's: the fork delivers to the conversation's assignee bot too, and a bot that was the
+  // inbox's responder keeps holding what it was assigned. Read as an observer's, that route
   // would answer nothing while the current responder's own route stands down before a conversation
   // another bot holds — and nobody would answer at all.
   test("a monitoring bot that holds the conversation is the assigned bot's route, not an observer's", async () => {
@@ -1546,12 +2610,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       status: "open",
     });
     expect(customerFacing()).toEqual([]);
-    // Folded in under the inbox's RESPONDER, which is what the assigned bot's route does with a
-    // message no turn covers — never under the monitoring bot whose route this is.
-    // QUAL LINHA É DESTA MENSAGEM não se decide por substring do payload: as faixas de
-    // `contactInboxId` (84012-84087) e de `messageId` (84007-84050) se sobrepõem, e no fim da
-    // suíte quatro messageIds já casam duas linhas cada nesse filtro. A linha da mensagem tem
-    // chave própria (issue #731).
+    // Folded in under the inbox's RESPONDER, which is what the assigned bot's route does with
+    // a message no turn covers, never under the monitoring bot whose route this is. A linha desta
+    // mensagem tem chave própria: as faixas de `contactInboxId` e `messageId` se sobrepõem, então
+    // substring do payload casa linhas de outras mensagens.
     const armed = await ingestRowFor(messageId);
     expect(await ingestArmedFor(messageId)).toBe(true);
     expect(agentOf(armed)).toBe(String(responderId));
@@ -1571,7 +2633,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     expect(await routeObservedOf(deliveryRowId)).toBe(true);
   });
 
-  // The watcher that used to answer: an agent added as the inbox's observer still HOLDS the
+  // NOTE: a watcher that once answered: an agent added as the inbox's observer still HOLDS the
   // conversations it was assigned back then, and those deliveries stay the assigned bot's.
   test("an observer that holds the conversation is still the assigned bot's route", async () => {
     requests.length = 0;
@@ -1580,12 +2642,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       assigneeId: OBSERVER_BOT,
       status: "open",
     });
-    // The message is folded in under the RESPONDER, which is what the assigned bot's route does with
-    // a conversation no turn covers — never under the watcher, whose route this is not.
-    // QUAL LINHA É DESTA MENSAGEM não se decide por substring do payload: as faixas de
-    // `contactInboxId` (84012-84087) e de `messageId` (84007-84050) se sobrepõem, e no fim da
-    // suíte quatro messageIds já casam duas linhas cada nesse filtro. A linha da mensagem tem
-    // chave própria (issue #731).
+    // The message is folded in under the RESPONDER, which is what the assigned bot's route
+    // does with a conversation no turn covers, never under the watcher, whose route this is not. A
+    // linha desta mensagem tem chave própria: as faixas de `contactInboxId` e `messageId` se
+    // sobrepõem, então substring do payload casa linhas de outras mensagens.
     const armed = await ingestRowFor(messageId);
     expect(await ingestArmedFor(messageId)).toBe(true);
     expect(agentOf(armed)).toBe(String(responderId));
@@ -1616,7 +2676,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
   });
 
   // A DEGRADED payload names no assignee at all, and the mirror is what still knows the conversation
-  // is held by the bot that used to answer this inbox. Read as "held by nobody", the route would be
+  // is held by the bot that answered this inbox before. Read as "held by nobody", the route would be
   // taken for an observer's and the customer would go unanswered.
   test("a payload with no assignee falls back to the mirror before claiming an observer's route", async () => {
     requests.length = 0;
@@ -1630,11 +2690,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       status: "open",
     });
     expect(customerFacing()).toEqual([]);
-    // The route is the assigned bot's, so the message is the RESPONDER's to remember.
-    // QUAL LINHA É DESTA MENSAGEM não se decide por substring do payload: as faixas de
-    // `contactInboxId` (84012-84087) e de `messageId` (84007-84050) se sobrepõem, e no fim da
-    // suíte quatro messageIds já casam duas linhas cada nesse filtro. A linha da mensagem tem
-    // chave própria (issue #731).
+    // The route is the assigned bot's, so the message is the RESPONDER's to remember. A linha
+    // desta mensagem tem chave própria: as faixas de `contactInboxId` e `messageId` se sobrepõem,
+    // então substring do payload casa linhas de outras mensagens.
     const armed = await ingestRowFor(messageId);
     expect(agentOf(armed)).toBe(String(responderId));
   });
@@ -1707,9 +2765,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       ).routeObserved,
     ).toBe(false);
 
-    // ...AND THE SAME STATEMENT SAYS WHAT THE ROUTE DOES WITH A MESSAGE IT DOES NOT ANSWER (issue
-    // #540, window 3). The observer's route folds it in — that is the whole of its work — and so
-    // does a responder that is switched on and ingests continuously.
+    // NOTE: ...AND THE SAME STATEMENT SAYS WHAT THE ROUTE DOES WITH A MESSAGE IT DOES NOT ANSWER. A
+    // responder that is switched on and ingests continuously folds it in. An observer's route says so
+    // only once it is about to append, and beside that responder it leaves the message to it.
     expect(
       (
         await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
@@ -1717,7 +2775,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
           select: { routeRemembers: true },
         })
       ).routeRemembers,
-    ).toBe(true);
+    ).toBe(false);
     expect(
       (
         await suDb.chatwootWebhookDelivery.findUniqueOrThrow({
@@ -1763,9 +2821,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     });
     expect((await jobs("DEBOUNCE")).length).toBe(1);
   });
-  // The watcher's verdict (issue #477): a customer message on an observed conversation arms the one
-  // OBSERVE row of that conversation, and a resolve delivered on the observer's route pulls it
-  // forward — on the shared inbox too, where the responder answers for the compaction.
+  // The watcher's verdict: a customer message on an observed conversation arms the one OBSERVE row
+  // of that conversation, and a resolve delivered on the observer's route pulls it forward, on the
+  // shared inbox too, where the responder answers for the compaction.
   async function deliverStatus(
     route: number,
     convId: number,
@@ -1814,10 +2872,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     });
   }
 
-  // ARMING IS THE MODE, and nothing else (issue #568). It used to need a label group configured,
-  // because a watcher with nothing to classify into had nothing to do; a watcher is now the ordinary
-  // agent that cannot answer, so being enabled, in monitoring mode and on the inbox is the whole
-  // condition.
+  // NOTE: ARMING IS THE MODE, and nothing else: a watcher is the ordinary agent that cannot answer,
+  // so being enabled, in monitoring mode and on the inbox is the whole condition (no label group
+  // required).
   test("a customer message on the observer's route arms its OBSERVE row", async () => {
     // Cleared first: every customer message on this route arms one now, so the deliveries the tests
     // above made have rows of their own.
@@ -1873,12 +2930,11 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     expect(customerFacing()).toEqual([]);
   });
 
-  // A DELAYED RESOLVE THE MIRROR REJECTED is not a resolve: read off the payload alone it pulled the
-  // verdict forward and let an `on_resolve` agent relabel a conversation that is open again (issue
-  // #477 review, round 2). The effective status is the mirror's.
-  // THE COMPACTION FOLLOWS THE MEMORY (issue #620). On an inbox nobody of ours answers the observer's
-  // route remembers nothing, so an attendance that ends there has nothing to summarise; beside a
-  // responder, the responder's own compaction is armed as it always was.
+  // NOTE: A DELAYED RESOLVE THE MIRROR REJECTED is not a resolve: read off the payload alone it would
+  // pull the verdict forward and let an `on_resolve` agent relabel a conversation that is open again,
+  // so the effective status is the mirror's. THE COMPACTION FOLLOWS THE MEMORY: on an inbox nobody
+  // of ours answers the observer's route remembers nothing, so an attendance ending there has
+  // nothing to summarise; beside a responder, the responder's own compaction is armed.
   test("a resolve on an inbox nobody of ours answers arms no compaction, and the responder's inbox still does", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "MEMORY_COMPACT" },
@@ -1920,13 +2976,14 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     });
   });
 
-  // The arming block runs on a delivery that is already CLAIMED, and a status-only event carries no
-  // `inboundMessageId` — nothing recovers it. A transient read failure there used to escape past the
-  // compaction and the redirect closing that follow.
+  // NOTE: The arming block runs on a delivery that is already CLAIMED, and a status-only event
+  // carries no `inboundMessageId`, so nothing recovers it: a transient read failure there must not
+  // escape past the compaction and the redirect closing that follow.
   test("a read that fails while arming the final verdict does not strand the delivery", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "OBSERVE" },
     });
+    let failedReads = 0;
     // biome-ignore lint/suspicious/noExplicitAny: proxying Prisma's client surface
     const failing = (target: any): any =>
       new Proxy(target, {
@@ -1942,7 +2999,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
             get(d, k, r) {
               const inner = Reflect.get(d, k, r);
               if (k !== "findFirst" && k !== "findUnique") return inner;
-              return async () => {
+              // NOTE: The mirror resolves the inbox by its Chatwoot key before anything else;
+              // failing that read fails the delivery outright and never reaches the arming block.
+              return async (args: { where?: Record<string, unknown> }) => {
+                if (args?.where?.tenantId_chatwootInstanceId_chatwootInboxId)
+                  return inner.call(d, args);
+                failedReads += 1;
                 throw new Error("pool exhausted");
               };
             },
@@ -1958,6 +3020,7 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       failing(appDb) as typeof appDb,
     );
     // Nothing armed, and the delivery still settled: the block is best-effort as a whole.
+    expect(failedReads).toBeGreaterThan(0);
     expect(await observeRows()).toHaveLength(0);
     expect(
       (
@@ -1993,11 +3056,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // OBSERVATION IS NOT A REPLY PATH. On the shared inbox the observer's bot can still HOLD a
-  // conversation from a life before the rebind: the reply route is then the responder's, correctly,
-  // and `observerRuntimeForRoute` answers null. Hung off that answer the watcher classified none of
-  // the conversations its own bot holds — neither the burst nor the final verdict (issue #477
-  // review, round 4).
+  // NOTE: OBSERVATION IS NOT A REPLY PATH. On the shared inbox the observer's bot can still HOLD a
+  // conversation from a life before the rebind: the reply route is then the responder's, and
+  // `observerRuntimeForRoute` answers null. Hung off that answer, the watcher would classify none of
+  // the conversations its own bot holds, neither the burst nor the final verdict.
   test("a bound observer whose bot holds the conversation still gets its verdict", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "OBSERVE" },
@@ -2048,10 +3110,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // A BOT THAT WAS DETACHED KEEPS RECEIVING THE EVENTS OF A CONVERSATION IT STILL OWNS, so
-  // "delivery, no row" is the ordinary post-detach state and not evidence of an attachment being
-  // written. Round 11 read it as the latter and armed a verdict for an agent nobody observes with,
-  // which then retried to DEAD on every message (issue #477 review, round 15).
+  // NOTE: A BOT THAT WAS DETACHED KEEPS RECEIVING THE EVENTS OF A CONVERSATION IT STILL OWNS, so
+  // "delivery, no row" is the ordinary post-detach state, not evidence of an attachment being
+  // written. Read as the latter, it would arm a verdict for an agent nobody observes with, which
+  // retries to DEAD on every message.
   test("a detached observer whose bot still holds the conversation arms nothing", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "OBSERVE" },
@@ -2098,10 +3160,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // A CONTROL COMMAND IS NOT CUSTOMER CONTENT. `/teste` and `/reset` are an operator talking to the
-  // runtime; the responder consumes them, and a verdict armed on one classifies the conversation off
-  // an instruction — and in `/reset`'s case wakes up after the command cleared the labels and puts
-  // them back (issue #477 review, round 5).
+  // NOTE: A CONTROL COMMAND IS NOT CUSTOMER CONTENT. `/teste` and `/reset` are an operator talking to
+  // the runtime; the responder consumes them, and a verdict armed on one classifies the conversation
+  // off an instruction (and in `/reset`'s case wakes up after the command cleared the labels and
+  // puts them back).
   test("a control command arms no verdict on the observer's route", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "OBSERVE" },
@@ -2153,12 +3215,11 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       });
     }
   });
-  // THE WORLD A DELIVERY ARRIVED IN, WRITTEN DOWN (issue #540). Every reader of the route's role
-  // re-derives it from the binding as it stands NOW, and an administrative write can land between
-  // Chatwoot emitting the event and that reading. The generation is what makes the two moments
-  // comparable: the row records the counter it was RECEIVED under, and it is written by the INSERT
-  // rather than by the claim — the rows that most need it are exactly the ones a process death
-  // stranded before any claim.
+  // NOTE: THE WORLD A DELIVERY ARRIVED IN, WRITTEN DOWN. Every reader of the route's role re-derives
+  // it from the binding as it stands NOW, and an administrative write can land between Chatwoot
+  // emitting the event and that reading. The row records the generation counter it was RECEIVED
+  // under, written by the INSERT rather than by the claim: the rows that most need it are the ones a
+  // process death stranded before any claim.
   test("the ledger records the inbox's generation at receipt, and a redelivery does not move it", async () => {
     const inbox = await suDb.inbox.findFirstOrThrow({
       where: { tenantId, chatwootInboxId: OBSERVED_ONLY_INBOX },
@@ -2229,13 +3290,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // WINDOW 1, WHICH IS A SILENT LOSS AND NOT A WRONG ANSWER. The delivery arrived on the observer's
-  // route; an unobserve and a promotion land before it is claimed, and the reading they leave
-  // resolves no runtime at all — on an inbox with no responder there is nothing else to resolve to.
-  // Settled there, the row goes PROCESSED having looked at nothing, and the observer's memory — the
-  // only memory this inbox has — loses a customer message with nobody told. The generation is what
-  // separates that from the ordinary empty reading (an inbox nothing of ours answers), which must go
-  // on settling exactly as it does.
+  // NOTE: A BINDING MOVED BEFORE THE CLAIM IS A SILENT LOSS, NOT A WRONG ANSWER. An unobserve and a
+  // promotion landing before the claim leave a reading that resolves no runtime, and on an inbox with
+  // no responder there is nothing else to resolve to. Settled there, the row goes PROCESSED having
+  // looked at nothing and the observer's memory (the only one this inbox has) loses a customer
+  // message. The generation separates that from the ordinary empty reading (an inbox nothing of ours
+  // answers), which goes on settling as it does.
   test("a delivery whose binding moved before its claim, and now resolves nothing, is left for the sweep", async () => {
     const inbox = await suDb.inbox.findFirstOrThrow({
       where: { tenantId, chatwootInboxId: OBSERVED_ONLY_INBOX },
@@ -2316,14 +3376,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // A READING THAT FAILED IS NOT A READING THAT SAID NOTHING (PR review, round 9). Both queries the
-  // refusal depends on used to answer null when they threw, and null switches the refusal OFF: the
-  // CAS goes through and the delivery settles PROCESSED with no runtime having looked at it, which
-  // is the exact loss the refusal exists to prevent, produced by a transient database failure on the
-  // one reading standing in its way. Both propagate now, and the row stays PENDING for the sweep.
-  //
-  // Written as a pair because they are two different queries on the same path: the generation, read
-  // inside the resolution (and therefore retried), and the row's own status, read at the refusal.
+  // A READING THAT FAILED IS NOT A READING THAT SAID NOTHING. Null switches the refusal OFF:
+  // the CAS goes through and the delivery settles PROCESSED with no runtime having looked at it, the
+  // exact loss the refusal prevents, from a transient database failure. Both queries propagate, and
+  // the row stays PENDING for the sweep. A pair because they are two queries on the same path: the
+  // generation, read inside the resolution (and so retried), and the row's own status, read at the
+  // refusal.
   const failingClient = (
     model: string,
     op: string,
@@ -2437,9 +3495,9 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
           base: failingClient(
             "inbox",
             "findFirst",
-            // The FALLBACK query alone, which is the one that used to swallow. The runtime resolvers
-            // read the same column on the same model and must go on answering, or this test would
-            // prove the retry loop and not the swallow: they select more than this one field.
+            // NOTE: The FALLBACK query alone, the one that must not swallow a failure. The runtime
+            // resolvers read the same column on the same model and must go on answering, or this test
+            // would prove the retry loop and not the swallow: they select more than this one field.
             (args) =>
               args?.select?.bindingGeneration === true &&
               Object.keys(args?.select ?? {}).length === 1,
@@ -2491,12 +3549,11 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // ...AND IT IS NOT RAISED ON A ROW THERE IS NOTHING TO LEAVE (PR review, round 6). `claimFrom` is
-  // what this call EXPECTS the status to be, not what it is: Chatwoot reposting an event whose row is
-  // already settled arrives claiming PENDING all the same, and the CAS is what turns that into the
-  // `skipped` an idempotent duplicate deserves. Raised ahead of the CAS, an ordinary duplicate became
-  // an async dispatch failure whose message promised the sweep would pick the row up — and a settled
-  // row is on no sweep worklist, so the promise was false on top of noisy.
+  // NOTE: ...AND IT IS NOT RAISED ON A ROW THERE IS NOTHING TO LEAVE. `claimFrom` is what this call
+  // EXPECTS the status to be: Chatwoot reposting an event whose row already settled arrives claiming
+  // PENDING all the same, and the CAS turns that into the `skipped` an idempotent duplicate
+  // deserves. Raised ahead of the CAS, an ordinary duplicate would become an async dispatch failure
+  // promising a sweep pickup, and a settled row is on no sweep worklist.
   test("a repost of a delivery that already settled is skipped, not refused", async () => {
     const inbox = await suDb.inbox.findFirstOrThrow({
       where: { tenantId, chatwootInboxId: OBSERVED_ONLY_INBOX },
@@ -2658,11 +3715,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       });
     }
   });
-  // WINDOW 3 (issue #540): the stand-down beside a responder was decided by reading that responder's
-  // mode and switch AT THE MOMENT THE OBSERVER ASKED. The two deliveries are concurrent by
-  // construction — one message, two routes — so a switch flipped between them makes this route stay
-  // quiet about a message the responder never folded in. The sibling row states what its own claim
-  // resolved, and that is what is read.
+  // NOTE: The stand-down beside a responder is NOT decided by reading that responder's mode and
+  // switch when the observer asks. The two deliveries are concurrent by construction (one message,
+  // two routes), so a switch flipped between them would keep this route quiet about a message the
+  // responder never folded in. The sibling row states what its own claim resolved, and that is read.
   test("beside a responder whose own delivery recorded that it remembers nothing, the message is remembered here", async () => {
     requests.length = 0;
     const sharedMessage = messageSeq + 1;
@@ -2735,11 +3791,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     }
   });
 
-  // ...AND THE SIBLING IS THE RESPONDER'S DELIVERY OF THE SAME EVENT (PR review, round 1). One
-  // customer message reaches the ledger twice — the creation, and the `message_updated` that finally
-  // carried a voice note's transcription — and both name it through `inboundMessageId` (issue #478).
-  // Matched without the event, this delivery would read the OTHER one's decision, and where the mode
-  // moved between them it is exactly the wrong one.
+  // NOTE: ...AND THE SIBLING IS THE RESPONDER'S DELIVERY OF THE SAME EVENT. One customer message
+  // reaches the ledger twice (the creation, and the `message_updated` that carries a voice note's
+  // transcription), both naming it through `inboundMessageId`. Matched without the event, this
+  // delivery would read the OTHER one's decision, the wrong one wherever the mode moved between them.
   test("a sibling delivery of a different event does not answer for this one", async () => {
     requests.length = 0;
     const sharedMessage = messageSeq + 1;
@@ -2794,20 +3849,12 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     expect(messageId).toBe(sharedMessage);
     expect(await ingestArmedFor(messageId)).toBe(false);
   });
-  // ...AND WHEN THE RESPONDER HAS SEVERAL DELIVERIES OF THE SAME EVENT, IT IS THE NEWEST THAT
-  // ANSWERS — including when the newest has not claimed yet (PR review, round 6). One message can
-  // emit `message_updated` more than once (a raw media write, then the transcription's), and a
-  // redelivery repeats an event outright: every one of those rows shares this conversation, message,
-  // route and event, so nothing on the row identifies its fan-out. The query used to skip rows that
-  // had stated nothing, and skipping is what made it walk back to an OLDER delivery's answer and
-  // hand it back as this one's — a mode change between the two then made this route repeat a message
-  // the responder folded in, or stay quiet about one it did not.
-  //
-  // The honest reading is the latest sibling, whatever it says. Null from it means the responder has
-  // not decided yet, which falls back to the responder's CURRENT mode — and that mode is what the
-  // responder's own claim is about to read anyway, so it beats a settled answer to an older
-  // question. Here the older delivery remembered nothing while the responder is production and
-  // enabled now: read from the old row this route would append the message, and it must not.
+  // NOTE: ...AND WHEN THE RESPONDER HAS SEVERAL DELIVERIES OF THE SAME EVENT, THE NEWEST ANSWERS,
+  // even unclaimed. `message_updated` can fire more than once and a redelivery repeats an event, so
+  // nothing on those rows identifies their fan-out; skipping rows that stated nothing would walk
+  // back to an OLDER delivery's answer. Null from the latest means the responder has not decided,
+  // which falls back to its CURRENT mode, what its own claim is about to read anyway. Here the older
+  // delivery remembered nothing while the responder is production and enabled now.
   test("the newest sibling answers, even unclaimed, and an older one does not answer for it", async () => {
     requests.length = 0;
     const sharedMessage = messageSeq + 1;
@@ -2848,12 +3895,10 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
     expect(customerFacing()).toEqual([]);
     expect(await ingestArmedFor(messageId)).toBe(false);
   });
-  // WINDOW 5 (issue #540): the attach window used to have no fact of its own. The row was written
-  // only after Chatwoot agreed, so a delivery landing inside it read "no row" — and where a
-  // promotion committed in that same window, not even the monitoring mode that stood in for the
-  // row. The row is now written first, unstamped, and the receiver reports that as the window: the
-  // verdict armed off it says `attaching`, so the tick retries instead of completing on a binding
-  // that has not landed, which for a resolve is permanent.
+  // NOTE: THE ATTACH WINDOW HAS A FACT OF ITS OWN. The row is written first, unstamped, before
+  // Chatwoot agrees, and the receiver reports that as the window: the verdict armed off it says
+  // `attaching`, so the tick retries instead of completing on a binding that has not landed, which
+  // for a resolve is permanent.
   test("a delivery inside the attach window is reported as attaching", async () => {
     await suDb.schedulerJob.deleteMany({
       where: { tenantId, kind: "OBSERVE" },
@@ -2945,6 +3990,259 @@ describe.skipIf(!dbUp)("a delivery on an observer's route", () => {
       await suDb.agent.update({
         where: { id: observerId },
         data: { settings: before.settings ?? {} },
+      });
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
+    }
+  });
+
+  // NOTE: an inbox carries several observers. The fork fans one message to every
+  // observer bot's route; each route resolves its own runtime and arms its own OBSERVE row, keyed by
+  // agent, and on an inbox nobody of ours answers neither route folds the message into memory.
+  test("two observers on one inbox: the same message reaches both routes, each arms its own OBSERVE row, nothing remembered or posted", async () => {
+    const SECOND_BOT = 961;
+    const second = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Segunda observadora",
+        systemPrompt: "…",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId: second.id,
+        chatwootAgentBotId: SECOND_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `obr-route-${SECOND_BOT}-${process.pid}`,
+        name: "Segunda observadora",
+      },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: OBSERVED_ONLY_INBOX },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId: second.id },
+    });
+    await suDb.schedulerJob.deleteMany({
+      where: { tenantId, kind: "OBSERVE" },
+    });
+    requests.length = 0;
+    const CONV = 7_111;
+    try {
+      const first = await deliver(OBSERVER_BOT, CONV, OBSERVED_ONLY_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      // The same message, fanned by the fork to the second observer's route.
+      messageSeq -= 1;
+      const again = await deliver(SECOND_BOT, CONV, OBSERVED_ONLY_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      expect(again.messageId).toBe(first.messageId);
+
+      const thread = chatwootThreadId(tenantId, instanceId, CONV);
+      expect((await observeRows()).map((r) => r.dedupeKey).sort()).toEqual(
+        [
+          `observe:${thread}:${observerId}`,
+          `observe:${thread}:${second.id}`,
+        ].sort(),
+      );
+      expect(await routeObservedOf(first.deliveryRowId)).toBe(true);
+      expect(await routeObservedOf(again.deliveryRowId)).toBe(true);
+      expect(await ingestArmedFor(first.messageId)).toBe(false);
+      expect(customerFacing()).toEqual([]);
+    } finally {
+      await suDb.inboxObserver.deleteMany({
+        where: { tenantId, inboxId: inbox.id, agentId: second.id },
+      });
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
+    }
+  });
+
+  // Each watcher asks its OWN contact gate (docs/contact-auth.md, The observer path). One watcher's
+  // refusal arms nothing for it and leaves the other's observation alone, and the gate decides what is
+  // observed, never what is remembered: the memory owner stays the inbox's first watcher whatever its
+  // gate said about this conversation.
+  const REFUSING_GATE = {
+    contactAuth: {
+      enabled: true,
+      rule: { kind: "label", label: "nunca-aplicada" },
+    },
+  };
+
+  test("two observers on one inbox, the second refused by its own gate: only the first arms, nothing remembered or posted", async () => {
+    const SECOND_BOT = SECOND_WATCHER_BOT;
+    const second = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Segunda observadora (recusa)",
+        systemPrompt: "…",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+        settings: REFUSING_GATE,
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId: second.id,
+        chatwootAgentBotId: SECOND_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `obr-route-${SECOND_BOT}-${process.pid}`,
+        name: "Segunda observadora (recusa)",
+      },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: OBSERVED_ONLY_INBOX },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId: second.id },
+    });
+    await suDb.schedulerJob.deleteMany({
+      where: { tenantId, kind: "OBSERVE" },
+    });
+    requests.length = 0;
+    const CONV = 7_113;
+    try {
+      const first = await deliver(OBSERVER_BOT, CONV, OBSERVED_ONLY_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      messageSeq -= 1;
+      const again = await deliver(SECOND_BOT, CONV, OBSERVED_ONLY_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      expect(again.messageId).toBe(first.messageId);
+
+      const thread = chatwootThreadId(tenantId, instanceId, CONV);
+      expect((await observeRows()).map((r) => r.dedupeKey)).toEqual([
+        `observe:${thread}:${observerId}`,
+      ]);
+      const conv = await suDb.conversation.findFirstOrThrow({
+        where: { tenantId, chatwootConversationId: CONV },
+        select: { id: true },
+      });
+      const lines = await flowLogRows(suDb, {
+        orderBy: { id: "asc" },
+        where: {
+          tenantId,
+          conversationId: conv.id,
+          stage: "contact_auth",
+          agentId: second.id,
+        },
+        select: { detail: true },
+      });
+      expect(
+        lines.map((l) => (l.detail as { outcome?: string }).outcome),
+      ).toEqual(["denied"]);
+      expect(await ingestArmedFor(first.messageId)).toBe(false);
+      expect(customerFacing()).toEqual([]);
+    } finally {
+      await suDb.inboxObserver.deleteMany({
+        where: { tenantId, inboxId: inbox.id, agentId: second.id },
+      });
+      await suDb.schedulerJob.deleteMany({
+        where: { tenantId, kind: "OBSERVE" },
+      });
+    }
+  });
+
+  test("beside other watchers, a memory owner refused by its own gate still owns the memory, and only the allowed watcher arms", async () => {
+    requests.length = 0;
+    const SECOND_BOT = 964;
+    const second = await suDb.agent.create({
+      data: {
+        tenantId,
+        name: "Segunda observadora (memória, permitida)",
+        systemPrompt: "…",
+        modelConfig: { provider: "openai", model: "gpt-5.4-mini" },
+        enabled: true,
+        mode: "monitoring",
+        settings: { memory: { compaction: { enabled: false } } },
+      },
+    });
+    await suDb.chatwootAgentBot.create({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        agentId: second.id,
+        chatwootAgentBotId: SECOND_BOT,
+        accessToken: encryptJson("BOT"),
+        webhookSecret: encryptJson("S"),
+        webhookRouteTokenHash: `obr-route-${SECOND_BOT}-${process.pid}`,
+        name: "Segunda observadora (memória, permitida)",
+      },
+    });
+    const inbox = await suDb.inbox.findFirstOrThrow({
+      where: { tenantId, chatwootInboxId: SHARED_INBOX },
+      select: { id: true },
+    });
+    await suDb.inboxObserver.create({
+      data: { tenantId, inboxId: inbox.id, agentId: second.id },
+    });
+    const ownerBefore = await suDb.agent.findUniqueOrThrow({
+      where: { id: observerId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: observerId },
+      data: {
+        settings: {
+          ...((ownerBefore.settings as Record<string, unknown>) ?? {}),
+          ...REFUSING_GATE,
+        },
+      },
+    });
+    await suDb.agent.update({
+      where: { id: responderId },
+      data: { enabled: false },
+    });
+    await suDb.schedulerJob.deleteMany({
+      where: { tenantId, kind: "OBSERVE" },
+    });
+    try {
+      const { messageId } = await deliver(SECOND_BOT, 48, SHARED_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      messageSeq -= 1;
+      await deliver(OBSERVER_BOT, 48, SHARED_INBOX, {
+        assigneeType: "User",
+        status: "open",
+      });
+      expect(agentOf(await ingestRowFor(messageId))).toBe(String(observerId));
+      const thread = chatwootThreadId(tenantId, instanceId, 48);
+      expect((await observeRows()).map((r) => r.dedupeKey)).toEqual([
+        `observe:${thread}:${second.id}`,
+      ]);
+      expect(customerFacing()).toEqual([]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: observerId },
+        data: { settings: ownerBefore.settings ?? {} },
+      });
+      await suDb.agent.update({
+        where: { id: responderId },
+        data: { enabled: true },
+      });
+      await suDb.inboxObserver.deleteMany({
+        where: { tenantId, inboxId: inbox.id, agentId: second.id },
       });
       await suDb.schedulerJob.deleteMany({
         where: { tenantId, kind: "OBSERVE" },

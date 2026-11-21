@@ -14,7 +14,10 @@ import {
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
 import { readAgentConfigHealth } from "@/modules/agents/config-health-read";
+import { readLimitsConfig } from "@/modules/agents/limits";
+import type { AgentMode } from "@/modules/agents/mode";
 import {
+  AGENT_KINDS,
   AGENT_MODES,
   type AgentCreate,
   type AgentUpdate,
@@ -26,10 +29,11 @@ import {
   listAgentsPaged,
   replaceAgentToolSelections,
   type ToolGrantInput,
-  updateAgent,
+  updateAgentAndGrants,
 } from "@/modules/agents/service";
 import { exportAgent, importAgent } from "@/modules/agents/transfer";
 import { listOutOfOfficeInboxes } from "@/modules/chatwoot/management";
+import { readAgentFullDetailUsage } from "@/modules/flowlog/full-detail";
 import {
   GUARDRAIL_HEALTH_WINDOW_HOURS,
   guardrailHealthWindowStart,
@@ -38,6 +42,7 @@ import {
 import { listProviderModels } from "@/modules/models/service";
 import { getPlaygroundMedia } from "@/modules/playground/media";
 import {
+  estimateCallFloor,
   listPlaygroundTools,
   runPlaygroundAudioTurn,
   runPlaygroundExtract,
@@ -54,11 +59,15 @@ import {
   startPlaygroundThread,
 } from "@/modules/playground/sessions";
 import { listTtsOptions } from "@/modules/tts/listing";
+import { issuePlaygroundCallTicket } from "@/modules/voice-call/playground";
+import { setUpAgentCalls } from "@/modules/voice-call/setup";
 
 // translate('errors.agentConfirmMismatch', 'The agent name does not match')
 // translate('errors.agentModifiedElsewhere', 'This agent was changed somewhere else. Reload it and try again.')
 // translate('errors.agentObservesInboxes', 'This agent observes inboxes. Remove it as an observer first.')
 // translate('errors.agentNotRunnable', 'This agent has no runnable model configured.')
+// translate('errors.voiceAgentMonitoring', 'A calls agent cannot be in monitoring mode.')
+// translate('errors.agentAnswersCalls', 'This agent answers the calls of an inbox. Take it off the inbox first.')
 // translate('errors.audioTooLarge', 'Audio file is too large')
 // translate('errors.baseUrlRequired', 'A base URL is required for this provider.')
 // translate('errors.credentialRequired', 'A credential is required to list provider models.')
@@ -68,12 +77,34 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.invalidAgentExport', 'This file is not a valid agent export.')
 // translate('errors.invalidModelConfig', 'The model configuration must be an object.')
 // translate('errors.invalidModelConfigDetail', 'The model configuration is not valid: {{reason}}')
+// translate('errors.modelConfigModelRequired', 'model is required for this provider')
+// translate('errors.modelConfigReasoningOpenaiOnly', 'reasoningEffort is only supported on the "openai" provider, not "{{provider}}"')
+// translate('errors.modelConfigPromptCacheProviders', '{{field}} is only supported on the {{providers}} providers, not "{{provider}}"')
+// translate('errors.modelConfigPromptCache1hAnthropicOnly', '{{field}} "1h" is only supported on the "anthropic" provider, not "{{provider}}": its usage does not say which writes were 1h, so they could not be priced')
+// translate('errors.modelConfigConversationTtlAfterPrefix', 'promptCacheConversationTtl "{{conversationTtl}}" needs promptCacheTtl "{{prefixTtl}}": a longer cache TTL cannot follow a shorter one')
+// translate('errors.modelConfigValidatorSaid', '{{path}}: the validator answered "{{detail}}"')
 // translate('errors.promptTooLong', 'System prompt is too long: {{len}} characters (limit {{max}}).')
 // translate('errors.providerModelsFailed', '{{provider}} refused the list request (status {{status}}).')
 // translate('errors.providerListUnexpectedResponse', '{{provider}} answered the list request in an unexpected format.')
 // translate('errors.providerListUnreachable', 'Could not reach {{provider}} to list the options')
 // translate('errors.sessionNotFound', 'Playground session not found.')
 // translate('errors.playgroundTurnFailed', 'The turn failed on the server. The cause is in the server log, under the id of this turn.')
+// translate('errors.serviceWindowKind', '{{where}}: not a proactive kind ({{kinds}}).')
+// translate('errors.serviceWindowReminderOffset', '{{where}}: the key is a reminder offset in hours.')
+// translate('errors.serviceWindowReminderChoice', '{{where}}: not a template choice ({ name, language, params, … }).')
+// translate('errors.serviceWindowAppointmentVar', '{{where}}: {{placeholder}} is an appointment placeholder, and only appointment reminders have an appointment.')
+// translate('errors.serviceWindowTemplateBlankBody', '{{where}}: body parameter {{index}} of template "{{name}}" is blank.')
+// translate('errors.serviceWindowTemplateBlankHeader', '{{where}}: header parameter {{index}} of template "{{name}}" is blank.')
+// translate('errors.serviceWindowReminderOffsetRepeated', '{{where}}: another key already names the reminder {{hours}} hours before.')
+// translate('errors.serviceWindowTemplateNotFound', '{{where}}: template "{{name}}" is not an approved template of this agent\'s inbox.')
+// translate('errors.serviceWindowTemplateLanguage', '{{where}}: template "{{name}}" has no "{{language}}" version (available: {{available}}).')
+// translate('errors.serviceWindowTemplateBodyCount', '{{where}}: template "{{name}}" takes {{want}} body parameter(s), {{got}} configured.')
+// translate('errors.serviceWindowTemplateHeaderCount', '{{where}}: template "{{name}}" takes {{want}} header parameter(s), {{got}} configured.')
+// translate('errors.serviceWindowTemplateMediaHeader', '{{where}}: template "{{name}}" has a {{format}} header, which proactive sends do not fill.')
+// translate('errors.serviceWindowTemplateButtonCount', '{{where}}: template "{{name}}" has {{want}} button(s), {{got}} configured.')
+// translate('errors.serviceWindowTemplateButtonNeedsSuffix', '{{where}}: button {{index}} ("{{text}}") of template "{{name}}" needs the end of its URL.')
+// translate('errors.serviceWindowTemplateButtonTakesNone', '{{where}}: button {{index}} ("{{text}}") of template "{{name}}" takes no parameter.')
+// translate('errors.serviceWindowTemplateAuthentication', '{{where}}: template "{{name}}" is an authentication (one-time code) template, which proactive messages cannot use.')
 // translate('errors.settingsTextTooLong', 'The text in {{field}} is too long: {{len}} characters (limit {{max}}).')
 // translate('errors.invalidSignatureSwitch', '`signature.enabled` must be true or false, not {{got}}. Send the whole signature block to change it.')
 // translate('errors.settingsBlocksDropped', 'This `settings` would delete what this agent has configured under {{blocks}}, because it replaces the whole object. Add what is missing, or pass `settingsMode: "replace"` to say it is complete.')
@@ -81,14 +112,31 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.ttsFishVoiceInvalid', '`tts.voice` must be a Fish Audio voice id (32 hex characters, as fish.audio shows it), not "{{got}}". Pick the voice in the list or paste its id.')
 // translate('errors.ttsChoiceMismatch', '`tts.{{field}}` "{{got}}" belongs to another provider and {{provider}} cannot use it. Pick one of this provider\'s, or leave it blank for its default.')
 // translate('errors.invalidSettingsValue', '`{{field}}` expects {{expected}}, not {{got}}. The agent would ignore that value and use its default, so it is not stored.')
+// translate('errors.settingsExpectedOneOf', 'one of {{values}}')
+// translate('errors.settingsExpectedType', 'a value of type {{type}}')
+// translate('errors.settingsExpectedWholeNumber', 'a whole number')
+// translate('errors.settingsExpectedAtLeast', 'a number of at least {{min}}')
+// translate('errors.settingsExpectedGreaterThan', 'a number greater than {{min}}')
+// translate('errors.settingsExpectedAtMost', 'a number of at most {{max}}')
+// translate('errors.settingsExpectedLessThan', 'a number less than {{max}}')
+// translate('errors.settingsExpectedPattern', 'a value matching {{pattern}}')
+// translate('errors.settingsExpectedValid', 'a valid value')
+// translate('errors.unknownSettingsField', 'Unknown field `{{field}}`: it no longer exists, so it is not stored. Remove it from the request.')
 // translate('errors.debugWindowTooLong', 'The log debug mode can be armed for at most {{hours}}h at a time.')
-// translate('errors.invalidToolPrecondition', '`{{tool}}` has an invalid precondition: it must name an attribute scope and key.')
-// translate('errors.invalidContactAuthRule', 'The contact authorization rule is invalid: a list needs 1 to 500 entries, phones with 8 to 15 digits (country code included) and identifiers up to 200 characters; an attribute rule needs a scope and a key.')
+// translate('errors.invalidToolPrecondition', '`{{tool}}` has an invalid precondition: every condition is a customer choice or names an attribute scope and key, and a list holds 1 to 10 conditions.')
+// translate('errors.decisionArgRequired', 'Rule {{rule}}: `{{tool}}` requires the argument `{{arg}}`. Give it a fixed value or a field to fill it from.')
+// translate('errors.decisionArgUnknown', 'Rule {{rule}}: `{{tool}}` has no argument `{{arg}}`.')
+// translate('errors.decisionArgType', 'Rule {{rule}}: the value of `{{arg}}` is not of the type `{{tool}}` takes for it.')
+// translate('errors.decisionArgSourceType', 'Rule {{rule}}: the field that fills `{{arg}}` is not of the type `{{tool}}` takes for it.')
+// translate('errors.decisionToolUnknown', 'Rule {{rule}}: there is no tool named `{{tool}}`.')
+// translate('errors.contactFieldNotInContext', 'A contact field the agent may update must also be in its context: {{fields}}.')
+// translate('errors.invalidContactAuthRule', 'The contact authorization rule is invalid: a list needs 1 to 500 entries, phones with 8 to 15 digits (country code included) and identifiers up to 200 characters; an attribute rule needs a scope and a key; a conversation type is group or individual; a label is not empty; all or any holds 1 to 10 of those, never another all or any; the effect, on the rule only, is serve or exclude.')
 // translate('errors.retiredLabelSetting', '`settings.{{key}}` was retired: say which labels exist and which exclude each other in the `set_labels` usage guidance.')
 // translate('errors.tooManyProtectedLabels', '`Labels off limits` takes at most {{max}} labels.')
 // translate('errors.tooManyAllowedLabels', '`Labels it may add` takes at most {{max}} labels.')
 // translate('errors.replyGateNeedsLabel', 'The reply gate is on but names no required label, so the agent would never answer. Name the label or turn the gate off.')
 // translate('errors.replyGateSameLabels', 'The hand-off label must differ from the required label.')
+// translate('errors.protectedResolveLabel', '`Labels on close` cannot hold a label `set_labels` keeps off limits: {{labels}}. Take it out of one of the two lists.')
 // translate('errors.halfConfiguredFallback', 'The fallback provider is only half configured: {{missing}} is missing.')
 // translate('errors.sttCredentialMissing', 'The transcription credential was not found.')
 // translate('errors.sttFailed', 'Transcription failed: {{detail}}')
@@ -105,6 +153,16 @@ import { listTtsOptions } from "@/modules/tts/listing";
 // translate('errors.visionFailed', 'Image/document extraction failed')
 // translate('errors.visionNotConfigured', 'Image/document reading is not configured')
 // translate('errors.spendCeilingReached', 'The playground token ceiling for this month has been reached. Raise it in Settings or wait for the next month.')
+// translate('errors.clientSpendCeilingReached', 'The client channel spend ceiling for this month has been reached. Raise it in Settings or wait for the next month.')
+// translate('errors.threadNotFound', 'Thread not found.')
+// translate('errors.agentClientTurnRunning', 'A conversation of this agent in an embedded app is running right now. Try again in a moment.')
+// translate('errors.clientContextTooLarge', 'The page context is too large: {{max}} characters at most.')
+// translate('errors.clientTurnInProgress', 'Another request is still running on this conversation. Try again in a moment.')
+// translate('errors.clientTurnClaimLost', 'This request lost the conversation to another one and was stopped. Send it again.')
+// translate('errors.clientTurnAwaitingAnswers', 'This conversation is waiting for the answers to its tool calls. Send them first.')
+// translate('errors.clientTurnNothingWaiting', 'No tool call is waiting for an answer in this conversation.')
+// translate('errors.clientTurnUnknownCall', 'No pending tool call has the id {{id}}.')
+// translate('errors.clientTurnUndeclaredTool', 'The pending call to {{tool}} is to a tool this request does not declare.')
 
 // Agent config REST surface (one of the three transports; MCP prompt_get/set + UI project over
 // the same service). Config management is TENANT_ADMIN; the scoped service is the hard boundary.
@@ -117,9 +175,9 @@ function ctxOrThrow(ctx: TenantContext | null): TenantContext {
 
 // Parses the optional optimistic-concurrency precondition from the request body. Exported for direct
 // unit testing of the boundary contract: a missing/blank/UNPARSEABLE value yields `undefined`, which
-// the service treats as "no precondition" (last-write-wins). That degrade-on-garbage is deliberate —
-// the precondition is opt-in (REST/MCP omit it) — but it means a client that serializes a malformed
-// timestamp silently loses the overwrite protection, so the editor must always send a real ISO date.
+// the service treats as "no precondition" (last-write-wins). That degrade-on-garbage is deliberate
+// (the precondition is opt-in; REST/MCP omit it), but a client that serializes a malformed timestamp
+// silently loses the overwrite protection, so the editor must always send a real ISO date.
 export function parseExpectedUpdatedAt(
   s: string | undefined,
 ): Date | undefined {
@@ -130,7 +188,7 @@ export function parseExpectedUpdatedAt(
 
 // Splits the optimistic-concurrency precondition out of the PATCH body BEFORE it reaches the service.
 // `agentUpdateSchema` is a strict zod object (rejects unknown keys), so forwarding the raw body with
-// `expectedUpdatedAt` still on it fails with `unrecognized_keys` — the precondition must travel as an
+// `expectedUpdatedAt` still on it fails with `unrecognized_keys`: the precondition must travel as an
 // opt, never as a patch field. Exported so the split is unit-tested directly.
 export function splitAgentUpdateBody(
   body: AgentUpdate & { expectedUpdatedAt?: string; settingsMode?: "replace" },
@@ -139,8 +197,8 @@ export function splitAgentUpdateBody(
   expectedUpdatedAt: Date | undefined;
   settingsMode: "replace" | undefined;
 } {
-  // Both of these are about the WRITE and not about the agent, so both come off the patch: the
-  // strict update schema refuses an unrecognized key, which is the regression the test below pins.
+  // Both are about the WRITE, not the agent, so both come off the patch: the strict update
+  // schema refuses an unrecognized key.
   const { expectedUpdatedAt, settingsMode, ...patch } = body;
   return {
     patch: patch as AgentUpdate,
@@ -150,11 +208,10 @@ export function splitAgentUpdateBody(
 }
 
 // Live, non-persisted playground override (the "edit live" popup): the unsaved prompt/model/settings
-// draft. The secret never travels — modelConfig carries only a credentialRef, resolved server-side.
-// NOTE: Elysia normalizes `draft` against this schema, so a field that is missing HERE is stripped
-// from the request before the handler ever sees it — silently, with the turn then running against
-// the saved config. The type below is derived from this object precisely so the two cannot drift:
-// declaring a draft field in TypeScript alone does not carry it over the wire.
+// draft. The secret never travels: modelConfig carries only a credentialRef, resolved server-side.
+// Elysia normalizes `draft` against this schema, so a field missing HERE is silently stripped and
+// the turn runs against the saved config. `PlaygroundDraft` derives from this object so the two
+// cannot drift: a draft field declared in TypeScript alone does not travel over the wire.
 export const playgroundDraftSchema = t.Object({
   systemPrompt: t.Optional(
     t.String({ maxLength: config.agent.promptMaxChars }),
@@ -178,7 +235,7 @@ type PlaygroundDraft = typeof playgroundDraftSchema.static;
 
 // The playground turn/follow-up request bodies, exported so the wire contract is TESTED rather than
 // mirrored: a field that exists in TypeScript but not here is stripped by Elysia's normalize before
-// the handler runs, and a test that copies the schema validates its own copy (issue #170).
+// the handler runs, and a test that copies the schema validates its own copy.
 export const playgroundTurnBodySchema = t.Object({
   message: t.String({
     minLength: 1,
@@ -246,7 +303,7 @@ function parseDraft(
 
 // Arbitrary text (a transcription / extraction) that might start with `{`/`[`, which Elysia's
 // multipart parser would auto-parse into an object (see parseDraft). The client sends it JSON-encoded
-// — always a quoted string, so it is never auto-parsed — and we decode it back here. Malformed ⇒
+// (always a quoted string, so it is never auto-parsed) and it is decoded back here. Malformed ⇒
 // undefined (the turn then re-derives the value server-side instead of reusing it).
 function decodeMultipartText(raw: unknown): string | undefined {
   if (typeof raw !== "string" || !raw) return undefined;
@@ -274,6 +331,66 @@ function decodeExtractKind(
     ? raw
     : undefined;
 }
+
+// One grant as the editor sends it, for the save and for the estimate of an unsaved set.
+const ToolGrantBody = t.Object({
+  source: t.Union(
+    [
+      t.Literal("NATIVE"),
+      t.Literal("RAG"),
+      t.Literal("HTTP"),
+      t.Literal("MCP"),
+      t.Literal("INTEGRATION"),
+      t.Literal("DOCUMENT"),
+      t.Literal("CODE"),
+    ],
+    {
+      description:
+        "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), INTEGRATION (integration instance), DOCUMENT (document template), or CODE (operator-authored code tool).",
+    },
+  ),
+  toolDefinitionId: t.Optional(
+    t.Union([t.String(), t.Null()], {
+      description:
+        "Tool definition id (BigInt string) for NATIVE or HTTP grants, or null.",
+    }),
+  ),
+  mcpServerConnectionId: t.Optional(
+    t.Union([t.String(), t.Null()], {
+      description:
+        "MCP server connection id (BigInt string) for MCP grants, or null.",
+    }),
+  ),
+  integrationInstanceId: t.Optional(
+    t.Union([t.String(), t.Null()], {
+      description:
+        "Integration instance id (BigInt string) for INTEGRATION grants, or null.",
+    }),
+  ),
+  documentTemplateId: t.Optional(
+    t.Union([t.String(), t.Null()], {
+      description:
+        "Document template id (BigInt string) for DOCUMENT grants, or null.",
+    }),
+  ),
+  codeToolDefinitionId: t.Optional(
+    t.Union([t.String(), t.Null()], {
+      description: "Code tool id (BigInt string) for CODE grants, or null.",
+    }),
+  ),
+  knowledgeBaseIds: t.Optional(
+    t.Array(t.String(), {
+      description:
+        "Knowledge-base ids (BigInt strings) for a RAG grant; the bases the agent may search.",
+    }),
+  ),
+  enabledTools: t.Optional(
+    t.Array(t.String(), {
+      description:
+        "Subset of tool names to enable within the source; omit to enable the source's full set.",
+    }),
+  ),
+});
 
 export const agentsController = new Elysia({
   prefix: "/v1/agents",
@@ -349,12 +466,22 @@ export const agentsController = new Elysia({
   )
   .get(
     "/:id",
-    async ({ tenantContext, params }) => ({
-      instance: instanceIdentity,
-      agent: await getAgent(ctxOrThrow(tenantContext), requireDbId(params.id)),
-    }),
+    async ({ tenantContext, params }) => {
+      const agent = await getAgent(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      );
+      return {
+        instance: instanceIdentity,
+        agent,
+        effective: { limits: readLimitsConfig(agent.settings) },
+      };
+    },
     {
-      detail: doc("Get agent", "Returns a single agent by id."),
+      detail: doc(
+        "Get agent",
+        "Returns a single agent by id. `agent.settings` is the bag as stored, which is what a PATCH sends back. `effective.limits` is what the runtime enforces: the stored execution limits with every absent or `null` field read as its default (`maxToolCalls` 10, `maxHistoryTokens` null = no ceiling, `retrySilence` true, `maxTurnsPerHour` 60, `maxProactivePerDay` 10; a stored `0` on the last two means no limit). It is read-only: do not send it back.",
+      ),
       response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
@@ -381,7 +508,7 @@ export const agentsController = new Elysia({
     {
       detail: doc(
         "Get guardrail health",
-        "Counts the guardrail analyses that could not run for this agent in the recent window, with the most recent one and the error it carried. Analysis is fail-open, so a check counted here caught nothing and held nothing back. It does not follow that the turn went out unscreened: the other direction may still have screened it, and a split output analysis can carry an error from one half and a violation from the other.",
+        "Counts the guardrail analyses that could not run for this agent in the recent window, with the most recent one and the error it carried. A check counted here judged nothing: the screening let the message through by default (`onFailure: pass`), or held it and asked for a hand-over under `onFailure: hold`. It does not follow that the turn went out unscreened: the other direction may still have screened it, and a split output analysis can carry an error from one half and a violation from the other.",
       ),
       response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
@@ -392,10 +519,9 @@ export const agentsController = new Elysia({
       }),
     },
   )
-  // "Is this agent's configuration healthy?", for a caller that is not the console. The same checks
-  // the editor's warning panel runs, over the SAVED row: an agent configured entirely over this API
-  // or over MCP never rendered that panel, so until this existed those warnings were not missed,
-  // they were never computed. Issue #467.
+  // "Is this agent's configuration healthy?", for a caller that is not the console: the same checks
+  // the editor's warning panel runs, over the SAVED row, so an agent configured entirely over this
+  // API or MCP (which never renders that panel) still gets them computed.
   .get(
     "/:id/config-health",
     async ({ tenantContext, params }) => ({
@@ -410,6 +536,177 @@ export const agentsController = new Elysia({
       detail: doc(
         "Get agent configuration health",
         'The configuration warnings the agent editor shows, computed server-side over the SAVED agent: a feature switched on with no credential, a credential referenced but never filled, a credential the vault no longer holds, two settings that cancel each other out, and text past the cap its reader keeps. Each issue carries a `severity` — `blocking` (the agent does not answer, or answers without a protection whose switch reads "on"), `degraded` (it answers, and a feature that is on does not run) or `advisory` (nothing is off; the operator has a choice to make) — plus the same sentence the console shows, in the language of Accept-Language. `unchecked` names the live readings this call did not take (Chatwoot, guardrail health), because both of those fail as an empty result that reads exactly like a clean one — an empty `unchecked` is what makes a clean answer trustworthy. Shape: `{ agentId, agentName, healthy, counts, issues[], unchecked[] }`, where `healthy` is true when no blocking and no degraded issue is live.',
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  // What the agent's kept full turn detail costs: the editor shows it beside the
+  // setting, since a retention meant to stay on is read by what it uses, not by a warning.
+  .get(
+    "/:id/full-detail-usage",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      ...(await readAgentFullDetailUsage(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      )),
+    }),
+    {
+      detail: doc(
+        "Get the agent's full-detail usage",
+        "What this agent keeps of its turns' full detail (`settings.observability.fullDetailRetentionDays`, every tool result and the audited system prompt whole, beside the log lines cut at 2,000 characters) and what that is using now. `retentionDays` is the setting (null = off), `effectiveDays` the days a line written now is kept (the setting, capped by `FLOWLOG_RETENTION_DAYS`), `lines` the log lines whose full text is still kept, and `bytes` what the distinct texts they point to take on disk, compressed. A text identical across lines is stored once, and one shared with another agent counts for both. Read the texts themselves on `GET /api/v1/conversations/:id` (`trail[].fullOutput`).",
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  // What every model call of the agent sends before the history: the editor shows it next to the
+  // history ceiling, so an operator sizing that ceiling sees the part of the call it does not govern.
+  .get(
+    "/:id/call-floor",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      floor: await estimateCallFloor({
+        ctx: ctxOrThrow(tenantContext),
+        agentId: requireDbId(params.id),
+      }),
+    }),
+    {
+      detail: doc(
+        "Estimate the agent's call floor",
+        'An ESTIMATE, in tokens, of what every model call of the saved agent sends before the first line of history: its instructions, what the runtime appends to them (the knowledge-base grounding rules, the MCP server block) and each granted tool\'s schema, largest first. A heuristic count that can run low against what a provider bills. What only a conversation supplies (contact attributes, appointments, other-inbox context, per-turn notices) is not in it, so it is a floor, not the size of a call. An agent that observes with the decisions engine never sends this prompt and answers `{ engine: "decisions" }` with no numbers. Shape: `{ engine: "llm", instructions, instructionsAdded, instructionsAddedBy{ grounding, mcp }, tools[{ name, category, estimatedTokens }], total }`.',
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  .post(
+    "/:id/call-floor",
+    async ({ tenantContext, params, body }) => ({
+      instance: instanceIdentity,
+      floor: await estimateCallFloor({
+        ctx: ctxOrThrow(tenantContext),
+        agentId: requireDbId(params.id),
+        grants: (body as { grants: ToolGrantInput[] }).grants,
+        settings: (body as { settings?: Record<string, unknown> }).settings,
+        mode: (body as { mode?: AgentMode }).mode,
+      }),
+    }),
+    {
+      detail: doc(
+        "Estimate the call floor of an unsaved tool set",
+        "The same estimate as `GET /v1/agents/{id}/call-floor`, measured with the given grants (and settings, when sent) in place of the saved ones, so an editor can show what saving them would send. Nothing is written. The grants are validated as `PUT /v1/agents/{id}/tool-selections` validates them; a grant pointing at something this tenant does not have counts as absent, as it would at runtime.",
+      ),
+      response: errors(400, 401, 403, 404, 422),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+      body: t.Object({
+        grants: t.Array(ToolGrantBody, {
+          description:
+            "The whole grant set to measure, in the shape the tool-selections replace takes.",
+        }),
+        settings: t.Optional(
+          t.Record(t.String(), t.Unknown(), {
+            description:
+              "The agent's settings to measure with, in place of the saved ones (the shape `PATCH /v1/agents/{id}` takes). Tools read them: the handoff instructions, the writable contact fields. Omit to use the saved settings.",
+          }),
+        ),
+        mode: t.Optional(
+          t.Union(
+            [
+              t.Literal("test"),
+              t.Literal("production"),
+              t.Literal("monitoring"),
+            ],
+            {
+              description:
+                "The agent's mode to measure with, in place of the saved one: an observer (`monitoring`) is offered what an observation is, and one on the decisions engine (`settings.monitoring.engine`) gets no numbers.",
+            },
+          ),
+        ),
+      }),
+    },
+  )
+  .post(
+    "/:id/calls/check",
+    async ({ tenantContext, params }) => {
+      const result = await setUpAgentCalls(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        { checkAccess: true },
+      );
+      return {
+        instance: instanceIdentity,
+        ...(result.ok
+          ? {
+              ok: true as const,
+              providerAgentId: result.setup.providerAgentId,
+            }
+          : {
+              ok: false as const,
+              problem: result.problem,
+              detail: result.detail ?? null,
+            }),
+      };
+    },
+    {
+      detail: doc(
+        "Check and sync the agent's calls",
+        "Over the SAVED agent: resolves the key of the voice provider `settings.calls.provider` names (ElevenLabs Agents, the only one today; for it the audio replies' ElevenLabs key also serves), checks it can run that provider's agents, and creates or updates the agent that carries this agent's WhatsApp calls on the customer's account there, writing its id to `settings.calls.providerAgentId`. Answers `{ ok: true, providerAgentId }`, or `{ ok: false, problem, detail }` with problem one of `disabled`, `no_credential`, `credential_unusable`, `invalid_key`, `missing_permission` (a text-to-speech-only key), `unreachable`, `sync_failed`. Every call runs the same sync as it opens; this is what the console runs after a save, so a bad key shows on the screen rather than on the first call.",
+      ),
+      response: errors(400, 401, 403, 404),
+      requireRole: "TENANT_ADMIN",
+      params: t.Object({
+        id: t.String({
+          description: "Agent id, a BigInt encoded as a decimal string.",
+        }),
+      }),
+    },
+  )
+  .post(
+    "/:id/playground/call",
+    async ({ tenantContext, params }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const agentId = requireDbId(params.id);
+      const result = await setUpAgentCalls(ctx, agentId);
+      return {
+        instance: instanceIdentity,
+        ...(result.ok
+          ? {
+              ok: true as const,
+              ticket: issuePlaygroundCallTicket(ctx, agentId),
+            }
+          : {
+              ok: false as const,
+              problem: result.problem,
+              detail: result.detail ?? null,
+            }),
+      };
+    },
+    {
+      detail: doc(
+        "Start a playground call",
+        "Over the SAVED agent's calls settings: answers `{ ok: true, ticket }`, a ticket valid for one minute to open the call's media stream at `/api/v1/voice/playground/{ticket}`, or `{ ok: false, problem, detail }` with the same problems as the calls check. The call runs the playground's toolset (conversation tools simulated) and leaves nothing in Chatwoot.",
       ),
       response: errors(400, 401, 403, 404),
       requireRole: "TENANT_ADMIN",
@@ -464,7 +761,7 @@ export const agentsController = new Elysia({
         }),
         systemPrompt: t.Optional(
           t.String({
-            // NOTE: no maxLength here — the service enforces the (env-configurable) cap and
+            // NOTE: no maxLength here: the service enforces the (env-configurable) cap and
             // raises the localized error; a TypeBox cap would 422 first with a raw message.
             description: `System prompt template, may contain {{variable}} placeholders (up to ${config.agent.promptMaxChars} characters).`,
           }),
@@ -475,16 +772,25 @@ export const agentsController = new Elysia({
               "Whether the agent is active and may handle conversations.",
           }),
         ),
-        // NOTE: derived, not spelled. This list was written by hand here and in ten other places,
-        // and when `monitoring` was briefly held back from the write side (v1.15.0) the compiler
-        // found the copies one at a time because none of them derived from anything. Deriving is
-        // what makes the next change to the set one edit instead of eleven.
+        // NOTE: derived from the mode set, not spelled out: a hand-written copy here would drift
+        // from the others, and a change to the set would need one edit per copy.
         mode: t.Optional(
           t.Union(
             AGENT_MODES.map((m) => t.Literal(m)),
             {
               description:
                 "Operating mode: 'test' stays silent in a conversation until the customer sends /teste; 'production' answers normally; 'monitoring' receives and remembers every message and never answers.",
+            },
+          ),
+        ),
+        kind: t.Optional(
+          t.Union(
+            // NOTE: spelled out rather than mapped from AGENT_KINDS: a mapped union reaches the
+            // typed client as `undefined`, and the console sends this key.
+            [t.Literal(AGENT_KINDS[0]), t.Literal(AGENT_KINDS[1])],
+            {
+              description:
+                "What the agent answers, fixed once created: 'text' (messages, the default) or 'voice' (WhatsApp calls, on an ElevenLabs agent configured in `settings.calls`, bound to an inbox with PUT /v1/chatwoot/inboxes/{id}/voice-agent). A voice agent cannot be in monitoring mode.",
             },
           ),
         ),
@@ -524,25 +830,32 @@ export const agentsController = new Elysia({
   .patch(
     "/:id",
     async ({ tenantContext, params, body }) => {
-      const { patch, expectedUpdatedAt, settingsMode } = splitAgentUpdateBody(
-        body as AgentUpdate & {
-          expectedUpdatedAt?: string;
-          settingsMode?: "replace";
-        },
+      const { grants, ...rest } = body as AgentUpdate & {
+        expectedUpdatedAt?: string;
+        settingsMode?: "replace";
+        grants?: ToolGrantInput[];
+      };
+      const { patch, expectedUpdatedAt, settingsMode } =
+        splitAgentUpdateBody(rest);
+      const { agent, toolSelection } = await updateAgentAndGrants(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+        patch,
+        grants ?? null,
+        undefined,
+        { expectedUpdatedAt, settingsMode },
       );
       return {
         instance: instanceIdentity,
-        agent: await updateAgent(
-          ctxOrThrow(tenantContext),
-          requireDbId(params.id),
-          patch,
-          undefined,
-          { expectedUpdatedAt, settingsMode },
-        ),
+        agent,
+        ...(toolSelection ? { toolSelection } : {}),
       };
     },
     {
-      detail: doc("Update agent", "Partially updates an existing agent."),
+      detail: doc(
+        "Update agent",
+        "Partially updates an existing agent. With `grants`, the agent's whole tool grant set is replaced in the same transaction: either every part of the write is applied or none is.",
+      ),
       response: errors(400, 401, 403, 404, 409, 422),
       requireRole: "TENANT_ADMIN",
       params: t.Object({
@@ -560,7 +873,7 @@ export const agentsController = new Elysia({
         ),
         systemPrompt: t.Optional(
           t.String({
-            // NOTE: no maxLength here — the service enforces the (env-configurable) cap and
+            // NOTE: no maxLength here: the service enforces the (env-configurable) cap and
             // raises the localized error; a TypeBox cap would 422 first with a raw message.
             description: `System prompt template, may contain {{variable}} placeholders (up to ${config.agent.promptMaxChars} characters).`,
           }),
@@ -571,10 +884,8 @@ export const agentsController = new Elysia({
               "Whether the agent is active and may handle conversations.",
           }),
         ),
-        // NOTE: derived, not spelled. This list was written by hand here and in ten other places,
-        // and when `monitoring` was briefly held back from the write side (v1.15.0) the compiler
-        // found the copies one at a time because none of them derived from anything. Deriving is
-        // what makes the next change to the set one edit instead of eleven.
+        // NOTE: derived from the mode set, not spelled out: a hand-written copy here would drift
+        // from the others, and a change to the set would need one edit per copy.
         mode: t.Optional(
           t.Union(
             AGENT_MODES.map((m) => t.Literal(m)),
@@ -620,6 +931,12 @@ export const agentsController = new Elysia({
               "Optimistic-concurrency precondition: the agent's updatedAt the client loaded (ISO). When it no longer matches, the update is rejected with 409 instead of overwriting a change made elsewhere. Omit for last-write-wins.",
           }),
         ),
+        grants: t.Optional(
+          t.Array(ToolGrantBody, {
+            description:
+              "The agent's WHOLE tool grant set, in the shape PUT /v1/agents/{id}/tool-selections takes (replace-the-set semantics), written in the same transaction as the other fields. The answer then carries `toolSelection`, the set as written with its catalog.",
+          }),
+        ),
         settingsMode: t.Optional(
           t.Literal("replace", {
             description:
@@ -629,7 +946,7 @@ export const agentsController = new Elysia({
       }),
     },
   )
-  // Deleting an agent destroys its brain (prompt, grants, behavior) and detaches its inboxes — HARD
+  // Deleting an agent destroys its brain (prompt, grants, behavior) and detaches its inboxes, HARD
   // gated like the Chatwoot teardown: the operator re-types the agent's name AND confirms with their
   // password (step-up). The bundled components (tools/KB/integrations) are tenant-level and survive.
   .delete(
@@ -1177,9 +1494,8 @@ export const agentsController = new Elysia({
     "/:id/playground/media/:mediaId",
     async ({ tenantContext, params, set }) => {
       const ctx = ctxOrThrow(tenantContext);
-      // NOTE: refused, not answered 404. A media id that is not an id is a malformed request, and
-      // this route used to answer it as "no such blob": the one spelling of the rule in this app
-      // that told the caller their id was fine and the row was gone. Issue #371.
+      // Refused (400), not answered 404: a media id that is not an id is a malformed request,
+      // and a 404 would tell the caller their id was fine and the row was gone.
       const blob = await getPlaygroundMedia(
         ctx,
         requireDbId(params.mediaId, "mediaId"),
@@ -1247,7 +1563,6 @@ export const agentsController = new Elysia({
           requireDbId(params.id),
           params.threadId,
         ),
-        // The session's total so far, from the ledger (issue #839).
         usage: await getPlaygroundSessionUsage(
           ctx,
           requireDbId(params.id),
@@ -1274,7 +1589,7 @@ export const agentsController = new Elysia({
     },
   )
   // A fresh playground thread for a session about to start, so its first call is billed to a thread
-  // the console already holds (issue #839). Only an id: nothing is written until a turn runs on it.
+  // the console already holds. Only an id: nothing is written until a turn runs on it.
   .post(
     "/:id/playground/threads",
     async ({ tenantContext, params }) => {
@@ -1299,7 +1614,7 @@ export const agentsController = new Elysia({
     },
   )
   // The session's total alone, for a console that has to re-read it: a turn that failed after a
-  // billed call leaves that call in the ledger and nothing in the reply (issue #839).
+  // billed call leaves that call in the ledger and nothing in the reply.
   .get(
     "/:id/playground/sessions/:threadId/usage",
     async ({ tenantContext, params }) => {
@@ -1510,67 +1825,7 @@ export const agentsController = new Elysia({
         }),
       }),
       body: t.Object({
-        grants: t.Array(
-          t.Object({
-            source: t.Union(
-              [
-                t.Literal("NATIVE"),
-                t.Literal("RAG"),
-                t.Literal("HTTP"),
-                t.Literal("MCP"),
-                t.Literal("INTEGRATION"),
-                t.Literal("DOCUMENT"),
-                t.Literal("CODE"),
-              ],
-              {
-                description:
-                  "Grant source: NATIVE (built-in tools), RAG (knowledge bases), HTTP (custom tool), MCP (MCP server connection), INTEGRATION (integration instance), DOCUMENT (document template), or CODE (operator-authored code tool).",
-              },
-            ),
-            toolDefinitionId: t.Optional(
-              t.Union([t.String(), t.Null()], {
-                description:
-                  "Tool definition id (BigInt string) for NATIVE or HTTP grants, or null.",
-              }),
-            ),
-            mcpServerConnectionId: t.Optional(
-              t.Union([t.String(), t.Null()], {
-                description:
-                  "MCP server connection id (BigInt string) for MCP grants, or null.",
-              }),
-            ),
-            integrationInstanceId: t.Optional(
-              t.Union([t.String(), t.Null()], {
-                description:
-                  "Integration instance id (BigInt string) for INTEGRATION grants, or null.",
-              }),
-            ),
-            documentTemplateId: t.Optional(
-              t.Union([t.String(), t.Null()], {
-                description:
-                  "Document template id (BigInt string) for DOCUMENT grants, or null.",
-              }),
-            ),
-            codeToolDefinitionId: t.Optional(
-              t.Union([t.String(), t.Null()], {
-                description:
-                  "Code tool id (BigInt string) for CODE grants, or null.",
-              }),
-            ),
-            knowledgeBaseIds: t.Optional(
-              t.Array(t.String(), {
-                description:
-                  "Knowledge-base ids (BigInt strings) for a RAG grant; the bases the agent may search.",
-              }),
-            ),
-            enabledTools: t.Optional(
-              t.Array(t.String(), {
-                description:
-                  "Subset of tool names to enable within the source; omit to enable the source's full set.",
-              }),
-            ),
-          }),
-        ),
+        grants: t.Array(ToolGrantBody),
         expectedUpdatedAt: t.Optional(
           t.String({
             description:

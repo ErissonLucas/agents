@@ -23,11 +23,26 @@ import {
   useModalController,
 } from "@/client/components";
 import { Tooltip } from "@/client/components/Tooltip";
+import { useClientChannelEnabled } from "@/client/contexts/AuthContext";
 import { api } from "@/client/lib/api";
-import { flowLevelLabel, flowStageLabel } from "@/client/lib/flowLabels";
+import {
+  flowLevelLabel,
+  flowStageLabel,
+  guardrailClassifierLabel,
+  guardrailExternalLabel,
+  guardrailGroundingLabel,
+  guardrailObservedLabel,
+  guardrailUncheckedLabel,
+  toolResultSizeLabel,
+} from "@/client/lib/flowLabels";
 import { type LogGroupTitle, logGroupTitle } from "@/client/lib/logGroupTitle";
 import { cn, formatDateTime } from "@/client/lib/utils";
-import { FLOW_LEVELS, FLOW_STAGES } from "@/modules/flowlog/stages";
+import { CLIENT_AUDIENCES } from "@/graph/usage-sources";
+import {
+  FLOW_LEVELS,
+  SELECTABLE_STAGES,
+  selectorOf,
+} from "@/modules/flowlog/stages";
 import { LogsExportModal } from "./LogsExportModal";
 
 // Execution-flow log viewer (TENANT_ADMIN). Rows are grouped by turn into collapsible cards;
@@ -41,7 +56,7 @@ const SEARCH_DEBOUNCE_MS = 300;
 // Shared by the search <input> and the filter <select>s. A fixed height keeps them aligned: native
 // <input> and <select> render at slightly different heights from identical padding alone.
 const selectCls =
-  "h-9 rounded-lg border border-border bg-bg-tertiary px-3 text-sm text-text-primary focus:border-border-focus focus:outline-none";
+  "h-8 rounded-md border border-border-hover bg-bg-tertiary px-2.5 text-sm text-text-primary transition-colors focus:border-border-focus focus:outline-none focus:ring-2 focus:ring-accent-soft";
 const LOG_SKELETON_KEYS = ["lg-0", "lg-1", "lg-2", "lg-3", "lg-4"];
 
 const LEVEL_RANK: Record<string, number> = { info: 0, warn: 1, error: 2 };
@@ -57,7 +72,7 @@ function LevelPill({ level }: { level: string }) {
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded px-1.5 py-0.5 font-medium text-xs",
+        "inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium",
         LEVEL_PILL[level] ?? LEVEL_PILL.info,
       )}
     >
@@ -73,6 +88,8 @@ interface TurnGroup {
   newestAt: string;
   conversationId: string | null;
   threadId: string | null;
+  // A client-channel turn served to an anonymous visitor's session.
+  anonymous: boolean;
 }
 
 function groupByTurn(items: LogItem[]): TurnGroup[] {
@@ -101,9 +118,13 @@ function groupByTurn(items: LogItem[]): TurnGroup[] {
       conversationId:
         rows.find((r) => r.conversationId)?.conversationId ?? null,
       threadId: rows.find((r) => r.threadId)?.threadId ?? null,
+      anonymous: rows.some((r) => r.anonymous),
     };
   });
 }
+
+// The breaker's card, where its lines send the admin to resume, raise the limit or turn it off.
+const PROACTIVE_BREAKER_CARD = "/resources/advanced?section=proactive-breaker";
 
 function StageRow({ row }: { row: LogItem }) {
   const { t, i18n } = useTranslation();
@@ -115,6 +136,13 @@ function StageRow({ row }: { row: LogItem }) {
     row.provider,
     row.model,
     row.durationMs != null ? `${row.durationMs}ms` : null,
+    row.stage === "tool"
+      ? toolResultSizeLabel(
+          (row.detail as Record<string, unknown> | null)?.resultSize,
+          t,
+          i18n.language,
+        )
+      : null,
   ]
     .filter(Boolean)
     .join(" · ");
@@ -123,12 +151,12 @@ function StageRow({ row }: { row: LogItem }) {
       {hasDetail ? (
         expanded ? (
           <ChevronDown
-            className="h-3.5 w-3.5 shrink-0 text-text-muted"
+            className="text-text-muted h-3.5 w-3.5 shrink-0"
             aria-hidden="true"
           />
         ) : (
           <ChevronRight
-            className="h-3.5 w-3.5 shrink-0 text-text-muted"
+            className="text-text-muted h-3.5 w-3.5 shrink-0"
             aria-hidden="true"
           />
         )
@@ -136,40 +164,97 @@ function StageRow({ row }: { row: LogItem }) {
         // Spacer so rows without a detail toggle stay aligned with the ones that have it.
         <span className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
       )}
-      <Badge variant="secondary">{flowStageLabel(row.stage, t)}</Badge>
+      <Badge variant="secondary">
+        {flowStageLabel(
+          selectorOf(row.stage, row.detail as Record<string, unknown> | null),
+          t,
+        )}
+      </Badge>
       {row.level !== "info" && <LevelPill level={row.level} />}
       {row.status && (
         <span className="text-text-muted text-xs">{row.status}</span>
       )}
       {meta && <span className="text-text-muted text-xs">{meta}</span>}
-      <span className="ml-auto text-text-muted text-xs tabular-nums">
+      <span className="text-text-muted ml-auto text-xs tabular-nums">
         {formatDateTime(row.createdAt, i18n.language)}
       </span>
     </div>
   );
-  if (!hasDetail) return <div className="px-3 py-2">{body}</div>;
+  const rowDetail = row.detail as Record<string, unknown> | null;
+  const unchecked = guardrailUncheckedLabel(row.stage, rowDetail, t);
+  const classifier = unchecked
+    ? guardrailClassifierLabel(rowDetail?.classifier, t)
+    : null;
+  // Outside the toggle on purpose: whether the message went on unchecked is the row's headline, not
+  // a detail to expand.
+  const external = guardrailExternalLabel(row.stage, rowDetail, t);
+  const grounding = guardrailGroundingLabel(row.stage, rowDetail, t);
+  const observed = guardrailObservedLabel(row.stage, rowDetail, t);
+  const uncheckedLine = unchecked ? (
+    <p className="text-warning mt-1 pl-5.5 text-xs">
+      {classifier ? `${unchecked} · ${classifier}` : unchecked}
+    </p>
+  ) : grounding ? (
+    <p
+      className={cn("mt-1 pl-5.5 text-xs", {
+        "text-warning": rowDetail?.verdict === "violated",
+        "text-text-muted": rowDetail?.verdict === "clean",
+      })}
+    >
+      {grounding}
+    </p>
+  ) : observed ? (
+    <p className="text-warning mt-1 pl-5.5 text-xs">{observed}</p>
+  ) : (
+    external && (
+      <p
+        className={cn("mt-1 pl-5.5 text-xs", {
+          "text-warning": rowDetail?.decision !== "allow",
+          "text-text-muted": rowDetail?.decision === "allow",
+        })}
+      >
+        {external}
+      </p>
+    )
+  );
+  if (!hasDetail)
+    return (
+      <div className="px-3 py-2">
+        {body}
+        {uncheckedLine}
+      </div>
+    );
   return (
     <div className="px-3 py-2">
       <button
         type="button"
         onClick={() => setExpanded((v) => !v)}
         aria-expanded={expanded}
-        className="w-full select-none text-left"
+        className="w-full text-left select-none"
       >
         {body}
       </button>
+      {uncheckedLine}
       {expanded && (
         <div className="mt-2 flex flex-col gap-2">
           {row.errorMessage && (
-            <p className="rounded-md border border-error/40 bg-error-soft px-2 py-1 text-error text-xs">
+            <p className="border-error/40 bg-error-soft text-error rounded-md border px-2 py-1 text-xs">
               {row.errorMessage}
             </p>
+          )}
+          {row.stage === "proactive_breaker" && (
+            <Link
+              to={PROACTIVE_BREAKER_CARD}
+              className="text-accent self-start text-xs hover:underline"
+            >
+              {t("logs.proactiveBreakerCard", "Resume or change the limit")}
+            </Link>
           )}
           {(() => {
             const detail = row.detail as Record<string, unknown> | null;
             if (!detail || Object.keys(detail).length === 0) return null;
-            // The resolved system prompt (item 15) reads as a wall of escaped JSON in the generic
-            // dump, so surface it as readable text; the remaining keys keep the JSON view.
+            // The resolved system prompt reads as a wall of escaped JSON in the generic dump, so surface
+            // it as readable text; the remaining keys keep the JSON view.
             const sysPrompt =
               typeof detail.systemPrompt === "string"
                 ? detail.systemPrompt
@@ -181,16 +266,16 @@ function StageRow({ row }: { row: LogItem }) {
               <>
                 {sysPrompt && (
                   <div className="flex flex-col gap-1">
-                    <span className="font-medium text-[10px] text-text-muted uppercase tracking-wider">
+                    <span className="text-text-muted text-[10px] font-medium tracking-wider uppercase">
                       {t("logs.systemPrompt", "System prompt")}
                     </span>
-                    <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-bg-tertiary px-2 py-1 text-text-secondary text-xs">
+                    <pre className="bg-bg-tertiary text-text-secondary max-h-72 overflow-auto rounded-md px-2 py-1 text-xs whitespace-pre-wrap">
                       {sysPrompt}
                     </pre>
                   </div>
                 )}
                 {Object.keys(rest).length > 0 && (
-                  <pre className="overflow-auto rounded-md bg-bg-tertiary px-2 py-1 text-text-secondary text-xs">
+                  <pre className="bg-bg-tertiary text-text-secondary overflow-auto rounded-md px-2 py-1 text-xs">
                     {JSON.stringify(rest, null, 2)}
                   </pre>
                 )}
@@ -203,9 +288,9 @@ function StageRow({ row }: { row: LogItem }) {
   );
 }
 
-// The group's name, rendered. `logGroupTitle` decides WHICH of the four it is (issue #357); this
-// only turns that answer into text, so a stage that has no `case` in `flowStageLabel` degrades to
-// its slug here exactly as it does on every row.
+// The group's name, rendered. `logGroupTitle` decides WHICH of the four it is; this only turns that
+// answer into text, so a stage with no `case` in `flowStageLabel` degrades to its slug here exactly
+// as it does on every row.
 function groupTitleText(title: LogGroupTitle, t: TFunction): string {
   switch (title.kind) {
     case "conversation":
@@ -222,8 +307,8 @@ function groupTitleText(title: LogGroupTitle, t: TFunction): string {
 }
 
 // One turn group: a controlled disclosure (chevron inline, no native triangle) plus per-group
-// actions when the turn is tied to a conversation — filter the log list to it (C2) or jump to the
-// conversation (C3). Error groups start expanded.
+// actions when the turn is tied to a conversation: filter the log list to it, or jump to the
+// conversation. Error groups start expanded.
 function TurnGroupCard({
   group,
   onFilterConversation,
@@ -234,33 +319,38 @@ function TurnGroupCard({
   const { t, i18n } = useTranslation();
   const [expanded, setExpanded] = useState(group.worstLevel === "error");
   return (
-    <Card className="!p-0 overflow-hidden">
+    <Card className="overflow-hidden !p-0">
       <div className="flex flex-wrap items-center gap-2 px-3 py-2.5">
         <button
           type="button"
           onClick={() => setExpanded((v) => !v)}
           aria-expanded={expanded}
-          className="flex min-w-0 flex-1 select-none items-center gap-2 text-left"
+          className="flex min-w-0 flex-1 items-center gap-2 text-left select-none"
         >
           {expanded ? (
             <ChevronDown
-              className="h-4 w-4 shrink-0 text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0"
               aria-hidden="true"
             />
           ) : (
             <ChevronRight
-              className="h-4 w-4 shrink-0 text-text-muted"
+              className="text-text-muted h-4 w-4 shrink-0"
               aria-hidden="true"
             />
           )}
           <LevelPill level={group.worstLevel} />
-          <span className="truncate text-sm text-text-secondary">
+          <span className="text-text-secondary truncate text-sm">
             {groupTitleText(logGroupTitle(group), t)}
           </span>
+          {group.anonymous && (
+            <span className="bg-bg-tertiary text-text-muted inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium">
+              {t("logs.anonymousSession", "Anonymous visitor")}
+            </span>
+          )}
           <span className="text-text-muted text-xs">
             {t("logs.steps", "{{count}} steps", { count: group.rows.length })}
           </span>
-          <span className="ml-auto whitespace-nowrap text-text-muted text-xs tabular-nums">
+          <span className="text-text-muted ml-auto text-xs whitespace-nowrap tabular-nums">
             {formatDateTime(group.newestAt, i18n.language)}
           </span>
         </button>
@@ -282,7 +372,7 @@ function TurnGroupCard({
                   "logs.filterConversation",
                   "Filter logs from this conversation",
                 )}
-                className="rounded-md p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary"
+                className="text-text-muted hover:bg-bg-hover hover:text-text-primary rounded-md p-1.5"
               >
                 <Filter className="h-3.5 w-3.5" aria-hidden="true" />
               </button>
@@ -291,7 +381,7 @@ function TurnGroupCard({
               <Link
                 to={`/conversations/${group.conversationId}`}
                 aria-label={t("logs.openConversation", "Open conversation")}
-                className="rounded-md p-1.5 text-text-muted hover:bg-bg-hover hover:text-text-primary"
+                className="text-text-muted hover:bg-bg-hover hover:text-text-primary rounded-md p-1.5"
               >
                 <MessageSquare className="h-3.5 w-3.5" aria-hidden="true" />
               </Link>
@@ -300,7 +390,7 @@ function TurnGroupCard({
         )}
       </div>
       {expanded && (
-        <div className="divide-y divide-border border-border border-t">
+        <div className="divide-border border-border divide-y border-t">
           {group.rows.map((r) => (
             <StageRow key={r.id} row={r} />
           ))}
@@ -311,16 +401,39 @@ function TurnGroupCard({
 }
 
 export function LogsPage() {
+  const clientChannelEnabled = useClientChannelEnabled();
   const { t } = useTranslation();
   const [searchParams, setSearchParams] = useSearchParams();
 
   const stage = searchParams.get("stage") ?? "";
   const level = searchParams.get("level") ?? "";
-  const source = searchParams.get("source") ?? "inbox";
+  // A saved `source=client` link on an install with the channel off reads as the default, so the
+  // filter shown and the rows asked for stay the same thing.
+  const askedSource = searchParams.get("source") ?? "inbox";
+  const source =
+    askedSource === "client" && !clientChannelEnabled ? "inbox" : askedSource;
+  // Who the client channel served, only under that source: an `audience` left in a link that no longer
+  // filters the client channel is not sent.
+  const askedAudience = searchParams.get("audience") ?? "";
+  const audience =
+    source === "client" &&
+    (CLIENT_AUDIENCES as readonly string[]).includes(askedAudience)
+      ? askedAudience
+      : "";
   const q = searchParams.get("q") ?? "";
   // Deep-link filters (set by "view this conversation's logs"): scope to one conversation or turn.
   const conversationId = searchParams.get("conversationId") ?? "";
   const turnId = searchParams.get("turnId") ?? "";
+  // Deep-link filters set by the dashboard's health block: its window, agent, inbox and one tool.
+  const since = searchParams.get("since") ?? "";
+  const until = searchParams.get("until") ?? "";
+  const agentId = searchParams.get("agentId") ?? "";
+  const inboxId = searchParams.get("inboxId") ?? "";
+  const tool = searchParams.get("tool") ?? "";
+  const noTool = searchParams.get("noTool") === "true";
+  const fromDashboard = Boolean(
+    since || until || agentId || inboxId || tool || noTool,
+  );
 
   const exportModal = useModalController();
 
@@ -354,7 +467,21 @@ export function LogsPage() {
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset on filter change only
   useEffect(() => {
     setCursorStack([null]);
-  }, [stage, level, source, q, conversationId, turnId]);
+  }, [
+    stage,
+    level,
+    source,
+    audience,
+    q,
+    conversationId,
+    turnId,
+    since,
+    until,
+    agentId,
+    inboxId,
+    tool,
+    noTool,
+  ]);
 
   const setFilter = (key: string, value: string) => {
     setSearchParams(
@@ -375,11 +502,18 @@ export function LogsPage() {
     setError(false);
     try {
       const query: Record<string, string> = { source };
+      if (audience) query.audience = audience;
       if (stage) query.stage = stage;
       if (level) query.level = level;
       if (q) query.search = q;
       if (conversationId) query.conversationId = conversationId;
       if (turnId) query.turnId = turnId;
+      if (since) query.since = since;
+      if (until) query.until = until;
+      if (agentId) query.agentId = agentId;
+      if (inboxId) query.inboxId = inboxId;
+      if (tool) query.tool = tool;
+      if (noTool) query.noTool = "true";
       if (cursor) query.cursor = cursor;
       const { data, error: err } = await api.api.v1.logs.get({ query });
       if (err || !data) {
@@ -393,21 +527,31 @@ export function LogsPage() {
     } finally {
       setLoading(false);
     }
-  }, [stage, level, source, q, conversationId, turnId, cursor]);
+  }, [
+    stage,
+    level,
+    source,
+    audience,
+    q,
+    conversationId,
+    turnId,
+    since,
+    until,
+    agentId,
+    inboxId,
+    tool,
+    noTool,
+    cursor,
+  ]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   const groups = useMemo(() => groupByTurn(items), [items]);
-  // The chip that says what the page is scoped to, when the scope is a `turnId`. It names the group
-  // exactly as the group's own card names it (`logGroupTitle`, issue #357) and adds the id, which is
-  // the thing the chip exists to point at — before issue #374 it said "Turn <id>" whatever the rows
-  // were, so one screen carried two different answers about one group.
-  //
-  // Matched by id rather than taken as the first group: the rows in state still belong to the
-  // PREVIOUS filter for the render between a URL change and its response landing, and naming this id
-  // with that group's answer is the same class of lie in a shorter window. No match is the id alone.
+  // The scope chip for a `turnId` names the group exactly as its own card does
+  // (`logGroupTitle`) and adds the id. Matched by id rather than taken as the first group: between a
+  // URL change and its response the rows still belong to the PREVIOUS filter. No match is the id alone.
   const scopedTurnLabel = useMemo(() => {
     const scoped = groups.find((g) => g.turnId === turnId);
     if (!scoped) return turnId;
@@ -418,24 +562,41 @@ export function LogsPage() {
   // The active filters, keyed to the export endpoint's query params (the server bounds + serializes).
   const exportFilters = useMemo(() => {
     const f: Record<string, string> = { source };
+    if (audience) f.audience = audience;
     if (stage) f.stage = stage;
     if (level) f.level = level;
     if (q) f.search = q;
     if (conversationId) f.conversationId = conversationId;
     if (turnId) f.turnId = turnId;
+    if (agentId) f.agentId = agentId;
+    if (inboxId) f.inboxId = inboxId;
+    if (tool) f.tool = tool;
+    if (noTool) f.noTool = "true";
     return f;
-  }, [source, stage, level, q, conversationId, turnId]);
+  }, [
+    source,
+    audience,
+    stage,
+    level,
+    q,
+    conversationId,
+    turnId,
+    agentId,
+    inboxId,
+    tool,
+    noTool,
+  ]);
 
   return (
     <PageContainer size="wide" className="space-y-6">
       <header className="flex flex-wrap items-start justify-between gap-4">
         <div className="flex items-center gap-3">
-          <ScrollText className="h-6 w-6 text-accent" aria-hidden="true" />
+          <ScrollText className="text-accent h-6 w-6" aria-hidden="true" />
           <div>
-            <h1 className="font-bold text-2xl text-text-primary">
+            <h1 className="text-text-primary text-2xl font-bold">
               {t("logs.title", "Logs")}
             </h1>
-            <p className="mt-1 text-sm text-text-secondary">
+            <p className="text-text-secondary mt-1 text-sm">
               {t(
                 "logs.subtitle",
                 "Per-step execution flow for each agent turn: transcription, generation, audio, delivery and handoffs.",
@@ -458,7 +619,7 @@ export function LogsPage() {
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative min-w-56 flex-1">
           <Search
-            className="absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-text-muted"
+            className="text-text-muted absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2"
             aria-hidden="true"
           />
           <input
@@ -476,7 +637,7 @@ export function LogsPage() {
           aria-label={t("logs.filterStage", "Stage")}
         >
           <option value="">{t("logs.allStages", "All stages")}</option>
-          {FLOW_STAGES.map((s) => (
+          {SELECTABLE_STAGES.map((s) => (
             <option key={s} value={s}>
               {flowStageLabel(s, t)}
             </option>
@@ -505,13 +666,86 @@ export function LogsPage() {
           <option value="playground">
             {t("logs.source.playground", "Playground")}
           </option>
+          {clientChannelEnabled && (
+            <option value="client">
+              {t("logs.source.client", "Client channel")}
+            </option>
+          )}
           <option value="all">{t("logs.source.all", "All")}</option>
         </select>
+        {source === "client" && (
+          <select
+            className={selectCls}
+            value={audience}
+            onChange={(e) => setFilter("audience", e.target.value)}
+            aria-label={t("logs.filterAudience", "Audience")}
+          >
+            <option value="">{t("logs.audience.all", "All users")}</option>
+            <option value="identified">
+              {t("logs.audience.identified", "Signed-in users")}
+            </option>
+            <option value="anonymous">
+              {t("logs.audience.anonymous", "Anonymous visitors")}
+            </option>
+          </select>
+        )}
       </div>
+
+      {fromDashboard && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="border-border bg-bg-tertiary text-text-secondary inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs">
+            {tool
+              ? t(
+                  "logs.scopedFromDashboardTool",
+                  "From the dashboard: {{tool}}",
+                  {
+                    tool,
+                  },
+                )
+              : noTool
+                ? t(
+                    "logs.scopedFromDashboardNoTool",
+                    "From the dashboard: lines that name no tool",
+                  )
+                : t("logs.scopedFromDashboard", "From the dashboard")}
+            {since && until
+              ? ` · ${t("logs.scopedRange", "{{from}} to {{to}}", {
+                  from: new Date(since).toLocaleDateString(),
+                  to: new Date(until).toLocaleDateString(),
+                })}`
+              : ""}
+            <button
+              type="button"
+              onClick={() =>
+                setSearchParams(
+                  (prev) => {
+                    const next = new URLSearchParams(prev);
+                    for (const k of [
+                      "since",
+                      "until",
+                      "agentId",
+                      "inboxId",
+                      "tool",
+                      "noTool",
+                    ])
+                      next.delete(k);
+                    return next;
+                  },
+                  { replace: true },
+                )
+              }
+              aria-label={t("logs.clearScope", "Clear filter")}
+              className="text-text-muted hover:text-text-primary"
+            >
+              <X className="h-3.5 w-3.5" aria-hidden="true" />
+            </button>
+          </span>
+        </div>
+      )}
 
       {(conversationId || turnId) && (
         <div className="flex flex-wrap items-center gap-2">
-          <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-bg-tertiary px-2.5 py-1 text-text-secondary text-xs">
+          <span className="border-border bg-bg-tertiary text-text-secondary inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs">
             {conversationId
               ? t("logs.scopedConversation", "Conversation #{{id}}", {
                   id: conversationId,
@@ -614,7 +848,11 @@ export function LogsPage() {
         </div>
       )}
 
-      <LogsExportModal modal={exportModal} filters={exportFilters} />
+      <LogsExportModal
+        modal={exportModal}
+        filters={exportFilters}
+        range={since || until ? { since, until } : undefined}
+      />
     </PageContainer>
   );
 }

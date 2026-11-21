@@ -408,7 +408,7 @@ export async function createRyzeLabel(
       "title",
     );
   }
-  // NOTE: the row goes in before the WhatsApp call, so the `label.update` echo of our own create
+  // The row goes in before the WhatsApp call, so the `label.update` echo of our own create
   // finds it by name and lends it the id instead of importing it as a label made on the phone.
   let row = await runScopedOn(base, ctx, (db) =>
     db.ryzeLabel.create({
@@ -612,7 +612,7 @@ async function syncNow(
         await ryze.assignTag(number, row.tagId);
       } catch (err) {
         if (!(err instanceof RyzeApiError && err.status === 404)) throw err;
-        // NOTE: the tag is gone from WhatsApp (deleted on the phone while we missed the event):
+        // The tag is gone from WhatsApp (deleted on the phone while we missed the event):
         // recreate it once under the same name and assign that one.
         const cleared = await forgetTagId(fresh, row, base);
         row = await ensureTagged(fresh, cleared.title, ryze, base);

@@ -1,12 +1,18 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
+import config from "@/config";
 import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
 import { instanceIdentity } from "@/lib/instance";
 import type { TenantContext } from "@/lib/tenancy";
 import { listCredentialCalendars } from "@/modules/integrations/google-calendar.service";
 import { listCredentialDriveFolders } from "@/modules/integrations/google-drive.service";
+import {
+  listCredentialSpreadsheets,
+  listSpreadsheetTabs,
+} from "@/modules/integrations/google-sheets.service";
+import { integrationInboundUrl } from "@/modules/integrations/inbound-url";
 import {
   createIntegrationInstance,
   deleteIntegrationInstance,
@@ -17,27 +23,43 @@ import {
   updateIntegrationInstance,
 } from "@/modules/integrations/service";
 import { getToolpackToolViews } from "@/modules/integrations/toolpacks";
+import {
+  TEST_BODY_MAX_CHARS,
+  TEST_RECEPTION_PER_MINUTE,
+  testReception,
+} from "@/modules/webhooks/inbound/test-reception";
 
-// The error catalog this controller's routes answer with. `bun i18n:extract` materialises
-// src/api/locales/*.json from these lines and prunes anything nothing references, and
-// `ErrorTranslationKey` (src/lib/errors.ts) makes a key that is missing here a type error at the
-// throw site rather than an English sentence on a pt-BR caller's screen.
-//
-// NOTE: `errors.badRequest`, `errors.notFound` and `errors.upstream` were here and are gone on
-// purpose. One generic sentence per HTTP class read as an answer and was not one: the four sites
-// behind `badRequest` said two different things ("not a connected Google account" / "invalid
-// credential reference") and the Drive 403 behind `upstream` carried the ONLY instruction that
-// resolves it, naming which OAuth scope to reconnect with. Registering the generic key made the
-// catalog win over `AppError.message` in `refusalBody`, so those sentences stopped reaching anyone,
-// in English too. Each fact now has its own key, and the ones that vary carry params.
+// The inbound URL to show next to a route token, from PUBLIC_URL (see inbound-url.ts).
+function inboundUrlOf(routeToken: string | null): string | null {
+  return routeToken
+    ? integrationInboundUrl(config.publicUrl, routeToken)
+    : null;
+}
+
+// The error catalog this controller's routes answer with (`bun i18n:extract` reads these lines).
+// One key per fact, never one generic key per HTTP class: a registered key wins over
+// `AppError.message` in `refusalBody`, so a generic one hides the specific sentence (the Drive 403's
+// is the only one that names the OAuth scope to reconnect with).
+// translate('errors.googleApiDisabled', 'The {{api}} API is turned off in the Google Cloud project of this credential\'s OAuth client. Enable it in that project and try again: {{url}}')
 // translate('errors.googleCredentialNotConnected', 'This credential is not a connected Google account.')
 // translate('errors.googleCredentialNotFound', 'The credential this integration needs was not found.')
 // translate('errors.googleDriveScopeDenied', "Google Drive denied the request. Reconnect the credential granting the 'Drive (read-only)' or 'Drive (full access)' scope; 'Drive (app files)' cannot list existing folders.")
+// translate('errors.googleSheetsListScopeDenied', "Google Drive denied the spreadsheet list. Reconnect the credential with the 'Drive (read-only)' scope, or paste the spreadsheet's URL instead.")
+// translate('errors.googleSheetsScopeDenied', "Google Sheets denied the request. Reconnect the credential granting the 'Google Sheets' scope, with an account that can open this spreadsheet.")
+// translate('errors.googleSpreadsheetIdInvalid', 'That is not a spreadsheet id. Paste the spreadsheet URL or the id between /d/ and /edit.')
+// translate('errors.googleSpreadsheetNotFound', 'Spreadsheet not found, or the connected Google account cannot open it.')
 // translate('errors.integrationHeaderNameUnusable', 'The "{{field}}" value is not a usable header name: use only letters, digits and !#$%&\'*+-.^_`|~ (no spaces or line breaks).')
 // translate('errors.integrationHttpError', '{{provider}} returned HTTP {{status}}.')
 // translate('errors.integrationInboundAuthRequired', 'This integration makes the agent message customers, so its webhook needs authentication: choose a static header or an HMAC signature.')
 // translate('errors.integrationInstanceNotFound', 'Integration instance not found.')
 // translate('errors.integrationInstructionsUnusable', 'The operator guidance ("{{field}}") must be text of at most 2000 characters, with no character that cannot be stored.')
+// translate('errors.integrationFetchBackUnusable', 'The notification lookup cannot be used ("{{field}}"): {{problem}}.')
+// translate('errors.integrationTestReceptionDisabled', 'The integration is disabled, so a real delivery would be refused: enable it, or test with the dry run.')
+// translate('errors.integrationTestReceptionRateLimited', 'At most {{limit}} test receptions a minute. Wait a moment and try again.')
+// translate('errors.integrationSignatureUnusable', 'The signature setting "{{field}}" cannot be used: {{problem}}.')
+// translate('errors.integrationConfigOutOfRange', '"{{field}}" must be between {{min}} and {{max}}.')
+// translate('errors.integrationSheetsConfigInvalid', '"{{field}}" must be the spreadsheet id or the numeric tab id, not a URL or a tab name. Pick the spreadsheet and the tab again in the integration settings.')
+// translate('errors.integrationSheetsConfigMissing', '"{{field}}" is missing. Choose the spreadsheet and the tab in the integration settings.')
 // translate('errors.integrationNoInboundWebhook', 'The {{integration}} integration has no inbound webhook.')
 // translate('errors.invalidCredentialRef', 'The credential reference is not valid.')
 
@@ -135,6 +157,61 @@ export const integrationsAdminController = new Elysia({
     },
   )
   .get(
+    "/google/spreadsheets",
+    async ({ tenantContext, query }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const spreadsheets = await listCredentialSpreadsheets(
+        ctx,
+        query.credentialRef,
+      );
+      return { instance: instanceIdentity, spreadsheets };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "List Google spreadsheets for a credential",
+        "Lists the spreadsheets a connected google_oauth credential can see through Drive (needs a Drive read scope), so the operator can pick the one the Sheets integration works on. Read-only against Google.",
+      ),
+      query: t.Object({
+        credentialRef: t.String({
+          description:
+            "Vault reference (vault:<id>) of a connected google_oauth credential.",
+        }),
+      }),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .get(
+    "/google/spreadsheet-tabs",
+    async ({ tenantContext, query }) => {
+      const ctx = ctxOrThrow(tenantContext);
+      const { title, tabs } = await listSpreadsheetTabs(
+        ctx,
+        query.credentialRef,
+        query.spreadsheetId,
+      );
+      return { instance: instanceIdentity, title, tabs };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "List a spreadsheet's tabs for a credential",
+        "Lists the tabs of one spreadsheet, each with its numeric sheetId and the column names in its header row, so the operator can pick the tab the Sheets integration works on. Read-only against Google.",
+      ),
+      query: t.Object({
+        credentialRef: t.String({
+          description:
+            "Vault reference (vault:<id>) of a connected google_oauth credential.",
+        }),
+        spreadsheetId: t.String({
+          description:
+            "The spreadsheet id (the part of its URL between /d/ and /edit).",
+        }),
+      }),
+      response: errors(400, 401, 403, 404, 422),
+    },
+  )
+  .get(
     "/instances",
     async ({ tenantContext }) => ({
       instance: instanceIdentity,
@@ -152,22 +229,26 @@ export const integrationsAdminController = new Elysia({
   .get(
     "/instances/:id",
     async ({ tenantContext, params, set }) => {
-      // NOTE: no-store — this is the ONE read that returns the decrypted routeToken, and nothing
+      // NOTE: no-store: this is the ONE read that returns the decrypted routeToken, and nothing
       // global sets the header. Keeps the webhook URL out of the browser's disk cache.
       set.headers["cache-control"] = "no-store";
+      const integration = await getIntegrationInstance(
+        ctxOrThrow(tenantContext),
+        requireDbId(params.id),
+      );
       return {
         instance: instanceIdentity,
-        integration: await getIntegrationInstance(
-          ctxOrThrow(tenantContext),
-          requireDbId(params.id),
-        ),
+        integration: {
+          ...integration,
+          inboundUrl: inboundUrlOf(integration.routeToken),
+        },
       };
     },
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Get integration instance",
-        "Fetches a single integration instance by id, including its inbound routeToken (null when the entry has no inbound surface, or when the instance predates token storage — rotate to mint a readable one).",
+        "Fetches a single integration instance by id, including its inbound routeToken and inboundUrl, the full webhook URL built from PUBLIC_URL (both null when the entry has no inbound surface, or when the instance predates token storage — rotate to mint a readable one).",
       ),
       params: t.Object({
         id: t.String({
@@ -195,16 +276,16 @@ export const integrationsAdminController = new Elysia({
       return {
         instance: instanceIdentity,
         id: String(created.id),
-        // NOTE: Paste into the upstream provider. Also readable later via GET /instances/:id, so
-        // losing this response is no longer a dead end.
+        // NOTE: pasted into the upstream provider; also readable later via GET /instances/:id.
         routeToken: created.routeToken,
+        inboundUrl: inboundUrlOf(created.routeToken),
       };
     },
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Create integration instance",
-        "Creates an integration instance and returns its id plus the opaque routeToken for the inbound webhook URL. The token stays readable afterwards via GET /instances/:id.",
+        "Creates an integration instance and returns its id plus the opaque routeToken and inboundUrl, the full inbound webhook URL built from PUBLIC_URL. The token stays readable afterwards via GET /instances/:id.",
       ),
       body: t.Object({
         catalogType: t.String({
@@ -306,23 +387,27 @@ export const integrationsAdminController = new Elysia({
       response: errors(400, 401, 403, 404, 422),
     },
   )
-  // NOTE: Rotation is a POST because it MUTATES: the old URL stops resolving the moment it commits.
-  // It exists for the two cases the stored token cannot cover — an instance created before the
-  // token was persisted (hash only), and a URL that leaked.
+  // Rotation is a POST because it MUTATES: the old URL stops resolving the moment it commits.
+  // It exists for the two cases the stored token cannot cover: an instance whose token is stored as
+  // a hash only, and a URL that leaked.
   .post(
     "/instances/:id/route-token",
-    async ({ tenantContext, params }) => ({
-      instance: instanceIdentity,
-      ...(await rotateIntegrationRouteToken(
+    async ({ tenantContext, params }) => {
+      const { routeToken } = await rotateIntegrationRouteToken(
         ctxOrThrow(tenantContext),
         requireDbId(params.id),
-      )),
-    }),
+      );
+      return {
+        instance: instanceIdentity,
+        routeToken,
+        inboundUrl: integrationInboundUrl(config.publicUrl, routeToken),
+      };
+    },
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Rotate inbound route token",
-        "Mints a new inbound webhook token for the instance and returns it. The previous URL stops working immediately, so the provider's dashboard must be updated.",
+        "Mints a new inbound webhook token for the instance and returns it with inboundUrl, the full webhook URL built from PUBLIC_URL. The previous URL stops working immediately, so the provider's dashboard must be updated.",
       ),
       params: t.Object({
         id: t.String({
@@ -331,6 +416,65 @@ export const integrationsAdminController = new Elysia({
         }),
       }),
       response: errors(400, 401, 403, 404),
+    },
+  )
+  // A POST because the non-dry run writes like a real delivery; the dry run (the default) writes
+  // nothing, the provider lookup included only as the read it is.
+  .post(
+    "/instances/:id/test-reception",
+    async ({ tenantContext, params, body, request, server }) => {
+      // A real test runs the lookup and the agent turn inline, which can outlast the server's idle
+      // timeout (the webhook route's dispatch allows minutes); the operator waits for its stages.
+      server?.timeout(request, 0);
+      return {
+        instance: instanceIdentity,
+        ...(await testReception(
+          ctxOrThrow(tenantContext),
+          requireDbId(params.id),
+          body,
+        )),
+      };
+    },
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Test inbound reception",
+        `Runs a pasted sample notification (raw body, optional headers and query string) through this instance's inbound path and returns each stage: signature (header read, signed message, verdict in the receptor's reason vocabulary), mapping, the lookup tool when the instance has one, correlation, and what would be recorded. \`dryRun\` (default true) writes nothing; false delivers the event as a real notification would. Never returns the secret. At most ${TEST_RECEPTION_PER_MINUTE} a minute per workspace.`,
+      ),
+      params: t.Object({
+        id: t.String({
+          description:
+            "Integration instance id (BigInt serialized as a string).",
+        }),
+      }),
+      body: t.Object({
+        body: t.String({
+          maxLength: TEST_BODY_MAX_CHARS,
+          description:
+            "The notification's raw body, exactly as the provider sends it.",
+        }),
+        headers: t.Optional(
+          t.Record(
+            t.String({ maxLength: 128 }),
+            t.String({ maxLength: 8192 }),
+            {
+              maxProperties: 50,
+              description: "Request headers, by name.",
+            },
+          ),
+        ),
+        query: t.Optional(
+          t.String({
+            maxLength: 8192,
+            description:
+              "The webhook URL's query string, e.g. data.id=123&type=payment.",
+          }),
+        ),
+        dryRun: t.Optional(
+          t.Boolean({ description: "Default true: nothing is written." }),
+        ),
+      }),
+      response: errors(400, 401, 403, 404, 409, 422, 429),
     },
   )
   .delete(

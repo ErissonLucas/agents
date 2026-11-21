@@ -1,0 +1,291 @@
+import { describe, expect, test } from "bun:test";
+import {
+  assertSettingsClosedValues,
+  assertSettingsReviseToolCalls,
+  InvalidSettingsValueError,
+} from "@/modules/agents/service";
+import { BEHAVIOR_PATCH_SHAPE } from "@/modules/agents/settings-schema";
+import {
+  GUARDRAILS_DEFAULTS,
+  readGuardrailsConfig,
+  resolveGroundingReviewer,
+} from "@/modules/guardrails/settings";
+
+// `guardrails.factualGrounding` as stored, read and written: off and observing by default, the
+// reviewer falling back to the guardrails model, and the write boundary refusing an unknown action.
+
+describe("reading it", () => {
+  test("an agent saved before the check exists reads it off, observing, with no sources", () => {
+    const fg = readGuardrailsConfig({
+      guardrails: { enabled: true },
+    }).factualGrounding;
+    expect(fg).toEqual(GUARDRAILS_DEFAULTS.factualGrounding);
+    expect(fg.enabled).toBe(false);
+    expect(fg.action).toBe("observe");
+  });
+
+  test("source names are trimmed and deduplicated, and junk is dropped", () => {
+    const fg = readGuardrailsConfig({
+      guardrails: {
+        factualGrounding: {
+          sourceTools: [" catalogo ", "catalogo", 3, "", "search_knowledge"],
+          action: "corrigir",
+          contextMessages: 99,
+        },
+      },
+    }).factualGrounding;
+    expect(fg.sourceTools).toEqual(["catalogo", "search_knowledge"]);
+    expect(fg.action).toBe("observe");
+    expect(fg.contextMessages).toBe(40);
+  });
+
+  test("an agent that never set the window reads 24 messages, and a stored value is kept", () => {
+    const read = (factualGrounding: Record<string, unknown>) =>
+      readGuardrailsConfig({ guardrails: { factualGrounding } })
+        .factualGrounding.contextMessages;
+    expect([
+      read({}),
+      read({ contextMessages: 6 }),
+      read({ contextMessages: 0 }),
+    ]).toEqual([24, 6, 0]);
+  });
+
+  test("the rewrite consults the sources by default, three calls at most, and a stored cap is clamped", () => {
+    const d = readGuardrailsConfig({}).factualGrounding;
+    expect([d.reviseWithTools, d.reviseMaxToolCalls]).toEqual([true, 3]);
+    const fg = readGuardrailsConfig({
+      guardrails: {
+        factualGrounding: { reviseWithTools: false, reviseMaxToolCalls: 400 },
+      },
+    }).factualGrounding;
+    expect([fg.reviseWithTools, fg.reviseMaxToolCalls]).toEqual([false, 50]);
+    expect(
+      readGuardrailsConfig({
+        guardrails: { factualGrounding: { reviseWithTools: "sim" } },
+      }).factualGrounding.reviseWithTools,
+    ).toBe(true);
+  });
+});
+
+// The reviewer as an override of the guardrails chat model, through the same resolver as every other
+// own-model field: the bug each case catches is a key or a model landing where it was not picked for.
+describe("resolving the reviewer", () => {
+  const KEYS = {
+    ownKey: "sk-own",
+    ownBaseUrl: null,
+    parentKey: "sk-guardrails",
+    parentBaseUrl: null,
+  };
+  const guard = (factualGrounding: Record<string, unknown>) =>
+    readGuardrailsConfig({
+      guardrails: {
+        provider: "openai",
+        model: "m-guard",
+        credentialRef: "vault:1",
+        factualGrounding,
+      },
+    });
+
+  test("nothing set runs on the guardrails model and its key", () => {
+    expect(resolveGroundingReviewer(guard({}), KEYS)).toEqual({
+      runnable: true,
+      provider: "openai",
+      model: "m-guard",
+      baseURL: null,
+      apiKey: "sk-guardrails",
+    });
+  });
+
+  test("a model of its own on the same provider keeps the guardrails key", () => {
+    expect(
+      resolveGroundingReviewer(
+        guard({ provider: "openai", model: "m-review" }),
+        KEYS,
+      ),
+    ).toMatchObject({
+      runnable: true,
+      model: "m-review",
+      apiKey: "sk-guardrails",
+    });
+  });
+
+  // The bug it catches: a guardrails model on a keyless OpenAI-compatible endpoint refused as a
+  // missing key for the reviewer that inherits it, so no reply was reviewed.
+  test("inheriting a keyless compatible guardrails model runs keyless, a configured key that did not resolve does not", () => {
+    const keyless = readGuardrailsConfig({
+      guardrails: {
+        provider: "openai-compatible",
+        model: "m-local",
+        baseURL: "http://modelo.local/v1",
+        factualGrounding: {},
+      },
+    });
+    const noKeys = { ...KEYS, ownKey: "", parentKey: "" };
+    expect([
+      resolveGroundingReviewer(keyless, noKeys),
+      resolveGroundingReviewer(guard({}), noKeys),
+    ]).toEqual([
+      {
+        runnable: true,
+        provider: "openai-compatible",
+        model: "m-local",
+        baseURL: "http://modelo.local/v1",
+        apiKey: "",
+      },
+      {
+        runnable: false,
+        reason: "credential_not_found",
+        provider: "openai",
+        model: "m-guard",
+      },
+    ]);
+  });
+
+  test("a model or a key stored with no provider is refused, as every override refuses it", () => {
+    for (const fg of [{ model: "m-orphan" }, { credentialRef: "vault:9" }])
+      expect(resolveGroundingReviewer(guard(fg), KEYS)).toMatchObject({
+        runnable: false,
+        reason: "override_without_provider",
+      });
+  });
+
+  test("another provider runs on its own key, and without one it is refused, never on the guardrails key", () => {
+    expect(
+      resolveGroundingReviewer(
+        guard({ provider: "anthropic", credentialRef: "vault:9" }),
+        KEYS,
+      ),
+    ).toMatchObject({
+      runnable: true,
+      provider: "anthropic",
+      apiKey: "sk-own",
+    });
+    expect(
+      resolveGroundingReviewer(guard({ provider: "anthropic" }), KEYS),
+    ).toMatchObject({ runnable: false, reason: "credential_required" });
+    expect(
+      resolveGroundingReviewer(
+        guard({ provider: "anthropic", credentialRef: "vault:9" }),
+        { ...KEYS, ownKey: "" },
+      ),
+    ).toMatchObject({ runnable: false, reason: "credential_not_found" });
+  });
+
+  test("a keyless compatible endpoint runs on no key at all", () => {
+    expect(
+      resolveGroundingReviewer(
+        guard({
+          provider: "openai-compatible",
+          model: "m-local",
+          baseURL: "http://revisor.local/v1",
+        }),
+        KEYS,
+      ),
+    ).toEqual({
+      runnable: true,
+      provider: "openai-compatible",
+      model: "m-local",
+      baseURL: "http://revisor.local/v1",
+      apiKey: "",
+    });
+  });
+});
+
+describe("writing it", () => {
+  const schema = BEHAVIOR_PATCH_SHAPE.guardrails;
+  test("the four actions are accepted and anything else is refused", () => {
+    for (const action of ["observe", "revise", "template", "handoff"])
+      expect(schema.safeParse({ factualGrounding: { action } }).success).toBe(
+        true,
+      );
+    for (const action of ["corrigir", "generated", "silent"])
+      expect(schema.safeParse({ factualGrounding: { action } }).success).toBe(
+        false,
+      );
+  });
+
+  test("the reviewer's window takes up to 40 messages, while the input check's stays at 20", () => {
+    const ok = (g: Record<string, unknown>) => schema.safeParse(g).success;
+    expect([
+      ok({ factualGrounding: { contextMessages: 24 } }),
+      ok({ factualGrounding: { contextMessages: 40 } }),
+      ok({ factualGrounding: { contextMessages: 41 } }),
+      ok({ input: { contextMessages: 20 } }),
+      ok({ input: { contextMessages: 21 } }),
+    ]).toEqual([true, true, false, true, false]);
+  });
+
+  test("an out-of-range window is refused, not clamped", () => {
+    expect(
+      schema.safeParse({ factualGrounding: { contextMessages: -1 } }).success,
+    ).toBe(false);
+    expect(() =>
+      assertSettingsClosedValues(
+        { guardrails: { factualGrounding: { action: "revise" } } },
+        {},
+      ),
+    ).not.toThrow();
+  });
+
+  test("the rewrite's cap is refused outside the turn limit's range, and the switch only as a boolean", () => {
+    for (const reviseMaxToolCalls of [0, 51, 1000, -1, 2.5])
+      expect(
+        schema.safeParse({ factualGrounding: { reviseMaxToolCalls } }).success,
+      ).toBe(false);
+    for (const reviseMaxToolCalls of [1, 3, 6, 50])
+      expect(
+        schema.safeParse({ factualGrounding: { reviseMaxToolCalls } }).success,
+      ).toBe(true);
+    expect(
+      schema.safeParse({ factualGrounding: { reviseWithTools: "sim" } })
+        .success,
+    ).toBe(false);
+    expect(
+      schema.safeParse({ factualGrounding: { reviseWithTools: false } })
+        .success,
+    ).toBe(true);
+  });
+
+  // The bug it catches: a cap above the agent's own turn limit saved, which the schema alone cannot
+  // see because the limit lives in another block; or a fixed ceiling refusing a cap the limit allows.
+  test("the rewrite's cap stops at the agent's limits.maxToolCalls: under 8, 8 is accepted and 9 refused", () => {
+    const bag = (reviseMaxToolCalls: number) => ({
+      limits: { maxToolCalls: 8 },
+      guardrails: {
+        factualGrounding: { action: "revise", reviseMaxToolCalls },
+      },
+    });
+    expect(() => assertSettingsReviseToolCalls(bag(8), {})).not.toThrow();
+    let refusal: unknown;
+    try {
+      assertSettingsReviseToolCalls(bag(9), {});
+    } catch (e) {
+      refusal = e;
+    }
+    expect(refusal).toBeInstanceOf(InvalidSettingsValueError);
+    expect((refusal as InvalidSettingsValueError).statusCode).toBe(422);
+    expect((refusal as Error).message).toContain(
+      "guardrails.factualGrounding.reviseMaxToolCalls expects a number of at most 8",
+    );
+    // Without a limits block the agent runs on the default turn limit, 10.
+    expect(() =>
+      assertSettingsReviseToolCalls(
+        { guardrails: { factualGrounding: { reviseMaxToolCalls: 11 } } },
+        {},
+      ),
+    ).toThrow(InvalidSettingsValueError);
+    // A stored cap the write does not change is not judged again: lowering the limit later saves.
+    expect(() => assertSettingsReviseToolCalls(bag(9), bag(9))).not.toThrow();
+    // The console writes the default 3 back on every Guardrails save: under a turn limit of 2 with no
+    // stored cap, that save goes through, and a cap of 4 does not.
+    const low = (n: number) => ({
+      limits: { maxToolCalls: 2 },
+      guardrails: { factualGrounding: { reviseMaxToolCalls: n } },
+    });
+    const stored = { limits: { maxToolCalls: 2 } };
+    expect(() => assertSettingsReviseToolCalls(low(3), stored)).not.toThrow();
+    expect(() => assertSettingsReviseToolCalls(low(4), stored)).toThrow(
+      InvalidSettingsValueError,
+    );
+  });
+});

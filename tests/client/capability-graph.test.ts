@@ -13,8 +13,12 @@ import type { GrantState, ToolCatalog } from "@/client/pages/agents/types";
 // the number of groups, not the number of tools. Large groups collapse to a "+N…" overflow node.
 describe("toMermaid — agent graph (LangGraph)", () => {
   const groups: MapGroup[] = [
-    { key: "native", label: "Built-in", items: ["Transfer", "Tag"] },
-    { key: "http", label: "Custom HTTP", items: ["Look up order"] },
+    {
+      key: "native",
+      label: "Built-in",
+      items: [{ label: "Transfer" }, { label: "Tag" }],
+    },
+    { key: "http", label: "Custom HTTP", items: [{ label: "Look up order" }] },
   ];
 
   test("emits a vertical (TB) flowchart with the LangGraph spine", () => {
@@ -50,7 +54,9 @@ describe("toMermaid — agent graph (LangGraph)", () => {
   });
 
   test("caps a large group with a '+N…' overflow node", () => {
-    const many = Array.from({ length: 20 }, (_, i) => `Tool ${i + 1}`);
+    const many = Array.from({ length: 20 }, (_, i) => ({
+      label: `Tool ${i + 1}`,
+    }));
     const m = toMermaid([{ key: "native", label: "Built-in", items: many }]);
     // 20 items, cap 12 → 8 hidden behind the overflow marker.
     expect(m).toContain('"+8…"');
@@ -123,45 +129,42 @@ describe("buildGroups — every grant source is drawn", () => {
   };
 
   test("every source in the enum produces a group", () => {
-    const missing: string[] = [];
+    const drawn: Record<string, unknown> = {};
     for (const source of Object.values(AgentToolSource)) {
       const grant = grantFor[source];
       if (!grant) {
-        missing.push(`${source} (no fixture)`);
+        drawn[source] = "no fixture";
         continue;
       }
       // NATIVE is the permissive default, so it draws with or without a grant; every other source
       // has to be asked for. Passing ONLY this grant isolates what it contributes.
       const groups = buildGroups(catalog, [grant], t);
-      const drawn = groups.filter(
-        (g) => source !== "NATIVE" || g.key === "native",
-      );
-      if (drawn.length === 0 || drawn.every((g) => g.items.length === 0)) {
-        missing.push(source);
-      }
+      drawn[source] = groups
+        .filter((g) => (source === "NATIVE") === (g.key === "native"))
+        .map((g) => [g.key, g.items.map((i) => i.label)]);
     }
-    expect(missing).toEqual([]);
-  });
-
-  // The editor's row and the map read the SAME field, and it is the one the assembly answers. A
-  // template that is enabled but unreadable is the case the two used to disagree on: the map drew
-  // its tool and the editor offered it as an ordinary grant, while the runtime exposed neither.
-  test("enabled and available are not the same question", () => {
-    const future = catalog.documentTemplates.find((d) => d.id === "7");
-    expect(future?.enabled).toBe(true);
-    expect(future?.available).toBe(false);
+    // NOTE: each source draws its OWN group, keyed and filled from its catalog entry.
+    expect(drawn).toEqual({
+      NATIVE: [["native", ["Hand off to human"]]],
+      RAG: [["knowledge", ["Base"]]],
+      HTTP: [["http", ["Look up order"]]],
+      MCP: [["mcp:3", ["(all tools)"]]],
+      INTEGRATION: [["integration:4", ["crm_lookup"]]],
+      DOCUMENT: [["document", ["send_orcamento"]]],
+      CODE: [["code", ["Look up CPF"]]],
+    });
   });
 
   test("a document grant is named by the tool the agent will call", () => {
     const groups = buildGroups(catalog, [grantFor.DOCUMENT as GrantState], t);
     const documents = groups.find((g) => g.key === "document");
-    expect(documents?.items).toEqual(["send_orcamento"]);
+    expect(documents?.items.map((i) => i.label)).toEqual(["send_orcamento"]);
   });
 
   test("a code grant is drawn by its display label", () => {
     const groups = buildGroups(catalog, [grantFor.CODE as GrantState], t);
     const code = groups.find((g) => g.key === "code");
-    expect(code?.items).toEqual(["Look up CPF"]);
+    expect(code?.items.map((i) => i.label)).toEqual(["Look up CPF"]);
   });
 
   test("a code grant whose tool the operator disabled draws nothing", () => {
@@ -170,7 +173,14 @@ describe("buildGroups — every grant source is drawn", () => {
     const disabled = {
       ...catalog,
       codeTools: [
-        { id: "8", name: "lookup_cpf", label: "Look up CPF", enabled: false },
+        {
+          id: "8",
+          name: "lookup_cpf",
+          label: "Look up CPF",
+          enabled: false,
+          toolName: "lookup_cpf",
+          args: [],
+        },
       ],
     };
     const groups = buildGroups(disabled, [grantFor.CODE as GrantState], t);

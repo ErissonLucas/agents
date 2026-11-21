@@ -2,6 +2,11 @@ import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import config from "@/config";
+import {
+  isTransientProviderStatus,
+  providerFailure,
+  statusOf,
+} from "@/lib/provider-failure";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { trackFlowWrite } from "@/modules/flowlog/scheduled";
 import {
@@ -18,12 +23,13 @@ import {
 import {
   getTtsProvider,
   pickTtsFormat,
+  type TtsOutputFormat,
   type TtsProvider,
   type TtsResult,
 } from "@/modules/tts/providers";
 import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { staticTtsImpossibility } from "./modality";
-import { type TtsConfig, voiceSettingsOf } from "./settings";
+import { type TtsConfig, ttsFallbackConfig, voiceSettingsOf } from "./settings";
 
 // Text-to-speech orchestration: normalize the reply for speech, synthesize via the configured
 // provider (key from the vault), and return the audio for the Chatwoot voice-note upload. The
@@ -74,7 +80,7 @@ export interface SynthesizeReplyParams {
   };
   // Optional execution-flow context: when present, the provider synth is logged as a `tts` stage.
   flow?: FlowContext;
-  // The corrupted-audio check (issue #779). Defaults to the deployment's `config.ttsCheck`.
+  // The corrupted-audio check. Defaults to the deployment's `config.ttsCheck`.
   check?: TtsCheckConfig;
   // Asked before paying for a regeneration: true = the turn this audio belongs to was called off,
   // so a new synthesis would be billed for a reply nobody will send.
@@ -99,76 +105,24 @@ export async function synthesizeReply(
 
   // Surface a misconfig skip on the turn trail / Logs (warn + skipped), so a TTS that silently does
   // nothing is visible to the operator instead of just falling back to text with no trace.
-  const skip = (reason: string): null => {
+  const skip: SkipReporter = (target, reason, fallback) => {
     if (params.flow) {
       emitFlowEvent(params.flow, {
         stage: "tts",
         level: "warn",
         status: "skipped",
-        provider: cfg.provider,
-        detail: { reason },
+        provider: target.provider,
+        detail: { reason, ...(fallback ? { fallback: true } : {}) },
       });
     }
-    return null;
   };
 
-  // The checks that need no network, in the order a skip reports them. Shared with the turn's plan
-  // (./modality.ts, issue #859), so a reply these refuse is also one the model was never told would
-  // be spoken.
-  // NOTE: container per destination channel. Like every other check here it runs BEFORE the paid
-  // rewrite below, so an unsupported combination skips without burning a call whose output would be
-  // discarded. No format = the provider cannot emit anything this channel accepts (openrouter on
-  // Instagram: mp3-only, and Meta refuses mp3) — synthesizing would produce a message Chatwoot shows
-  // as sent and Meta then rejects, so degrade to a text reply with a visible skip.
-  const impossible = staticTtsImpossibility(cfg, params.channelType);
-  if (impossible) {
-    logger.warn(
-      "tts: %s (provider %s, channel %s) — falling back to text",
-      impossible,
-      cfg.provider,
-      params.channelType,
-    );
-    return skip(impossible);
-  }
-  const provider = getTtsProvider(cfg.provider) as TtsProvider;
-  const voice = cfg.voice || provider.defaultVoice;
-  const format = pickTtsFormat(
-    provider,
-    params.channelType ?? null,
-  ) as NonNullable<ReturnType<typeof pickTtsFormat>>;
-  const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
-    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
-  );
-  if (entry.state !== "ok") {
-    // Gone/unfilled and wrong-KIND are separate lines because the operator's move differs: re-pick or
-    // fill one, move the other to the field it belongs on (issue #471).
-    if (entry.state === "unusable") {
-      logger.warn(
-        "tts: credential %s is a %s credential, which cannot be used as an API key — skipping",
-        cfg.credentialRef,
-        entry.kind,
-      );
-      return skip("credential_unusable");
-    }
-    logger.warn(
-      "tts: credential %s not found in the vault — skipping",
-      cfg.credentialRef,
-    );
-    return skip("credential_not_found");
-  }
-  // NOTE: credential baseUrl takes precedence over the agent config baseURL (config is a fallback).
-  // The requiresBaseURL check uses the effective value so a credential-stored URL satisfies the guard.
-  const effectiveBaseURL = entry.baseUrl ?? cfg.baseURL;
-  if (provider.requiresBaseURL && !effectiveBaseURL) {
-    logger.warn("tts: provider %s requires a baseURL — skipping", cfg.provider);
-    return skip("no_base_url");
-  }
+  const primary = await resolveVoice(cfg, false, params, base, skip);
+  if (!primary) return null;
 
-  // The rewrite for speech, LAST of all: it is a billed model call, and every check above can still
-  // abort this synthesis. It used to run before the credential was even resolved, which was harmless
-  // while the rewrite was opt-in and is not now that it ships on: an agent set to mirror/preference
-  // with no TTS credential would pay for a rewrite on every audio-triggering turn and still fall back
-  // to text. Best-effort: any failure here keeps the raw speech text. The Chatwoot transcribedText
+  // NOTE: The rewrite for speech, LAST of all: it is a billed model call, and every check above can still
+  // abort this synthesis (an agent with no TTS credential would otherwise pay for a rewrite on every
+  // audio turn and still fall back to text). Best-effort: any failure here keeps the raw speech text. The Chatwoot transcribedText
   // keeps the ORIGINAL reply either way; only the synth input is rewritten.
   if (cfg.normalize && params.deps?.normalizeSpeech) {
     try {
@@ -182,54 +136,84 @@ export async function synthesizeReply(
     }
   }
 
-  const synth = (attempt: number): Promise<TtsResult> =>
+  const synthOn = (voice: ResolvedVoice, attempt: number): Promise<TtsResult> =>
     withFlowStage(
       params.flow,
       "tts",
       {
-        provider: cfg.provider,
-        model: cfg.model || provider.defaultModel,
+        provider: voice.cfg.provider,
+        model: voice.model,
         // NOTE: `format` is our internal container name; `providerFormat` is the value that actually goes on
         // the wire (ElevenLabs `output_format`, OpenAI `response_format`). Both, because a failing line
         // showing only "ogg_opus" reads like the wire value and has been reported as one.
         detail: {
           normalized: cfg.normalize,
-          format,
-          providerFormat: provider.providerFormat(format),
-          // Which synthesis of this reply the line is: 1, or a regeneration after the detector
-          // called the previous one corrupted (issue #779).
+          format: voice.format,
+          providerFormat: voice.provider.providerFormat(voice.format),
+          // NOTE: 1, or a regeneration after the detector called the previous one corrupted.
           attempt,
-          // AND NOT THE REPLY ITSELF, which is the fix this issue asked for and the one the
-          // contract refuses (issue #763). `docs/logs.md` promises `execution_logs` NEVER carries
-          // message text: that promise is what makes the Logs page and `GET /v1/logs` exportable,
-          // and `redactSecretsDeep` removes credentials, not a customer's name or number, which a
-          // reply routinely repeats back. The spoken words live on the conversation instead — the
-          // audio attachment's `transcribed_text`, which `GET /v1/conversations/:id/messages`
-          // already returns — and that surface has the access control this one does not.
+          // NOTE: only on the fallback voice's lines, so a primary line reads as it always did.
+          ...(voice.fallback ? { fallback: true } : {}),
+          // NOTE: not the reply itself: `docs/logs.md` promises `execution_logs` never carries message
+          // text, and `redactSecretsDeep` removes credentials, not a customer's name or number. The spoken
+          // words live on the audio attachment's `transcribed_text`, behind the conversation's access control.
         },
         // TTS is best-effort: the runtime falls back to a text reply on a synth error, so log a warn
         // (advisory), not a red error, on the conversation/Logs.
         errorLevel: "warn",
       },
       () =>
-        provider.synthesize({
+        voice.provider.synthesize({
           text: speech,
-          voice,
-          model: cfg.model || provider.defaultModel,
+          voice: voice.voice,
+          model: voice.model,
           language: "",
-          apiKey: entry.secret,
-          baseURL: effectiveBaseURL,
+          apiKey: voice.apiKey,
+          baseURL: voice.baseURL,
           fetchImpl: params.deps?.fetchImpl ?? fetch,
-          format,
+          format: voice.format,
           voiceSettings: voiceSettingsOf(cfg),
+          ...(cfg.fallbackProvider && cfg.fallbackTimeoutMs !== null
+            ? { timeoutMs: cfg.fallbackTimeoutMs }
+            : {}),
         }),
     );
+
+  // The voice the reply is rendered in. It becomes the fallback the first time the primary fails in
+  // a way another provider can answer, and stays there: a regeneration after the audio check repeats
+  // the voice that produced the audio, and the fallback is tried once per reply.
+  let current = primary;
+  let fallbackTried = false;
+  const synth = async (attempt: number): Promise<TtsResult> => {
+    try {
+      return await synthOn(current, attempt);
+    } catch (err) {
+      const fallbackCfg = ttsFallbackConfig(cfg);
+      if (fallbackTried || !fallbackCfg || !isTtsFallbackWorthy(err)) throw err;
+      fallbackTried = true;
+      // NOTE: one more billed synthesis and one more wait, not worth paying for a reply this turn
+      // will not send.
+      if (params.shouldStop && (await params.shouldStop())) throw err;
+      const fallback = await resolveVoice(
+        fallbackCfg,
+        true,
+        params,
+        base,
+        skip,
+      );
+      // A fallback that cannot run leaves its own skipped line, and the reply fails as it would
+      // with none: the error the caller gets is the primary's.
+      if (!fallback) throw err;
+      current = fallback;
+      return synthOn(current, attempt);
+    }
+  };
 
   // Synthesized ONCE per attempt from the same `speech`: a regeneration repeats the synthesis and
   // never the rewrite above, which is a billed model call whose output did not change.
   let out = await synth(1);
-  // The deployment owns the detector; the agent may pick what the check does with it (issue #802),
-  // and one that never picked follows the deployment's mode.
+  // The deployment owns the detector; the agent may pick what the check does with it, and one
+  // that never picked follows the deployment's mode.
   const deployment = params.check ?? config.ttsCheck;
   const check: TtsCheckConfig = {
     ...deployment,
@@ -298,6 +282,109 @@ export async function synthesizeReply(
     reportCheck(params.flow, check, c, attempt, "regenerated");
     out = await synth(attempt + 1);
   }
+}
+
+// When the fallback voice is worth asking: the same policy as the model fallback
+// (graph/model-fallback), a timeout or a status that describes the endpoint's momentary state. A
+// 400/401/404 is the request or the key, the fallback would hide it, and the reply goes as text.
+export function isTtsFallbackWorthy(err: unknown): boolean {
+  if (providerFailure(err) === "timeout") return true;
+  const status = statusOf(err);
+  return status !== null && isTransientProviderStatus(status);
+}
+
+type SkipReporter = (
+  target: TtsConfig,
+  reason: string,
+  fallback: boolean,
+) => void;
+
+// Everything one synthesis needs, settled before it is paid for.
+interface ResolvedVoice {
+  cfg: TtsConfig;
+  provider: TtsProvider;
+  voice: string;
+  model: string;
+  format: TtsOutputFormat;
+  apiKey: string;
+  baseURL: string | null;
+  fallback: boolean;
+}
+
+// The checks that need no network, then the key from the vault, for the primary voice or the
+// fallback one. null = this voice cannot run, after its skipped line was written.
+async function resolveVoice(
+  cfg: TtsConfig,
+  fallback: boolean,
+  params: SynthesizeReplyParams,
+  base: PrismaClient,
+  skip: SkipReporter,
+): Promise<ResolvedVoice | null> {
+  const which = fallback ? "fallback voice" : "voice";
+  // The checks that need no network, in the order a skip reports them, shared with the turn's plan
+  // (./modality.ts) so a reply these refuse was never announced as spoken.
+  // NOTE: they run BEFORE the paid rewrite, so an unsupported combination burns no call. No
+  // format = the provider cannot emit anything this channel accepts (openrouter on Instagram): Meta
+  // would reject it after Chatwoot shows it sent, so degrade to text with a visible skip.
+  const impossible = staticTtsImpossibility(cfg, params.channelType);
+  if (impossible) {
+    logger.warn(
+      "tts: %s %s (provider %s, channel %s) — falling back to text",
+      which,
+      impossible,
+      cfg.provider,
+      params.channelType,
+    );
+    skip(cfg, impossible, fallback);
+    return null;
+  }
+  const provider = getTtsProvider(cfg.provider) as TtsProvider;
+  const format = pickTtsFormat(
+    provider,
+    params.channelType ?? null,
+  ) as NonNullable<ReturnType<typeof pickTtsFormat>>;
+  const entry = await runScopedOn(base, sysCtx(params.tenantId), (db) =>
+    tryResolveApiKeyEntry(db, cfg.credentialRef as string),
+  );
+  if (entry.state !== "ok") {
+    // NOTE: separate lines because the operator's move differs: re-pick or fill a gone/unfilled one,
+    // move a wrong-KIND one to the field it belongs on.
+    if (entry.state === "unusable") {
+      logger.warn(
+        "tts: %s credential %s is a %s credential, which cannot be used as an API key — skipping",
+        which,
+        cfg.credentialRef,
+        entry.kind,
+      );
+      skip(cfg, "credential_unusable", fallback);
+      return null;
+    }
+    logger.warn(
+      "tts: %s credential %s not found in the vault — skipping",
+      which,
+      cfg.credentialRef,
+    );
+    skip(cfg, "credential_not_found", fallback);
+    return null;
+  }
+  // Credential baseUrl takes precedence over the agent config baseURL (config is a fallback).
+  // The requiresBaseURL check uses the effective value so a credential-stored URL satisfies the guard.
+  const baseURL = entry.baseUrl ?? cfg.baseURL;
+  if (provider.requiresBaseURL && !baseURL) {
+    logger.warn("tts: provider %s requires a baseURL — skipping", cfg.provider);
+    skip(cfg, "no_base_url", fallback);
+    return null;
+  }
+  return {
+    cfg,
+    provider,
+    voice: cfg.voice || provider.defaultVoice,
+    model: cfg.model || provider.defaultModel,
+    format,
+    apiKey: entry.secret,
+    baseURL,
+    fallback,
+  };
 }
 
 // What THIS function did with the verdict, never what happened to the reply afterwards: the send is

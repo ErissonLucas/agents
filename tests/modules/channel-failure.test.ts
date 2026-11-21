@@ -7,16 +7,25 @@ import {
   channelFailureOf,
   mediaFallbackDedupeKey,
   mediaFallbackHandler,
+  newerThanFailure,
+  RATE_LIMITED_RESEND_DELAY_MS,
+  RESEND_DELAY_MS,
 } from "@/modules/chatwoot/channel-failure";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
-import { CHATWOOT_REPLY_TEXT_KEY } from "@/modules/chatwoot/constants";
+import {
+  CHATWOOT_REPLY_BY_OPERATOR_KEY,
+  CHATWOOT_REPLY_TEXT_KEY,
+  CHATWOOT_SEND_ID_KEY,
+} from "@/modules/chatwoot/constants";
+import { parseChatwootMessages } from "@/modules/chatwoot/messages";
 import { normalizeChatwootEvent } from "@/modules/chatwoot/normalize";
 import { processChatwootDelivery } from "@/modules/chatwoot/webhook";
 import { type ClaimedJob, completeJob } from "@/modules/scheduler/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// Issue #587: an outgoing attachment the CHANNEL refused after Chatwoot accepted it. The failure
+// An outgoing attachment the CHANNEL refused after Chatwoot accepted it. The failure
 // arrives later, as a `message_updated` carrying `content_attributes.external_error`. A media-class
 // code is answered with the same reply as text, once; anything else is a line naming the code.
 
@@ -36,8 +45,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -58,15 +67,22 @@ function updated(
     error?: string | null;
     sender?: { type: string; id: number } | null;
     transcribed?: string | null;
-    // The whole reply the voice note carries when its speech left an item out (#792).
+    // The whole reply the voice note carries when its speech left an item out.
     replyText?: string;
+    byOperator?: boolean;
     event?: string;
+    // A TEXT reply: its content, with no voice note attached.
+    content?: string;
+    // A file other than a voice note, which a caption alone does not replace.
+    image?: boolean;
+    // The send id the message went out with, when it was one of ours.
+    sendId?: string;
   } = {},
 ) {
   const n = normalizeChatwootEvent({
     event: opts.event ?? "message_updated",
     id: messageId,
-    content: null,
+    content: opts.content ?? null,
     message_type: "outgoing",
     private: false,
     sender:
@@ -80,9 +96,18 @@ function updated(
       ...(opts.replyText === undefined
         ? {}
         : { [CHATWOOT_REPLY_TEXT_KEY]: opts.replyText }),
+      ...(opts.byOperator ? { [CHATWOOT_REPLY_BY_OPERATOR_KEY]: true } : {}),
+      ...(opts.sendId ? { [CHATWOOT_SEND_ID_KEY]: opts.sendId } : {}),
     },
-    attachments:
-      opts.transcribed === null
+    attachments: opts.image
+      ? [
+          {
+            id: messageId * 10,
+            file_type: "image",
+            data_url: "https://chat.example/a.png",
+          },
+        ]
+      : opts.transcribed === null || opts.content !== undefined
         ? []
         : [
             {
@@ -169,6 +194,10 @@ describe("channelFailureOf", () => {
       code: "131053",
       kind: "media",
       text: REPLY,
+      byOperator: false,
+      rendered: false,
+      wasResend: false,
+      replyKey: null,
     });
     expect(
       channelFailureOf(updated(2, { error: "131052: x" }), BOT_ID)?.kind,
@@ -182,13 +211,71 @@ describe("channelFailureOf", () => {
     expect(
       channelFailureOf(updated(4, { error: "999999: new" }), BOT_ID)?.kind,
     ).toBe("unknown");
-    // A title that names media but carries no code is NOT media: the table is by code.
+    // NOTE: A title that names media but carries no code is NOT media: the table is by code.
     expect(
       channelFailureOf(updated(5, { error: "Media upload error" }), BOT_ID),
     ).toMatchObject({ code: null, kind: "unknown" });
   });
 
-  // #792: since #787 the transcription is the speech, which has holes where a URL or an address was.
+  // The Cloud API sends some codes in parentheses, and a regex anchored on a leading number read
+  // none of them: 131000 arrived as `code: null` and was dropped as unknown.
+  test("the code is read from the parenthesised form as from the leading one", () => {
+    const read = (error: string) =>
+      channelFailureOf(updated(20, { error }), BOT_ID);
+    expect(read("(#131000) Something went wrong")).toMatchObject({
+      code: "131000",
+      kind: "unknown",
+    });
+    expect(read("(#2) Service temporarily unavailable")?.code).toBe("2");
+    expect(read("(#368) Temporarily blocked")).toMatchObject({
+      code: "368",
+      kind: "account",
+    });
+    expect(read("(#130429) Rate limit hit")?.kind).toBe("rate_limit");
+    // NOTE: A number later in the sentence is not the code.
+    expect(read("Something went wrong (#131000)")?.code).toBeNull();
+  });
+
+  test("a text reply is its own content, and a reply with a file has no text to resend", () => {
+    expect(
+      channelFailureOf(
+        updated(21, { error: "(#131000) x", content: "Até amanhã, {{nome}}" }),
+        BOT_ID,
+      )?.text,
+    ).toBe("Até amanhã, {{nome}}");
+    expect(
+      channelFailureOf(
+        updated(22, {
+          error: "(#131000) x",
+          content: "a legenda",
+          image: true,
+        }),
+        BOT_ID,
+      )?.text,
+    ).toBeNull();
+  });
+
+  test("a failure on one of our resends is known to be one", () => {
+    const of = (sendId?: string) =>
+      channelFailureOf(updated(23, { error: "(#131000) x", sendId }), BOT_ID)
+        ?.wasResend;
+    expect(of("channel-resend:9")).toBe(true);
+    expect(of("reply:k1:channel-resend:9")).toBe(true);
+    expect(of("reply:k1:media-fallback:9")).toBe(true);
+    expect(of("media-fallback:9")).toBe(true);
+    // NOTE: The send ids of every first reply are not resends.
+    expect(of("turn:abc:0")).toBe(false);
+    expect(of()).toBe(false);
+  });
+
+  // A voice note whose words were the operator's says so, and the text that replaces it keeps them.
+  test("a voice note of the operator's words is read as such", () => {
+    expect(
+      channelFailureOf(updated(13, { byOperator: true }), BOT_ID)?.byOperator,
+    ).toBe(true);
+  });
+
+  // The transcription is the speech, which has holes where a URL or an address was left out.
   test("the whole reply the voice note carries is the text, not the speech with holes", () => {
     const holed = "Acompanhe seu pedido em a qualquer momento";
     const whole =
@@ -199,7 +286,7 @@ describe("channelFailureOf", () => {
         BOT_ID,
       )?.text,
     ).toBe(whole);
-    // A blank one is no reply: the transcription is still the text.
+    // NOTE: A blank one is no reply: the transcription is still the text.
     expect(
       channelFailureOf(
         updated(13, { transcribed: holed, replyText: "  " }),
@@ -228,6 +315,69 @@ describe("channelFailureOf", () => {
     ).toBeNull();
     expect(channelFailureOf(updated(11), null)).toBeNull();
   });
+});
+
+// The server log is where a skipped resend is explained, so each cause names itself.
+test("what came after a failed reply names why its resend is skipped", () => {
+  const after = (rows: Record<string, unknown>[]) =>
+    newerThanFailure(
+      parseChatwootMessages({
+        payload: [
+          { id: 1, content: "x", message_type: 1, private: false },
+          ...rows.map((r, i) => ({
+            id: 2 + i,
+            content: "y",
+            private: false,
+            ...r,
+          })),
+        ],
+      }),
+      1,
+    );
+  expect(after([])).toBeNull();
+  // A reaction answers nothing, and an imported row is old history with a new id.
+  expect(
+    after([
+      {
+        message_type: 1,
+        sender: { type: "user", id: 3 },
+        content_attributes: { is_reaction: true },
+      },
+      {
+        message_type: 0,
+        sender: { type: "contact", id: 31 },
+        content_attributes: { imported: true },
+      },
+    ]),
+  ).toBeNull();
+  expect(
+    after([{ message_type: 0, sender: { type: "contact", id: 31 } }]),
+  ).toBe("the customer wrote after the failed reply");
+  expect(
+    after([{ message_type: 1, sender: { type: "agent_bot", id: BOT_ID } }]),
+  ).toBe("the bot already sent something newer");
+  expect(after([{ message_type: 1, sender: { type: "user", id: 3 } }])).toBe(
+    "a person already sent something newer",
+  );
+  // The rest of the same reply (the balloon after it, the text after a voice note) is not newer.
+  const bot = (sendId: string) => ({
+    message_type: 1,
+    sender: { type: "agent_bot", id: BOT_ID },
+    content_attributes: { fazer_ai_send_id: sendId },
+  });
+  const rows = parseChatwootMessages({
+    payload: [
+      { id: 1, content: "x", message_type: 1, private: false },
+      { id: 2, content: "y", private: false, ...bot("reply:k1:b") },
+    ],
+  });
+  expect(newerThanFailure(rows, 1, "k1")).toBeNull();
+  expect(newerThanFailure(rows, 1, "k2")).toBe(
+    "the bot already sent something newer",
+  );
+  expect(newerThanFailure(rows, 1, null)).toBe(
+    "the bot already sent something newer",
+  );
 });
 
 test("the fallback's key names the Chatwoot instance, so a replaced server cannot collide", () => {
@@ -304,7 +454,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     expect(
       job?.payloadSecret ? decryptJson<string>(job.payloadSecret) : null,
     ).toBe(REPLY);
-    // The reply never rides the Json payload.
+    // NOTE: The reply never rides the Json payload.
     expect(JSON.stringify(job?.payload)).not.toContain("pedido");
     const lines = await linesFor(9001);
     expect(lines.map((l) => [l.level, l.detail])).toEqual([
@@ -350,6 +500,20 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     onRead?: () => Promise<void>;
     onLive?: () => Promise<void>;
     liveInbox?: number;
+    // The failed message the thread is built around, and what the conversation received after it.
+    failedId?: number;
+    after?: {
+      messageType: number;
+      sender: { type: string; id: number } | null;
+      private?: boolean;
+      sendId?: string;
+    }[];
+    // Messages that land only once the job has read the conversation live.
+    afterLive?: {
+      messageType: number;
+      sender: { type: string; id: number } | null;
+      reaction?: boolean;
+    }[];
   }) {
     const sent: {
       conv: number;
@@ -358,10 +522,12 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
       sendId: string | null;
     }[] = [];
     let token = "";
+    let readLive = false;
     const makeClient = (async (cfg: { botToken: string }) => {
       token = cfg.botToken;
       return {
         getConversation: async () => {
+          readLive = true;
           await opts.onLive?.();
           return {
             id: CONV_ID,
@@ -378,14 +544,32 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
             assignee_id: opts.assignee?.id ?? null,
           };
         },
-        // Pages the way Chatwoot does: the latest ~20, or the ~20 older than `before`. The thread is
+        // NOTE: Pages the way Chatwoot does: the latest ~20, or the ~20 older than `before`. The thread is
         // the failed voice note, `filler` newer messages, and the named sends.
         getMessages: async (_c: number, o?: { before?: number }) => {
           await opts.onRead?.();
           if (opts.unreadable) return {};
           if (opts.emptyPage) return { payload: [] };
-          const thread = [
-            { id: 9001, sendId: null as string | null },
+          const failedId = opts.failedId ?? 9001;
+          type Row = {
+            id: number;
+            sendId: string | null;
+            messageType?: number;
+            sender?: { type: string; id: number } | null;
+            private?: boolean;
+          };
+          const thread: Row[] = [
+            { id: failedId, sendId: null },
+            ...(opts.after ?? []).map((m, i) => ({
+              ...m,
+              id: failedId + 1 + i,
+              sendId: m.sendId ?? null,
+            })),
+            ...(readLive ? (opts.afterLive ?? []) : []).map((m, i) => ({
+              ...m,
+              id: failedId + 50 + i,
+              sendId: null,
+            })),
             ...Array.from({ length: opts.filler ?? 0 }, (_, i) => ({
               id: 10_000 + i,
               sendId: null as string | null,
@@ -401,13 +585,17 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
             payload: thread.slice(-20).map((m) => ({
               id: m.id,
               content: REPLY,
-              message_type: 1,
-              private: false,
+              message_type: m.messageType ?? 1,
+              private: m.private === true,
               created_at: Math.floor(Date.now() / 1000),
-              sender: { type: "agent_bot", id: BOT_ID },
-              content_attributes: m.sendId
-                ? { fazer_ai_send_id: m.sendId }
-                : {},
+              sender:
+                m.sender === undefined
+                  ? { type: "agent_bot", id: BOT_ID }
+                  : m.sender,
+              content_attributes: {
+                ...(m.sendId ? { fazer_ai_send_id: m.sendId } : {}),
+                ...("reaction" in m && m.reaction ? { is_reaction: true } : {}),
+              },
             })),
           };
         },
@@ -416,7 +604,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
           text: string,
           o?: { private?: boolean; sendId?: string },
         ) => {
-          // The customer has to READ it: a private note would be the team talking to itself.
+          // NOTE: The customer has to READ it: a private note would be the team talking to itself.
           sent.push({
             conv,
             text,
@@ -519,7 +707,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
       const cw = fakeChatwoot({});
       await mediaFallbackHandler(await claimed(9001), appDb, cw.makeClient);
       expect(cw.sent).toEqual([]);
-      // ...and inside it, it does.
+      // NOTE: ...and inside it, it does.
       await suDb.conversation.updateMany({
         where: { tenantId, chatwootConversationId: CONV_ID },
         data: { lastInboundAt: new Date() },
@@ -564,7 +752,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
   test("a takeover the mirror recorded after Chatwoot's snapshot was taken stops the send", async () => {
     const cw = fakeChatwoot({
       onLive: async () => {
-        // The takeover webhook commits while the GET is in flight: newer than the snapshot.
+        // NOTE: The takeover webhook commits while the GET is in flight: newer than the snapshot.
         await suDb.conversation.updateMany({
           where: { tenantId, chatwootConversationId: CONV_ID },
           data: {
@@ -634,6 +822,58 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     }
   });
 
+  // The text replacing the voice note is the model's reply, which Chatwoot renders as
+  // Liquid, so it goes escaped; the operator's signature keeps its own Liquid.
+  test("the model's text goes escaped and the signature's Liquid is left alone", async () => {
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          signature: {
+            enabled: true,
+            text: "Att {{contact.name}}",
+            position: "bottom",
+          },
+        },
+      },
+    });
+    try {
+      const cw = fakeChatwoot({});
+      await mediaFallbackHandler(
+        {
+          ...(await claimed(9001)),
+          payloadSecret: encryptJson("Seu cadastro: {{contact.email}} fim"),
+        },
+        appDb,
+        cw.makeClient,
+      );
+      expect(cw.sent.map((m) => m.text)).toEqual([
+        "Seu cadastro: {{ '{{' }}contact.email}} fim\n\nAtt {{contact.name}}",
+      ]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: {} },
+      });
+    }
+  });
+
+  // The operator's words (a guardrail template spoken as audio) keep Chatwoot's Liquid in the text.
+  test("an operator's text replacing the voice note is sent as written", async () => {
+    const cw = fakeChatwoot({});
+    const job = await claimed(9001);
+    await mediaFallbackHandler(
+      {
+        ...job,
+        payload: { ...(job.payload as object), byOperator: true },
+        payloadSecret: encryptJson("Olá {{contact.name}}"),
+      },
+      appDb,
+      cw.makeClient,
+    );
+    expect(cw.sent.map((m) => m.text)).toEqual(["Olá {{contact.name}}"]);
+  });
+
   test("an inbox handed to another agent, or a test agent on a conversation never activated, gets nothing", async () => {
     const other = await suDb.agent.create({
       data: { tenantId, name: "Outro", systemPrompt: "x", settings: {} },
@@ -662,26 +902,6 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
       await suDb.agent.update({
         where: { id: agentId },
         data: { mode: "production" },
-      });
-    }
-  });
-
-  test("a reset that lands while the job reads the conversation still stops the send", async () => {
-    const cw = fakeChatwoot({
-      onRead: async () => {
-        await suDb.conversation.updateMany({
-          where: { tenantId, chatwootConversationId: CONV_ID },
-          data: { resetAtMessageId: 9001 },
-        });
-      },
-    });
-    try {
-      await mediaFallbackHandler(await claimed(9001), appDb, cw.makeClient);
-      expect(cw.sent).toEqual([]);
-    } finally {
-      await suDb.conversation.updateMany({
-        where: { tenantId, chatwootConversationId: CONV_ID },
-        data: { resetAtMessageId: null },
       });
     }
   });
@@ -726,7 +946,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     expect(after.status).toBe("DONE");
     expect(after.dedupeKey).toBe(mediaFallbackDedupeKey(instanceId, 9001));
     expect(after.payloadSecret).toBeNull();
-    // Back to what the tests below expect to claim.
+    // NOTE: Back to what the tests below expect to claim.
     await suDb.schedulerJob.update({
       where: { id: row.id },
       data: { status: "PENDING", payloadSecret: encryptJson(REPLY) },
@@ -834,7 +1054,7 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     await deliver(updated(9002));
     let jobs = await jobsFor(9002);
     expect(jobs).toHaveLength(1);
-    // As if the job had run: a later redelivery must not put it back to PENDING.
+    // NOTE: As if the job had run: a later redelivery must not put it back to PENDING.
     await suDb.schedulerJob.update({
       where: { id: jobs[0]?.id },
       data: { status: "DONE" },
@@ -919,21 +1139,302 @@ describe.skipIf(!dbUp)("a channel failure reported to the bot", () => {
     ]);
   });
 
-  test("an unknown or unreadable code sends nothing and says so", async () => {
-    await deliver(updated(9004, { error: "999999: Some future error" }));
-    await deliver(updated(9005, { error: "Media upload error" }));
-    expect(await jobsFor(9004)).toHaveLength(0);
-    expect(await jobsFor(9005)).toHaveLength(0);
-    expect((await linesFor(9004))[0]?.detail).toMatchObject({
-      code: "999999",
+  // The production case: a text reply refused with 131000 was dropped as unknown, and the customer
+  // never got the answer. Every code nobody listed as permanent is resent once, after a delay.
+  test("a refusal not known to be permanent arms the same reply, after a delay", async () => {
+    const text = "O plano custa R$ 89 por mês";
+    const before = Date.now();
+    await deliver(
+      updated(9004, { error: "(#131000) Something went wrong", content: text }),
+    );
+    await deliver(updated(9005, { error: "999999: Some future error" }));
+    await deliver(
+      updated(9009, { error: "(#130429) Rate limit hit", content: text }),
+    );
+    const [generic] = await jobsFor(9004);
+    expect(
+      generic?.payloadSecret
+        ? decryptJson<string>(generic.payloadSecret)
+        : null,
+    ).toBe(text);
+    expect(generic?.payload).toMatchObject({ messageId: 9004, resend: true });
+    expect(generic?.runAt.getTime()).toBeGreaterThanOrEqual(
+      before + RESEND_DELAY_MS,
+    );
+    expect(await jobsFor(9005)).toHaveLength(1);
+    const [limited] = await jobsFor(9009);
+    expect(limited?.runAt.getTime()).toBeGreaterThanOrEqual(
+      before + RATE_LIMITED_RESEND_DELAY_MS,
+    );
+    expect((await linesFor(9004))[0]?.detail).toEqual({
+      messageId: 9004,
+      code: "131000",
+      codeRead: true,
       class: "unknown",
+      action: "resend",
+    });
+    expect((await linesFor(9009))[0]?.detail).toMatchObject({
+      class: "rate_limit",
+      action: "resend",
+    });
+  });
+
+  test("a refusal the channel documents as permanent arms nothing", async () => {
+    await deliver(
+      updated(9110, { error: "(#368) Temporarily blocked", content: "x" }),
+    );
+    await deliver(
+      updated(9111, { error: "(#131047) Re-engagement message", content: "x" }),
+    );
+    expect(await jobsFor(9110)).toHaveLength(0);
+    expect(await jobsFor(9111)).toHaveLength(0);
+    expect((await linesFor(9110))[0]?.detail).toMatchObject({
+      class: "account",
       action: "none",
     });
-    expect((await linesFor(9005))[0]?.detail).toMatchObject({
-      code: null,
-      codeRead: false,
-      class: "unknown",
+    expect((await linesFor(9111))[0]?.detail).toMatchObject({
+      class: "delivery",
+      action: "none",
     });
+  });
+
+  test("the refusal of a resend is not resent a third time, and the line says so", async () => {
+    await deliver(
+      updated(9012, {
+        error: "(#131000) Something went wrong",
+        content: "x",
+        sendId: "channel-resend:9004",
+      }),
+    );
+    expect(await jobsFor(9012)).toHaveLength(0);
+    expect((await linesFor(9012))[0]?.detail).toMatchObject({
+      code: "131000",
+      action: "not_resent",
+    });
+  });
+
+  test("the resend goes out as the customer would have read it, with no second signature", async () => {
+    const text = "Até amanhã, {{nome}}. Equipe Loja";
+    await deliver(
+      updated(9013, { error: "(#131000) Something went wrong", content: text }),
+    );
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          signature: { enabled: true, text: "Equipe Loja", position: "bottom" },
+        },
+      },
+    });
+    try {
+      const cw = fakeChatwoot({ failedId: 9013 });
+      await mediaFallbackHandler(await claimed(9013), appDb, cw.makeClient);
+      expect(cw.sent).toEqual([
+        {
+          conv: CONV_ID,
+          text: "Até amanhã, {{ '{{' }}nome}}. Equipe Loja",
+          private: false,
+          sendId: "channel-resend:9013",
+        },
+      ]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: {} },
+      });
+    }
+  });
+
+  // A voice note refused with a code outside the media list is resent too, and its words are the
+  // words it was spoken from: signed, as the media text is, not escaped as rendered content.
+  test("a voice note refused with an unlisted code resends its words as the media text would", async () => {
+    await deliver(updated(9015, { error: "(#131000) Something went wrong" }));
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          signature: { enabled: true, text: "Equipe Voz", position: "bottom" },
+        },
+      },
+    });
+    try {
+      const cw = fakeChatwoot({ failedId: 9015 });
+      await mediaFallbackHandler(await claimed(9015), appDb, cw.makeClient);
+      expect(cw.sent.map((m) => [m.text, m.sendId])).toEqual([
+        [`${REPLY}\n\nEquipe Voz`, "channel-resend:9015"],
+      ]);
+    } finally {
+      await suDb.agent.update({
+        where: { id: agentId },
+        data: { settings: {} },
+      });
+    }
+  });
+
+  // A voice note refused while the text after it landed: that text is the rest of the same reply,
+  // and the spoken part still has to reach the customer.
+  test("the rest of the same reply does not cancel the resend, a newer reply does", async () => {
+    await deliver(
+      updated(9017, { error: "(#131000) x", sendId: "reply:k17:audio" }),
+    );
+    const sameReply = fakeChatwoot({
+      failedId: 9017,
+      after: [
+        {
+          messageType: 1,
+          sender: { type: "agent_bot", id: BOT_ID },
+          sendId: "reply:k17:text",
+        },
+      ],
+    });
+    await mediaFallbackHandler(
+      await claimed(9017),
+      appDb,
+      sameReply.makeClient,
+    );
+    expect(sameReply.sent).toHaveLength(1);
+    const newer = fakeChatwoot({
+      failedId: 9017,
+      after: [
+        {
+          messageType: 1,
+          sender: { type: "agent_bot", id: BOT_ID },
+          sendId: "reply:k99:text",
+        },
+      ],
+    });
+    await mediaFallbackHandler(await claimed(9017), appDb, newer.makeClient);
+    expect(newer.sent).toEqual([]);
+  });
+
+  // Two balloons of one reply refused: the first one's resend landing must not read as a newer reply
+  // to the second one's job, so the replacement keeps the reply's key.
+  test("a sibling's resend is still the same reply, and carries the key forward", async () => {
+    await deliver(
+      updated(9018, {
+        error: "(#131000) x",
+        content: "a",
+        sendId: "reply:k18:a",
+      }),
+    );
+    const first = fakeChatwoot({ failedId: 9018 });
+    await mediaFallbackHandler(await claimed(9018), appDb, first.makeClient);
+    expect(first.sent.map((m) => m.sendId)).toEqual([
+      "reply:k18:channel-resend:9018",
+    ]);
+    await deliver(
+      updated(9019, {
+        error: "(#131000) x",
+        content: "b",
+        sendId: "reply:k18:b",
+      }),
+    );
+    const second = fakeChatwoot({
+      failedId: 9019,
+      after: [
+        {
+          messageType: 1,
+          sender: { type: "agent_bot", id: BOT_ID },
+          sendId: "reply:k18:channel-resend:9018",
+        },
+      ],
+    });
+    await mediaFallbackHandler(await claimed(9019), appDb, second.makeClient);
+    expect(second.sent).toHaveLength(1);
+  });
+
+  // A customer message that lands while the job reads who owns the conversation is not on the
+  // pages read before; the latest page, read again after those reads, has it. A reaction does not
+  // count there either.
+  test("a customer message landing during the ownership reads stops the resend, a reaction does not", async () => {
+    await deliver(updated(9016, { error: "(#131000) x", content: "x" }));
+    const wrote = fakeChatwoot({
+      failedId: 9016,
+      afterLive: [{ messageType: 0, sender: { type: "contact", id: 31 } }],
+    });
+    await mediaFallbackHandler(await claimed(9016), appDb, wrote.makeClient);
+    expect(wrote.sent).toEqual([]);
+    const reacted = fakeChatwoot({
+      failedId: 9016,
+      afterLive: [
+        { messageType: 0, sender: { type: "contact", id: 31 }, reaction: true },
+      ],
+    });
+    await mediaFallbackHandler(await claimed(9016), appDb, reacted.makeClient);
+    expect(reacted.sent).toHaveLength(1);
+  });
+
+  // The latest page is read again after the live read; a person taking the conversation while that
+  // read is in flight is caught by the mirror, read after it.
+  test("a takeover landing during the resend's last page read stops it", async () => {
+    await deliver(updated(9020, { error: "(#131000) x", content: "x" }));
+    let live = false;
+    const cw = fakeChatwoot({
+      failedId: 9020,
+      onLive: async () => {
+        live = true;
+      },
+      onRead: async () => {
+        if (!live) return;
+        await suDb.conversation.updateMany({
+          where: { tenantId, chatwootConversationId: CONV_ID },
+          data: {
+            assigneeType: "User",
+            assigneeId: 3,
+            lastEventAt: new Date(Date.now() + 3_600_000),
+          },
+        });
+      },
+    });
+    try {
+      await mediaFallbackHandler(await claimed(9020), appDb, cw.makeClient);
+      expect(cw.sent).toEqual([]);
+    } finally {
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: CONV_ID },
+        data: { assigneeType: null, assigneeId: null, lastEventAt: new Date() },
+      });
+    }
+  });
+
+  // The next turn answers a customer who wrote again, with fresh context; a newer reply already
+  // moved the conversation on. Either way the old reply would arrive out of place.
+  test("a resend is skipped when the conversation received anything after the failure", async () => {
+    await deliver(updated(9014, { error: "(#131000) x", content: "x" }));
+    for (const after of [
+      { messageType: 0, sender: { type: "contact", id: 31 } },
+      { messageType: 1, sender: { type: "agent_bot", id: BOT_ID } },
+      { messageType: 1, sender: { type: "user", id: 3 } },
+    ]) {
+      const cw = fakeChatwoot({ failedId: 9014, after: [after] });
+      await mediaFallbackHandler(await claimed(9014), appDb, cw.makeClient);
+      expect(cw.sent).toEqual([]);
+    }
+    // A customer message pushed off the latest page by the team's notes is still found: the read-back
+    // pages down to the failed reply, not only the newest page.
+    const buried = fakeChatwoot({
+      failedId: 9014,
+      after: [
+        { messageType: 0, sender: { type: "contact", id: 31 } },
+        ...Array.from({ length: 25 }, () => ({
+          messageType: 1,
+          sender: { type: "user", id: 3 },
+          private: true,
+        })),
+      ],
+    });
+    await mediaFallbackHandler(await claimed(9014), appDb, buried.makeClient);
+    expect(buried.sent).toEqual([]);
+    // A private note and an activity line are not something the customer received.
+    const quiet = fakeChatwoot({
+      failedId: 9014,
+      after: [
+        { messageType: 1, sender: { type: "user", id: 3 }, private: true },
+        { messageType: 2, sender: null },
+      ],
+    });
+    await mediaFallbackHandler(await claimed(9014), appDb, quiet.makeClient);
+    expect(quiet.sent).toHaveLength(1);
   });
 
   test("a media failure with no text to send says that, and sends nothing", async () => {

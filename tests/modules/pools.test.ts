@@ -27,9 +27,10 @@ import {
   listVaultEntries,
   vaultReferences,
 } from "@/modules/vault/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 
 // The context these calls take: the tenant id came from a row this test created, so it carries
-// TENANT_ADMIN — the role that tells `runScopedOn` the id never came from outside (issue #280).
+// TENANT_ADMIN, the role that tells `runScopedOn` the id never came from outside.
 const ctxOf = (tenantId: bigint): TenantContext => ({
   tenantId,
   userId: null,
@@ -52,8 +53,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -175,7 +176,7 @@ describe.skipIf(!dbUp)("tier-1 pools CRUD", () => {
   });
 
   test("tool definitions: programmatic authoring shapes are stored canonical", async () => {
-    // NOTE: JSON-Schema input + OpenAPI-style single-brace path param (what an API/MCP author writes).
+    // JSON-Schema input + OpenAPI-style single-brace path param (what an API/MCP author writes).
     const td = await createToolDefinition(
       ctx(tenant),
       {
@@ -196,7 +197,7 @@ describe.skipIf(!dbUp)("tier-1 pools CRUD", () => {
     });
     expect(td.urlTemplate).toBe("https://api.example.com/v1/cnpj/{{cnpj}}");
 
-    // NOTE: a partial update normalizes against the row's existing field set.
+    // A partial update normalizes against the row's existing field set.
     const updated = await updateToolDefinition(
       ctx(tenant),
       BigInt(td.id),

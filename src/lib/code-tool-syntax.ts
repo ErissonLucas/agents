@@ -1,16 +1,12 @@
 // Static check of a code tool's body, shared by the console (while the operator types) and by the
-// service (on save). It WARNS and never refuses: invalid code is stored as written and fails at
-// call time, as the operator's failure, so a half-typed body can be saved and a warning can be
-// wrong without locking anyone out. The parser is acorn, a pure-JS ECMAScript parser, because the
-// console runs under a production CSP with neither 'unsafe-eval' nor 'wasm-unsafe-eval': a
-// `new Function(body)` check passes every local test and throws EvalError on the first deploy, and
-// the interpreter itself (QuickJS over WebAssembly) cannot load in the browser either. What the
-// engine says at call time remains the truth; this is the same parse, one keystroke earlier.
-//
-// The body is parsed exactly as the sandbox runs it — as the body of `function (input, context)`
-// — so a top-level `return` is fine and a line the parser reports is the body's own line minus the
-// wrapper's one line above it (code-sandbox.worker.ts keeps the same offset for the engine's
-// errors).
+// service (on save). It WARNS and never refuses: invalid code is stored as written and fails at call
+// time, so a half-typed body can be saved and a wrong warning locks nobody out. The parser is acorn
+// (pure JS) because the console's CSP allows neither 'unsafe-eval' nor 'wasm-unsafe-eval': a
+// `new Function(body)` check throws EvalError in production, and QuickJS over WebAssembly cannot load.
+
+// The body is parsed as the sandbox runs it, as the body of `function (input, context)`: a top-level
+// `return` is fine, and a reported line is the body's own line minus the wrapper's one line above it
+// (code-sandbox.worker.ts keeps the same offset for the engine's errors).
 
 export type CodeSyntaxWarning =
   | { kind: "syntax"; line: number; column: number; message: string }
@@ -54,7 +50,7 @@ function syntaxWarning(e: unknown, lines: string[]): CodeSyntaxWarning {
   };
   const rawLine = typeof err.loc?.line === "number" ? err.loc.line : 1;
   const rawColumn = typeof err.loc?.column === "number" ? err.loc.column : 0;
-  // NOTE: One wrapper line above the body. An error at the END of the body (an unfinished
+  // One wrapper line above the body. An error at the END of the body (an unfinished
   // `input.cpf.`, an unclosed brace) is reported on the wrapper's closing line, past the body, and
   // lands at the end of the body's last line instead — the same clamp the sandbox applies to the
   // engine's line (code-sandbox.worker.ts withSourceLine).

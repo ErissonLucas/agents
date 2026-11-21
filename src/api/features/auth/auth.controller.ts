@@ -4,19 +4,22 @@ import {
   changeUserPassword,
   createInitialAdmin,
   createUser,
+  getAccountDetails,
+  getPasswordHash,
   getTenantName,
   getUserByEmail,
-  getUserHasPassword,
   hashPassword,
   IncorrectPasswordError,
   isEmailDomainAllowed,
   listMembershipTenants,
   NoMembershipError,
   NoPasswordSetError,
+  PasswordChangedConcurrentlyError,
   resolveDefaultTenantId,
   SetupAlreadyCompleteError,
   sessionUserOf,
   updateLastLogin,
+  updateUserName,
   verifyPassword,
 } from "@/api/features/auth/auth.service";
 import {
@@ -43,10 +46,16 @@ import {
   InviteInvalidError,
   InvitePasswordRequiredError,
 } from "@/api/features/invitations/invitation.service";
+import {
+  closeSessionSockets,
+  closeUserSockets,
+} from "@/api/features/realtime/realtime.service";
 import { authPlugin } from "@/api/lib/auth";
 import { translate } from "@/api/lib/i18n";
 import logger from "@/api/lib/logger";
 import { doc, errors, jsonResponse } from "@/api/lib/openapi";
+import { WS_CLOSE } from "@/api/lib/realtime";
+import { requireSession } from "@/api/lib/step-up";
 import config from "@/config";
 
 const baseAuthController = new Elysia({
@@ -109,7 +118,7 @@ const baseAuthController = new Elysia({
       }
 
       completeSetup();
-      await setAuthCookie(user);
+      await setAuthCookie(user, passwordHash, { method: "password" });
       // NOTE: Log non-PII identifiers only. `userId` is stable and audit-
       // useful, `role` confirms this was the bootstrap-ADMIN path. The email
       // is recoverable from the DB by joining on userId if needed.
@@ -193,7 +202,7 @@ const baseAuthController = new Elysia({
 
       const { email, password } = body;
 
-      // NOTE: Look up the existing user first so users on a domain that was
+      // Look up the existing user first so users on a domain that was
       // later removed from ALLOWED_SIGNUP_DOMAINS still get the accurate
       // "email already in use" response instead of a misleading domain error.
       const existingUser = await getUserByEmail(email);
@@ -201,7 +210,7 @@ const baseAuthController = new Elysia({
         set.status = 400;
         return {
           error: translate("errors.emailInUse", "Email already in use"),
-          // The one input the operator fixes, named the way every other refusal names one (#231).
+          // NOTE: the one input the operator fixes, named the way every other refusal names one.
           // Built by hand here rather than raised as an AppError, so `refusalBody` never sees it.
           field: "email",
         };
@@ -217,7 +226,7 @@ const baseAuthController = new Elysia({
         };
       }
 
-      // NOTE: a self-signup user must join a tenant; with none provisioned, keep the
+      // A self-signup user must join a tenant; with none provisioned, keep the
       // endpoint closed rather than create a tenant-less account.
       const tenantId = await resolveDefaultTenantId();
       if (tenantId === null) {
@@ -230,7 +239,7 @@ const baseAuthController = new Elysia({
       const passwordHash = await hashPassword(password);
       const user = await createUser(email, passwordHash, tenantId);
 
-      await setAuthCookie(user);
+      await setAuthCookie(user, passwordHash, { method: "password" });
 
       return {
         user: {
@@ -280,7 +289,7 @@ const baseAuthController = new Elysia({
       }
 
       const isValidPassword = await verifyPassword(password, row.passwordHash);
-      // NOTE: a person with no tenant to enter gets the same answer as a wrong password, after the
+      // A person with no tenant to enter gets the same answer as a wrong password, after the
       // password is checked: a distinct one would confirm the password to whoever guessed it.
       const user = isValidPassword ? sessionUserOf(row) : null;
       if (!user) {
@@ -293,7 +302,7 @@ const baseAuthController = new Elysia({
         };
       }
 
-      await setAuthCookie(user);
+      await setAuthCookie(user, row.passwordHash, { method: "password" });
       void updateLastLogin(user.id).catch((error) => {
         logger.warn(
           { error, userId: user.id.toString() },
@@ -346,7 +355,7 @@ const baseAuthController = new Elysia({
           ? await getTenantName(user.tenantId)
           : null;
 
-      // NOTE: the SUPER_ADMIN (tenantId null) has no membership to default to. Hand back the first
+      // The SUPER_ADMIN (tenantId null) has no membership to default to. Hand back the first
       // accessible tenant so the client can seed the selector on first login/reload instead of
       // dead-ending on an empty state. A member always runs under a membership, so needs no seed.
       const defaultTenantId =
@@ -356,9 +365,10 @@ const baseAuthController = new Elysia({
 
       // Whether the account can change its password locally (false for Google-only users) — drives the
       // settings form vs the "you sign in with Google" note.
-      const hasPassword = user ? await getUserHasPassword(user.id) : false;
+      const account = user ? await getAccountDetails(user.id) : null;
+      const hasPassword = account?.hasPassword ?? false;
 
-      // Every tenant the person belongs to, with the role held there (issue #756). The console shows
+      // Every tenant the person belongs to, with the role held there. The console shows
       // its tenant selector when there is more than one; `tenantId` above is the one this request ran
       // under. Empty for the SUPER_ADMIN, who picks from the whole tenant list instead.
       const tenants =
@@ -377,6 +387,8 @@ const baseAuthController = new Elysia({
                 user.tenantId === null ? null : user.tenantId.toString(),
               tenantName,
               hasPassword,
+              googleLinked: account?.googleLinked ?? false,
+              createdAt: account?.createdAt.toISOString() ?? null,
               tenants: tenants.map((m) => ({
                 id: m.tenantId.toString(),
                 name: m.name,
@@ -388,11 +400,13 @@ const baseAuthController = new Elysia({
         setupRequired: isSetupRequired(),
         setupTokenRequired: isSetupTokenRequired(),
         signupEnabled: config.signupEnabled,
+        // Whether passkey sign-in is on (PASSKEYS_ENABLED). Off, the console shows no passkey anywhere.
+        passkeysEnabled: config.passkeysEnabled,
         // Whether stdio MCP transport is enabled server-side (config.mcpStdioEnabled). Surfaced so the
         // MCP connection form can clearly flag a stdio server as inert when the operator has it off.
         mcpStdioEnabled: config.mcpStdioEnabled,
-        // Whether this install runs the audio detector, and the mode an agent that never chose one
-        // gets (issue #802). The address and token stay server-side: the editor only needs to know
+        // NOTE: whether this install runs the audio detector, and the mode an agent that never chose
+        // one gets. The address and token stay server-side: the editor only needs to know
         // whether the per-agent choice can do anything, and what "the default" means.
         ttsCheck: {
           configured: config.ttsCheck.url !== "",
@@ -417,24 +431,74 @@ const baseAuthController = new Elysia({
       },
     },
   )
+  .patch(
+    "/me",
+    async ({ body, set, getAuthUser }) => {
+      const current = await getAuthUser();
+      if (!current) {
+        set.status = 401;
+        return { error: translate("errors.unauthorized", "Unauthorized") };
+      }
+      // An API key's principal carries its creator's id for audit, not the creator's authority over
+      // their own account: renaming a person is done by that person, from a session.
+      requireSession(current);
+      const user = await updateUserName(current.id, body.name.trim() || null);
+      return {
+        user: {
+          id: user.id.toString(),
+          email: user.email,
+          name: user.name,
+          role: current.role,
+        },
+      };
+    },
+    {
+      requireAuth: true,
+      body: t.Object({
+        name: t.String({
+          maxLength: 100,
+          description:
+            "The display name. Blank clears it, and the console shows the email instead.",
+        }),
+      }),
+      detail: doc(
+        "Update own profile",
+        "Only the display name is editable. The email is the account's identity and the role is an admin decision. Refused (403) with an API key: the key's principal names its creator for audit and does not act as them on their own account.",
+      ),
+      response: errors(401, 403, 422),
+    },
+  )
   // Change the authenticated user's own password (verify current, store new). Google-only accounts
   // get a 400 (no local password); a wrong current password is a 400 (not 401) so it doesn't trip
   // the client's session-expired handling.
   .patch(
     "/password",
-    async ({ body, set, getAuthUser }) => {
+    async ({ body, set, getAuthUser, setAuthCookie }) => {
       const user = await getAuthUser();
       if (!user) {
         set.status = 401;
         return { error: translate("errors.unauthorized", "Unauthorized") };
       }
+      // Same boundary as the profile: a key names its creator for audit and does not act as them on
+      // their own account.
+      requireSession(user);
+      let passwordHash: string;
       try {
-        await changeUserPassword(
+        passwordHash = await changeUserPassword(
           user.id,
           body.currentPassword,
           body.newPassword,
         );
       } catch (error) {
+        if (error instanceof PasswordChangedConcurrentlyError) {
+          set.status = 409;
+          return {
+            error: translate(
+              "errors.passwordChangedConcurrently",
+              "The password was changed in another session. Sign in again and retry.",
+            ),
+          };
+        }
         if (error instanceof NoPasswordSetError) {
           set.status = 400;
           return {
@@ -458,9 +522,15 @@ const baseAuthController = new Elysia({
         }
         throw error;
       }
+      // NOTE: the new hash revoked every session of this account, this one included. The caller's own
+      // cookie is re-signed so whoever made the change stays in. A change is not a sign-in, so the
+      // new cookie carries no method and does not stand in for adding a passkey.
+      await setAuthCookie(user, passwordHash);
+      closeUserSockets(user.id, WS_CLOSE.CREDENTIALS_CHANGED);
       return { success: true };
     },
     {
+      requireAuth: true,
       body: t.Object({
         currentPassword: t.String({
           minLength: 1,
@@ -476,9 +546,9 @@ const baseAuthController = new Elysia({
       }),
       detail: doc(
         "Change own password",
-        "Verifies the current password and stores a new one for the authenticated user. Returns 400 for Google-only accounts (no local password) or an incorrect current password.",
+        "Verifies the current password and stores a new one for the authenticated user, signing out every other session of the account. Returns 400 for Google-only accounts (no local password) or an incorrect current password, 403 with an API key (a session-only action), and 409 when another request changed the password first.",
       ),
-      response: errors(400, 401, 422),
+      response: errors(400, 401, 403, 409, 422),
     },
   )
   // ── invitation acceptance (public: the invitee has no account yet) ──
@@ -525,22 +595,22 @@ const baseAuthController = new Elysia({
   )
   // Consume the invite: join the invitee to the tenant (tenant + role bound to the invite row, never
   // the request) and auto-login. An email that already has an account gets a membership added to it,
-  // proven by being signed in as that account or by its current password (issue #756); otherwise the
+  // proven by being signed in as that account or by its current password; otherwise the
   // account is created. Bypasses SIGNUP_ENABLED / ALLOWED_SIGNUP_DOMAINS BY DESIGN — an
   // invite is explicit authorization by an admin, like the /setup operator bypass.
   .post(
     "/accept-invite",
-    async ({ body, set, setAuthCookie, getSessionUserId }) => {
+    async ({ body, set, setAuthCookie, getSessionIdentity }) => {
       let user: Awaited<ReturnType<typeof acceptInvite>>;
+      // A signed-in session only proves WHICH person it is, so it is read without the tenant
+      // selector: a membership removed while the page was open must not sign the invitee out here.
+      const session = await getSessionIdentity();
       try {
-        // A signed-in session only matters as proof of WHICH person it is, so it is read without the
-        // tenant selector: a membership removed while the page was open must not make the invitee
-        // "signed out" here (review round 5).
         user = await acceptInvite({
           token: body.token,
           password: body.password,
           name: body.name?.trim() || null,
-          sessionUserId: await getSessionUserId(),
+          session,
         });
       } catch (error) {
         if (error instanceof InviteAccountProofError) {
@@ -581,7 +651,18 @@ const baseAuthController = new Elysia({
         }
         throw error;
       }
-      await setAuthCookie(user);
+      // The same test `acceptInvite` applies before a password: when the session was the proof,
+      // the re-issue is refused if a logout ended that session meanwhile.
+      const provedBySession =
+        session?.userId === user.id &&
+        session.passwordHash === user.sessionPasswordHash;
+      await setAuthCookie(
+        user,
+        user.sessionPasswordHash,
+        provedBySession && session.sessionId
+          ? { proofSessionId: session.sessionId }
+          : {},
+      );
       logger.info(
         { userId: user.id.toString(), role: user.role },
         "User account created via invitation",
@@ -596,7 +677,8 @@ const baseAuthController = new Elysia({
         },
         // The tenant the invitation joined, which the console opens on. Separate from
         // `user.tenantId`, which is null for a fleet administrator.
-        joinedTenantId: user.joinedTenantId.toString(),
+        joinedTenantId:
+          user.joinedTenantId === null ? null : user.joinedTenantId.toString(),
       };
     },
     {
@@ -633,7 +715,17 @@ const baseAuthController = new Elysia({
   )
   .post(
     "/logout",
-    ({ clearAuthCookie }) => {
+    async ({ clearAuthCookie, endSession }) => {
+      const ended = await endSession();
+      // NOTE: a socket only checks its session when it opens, so the ones this session already
+      // opened are closed here; one opening right now re-reads the session and finds it ended.
+      if (ended) {
+        closeSessionSockets(
+          ended.userId,
+          ended.sessionId,
+          WS_CLOSE.UNAUTHORIZED,
+        );
+      }
       clearAuthCookie();
       return { success: true };
     },
@@ -641,13 +733,16 @@ const baseAuthController = new Elysia({
       detail: {
         ...doc(
           "Log out",
-          "Clears the authentication cookie for the current session.",
+          "Ends the current session on the server, so a copy of its cookie is refused from now on, and clears the cookie. Other sessions of the same account stay signed in. Succeeds with no session or an invalid cookie, ending nothing.",
         ),
         security: [],
         responses: {
           200: jsonResponse(
-            "The auth cookie was cleared.",
+            "The session was ended and the auth cookie cleared.",
             t.Object({ success: t.Literal(true) }),
+          ),
+          503: jsonResponse(
+            "The session could not be recorded as ended (a transient database failure); the cookie was kept so the logout can be retried.",
           ),
         },
       },
@@ -660,7 +755,11 @@ const googleAuthController = baseAuthController.post(
     try {
       const profile = await verifyGoogleIdToken(body.credential);
       const user = await upsertGoogleUser(profile);
-      await setAuthCookie(user);
+      // NOTE: the proof here is the Google credential, so the session is signed under whatever
+      // password the account holds now.
+      await setAuthCookie(user, await getPasswordHash(user.id), {
+        method: "google",
+      });
       void updateLastLogin(user.id).catch((error) => {
         logger.warn(
           { error, userId: user.id.toString() },
@@ -744,7 +843,7 @@ const googleAuthController = baseAuthController.post(
   },
 );
 
-// NOTE: When Google OAuth is disabled, the `/google` route is not registered at
+// When Google OAuth is disabled, the `/google` route is not registered at
 // all so schema validation never runs and Elysia returns its standard 404.
 // The exported type is always the enabled-mode controller so that the
 // generated treaty client keeps `auth.google.post(...)` available; the

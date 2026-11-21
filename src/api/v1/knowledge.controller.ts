@@ -1,6 +1,7 @@
 import { Elysia, t } from "elysia";
 import { doc, errors } from "@/api/lib/openapi";
 import { parseQueryCount, parseQueryText } from "@/api/lib/query-filters";
+import { tRanged } from "@/api/lib/ranged";
 import { tenancyPlugin } from "@/api/middlewares/tenancy";
 import { requireDbId } from "@/lib/db-id";
 import { ForbiddenError, TenantTargetRequiredError } from "@/lib/errors";
@@ -19,6 +20,11 @@ import {
 } from "@/modules/rag/documents";
 import { extractText } from "@/modules/rag/loaders";
 import {
+  CHUNK_OVERLAP_RANGE,
+  CHUNK_SIZE_RANGE,
+  SYNC_INTERVAL_MINUTES,
+} from "@/modules/rag/ranges";
+import {
   approveApprovalItem,
   createKnowledgeBase,
   createSuggestion,
@@ -26,9 +32,12 @@ import {
   editApprovalItem,
   getKnowledgeBase,
   KB_NAME_MAX,
+  listApprovals,
   listKnowledgeBases,
   listPendingApprovals,
+  REJECTION_REASON_MAX,
   rejectApprovalItem,
+  requeueDiscardedItem,
   searchKnowledge,
   updateKnowledgeBase,
 } from "@/modules/rag/service";
@@ -41,13 +50,11 @@ import {
 import type { ChunkHit } from "@/modules/rag/sql";
 
 // Knowledge base + human-approval REST surface (same core the agent tools and MCP project over).
-// Reads need auth; mutations and approvals require TENANT_ADMIN (the approval gate is the
-// load-bearing "nothing enters a KB without a human" invariant — it must be enforced server-side,
-// not by the UI).
-//
-// i18n anchor — keys referenced via AppError third argument (not direct translate() calls),
-// so they are declared here for the i18n extractor (keepRemoved: false). Keep in sync with
-// src/modules/rag/loaders.ts and src/modules/rag/documents.ts.
+// Reads need auth; mutations and approvals require TENANT_ADMIN, enforced server-side and not by
+// the UI: the approval gate is the load-bearing "nothing enters a KB without a human" invariant.
+
+// i18n extractor anchors, one line per AppError key (keepRemoved: false prunes a key with no
+// literal reference). Keep in sync with src/modules/rag/loaders.ts and src/modules/rag/documents.ts.
 // translate('errors.documentTooLarge', 'Document is too large to process')
 // translate('errors.invalidKnowledgeBaseName', 'Name must be 1 to {{max}} characters and cannot be blank')
 // translate('errors.embeddingEmpty', 'The embedding credential is empty.')
@@ -64,6 +71,14 @@ import type { ChunkHit } from "@/modules/rag/sql";
 // translate('errors.sourceUrlNotHttp', 'The portal URL must start with https:// or http://.')
 // translate('errors.sourceUrlQuery', 'The portal URL must not carry a query (?) or a fragment (#).')
 // translate('errors.sourceUrlNotAllowed', 'The server does not reach this address ({{reason}}): it only fetches public https addresses that resolve.')
+// translate('errors.ssrfBlocked', 'Blocked outbound URL: {{reason}}')
+// translate('errors.ssrfInvalidUrl', 'invalid URL')
+// translate('errors.ssrfProtocol', 'protocol {{protocol}} not allowed')
+// translate('errors.ssrfInternalTargetPort', '{{host}} is a declared internal target only on port {{declared}}, not {{port}}')
+// translate('errors.ssrfBlockedAddress', 'address {{host}} is in a blocked range')
+// translate('errors.ssrfDidNotResolveCode', '{{host}} did not resolve ({{code}})')
+// translate('errors.ssrfDidNotResolve', '{{host}} did not resolve')
+// translate('errors.ssrfResolvesToBlocked', '{{host}} resolves to blocked address {{address}}')
 // translate('errors.sourceSlugInvalid', 'The portal slug is required and may only use letters, digits, hyphens and underscores.')
 // translate('errors.sourceLocaleInvalid', 'The locale is required and must be a locale code, like pt_BR or en.')
 // translate('errors.sourceExcludeIdsInvalid', 'Excluded articles must be a list of article ids.')
@@ -94,13 +109,10 @@ export function readerSafeBlock(
   return block ? { reason: block.reason } : null;
 }
 
-// One search hit on the wire. Written out field by field, NOT as a spread of the row: `ChunkHit`
-// carries three bigint columns and the spread published all of them, with only two given a spelling
-// JSON accepts. `documentId` rode out as a BigInt and every search that MATCHED something answered
-// 500 (issue #253) — the empty-result case serialized fine, so the endpoint looked half-alive. The
-// two other readers of `ChunkHit` (the MCP tool and the agent's search_knowledge) already project
-// explicitly; this is the one that did not. A column added to the row now reaches the client only
-// when someone gives it a spelling here.
+// One search hit on the wire, written out field by field, NOT as a spread of the row: `ChunkHit`
+// carries bigint columns, and one without a JSON spelling makes every search that MATCHES something
+// answer 500 while the empty result still serializes. A column added to the row reaches the client
+// only when someone gives it a spelling here.
 export function searchHitDto(h: ChunkHit) {
   return {
     id: String(h.id),
@@ -124,8 +136,8 @@ export const knowledgeController = new Elysia({
     "/bases",
     async ({ tenantContext }) => {
       const bases = await listKnowledgeBases(ctxOrThrow(tenantContext));
-      // BigInt is not JSON-serializable (Elysia 500s) and the Eden treaty types must match the
-      // wire — serialize ids to string at the boundary (service keeps bigint for internal callers).
+      // NOTE: BigInt is not JSON-serializable (Elysia 500s) and the Eden treaty types must match the
+      // wire, so ids become strings at the boundary (the service keeps bigint for internal callers).
       return {
         instance: instanceIdentity,
         bases: bases.map((b) => ({ ...b, id: String(b.id) })),
@@ -186,8 +198,8 @@ export const knowledgeController = new Elysia({
       const ctx = ctxOrThrow(tenantContext);
       const id = requireDbId(params.id);
       const kb = await getKnowledgeBase({ ctx, id });
-      // The base's help center source, if it has one (issue #794): its config and the last run's
-      // outcome, which is where an operator reads a failed or suspicious sync.
+      // The base's help center source, if it has one: its config and the last run's outcome,
+      // which is where an operator reads a failed or suspicious sync.
       const source = await getSource(ctx, id);
       return {
         instance: instanceIdentity,
@@ -245,17 +257,13 @@ export const knowledgeController = new Elysia({
           }),
         ),
         chunkSize: t.Optional(
-          t.Integer({
-            minimum: 100,
-            maximum: 8000,
+          tRanged(CHUNK_SIZE_RANGE, {
             description:
               "Maximum characters per chunk when splitting documents for embedding.",
           }),
         ),
         chunkOverlap: t.Optional(
-          t.Integer({
-            minimum: 0,
-            maximum: 4000,
+          tRanged(CHUNK_OVERLAP_RANGE, {
             description:
               "Number of overlapping characters between consecutive chunks.",
           }),
@@ -304,7 +312,7 @@ export const knowledgeController = new Elysia({
           }),
         ),
         intervalMinutes: t.Optional(
-          t.Integer({
+          tRanged(SYNC_INTERVAL_MINUTES, {
             description: "Minutes between periodic syncs (default 10).",
           }),
         ),
@@ -407,10 +415,9 @@ export const knowledgeController = new Elysia({
       const block = await readEmbeddingBlock(ctx);
       return {
         instance: instanceIdentity,
-        // The tenant's CURRENT embedding block (null when indexing would work). Resolved per read,
-        // not stamped on the rows when they were blocked: a token stored back then would still be
-        // telling the operator to fill a credential they have since filled (issue #80).
-        //
+        // NOTE: the tenant's CURRENT embedding block (null when indexing would work). Resolved per
+        // read, not stamped on the rows when they were blocked: a stamped token would keep telling
+        // the operator to fill a credential they have since filled.
         embeddingBlock: readerSafeBlock(block),
         documents: page.documents.map((d) => ({
           ...d,
@@ -781,6 +788,45 @@ export const knowledgeController = new Elysia({
       response: errors(401, 403, 404),
     },
   )
+  .get(
+    "/approvals/discarded",
+    async ({ tenantContext }) => {
+      const approvals = await listApprovals(
+        ctxOrThrow(tenantContext),
+        "discarded",
+      );
+      return { instance: instanceIdentity, approvals };
+    },
+    {
+      requireAuth: true,
+      detail: doc(
+        "List discarded suggestions",
+        "List knowledge-base suggestions the suggestion reviewer held back as the same claim as something the base, the queue or a rejection already holds, with what each matched.",
+      ),
+      response: errors(401, 403, 404),
+    },
+  )
+  .post(
+    "/approvals/:id/requeue",
+    async ({ tenantContext, params }) => ({
+      instance: instanceIdentity,
+      result: await requeueDiscardedItem({
+        ctx: ctxOrThrow(tenantContext),
+        id: requireDbId(params.id),
+      }),
+    }),
+    {
+      requireRole: "TENANT_ADMIN",
+      detail: doc(
+        "Requeue discarded suggestion",
+        "Send a suggestion the reviewer discarded to the pending list, for a person to decide.",
+      ),
+      response: errors(400, 401, 403, 404),
+      params: t.Object({
+        id: t.String({ description: "Approval item id (BigInt as a string)." }),
+      }),
+    },
+  )
   .patch(
     "/approvals/:id",
     async ({ tenantContext, params, body }) => ({
@@ -818,43 +864,65 @@ export const knowledgeController = new Elysia({
   )
   .post(
     "/approvals/:id/approve",
-    async ({ tenantContext, params }) => ({
+    async ({ tenantContext, params, body }) => ({
       instance: instanceIdentity,
       result: await approveApprovalItem({
         ctx: ctxOrThrow(tenantContext),
         id: requireDbId(params.id),
+        asNew: body?.asNew,
       }),
     }),
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Approve suggestion",
-        "Approve a pending suggestion, committing the entry into its knowledge base.",
+        "Approve a pending suggestion, committing the entry into its knowledge base. When the suggestion reviewer named a document to replace, approving replaces that document unless asNew is true; a replacement that can no longer be made answers outcome replace-unavailable and claims nothing.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({ description: "Approval item id (BigInt as a string)." }),
       }),
+      body: t.Optional(
+        t.Object({
+          asNew: t.Optional(
+            t.Boolean({
+              description:
+                "Store the entry as a new document even when the reviewer named one to replace.",
+            }),
+          ),
+        }),
+      ),
     },
   )
   .post(
     "/approvals/:id/reject",
-    async ({ tenantContext, params }) => ({
+    async ({ tenantContext, params, body }) => ({
       instance: instanceIdentity,
       result: await rejectApprovalItem({
         ctx: ctxOrThrow(tenantContext),
         id: requireDbId(params.id),
+        reason: body?.reason,
       }),
     }),
     {
       requireRole: "TENANT_ADMIN",
       detail: doc(
         "Reject suggestion",
-        "Reject a pending suggestion so it is not added to the knowledge base.",
+        "Reject a pending suggestion so it is not added to the knowledge base. An optional reason is kept on the item and shown to the suggestion reviewer of later proposals; the audit line records the decision only.",
       ),
-      response: errors(400, 401, 403, 404),
+      response: errors(400, 401, 403, 404, 422),
       params: t.Object({
         id: t.String({ description: "Approval item id (BigInt as a string)." }),
       }),
+      body: t.Optional(
+        t.Object({
+          reason: t.Optional(
+            t.String({
+              maxLength: REJECTION_REASON_MAX,
+              description: "Why the suggestion was rejected.",
+            }),
+          ),
+        }),
+      ),
     },
   );

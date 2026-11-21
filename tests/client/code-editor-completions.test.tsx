@@ -1,7 +1,6 @@
 /// <reference lib="dom" />
 
-import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { afterEach, describe, expect, jest, test } from "bun:test";
 import {
   CompletionContext,
   closeCompletion,
@@ -31,13 +30,11 @@ import {
   CODE_TOOL_CONTEXT_VARS,
   CODE_TOOL_GLOBALS,
 } from "@/lib/code-tool-vocabulary";
+import { until } from "@/tests/utils/poll";
 
-// What the editor OFFERS, which is the half of issue #538 that pays: highlighting makes a broken
-// body easier to see, and completion is what makes the `context` vocabulary discoverable at all.
-//
-// The completion source is asked directly rather than through a keystroke: driving CodeMirror's
-// completion state in happy-dom would measure the debounce and the tooltip, not the rule, and the
-// rule is "which names, from where".
+// What the editor OFFERS: completion is what makes the `context` vocabulary discoverable at all.
+// The completion source is asked directly: driving CodeMirror's completion state in happy-dom would
+// measure the debounce and the tooltip, not the rule ("which names, from where").
 
 afterEach(cleanup);
 
@@ -133,9 +130,8 @@ describe("the editor the operator actually gets", () => {
     expect(view.state.doc.toString()).toBe("return 2;");
   });
 
-  // The counter `<Textarea>` renders, which the body lost when it moved off one. It matters MORE
-  // here, because the filter below refuses the edit instead of clamping the value: without a
-  // counter the field simply stops accepting characters and says nothing about why.
+  // NOTE: the counter `<Textarea>` renders matters MORE here, because the filter below refuses the edit
+  // instead of clamping: without a counter the field stops accepting characters and says nothing.
   test("the counter appears near the cap and marks a body already past it", () => {
     const { rerender } = render(
       <CodeEditor
@@ -169,7 +165,7 @@ describe("the editor the operator actually gets", () => {
       />,
     );
     expect(counted()).toEqual(["101/100"]);
-    // And the editor HOLDS it. The cap refuses an edit, and a write from the prop is not an edit:
+    // The editor HOLDS it. The cap refuses an edit, and a write from the prop is not an edit:
     // refusing one would leave the counter saying 101 over a document still holding 80, and the
     // next keystroke would write that stale text back over a value never shown.
     const view = EditorView.findFromDOM(
@@ -214,8 +210,8 @@ describe("the editor the operator actually gets", () => {
     expect(target?.textContent ?? "").toContain("over the limit");
   });
 
-  // A refusal the FORM decided is the other half of the same attribute, and it is the case that
-  // never had one: `invalid` reached the border and stopped there.
+  // NOTE: A refusal the FORM decided is the other half of the same attribute: `invalid` has to reach the
+  // accessibility tree, not only the border.
   test("the invalid prop reaches the textbox too", () => {
     render(
       <CodeEditor
@@ -230,10 +226,9 @@ describe("the editor the operator actually gets", () => {
     ).toBe("true");
   });
 
-  // Measured against the sibling field in the same modal: a real paste of 2 500 characters into
-  // `<textarea maxLength={2000}>` lands 2 000 of them, so the browser TRIMS. This editor refuses
-  // instead, because a JavaScript body missing its tail saves clean and fails when the agent calls
-  // it, and the refusal is announced by the test below.
+  // NOTE: A browser TRIMS a paste into `<textarea maxLength>`; this editor refuses instead, because a
+  // JavaScript body missing its tail saves clean and fails when the agent calls it. The refusal is
+  // announced (test below).
   test("a change past maxLength is refused, and an over-cap value still edits DOWN", () => {
     render(
       <CodeEditor
@@ -255,8 +250,8 @@ describe("the editor the operator actually gets", () => {
     expect(view.state.doc.toString()).toBe("abcde");
 
     cleanup();
-    // A value that ARRIVED past the cap (imported, or written through the API before the cap
-    // existed) has to open and has to shorten, or the operator cannot fix it from here.
+    // NOTE: a value that ARRIVED past the cap (imported, or written through the API) has to open and
+    // has to shorten, or the operator cannot fix it from here.
     render(
       <CodeEditor
         value="abcdefghij"
@@ -271,10 +266,9 @@ describe("the editor the operator actually gets", () => {
     expect(view2.state.doc.toString()).toBe("defghij");
   });
 
-  // The counter covers a body already NEAR the cap. A paste onto a short body is the case it does
-  // not cover, and it is the ordinary one: the operator drops in a body from somewhere, nothing
-  // lands, and there is no counter, no message and no error on screen to say a limit exists. So
-  // the refusal speaks for itself, and brings the counter out with it.
+  // NOTE: the counter covers a body already NEAR the cap, not a paste onto a short body: there nothing
+  // lands and nothing on screen says a limit exists. So the refusal speaks for itself, and brings
+  // the counter out with it.
   test("a refused change says so, on a body far below the counter's threshold", () => {
     render(
       <CodeEditor
@@ -380,10 +374,9 @@ describe("the editor the operator actually gets", () => {
     expect(seen).toEqual(["abcde"]);
   });
 
-  // The placeholder is console text, so it follows a language switch, and the completion source
-  // already reconfigures for exactly that event rather than rebuilding. The placeholder was the one
-  // that still tore the editor down: the operator switching the console to English mid-body would
-  // get a new view, losing the cursor, the selection and the undo history behind it.
+  // NOTE: the placeholder is console text, so it follows a language switch, and it must reconfigure
+  // rather than rebuild: a new view on a language switch would lose the cursor, the selection and
+  // the undo history.
   test("a placeholder change keeps the editor, with its history", () => {
     const { rerender } = render(
       <CodeEditor
@@ -421,8 +414,8 @@ describe("the editor the operator actually gets", () => {
     expect(placeholderText()).toBe("depois");
   });
 
-  // A body written in by the FORM is exempt from the cap (that is what opens an over-cap tool for
-  // editing), so it must not be reported as a refusal either — and it retires one already on
+  // NOTE: A body written in by the FORM is exempt from the cap (that is what opens an over-cap tool for
+  // editing), so it must not be reported as a refusal either, and it retires one already on
   // screen, which described a paste against the body being replaced.
   test("a controlled write is not a refusal, and retires the one on screen", () => {
     const { rerender } = render(
@@ -592,6 +585,15 @@ describe("the popup speaks the console's language", () => {
     }
   });
 
+  test("in pt-BR every context entry reads its own translated sentence", async () => {
+    await i18n.changeLanguage("pt-BR");
+    const got = completionsFor("context", [], i18n.t);
+    await i18n.changeLanguage("en");
+    for (const c of got) {
+      expect([c.label, c.info]).toEqual([c.label, ptContext[c.label]]);
+    }
+  });
+
   // The switch has to reach a popup that is already mounted: the completion source closes over `t`,
   // so nothing would change language until the modal was reopened.
   test("switching the language changes what the source would offer", async () => {
@@ -698,7 +700,9 @@ describe("text is not code: no completion inside a string or a comment", () => {
   // A slash is division far more often than it is a pattern, and lezer tells the two apart. This is
   // the case the guard must NOT take with it.
   test("but a division is code, and still completes", () => {
-    expect(ask("const x = a / input.")?.options.length).toBeGreaterThan(0);
+    expect(ask("const x = a / input.")?.options.map((o) => o.label)).toEqual([
+      "cpf",
+    ]);
   });
 
   // The hole in a template IS code, and the commonest place a body builds a message from a
@@ -711,10 +715,8 @@ describe("text is not code: no completion inside a string or a comment", () => {
 });
 
 // Ctrl-Space is how an operator asks what exists, and the blank body is where they most need to
-// ask. `matchBefore` needs at least one character, so it answered `null` there and the source
-// returned nothing: the one affordance for discovering `context` and `input` was silent at the
-// moment it was for. The dead `word.from === word.to` branch is what the original intent looked
-// like, and this is it, working.
+// ask. `matchBefore` needs at least one character, so the source answers the empty position on its
+// own (`word.from === word.to`) instead of returning nothing.
 describe("Ctrl-Space on nothing still offers the two roots", () => {
   function ask(doc: string, explicit: boolean) {
     const state = EditorState.create({ doc, extensions: [javascript()] });
@@ -727,8 +729,8 @@ describe("Ctrl-Space on nothing still offers the two roots", () => {
     r?.options.map((o) => o.label) ?? null;
 
   test("an explicit request on an empty body offers them", () => {
-    // The two parameters lead, and the sandbox globals follow them: the assertion is about the
-    // position answering at all, which is what was silent before.
+    // NOTE: the two parameters lead, and the sandbox globals follow them: the assertion is about the
+    // position answering at all.
     expect(labels(ask("", true))?.slice(0, 2)).toEqual(["context", "input"]);
   });
 
@@ -750,17 +752,11 @@ describe("Ctrl-Space on nothing still offers the two roots", () => {
   test("and an explicit request after another object's dot offers nothing", () => {
     expect(ask("foo.", true)).toBeNull();
   });
-
-  // A word being typed is a root position, so the list comes back and CodeMirror filters it: that
-  // is how `co` narrows to `context`, and it is why the check above has to be about the DOT.
-  test("while a word being typed is still a root", () => {
-    expect(labels(ask("co", true))?.slice(0, 2)).toEqual(["context", "input"]);
-  });
 });
 
-// The hotkey is meant to answer "what can I write here", and it answered with two names: the two
-// parameters. Everything else in scope was invisible, because `override` REPLACES the language's
-// own sources rather than adding to them, and the sandbox's own globals were in no list at all.
+// The hotkey answers "what can I write here" with the whole scope, not the two parameters.
+// `override` REPLACES the language's own sources rather than adding to them, so the sandbox's
+// globals and the language's locals have to be composed in explicitly.
 describe("the hotkey lists what is in scope, not just the two roots", () => {
   function ask(doc: string) {
     const state = EditorState.create({ doc, extensions: [javascript()] });
@@ -796,11 +792,9 @@ describe("the hotkey lists what is in scope, not just the two roots", () => {
     expect(at("JSON")?.detail).toBe("sandbox");
   });
 
-  // A name the OPERATOR declared is the other half of "what is in scope", and it is the half a
-  // custom `override` silently drops: passing sources there REPLACES the language's own, including
-  // the `localCompletionSource` that ships with it and reads the same tree. Driven through the
-  // mounted editor rather than by calling that source directly, because what is being tested is the
-  // composition: calling it by hand passes with the editor configured either way.
+  // NOTE: A name the OPERATOR declared is the other half of "what is in scope", and the half a custom
+  // `override` silently drops (it replaces `localCompletionSource`). Driven through the mounted
+  // editor because the test is about the composition: calling that source by hand passes either way.
   test("a variable the operator declared completes", async () => {
     render(
       <CodeEditor
@@ -814,19 +808,16 @@ describe("the hotkey lists what is in scope, not just the two roots", () => {
     ) as EditorView;
     view.dispatch({ selection: { anchor: view.state.doc.length } });
     startCompletion(view);
-    await new Promise((r) => setTimeout(r, 200));
+    await until("the list", () => completionStatus(view.state) === "active");
     expect(currentCompletions(view.state).map((c) => c.label)).toContain(
       "meuValor",
     );
   });
 });
 
-// The hotkey the console advertises. CodeMirror ships Ctrl-Space plus Alt-i/Alt-` on macOS, and on
-// a Mac none of the three arrives: macOS keeps Ctrl-Space for the input-source switcher, and on a US
-// International layout Alt-i is the circumflex DEAD key, so Chrome delivers `key: "Dead"` and a
-// keymap that matches on the key name has nothing to match. The operator saw a list that opened
-// while they typed and could not be reopened, which reads as a broken editor rather than as a
-// keyboard layout. The events below are the ones the OS actually produces.
+// The hotkey the console advertises. None of CodeMirror's own chords reaches a Mac (docs/ui.md,
+// the code editor's hotkey paragraph): macOS keeps Ctrl-Space for the input-source switcher, and
+// on US International Alt-i is a DEAD key. The events below are the ones the OS actually produces.
 describe("the advertised hotkey opens the list", () => {
   function mount() {
     render(<CodeEditor value="" onChange={() => {}} aria-label="Code" />);
@@ -860,31 +851,29 @@ describe("the advertised hotkey opens the list", () => {
   test("the Mod-i chord does, and the Mac dead key does not", async () => {
     const view = mount();
     press(view, modI);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(currentCompletions(view.state).length).toBeGreaterThan(0);
+    await until("the list", () => currentCompletions(view.state).length > 0);
 
     closeCompletion(view);
-    await new Promise((r) => setTimeout(r, 50));
-    expect(currentCompletions(view.state).length).toBe(0);
+    await until("the list closed", () => completionStatus(view.state) === null);
 
-    // What ⌥I sends on a US International layout: the keymap sees "Dead", not "i".
+    // What ⌥I sends on a US International layout: the keymap sees "Dead", not "i". A chord that
+    // started a completion would have it pending the moment the key is handled.
     press(view, { key: "Dead", code: "KeyI", keyCode: 73, altKey: true });
-    await new Promise((r) => setTimeout(r, 200));
-    expect(currentCompletions(view.state).length).toBe(0);
+    expect(completionStatus(view.state)).toBeNull();
   });
 
-  // Closing the list has to leave it reopenable, which is the half the operator reported: the popup
-  // came up on its own while typing and never came back after it was dismissed.
+  // NOTE: closing the list has to leave it reopenable: a popup that opens while typing and cannot come
+  // back after it is dismissed reads as a broken editor.
   test("and it reopens after the list was closed", async () => {
     const view = mount();
     const open = async () => {
       press(view, modI);
-      await new Promise((r) => setTimeout(r, 200));
+      await until("the list", () => currentCompletions(view.state).length > 0);
       return currentCompletions(view.state).length;
     };
     expect(await open()).toBeGreaterThan(0);
     closeCompletion(view);
-    await new Promise((r) => setTimeout(r, 50));
+    await until("the list closed", () => completionStatus(view.state) === null);
     expect(await open()).toBeGreaterThan(0);
   });
 });
@@ -928,10 +917,9 @@ describe("hover answers with the completion the list would have offered", () => 
     );
   });
 
-  // An argument name is any non-empty string, so a quote is declarable, and the subscript the
-  // COMPLETION writes for it is `JSON.stringify`'d. Stripping the two quote characters then leaves
-  // the escape in the middle, matching no declared name: the pointer went silent over a line this
-  // editor had just generated. Both quote styles, because the operator types the other one.
+  // NOTE: an argument name is any non-empty string, so a quote is declarable, and the subscript the
+  // COMPLETION writes for it is `JSON.stringify`'d. Stripping only the two quote characters would
+  // leave the escape in the middle and match no declared name. Both quote styles.
   test("a name whose subscript carries an escape", () => {
     const state = (doc: string) =>
       EditorState.create({ doc, extensions: [javascript()] });
@@ -945,10 +933,8 @@ describe("hover answers with the completion the list would have offered", () => 
     expect(
       askNamed(single, single.indexOf("contact_id") + 1, [])?.completion.label,
     ).toBe("contact_id");
-    // Every escape `JSON.stringify` can emit, not the two a hand-written table thought of: an
-    // argument name is any non-empty string, so a control character reaches one through the API and
-    // the completion writes it as `\\r` or `\\u0007`. Decoding those as the letters `r` and `u`
-    // matched no declared name, over an accessor this editor had generated.
+    // Every escape `JSON.stringify` can emit: an argument name can hold a control character
+    // (through the API), and the completion writes it as `\\r` or `\\u0007`.
     const control = "a\rb\u0007c";
     const written = `input[${JSON.stringify(control)}]`;
     expect(
@@ -974,33 +960,60 @@ describe("hover answers with the completion the list would have offered", () => 
     }
   });
 
-  // Pressing the chord proves ONE of the two bindings, the one this platform resolves `Mod-` to, and
-  // the other exists for the case this suite cannot stage: CodeMirror decides `Mod-` from the real
-  // `navigator` at module load, so a Mac cannot be simulated here, and the case is precisely a Mac
-  // whose label came out `Ctrl+I`. What the second binding buys is that a wrong label still names a
-  // key that works, so the decision is pinned as data rather than left to the one chord a test can
-  // press.
+  // NOTE: pressing the chord proves only the binding this platform resolves `Mod-` to. CodeMirror decides
+  // `Mod-` from the real `navigator` at module load, so a Mac cannot be staged here; the second
+  // binding is pinned as data so a wrong label still names a key that works.
   test("both chords are bound, so a wrong label still names a working key", () => {
     expect(SHOW_SCOPE_KEYS.map((b) => b.key)).toEqual(["Mod-i", "Ctrl-i"]);
     // Without this the browser's own Ctrl+I (page info, in Firefox) fires alongside the list.
     expect(SHOW_SCOPE_KEYS.every((b) => b.preventDefault)).toBe(true);
   });
 
-  // The tests above ask `hoverInfo` directly, and removing the hover from the editor's extensions
-  // leaves every one of them green: the same hole the local-completion test had, one file over. A
-  // hover cannot be driven here, though, and that was measured rather than assumed: happy-dom
-  // answers `posAtCoords` with 0 and CodeMirror's hover plugin still renders nothing, because it
-  // needs real geometry to decide what the pointer is over. So this is a source fence, for the
-  // reason the fences in CodeToolEditModal.test.tsx give, and what it asserts is the WIRING: the
-  // hover rides in the same extension the completion does, which is what makes a renamed argument
-  // reach both on one dispatch.
-  test("the hover is actually installed, in the completion's own compartment", () => {
-    const src = readFileSync("src/client/components/CodeEditor.tsx", "utf8");
-    const ext = src.slice(
-      src.indexOf("function completionExt("),
-      src.indexOf("function completionExt(") + 900,
+  // The pointer resting on a name opens the same sentence, and a renamed argument reaches it with
+  // the same reconfigure that reaches the list. happy-dom has no layout, so the view is told where
+  // the pointer is, and the hover delay runs on fake timers.
+  test("the hover answers on the editor, and follows a renamed argument", () => {
+    const doc = "return input.cpf;";
+    const hoverOn = (names: string[]) => (
+      <CodeEditor
+        value={doc}
+        onChange={() => {}}
+        argumentNames={names}
+        aria-label="Code"
+      />
     );
-    expect(ext.includes("scopeHover(names, t)")).toBe(true);
+    const { rerender } = render(hoverOn(["cpf"]));
+    const view = EditorView.findFromDOM(
+      document.body.querySelector(".cm-editor") as HTMLElement,
+    ) as EditorView;
+    const at = inside(doc, "cpf");
+    view.posAtCoords = (() => at) as typeof view.posAtCoords;
+    view.coordsAtPos = () => ({ top: 0, bottom: 20, left: 0, right: 400 });
+    const hovered = () => {
+      jest.useFakeTimers();
+      try {
+        const line = view.contentDOM.querySelector(".cm-line") as HTMLElement;
+        line.dispatchEvent(
+          new MouseEvent("mousemove", {
+            bubbles: true,
+            clientX: 10,
+            clientY: 10,
+          }),
+        );
+        jest.advanceTimersByTime(1_000);
+      } finally {
+        jest.useRealTimers();
+      }
+      const shown = document.body.querySelector(".cm-scopeHoverName");
+      return shown?.textContent ?? null;
+    };
+
+    expect(hovered()).toBe("cpf");
+    rerender(hoverOn(["valor"]));
+    expect(document.body.querySelector(".cm-scopeHoverName") === null).toBe(
+      true,
+    );
+    expect(hovered()).toBeNull();
   });
 
   test("and nothing at all for a name this editor does not know", () => {
@@ -1016,10 +1029,9 @@ describe("hover answers with the completion the list would have offered", () => 
   });
 });
 
-// The matcher allows whitespace on both sides of the dot, and then the range it returned started
-// at the dot, so CodeMirror filtered the list by a query beginning with spaces. Nothing matches
-// that, so an operator who typed `context. co` saw no popup at all while `context.co` worked:
-// half-supporting the spacing is worse than not allowing it, because the offer is silently empty.
+// The matcher allows whitespace on both sides of the dot, so the range it returns must start after
+// the spaces: CodeMirror filters by everything from `from` to the cursor, and a query beginning
+// with spaces matches nothing, leaving `context. co` with a silently empty popup.
 describe("the range starts at the NAME, not at the dot", () => {
   // What CodeMirror will filter the options by: everything from `from` to the cursor.
   function query(doc: string) {
@@ -1040,9 +1052,8 @@ describe("the range starts at the NAME, not at the dot", () => {
 });
 
 // An argument name is any string the operator declares, and this console is written in Portuguese:
-// `ação` is an ordinary field name here. The offer opened on `input.` and then vanished at the
-// `\u00e7`, because the matcher and its `validFor` were ASCII, so the operator saw the list they
-// wanted disappear exactly as they typed the letter that identifies it.
+// `ação` is an ordinary field name. The matcher and its `validFor` must accept non-ASCII letters,
+// or the offer vanishes at the `ç`.
 describe("an accented argument name stays filterable", () => {
   function ask(doc: string) {
     const state = EditorState.create({ doc, extensions: [javascript()] });
@@ -1077,10 +1088,9 @@ describe("an accented argument name stays filterable", () => {
   });
 });
 
-// What separates the sandbox's `context` from a name that merely ENDS in it, in every spelling the
-// look-back has been wrong about: a non-ASCII letter before it (`\w` is ASCII and a JavaScript
-// identifier is not), a private-field `#`, and a member dot on the other side of a space. Each one
-// offered this sandbox's members for somebody else's object.
+// What separates the sandbox's `context` from a name that merely ENDS in it: a non-ASCII letter
+// before it (`\w` is ASCII and a JavaScript identifier is not), a private-field `#`, and a member
+// dot on the other side of a space.
 describe("what is a root, and what is somebody else's member", () => {
   function ask(doc: string) {
     const state = EditorState.create({ doc, extensions: [javascript()] });
@@ -1090,22 +1100,19 @@ describe("what is a root, and what is somebody else's member", () => {
     )(new CompletionContext(state, doc.length, true));
   }
 
-  // The whitespace the matcher tolerates after a dot cuts both ways: with `config. context.` the
-  // character before the name is a SPACE, so a one-character look-back called it a root and offered
-  // this sandbox's members for somebody else's object. Skipping the whitespace is not enough on its
-  // own either, because `return context.` also has a space there and IS a root: what disqualifies
-  // the name is a member operator on the other side of the gap, never an identifier across it.
+  // NOTE: with `config. context.` the character before the name is a SPACE, so a one-character
+  // look-back would call it a root. Skipping whitespace alone is not enough either: `return context.`
+  // IS a root. What disqualifies the name is a member operator across the gap, not an identifier.
   for (const doc of [
     "config. context.",
     "obj?. con",
     "config.  input.",
     "a.b. context.",
-    // A comment is trivia between the dot and the property, and the character walk stopped at the
-    // slash and called what followed a variable.
+    // NOTE: a comment is trivia between the dot and the property; a character walk would stop at
+    // the slash.
     "config./*x*/ context.",
     "config. /* still a member */ input.",
-    // A member access split across lines: `matchBefore` never leaves the line, so the walk saw a
-    // newline, called it a boundary, and offered.
+    // NOTE: a member access split across lines: `matchBefore` never leaves the line.
     "config.\ncontext.",
     // And the name in a position where it is being DECLARED rather than read, which is every node
     // the grammar has other than a reference: only `VariableName` is one, which is why the check
@@ -1120,7 +1127,7 @@ describe("what is a root, and what is somebody else's member", () => {
 
   for (const doc of ["return context.", "  context.", "} context."]) {
     test(`${doc} is still a root`, () => {
-      expect(ask(doc)?.options.length).toBeGreaterThan(0);
+      expect(ask(doc)?.options.map((o) => o.label)).toContain("contact_name");
     });
   }
 
@@ -1136,10 +1143,6 @@ describe("what is a root, and what is somebody else's member", () => {
       expect(ask(doc)).toBeNull();
     });
   }
-
-  test("and the roots themselves still answer", () => {
-    expect(ask("context.")?.options.length).toBeGreaterThan(0);
-  });
 });
 
 // The list identity the reconfigure effect keys on. An argument name is not required to be an
@@ -1155,14 +1158,14 @@ describe("the key that decides a rename happened", () => {
     expect(namesKeyOf(['say "hi"', "x"])).not.toBe(namesKeyOf(['say "hi" x']));
   });
 
-  // And the component has to USE it. Driving CodeMirror's own completion is the only way to see the
-  // reconfigure land: the source is closed over by the compartment, so a rename that the effect did
-  // not notice leaves the editor offering the previous names with nothing on screen saying so.
+  // NOTE: the component has to USE it. Driving CodeMirror's own completion is the only way to see
+  // the reconfigure land: the source is closed over by the compartment, so a missed rename leaves
+  // the editor offering the previous names.
   test("a rename between two lists that collide on a join still reoffers", async () => {
     async function offered(view: EditorView) {
       view.dispatch({ selection: { anchor: view.state.doc.length } });
       startCompletion(view);
-      await new Promise((r) => setTimeout(r, 200));
+      await until("the list", () => completionStatus(view.state) === "active");
       return currentCompletions(view.state)
         .map((c) => c.label)
         .sort();
@@ -1198,11 +1201,10 @@ describe("the key that decides a rename happened", () => {
   });
 });
 
-// Escape is the standard key for dismissing a suggestion, and this editor lives in a dialog that
-// closes on Escape. Radix hears the press first (capture phase on `document`), so the editor cannot
-// stop it: it CLAIMS the press, and `<Modal>` turns the claim into the `preventDefault` Radix reads
-// back. Measured in a browser before this existed: dismissing a suggestion opened "Discard
-// changes?" over a body the operator was still writing.
+// Escape dismisses a suggestion, and this editor lives in a dialog that closes on Escape. Radix
+// hears the press first (capture phase on `document`), so the editor cannot stop it: it CLAIMS the
+// press, and `<Modal>` turns the claim into the `preventDefault` Radix reads back. Without it,
+// dismissing a suggestion would open "Discard changes?".
 describe("who owns Escape while the popup is open", () => {
   function mount(value: string) {
     render(
@@ -1226,12 +1228,10 @@ describe("who owns Escape while the popup is open", () => {
 
     view.dispatch({ selection: { anchor: view.state.doc.length } });
     startCompletion(view);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(completionStatus(view.state)).toBe("active");
+    await until("the list", () => completionStatus(view.state) === "active");
     expect(handOverEscape(content)).toBe(true);
     // Answering the claim also CLOSES the popup, because the press it answered was the press meant
     // to close it: reporting alone would leave the suggestion on screen and swallow the key.
-    await new Promise((r) => setTimeout(r, 50));
     expect(completionStatus(view.state)).not.toBe("active");
     expect(handOverEscape(content)).toBe(false);
   });
@@ -1242,21 +1242,27 @@ describe("who owns Escape while the popup is open", () => {
   // that had not finished arriving.
   test("a press during the debounce is claimed too", async () => {
     const { view, content } = mount("return context.");
-    view.dispatch({ selection: { anchor: view.state.doc.length } });
-    startCompletion(view);
-    expect(completionStatus(view.state)).toBe("pending");
-    expect(handOverEscape(content)).toBe(true);
-    // Answering it cancels the pending query rather than leaving one to open after the press.
-    await new Promise((r) => setTimeout(r, 250));
-    expect(completionStatus(view.state)).toBeNull();
+    jest.useFakeTimers();
+    try {
+      view.dispatch({ selection: { anchor: view.state.doc.length } });
+      startCompletion(view);
+      expect(completionStatus(view.state)).toBe("pending");
+      expect(handOverEscape(content)).toBe(true);
+      // Answering it cancels the pending query rather than leaving one to open after the press: the
+      // debounce runs out, and nothing opens when it does.
+      jest.advanceTimersByTime(1_000);
+      await act(async () => {});
+      expect(completionStatus(view.state)).toBeNull();
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   test("a press outside this editor is not this editor's to claim", async () => {
     const { view } = mount("return context.");
     view.dispatch({ selection: { anchor: view.state.doc.length } });
     startCompletion(view);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(completionStatus(view.state)).toBe("active");
+    await until("the list", () => completionStatus(view.state) === "active");
     expect(handOverEscape(document.body)).toBe(false);
   });
 
@@ -1266,8 +1272,7 @@ describe("who owns Escape while the popup is open", () => {
     const { view, content } = mount("return context.");
     view.dispatch({ selection: { anchor: view.state.doc.length } });
     startCompletion(view);
-    await new Promise((r) => setTimeout(r, 200));
-    expect(completionStatus(view.state)).toBe("active");
+    await until("the list", () => completionStatus(view.state) === "active");
     // NOT consulted before unmounting, on purpose: consulting closes the popup, and the claim would
     // then answer `false` for that reason instead of for the release, which is a test that passes
     // whether or not the release exists. Destroying a view leaves its last state behind, so a claim

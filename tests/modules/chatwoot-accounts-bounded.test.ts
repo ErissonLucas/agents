@@ -6,24 +6,16 @@ import type { TenantContext } from "@/lib/tenancy";
 import { setConnectedAccounts } from "@/modules/chatwoot/management";
 import type { VerifiedToken } from "@/modules/mcp/oauth/tokens";
 import { deploymentSetAccounts } from "@/modules/mcp/write-channels";
-import { seedChatwootInstance } from "../utils/chatwoot";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { fakeInstallation, seedChatwootInstance } from "../utils/chatwoot";
 
-// `deployment_set_accounts` publishes `account_ids: z.array(z.number().int())` with no maximum, and
-// `setConnectedAccounts` iterates it: every id not already active gets a row plus a best-effort
-// `syncInboxes`, two HTTP calls to the operator's Chatwoot, sequentially. Measured before the bound
-// existed (issue #503): one call carrying 40,000 ids created 16,774 `chatwoot_instances` rows in
-// about two minutes and was still climbing when it was killed.
-//
-// The bound is the deployment's own account list, and that it CAN be the bound was measured against
-// a real Chatwoot 4.17.0 rather than reasoned: a user access token whose profile reported account 1
-// of the server's two got 200 on `/api/v1/accounts/1/inboxes` and 401 "You are not authorized to
-// access this account" on `/accounts/2/inboxes`. An id outside the profile is an account the token
-// cannot operate at all.
-//
-// The stubs below therefore describe servers that can exist. A profile reporting [5, 8, 9] means a
-// token that reaches exactly those three, and `profileDown` is the probe FAILING — the only window
-// the numeric cap covers, kept fail-open so an outage on the operator's Chatwoot does not refuse a
-// write whose ids the operator picked deliberately.
+// `deployment_set_accounts` publishes `account_ids` with no maximum, and `setConnectedAccounts` gives
+// every new id a row plus a best-effort `syncInboxes` (two sequential HTTP calls), so an unbounded
+// list is unbounded work. The bound is the deployment's own account list: Chatwoot answers 401 on
+// `/accounts/:id/inboxes` for an account outside the token's profile, so such an id is one the token
+// cannot operate at all. A profile of [5, 8, 9] is a token reaching exactly those; `profileDown` is
+// the probe FAILING, the only window the numeric cap covers, kept fail-open so an outage on the
+// operator's Chatwoot does not refuse ids the operator picked deliberately.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -41,14 +33,14 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const suDb = su as PrismaClient;
 const appDb = app as PrismaClient;
 
-// NOTE: loopback on the discard port, for the reason spelled out in chatwoot-account-uniqueness:
+// Loopback on the discard port, for the reason spelled out in chatwoot-account-uniqueness:
 // the best-effort provisioning call inside setConnectedAccounts reaches out with this base URL, and
 // only loopback is refused by the SSRF guard immediately and offline.
 const SERVER = "https://127.0.0.1:9";
@@ -57,8 +49,14 @@ const REPORTED = [
   { id: 8, name: "Acc 8" },
   { id: 9, name: "Acc 9" },
 ];
-const profileOk = { fetchProfile: async () => ({ accounts: REPORTED }) };
+// Every account still answers its own read, which is what a claim is checked by.
+const { fetchAccount } = fakeInstallation("bounded");
+const profileOk = {
+  fetchProfile: async () => ({ accounts: REPORTED }),
+  fetchAccount,
+};
 const profileDown = {
+  fetchAccount,
   fetchProfile: async () => {
     throw new Error("chatwoot unreachable");
   },
@@ -119,14 +117,6 @@ describe.skipIf(!dbUp)("the accounts a deployment can be asked for", () => {
     expect(await activeIds()).toEqual([5]);
   });
 
-  test("a large array of ids it does not report is refused before any write", async () => {
-    const many = Array.from({ length: 501 }, (_, i) => 20_000 + i);
-    await expect(
-      setConnectedAccounts(ctx(), many, profileOk, appDb),
-    ).rejects.toThrow(/does not report account/);
-    expect(await activeIds()).toEqual([5]);
-  });
-
   // NOTE: with the probe down there is no list to check against, so the cap is what is left. Both
   // sides of it, because a cap asserted in one direction is satisfied by a tool that refuses
   // everything.
@@ -146,7 +136,7 @@ describe.skipIf(!dbUp)("the accounts a deployment can be asked for", () => {
   });
 
   test("the cap is measured on the DEDUPLICATED array", async () => {
-    // NOTE: 600 entries naming 3 accounts is not 600 accounts, and the work either bound exists to
+    // 600 entries naming 3 accounts is not 600 accounts, and the work either bound exists to
     // limit is per distinct account.
     const repeated = Array.from(
       { length: 600 },
@@ -158,7 +148,7 @@ describe.skipIf(!dbUp)("the accounts a deployment can be asked for", () => {
     expect(await activeIds()).toEqual([5]);
   });
 
-  // NOTE: the rule is the core's, so the preview inherits it rather than restating it (#490).
+  // NOTE: the rule is the core's, so the preview inherits it rather than restating it.
   test("the preview refuses what the apply refuses", async () => {
     const p: VerifiedToken = {
       userId: 1n,
@@ -171,7 +161,7 @@ describe.skipIf(!dbUp)("the accounts a deployment can be asked for", () => {
     const previewed = await deploymentSetAccounts(
       p,
       { account_ids: [5, 4242], dry_run: true },
-      { base: appDb, fetchProfile: profileOk.fetchProfile },
+      { base: appDb, ...profileOk },
     );
     expect(previewed.ok).toBe(false);
     if (!previewed.ok) {

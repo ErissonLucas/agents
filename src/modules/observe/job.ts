@@ -2,10 +2,10 @@ import type { BaseChatModel } from "@langchain/core/language_models/chat_models"
 import { type BaseMessage, HumanMessage } from "@langchain/core/messages";
 import { ToolInputParsingException } from "@langchain/core/tools";
 import { MemorySaver } from "@langchain/langgraph";
-import type { PrismaClient } from "@/../generated/prisma/client";
+import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import { chatwootThreadId } from "@/graph/checkpointer";
-import { recursionLimitFor } from "@/graph/graph";
+import { DEFAULT_MAX_TOOL_CALLS, recursionLimitFor } from "@/graph/graph";
 import type { ResolvedModelConfig } from "@/graph/models";
 import {
   buildCallbacks,
@@ -21,92 +21,111 @@ import { isEffectFreeTool } from "@/graph/tools/effect-free";
 import { modelVisibleLabels } from "@/graph/tools/label-view";
 import type { LabelWrite } from "@/graph/tools/label-writes";
 import type { McpLoadDeps } from "@/graph/tools/mcp";
-import { buildNativeTools } from "@/graph/tools/native";
+import {
+  buildNativeTools,
+  type HandoffTurnState,
+  sharedWriteKey,
+} from "@/graph/tools/native";
+import { recordDirectUsage } from "@/graph/usage";
 import { parseDbId } from "@/lib/db-id";
 import { withEntityLock } from "@/lib/locks";
+import { failureDetail, providerFailure } from "@/lib/provider-failure";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { clipText, clipTextEnd } from "@/lib/text";
+import { clipText } from "@/lib/text";
 import { isMonitoring } from "@/modules/agents/mode";
 import { agentObservesNow } from "@/modules/agents/speaks";
 import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { resetAckSendId } from "@/modules/chatwoot/constants";
 import {
+  instanceAgentBotChatwootIds,
   type LoadChatwootClientDeps,
   loadAgentBot,
   loadChatwootClient,
 } from "@/modules/chatwoot/instance";
 import { labelsNarrated } from "@/modules/chatwoot/label-activity";
+import type { ChatwootMessageRow } from "@/modules/chatwoot/messages";
 import {
-  buildQuoteResolver,
-  type ChatwootMessageRow,
-  parseChatwootMessages,
-  toRenderable,
-} from "@/modules/chatwoot/messages";
-import {
-  renderAttendantMessage,
-  renderInboundMessage,
-} from "@/modules/chatwoot/render";
+  readWindowRows,
+  renderTranscript,
+  stripFences,
+  type TranscriptLine,
+  transcriptFromRows,
+} from "@/modules/chatwoot/transcript";
 import { loadChatwootLabels } from "@/modules/chatwoot/vocab";
 import { underSignal } from "@/modules/contact-auth/check";
+import { observerRuleVerdict } from "@/modules/contact-auth/observer";
+import {
+  contactAuthHasRuleStage,
+  readContactAuthConfig,
+} from "@/modules/contact-auth/settings";
+import {
+  type DecisionsConfig,
+  decisionsFingerprint,
+  readDecisionsConfig,
+} from "@/modules/decisions/config";
+import type { DecisionResult } from "@/modules/decisions/providers";
+import {
+  answersForLog,
+  applyDecisions,
+  askProvider,
+  type DecisionProgress,
+} from "@/modules/decisions/run";
+import type { FillContext } from "@/modules/decisions/tool-args";
+import {
+  claimTriggerState,
+  type Generation,
+  latchRules,
+  type TriggerClaim,
+  writeTriggerState,
+} from "@/modules/decisions/trigger-state";
+import { emitCapacityWait } from "@/modules/flowlog/capacity";
+import {
+  emitFallbackAnswered,
+  emitFallbackFailed,
+} from "@/modules/flowlog/fallback-lines";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import {
   type ClaimedJob,
+  jobRetriesAfterFailure,
   type Rearm,
+  retireUnlessAllowedLaterOn,
   upsertJobRow,
 } from "@/modules/scheduler/service";
-import { type JobResult, registerJobHandler } from "@/modules/scheduler/worker";
+import {
+  type JobResult,
+  registerJobHandler,
+  wakeObserveDrainAt,
+} from "@/modules/scheduler/worker";
 import {
   announceSpendCeiling,
   spendCeilingVerdict,
 } from "@/modules/spend-ceiling/service";
+import { tryResolveApiKeyEntry } from "@/modules/vault/service";
 import { type MonitoringConfig, readMonitoringConfig } from "./settings";
 
-// The OBSERVE job (issue #477): a monitoring agent's verdict on a conversation it does not answer,
-// written as labels. It is what a watcher is for — a memory that grows and is never asked anything
-// is a cost with no reader — and it is the shape the rest of the product already reads: labels are
-// what the team filters by, what the reports count and what the automations key off.
-//
-// THE TICK IS STATELESS. It reads the newest messages of the conversation from Chatwoot rather than
-// the agent's memory thread, for two reasons that both come from the thread being keyed by CONTACT-
-// INBOX and not by agent: an observer beside a responder shares that thread (and would read the
-// responder's summaries as its own), and a conversation that predates the observer has history the
-// thread never saw. Chatwoot has all of it, and a transcription written by anyone is read through the
-// same renderers the turn uses.
-//
-// THEN THE ORDINARY TURN, on a muted client: `buildToolset` and `buildModelAndGraph`, the same two
-// calls the reactive turn and the nudge make. What the watcher does with what it read is its prompt
-// and its tools, not this file's business — this file only guarantees that nothing it does can
-// reach the customer, and that it stops when the world moves under it. It used to be one model call
-// constrained to a schema derived from `settings.monitoring.labelGroups`, with the verdict applied
-// deterministically here and announced as a private note; issue #568 is that whole shape.
+// The OBSERVE job: a monitoring agent's turn on a conversation it does not answer
+// (docs/chatwoot.md, Observation). THE TICK IS STATELESS: it reads the newest messages from
+// Chatwoot, not the memory thread, because that thread is keyed by contact-inbox and not by agent
+// (an observer beside a responder would read the responder's summaries, and history older than the
+// observer is not in it). Then the ordinary turn on a muted client (`buildToolset` and
+// `buildModelAndGraph`): this file only guarantees that nothing reaches the customer and that the
+// tick stops when the world moves.
 
 export type ObserveReason = "burst" | "resolved";
 
-// THE WHOLE TICK'S BUDGET, not the model call's. It bounds tool discovery as well as the turn,
-// because `runSchedulerTick` awaits every handler and `startScheduler` skips the next tick while one
-// is running: an MCP server that opens a stream and never says anything else stops reminders and
-// every other tenant's scheduled work, and discovery happens before any model call.
-//
-// Raised from the 60s the single constrained verdict call used to get, because a turn is now as many
-// model calls as the model makes tool calls, and a deadline a legitimate turn cannot meet is a tick
-// that fails, retries and spends again. Kept well under the scheduler's own 5-minute stale window,
-// so a tick always finishes before the reaper would treat its claim as abandoned.
+// THE WHOLE TICK'S BUDGET, discovery included: a tick holds one of the observe drain's slots and a
+// provider permit the shared tick's follow-ups also wait for, so an MCP server that never answers
+// would hold both for as long as it was let. Long enough for a multi-call turn, and well under the
+// scheduler's 5-minute stale window, so the reaper never treats a live claim as abandoned.
 export const OBSERVE_TIMEOUT_MS = 120_000;
 export const OBSERVE_CEILING_WINDOW_MS = 10 * 60_000;
 
-// HOW EACH FENCE REFUSAL ENDS THE TICK, one entry per refusal, so a refusal added later is a type
-// error until both of its questions are answered on purpose: is it retried, and if not, is its
-// `skipped` line something an operator has to act on.
-//
-// `retry` for the four reads that failed, and for a binding that has not landed yet: not a failed
-// read, but the same shape of answer, the world has not settled, so nothing it says is evidence.
-//
-// `info` for every withdrawal, because each one is the tick being RIGHT to stop and nobody has
-// anything to do about it: a message re-armed the row and the next tick reads it, the conversation
-// reopened or was reset, the operator switched the agent off, changed its analysis or took it off
-// the inbox. They defaulted to `warn`, and a warn pages the alert channel; on its first day in
-// production every observe alert was a `superseded` with nothing behind it (issue #611).
+// HOW EACH FENCE REFUSAL ENDS THE TICK, one entry per refusal, so a new refusal is a type error
+// until both questions are answered: is it retried, and does its `skipped` line need an operator.
+// `retry`: the failed reads, and a binding not landed yet (the world has not settled). `info`:
+// every withdrawal (re-armed, reopened, reset, switched off, analysis changed, off the inbox),
+// because the tick is RIGHT to stop and a `warn` would page the alert channel for nothing.
 const REFUSAL_ENDING = {
   agent_state_unreadable: "retry",
   settings_unreadable: "retry",
@@ -117,12 +136,14 @@ const REFUSAL_ENDING = {
   reopened: "info",
   reset: "info",
   analysis_changed: "info",
+  engine_changed: "info",
   agent_no_longer_observes: "info",
   agent_no_longer_on_inbox: "info",
+  contact_auth_refused: "info",
+  contact_auth_unreadable: "retry",
 } as const satisfies Record<string, "retry" | "info" | "warn">;
 type Refusal = keyof typeof REFUSAL_ENDING;
 
-const TRANSCRIPT_MAX_CHARS = 40_000;
 // The notes block gets its own budget, and it needs one for the same reason the transcript has one:
 // `window.messages` caps a COUNT, and a count is not a size. Twenty notes of twenty thousand
 // characters is a four-hundred-thousand-character prompt beside a three-line transcript, which
@@ -132,47 +153,73 @@ const NOTES_MAX_CHARS = 8_000;
 // ...and no single note may eat the whole budget, so one operator who pasted a log cannot hide every
 // note around it. `clipText` keeps the START, which for a note is where it says what it is about.
 const NOTE_MAX_CHARS = 2_000;
-// A label-change line is "<somebody> <verb> <label>", and each of the three is short. This block
-// rides on every observation of a conversation whose label has moved and a tick costs about
-// US$ 0.0005 today, so the line has a size it must fit in — but it is a REFUSAL and not a cut
-// (issue #642, round 14): a clipped sentence loses the later labels of a multi-label change, and in
-// a verb-final language it loses the verb.
+// A label-change line is "<somebody> <verb> <label>", each part short, and the block rides on every
+// observation, so a line has a size to fit in. Over it the line is REFUSED, not cut: a clipped
+// sentence loses the later labels of a multi-label change, and in a verb-final language the verb.
 const LABEL_CHANGE_MAX_CHARS = 200;
 const LABEL_CHANGES_MAX = 8;
-// NOTE: `notas-internas` joined the list when the notes block was added (issue #568, review round
-// 24), and it is the one whose content is WRITTEN BY PEOPLE — a colleague pasting a prompt they were
-// debugging, or a note that quoted a customer. A closing tag inside it ends the block early and
-// everything after it reads as if it were outside the notes, which is the same escape the transcript
-// closed on day one.
-// NOTE: `mudancas-de-etiqueta` joined it with the label-history block (issue #642): its content is
-// Chatwoot's own sentence around a LABEL, and a label is a string the model wrote (the tag list
-// accepts what the account's catalog would refuse), so the closing tag can arrive inside it.
-const FENCE_TAG =
-  /<\s*\/?\s*(transcricao|etiquetas-atuais|notas-internas|mudancas-de-etiqueta)[^>]*>/gi;
 
 function sysCtx(tenantId: bigint): TenantContext {
   return { tenantId, userId: null, role: "TENANT_ADMIN" };
 }
 
-// One row per CONVERSATION **and CLASSIFIER**: a burst re-arms it, a resolve pulls it forward. Its
-// own prefix, so it never collides with the responder's `debounce:` row on the same conversation.
-//
-// THE AGENT IS PART OF THE KEY (issue #477 review, round 1). An inbox can be watched by TWO
-// personas at once — a monitoring agent bound as the RESPONDER (#209's first rung) and a different
-// agent bound beside it as the OBSERVER — and both routes arm a tick, by design, each with its own
-// prompt and its own tools. Keyed by the conversation alone the two upserts are the same row: the
-// second overwrites `payload.agentId`, and which persona gets to look is decided by which delivery
-// happens to land last, with the other's turn dropped and nothing anywhere saying so. Two watchers
-// is two rows, two bursts and two model calls, which is what configuring two of them asks for.
+// One row per CONVERSATION and AGENT: a burst re-arms it, a resolve pulls it forward, and its own
+// prefix keeps it apart from the responder's `debounce:` row. The agent is in the key because an
+// inbox can have two watchers at once (a monitoring responder and a separate observer), each with
+// its own prompt and tools; keyed by conversation alone, the last delivery would decide who looks.
 export function observeDedupeKey(threadId: string, agentId: bigint): string {
   return `${observeKeyPrefix(threadId)}${String(agentId)}`;
 }
 
-// Every classifier's row on ONE conversation, for the caller that has to retire them together: the
-// key carries the agent, so a conversation's verdicts are a prefix and not a key (issue #477 review,
-// round 5).
+// Every agent's row on ONE conversation, for the caller that retires them together: the key carries
+// the agent, so a conversation's rows are a prefix and not a key.
 export function observeKeyPrefix(threadId: string): string {
   return `observe:${threadId}:`;
+}
+
+// The watcher's endpoint refused this conversation at an arm: retires its queued observation unless
+// an allow asked after this refusal armed it, and leaves the refusal's ask time on the row, under the
+// arm's lock, so an allow asked before it and still in flight (a delivery waiting on its media pass)
+// cannot re-arm what the refusal retired (`ArmObserveParams.gateAskedAt`). With no row yet, a DONE
+// one is created to carry the mark.
+export async function retireRefusedObserve(p: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  agentId: bigint;
+  askedAt: number;
+  base: PrismaClient;
+}): Promise<void> {
+  const threadId = chatwootThreadId(p.tenantId, p.instanceId, p.conversationId);
+  const dedupeKey = observeDedupeKey(threadId, p.agentId);
+  await runScopedOn(p.base, sysCtx(p.tenantId), (db) =>
+    withEntityLock(db, `observe-arm:${threadId}`, async () => {
+      await retireUnlessAllowedLaterOn(db, {
+        tenantId: p.tenantId,
+        kind: "OBSERVE",
+        dedupeKey,
+        at: p.askedAt,
+        allowedField: "gateAllowedAt",
+        refusedField: "gateRefusedAt",
+        // A resolution's verdict retired before it ran is not one this resolution already has.
+        unrunFields: ["resolveMark"],
+        createPayload: {
+          instanceId: String(p.instanceId),
+          conversationId: p.conversationId,
+          agentId: String(p.agentId),
+        },
+      });
+    }),
+  );
+}
+
+function readGateMark(
+  payload: unknown,
+  field: "gateRefusedAt" | "gateAllowedAt",
+): number | null {
+  if (!payload || typeof payload !== "object") return null;
+  const v = (payload as Record<string, unknown>)[field];
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
 export interface ArmObserveParams {
@@ -197,15 +244,16 @@ export interface ArmObserveParams {
   // not committed yet (`boundObserverRuntime`). Carried so the tick can tell "the row has not landed
   // yet" from "the agent was detached", which read the same on the row alone.
   attaching?: boolean;
-  // THE MESSAGE THIS BURST WAS ARMED ON, and the only coordinate the reset fence can be asked in
-  // (issue #477 review, round 6). `/reset` retires the PENDING rows, but a tick already claimed —
-  // its model call overlapping the command — is past every cancel, and it would write back the
-  // labels the reset had just cleared. `resetAtMessageId` is Chatwoot's own sequence, which is the
-  // order the operator experienced, so a verdict about a message at or below the command's is a
-  // verdict about the episode that was erased. Null on a resolve, which the reopen check covers
-  // instead: the command is an incoming message and it hands the conversation back, so a
-  // conversation that was resolved is no longer.
+  // THE MESSAGE THIS BURST WAS ARMED ON, the only coordinate the reset fence can be asked in:
+  // `/reset` retires PENDING rows, but a tick already claimed would write back the labels it
+  // cleared. Chatwoot's message id is the order the operator experienced, so a turn at or below the
+  // command's id is about the erased episode. Null on a resolve, which the reopen check covers (the
+  // command reopens it).
   atMessageId?: number | null;
+  // WHEN THE GATE'S ALLOW WAS ASKED (`observerArmPermit`). A refusal asked at or after it has
+  // retired the row and left its own ask time there (`retireRefusedObserve`); this arm then arms
+  // nothing, since the newer answer is the refusal. Absent, the arm is not fenced.
+  gateAskedAt?: number;
 }
 
 function readBurstStart(payload: unknown): number | null {
@@ -226,24 +274,22 @@ function readResolveMark(payload: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-// Arms (or re-arms) the one OBSERVE row of a conversation. `off` when the agent has nothing to
-// classify into, or when a burst arrives on an agent that only looks at the end; the caller is the
-// receiver or the flush, and neither treats a failure here as its own — a label that is late is not
-// a message that is lost. Same shape as the responder's debounce arm: a live PENDING row is the burst
-// this message joins and keeps its retry budget; anything else opens a new burst.
+// Arms (or re-arms) the one OBSERVE row of a conversation and agent. `off` when a burst arrives on
+// an agent that only looks at the end, or when this resolution already has its tick. The caller
+// (the receiver or the flush) does not treat a failure here as its own: a late observation is not a
+// lost message. Same shape as the responder's debounce arm: a live PENDING burst keeps its retry
+// budget.
 export async function armObserve(
   p: ArmObserveParams,
 ): Promise<"armed" | "off" | "failed"> {
-  // OBSERVATION IS THE MODE, and nothing else switches it on (issue #568). It used to be "there is
-  // at least one label group", because a watcher with nothing to classify into had nothing to do —
-  // which was true of a classifier and is not true of an agent. An enabled monitoring agent attached
-  // to an inbox is an agent the operator wants looking at these conversations; switching it off is
-  // disabling it or taking it off the inbox, the same two answers a responder has.
+  // NOTE: OBSERVATION IS THE MODE, and nothing else switches it on: an enabled monitoring agent on
+  // the inbox is one the operator wants looking. Switching it off is disabling it or taking it off.
   if (p.reason === "burst" && p.cfg.analysis !== "incremental") return "off";
   const threadId = chatwootThreadId(p.tenantId, p.instanceId, p.conversationId);
   const dedupeKey = observeDedupeKey(threadId, p.agentId);
   const nowMs = (p.now ?? new Date()).getTime();
   let armed = true;
+  let dueAt: Date | null = null;
   try {
     await runScopedOn(p.base, sysCtx(p.tenantId), (db) =>
       withEntityLock(db, `observe-arm:${threadId}`, async () => {
@@ -251,23 +297,27 @@ export async function armObserve(
           where: { kind: "OBSERVE", dedupeKey },
           select: { status: true, payload: true },
         });
-        // A PENDING row is the burst this message joins only when it IS a burst (issue #477 review,
-        // round 2). A resolve pulls the row to now, and a customer who reopens the conversation
-        // before that verdict is claimed opens a NEW burst: read as a continuation it inherits the
-        // resolve's `burstStartedAt`, which by then is almost always past the max window, so the new
-        // burst runs immediately instead of waiting for the window it was configured with.
-        // ONE VERDICT PER RESOLUTION, whichever of the four deliveries gets here (see `mark`). Read
-        // off the row whatever its status, because the case this closes is precisely the one where
-        // the first verdict has already been claimed.
-        //
-        // AT OR BELOW, not equal (issue #477 review, round 22). The mark is the conversation's own
-        // version, so it only ever moves forward; a delivery carrying one the row has already passed
-        // is a LATE echo of an older resolution — resolved, reopened, resolved again, with the first
-        // resolution's fourth delivery still in flight. Compared for equality it armed: the newer
-        // mark was overwritten by the older, so the current resolution could arm a second time and
-        // be billed twice, and the re-arm superseded a verdict that was in flight for the resolution
-        // that actually stands. A burst clears the mark, which is what keeps this from suppressing
-        // the NEXT resolution.
+        // A PENDING row is the burst this message joins only when it IS a burst: a customer
+        // reopening before a resolve's tick is claimed opens a NEW burst, which would otherwise
+        // inherit the resolve's `burstStartedAt` and run at once. ONE TICK PER RESOLUTION (see
+        // `mark`), read whatever the row's status. AT OR BELOW, not equal: the mark only moves
+        // forward, so a lower one is a late echo of an older resolution, and arming on it would
+        // bill the current one twice. A burst clears the mark.
+        // A refusal asked at or after this arm's allow is the newer answer, and it retired the row.
+        const gateRefusedAt = readGateMark(existing?.payload, "gateRefusedAt");
+        if (
+          p.gateAskedAt != null &&
+          gateRefusedAt !== null &&
+          gateRefusedAt >= p.gateAskedAt
+        ) {
+          armed = false;
+          return;
+        }
+        const allowedBefore = readGateMark(existing?.payload, "gateAllowedAt");
+        const gateAllowedAt =
+          p.gateAskedAt != null || allowedBefore !== null
+            ? Math.max(p.gateAskedAt ?? 0, allowedBefore ?? 0)
+            : null;
         const recordedMark = readResolveMark(existing?.payload);
         if (
           p.reason === "resolved" &&
@@ -275,6 +325,23 @@ export async function armObserve(
           recordedMark !== null &&
           recordedMark >= p.mark
         ) {
+          // Not re-armed, but a newer allow is kept: a refusal asked before it and landing late
+          // must still find the row authorized after it (`retireRefusedObserve`).
+          if (
+            gateAllowedAt !== null &&
+            gateAllowedAt !== allowedBefore &&
+            existing
+          ) {
+            await db.schedulerJob.updateMany({
+              where: { kind: "OBSERVE", dedupeKey },
+              data: {
+                payload: {
+                  ...(existing.payload as Record<string, unknown>),
+                  gateAllowedAt,
+                } as Prisma.InputJsonValue,
+              },
+            });
+          }
           armed = false;
           return;
         }
@@ -308,12 +375,16 @@ export async function armObserve(
               ? { resolveMark: p.mark }
               : {}),
             ...(p.attaching === true ? { attaching: true } : {}),
-            // ...and the NEWEST message of the burst, which is the MAXIMUM and not the last one
-            // to arrive (issue #477 review, round 9). Chatwoot delivers out of order often enough
-            // to matter, and this id is what the reset fence orders against: a delayed older
-            // delivery joining a burst that a newer message already armed would push the id
-            // BACKWARDS, and a reset sitting between the two would then discard the whole burst,
-            // the valid new message with it.
+            // Carried across re-arms, so an allow asked before the refusal and landing after a newer
+            // one still finds it.
+            ...(gateRefusedAt !== null ? { gateRefusedAt } : {}),
+            // The newest allow behind this row, so a refusal asked before it and landing late
+            // leaves the row runnable (`retireRefusedObserve`).
+            ...(gateAllowedAt !== null ? { gateAllowedAt } : {}),
+            // NOTE: ...and the NEWEST message of the burst: the MAXIMUM, not the last to arrive.
+            // Chatwoot delivers out of order, and a delayed older delivery pushing the id backwards
+            // would let a reset between the two discard the whole burst, the valid new message with
+            // it.
             ...(p.reason === "burst" &&
             (p.atMessageId != null ||
               (continuing && readAtMessageId(existing?.payload) != null))
@@ -328,8 +399,11 @@ export async function armObserve(
           },
           rearm,
         });
+        dueAt = new Date(runAtMs);
       }),
     );
+    // After the arm committed: the drain is asked for the instant the row becomes due.
+    if (dueAt !== null) wakeObserveDrainAt(dueAt);
     return armed ? "armed" : "off";
   } catch (err) {
     logger.warn(
@@ -386,126 +460,61 @@ export interface ObserveDeps {
   checkpointer?: ConstructorParameters<typeof MemorySaver> extends never
     ? never
     : MemorySaver;
-  // The row this tick is running FOR, so the generation fence below can ask whether it still is
-  // (issue #477 review, round 7). Optional because `runObserve` is callable without the scheduler.
+  // The row this tick is running FOR, so the generation fence can ask whether it still is. Optional
+  // because `runObserve` is callable without the scheduler.
   claim?: { jobId: bigint; claimSeq: number };
+  // What the scheduler does with this tick if it fails with nothing committed: `retry` while the job
+  // has attempts left, `dead_letter` on its last. Sets the failure line's level (`info` with
+  // `willRetry`, or `warn`); absent where no scheduler stands behind the tick, which keeps `error`.
+  afterFailure?: "retry" | "dead_letter";
   // The turn's deadline, injectable so a test can assert the tick gives up without waiting a
   // minute for it. Production never passes it.
   timeoutMs?: number;
-  // The fetch the outbound tools use, injectable for the same reason as makeClient and makeModel:
-  // the observer runs the ordinary toolset, and until this there was no way to exercise that path
-  // without the network. Production never passes it.
+  // The fetch the outbound tools use, injectable like makeClient and makeModel, since the observer
+  // runs the ordinary toolset. Production never passes it.
   outboundFetch?: typeof fetch;
+  // The fetch the `decisions` engine reaches its provider with. Production never passes it.
+  decisionFetch?: typeof fetch;
 }
 
-// A ROW THE TRANSCRIPT CAN USE. Factored out of `transcriptFromRows` so the paging below counts the
-// same thing the window measures: private notes, reactions and activity rows are not messages.
-function usableRow(m: ChatwootMessageRow): boolean {
-  return (
-    !m.private &&
-    !m.isReaction &&
-    (m.messageType === "incoming" ||
-      m.messageType === "outgoing" ||
-      // A TEMPLATE IS THE ATTENDANT SPEAKING (issue #477 review, round 4). Chatwoot files a
-      // customer-facing template send under its own `message_type`, and dropping it left the
-      // classifier a terse "sim" with nothing before it — the reply without the question. Activity
-      // lines stay out: they are the system narrating, not either side talking.
-      m.messageType === "template")
-  );
-}
-
-// PAGED BACKWARDS UNTIL THE WINDOW IS FULL (issue #477 review, round 1). One unanchored read is
-// Chatwoot's newest page, about twenty RAW rows, and `window.messages` goes to sixty — so every
-// value above one page silently read one page, and a newest page thick with private notes,
-// activity rows and reactions read fewer messages than that even on a short window. `before` walks
-// older (the fork's MessageFinder honours it), and the loop stops the moment the window is covered.
-//
-// BOUNDED, because a conversation is not: five pages is sixty usable messages at a dozen per page,
-// which is the ceiling the window itself has, and a conversation whose history is thinner than the
-// window simply ends — a page that adds no row older than the one before it is the end of it.
-const OBSERVE_MAX_PAGES = 5;
-
-async function readWindowRows(
-  client: ChatwootClient,
-  conversationId: number,
-  want: number,
-): Promise<ChatwootMessageRow[]> {
-  const seen = new Map<number, ChatwootMessageRow>();
-  let before: number | undefined;
-  for (let page = 0; page < OBSERVE_MAX_PAGES; page++) {
-    const rows = parseChatwootMessages(
-      await client.getMessages(
-        conversationId,
-        before === undefined ? undefined : { before },
-      ),
-    );
-    let oldest: number | null = null;
-    let added = 0;
-    for (const r of rows) {
-      if (!seen.has(r.id)) added += 1;
-      seen.set(r.id, r);
-      if (oldest === null || r.id < oldest) oldest = r.id;
+// What the `decisions` engine needs before the tick spends anything: the block it runs, and the key
+// it calls with. A problem stops the tick with a reason and never falls back to the `llm` engine: an
+// operator who chose classification did not choose to pay for a model turn when it is misconfigured.
+type DecisionsSetup =
+  | {
+      ok: true;
+      config: DecisionsConfig;
+      apiKey: string;
+      baseURL: string | null;
     }
-    // Nothing older came back: this is the start of the conversation, whatever the window asked for.
-    if (added === 0 || oldest === null) break;
-    let usable = 0;
-    for (const r of seen.values()) if (usableRow(r)) usable += 1;
-    // ...AND THE MESSAGES THE WINDOW QUOTES (issue #477 review, round 11). Enough rows is not
-    // enough CONTEXT: a reply inside the window can quote something on an older page, and a terse
-    // "sim" reaching the classifier without the question it answers is exactly the case the quote
-    // resolver exists for. Only the rows that will actually be RENDERED are asked about, and only
-    // within the same page bound, so this buys at most the pages the window already allows.
-    if (usable >= want && quotesResolved(seen, want)) break;
-    before = oldest;
-  }
-  return [...seen.values()];
-}
+  | {
+      ok: false;
+      skipped: "decisions_config_invalid" | "decisions_credential_unresolved";
+      problem?: string;
+      provider: string | null;
+      model: string | null;
+    };
 
-// Whether every quote the rendered window points at is already fetched. The window is the newest
-// `want` usable rows, the same slice `transcriptFromRows` renders.
-function quotesResolved(
-  seen: Map<number, ChatwootMessageRow>,
-  want: number,
-): boolean {
-  const window = [...seen.values()]
-    .filter(usableRow)
-    .sort((a, b) => a.id - b.id)
-    .slice(-want);
-  for (const r of window)
-    if (r.inReplyTo !== null && !seen.has(r.inReplyTo)) return false;
-  return true;
-}
-
-// The task, appended to the agent's own prompt: the persona says what the business is, this says
-// what to do with the conversation. In the product's language, like the summarizer's.
-// WHAT THE MODEL IS ASKED, and it is no longer a classification task. The groups, the enum and the
-// rules about which value wins used to be built here, because the verdict had to be machine-read;
-// now the operator writes that in their own prompt or in the tool's usage guidance, exactly as they
-// would for a responder — which is the whole point of the mode being generic (issue #568).
-//
-// What is left is the frame the agent cannot know on its own: it is reading, not answering, and
-// there is no reply channel this turn. The last line is the one that keeps a tick cheap: a
-// conversation where nothing changed should cost one model call and no writes.
-// What the block renders: the lines it recognised, and whether that is ALL of them. Two claims and
-// not one, because a line can be recognised in a window whose reading was still incomplete — a
-// change too long to scan or to show, or a recognition source that did not answer. `complete` is
-// deliberately not a count: a failed source leaves no number, and a note that invents one would be
-// a more precise claim than the evidence supports.
+// What the label-history block renders: the lines it recognised, and whether that is ALL of them.
+// A line can be recognised in a reading that was still incomplete (a change too long to scan, a
+// source that did not answer). `complete` is not a count: a failed source leaves no number.
 export interface LabelHistoryForPrompt {
   lines: readonly string[];
   complete: boolean;
 }
 
+// The observation frame appended to the agent's own prompt, in the product's language: what the
+// agent cannot know on its own (it is reading, with no reply channel). What to do with the
+// conversation is the operator's prompt. The last line keeps a quiet tick at one model call.
 export function observeTurnText(
   transcript: readonly TranscriptLine[],
-  // `null` is "we could not read them", which is NOT "there are none": the second is what makes a
-  // model clear a conversation it never saw the labels of (review round 33).
+  // `null` is "we could not read them", which is NOT "there are none": the second would let the
+  // model clear labels it never saw.
   current: readonly string[] | null,
   notes: readonly string[] = [],
-  // `null` is "no vocabulary to recognise a label change by", which is not "nothing changed": the
-  // block says which of the two it is (issue #642). Otherwise it is the history itself, the lines
-  // AND whether they are all of them, because the block has to be able to make a third claim:
-  // HERE IS WHAT I READ, AND IT IS NOT ALL OF IT (round 17).
+  // `null` is "no vocabulary to recognise a label change by", which is not "nothing changed"; the
+  // block says which. Otherwise the lines AND whether they are all of them, so the block can say
+  // "here is what I read, and it is not all of it".
   labelChanges: LabelHistoryForPrompt | null = null,
 ): string {
   return [
@@ -513,22 +522,32 @@ export function observeTurnText(
     "Não existe canal de resposta aqui: qualquer texto que você escrever não chega a lugar nenhum, nem ao cliente nem à equipe.",
     "O que você faz neste turno é agir sobre a conversa com as ferramentas que tem: etiquetar, anotar em nota privada, registrar atributo, mover o card, o que o seu papel pedir.",
     "Cada turno começa do zero: o que você já fez nesta conversa está no que está registrado nela, não na sua memória.",
-    // ...AND THE HALF THAT DOES NOT REGISTER ITSELF (review round 32). A label and a note are on the
-    // conversation, so the two lines above are enough for them. An action whose effect lands
-    // somewhere else — an HTTP call, a booking, a charge — leaves NOTHING here, and the next burst
-    // reads an overlapping window with the same evidence, which is an invitation to do it again.
-    // The note channel is the trace this design already has, so the frame asks for it and asks the
-    // model to read it back. A mitigation, not a guarantee: the residual risk is declared in the PR
-    // and in docs/chatwoot.md, because a model that ignores the instruction, or an effect older than
-    // the window, is still a repeat nobody can see from here.
+    // NOTE: an action with an effect OUTSIDE the conversation (an HTTP call, a booking) leaves
+    // nothing here, and the next burst reads an overlapping window with the same evidence. The note
+    // channel is the trace, so the frame asks for it and to read it back. A mitigation, not a
+    // guarantee.
     "Uma ação com efeito FORA desta conversa (chamada a sistema externo, agendamento, cobrança) não deixa rastro aqui: ao fazer uma, registre em nota privada o que foi feito, e não repita a que já estiver registrada.",
     "As notas abaixo são as que aparecem na janela que você está lendo; pode haver outras mais antigas que não estão aqui.",
     "Se nada precisa mudar em relação ao que já está registrado, não chame ferramenta nenhuma.",
     "",
-    // STRIPPED like the notes and the transcript, and for the same reason: `set_labels` sends the
-    // model's own strings to Chatwoot, and Chatwoot's tag list accepts what the account's label
-    // catalog would refuse — so a label can carry this block's own closing tag and end it early
-    // (review round 26). The tool's XML renderer escapes; this block is plain text, so it strips.
+    observeEvidenceText(transcript, current, notes, labelChanges),
+  ].join("\n");
+}
+
+// WHAT THE TICK READ, without the frame that tells a model how to act on it: the evidence the
+// `decisions` engine hands a classification API (modules/decisions), which has no tools and no use
+// for instructions about them, and which reads worse with irrelevant text in its state. The SAME
+// blocks the LLM path renders, by construction, so the two engines decide on the same evidence.
+export function observeEvidenceText(
+  transcript: readonly TranscriptLine[],
+  current: readonly string[] | null,
+  notes: readonly string[] = [],
+  labelChanges: LabelHistoryForPrompt | null = null,
+): string {
+  return [
+    // NOTE: stripped like the notes and the transcript: `set_labels` sends the model's strings to
+    // Chatwoot, whose tag list accepts what the catalog refuses, so a label can carry this block's
+    // closing tag. The tool's XML renderer escapes; this plain-text block strips.
     `<etiquetas-atuais>${
       current === null
         ? "(não foi possível ler)"
@@ -537,37 +556,19 @@ export function observeTurnText(
           : "(nenhuma)"
     }</etiquetas-atuais>`,
     "",
-    // THE NOTES THE CONVERSATION ALREADY CARRIES, and the reason they are here is the same as the
-    // labels'. A tick is stateless on purpose — its own thread, an in-memory checkpointer — so
-    // "don't write if nothing changed" is a question the model can only answer against what is
-    // WRITTEN on the conversation. A label it can see; a private note it wrote on the last burst it
-    // could not, because the transcript is public messages only, and it would file the same note
-    // again on every burst. Given as a separate block rather than folded into the transcript: a
-    // note is not somebody talking, and the window that counts messages must keep counting messages.
-    // NAMED FOR WHAT IT ACTUALLY HOLDS: the notes inside the window this turn read, not every note
-    // the conversation ever carried. The rows are the window's rows — a conversation with more
-    // public messages after a note than the window is wide does not fetch that note, and paging
-    // further for one would cost extra Chatwoot reads on every tick of every conversation that has
-    // no notes at all, which is most of them. So the block says its own scope instead of implying a
-    // completeness it does not have: "(nenhuma nesta janela)" is a different claim from "(nenhuma)",
-    // and it is the one that is true (review round 27).
+    // NOTE: THE NOTES THE CONVERSATION ALREADY CARRIES: the tick is stateless, so "don't write if
+    // nothing changed" can only be answered against what is WRITTEN, and the transcript is public
+    // messages only. A separate block, since a note is not somebody talking. Scoped to the window
+    // read, and it says so: "(nenhuma nesta janela)" is a different, true claim from "(nenhuma)".
     `<notas-internas escopo="janela-lida">${
       notes.length
         ? `\n${notes.map((n) => `- ${n}`).join("\n")}\n`
         : "(nenhuma nesta janela)"
     }</notas-internas>`,
     "",
-    // WHAT ALREADY CHANGED ON THIS CONVERSATION, for the same reason the two blocks above exist: a
-    // decision the model cannot see is a decision it makes again. Rendered even when empty, and
-    // saying which kind of empty — a block that disappears teaches nothing, while "(nenhuma nesta
-    // janela)" is the evidence that the label standing now has been standing since the window
-    // opened.
-    // A PARTIAL READING SAYS SO WHILE STILL SHOWING WHAT IT HAS (round 17). Lines that were
-    // recognised are read, whatever else was not, and dropping them costs the model the changes it
-    // CAN see; but handing them over silently makes an incomplete list look complete, which is the
-    // same licence to decide again that "(nenhuma nesta janela)" would be. So the block carries
-    // both: the lines, and that they are not all of them. With no line left to show, incomplete is
-    // the whole answer and the block says it could not read.
+    // NOTE: WHAT ALREADY CHANGED, for the same reason: a decision the model cannot see it makes
+    // again. Rendered even when empty, saying which empty. A partial reading shows what it has AND
+    // says it is incomplete; with nothing to show, incomplete reads as "could not read".
     `<mudancas-de-etiqueta escopo="janela-lida"${
       labelChanges !== null && !labelChanges.complete
         ? ' leitura="incompleta"'
@@ -619,113 +620,18 @@ function namesGuardedTitle(text: string, guard: ReadonlySet<string>): boolean {
   return false;
 }
 
-// WHAT WAS ALREADY DECIDED ON THIS CONVERSATION, in Chatwoot's own words (issue #642).
-//
-// A tick is stateless on purpose, and the frame says so: what the agent already did is in what is
-// RECORDED on the conversation. The labels standing right now are recorded and the model gets them.
-// The CHANGES are recorded too — Chatwoot writes one activity line per label added or removed — and
-// those were dropped from the window with the rest of the system's narration, so the model could not
-// tell a label that has been there since the first message from one it has already put on and taken
-// off twice in four minutes. Measured on one install over 12 hours: 676 category changes, 161
-// conversations going A to B and back to A, and 42% of the conversations that changed ending in the
-// category they started in.
-//
-// SHOWN VERBATIM. The activity row carries no sender and no `content_attributes` (measured:
-// `message_type=2`, `content_type=0`, `sender_id` null) — the only thing there is the sentence
-// Chatwoot localized ("Fulano adicionou cancelamento"). Rewriting it would mean composing grammar in
-// the account's language; forwarded whole, the actor, the verb and the label survive in every
-// language, and a human's change reads as a human's.
-//
-// SELECTED BY THE TEMPLATE CHATWOOT RENDERED IT FROM, and never by a guess about where the labels
-// sit in the sentence (round 5). `labelsNarrated` (chatwoot/label-activity.ts) holds the 74 strings
-// `conversations.activity.labels.added` and `.removed` take across every locale the fork ships, and
-// answers which titles a line names, or that no template rendered it. Guessing at the position is
-// what the rounds before it kept paying for: a run of known titles at the edge of the line misses
-// German and Turkish, which put it in the middle, and the quoted form that Japanese needs accepts
-// any other activity that quotes a value, a priority change or a group rename among them.
-//
-// THE TITLES IT NAMES STILL HAVE TO BE LABELS THIS ACCOUNT HAS, so a display name carrying a
-// template's own words ("João adicionou vip" as somebody's name) cannot narrate a change that never
-// happened. The check is against the account's catalog AND the conversation's own tags, which in
-// Chatwoot are two different tables: `/labels` answers from `Label`, filled by an operator in
-// Settings, while a tag attached through `set_labels` goes through acts_as_taggable_on and creates
-// no row there. A title the model invented is therefore in no catalog at any TTL, and the
-// conversation carrying it is the only place it can be recognised from (round 4).
-//
-// A ROW THAT DECLARES ITS OWN KIND IS NOT READ AT ALL. `content_attributes.activity.type` is the
-// only structural field an activity row has, and a label change never sets it: the label, assignee,
-// team, priority and SLA handlers all pass the sentence with no bag, while a status change writes
-// `conversation_status_changed` (round 2).
-//
-// THE GUARDED LABELS ARE SUBTRACTED, the way they are everywhere else the model can see
-// (`modelVisibleLabels`, `set_labels`): a line that names one is refused whole rather than edited,
-// because the guard's list may not reach the prompt in Chatwoot's sentence any more than in the
-// block above it, and a change nobody asked the model to make is not history it should reason from.
-// The ceiling on that list does NOT apply here: 40 is how many titles may be SHOWN, while this only
-// has to RECOGNISE them, and a label past the fortieth still gets put on conversations.
+// WHAT WAS ALREADY DECIDED ON THIS CONVERSATION: Chatwoot's label activity lines, forwarded
+// VERBATIM and selected by the template Chatwoot rendered them from (`labelsNarrated`). A title
+// must be a label in the account's catalog or on the conversation; a row declaring its own activity
+// type is not read; guarded labels refuse the line whole. docs/chatwoot.md (Observation) has the
+// reasoning.
 export interface LabelHistory {
   lines: string[];
   // Lines that ARE changes and could not be shown whole. Non-zero means the block may not claim the
-  // window was quiet, for the same reason a failed read may not (round 14).
+  // window was quiet, as a failed read may not.
   omitted: number;
 }
 
-// THE RESET'S OWN CLEANUP IS NOT THIS EPISODE'S HISTORY (round 20). `reset_at_message_id` is the id
-// of the `/reset` MESSAGE, and the command clears the labels a dozen Chatwoot calls later, so the
-// removal activity Chatwoot writes for that clear lands ABOVE the boundary and survives the filter
-// every other block is protected by. The next tick then reads "Fulano removeu compra-de-ingresso" —
-// the erased episode's labels, named, and read by a stateless observer as a reason not to put that
-// label back, which is the opposite of what the operator was told happened.
-//
-// The cut is the ACKNOWLEDGEMENT'S OWN ROW, found by the name the command wrote into it
-// (`resetAckSendId`, constants.ts). `/reset` posts it only once every cleanup step has run, so it
-// is the latest point in the command this side can name. The first version cut at the first row
-// that was not narration, and a customer message landing inside the cleanup takes that place and
-// lets the removal through; it also never stopped applying, so once the window had slid past the
-// reset it went on dropping legitimate activity rows before the window's oldest message (round 21).
-//
-// AND THE CUT IS WHAT THE RESET SAYS IT TOOK, NOT WHERE THE ACK LANDED (issue #645). The
-// label-change activity is not written by the labels request: `LabelActivityMessageHandler#create_label_change_activity`
-// hands it to `Conversations::ActivityMessageJob.perform_later`, so the row appears whenever that
-// Sidekiq job runs. Normally that is well inside the dozen calls still ahead of the acknowledgement;
-// on an install whose queues are backed up (which this one has been) the job lands after it, the row
-// keeps an id ABOVE the ack, and an order test cannot see it — which is exactly the residual round 22
-// wrote down and this issue came back for. So the command NAMES the set it removed, on
-// `conversations.reset_cleared_labels`, and the question here is a content one: a removal line whose
-// titles are all in that set is the reset's own, whenever it arrives.
-//
-// ON OUR ROW AND NOT ON THE ACKNOWLEDGEMENT'S `content_attributes`, which is where it was until the
-// review round measured the leak (round 2): the widget renders that bag verbatim to the CONTACT
-// (`api/v1/widget/messages/index.json.jbuilder`) and `Message#push_event_data` ships the whole
-// attributes hash, so internal label names would reach the customer on a website inbox. The column
-// also frees the content test from needing the acknowledgement to have landed at all.
-//
-// CONSUMED, one title at a time, and only by a REMOVAL line (round 1). A cleared title leaves the
-// set with the removal that narrates it, so a label put back after the reset and taken off again
-// has its own lines read: the reset removes each title exactly once, and every further mention of it
-// is somebody else's doing.
-//
-// The reading is checked against the CLEARED SET and not against the account's catalog, which is
-// stricter for free: these titles were standing on this conversation seconds ago, so a locale that
-// admits two readings of the same line ("Ana removeu a vip" is the label `a vip` under pt and `vip`
-// under pt_BR) is settled by the set rather than by a catalog that has both.
-//
-// THE TWO CUTS ARE JOINED (round 5): the set answers for the titles THIS reset removed, at any id,
-// and the acknowledgement's row answers for everything the command wrote before it, whatever the
-// titles. Only the second covers a PREVIOUS reset's removal line arriving late, which names a title
-// the newer clear no longer found standing and therefore never recorded.
-//
-// NO SET, THE OLD CUT ALONE, AND THEN NO MARKER, NO CUT. A reset from before the column made no claim, so
-// those conversations fall back to the acknowledgement's id and keep the round-20 behaviour —
-// including its miss, the colleague who changed a label between the command and the ack. A reset
-// whose acknowledgement never landed either has nothing left that says where its cleanup ended, and
-// a guess there is what round 21 was about: it reads the way it did before this block existed. With
-// a set present neither applies, and that miss is gone: the colleague's line names a title the reset
-// did not remove.
-//
-// A line nothing can READ is not filtered here, and does not have to be: recognition is the same
-// parser `labelHistoryFromRows` runs below, so a removal sentence no template matches is invisible
-// to the reader this filter protects.
 // An array of strings or nothing. A single element of another type disqualifies the whole value
 // rather than being dropped: a column value this build did not write cannot be repaired into one it
 // did, and a set read half-right would hide the lines of the titles that survived.
@@ -734,41 +640,30 @@ export function stringArrayOrNull(v: unknown): string[] | null {
   return v.every((e) => typeof e === "string") ? (v as string[]) : null;
 }
 
+// The rows past the reset boundary MINUS the reset's own cleanup (docs/chatwoot.md, Observation): a
+// removal line whose titles are all in `cleared` is the reset's own, each title consumed once, and
+// the acknowledgement's row (`resetAckSendId`) cuts every activity the command wrote before it.
 export function afterResetNarration(
-  // THE PAGE AS FETCHED, boundary and all, and this function applies the boundary filter itself
-  // (issue #645, review round 1). It needs one fact the filtered rows cannot carry: whether the
-  // window still REACHES the command. A page that stops above it was truncated, so the cleanup's
-  // own row may have aged out while the acknowledgement is still in view, and the two regimes below
-  // answer the same ambiguous pair of lines differently.
+  // THE PAGE AS FETCHED, boundary included, filtered here: whether the window still REACHES the
+  // command decides how an ambiguous pair of lines is read below.
   fetched: ChatwootMessageRow[],
   resetBoundary: number | null,
-  // WHAT THE RESET SAYS IT REMOVED, from `conversations.reset_cleared_labels` and not from any row
-  // in the page (issue #645, review round 2). It rode the acknowledgement's own `content_attributes`
-  // first, which hands it to the CONTACT on a website inbox, so the set lives on our side of the
-  // fence now — and it no longer needs the acknowledgement to have landed at all. NULL is a reset
-  // that made no claim (one from before the column, or one whose clear never returned), which is
-  // the only case that still falls back to the order cut below.
+  // WHAT THE RESET SAYS IT REMOVED, from `conversations.reset_cleared_labels` (our row, because the
+  // ack's `content_attributes` reach the CONTACT on a website inbox). NULL is a reset that made no
+  // claim, the only case that falls back to the order cut alone.
   cleared: string[] | null,
 ): ChatwootMessageRow[] {
   if (resetBoundary === null) return fetched;
   const rows = fetched.filter((r) => r.id > resetBoundary);
-  // THE TWO CUTS ARE JOINED, not alternatives (issue #645, review round 5). The set answers for the
-  // titles THIS reset removed, at any id; the acknowledgement's row answers for everything the
-  // command wrote before it, whatever the titles. Only the second one covers a PREVIOUS reset's
-  // removal line arriving late: two commands in a row with the activity job behind them leaves the
-  // first reset's line between the second command and its acknowledgement, named with a title the
-  // second clear no longer found standing and therefore never recorded.
-  //
-  // The price is the one the order cut always had, and it comes back with it: a colleague who
-  // changed a label between the command and its acknowledgement loses that line. It is a miss, in
-  // the direction this block fails in on purpose, and it is bounded by the cleanup's own stretch.
+  // THE TWO CUTS ARE JOINED: the set answers for the titles THIS reset removed, at any id;
+  // the ack's row for everything the command wrote before it, which alone covers a PREVIOUS reset's
+  // late removal line. Its price: a colleague's label change between the command and its ack is
+  // lost.
   const marker = resetAckSendId(resetBoundary);
   const ack = rows.find((r) => r.sendId === marker);
-  // ...AND THE ORDER CUT IS APPLIED LAST, after the walk below has read every row past the boundary
-  // (round 6). In the ORDINARY case the cleanup's removal line sits BELOW the acknowledgement, so
-  // cutting first hid it from the walk, its titles were never spent, and the next genuine removal
-  // of one of them was dropped in its place — the miss this filter exists to avoid, on the common
-  // path rather than on a rare one.
+  // ...AND THE ORDER CUT IS APPLIED LAST, after the walk reads every row past the boundary:
+  // the cleanup's removal line usually sits BELOW the ack, and cutting first would leave its titles
+  // unspent.
   const orderCut = (r: ChatwootMessageRow) =>
     ack === undefined || r.messageType !== "activity" || r.id > ack.id;
   // NO SET, NO CONTENT TEST, and then the order cut is all there is.
@@ -780,8 +675,8 @@ export function afterResetNarration(
   // have aged out, and a budget held for a row nobody will ever read hides real removals forever.
   const reachesCommand = fetched.some((r) => r.id <= resetBoundary);
   const dropped = new Set<number>();
-  // In id order, because consuming a title is order-dependent; the ROWS are returned in the order
-  // they came in, which is what every caller before this change received.
+  // NOTE: in id order, because consuming a title is order-dependent; the rows are returned in the
+  // order they came in.
   for (const r of [...rows].sort((a, b) => a.id - b.id)) {
     // CONSUMPTION IS A LIMITED RESOURCE, so only a row that could BE Chatwoot's own narration may
     // spend a title. A private note and a row that declares its own kind are neither (Chatwoot
@@ -796,20 +691,15 @@ export function afterResetNarration(
     // over the very cleanup this function exists to hide.
     if (r.content.length > ACTIVITY_SCAN_MAX_CHARS) continue;
     const readings = labelsNarrated(r.content);
-    // A TITLE PUT BACK IS NOT PENDING ANY MORE — but only where the cleanup's own line is out of
-    // reach (issue #645, review round 1). The two regimes answer the same pair of rows, `[added A,
-    // removed A]`, and the rows are IDENTICAL in both: with a truncated page the removal is
-    // somebody's real change and the reset's own line aged out, while with the command in view the
-    // removal is the reset's, delayed past an addition whose own Sidekiq job was delayed too.
-    // Nothing in the content separates them, so the page's reach decides, and each regime chooses
-    // the error that fits it: a truncated page must not hold a budget for a row it will never see,
-    // and a complete page must not spend that budget on an addition.
+    // NOTE: A TITLE PUT BACK IS NOT PENDING ANY MORE, but only where the cleanup's own line is out
+    // of reach. `[added A, removed A]` is identical in both regimes, so the page's reach decides: a
+    // truncated page holds no budget for a row it will never see, a complete one never spends it on
+    // an addition.
     if (!reachesCommand)
       for (const r0 of readings)
         if (r0.kind === "added") for (const t of r0.titles) pending.delete(t);
-    // ...AND ONLY A REMOVAL CAN BE THE CLEANUP'S OWN LINE. Reading the verb is what stops an
-    // addition whose Sidekiq job landed out of order from spending the title and letting the real
-    // removal through — the finding that this asymmetry exists to answer.
+    // ...AND ONLY A REMOVAL CAN BE THE CLEANUP'S OWN LINE, so an addition whose Sidekiq job
+    // landed out of order cannot spend the title and let the real removal through.
     const removal = readings.find(
       (r0) => r0.kind === "removed" && r0.titles.every((t) => pending.has(t)),
     );
@@ -832,19 +722,10 @@ export function labelHistoryFromRows(
     vocabulary.map((l) => l.trim()).filter((l) => l !== ""),
   );
   if (known.size === 0) return { lines: [], omitted: 0 };
-  // A row too long to SCAN is a row nobody read, so it is counted like the one too long to SHOW
-  // (round 16). `set_labels` takes an unbounded list, so a batch big enough to push its own activity
-  // sentence past the scan limit is something this application produces, and dropping it quietly let
-  // the block report `(nenhuma nesta janela)` over the very change the model had just made. The
-  // guard is checked FIRST and stays silent. Its ORIGINAL reason died with issue #695 — the promise
-  // used to be that the guarded string never reaches the model, and it now reaches it twice, in the
-  // tool's own description and in `<etiquetas-atuais>`. What survives is the narrower reason, which
-  // is the one that still holds here: a count that appears only on conversations carrying a guarded
-  // label is itself a signal about that label, so a visible `omitted` would announce "something you
-  // may not touch moved" on exactly those conversations and nowhere else. This block narrates WHO
-  // moved WHAT, which is not the model's business for a label it may not move; the VALUE is shown
-  // elsewhere precisely so it stops inventing a synonym for it. Relaxing this is a decision about
-  // narration rather than about the fence, and it belongs to its own issue.
+  // A row too long to SCAN is a row nobody read, so it is counted like one too long to SHOW
+  // (`set_labels` takes an unbounded list, so this application produces such rows). The guard is
+  // checked FIRST and stays silent: a count appearing only on conversations carrying a guarded
+  // label would itself narrate that label.
   let unread = 0;
   const recognised = rows
     .filter((m) => {
@@ -852,21 +733,16 @@ export function labelHistoryFromRows(
       if (m.activityType !== null) return false;
       if (namesGuardedTitle(m.content, guard)) return false;
       if (m.content.length > ACTIVITY_SCAN_MAX_CHARS) {
-        // ...AND ONLY IF IT COULD HAVE BEEN ONE (round 21). Recognition needs EVERY title the line
-        // names to be a label this account has, so a sentence carrying none of them cannot be a
-        // change under any reading — an imported activity with a long body is the ordinary case.
-        // Counting it made the block announce a hidden label change over a row where no label
-        // moved. The substring test is looser than the reading that would follow, which is the
-        // right direction: it over-counts rather than claiming a quiet window.
+        // NOTE: ...AND ONLY IF IT COULD HAVE BEEN ONE: recognition needs every title to be a label
+        // this account has, so a long line naming none is not a change. The substring test
+        // over-counts, which is the safe direction.
         if ([...known].some((t) => m.content.includes(t))) unread += 1;
         return false;
       }
       const readings = labelsNarrated(m.content);
       if (readings.length === 0) return false;
-      // ANY reading naming a guarded label refuses the line: the guard's promise is about the
-      // string reaching the model, and a locale that glues a particle onto the title (Korean writes
-      // `vip을(를)`) puts it out of reach of the scan above, which asks for a word boundary the
-      // sentence does not have (round 7).
+      // NOTE: ANY reading naming a guarded label refuses the line: a locale that glues a particle
+      // onto the title (Korean `vip을(를)`) escapes the word-boundary scan above.
       if (readings.some((r) => r.titles.some((t) => guard.has(t))))
         return false;
       // And ONE reading whose titles this account actually has is what makes the line a change.
@@ -875,11 +751,8 @@ export function labelHistoryFromRows(
       return readings.some((r) => r.titles.every((t) => known.has(t)));
     })
     .sort((a, b) => a.id - b.id);
-  // THE CAP HIDES CHANGES TOO (round 18). `escopo="janela-lida"` says where the block looked, not
-  // that everything it found is in it, and a conversation with more than `limit` changes in one
-  // window is the oscillation this whole block exists for. Showing the newest eight as if they were
-  // all of them is the same false completeness a silent drop would be, so what the cap removes is
-  // counted like everything else nobody could show.
+  // THE CAP HIDES CHANGES TOO: `escopo="janela-lida"` says where the block looked, not that
+  // all it found is in it, so what the cap removes is counted like anything else nobody could show.
   const capped = Math.max(0, recognised.length - limit);
   const changes = recognised
     .slice(-limit)
@@ -889,11 +762,8 @@ export function labelHistoryFromRows(
         .replace(/\s*\n\s*/g, " "),
     )
     .filter((t) => t.length > 0);
-  // WHOLE OR NOT AT ALL (round 14). Clipping a sentence to its first 200 characters drops the later
-  // labels of a multi-label change, and in a verb-final language it drops the VERB: "Hans hat vip,
-  // …, x hinzugefügt" cut short says somebody did something to those labels and not which thing,
-  // which is worse than not knowing. So an over-long line is left out and counted, and the count is
-  // what stops the block from reporting the window as quiet.
+  // WHOLE OR NOT AT ALL: a clipped sentence drops later labels and, in a verb-final language
+  // ("Hans hat vip, …, x hinzugefügt"), the verb. An over-long line is left out and counted.
   const lines = changes.filter((t) => t.length <= LABEL_CHANGE_MAX_CHARS);
   return { lines, omitted: changes.length - lines.length + unread + capped };
 }
@@ -901,13 +771,20 @@ export function labelHistoryFromRows(
 // The private notes already on the conversation, oldest first, newest `limit`. Written by anyone —
 // this watcher on an earlier tick, another watcher, the responder, a colleague — because the
 // question the block answers is "what does this conversation already say", and it is the same
-// question whoever wrote the answer.
+// question whoever wrote the answer. The engine's own activity notes are the exception: they say
+// what an agent ran, not what the conversation is about.
 export function notesFromRows(
   rows: ChatwootMessageRow[],
   limit: number,
 ): string[] {
   const all = rows
-    .filter((m) => m.private && !m.isReaction && m.content.trim().length > 0)
+    .filter(
+      (m) =>
+        m.private &&
+        !m.isReaction &&
+        m.activityNote === undefined &&
+        m.content.trim().length > 0,
+    )
     .sort((a, b) => a.id - b.id)
     .slice(-limit)
     .map((m) =>
@@ -934,72 +811,6 @@ export function notesFromRows(
   return kept.reverse();
 }
 
-// The fence tags the renderers wrap machine-written text in (a transcription, an image
-// description): stripped so a transcript line reads as the message, not as its markup.
-function stripFences(text: string): string {
-  return text.replace(FENCE_TAG, "");
-}
-
-export interface TranscriptLine {
-  role: "customer" | "attendant";
-  text: string;
-}
-
-// The newest `limit` public messages of the conversation, oldest first, rendered per direction the
-// way the turn and the memory render them (so a transcription or an image description is read).
-export function transcriptFromRows(
-  rows: ChatwootMessageRow[],
-  limit: number,
-): TranscriptLine[] {
-  // Built from EVERY row fetched, not from the windowed slice: a reply inside the window can quote a
-  // message older than it, and the quote is then the only thing that says what it is about.
-  const resolveQuoted = buildQuoteResolver(rows);
-  const usable = rows
-    .filter(usableRow)
-    .sort((a, b) => a.id - b.id)
-    .slice(-limit);
-  const out: TranscriptLine[] = [];
-  for (const m of usable) {
-    const text =
-      m.messageType === "incoming"
-        ? renderInboundMessage(
-            // ASKED OF `toRenderable`, not spelled here (issue #598). The same copy the memory fold
-            // had, and the same cost: the email subject reached the renderer, the burst, the ceiling
-            // gate and the fold, while the observer went on reading a subject-only email as a blank
-            // line and classifying a conversation in which, as far as it could see, the customer had
-            // said nothing. `isReaction` is always false past `usableRow`, so the shared mapping
-            // changes nothing else here.
-            toRenderable(m),
-            // WHAT A REPLY IS ANSWERING (issue #477 review, round 4), resolved off the same rows the
-            // window fetched — the debounce path builds it the same way. Without it a quoted "sim"
-            // reaches the model with the demand it answers stripped out, and a label decided on that
-            // is decided on half the sentence.
-            { resolveQuoted },
-          )
-        : renderAttendantMessage({
-            text: m.content,
-            attachmentTypes: m.attachmentTypes,
-            // Filled by `overlayMediaAnnotations` above for a reply this process just spoke, and by
-            // the attachment's own meta on the fork.
-            transcribedText: m.transcribedText,
-          });
-    const clean = stripFences(text).trim();
-    if (!clean) continue;
-    out.push({
-      role: m.messageType === "incoming" ? "customer" : "attendant",
-      text: clean,
-    });
-  }
-  return out;
-}
-
-export function renderTranscript(lines: readonly TranscriptLine[]): string {
-  const joined = lines
-    .map((l) => `${l.role === "customer" ? "Cliente" : "Atendente"}: ${l.text}`)
-    .join("\n");
-  return clipTextEnd(joined, TRANSCRIPT_MAX_CHARS);
-}
-
 function _isRequestRefused(err: unknown): boolean {
   return (
     typeof err === "object" &&
@@ -1008,24 +819,11 @@ function _isRequestRefused(err: unknown): boolean {
   );
 }
 
-// STILL ON THE INBOX, and not merely still a monitoring agent (issue #477 review, round 1).
-// `agentObservesNow` asks about the AGENT — switched on, still in monitoring — and an unobserve
-// changes neither. The OBSERVE row is not retired by a detach either, so a watcher taken off an
-// inbox while its verdict sat queued would otherwise spend a model call, move that inbox's labels
-// and post a note on a conversation nothing gives it any more. Asked of BOTH bindings, because a
-// monitoring agent may be the inbox's responder rather than its observer (#209's first rung).
-//
-// A read that fails is not evidence the binding is gone: `unreadable` keeps the tick, the same rule
-// every compensation in the binding path follows. So is an inbox this conversation does not name —
-// the mirror writes `inboxId` null for a conversation whose first event was sparse, and refusing
-// there would silence observation on exactly the conversations that need it most.
-//
-// ...AND "ATTACHING" IS ITS OWN ANSWER (issue #540, window 5). The observer row is now written
-// BEFORE Chatwoot is asked and stamped after, so an unstamped row is an attach in flight: the
-// binding has not landed, and acting on it would move labels and post a note for an observe that
-// can still be refused and taken back. It is not "no" either — that is a detach, and completing on
-// it is permanent for a resolve. The caller retries, which is what the payload's `attaching` flag
-// bought before this column and now buys only for a job an older release enqueued.
+// STILL ON THE INBOX, not merely still a monitoring agent: an unobserve changes neither the agent
+// nor the queued OBSERVE row. Asked of BOTH bindings (a monitoring agent may be the responder). A
+// failed read, or an inbox the conversation does not name yet, keeps the tick. An unstamped
+// observer row is an attach in flight: `attaching`, retried, since acting on it could still be
+// taken back and completing on it is permanent for a resolve.
 async function agentStillOnInbox(
   tenantId: bigint,
   inboxId: bigint,
@@ -1045,8 +843,8 @@ async function agentStillOnInbox(
         },
       });
       if (!inbox) return "no";
-      // The RESPONDER binding first, and it is never pending: it is a column on the inbox, written
-      // in one statement (#209's first rung, a monitoring agent bound as the responder).
+      // NOTE: the RESPONDER binding first; it is a column on the inbox, written in one statement,
+      // so it is never pending.
       if (inbox.agentId === agentId) return "yes";
       if (inbox.observers.length === 0) return "no";
       return inbox.observers.some((o) => o.attachedAt === null)
@@ -1062,6 +860,223 @@ async function agentStillOnInbox(
   }
 }
 
+// Which attribute bags the decisions rules fill an argument from.
+export function attributeFillsOf(mon: {
+  engine: string;
+  decisions?: unknown;
+}): {
+  conversation: boolean;
+  contact: boolean;
+} {
+  const out = { conversation: false, contact: false };
+  if (mon.engine !== "decisions") return out;
+  const rules = (mon.decisions as { rules?: unknown } | null)?.rules;
+  for (const r of Array.isArray(rules) ? rules : []) {
+    const fill = (r as { action?: { fill?: unknown } } | null)?.action?.fill;
+    if (!fill || typeof fill !== "object") continue;
+    for (const v of Object.values(fill)) {
+      if (typeof v !== "string") continue;
+      if (v.startsWith("conversation.attribute.")) out.conversation = true;
+      if (v.startsWith("contact.attribute.")) out.contact = true;
+    }
+  }
+  return out;
+}
+
+// What a rule's custom tool may fill an argument from (decisions/tool-args.ts): the contact and inbox
+// as the HTTP tools' context carries them, the conversation by the number its link shows, and the
+// mirror's attribute bags.
+export function fillContextOf(
+  context: Record<string, string>,
+  conv: {
+    customAttributes?: unknown;
+    contact?: { customAttributes?: unknown } | null;
+  } | null,
+  displayId: number,
+  client: Pick<ChatwootClient, "conversationLink">,
+): FillContext {
+  const bag = (v: unknown): Record<string, unknown> =>
+    v && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : {};
+  const inbox = Number(context.inbox_id);
+  return {
+    contact: {
+      ...(context.contact_name ? { name: context.contact_name } : {}),
+      ...(context.contact_phone ? { phone: context.contact_phone } : {}),
+      ...(context.contact_email ? { email: context.contact_email } : {}),
+      ...(context.contact_identifier
+        ? { identifier: context.contact_identifier }
+        : {}),
+    },
+    contactAttributes: bag(conv?.contact?.customAttributes),
+    conversation: {
+      display_id: displayId,
+      ...(Number.isInteger(inbox) && context.inbox_id
+        ? { inbox_id: inbox }
+        : {}),
+      // A client without the dashboard's address (a test double) has no link to give. The link is the
+      // one a person follows: the connection's public address when it has one.
+      ...(typeof client.conversationLink === "function"
+        ? { link: client.conversationLink(displayId) }
+        : {}),
+    },
+    conversationAttributes: bag(conv?.customAttributes),
+  };
+}
+
+// Whether these settings carry a contact gate with conditions, the ones the fence asks of the
+// conversation's labels and attributes.
+function hasGateRule(settings: unknown): boolean {
+  const gate = readContactAuthConfig(settings);
+  return gate.enabled && contactAuthHasRuleStage(gate);
+}
+
+// WHAT A TICK READS OF THE CONVERSATION, in one place because two callers read it: the tick, and the
+// conversation page's test of a decisions agent (modules/decisions/try.ts), which must send its
+// classifier exactly what a tick would. The window of rows after the last `/reset`, the transcript
+// and notes off the same rows, the labels standing now (asked with the window, `null` when
+// unreadable), and the label history. `customer: false` stops before the reads a tick with no
+// customer message would waste.
+export type ObserveEvidence =
+  | { customer: false; transcript: TranscriptLine[]; notes: string[] }
+  | {
+      customer: true;
+      transcript: TranscriptLine[];
+      notes: string[];
+      current: string[] | null;
+      currentForPrompt: string[] | null;
+      vocabLabels: string[] | null;
+      labelChanges: LabelHistory;
+      labelsAskedAt: number;
+    };
+
+export async function readObserveEvidence(p: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  client: ChatwootClient;
+  base: PrismaClient;
+  windowMessages: number;
+  conv: {
+    resetAtMessageId: number | null;
+    resetClearedLabels: unknown;
+    inbox: { provider: string | null } | null;
+  } | null;
+  protectedLabels: readonly string[] | undefined;
+}): Promise<ObserveEvidence> {
+  const { tenantId, instanceId, conversationId, client, base, conv } = p;
+  // The labels standing now are asked for WITH the window, not after it: the two reads do not
+  // depend on each other, and one after the other is a round trip the verdict waits through.
+  // Tolerated when it fails, as `buildToolset` does (prepare.ts): a watcher may not touch labels at
+  // all. `null`, not `[]`: "no labels" would let the model clear everything.
+  // Timed from when it was ASKED: the answer may sit resolved while the window is still paging.
+  const labelsAskedAt = Date.now();
+  const labelsRead: Promise<string[] | null> = client
+    .getConversationLabels(conversationId)
+    .catch((e: unknown) => {
+      logger.warn(
+        "observe: conversation labels unreadable (tenant=%s conv=%s): %s",
+        String(tenantId),
+        String(conversationId),
+        e instanceof Error ? e.message : String(e),
+      );
+      return null;
+    });
+  const fetched = await readWindowRows(
+    client,
+    conversationId,
+    p.windowMessages,
+  );
+  // NOTE: upstream Chatwoot 404s the attachment-meta write-back, so an eager transcription or image
+  // description may exist only in the in-process annotation store (docs/stt.md). Overlaid as the
+  // direct turn and the flush do, never over a value the fork did write.
+  overlayMediaAnnotations(tenantId, instanceId, fetched);
+  // ...AND THE EPISODE THE RESET ENDED IS NOT PART OF THIS ONE. `/reset` clears the labels and the
+  // memory, but Chatwoot keeps every message, and this module reads Chatwoot rather than the
+  // thread — so without this the next verdict reads the erased episode's demands (and the command
+  // itself), finds no labels standing, and writes the old classification straight back, which is
+  // the opposite of what the operator was told happened. Applied before the quote resolver is
+  // built, so a reply quoting a pre-reset message does not reintroduce its text either.
+  const resetBoundary = conv?.resetAtMessageId ?? null;
+  // A `Json?` column, READ rather than trusted: NULL is a reset that made no claim, and
+  // anything but an array of strings is a row this build did not write.
+  const resetCleared = stringArrayOrNull(conv?.resetClearedLabels);
+  const rows =
+    resetBoundary === null
+      ? fetched
+      : fetched.filter((r) => r.id > resetBoundary);
+  const ownBotIds = new Set(
+    await instanceAgentBotChatwootIds(tenantId, instanceId, base),
+  );
+  const transcript = transcriptFromRows(rows, p.windowMessages, {
+    ownBotIds,
+    whatsappProvider: conv?.inbox?.provider ?? null,
+    // NOTE: kept for the `customer_choice` judge, which reads each message against the day it was
+    // written; the prompt renders the lines undated, since it passes no timezone.
+    dated: true,
+  });
+  // Read off the SAME rows, after the reset boundary like everything else: a note about the episode
+  // the operator wiped is not part of this one either.
+  const notes = notesFromRows(rows, p.windowMessages);
+  if (!transcript.some((l) => l.role === "customer")) {
+    return { customer: false, transcript, notes };
+  }
+  // ONE READ, for the prompt block AND `set_labels`' baseline: the tool diffs against what
+  // the model was SHOWN, so two reads could turn a label repeated to keep it into an ADDITION.
+  const current = await labelsRead;
+  // THE PROMPT BLOCK SHOWS THE GUARDED LABELS, as the tool does (it shows them and refuses to
+  // move them): the same projection the tool renders (label-view.ts).
+  const currentForPrompt =
+    current === null ? null : modelVisibleLabels(current);
+
+  // Read here, not beside `notes`, because it is a request every exit above would waste. The
+  // labels ALONE, not the toolset's vocabulary: that is two requests under one `Promise.all`, and a
+  // down attribute endpoint would stall every tick. `null` makes the block say it could not read.
+  const vocabLabels = await loadChatwootLabels(
+    client,
+    `${tenantId}:${instanceId}`,
+  ).catch(() => null);
+  // THE CONVERSATION'S OWN LABELS JOIN THE INDEX: a tag attached through `set_labels` creates
+  // no `Label` row, so an invented title is only on the conversation. A title invented, applied and
+  // removed between two ticks is in neither list, a miss chosen over inventing a decision.
+  const labelChanges = labelHistoryFromRows(
+    // NOTE: minus the reset's own cleanup. The PAGE goes in, not `rows`: whether it still reaches
+    // the command decides how a removal line is read.
+    afterResetNarration(fetched, resetBoundary, resetCleared),
+    vocabLabels === null && current === null
+      ? null
+      : [...(vocabLabels ?? []), ...(current ?? [])],
+    p.protectedLabels,
+    LABEL_CHANGES_MAX,
+  );
+
+  return {
+    customer: true,
+    transcript,
+    notes,
+    current,
+    currentForPrompt,
+    vocabLabels,
+    labelChanges,
+    labelsAskedAt,
+  };
+}
+
+// The text a classification API is asked about: the evidence blocks, with the label history marked
+// complete only when both label lists were read (each recognises changes the other cannot).
+export function observeDecisionInput(
+  e: Extract<ObserveEvidence, { customer: true }>,
+): string {
+  return observeEvidenceText(e.transcript, e.currentForPrompt, e.notes, {
+    lines: e.labelChanges.lines,
+    complete:
+      e.vocabLabels !== null &&
+      e.current !== null &&
+      e.labelChanges.omitted === 0,
+  });
+}
+
 export async function runObserve(
   tenantId: bigint,
   p: ObservePayload,
@@ -1072,13 +1087,11 @@ export async function runObserve(
   const threadId = chatwootThreadId(tenantId, instanceId, conversationId);
   const turnId = crypto.randomUUID();
 
-  // NOTE: THE CLAIM, ASKED BEFORE ANYTHING IS PAID FOR (issue #621 review, round 1). The shared tick
-  // claims several rounds of observations and runs them one provider bound at a time, so a claimed
-  // row can wait seconds for its permit, and a message landing in that wait re-arms it to PENDING.
-  // The fence at the tool boundary below still refuses the write, but only after the model has been
-  // paid, for a conversation the re-armed row will observe again anyway. Unreadable proceeds: that
-  // fence is still ahead, and an unknown is not a supersession.
-  if (deps.claim !== undefined) {
+  // THE CLAIM, ASKED BEFORE ANYTHING IS PAID FOR: a claimed row can wait seconds for a
+  // provider permit, and a message in that wait re-arms it. The tool-boundary fence would refuse
+  // the write only after the model was paid. Unreadable proceeds: that fence is still ahead.
+  const claimLost = async (): Promise<boolean> => {
+    if (deps.claim === undefined) return false;
     const claim = deps.claim;
     const row = await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.schedulerJob.findUnique({
@@ -1086,13 +1099,12 @@ export async function runObserve(
         select: { status: true, claimSeq: true },
       }),
     ).catch(() => "unreadable" as const);
-    if (
+    return (
       row !== "unreadable" &&
       !(row?.status === "CLAIMED" && row.claimSeq === claim.claimSeq)
-    ) {
-      return { outcome: "done" };
-    }
-  }
+    );
+  };
+  if (await claimLost()) return { outcome: "done" };
 
   const loaded = await runScopedOn(base, sysCtx(tenantId), async (db) => {
     const agent = await db.agent.findUnique({
@@ -1100,12 +1112,12 @@ export async function runObserve(
       select: { name: true, enabled: true, mode: true, settings: true },
     });
     if (!agent?.enabled || !isMonitoring(agent.mode)) return null;
+    const settings = agent.settings;
     const mon = readMonitoringConfig(agent.settings);
-    // THE ARM'S OWN REFUSAL, ASKED AGAIN AGAINST THE CONFIGURATION NOW (issue #477 review, round 1).
-    // A burst queued while the agent was `incremental` outlives a flip to `on_resolve`: the row is
-    // not retired by the edit, and reloading the config here without re-asking spends a model call
-    // and moves a label under a setting that says only the end of the conversation is classified.
+    // NOTE: THE ARM'S OWN REFUSAL, asked again against the configuration now: a burst queued while
+    // the agent was `incremental` outlives a flip to `on_resolve`, which does not retire the row.
     if (p.reason === "burst" && mon.analysis !== "incremental") return null;
+    const fills = attributeFillsOf(mon);
     const conv = await db.conversation.findUnique({
       where: {
         tenantId_chatwootInstanceId_chatwootConversationId: {
@@ -1119,26 +1131,66 @@ export async function runObserve(
         inboxId: true,
         status: true,
         resetAtMessageId: true,
-        // Read with the boundary, from the same row: the pair is what the label filter needs, and
-        // reading them apart would let a second `/reset` land between the two queries (issue #645).
+        // NOTE: read with the boundary, from the same row, so a second `/reset` cannot land between
+        // them.
         resetClearedLabels: true,
+        // Whether a phone-echo marker can be trusted to name a person (`providerReservesEchoIds`).
+        inbox: { select: { provider: true } },
+        // The mirror's attribute bags, which a rule's custom tool may fill an argument from
+        // (decisions/tool-args.ts): refreshed by the event that queued this tick. Unbounded, so read
+        // only when a rule fills from them.
+        customAttributes: fills.conversation,
+        // Left out whole when unused: Prisma refuses a nested select with nothing selected.
+        ...(fills.contact
+          ? { contact: { select: { customAttributes: true } } }
+          : {}),
       },
     });
     const cfg = await loadAgentConfig(
       db,
       { tenantId, instanceId, conversationId, agentId, threadId },
-      { skipExperiment: true, ignoreMode: true },
+      {
+        skipExperiment: true,
+        ignoreMode: true,
+        // The decisions engine asks its classification API and never builds the chat model, so an
+        // agent configured only for it observes (agents#1224).
+        chatModelUnused: mon.engine === "decisions",
+      },
     );
-    // A CONFIG THAT DOES NOT BUILD IS NOT AN AGENT THAT STOPPED OBSERVING (issue #477 review,
-    // round 8). The checks above are deliberate operator states — switched off, no longer
-    // monitoring, no groups left, per-burst turned off — and `done` is the right answer to each.
-    // This is a credential the vault cannot hand over: pending, rotated, deleted. Folded into the
-    // same `null` it retired an `on_resolve` verdict for good, and the line said the agent had
-    // stopped observing, which is not what happened and not what an operator would go looking at.
-    // The CONV goes with it, so the stale-state fences below can run before this is treated as a
-    // retryable failure (issue #477 review, round 20).
-    if (!cfg) return { noModel: true as const, conv };
-    return { mon, cfg, conv };
+    // NOTE: A CONFIG THAT DOES NOT BUILD IS NOT AN AGENT THAT STOPPED OBSERVING: the checks above
+    // are operator states and end the job; this is a credential the vault cannot hand over, and it
+    // retries. The CONV goes with it, so the stale-state fences below run before the retry.
+    if (!cfg) return { noModel: true as const, conv, settings };
+    let decisions: DecisionsSetup | null = null;
+    if (mon.engine === "decisions") {
+      const read = readDecisionsConfig({ decisions: mon.decisions });
+      if (!read.ok) {
+        decisions = {
+          ok: false,
+          skipped: "decisions_config_invalid",
+          problem: read.problem,
+          provider: null,
+          model: null,
+        };
+      } else {
+        const key = await tryResolveApiKeyEntry(db, read.config.credentialRef);
+        decisions =
+          key.state === "ok"
+            ? {
+                ok: true,
+                config: read.config,
+                apiKey: key.secret,
+                baseURL: key.baseUrl ?? null,
+              }
+            : {
+                ok: false,
+                skipped: "decisions_credential_unresolved",
+                provider: read.config.provider,
+                model: read.config.model,
+              };
+      }
+    }
+    return { mon, cfg, conv, settings, decisions };
   });
   if (loaded !== null && loaded.conv?.inboxId != null) {
     const onInbox = await agentStillOnInbox(
@@ -1147,13 +1199,10 @@ export async function runObserve(
       agentId,
       base,
     );
-    // A ROW THAT HAS NOT LANDED IS NOT A DETACH (issue #477 review, round 13). This job was armed
-    // off the ATTACH WINDOW — Chatwoot took the attachment, the `InboxObserver` row had not
-    // committed — and on the row alone that reads identical to an agent taken off the inbox. It is
-    // not: the arm carries the distinction. Completing here was permanent for a RESOLVE, since the
-    // `resolveMark` then suppresses every later delivery of the same resolution, so the tick fails
-    // and retries until the row is visible; an attachment the mirror never records dead-letters,
-    // which is the right report for a leak nothing else names.
+    // NOTE: A ROW THAT HAS NOT LANDED IS NOT A DETACH: armed off the attach window, it reads like
+    // one on the row alone, and completing would be permanent for a RESOLVE (`resolveMark`
+    // suppresses later deliveries). So it retries; an attachment the mirror never records
+    // dead-letters.
     if (onInbox === "attaching" || (onInbox === "no" && p.attaching === true)) {
       logger.warn(
         "observe: the observer binding has not landed yet (conv=%s, agent=%s); retrying",
@@ -1180,13 +1229,40 @@ export async function runObserve(
     );
     return { outcome: "done" };
   }
+  // THE CONTACT GATE'S RULE, asked again before anything is spent and before the model's own
+  // configuration is required: the arm asked it, but a label removed or a rule tightened since then
+  // leaves this row runnable, and an excluded conversation must complete even when no model could run.
+  const ruled = await observerRuleVerdict(
+    {
+      tenantId,
+      instanceId,
+      conversationId,
+      agentId,
+      settings: loaded.settings,
+      base,
+    },
+    { emit: true },
+  );
+  // The claim again, after the gate: an endpoint refusal at an arm retires this row
+  // (`retireRefusedObserve`), and one landing since the first look must still keep the model out.
+  if (ruled !== "unreadable" && (await claimLost())) return { outcome: "done" };
+  if (ruled === "unreadable") {
+    return {
+      outcome: "fail",
+      error: "observe: the contact gate's rule could not be evaluated",
+    };
+  }
+  if (ruled === "refused" && "noModel" in loaded) {
+    logger.info(
+      "observe: the contact gate's rule no longer covers this conversation (conv=%s); nothing to do",
+      String(conversationId),
+    );
+    return { outcome: "done" };
+  }
   if ("noModel" in loaded) {
-    // A MOOT JOB IS NOT RETRIED (issue #477 review, round 20). The detach fence above already
-    // completed for an agent taken off the inbox; the other moot case is a resolve verdict on a
-    // conversation that reopened, and asking it here — before the model config is called a
-    // retryable failure — is what keeps a credential that happens to be missing from failing its
-    // way to the dead-letter list on work nobody wanted. The live path asks the same question
-    // further down, where the flow line can carry it.
+    // NOTE: A MOOT JOB IS NOT RETRIED: a resolve tick on a conversation that reopened is asked
+    // here, before a missing credential counts as retryable, so it does not dead-letter work nobody
+    // wants.
     if (
       loaded.conv !== null &&
       reason === "resolved" &&
@@ -1208,7 +1284,7 @@ export async function runObserve(
       error: "observe: the agent's model configuration could not be built",
     };
   }
-  const { mon, cfg, conv } = loaded;
+  const { mon, cfg, conv, decisions } = loaded;
   const flow: FlowContext = {
     tenantId,
     turnId,
@@ -1218,65 +1294,112 @@ export async function runObserve(
     inboxId: conv?.inboxId ?? null,
     threadId,
     base,
+    // The observer's tool lines keep their full text like a reply's do, under the same setting.
+    fullDetailRetentionDays: cfg?.fullDetailRetentionDays ?? null,
   };
-  // WHAT THE OBSERVATION WROTE, so the line can say it (issue #635). A watching agent's entire output
-  // is its labels, and this line said `acted: true` and stopped: which label it applied, and which
-  // one that replaced, lived only in Chatwoot, which keeps no history of a label write. Collected
-  // from the tool itself, already filtered to the operator's own vocabulary (label-writes.ts),
-  // because the `tool` line beside this one carries the ARGUMENT'S SHAPE unless the agent has
-  // `logToolValues` on — and that switch would log every other tool's arguments too.
+  // WHAT THE OBSERVATION WROTE, so the line can say it: Chatwoot keeps no history of a label
+  // write. Collected from the tool, filtered to the operator's vocabulary (label-writes.ts),
+  // because the `tool` line carries values only under `logToolValues`, which logs every tool's
+  // arguments.
   const labelWrites: LabelWrite[] = [];
-  // Declared HERE, above `line`, because every exit after a write has to carry it: a label commits
-  // and the model call that follows can still fail, and a fence can still refuse the turn. Neither is
-  // retried (at-most-once for the effects), so a line without the write is the write lost for good
-  // (review round 1). Empty on every exit that runs before a tool could write, where the key is
-  // simply absent.
+  // Declared above `line` because every exit after a write carries it: a committed label is
+  // never retried, so a line without it loses the write. Absent on exits before any tool ran.
+  // A `decisions` tick is the classification API's, on every exit it shares with the model's tick
+  // (a fence refusal after a paid call included), never the unrelated chat model's.
+  const attribution =
+    decisions === null
+      ? { provider: cfg.mc.provider, model: cfg.mc.model, engine: {} }
+      : decisions.ok
+        ? {
+            provider: decisions.config.provider,
+            model: decisions.config.model,
+            engine: { engine: "decisions" },
+          }
+        : {
+            provider: decisions.provider,
+            model: decisions.model,
+            engine: { engine: "decisions" },
+          };
+  // Set once the model has been handed the prompt, so a tick that a fence then stops (superseded,
+  // retired) still keeps the prompt it sent when the agent keeps full turn detail.
+  let promptSent = false;
   const line = (
     status: "ok" | "error" | "skipped",
     detail: Record<string, unknown>,
     level: "info" | "warn" | "error" = status === "ok" ? "info" : "warn",
   ) =>
     emitFlowEvent(flow, {
+      ...(promptSent
+        ? {
+            full: {
+              kind: "system_prompt" as const,
+              text: cfg.systemPromptAudit,
+            },
+          }
+        : {}),
       stage: "observe",
       level,
       status,
-      provider: cfg.mc.provider,
-      model: cfg.mc.model,
+      provider: attribution.provider,
+      model: attribution.model,
       detail: {
         reason,
+        ...attribution.engine,
         ...detail,
         ...(labelWrites.length > 0 ? { labels: labelWrites } : {}),
       },
     });
 
-  // A RESOLVE VERDICT IS ABOUT A CONVERSATION THAT IS RESOLVED, and that is asked BEFORE anything is
-  // spent (issue #477 review, round 6). A customer message reopens the conversation, and on an
-  // `on_resolve` agent that message arms nothing by design, so the row queued for the old resolution
-  // survives and would classify a live conversation as if it had ended. The verdict is refused
-  // whatever the model would have said, so the tick ends here rather than after a paid call; the
-  // same question is asked again before writing, for a reopening that lands mid-call. Only a
-  // definite answer refuses: a mirror row that vanished is not a reopening.
+  // A failure the scheduler will run again is not the tick's outcome yet, and the last one is
+  // degraded labelling, never a lost message: the observer answers nobody.
+  const uncommittedFailure = (): {
+    level: "info" | "warn" | "error";
+    detail: Record<string, unknown>;
+  } =>
+    deps.afterFailure === "retry"
+      ? { level: "info", detail: { willRetry: true } }
+      : deps.afterFailure === "dead_letter"
+        ? { level: "warn", detail: { willRetry: false } }
+        : { level: "error", detail: {} };
+
+  // NOTE: A RESOLVE TICK IS ABOUT A RESOLVED CONVERSATION, asked BEFORE anything is spent: on an
+  // `on_resolve` agent the reopening message arms nothing, so the old row survives. Asked again
+  // before writing, for a reopening mid-call. A mirror row that vanished is not a reopening.
   if (reason === "resolved" && conv !== null && conv.status !== "resolved") {
-    // NOTE: `info`, as its twin `reopened` at the fence: the tick is right to stop (issue #611).
+    // NOTE: `info`, as its twin `reopened` at the fence: the tick is right to stop.
     line("skipped", { skipped: "conversation_reopened" }, "info");
+    return { outcome: "done" };
+  }
+  // A `decisions` agent that cannot run says why and stops, before Chatwoot is read or anything is
+  // spent; `warn`, since only the operator can fix it. The next burst asks again.
+  if (decisions !== null && !decisions.ok) {
+    emitFlowEvent(flow, {
+      stage: "observe",
+      level: "warn",
+      status: "skipped",
+      provider: decisions.provider,
+      model: decisions.model,
+      detail: {
+        reason,
+        engine: "decisions",
+        skipped: decisions.skipped,
+        ...(decisions.problem ? { problem: decisions.problem } : {}),
+      },
+    });
+    return { outcome: "done" };
+  }
+
+  if (ruled === "refused") {
+    line("skipped", { skipped: "contact_auth_refused" }, "info");
     return { outcome: "done" };
   }
 
   const bot = await loadAgentBot(tenantId, instanceId, agentId, base);
-  // MUTED, and this is where the guarantee that a watcher never answers now lives (issue #568).
-  // It used to live in `loadAgentConfig`, which refuses to build a config for a monitoring agent at
-  // all — and that refusal is why this module had to grow its own model call in the first place: the
-  // graph could not run, so a bespoke classifier was written beside it. `loadAgentConfig` keeps
-  // refusing for every customer-facing caller, which is what it is for; here the tick loads the
-  // config with `ignoreMode` and gets a client that cannot post to the customer instead, so the
-  // ordinary graph — the agent's tools, its MCP, its knowledge — can run for a watcher exactly as it
-  // does for a responder, minus the one thing a watcher must not do.
-  // THE TICK'S DEADLINE, created here so it covers everything after it: the transcript read, tool
-  // discovery, the turn, and — through `expiresOn` on the client below — any write a tool handler
-  // is still in the middle of when it fires. Aborting the invoke stops the caller waiting; it does
-  // not stop a handler already inside its own sequence of writes, and this client gives each
-  // request an independent deadline of its own, so without this the tick could report a retryable
-  // failure while the turn it walked away from kept mutating the conversation (review r10).
+  // MUTED: this is where the guarantee that a watcher never answers lives. `loadAgentConfig`
+  // keeps refusing monitoring agents for every customer-facing caller; here `ignoreMode` plus a
+  // client that cannot post to the customer lets the ordinary graph run. THE TICK'S DEADLINE covers
+  // all that follows and, through `expiresOn`, any write a tool handler is still making when it
+  // fires: aborting the invoke does not stop a handler mid-sequence.
   const deadline = AbortSignal.timeout(deps.timeoutMs ?? OBSERVE_TIMEOUT_MS);
   const client: ChatwootClient = await loadChatwootClient(
     tenantId,
@@ -1289,40 +1412,19 @@ export async function runObserve(
       expiresOn: deadline,
     },
   );
-  const fetched = await readWindowRows(
-    client,
+  const evidence = await readObserveEvidence({
+    tenantId,
+    instanceId,
     conversationId,
-    mon.window.messages,
-  );
-  // WHAT THE FORK WOULD HAVE WRITTEN BACK, FROM THE PROCESS THAT HEARD IT (issue #477 review,
-  // round 9). Upstream Chatwoot 404s the attachment-meta write-back, so an eager transcription or
-  // image description exists only in the in-process annotation store (docs/stt.md). Both the direct
-  // turn and the debounce flush overlay it onto their fetched page; without it here, an audio-only
-  // or image-only message reaches the model as an attachment with no text at all, and the verdict
-  // is about a conversation the observer cannot read. In place, and never over a value the fork
-  // did write.
-  overlayMediaAnnotations(tenantId, instanceId, fetched);
-  // ...AND THE EPISODE THE RESET ENDED IS NOT PART OF THIS ONE. `/reset` clears the labels and the
-  // memory, but Chatwoot keeps every message, and this module reads Chatwoot rather than the
-  // thread — so without this the next verdict reads the erased episode's demands (and the command
-  // itself), finds no labels standing, and writes the old classification straight back, which is
-  // the opposite of what the operator was told happened. Applied before the quote resolver is
-  // built, so a reply quoting a pre-reset message does not reintroduce its text either.
-  const resetBoundary = conv?.resetAtMessageId ?? null;
-  // A `Json?` column, so it arrives as `unknown` and is READ rather than trusted: NULL is a reset
-  // that made no claim, and anything that is not an array of strings is a row nothing this build
-  // wrote (issue #645).
-  const resetCleared = stringArrayOrNull(conv?.resetClearedLabels);
-  const rows =
-    resetBoundary === null
-      ? fetched
-      : fetched.filter((r) => r.id > resetBoundary);
-  const transcript = transcriptFromRows(rows, mon.window.messages);
-  // Read off the SAME rows, after the reset boundary like everything else: a note about the episode
-  // the operator wiped is not part of this one either.
-  const notes = notesFromRows(rows, mon.window.messages);
-  if (!transcript.some((l) => l.role === "customer")) {
-    // NOTE: `info`: nothing to classify yet is not a problem anybody can fix (issue #611).
+    client,
+    base,
+    windowMessages: mon.window.messages,
+    conv,
+    protectedLabels: cfg.protectedLabels,
+  });
+  const { transcript, notes } = evidence;
+  if (!evidence.customer) {
+    // NOTE: `info`: nothing to observe yet is not a problem anybody can fix.
     line(
       "skipped",
       { skipped: "no_customer_message", messages: transcript.length },
@@ -1330,114 +1432,31 @@ export async function runObserve(
     );
     return { outcome: "done" };
   }
-  // ONE READ, for the prompt block below AND for the tool's comparison baseline. `set_labels` diffs
-  // the model's list against what the model was SHOWN, so two reads a few hundred milliseconds apart
-  // are two different claims about the same turn: a label this block advertises can be missing from
-  // the tool's baseline, and the model repeating it to keep it then reads as an ADDITION — putting
-  // back exactly what somebody removed in between. Handed to `buildToolset` for that reason.
-  // TOLERATED WHEN IT FAILS, because this read is not what the tick is FOR (review round 33). A
-  // watcher does not have to be a classifier: one that only writes a private note, or calls an HTTP
-  // tool, has nothing to do with labels — and an uncaught throw here ended its tick before the graph
-  // was ever invoked, retried the whole thing, and eventually dead-lettered it over a read it never
-  // needed. `buildToolset` already degrades its own label read the same way (prepare.ts): the scope
-  // simply disappears, which is the safe degenerate, since a scope that was not shown produces no
-  // removal.
-  //
-  // `null`, not `[]`, and the prompt block says which: "no labels" and "could not read" are
-  // different claims, and the first is the one that makes a model clear everything.
-  let current: string[] | null = null;
-  try {
-    current = await client.getConversationLabels(conversationId);
-  } catch (e) {
-    logger.warn(
-      "observe: conversation labels unreadable (tenant=%s conv=%s): %s",
-      String(tenantId),
-      String(conversationId),
-      e instanceof Error ? e.message : String(e),
-    );
-  }
-  // THE PROMPT BLOCK SHOWS THE GUARDED ONES, and that is the change of issue #695. It used to hide
-  // them, because `set_labels` hid them too and a block that printed `agente-off` while the tool's
-  // description denied it existed was a contradiction to reason from. The tool now shows them and
-  // refuses to move them, so this block says the same thing by saying everything: the same
-  // projection the tool renders, which is the ceiling and nothing else (see label-view.ts).
-  const currentForPrompt =
-    current === null ? null : modelVisibleLabels(current);
+  const {
+    current,
+    currentForPrompt,
+    vocabLabels,
+    labelChanges,
+    labelsAskedAt,
+  } = evidence;
 
-  // WHAT ALREADY CHANGED, beside what is standing now, and read here rather than beside `notes`
-  // because this is a request: every exit above it (no customer message, agent off, window empty)
-  // would pay for a Chatwoot round trip on a cold cache and then throw the answer away.
-  //
-  // THE LABELS ALONE, and not the vocabulary the toolset reads (round 10). That one is two requests
-  // under a single `Promise.all` — the labels and the custom attribute DEFINITIONS — so an attribute
-  // endpoint that is down fails the pair, caches nothing, and would make every tick of every
-  // conversation wait out its timeout before this block could look at a catalog that answered fine.
-  // `loadChatwootLabels` answers from the combined entry while it is warm and keeps its own
-  // otherwise, so the toolset still pays for its read once and this pays for nothing twice.
-  // Best-effort like the labels above: `null` makes the block say it could not be read, rather than
-  // claim that nothing ever changed.
-  const vocabLabels = await loadChatwootLabels(
-    client,
-    `${tenantId}:${instanceId}`,
-  ).catch(() => null);
-  // THE CONVERSATION'S OWN LABELS JOIN THE INDEX, and they are not a nicety (round 4). The account
-  // catalog and the conversation's tags are two different tables in Chatwoot: `/labels` answers from
-  // `Label`, which an operator fills in Settings, while a tag attached through `set_labels` goes
-  // through acts_as_taggable_on and creates NO row there. So a title the model invented is never in
-  // the catalog, at any TTL — the only place it shows up is the conversation carrying it, which this
-  // tick has already read. Union, so an invented label's own history is recognisable while it is
-  // standing; a title invented, applied and taken off between two ticks is in neither list and its
-  // lines are not read, which is the miss this block chooses over inventing a decision.
-  const labelChanges = labelHistoryFromRows(
-    // Minus the reset's own cleanup. The PAGE goes in rather than `rows`: this one applies the
-    // reset boundary itself, because whether the page still reaches the command is what decides
-    // how it reads a removal line (issue #645).
-    afterResetNarration(fetched, resetBoundary, resetCleared),
-    vocabLabels === null && current === null
-      ? null
-      : [...(vocabLabels ?? []), ...(current ?? [])],
-    cfg.protectedLabels,
-    LABEL_CHANGES_MAX,
-  );
-
-  // THE TURN ITSELF, and from here on this is the ordinary graph (issue #568). What used to sit in
-  // these lines was a classifier: one model call with a JSON schema built from the operator's label
-  // groups, then a deterministic apply that wrote the verdict. It existed because `loadAgentConfig`
-  // refuses to build a config for a monitoring agent, so the graph could not run and something had
-  // to be written beside it — and the taxonomy screen existed because that something needed to be
-  // told what to classify into.
-  //
-  // With a muted client the graph runs, so a watcher is what it was always meant to be: the ordinary
-  // agent, with its tools, its MCP and its knowledge, that cannot answer the customer. Classifying
-  // is then one thing it can do with `set_labels`, described in the operator's own prompt, and not a
-  // mode with a screen of its own.
+  // THE TURN ITSELF, the ordinary graph: with a muted client a watcher is the ordinary agent
+  // (tools, MCP, knowledge) that cannot answer the customer; classifying is `set_labels` in its
+  // prompt.
   const checkpointer = deps.checkpointer ?? new MemorySaver();
-  // A THREAD OF ITS OWN, per agent, and never the conversation's. The responder's memory lives on
-  // `chatwootThreadId(...)`; invoking here with that id would checkpoint the watcher's transcript,
-  // tool calls and prose into the history the responder replies from. In-memory by default, so a
-  // tick is stateless the way the verdict was: the transcript below is rebuilt from Chatwoot every
-  // time, which is what makes an observation reproducible from the conversation alone.
+  // A THREAD OF ITS OWN, per agent, never the conversation's: the responder's memory lives on
+  // `chatwootThreadId(...)`, and invoking with that id would checkpoint the watcher's turn into it.
+  // In-memory by default, so an observation is reproducible from the conversation alone.
   const graphThreadId = `${threadId}:observer:${agentId}`;
 
-  // WHY THE FENCES MOVED. They used to be asked once, after the model call and before the write,
-  // because there was exactly one write and it was ours. A turn has as many writes as the model has
-  // tool calls, so the same questions are now asked at every tool HOP, which is the seam
-  // `buildAgentGraph({stillWanted})` exists for and the one the nudge uses for the same reason: a
-  // scheduler job whose world can change while a model call is in flight.
-  //
-  // Each returns a REASON rather than a boolean, so the flow line can say which door closed — and
-  // `unreadable` is kept apart from `no` throughout, because folding a transient read failure into
-  // "the operator switched it off" throws away a turn already paid for and says something false on
-  // the trail (issue #477, rounds 7, 8 and 10).
-  //
-  // AND THE TWO ANSWERS END THE TICK DIFFERENTLY, which is the other half of keeping them apart. A
-  // withdrawal is done: the operator moved the world and the turn was right to stop, so the job
-  // completes. A read that FAILED is a verdict lost, not a verdict declined — nothing re-arms this
-  // row on its own, an `on_resolve` agent has no later burst and a resolve happens once, so a
-  // transient database blip here is a conversation that is never classified (issue #477 review,
-  // round 7). Those fail, and the scheduler retries with backoff up to the cap; the retry spends the
-  // model call again, which is the price, and the spend ceiling gates it like every other tick.
+  // THE FENCES are asked at every tool HOP (`buildAgentGraph({stillWanted})`, as the nudge
+  // does), since a turn has as many writes as tool calls. Each returns a REASON, and `unreadable`
+  // stays apart from `no`: a withdrawal completes the job, a failed read retries with backoff
+  // (nothing else re-arms the row, and a resolve happens once), paying the model call again under
+  // the spend ceiling.
   let refusal: Refusal | null = null;
+  // Whether the contact gate has conditions, as of the settings the last fence read.
+  let gatedByRule = hasGateRule(loaded.settings);
   const fence = async (): Promise<boolean> => {
     if (refusal !== null) return false;
     const observesNow = await agentObservesNow(tenantId, agentId, base);
@@ -1448,24 +1467,21 @@ export async function runObserve(
           : "agent_no_longer_observes";
       return false;
     }
-    // ONE ROW ANSWERS BOTH QUESTIONS, and this read is the later of the two: the switch and the mode
-    // were read a query ago, and an operator who turned the agent off in between leaves this read
-    // observing the new row while the fence goes on acting on the old pair. Re-asking them here is
-    // two more columns of a query already being made, and it closes the case a `settings`-only
-    // select could not even see — a row that is GONE, the agent deleted mid-turn, which read as "no
-    // monitoring config" and passed (review round 38). It narrows the window to this read and the
-    // work; nothing closes it, as with every other fence in this file.
+    // ONE ROW ANSWERS BOTH QUESTIONS: re-reading the switch and mode here narrows the window
+    // to this read, and catches an agent deleted mid-turn, which a `settings`-only select read as
+    // no config.
+    let settingsNow: unknown = null;
     const monNow = await runScopedOn(base, sysCtx(tenantId), (db) =>
       db.agent.findUnique({
         where: { id: agentId },
         select: { enabled: true, mode: true, settings: true },
       }),
     )
-      .then((row) =>
-        !row?.enabled || !isMonitoring(row.mode)
-          ? ("gone" as const)
-          : readMonitoringConfig(row.settings),
-      )
+      .then((row) => {
+        if (!row?.enabled || !isMonitoring(row.mode)) return "gone" as const;
+        settingsNow = row.settings;
+        return readMonitoringConfig(row.settings);
+      })
       .catch(() => "unreadable" as const);
     if (monNow === "unreadable") {
       refusal = "settings_unreadable";
@@ -1475,6 +1491,7 @@ export async function runObserve(
       refusal = "agent_no_longer_observes";
       return false;
     }
+    gatedByRule = hasGateRule(settingsNow);
     // The arm's own second question, asked again: an operator switching to `on_resolve` while the
     // call is in flight is refusing exactly this turn, and a fence that did not ask let it act.
     if (
@@ -1483,6 +1500,35 @@ export async function runObserve(
       monNow.analysis !== "incremental"
     ) {
       refusal = "analysis_changed";
+      return false;
+    }
+    // The engine, asked again: an operator switching engines while the call is in flight has refused
+    // the writes this tick would make next.
+    if (
+      monNow !== null &&
+      monNow.engine !== (decisions === null ? "llm" : "decisions")
+    ) {
+      refusal = "engine_changed";
+      return false;
+    }
+    // The contact gate's rule, against the settings and the conversation as they are now: a label
+    // removed while the model answers takes the conversation out of scope before the next write.
+    const ruledNow = await observerRuleVerdict(
+      {
+        tenantId,
+        instanceId,
+        conversationId,
+        agentId,
+        settings: settingsNow,
+        base,
+      },
+      { emit: false },
+    );
+    if (ruledNow !== "allowed") {
+      refusal =
+        ruledNow === "unreadable"
+          ? "contact_auth_unreadable"
+          : "contact_auth_refused";
       return false;
     }
     const rows = await runScopedOn(base, sysCtx(tenantId), async (db) => {
@@ -1548,11 +1594,10 @@ export async function runObserve(
         base,
       );
       if (onInbox !== "yes") {
-        // A ROW THAT HAS NOT LANDED IS NOT A DETACH, and the load-time check already says so — this
-        // one folded it into a permanent detach, which COMPLETES the job. A detach and a reattach
-        // that straddle the model call leave `attachedAt` null for a moment, and for an
-        // `on_resolve` watcher that moment is the whole classification: the resolve mark suppresses
-        // every later delivery of the same resolution, so it is never observed at all (review r10).
+        // NOTE: A ROW THAT HAS NOT LANDED IS NOT A DETACH here either: a detach and reattach
+        // straddling the model call leave `attachedAt` null for a moment, and completing would lose
+        // an `on_resolve` watcher's whole observation (the resolve mark suppresses later
+        // deliveries).
         refusal =
           onInbox === "unreadable"
             ? "binding_unreadable"
@@ -1568,11 +1613,20 @@ export async function runObserve(
   // ...AND IT COVERS DISCOVERY, which is the one call that can hang forever: `buildToolset` contacts
   // every MCP server the agent has, and an SSE server that opens the stream and never emits its
   // endpoint waits with no timeout of its own.
+  // NOTE: not for delivering anything (a muted client cannot): it lets `resolve_conversation` see
+  // that THIS turn transferred the conversation, and refuse to close what the human queue now owns;
+  // and it is what the tool's flow line reads to say whether the transfer happened.
+  const handoffState: HandoffTurnState = {
+    customerMessage: null,
+    completed: false,
+  };
   let tools: Awaited<ReturnType<typeof buildToolset>>;
   try {
     tools = await underSignal(
       buildToolset(
-        cfg,
+        // A rule's handoff reason is the rule's own text, so the switch for a model's summary does
+        // not hold it back; an empty reason is what leaves no note.
+        decisions ? { ...cfg, transferWithSummary: true } : cfg,
         {
           tenantId,
           instanceId,
@@ -1581,30 +1635,51 @@ export async function runObserve(
           conversationId,
           threadId,
           expiresOn: deadline,
-          // The burst's triggering message, exposed to HTTP and code tools as {{message_id}}. The
-          // observer runs the ORDINARY toolset now, so a tool whose URL carries that placeholder is
-          // as legal here as on a reactive turn — and without this it failed with a missing
-          // placeholder on every observation. Null on an `on_resolve` tick, which has no triggering
-          // message: the placeholder is then absent, which is the same answer a nudge gives.
+          // NOTE: the conversation the tick read, by role: the graph's own state is one rendered
+          // prompt, and a choice judged on it would be the whole frame read as the customer's words.
+          // A `decisions` rule's action keeps no transcript, and refuses, as a rule's action does.
+          ...(decisions
+            ? {}
+            : {
+                choiceTranscript: () =>
+                  transcript.map((l) => ({
+                    role:
+                      l.role === "customer" || l.role === "assistant"
+                        ? l.role
+                        : "attendant",
+                    text: l.text,
+                    at: l.at ?? null,
+                  })),
+              }),
+          // NOTE: the burst's triggering message, exposed to HTTP and code tools as {{message_id}}
+          // as on a reactive turn. Null on an `on_resolve` tick: the placeholder is then absent, as
+          // for a nudge.
           ...(p.atMessageId != null ? { messageId: p.atMessageId } : {}),
           ...(deps.outboundFetch ? { outboundFetch: deps.outboundFetch } : {}),
           stillWanted: () => fence(),
+          writesAlone: () => gatedByRule,
           onLabelsWritten: (write) => labelWrites.push(write),
           onNoEffect: (toolName: string) => {
             if (counted.has(toolName)) noEffect++;
           },
           observed: conv ? { status: conv.status, statusAt: null } : undefined,
-          // Not for delivering anything (a muted client cannot, and this turn throws its final
-          // output away): it is what lets `resolve_conversation` see that THIS turn transferred the
-          // conversation, and refuse to close what the human queue now owns. Without it the tool's
-          // guard reads `undefined` and the observer closes a conversation it had just escalated
-          // (issue #671).
-          handoffState: { customerMessage: null, completed: false },
+          handoffState,
           // Absent when the read failed, so the toolset asks Chatwoot itself and applies its own
           // degradation if that fails too — one extra request on the failing path only.
           ...(current === null ? {} : { conversationLabels: current }),
+          // The `decisions` tick writes one provider call after this read, so its label rules
+          // apply to it. A model's turn takes seconds and reads again.
+          ...(current !== null && decisions?.ok === true
+            ? { conversationLabelsRead: { labels: current, at: labelsAskedAt } }
+            : {}),
         },
-        { buildNativeTools, mcp: deps.mcp, flow },
+        {
+          buildNativeTools,
+          mcp: deps.mcp,
+          flow,
+          makeModel: deps.makeModel,
+          modelPriority: "background",
+        },
       ),
       deadline,
     );
@@ -1614,34 +1689,13 @@ export async function runObserve(
     return { outcome: "fail", error: `observe: ${msg}` };
   }
 
-  // WHETHER ANYTHING IRREVERSIBLE HAS ALREADY HAPPENED THIS TICK. A scheduler job that fails is
-  // retried, and this tick is stateless by design — its own thread, an in-memory checkpointer — so a
-  // retry re-runs the WHOLE turn from the top. That was harmless while the tick was a classifier
-  // with one deterministic write; with the ordinary toolset it is not: a booking, an outbound POST,
-  // a charge, a hand-off can all have committed before the failure, and the retry does them again
-  // (issue #568, review round 25).
-  //
-  // So a tick that has already invoked a tool does not retry. At-most-once for the effects beats
-  // at-least-once for a classification: the effects reach other systems and cannot be taken back,
-  // while the classification is re-asked on the very next burst. Counted at the tool boundary rather
-  // than from the model's reported calls, because the count has to exist when the invoke THREW.
-  //
-  // COUNTED ONLY FOR A TOOL THAT CAN LEAVE SOMETHING BEHIND. Three cannot, by construction: the
-  // utility natives (a calculator, a clock), `skip_reply`, whose whole implementation is the
-  // sentence it returns, and the knowledge SEARCH. A tick whose only call was one of those has
-  // nothing to repeat, so refusing the retry there would throw away the run for free — and an
-  // `on_resolve` observer has no later burst to try again in.
-  //
-  // BY NAME FOR THE NATIVES, BY IDENTITY FOR THE SEARCH, and the asymmetry is the point (round 29).
-  // A native's name is reserved by the assembly whether the native was built or not (#457), so
-  // nothing else can answer under it. `search_knowledge` is a RAG built-in whose name is reserved
-  // nowhere, and RAG is assembled LAST, so a legacy tenant row carrying that name wins it — and
-  // exempting it by name would hand this exemption to whatever that row does, an HTTP POST
-  // included. The RAG tool is marked at its build seam instead (tools/effect-free.ts).
-  //
-  // Everything else counts, including an HTTP GET that happens to be a read: nothing in a tool
-  // definition says so, and the two errors are not symmetric. Counting a read costs one lost
-  // observation; NOT counting a write costs the write, again, in somebody else's system.
+  // WHETHER ANYTHING IRREVERSIBLE HAS ALREADY HAPPENED: a retry re-runs the WHOLE stateless
+  // turn, so a tick that already invoked a tool does not retry (at-most-once for effects that reach
+  // other systems). Only tools that can leave something behind count: utility natives and
+  // `skip_reply` are exempt by name (a native's name is reserved), the knowledge search by identity
+  // (tools/effect-free.ts), since its name is reserved nowhere. A read-only GET counts too:
+  // counting a read costs one observation, not counting a write repeats it in somebody else's
+  // system.
   const effectFreeNames = new Set<string>([
     ...UTILITY_NATIVE_TOOL_NAMES,
     SKIP_REPLY_TOOL,
@@ -1649,23 +1703,18 @@ export async function runObserve(
   let toolsRan = 0;
   // Dispatches that answered without writing anything. `toolsRan - noEffect` is what committed.
   let noEffect = 0;
-  // ...AND ONLY FOR A TOOL THIS COUNTER COUNTS. An effect-free tool never incremented `toolsRan`, so
-  // a report from one — a guarded `calculator` refused by a precondition — would subtract something
-  // that was never added, and a real write by a sibling tool in the same turn would then read as
-  // nothing committed: the retry that repeats it (review round 37). The name is the key both ends
-  // can agree on, because the assembly makes it unique across every source.
+  // ...AND ONLY FOR A TOOL THIS COUNTER COUNTS: an effect-free tool never incremented
+  // `toolsRan`, so its no-effect report would hide a sibling's real write. The name is unique
+  // across every source.
   const counted = new Set<string>();
   const fencedTools = tools.map((t) => {
     // The prototype trick guardedTool uses: name, description and schema stay the tool's own, and a
     // permitted call reaches exactly the run it would have had.
     const seen = Object.create(t) as typeof t;
     seen.invoke = (async (input: unknown, config?: unknown) => {
-      // BEFORE the call, because the count has to exist when the invoke THREW — a booking that
-      // reached its POST and then blew up is exactly the case this guards. What did NOT happen is
-      // reported by the handler itself, through `onNoEffect` below: a precondition that refused, a
-      // fence that answered inside a handler before its write, a toolpack request that threw
-      // instead of leaving. Counted apart rather than subtracted here, because one of those exits
-      // throws and never comes back through this wrapper (rounds 33 and 36).
+      // BEFORE the call, because the count has to exist when the invoke THREW after its
+      // write. What did NOT happen is reported by the handler through `onNoEffect`, counted apart
+      // because one of those exits throws and never comes back through this wrapper.
       const countsHere = !effectFreeNames.has(t.name) && !isEffectFreeTool(t);
       if (countsHere) {
         counted.add(t.name);
@@ -1677,13 +1726,9 @@ export async function runObserve(
           config,
         );
       } catch (e) {
-        // ARGUMENTS THE TOOL NEVER ACCEPTED. The count above is deliberately blind — an invoke that
-        // threw may have thrown after its write — but ONE throw is provably before it: the schema
-        // parse, which happens in `invoke` and never reaches the handler, so no handler is there to
-        // report (review round 39). The model is handed the error and usually retries; what must
-        // not survive is a dispatch counted as committed on the strength of arguments that were
-        // rejected, because it turns the next failure into a completed job and the observation is
-        // never made.
+        // NOTE: ARGUMENTS THE TOOL NEVER ACCEPTED: the schema parse throws inside `invoke` before
+        // any handler runs, so it provably had no effect; counting it as committed would turn the
+        // next failure into a completed job with no observation.
         if (countsHere && e instanceof ToolInputParsingException) noEffect++;
         throw e;
       }
@@ -1691,71 +1736,344 @@ export async function runObserve(
     return seen;
   });
 
-  let graph: Awaited<ReturnType<typeof buildModelAndGraph>>;
+  // The model that answered once the fallback took the tick, for the tick's closing line.
+  let answeredBy: { provider: string; model: string } | null = null;
+  // THE `decisions` ENGINE BUILDS NO MODEL: its brain is the provider call below.
+  let graph: Awaited<ReturnType<typeof buildModelAndGraph>> | null = null;
   try {
-    graph = await buildModelAndGraph(cfg, fencedTools, {
-      makeModel: deps.makeModel,
-      checkpointer,
-      stillWanted: () => fence(),
-      // NOTE: the tick's frame says the model answers nobody, so the tool budget's wrap-up says the
-      // same (issue #629): finish with a tool, or stop, never "responda ao cliente".
-      noReplyChannel: true,
-      onModelRetry: ({ attempt, provider, model }) =>
-        emitFlowEvent(flow, {
-          stage: "generate",
-          level: "warn",
-          status: "ok",
-          provider,
-          model,
-          detail: { retry: attempt, node: "observer" },
-        }),
-      onModelFallback: ({ provider, model, reason: why }) =>
-        emitFlowEvent(flow, {
-          stage: "observe",
-          level: "warn",
-          status: "ok",
-          provider,
-          model,
-          detail: { fallbackFrom: cfg.mc.provider, fallbackReason: why },
-        }),
-      onModelFallbackFailed: ({ provider, model, reason: why }) =>
-        emitFlowEvent(flow, {
-          stage: "observe",
-          level: "info",
-          status: "error",
-          provider,
-          model,
-          detail: { fallbackFailed: why },
-        }),
-      // ...AND THE ONE THAT FIRES BEFORE ANY FAILURE. A fallback the operator configured and that
-      // cannot be BUILT — credential deleted, configuration unrunnable — leaves the turn with
-      // nothing behind it, which is indistinguishable from having configured none. Reported at
-      // build time rather than on the failure, because by then it is too late to be the warning it
-      // needs to be, and a tick whose primary keeps answering would otherwise hide it forever.
-      onModelFallbackUnavailable: ({ provider, model, reason: why }) =>
-        emitFlowEvent(flow, {
-          stage: "observe",
-          level: "warn",
-          status: "ok",
-          provider,
-          model,
-          detail: { fallbackUnavailable: why },
-        }),
-    });
+    if (decisions === null)
+      graph = await buildModelAndGraph(cfg, fencedTools, {
+        makeModel: deps.makeModel,
+        checkpointer,
+        stillWanted: () => fence(),
+        // NOTE: the tick's frame says the model answers nobody, so the tool budget's wrap-up says the
+        // same: finish with a tool, or stop, never "responda ao cliente".
+        noReplyChannel: true,
+        // A step that grew it wrote nothing somewhere, so the turn goes on (graph.ts `endsOnWrites`).
+        noEffectCount: () => noEffect,
+        // NOTE: nobody waits on an observation this second, so its model call yields to replies under
+        // contention, within the background's share and aging bound; a wait past the threshold is
+        // written, at info, so a starved observer shows in the Logs.
+        modelPriority: "background",
+        onModelPermitWait: (wait) =>
+          emitCapacityWait(flow, "model_semaphore", wait),
+        // NOTE: Written before the retry runs, so `info` with `willRetry`: a second empty answer fails
+        // the tick, and that failure is the line.
+        onModelRetry: ({ attempt, provider, model }) =>
+          emitFlowEvent(flow, {
+            stage: "generate",
+            level: "info",
+            status: "ok",
+            provider,
+            model,
+            detail: { retry: attempt, node: "observer", willRetry: true },
+          }),
+        onModelFallback: (info) => {
+          answeredBy = { provider: info.provider, model: info.model };
+          emitFallbackAnswered(flow, "observe", cfg.mc.provider, info);
+        },
+        onModelFallbackFailed: (info) =>
+          emitFallbackFailed(flow, "observe", info),
+        // ...AND THE ONE THAT FIRES BEFORE ANY FAILURE. A fallback the operator configured and that
+        // cannot be BUILT — credential deleted, configuration unrunnable — leaves the turn with
+        // nothing behind it, which is indistinguishable from having configured none. Reported at
+        // build time rather than on the failure, because by then it is too late to be the warning it
+        // needs to be, and a tick whose primary keeps answering would otherwise hide it forever.
+        onModelFallbackUnavailable: ({ provider, model, reason: why }) =>
+          emitFlowEvent(flow, {
+            stage: "observe",
+            level: "warn",
+            status: "ok",
+            provider,
+            model,
+            detail: { fallbackUnavailable: why },
+          }),
+      });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    line("error", { failed: "model_build" }, "error");
+    const failure = uncommittedFailure();
+    line("error", { failed: "model_build", ...failure.detail }, failure.level);
     return {
       outcome: "fail",
       error: `observe: model could not be built: ${msg}`,
     };
   }
 
-  // GATED IMMEDIATELY BEFORE THE BILLED CALL, and immediately is the whole rule (CLAUDE.md,
-  // spend-ceiling/coverage.ts names this node). Asked at the top of the tick instead, it answered
-  // for every exit that comes before it — a conversation with no customer message yet, a transcript
-  // the renderers emptied — each reported as `spend_ceiling` on a tick that was never going to
-  // spend anything, which reads on the flow page as a tenant hitting its budget.
+  const runDecisionsTick = async (
+    setup: Extract<DecisionsSetup, { ok: true }>,
+  ): Promise<JobResult> => {
+    const { config } = setup;
+    const startedAt = Date.now();
+    const decisionLine = (
+      status: "ok" | "error",
+      detail: Record<string, unknown>,
+      level: "info" | "warn" | "error",
+    ) =>
+      emitFlowEvent(flow, {
+        stage: "observe",
+        level,
+        status,
+        provider: config.provider,
+        model: config.model,
+        durationMs: Date.now() - startedAt,
+        detail: {
+          reason,
+          engine: "decisions",
+          // Which questions and rules this tick ran: the rule indices below mean nothing without it.
+          block: decisionsFingerprint(config),
+          ...detail,
+          ...(labelWrites.length > 0 ? { labels: labelWrites } : {}),
+        },
+      });
+    // THE TRIGGER STATE, read before anything is paid for: a rule that already acted and holds is
+    // not run again (docs/decisions.md, "When a rule acts"). Unreadable fails the tick before the
+    // provider call, since acting without it could repeat a note the conversation already has.
+    const triggerScope =
+      conv === null ? null : { tenantId, agentId, conversationId: conv.id };
+    let latched: Set<string> = new Set();
+    // The generation this read took, in the scheduler's order (trigger-state.ts): every write below
+    // carries it, and one a newer observation holds is refused, so an older tick never changes a
+    // newer one's state. A run the scheduler already superseded gets none and ends here.
+    let generation: Generation = { jobId: 0n, seq: 0n };
+    let claimed: TriggerClaim | null = null;
+    if (triggerScope !== null) {
+      try {
+        claimed = await claimTriggerState(base, triggerScope, deps.claim);
+      } catch (err) {
+        const failure = uncommittedFailure();
+        decisionLine(
+          "error",
+          {
+            failed: "trigger_state",
+            ...failureDetail(err),
+            messagesRead: transcript.length,
+            ...failure.detail,
+          },
+          failure.level,
+        );
+        return {
+          outcome: "fail",
+          error: "observe: the rules' trigger state could not be read",
+        };
+      }
+    }
+    if (triggerScope !== null) {
+      if (claimed === null) return endOnRefusal("superseded");
+      ({ generation, latched } = claimed);
+    }
+    // Written for what ran, the withdrawn tick's actions included: a note that left is one the next
+    // observation must not post again. A write that fails is said on the line and does not undo the
+    // tick, which already committed; one a newer observation superseded is not a failure.
+    const persistTriggerState = async (
+      change: Awaited<ReturnType<typeof applyDecisions>>["triggerState"],
+    ): Promise<"written" | "superseded" | "failed"> => {
+      if (triggerScope === null) return "written";
+      try {
+        return (await writeTriggerState(base, triggerScope, generation, change))
+          ? "written"
+          : "superseded";
+      } catch (err) {
+        logger.warn(
+          { err, agentId: String(agentId) },
+          "observe: the rules' trigger state could not be written (conv=%s)",
+          String(conversationId),
+        );
+        return "failed";
+      }
+    };
+    let result: DecisionResult;
+    try {
+      result = await underSignal(
+        askProvider(config, {
+          input: observeDecisionInput(evidence),
+          apiKey: setup.apiKey,
+          baseURL: setup.baseURL,
+          ...(deps.decisionFetch ? { fetchImpl: deps.decisionFetch } : {}),
+          signal: deadline,
+        }),
+        deadline,
+      );
+    } catch (err) {
+      // Nothing ran yet, so this is the uncommitted-failure rule: `info` while the scheduler retries,
+      // `warn` on the last attempt. The closed vocabulary only: a provider body can echo the text.
+      const failure = uncommittedFailure();
+      // `underSignal` rejects with a plain error, so the deadline is asked rather than the error read.
+      const why = providerFailure(err, deadline.aborted);
+      decisionLine(
+        "error",
+        {
+          failed: "decision_call",
+          failure: why,
+          messagesRead: transcript.length,
+          ...failure.detail,
+        },
+        failure.level,
+      );
+      return {
+        outcome: "fail",
+        error: `observe: decision call failed (${why})`,
+      };
+    }
+    // Recorded on success only: a failed call bills nothing either provider documents, and a row
+    // with tokens nobody was charged for would inflate the cost the ceiling reads.
+    await recordDirectUsage(flow, {
+      provider: config.provider,
+      model: config.model,
+      node: "decision",
+      promptTokens: result.inputTokens,
+      completionTokens: 0,
+      durationMs: Date.now() - startedAt,
+    });
+    const toolLogger = new ToolFlowLogger(flow, {
+      logValues: cfg.logToolValues,
+      tools,
+      handedOff: () => handoffState.completed === true,
+    });
+    // UNDER THE TICK'S DEADLINE, as the graph is: a native write can wait in a keyed queue that the
+    // signal does not cancel, and a tick that outlives its budget reaches the scheduler's outer
+    // deadline and is retried whole, repeating what already committed.
+    let report: Awaited<ReturnType<typeof applyDecisions>>;
+    const progress: DecisionProgress = {};
+    // Keys released after the deadline (below), forgotten when the engine latches one again.
+    const released = new Set<string>();
+    let applying: Promise<unknown> = Promise.resolve();
+    try {
+      const run = applyDecisions(
+        config,
+        result.answers,
+        fencedTools,
+        [toolLogger],
+        deadline,
+        () => fence(),
+        cfg.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS,
+        // The label write and the attribute write touch different things on the conversation, so
+        // the two go out side by side as well, not one after the other. A tool with a precondition
+        // stays on its own: its condition reads what the rules before it wrote. Under a contact
+        // gate with conditions every action does, since the fence asks them of the same labels
+        // and attributes; the engine asks this again after the fences, which is when a gate
+        // saved during the provider call is first seen.
+        (action) =>
+          gatedByRule ||
+          Object.hasOwn(cfg.toolPreconditions, action.tool) ||
+          sharedWriteKey(action.tool, action.args) === null
+            ? null
+            : "conversation",
+        false,
+        latched,
+        progress,
+        async (keys) => {
+          if (triggerScope === null) return true;
+          const held = await latchRules(base, triggerScope, generation, keys);
+          for (const k of keys) released.delete(k);
+          return held;
+        },
+        {
+          context: fillContextOf(
+            cfg.httpToolContext,
+            conv,
+            conversationId,
+            client,
+          ),
+          questions: config.questions,
+          logValues: cfg.logToolValues,
+        },
+      );
+      applying = run;
+      report = await underSignal(run, deadline);
+    } catch (err) {
+      toolLogger.settle();
+      // The latches written ahead stay: an action still in flight when the deadline ended the call
+      // may have written, and holding its rule is safer than repeating it. Those whose action
+      // settled without writing, or that were never dispatched, and the `on_start` rules that did
+      // not hold, are released: now, on every later change (a handler that says after the deadline
+      // it wrote nothing) and once the engine has stopped (it may still be between a latch and its
+      // fence).
+      const release = async () => {
+        if (triggerScope === null) return;
+        const fresh = (keys: string[] | undefined) =>
+          (keys ?? []).filter((k) => !released.has(k));
+        const change = {
+          release: fresh(progress.release),
+          undo: fresh(progress.undo),
+        };
+        const due = [...change.release, ...change.undo];
+        if (due.length === 0) return;
+        try {
+          // Superseded, only its own reservations go: the newer observation owns the rest.
+          await writeTriggerState(base, triggerScope, generation, change);
+          // Counted only once done, so a failed release is tried again by the next call.
+          for (const k of due) released.add(k);
+        } catch (err) {
+          logger.warn(
+            { err, agentId: String(agentId) },
+            "observe: the rules' trigger state could not be written (conv=%s)",
+            String(conversationId),
+          );
+        }
+      };
+      progress.onChange = () => void release();
+      await release();
+      void applying.then(release, release);
+      if (refusal !== null) return endOnRefusal(refusal);
+      // The same rule as the model-failure path: a dispatch that never settled counts as committed,
+      // and a committed effect is never retried.
+      const committed = toolsRan - noEffect > 0;
+      const failure = uncommittedFailure();
+      decisionLine(
+        "error",
+        {
+          failed: "decision_actions",
+          ...(deadline.aborted ? { failure: "timeout" } : failureDetail(err)),
+          toolCalls: toolsRan - noEffect,
+          ...(committed ? { retried: false } : failure.detail),
+        },
+        committed ? "warn" : failure.level,
+      );
+      if (committed) return { outcome: "done" };
+      return {
+        outcome: "fail",
+        error: `observe: decision actions did not finish (${providerFailure(err, deadline.aborted)})`,
+      };
+    }
+    toolLogger.settle();
+    const stateWritten = await persistTriggerState(report.triggerState);
+    if (refusal !== null || report.withdrawn) {
+      return endOnRefusal(refusal ?? "superseded");
+    }
+    decisionLine(
+      "ok",
+      {
+        acted: report.actions.some((a) => a.outcome === "ran"),
+        // What the provider says answered: TypeSafe resolves the alias to a version; null when the
+        // body names none, and then the line claims only the model that was asked for.
+        modelVersion: result.modelVersion,
+        answers: answersForLog(result.answers),
+        actions: report.actions,
+        ...(report.missed.length > 0 ? { notFired: report.missed } : {}),
+        // Rules whose conditions held and that did not act because their trigger holds them back,
+        // so "did not fire" (`notFired`) and "fired and was held" read apart.
+        ...(report.held.length > 0 ? { held: report.held } : {}),
+        ...(stateWritten === "failed" ? { triggerStateWritten: false } : {}),
+        ...(stateWritten === "superseded"
+          ? { triggerStateSuperseded: true }
+          : {}),
+        messagesRead: transcript.length,
+        labelsBefore: current === null ? null : current.length,
+      },
+      report.actions.some(
+        (a) =>
+          a.outcome === "failed" ||
+          a.outcome === "not_granted" ||
+          a.outcome === "over_budget",
+      )
+        ? "warn"
+        : "info",
+    );
+    return { outcome: "done" };
+  };
+
+  // GATED IMMEDIATELY BEFORE THE BILLED CALL (spend-ceiling/coverage.ts names this node), so
+  // an exit that was never going to spend is not reported as a tenant hitting its budget.
   const ceiling = await spendCeilingVerdict({
     tenantId,
     source: "inbox",
@@ -1766,8 +2084,8 @@ export async function runObserve(
     windowMs: OBSERVE_CEILING_WINDOW_MS,
   });
   if (ceiling.state === "over") {
-    // NOTE: kept at `warn`, unlike every other skip here (issue #611): the budget is the one
-    // reason an observation is skipped that an operator can do something about.
+    // NOTE: kept at `warn`, unlike every other skip here: the budget is the one reason an
+    // observation is skipped that an operator can act on.
     line("skipped", { skipped: "spend_ceiling" }, "warn");
     return { outcome: "done" };
   }
@@ -1786,13 +2104,9 @@ export async function runObserve(
       );
       return { outcome: "done" };
     }
-    // ...UNLESS SOMETHING ALREADY COMMITTED, which is the same rule the model-failure path below
-    // follows and for the same reason (review round 30). A fence is asked at EVERY tool hop, so an
-    // unreadable one can arrive after a booking, a charge or an HTTP POST has already left — and
-    // the retry would send it again. At-most-once for the effects wins over the retry here too:
-    // the tick stops, reported as a warn the operator reads, and the next burst re-asks the
-    // classification. Nothing is lost that a retry could have recovered, because the retry would
-    // re-run the very hops that committed.
+    // NOTE: ...UNLESS SOMETHING ALREADY COMMITTED, the same rule as the model-failure path: a fence
+    // is asked at every hop, so an unreadable one can arrive after a write left, and a retry would
+    // repeat it. The tick stops with a warn, and the next burst re-asks.
     if (toolsRan - noEffect > 0) {
       line(
         "error",
@@ -1806,26 +2120,38 @@ export async function runObserve(
       );
       return { outcome: "done" };
     }
-    line("error", { failed: why, messagesRead: transcript.length }, "error");
+    const failure = uncommittedFailure();
+    line(
+      "error",
+      { failed: why, messagesRead: transcript.length, ...failure.detail },
+      failure.level,
+    );
     return {
       outcome: "fail",
       error: `observe: a fence could not be re-read before writing (${why})`,
     };
   };
 
+  // THE `decisions` ENGINE: one classification call on the same evidence the model would read, then
+  // the rules' tool calls through the same fenced tools, then one line saying what was asked, what
+  // came back and what ran. Everything above (arming, fences, window, labels, ceiling) is shared.
+  if (graph === null) {
+    if (decisions === null || !decisions.ok) return { outcome: "done" };
+    return runDecisionsTick(decisions);
+  }
+
   const startedAt = Date.now();
   let toolCalls = 0;
-  // A DEADLINE, because this tick runs on the SHARED scheduler. `runSchedulerTick` awaits every
-  // handler and `startScheduler` skips the next tick while one is still running, so a provider that
-  // never answers does not just lose this observation: it stops reminders and every other scheduled
-  // job behind it. The verdict call this replaced carried `AbortSignal.timeout(OBSERVE_TIMEOUT_MS)`
-  // and the graph invoke came up without one (round 2 of review).
-  //
-  // BOTH HALVES, and they answer different questions. The signal in the config is what the model
-  // client receives, so the provider request is actually cancelled rather than left in flight;
-  // `underSignal` is what guarantees THIS function stops waiting, whatever a link in the chain does
-  // with the signal it was handed. The scheduler's problem is the waiting, not the socket.
+  const toolLogger = new ToolFlowLogger(flow, {
+    logValues: cfg.logToolValues,
+    tools,
+    handedOff: () => handoffState.completed === true,
+  });
+  // NOTE: A DEADLINE, because this tick holds a slot of the scheduler's drain (see `OBSERVE_TIMEOUT_MS`).
+  // Both halves: the config's signal cancels the provider request, and `underSignal` guarantees
+  // this function stops waiting whatever a link in the chain does with the signal.
   try {
+    promptSent = true;
     const result = await underSignal(
       graph.invoke(
         {
@@ -1835,14 +2161,9 @@ export async function runObserve(
                 transcript,
                 currentForPrompt,
                 notes,
-                // EMPTY IS A CLAIM, so it is only made when BOTH lists were read (round 8). Each
-                // one recognises changes the other cannot — the catalog knows a label removed
-                // during the window, which is gone from the conversation's set, and the
-                // conversation knows a title the model invented, which is in no catalog — so with
-                // one of them missing, "nothing changed here" is exactly the sentence a stateless
-                // observer would take as licence to decide again. Lines that WERE recognised are
-                // still shown: those are read, whatever else was not, and a read that was missing a
-                // source is handed over as incomplete rather than silently as complete (round 17).
+                // NOTE: EMPTY IS A CLAIM, made only when BOTH lists were read: each recognises
+                // changes the other cannot (a label removed in the window, a title the model
+                // invented). Recognised lines are still shown, with the reading marked incomplete.
                 {
                   lines: labelChanges.lines,
                   complete:
@@ -1878,7 +2199,7 @@ export async function runObserve(
               base,
               tools,
             }),
-            new ToolFlowLogger(flow, { logValues: cfg.logToolValues, tools }),
+            toolLogger,
           ],
         },
       ),
@@ -1891,28 +2212,22 @@ export async function runObserve(
       if (Array.isArray(calls)) toolCalls += calls.length;
     }
   } catch (err) {
+    toolLogger.settle();
     const msg = err instanceof Error ? err.message : String(err);
     // A REFUSED FENCE IS NOT A MODEL FAILURE. `stillWanted` stops the turn by refusing the tool
     // node, and whatever that surfaces as, the exception is not what went wrong — the world moved.
     // Whether the tick is DONE or retried is the fence's own answer, not this catch's.
     if (refusal !== null) return endOnRefusal(refusal);
-    // A FAILURE AFTER A TOOL RAN ENDS THE TICK, and the level says which of the two it was: an
-    // `error` the scheduler will retry, or a `warn` that stops here because a retry would repeat
-    // whatever already committed. Reported either way — the operator needs to know the observation
-    // did not finish, and that nothing will pick it up before the next burst.
-    // ...AND A DISPATCH THAT NEVER SETTLED COUNTS, which is the deadline's case and is deliberate
-    // (review round 34). When the tick's budget fires, `underSignal` rejects the whole invoke: a
-    // tool still running does not report back, so from here "it was resolving a credential" and
-    // "its POST landed and the response never arrived" are the same picture. The mark above can
-    // only speak for a call that RETURNED. Unknown therefore reads as committed, because the two
-    // errors are not symmetric: counting a no-op costs one observation, which the next burst
-    // re-asks; not counting a write costs the write, again, in somebody else's system. An
-    // `on_resolve` agent has no next burst, and that is the price, declared in docs/chatwoot.md
-    // rather than guessed away.
+    // A FAILURE AFTER A TOOL RAN ENDS THE TICK: `error` when the scheduler will retry, `warn`
+    // when a retry would repeat a commit. A dispatch that never settled (the deadline rejected the
+    // invoke) counts as committed, because counting a no-op costs one observation and not counting
+    // a write repeats it. An `on_resolve` agent has no next burst, the declared price
+    // (docs/chatwoot.md).
     const committed = toolsRan - noEffect > 0;
+    const failure = uncommittedFailure();
     emitFlowEvent(flow, {
       stage: "observe",
-      level: committed ? "warn" : "error",
+      level: committed ? "warn" : failure.level,
       status: "error",
       provider: cfg.mc.provider,
       model: cfg.mc.model,
@@ -1920,22 +2235,24 @@ export async function runObserve(
       detail: {
         reason,
         failed: "model_call",
+        ...failureDetail(err),
         toolCalls: toolsRan - noEffect,
-        ...(committed ? { retried: false } : {}),
+        ...(committed ? { retried: false } : failure.detail),
         ...(labelWrites.length > 0 ? { labels: labelWrites } : {}),
       },
       errorMessage: msg,
+      full: { kind: "system_prompt", text: cfg.systemPromptAudit },
     });
     if (committed) return { outcome: "done" };
     return { outcome: "fail", error: `observe: ${msg}` };
   }
+  toolLogger.settle();
   if (refusal !== null) return endOnRefusal(refusal);
   emitFlowEvent(flow, {
     stage: "observe",
     level: "info",
     status: "ok",
-    provider: cfg.mc.provider,
-    model: cfg.mc.model,
+    ...(answeredBy ?? { provider: cfg.mc.provider, model: cfg.mc.model }),
     durationMs: Date.now() - startedAt,
     detail: {
       reason,
@@ -1945,18 +2262,31 @@ export async function runObserve(
       labelsBefore: current === null ? null : current.length,
       ...(labelWrites.length > 0 ? { labels: labelWrites } : {}),
     },
+    // The observer's audited prompt, whole, when the agent keeps full turn detail.
+    full: { kind: "system_prompt", text: cfg.systemPromptAudit },
   });
   return { outcome: "done" };
 }
 
-export async function observeHandler(
+export function observeHandler(
   job: ClaimedJob,
   base: PrismaClient,
+): Promise<JobResult> {
+  return runObserveJob(job, base);
+}
+
+// The handler's body, with `deps` for a test that drives a claimed job minus the network.
+export async function runObserveJob(
+  job: ClaimedJob,
+  base: PrismaClient,
+  deps: Pick<ObserveDeps, "makeModel" | "makeClient"> = {},
 ): Promise<JobResult> {
   const p = parseObservePayload(job.payload);
   if (!p) return { outcome: "done" };
   return runObserve(job.tenantId, p, base, {
+    ...deps,
     claim: { jobId: job.id, claimSeq: job.claimSeq },
+    afterFailure: jobRetriesAfterFailure(job) ? "retry" : "dead_letter",
   });
 }
 

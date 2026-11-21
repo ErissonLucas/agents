@@ -1,7 +1,9 @@
-import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import basePrisma from "@/api/lib/prisma";
+import type { ClientAudience } from "@/graph/usage-sources";
 import { assertUsableCount } from "@/lib/query-param";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
+import { GUARDRAIL_OBSERVED } from "./stages";
 
 // Read surface for the execution-flow log (the Logs page). RLS-scoped to the active tenant. KEYSET
 // pagination by id desc (the table is high-write; offset pagination degrades): pass the last id
@@ -22,6 +24,8 @@ export interface ExecutionLogItem {
   model: string | null;
   durationMs: number | null;
   source: string;
+  // A line of a client-channel turn served to an anonymous visitor's session.
+  anonymous: boolean;
   detail: unknown;
   errorMessage: string | null;
   createdAt: string;
@@ -33,10 +37,18 @@ export interface ListLogsOpts {
   level?: string;
   stage?: string;
   agentId?: bigint;
+  inboxId?: bigint;
   conversationId?: bigint;
   turnId?: string;
+  // A tool line's `detail.tool`, which is how the dashboard's health block opens one tool's failures.
+  tool?: string;
+  // Only lines that name no tool (`detail.tool` absent): the health block's group of tool warnings
+  // written before any tool was known (an MCP server that could not be listed).
+  noTool?: boolean;
   // undefined → "inbox" (real traffic); "all" → no source filter; else exact match.
   source?: string;
+  // Client-channel lines of one audience only (and so no line of another source).
+  audience?: ClientAudience;
   // Case-insensitive substring match on errorMessage.
   search?: string;
   limit?: number;
@@ -66,6 +78,7 @@ export const LOG_SELECT = {
   model: true,
   durationMs: true,
   source: true,
+  anonymous: true,
   detail: true,
   errorMessage: true,
   createdAt: true,
@@ -79,21 +92,47 @@ export type ExecutionLogRow = Prisma.ExecutionLogGetPayload<{
 // keyset pagination via `cursor`) and the export (which ignores `cursor`/`limit`).
 export function buildLogWhere(
   opts: ListLogsOpts,
+  // Under an inbox filter: lines naming no inbox whose conversation is that inbox's
+  // (`inboxLogLineIds`), which are that inbox's lines too.
+  inboxLineIds: bigint[] = [],
 ): Prisma.ExecutionLogWhereInput {
   const createdAt: Prisma.DateTimeFilter = {};
   if (opts.since) createdAt.gte = opts.since;
   if (opts.until) createdAt.lte = opts.until;
+  const observed = opts.stage === GUARDRAIL_OBSERVED;
+  const and: Prisma.ExecutionLogWhereInput[] = [
+    // An audience is client traffic of that kind, whatever the source says: ANDed, so a source
+    // other than "client" with an audience matches nothing rather than being replaced.
+    ...(opts.audience
+      ? [{ source: "client", anonymous: opts.audience === "anonymous" }]
+      : []),
+    // The observed guardrail trips: `guardrail` lines whose action only recorded (./stages.ts).
+    ...(observed ? [{ detail: { path: ["action"], equals: "observe" } }] : []),
+  ];
   return {
     ...(opts.since || opts.until ? { createdAt } : {}),
     ...(opts.level ? { level: opts.level } : {}),
-    ...(opts.stage ? { stage: opts.stage } : {}),
+    ...(opts.stage ? { stage: observed ? "guardrail" : opts.stage } : {}),
     ...(opts.agentId !== undefined ? { agentId: opts.agentId } : {}),
+    ...(opts.inboxId !== undefined
+      ? {
+          OR: [
+            { inboxId: opts.inboxId },
+            ...(inboxLineIds.length > 0 ? [{ id: { in: inboxLineIds } }] : []),
+          ],
+        }
+      : {}),
+    ...(opts.tool ? { detail: { path: ["tool"], equals: opts.tool } } : {}),
+    ...(opts.noTool && !opts.tool
+      ? { detail: { path: ["tool"], equals: Prisma.AnyNull } }
+      : {}),
     ...(opts.conversationId !== undefined
       ? { conversationId: opts.conversationId }
       : {}),
     ...(opts.turnId ? { turnId: opts.turnId } : {}),
     // source: default to real traffic; "all" lifts the filter entirely.
     ...(opts.source === "all" ? {} : { source: opts.source ?? "inbox" }),
+    ...(and.length > 0 ? { AND: and } : {}),
     ...(opts.search
       ? { errorMessage: { contains: opts.search, mode: "insensitive" } }
       : {}),
@@ -116,10 +155,58 @@ export function mapExecutionLogRow(r: ExecutionLogRow): ExecutionLogItem {
     model: r.model,
     durationMs: r.durationMs,
     source: r.source,
+    anonymous: r.anonymous,
     detail: r.detail,
     errorMessage: r.errorMessage,
     createdAt: r.createdAt.toISOString(),
   };
+}
+
+// A line written before its inbox was known (a person taking over is logged from the webhook) names
+// only its conversation. Under an inbox filter it is still that inbox's line, so the reader finds
+// such lines whose conversation is in the inbox and that pass every other filter, newest first, and
+// at most `limit` of them: the page is the newest `limit` rows of both arms together, so no more than
+// that many from this arm can ever be on it, and the id list it hands `buildLogWhere` stays bounded
+// however large the inbox. The dashboard counts them by the same rule (`logWhereSql`).
+export async function inboxLogLineIds(
+  db: Prisma.TransactionClient,
+  opts: ListLogsOpts,
+  limit: number,
+): Promise<bigint[]> {
+  if (opts.inboxId === undefined) return [];
+  const since = opts.since ?? null;
+  const until = opts.until ?? null;
+  const source = opts.source === "all" ? null : (opts.source ?? "inbox");
+  const audience = opts.audience ?? null;
+  const tool = opts.tool ?? null;
+  const noTool = Boolean(opts.noTool && !opts.tool);
+  const observed = opts.stage === GUARDRAIL_OBSERVED;
+  const stage = observed ? "guardrail" : (opts.stage ?? null);
+  const rows = await db.$queryRaw<{ id: bigint }[]>(Prisma.sql`
+    SELECT l.id
+      FROM execution_logs l
+     WHERE l.inbox_id IS NULL
+       AND EXISTS (SELECT 1 FROM conversations c
+                    WHERE c.id = l.conversation_id AND c.inbox_id = ${opts.inboxId})
+       AND (${since}::timestamptz IS NULL OR l.created_at >= ${since})
+       AND (${until}::timestamptz IS NULL OR l.created_at <= ${until})
+       AND (${opts.level ?? null}::text IS NULL OR l.level = ${opts.level ?? null})
+       AND (${stage}::text IS NULL OR l.stage = ${stage})
+       AND (NOT ${observed} OR l.detail->>'action' = 'observe')
+       AND (${opts.agentId ?? null}::bigint IS NULL OR l.agent_id = ${opts.agentId ?? null})
+       AND (${tool}::text IS NULL OR l.detail->>'tool' = ${tool})
+       AND (NOT ${noTool} OR l.detail->>'tool' IS NULL)
+       AND (${opts.conversationId ?? null}::bigint IS NULL OR l.conversation_id = ${opts.conversationId ?? null})
+       AND (${opts.turnId ?? null}::text IS NULL OR l.turn_id = ${opts.turnId ?? null})
+       AND (${source}::text IS NULL OR l.source = ${source})
+       AND (${audience}::text IS NULL
+            OR (l.source = 'client' AND l.anonymous = (${audience}::text = 'anonymous')))
+       AND (${opts.search ?? null}::text IS NULL
+            OR strpos(lower(l.error_message), lower(${opts.search ?? null})) > 0)
+       AND (${opts.cursor ?? null}::bigint IS NULL OR l.id < ${opts.cursor ?? null})
+     ORDER BY l.id DESC
+     LIMIT ${limit}`);
+  return rows.map((r) => r.id);
 }
 
 export async function listExecutionLogs(
@@ -129,10 +216,9 @@ export async function listExecutionLogs(
 ): Promise<ListLogsResult> {
   assertUsableCount(opts.limit, "limit");
   const take = Math.min(opts.limit ?? 50, 200);
-  const where = buildLogWhere(opts);
-  const rows = await runScopedOn(base, ctx, (db) =>
+  const rows = await runScopedOn(base, ctx, async (db) =>
     db.executionLog.findMany({
-      where,
+      where: buildLogWhere(opts, await inboxLogLineIds(db, opts, take + 1)),
       orderBy: { id: "desc" },
       take: take + 1, // one extra row tells us whether a next page exists
       select: LOG_SELECT,

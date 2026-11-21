@@ -4,25 +4,31 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { encryptJson } from "@/api/lib/crypto";
 import logger from "@/api/lib/logger";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
-import { deleteAgent } from "@/modules/agents/service";
+import {
+  deleteAgent,
+  replaceAgentToolSelections,
+  updateAgent,
+} from "@/modules/agents/service";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import { bindInbox } from "@/modules/chatwoot/management";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
+import { withAuditTriggerFixture } from "../utils/pg-waits";
 
-// #546. `Inbox.agentId` is a plain column with no `@relation`, so no foreign key ever refused a
-// binding to an agent that is gone, and `persistBinding` referenced the row without holding any lock
-// on it. `deleteAgent` is the writer that fits in the window: it takes the agent `FOR UPDATE`, nulls
-// every inbox pointing at it (this one is not yet), deletes it, and the bind then commits the
-// dangling reference. The window is not a millisecond either: step 2 of `bindInbox` is the round trip
-// to Chatwoot, made deliberately OUTSIDE the transaction.
-//
-// Sibling of #501, which answered the same shape on `Experiment.agentId`.
+// `Inbox.agentId` is a plain column with no `@relation`, so no foreign key refuses a binding to an
+// agent that is gone; `persistBinding` has to lock the agent row itself. `deleteAgent` fits in the
+// window: it takes the agent `FOR UPDATE`, nulls every inbox pointing at it (this one is not yet),
+// deletes it, and an unlocked bind then commits the dangling reference. The window is wide: step 2
+// of `bindInbox` is the round trip to Chatwoot, made deliberately OUTSIDE the transaction.
+// `Experiment.agentId` has the same shape and the same guard.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
 let su: PrismaClient | undefined;
 let app: PrismaClient | undefined;
+/** The role the app's connections run as, which is how a waiting backend is told apart as ours. */
+let appRole = "";
 if (appUrl && suUrl) {
   try {
     su = new PrismaClient({
@@ -32,10 +38,12 @@ if (appUrl && suUrl) {
     app = new PrismaClient({
       adapter: new PrismaPg({ connectionString: appUrl }),
     });
-    await app.$queryRaw`SELECT 1`;
+    const [me] = await app.$queryRaw<Array<{ role: string }>>`
+      SELECT current_user::text AS role`;
+    appRole = me?.role ?? "";
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -66,6 +74,7 @@ function stubClient(onAttach?: () => Promise<void>) {
       calls.push("updateAgentBot");
       return {};
     },
+    inboxAgentBotId: async () => null,
     setInboxAgentBot: async () => {
       calls.push("setInboxAgentBot");
       await onAttach?.();
@@ -239,11 +248,21 @@ describe.skipIf(!dbUp)("#546 binding an agent that is being deleted", () => {
 
   // Polls Postgres rather than the clock: on a fast machine it returns in one round trip, and on a
   // slow one it keeps asking instead of concluding.
-  async function someoneBlockedBy(pid: number, ms = 5000): Promise<boolean> {
+  /**
+   * Whether an application backend is waiting on `pid`. Only backends of the app's own role count: a
+   * file running beside this one under `--parallel` creates and drops triggers as the superuser, and
+   * that DDL queues behind any table lock without being anything this file started. `stop` ends the
+   * poll early, so a caller that stops needing the answer can wait for it to wind down.
+   */
+  async function someoneBlockedBy(
+    pid: number,
+    { ms = 5000, stop }: { ms?: number; stop?: { done: boolean } } = {},
+  ): Promise<boolean> {
     const until = Date.now() + ms;
-    while (Date.now() < until) {
+    while (Date.now() < until && !stop?.done) {
       const rows = await suDb.$queryRaw<Array<{ pid: number }>>`
-        SELECT pid FROM pg_stat_activity WHERE ${pid} = ANY(pg_blocking_pids(pid))`;
+        SELECT pid FROM pg_stat_activity
+        WHERE ${pid} = ANY(pg_blocking_pids(pid)) AND usename = ${appRole}`;
       if (rows.length > 0) return true;
       await new Promise((r) => setTimeout(r, 25));
     }
@@ -256,10 +275,9 @@ describe.skipIf(!dbUp)("#546 binding an agent that is being deleted", () => {
   // transaction, and Postgres is asked who is blocking whom.
   test("the write waits for the agent's own lock", async () => {
     const { agentId, inboxId } = await pair("waits");
-    // Provision the bot FIRST, and then re-bind through a client that reports it alive. Otherwise
+    // NOTE: provision the bot FIRST, then re-bind through a client that reports it alive. Otherwise
     // `ensureAgentBot` inserts `chatwoot_agent_bots`, whose foreign key takes KEY SHARE on the agent
-    // and blocks against the holder all by itself: the assertion below would be green with no guard
-    // in the write at all, which is how this test passed before it was written properly.
+    // and blocks against the holder by itself, so the assertion would pass with no guard at all.
     await bindInbox(
       ctx(),
       inboxId,
@@ -315,13 +333,11 @@ describe.skipIf(!dbUp)("#546 binding an agent that is being deleted", () => {
     expect(await boundAgentOf(inboxId)).toBe(agentId);
   });
 
-  // The other half of the mode, and the one a future edit is most likely to break: an ordinary SAVE
-  // of the agent must NOT hold the bind up. `FOR KEY SHARE` conflicts with `FOR UPDATE` and with
-  // nothing else, so this holds true only while the non-deleting writers take `FOR NO KEY UPDATE`
-  // (`updateAgent` and `replaceAgentToolSelections`, weakened for exactly this in #546). If one of
-  // them goes back to `FOR UPDATE`, this test does not fail with a message: it HANGS until the
-  // runner kills it, which is the loud version of the stall it is about, since a bind that waits
-  // here is holding the Chatwoot account row while it does.
+  // The other half of the mode: an ordinary SAVE of the agent must NOT hold the bind up. `FOR KEY
+  // SHARE` conflicts only with `FOR UPDATE`, so this holds while the non-deleting writers
+  // (`updateAgent`, `replaceAgentToolSelections`) take `FOR NO KEY UPDATE`. If one takes `FOR UPDATE`,
+  // this test HANGS until the runner kills it: the stall it is about, since a waiting bind holds the
+  // Chatwoot account row.
   test("an ordinary save of the same agent does not hold the bind up", async () => {
     const { agentId, inboxId } = await pair("saved");
     const holder = await holdAgentLock(agentId, "FOR NO KEY UPDATE");
@@ -363,26 +379,101 @@ describe.skipIf(!dbUp)("#546 binding an agent that is being deleted", () => {
     await holder.done;
   });
 
-  // The test above proves the two modes are compatible; this one proves the agents module still
-  // SPEAKS the weak one. They are different claims, and only the second survives a writer being
-  // added: a new `FOR UPDATE` in some third agent write would stall the bind exactly like the two
-  // weakened in #546 did, and the test above would go on passing because it takes its own lock. The
-  // delete is the single admissible strong lock, and it is the conflict the bind wants.
-  test("only the delete takes a lock on the agent strong enough to stall a bind", async () => {
-    const src = await Bun.file(
-      new URL("../../src/modules/agents/service.ts", import.meta.url),
-    ).text();
-    // Comments stripped first, for the reason the same fence in `audit-channel-family` gives: the
-    // NOTEs in that file name `FOR UPDATE` while explaining why they do not take it.
-    const code = src.replace(/^\s*\/\/.*$/gm, "");
-    const strong = [...code.matchAll(/FOR UPDATE/g)].map((m) => m.index);
-    const del = code.indexOf("export async function deleteAgent(");
-    const next = code.indexOf("\nexport async function", del + 1);
-    expect(del).toBeGreaterThan(-1);
-    expect(next).toBeGreaterThan(del);
-    expect(strong).toHaveLength(1);
-    expect(strong[0]).toBeGreaterThan(del);
-    expect(strong[0]).toBeLessThan(next);
-    expect(code.match(/FOR NO KEY UPDATE/g) ?? []).not.toHaveLength(0);
+  // The test above proves the two modes are compatible; this one proves the agents module's own
+  // writers still TAKE the weak one. Each is parked inside its transaction, after its lock on the
+  // agent and at its audit insert, on an advisory lock this test holds; the bind must finish while it
+  // waits there. A writer that took `FOR UPDATE` would stall the bind behind it.
+  async function bindsWhileParked(
+    agentId: bigint,
+    write: () => Promise<unknown>,
+  ) {
+    return withAuditTriggerFixture(suDb, () => parkedBind(agentId, write));
+  }
+
+  async function parkedBind(agentId: bigint, write: () => Promise<unknown>) {
+    const key = 546_000_000 + Number(agentId);
+    const fn = `park_agent_audit_${process.pid}`;
+    await suDb.$executeRawUnsafe(
+      `CREATE FUNCTION ${fn}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(${key}); RETURN NEW; END $$`,
+    );
+    await suDb.$executeRawUnsafe(
+      `CREATE TRIGGER ${fn} BEFORE INSERT ON audit_logs FOR EACH ROW WHEN (NEW.tenant_id = ${tenantId} AND NEW.action LIKE 'agent.%') EXECUTE FUNCTION ${fn}()`,
+    );
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let announce!: (pid: number) => void;
+    const gotIt = new Promise<number>((r) => {
+      announce = r;
+    });
+    const holding = suDb.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe(`SELECT pg_advisory_xact_lock(${key})`);
+        const [me] = await tx.$queryRaw<Array<{ pid: number }>>`
+          SELECT pg_backend_pid()::int AS pid`;
+        announce(me?.pid as number);
+        await held;
+      },
+      { timeout: 30_000 },
+    );
+    try {
+      const holder = await gotIt;
+      const writing = write();
+      expect(await someoneBlockedBy(holder)).toBe(true);
+      const [writer] = await suDb.$queryRaw<Array<{ pid: number }>>`
+        SELECT pid FROM pg_stat_activity WHERE ${holder} = ANY(pg_blocking_pids(pid))`;
+      const binding = bindInbox(
+        ctx(),
+        (await pair(`parked-${agentId}`)).inboxId,
+        agentId,
+        { makeClient: stubClient().makeClient },
+        appDb,
+      );
+      const stop = { done: false };
+      const probe = someoneBlockedBy(writer?.pid ?? -1, { stop });
+      const outcome = await Promise.race([
+        binding.then(() => "bound"),
+        probe.then((b) => (b ? "stalled" : "neither")),
+      ]);
+      stop.done = true;
+      await probe;
+      release();
+      await holding;
+      await writing;
+      await binding;
+      return outcome;
+    } finally {
+      release();
+      await holding.catch(() => {});
+      await suDb.$executeRawUnsafe(`DROP TRIGGER ${fn} ON audit_logs`);
+      await suDb.$executeRawUnsafe(`DROP FUNCTION ${fn}()`);
+    }
+  }
+
+  test("an agent save and a grant replacement in flight do not stall a bind", async () => {
+    const saved = await pair("save-in-flight");
+    expect(
+      await bindsWhileParked(saved.agentId, () =>
+        updateAgent(
+          ctx(),
+          saved.agentId,
+          { systemPrompt: "edited while a bind runs" },
+          appDb,
+        ),
+      ),
+    ).toBe("bound");
+
+    const granted = await pair("grants-in-flight");
+    expect(
+      await bindsWhileParked(granted.agentId, () =>
+        replaceAgentToolSelections(
+          ctx(),
+          granted.agentId,
+          [{ source: "NATIVE", enabledTools: ["handoff_to_human"] }],
+          appDb,
+        ),
+      ),
+    ).toBe("bound");
   });
 });

@@ -30,7 +30,10 @@ import {
 import { agentObservesNow, agentStillSpeaks } from "@/modules/agents/speaks";
 import { retireRedirectFollowUp } from "@/modules/channel-redirect/followup";
 import { readChannelRedirectConfig } from "@/modules/channel-redirect/service";
-import { overlayMediaAnnotations } from "@/modules/chatwoot/annotations";
+import {
+  awaitOpenTranscriptions,
+  overlayMediaAnnotations,
+} from "@/modules/chatwoot/annotations";
 import {
   recordTurnCoverage,
   retireCoveredDeliveries,
@@ -43,6 +46,7 @@ import { loadChatwootClient } from "@/modules/chatwoot/instance";
 import {
   buildQuoteResolver,
   type ChatwootMessageRow,
+  hasAnswerableContent,
   parseChatwootMessages,
   pendingIncoming,
   toRenderable,
@@ -55,17 +59,23 @@ import { renderInboundMessage } from "@/modules/chatwoot/render";
 import { turnHadTheWords } from "@/modules/chatwoot/webhook";
 import type { AuthContext } from "@/modules/contact-auth/check";
 import { mediaRefusedThrough } from "@/modules/contact-auth/media-refusal";
+import { observerArmPermit } from "@/modules/contact-auth/observer";
 import {
   authorizeContact,
+  type ContactAuthStage,
   contactAuthFlowEvent,
 } from "@/modules/contact-auth/service";
+import {
+  contactAuthHasEndpointStage,
+  contactAuthHasRuleStage,
+} from "@/modules/contact-auth/settings";
 import {
   clearConversationError,
   recordConversationError,
 } from "@/modules/conversations/error";
 import { announceFailedTurn } from "@/modules/conversations/failure-note";
 import { armNothingToAnswer } from "@/modules/conversations/nothing-to-answer";
-import { emitFlowEvent } from "@/modules/flowlog/service";
+import { emitFlowEvent, writeFlowEvent } from "@/modules/flowlog/service";
 import type { FlowStage } from "@/modules/flowlog/stages";
 import { emitUnroutedMessage } from "@/modules/flowlog/unrouted";
 import { readMemoryConfig } from "@/modules/memory/settings";
@@ -75,6 +85,7 @@ import {
   type ClaimedJob,
   jobRetired,
   jobRetiredStrict,
+  jobRetriesAfterFailure,
 } from "@/modules/scheduler/service";
 import {
   type JobContext,
@@ -88,6 +99,8 @@ import {
   SPEND_CEILING_BURST_WINDOW_MS,
   spendCeilingVerdict,
 } from "@/modules/spend-ceiling/service";
+import { transcribeInboundAudio } from "@/modules/stt/service";
+import { readSttConfig } from "@/modules/stt/settings";
 import {
   extractMessageVisuals,
   hasUnextractedVisual,
@@ -148,6 +161,9 @@ function err(e: unknown): string {
 export interface CoalesceTurnContext {
   // The scheduler job's signal when a flush runs this; the re-engage has none.
   signal?: AbortSignal;
+  // Handed straight to `runLoadedTurn`: what the job does with this burst if the turn throws. Only
+  // the flush has a job; see the field on `RunLoadedTurnParams`.
+  afterThrow?: "retry" | "dead_letter";
   tenantId: bigint;
   instanceId: bigint;
   conversationId: number;
@@ -182,10 +198,13 @@ export interface CoalesceTurnContext {
   // Whether this caller is the operator's own re-engage, the only one entitled to answer over a
   // silence something chose deliberately.
   initiatedBy: "automatic" | "operator";
-  // Extract the attachments nobody has read yet before the turn's text is built (arrival-time
-  // extraction never ran for messages from before the agent watched the inbox). Opt-in: on the flush,
-  // which runs after the eager pass, a meta-less attachment already failed once.
-  fillMissingMedia?: boolean;
+  // Extract the attachments nobody has read yet before the turn's text is built. "all" opens every
+  // one without a reading (the re-engage: messages from before the agent watched the inbox, or a
+  // file that failed once and is worth one more attempt a person asked for). "untried" skips what the
+  // arrival pass already tried, which it leaves as a count of unread files in the stash: the flush
+  // runs seconds after that pass, and the attachments it still finds unread are the ones attached
+  // AFTER the message was created, which the arrival pass never saw.
+  fillMissingMedia?: "all" | "untried";
   // The Chatwoot id of this tenant's agent bot, so the post gate can tell OUR outgoing message from
   // everybody else's. Null when the caller has no bot to name, and then every outgoing message on the
   // page counts as somebody else's.
@@ -213,6 +232,9 @@ export interface CoalesceTurnContext {
     // The burst's earliest reaction, for a conversation with no mark (see `readReactionFrom`).
     reactionFrom?: number | null;
   };
+  // Called with the page the selection read when it found no burst to answer, so the caller can tell
+  // "nothing to answer" (the message that armed it has no answerable content) from nothing pending.
+  onEmptyBurst?: (page: ChatwootMessageRow[]) => void;
 }
 
 // Is there a burst to answer, and what is it. Shared with the flush's spend-ceiling branch, which must
@@ -269,7 +291,7 @@ async function withCaughtUp(
   const after =
     catchUp?.after ?? (starts.length > 0 ? Math.min(...starts) - 1 : null);
   if (after === null) return page;
-  // NOTE: Read until dry (a hundred rows per read), not until the overlap with the page: the reaction
+  // Read until dry (a hundred rows per read), not until the overlap with the page: the reaction
   // can sort above it. A read the cap cuts short adds nothing, because a reply hidden in the gap would
   // reopen a request it already closed.
   const caught: ChatwootMessageRow[] = [];
@@ -289,6 +311,11 @@ async function withCaughtUp(
   return [...page, ...added].sort((a, b) => a.id - b.id);
 }
 
+// How long a burst waits for a voice note whose transcription is still in flight in this process,
+// once for the whole burst. Past it the audio renders as today's "not audible" marker and the reply
+// still goes out: a provider that hangs costs this much latency, never the turn.
+export const FLUSH_TRANSCRIPTION_WAIT_MS = 8000;
+
 // The fork's `MessageFinder::CATCH_UP_LIMIT`: a full batch means more may follow.
 const CATCH_UP_PAGE = 100;
 // A burst that fell this far behind its page is not one a reaction explains; the page alone answers.
@@ -297,6 +324,7 @@ const CATCH_UP_MAX_READS = 5;
 export async function selectAnswerableBurst(
   ctx: Pick<
     CoalesceTurnContext,
+    | "signal"
     | "tenantId"
     | "instanceId"
     | "conversationId"
@@ -305,12 +333,16 @@ export async function selectAnswerableBurst(
     | "settings"
     | "label"
     | "catchUp"
+    | "onEmptyBurst"
   > & {
     // Presente só quando o chamador quer os anexos sem extração abertos antes do render (ver
     // `fillMissingMedia` em CoalesceTurnContext). Os ids são os da linha de log: sem eles a linha
     // de estágio `vision` sai órfã, e a rota do operador para o rastro de um turno
     // (/logs?conversationId=) não mostra o anexo que falhou.
     fillMedia?: {
+      mode: "all" | "untried";
+      // The flush job's deadline: past it, no further paid extraction starts.
+      signal?: AbortSignal;
       turnId: string;
       convDbId: bigint;
       agentId: bigint;
@@ -354,7 +386,10 @@ export async function selectAnswerableBurst(
       if (free.length > 0) pending = free;
     }
   }
-  if (pending.length === 0) return null;
+  if (pending.length === 0) {
+    ctx.onEmptyBurst?.(messages);
+    return null;
+  }
   let dropped: typeof pending = [];
 
   const cfg = readDebounceConfig(ctx.settings);
@@ -391,19 +426,54 @@ export async function selectAnswerableBurst(
       base,
       deps,
     });
+  // The voice notes nobody transcribed, only for `all`: a person asked for this conversation, and the
+  // arrival pass never transcribes one that came in while a person held it. `untried` has no such
+  // mark for audio, and the wait below already covers a transcription the arrival pass has open.
+  // A transcription takes up to a minute per note, so one attempted is a wait like the visual one:
+  // the turn re-asks whose conversation it is before the model runs.
+  if (
+    ctx.fillMedia?.mode === "all" &&
+    (await fillMissingAudio({
+      tenantId,
+      instanceId,
+      conversationId,
+      settings: ctx.settings,
+      pending,
+      fill: ctx.fillMedia,
+      base,
+      deps,
+    }))
+  )
+    waitedOnMedia = true;
+
+  // A voice note of this burst that the arrival pass is still transcribing: the re-read above can land
+  // a moment before its words do, and rendered now it becomes the marker that asks the customer to
+  // send it again. Waited for once, bounded, then the annotations are overlaid again.
+  const unheard = pending
+    .filter((m) => m.attachmentTypes.includes("audio") && !m.transcribedText)
+    .map((m) => m.id);
+  if (
+    unheard.length > 0 &&
+    (await awaitOpenTranscriptions(tenantId, instanceId, unheard, {
+      timeoutMs: deps?.transcriptionWaitMs ?? FLUSH_TRANSCRIPTION_WAIT_MS,
+      signal: ctx.signal,
+    }))
+  )
+    waitedOnMedia = true;
+  // NOTE: overlaid again whether or not anything was waited for: a transcription that settled after the
+  // first overlay above, during the selection's own reads, is closed by now and stashed all the same.
+  if (unheard.length > 0)
+    overlayMediaAnnotations(tenantId, instanceId, messages);
 
   const targetWatermark = pending[pending.length - 1]?.id as number;
   // The agent answers the burst's MOST RECENT message, so {{message_id}} must be that exact id.
   // Take the max id over the burst (order-independent, and across every message type incl. an
   // audio-only last message) instead of trusting the array position.
-  const lastMessageId = pending.reduce(
-    (max, m) => (m.id > max ? m.id : max),
-    0,
-  );
+  const lastMessageId = pending.reduce((max, m) => Math.max(max, m.id), 0);
   // Resolve quoted/replied-to messages from the full page, then render each pending message for the
   // agent (markers for audio/image/file, quote context). Coalesce into one turn.
   const resolveQuoted = buildQuoteResolver(messages);
-  // NOTE: Paired with its source message so the ledger reads the same list the turn's input was built
+  // Paired with its source message so the ledger reads the same list the turn's input was built
   // from. The filter drops nothing today (`pendingIncoming` admits exactly what renders); it guards
   // against those two predicates, in different files, drifting apart.
   const rendered = pending
@@ -423,6 +493,7 @@ export async function selectAnswerableBurst(
       toMessageId: targetWatermark,
       base,
     });
+    ctx.onEmptyBurst?.(messages);
     return null;
   }
   return {
@@ -439,8 +510,9 @@ export async function selectAnswerableBurst(
 
 // Extracts the burst's attachments nobody has read yet. Returns whether any extraction was attempted,
 // that is, whether the turn waited. Best-effort: a failure leaves the turn with what it had, and never
-// blocks the reply.
-async function fillMissingVisuals(args: {
+// blocks the reply. Shared with the snoozed reminder (../followups/snoozed.ts), which reads the window
+// a person asked about the way the re-engage does.
+export async function fillMissingVisuals(args: {
   tenantId: bigint;
   instanceId: bigint;
   conversationId: number;
@@ -448,6 +520,8 @@ async function fillMissingVisuals(args: {
   messages: ChatwootMessageRow[];
   pending: ChatwootMessageRow[];
   fill: {
+    mode: "all" | "untried";
+    signal?: AbortSignal;
     turnId: string;
     convDbId: bigint;
     agentId: bigint;
@@ -456,6 +530,9 @@ async function fillMissingVisuals(args: {
   };
   base: PrismaClient;
   deps?: RuntimeDeps;
+  // Asked before each paid read: a caller whose work can be withdrawn while it reads (a retired job)
+  // stops opening files there. Absent answers yes.
+  stillWanted?: () => Promise<boolean>;
 }): Promise<boolean> {
   // DAS SETTINGS QUE O TURNO JÁ CARREGOU, sem ir ao banco. `resolveVisionConfig` faz exatamente
   // isto depois de descobrir o agente pela inbox, e aqui o agente já está decidido: quem chegou até
@@ -463,7 +540,7 @@ async function fillMissingVisuals(args: {
   // respondida — um agente desligado não tem turno.
   const cfg = readVisionConfig(args.settings);
   if (!cfg.enabled) return false;
-  // NOTE: Only a message with no reading at all is opened (checked on the message's aggregate, where
+  // Only a message with no reading at all is opened (checked on the message's aggregate, where
   // attachment meta and the overlaid stash meet): re-extracting a partial one could publish a poorer
   // aggregate over the complete one. An email body image has no attachment meta, so only the body
   // pass's stash covers it.
@@ -472,10 +549,12 @@ async function fillMissingVisuals(args: {
       hasUnextractedVisual(m.visuals) &&
       ((m.bodyImages ?? 0) > 0
         ? !m.bodyRead
-        : !m.imageDescription && !m.extractedText),
+        : !m.imageDescription && !m.extractedText) &&
+      // The arrival pass's count of unread files is the mark that it tried: see `fillMissingMedia`.
+      (args.fill.mode === "all" || !m.attachmentsUnread),
   );
   if (alvos.length === 0) return false;
-  // NOTE: Media the contact authorization refused stays unread even when the gate now says yes
+  // Media the contact authorization refused stays unread even when the gate now says yes
   // (docs/contact-auth.md, "Media waits for the gate").
   const recusadaAte = await refusalMarkOrClosed(args);
   const abriveis = alvos.filter(
@@ -488,6 +567,10 @@ async function fillMissingVisuals(args: {
   // onde o cliente anexa o comprovante, o documento e o print de uma vez; disparar as mensagens
   // todas juntas multiplicaria o teto por mensagem sem nenhum ganho de latência que o cliente veja.
   for (const [i, m] of abriveis.entries()) {
+    // NOTE: Each message can take a document's whole budget, so the job's deadline is asked before
+    // every one; what is left renders as unread and the reply still goes out.
+    if (args.fill.signal?.aborted) break;
+    if (args.stillWanted && !(await args.stillWanted())) break;
     // NOTE: A refusal can land while an earlier message is being read.
     if (i > 0) {
       const agora = await refusalMarkOrClosed(args);
@@ -501,7 +584,9 @@ async function fillMissingVisuals(args: {
         messageId: m.id,
         visuals: m.visuals,
         cfg,
+        signal: args.fill.signal,
         stillAllowed: async () => {
+          if (args.stillWanted && !(await args.stillWanted())) return false;
           const agora = await refusalMarkOrClosed(args);
           return agora === null || m.id > agora;
         },
@@ -533,6 +618,7 @@ async function fillMissingVisuals(args: {
         if (lido.imageDescription) m.imageDescription = lido.imageDescription;
         if (lido.extractedText) m.extractedText = lido.extractedText;
         m.attachmentsUnread = lido.attachmentsUnread;
+        m.unreadFiles = lido.unreadFiles;
       }
     } catch (err) {
       logger.warn(
@@ -544,6 +630,82 @@ async function fillMissingVisuals(args: {
     }
   }
   return true;
+}
+
+// The voice notes nobody transcribed, transcribed now with the agent's STT, under the same fences as
+// `fillMissingVisuals`: the contact-authorization refusal mark, the deadline and the caller's
+// withdrawal, asked before each one. A transcription already stashed or on the attachment is reused
+// (`transcribeInboundAudio`), and the words land on the row. Best-effort: what fails stays unheard.
+export async function fillMissingAudio(args: {
+  tenantId: bigint;
+  instanceId: bigint;
+  conversationId: number;
+  settings: unknown;
+  pending: ChatwootMessageRow[];
+  fill: {
+    signal?: AbortSignal;
+    turnId: string;
+    convDbId: bigint;
+    agentId: bigint;
+    inboxDbId: bigint | null;
+    threadId: string;
+  };
+  base: PrismaClient;
+  deps?: RuntimeDeps;
+  stillWanted?: () => Promise<boolean>;
+  // True once a transcription was attempted: the caller waited on the provider.
+}): Promise<boolean> {
+  const cfg = readSttConfig(args.settings);
+  if (!cfg.enabled) return false;
+  const alvos = args.pending.filter((m) => m.audio && !m.transcribedText);
+  if (alvos.length === 0) return false;
+  let attempted = false;
+  for (const m of alvos) {
+    if (args.fill.signal?.aborted) break;
+    if (args.stillWanted && !(await args.stillWanted())) break;
+    const recusadaAte = await refusalMarkOrClosed(args);
+    if (recusadaAte !== null && m.id <= recusadaAte) continue;
+    const audio = m.audio;
+    if (!audio) continue;
+    attempted = true;
+    try {
+      const transcribe = args.deps?.transcribe ?? transcribeInboundAudio;
+      const text = await transcribe({
+        tenantId: args.tenantId,
+        instanceId: args.instanceId,
+        conversationId: args.conversationId,
+        messageId: m.id,
+        attachmentId: audio.id,
+        dataUrl: audio.dataUrl,
+        cfg,
+        base: args.base,
+        signal: args.fill.signal,
+        flow: {
+          tenantId: args.tenantId,
+          turnId: args.fill.turnId,
+          source: "inbox",
+          conversationId: args.fill.convDbId,
+          agentId: args.fill.agentId,
+          inboxId: args.fill.inboxDbId,
+          threadId: args.fill.threadId,
+          base: args.base,
+        },
+        deps: {
+          makeClient: args.deps?.makeClient,
+          fetchImpl: args.deps?.sttFetch,
+        },
+      });
+      if (text) m.transcribedText = text;
+    } catch (err) {
+      logger.warn(
+        "stt fill failed (conv=%s msg=%s): %s",
+        String(args.conversationId),
+        String(m.id),
+        err instanceof Error ? err.message : String(err),
+      );
+    }
+  }
+  return attempted;
 }
 
 // The conversation's media refusal mark, or null without one. Unreadable closes everything.
@@ -581,6 +743,20 @@ function newestCreatedAt(rows: ChatwootMessageRow[]): Date | null {
   return newest;
 }
 
+// The instant of the OLDEST message in the turn's input: where the burst, and so an attendance it
+// opens, started. Null with fewer than two dated messages, where it is the newest.
+export function oldestCreatedAt(rows: ChatwootMessageRow[]): Date | null {
+  let oldest: Date | null = null;
+  let dated = 0;
+  for (const row of rows) {
+    const at = row.createdAt ?? null;
+    if (!at) continue;
+    dated += 1;
+    if (oldest === null || at < oldest) oldest = at;
+  }
+  return dated > 1 ? oldest : null;
+}
+
 export async function coalesceAndRunTurn(
   ctx: CoalesceTurnContext,
   base: PrismaClient,
@@ -606,6 +782,8 @@ export async function coalesceAndRunTurn(
       ...(ctx.fillMissingMedia
         ? {
             fillMedia: {
+              mode: ctx.fillMissingMedia,
+              signal: ctx.signal,
               turnId,
               convDbId,
               agentId: loaded.agentId,
@@ -638,7 +816,7 @@ export async function coalesceAndRunTurn(
       const page = parseChatwootMessages(
         await client.getMessages(conversationId),
       );
-      // NOTE: A reaction that arrived mid-turn is on no default page either, so the same catch-up
+      // A reaction that arrived mid-turn is on no default page either, so the same catch-up
       // read runs here; without it the turn posts over the reaction its re-armed flush answers again.
       // A failure of this read keeps the page already read rather than skipping the gate.
       const latest = await (async () => {
@@ -662,7 +840,7 @@ export async function coalesceAndRunTurn(
           return page;
         }
       })();
-      // NOTE: Asked by identity (is there an OPEN message above what I answer), not by `max id >
+      // Asked by identity (is there an OPEN message above what I answer), not by `max id >
       // target`: a turn can answer below a message another turn claimed, and arithmetic would defer
       // its retry forever. Not through `ctx.selectPending` either: the re-engage's "after the last
       // outgoing" tail is emptied by our own mid-turn acknowledgement (`emitAck`).
@@ -680,7 +858,7 @@ export async function coalesceAndRunTurn(
         managedBotId: ctx.managedBotId,
         whatsappProvider: ctx.whatsappProvider,
       }).some((m) => m.id > targetWatermark);
-      // NOTE: And whether somebody else already answered this burst, which writes no row. Asked as
+      // And whether somebody else already answered this burst, which writes no row. Asked as
       // the foreign-reply boundary, not "are my ids still open": a member another TURN claimed is not
       // open either, and that case belongs to the claim, whose `partial` sends the flush back.
       const boundary = foreignReplyBoundary(latest, {
@@ -740,17 +918,18 @@ export async function coalesceAndRunTurn(
       },
     );
   }
-  // NOTE: Whether the burst ended up in the thread, reported by the runtime (the outcome word
+  // Whether the burst ended up in the thread, reported by the runtime (the outcome word
   // straddles `graph.invoke` both ways). Recorded as coverage there, not settled: a send failing after
   // the invoke would skip the settlement, and closing a row mid-turn hides it from the sweep.
   let foldedIn = false;
   const outcome = await runLoadedTurn({
     signal: ctx.signal,
+    afterThrow: ctx.afterThrow,
     // NOTE: Media extraction turns the window between the re-engage's owner check and the invoke
     // into minutes, so the ownership gate runs again after the wait.
     waitedBeforeInvoke: waitedOnMedia,
     onFoldedIn: async () => {
-      // NOTE: Only the messages whose words reached the turn's input: a voice note still waiting on
+      // Only the messages whose words reached the turn's input: a voice note still waiting on
       // STT is a placeholder here, and claiming it would suppress the ingest its write-back arms.
       const withWords = inTurn.filter((m) =>
         turnHadTheWords({
@@ -775,7 +954,10 @@ export async function coalesceAndRunTurn(
     // NOTE: The age of what the model reads, resolved here because both callers load the config
     // before fetching the thread. From `inTurn`, not `pending`: a voice note still waiting on its
     // transcription is not what the age describes. The re-render runs on every burst; it is cheap.
-    loaded: withMessageAge(loaded, newestCreatedAt(inTurn)),
+    loaded: {
+      ...withMessageAge(loaded, newestCreatedAt(inTurn)),
+      burstStartedAt: oldestCreatedAt(inTurn),
+    },
     authContext: ctx.authContext,
     tenantId,
     instanceId,
@@ -1129,7 +1311,9 @@ async function ingestObservedBurst(args: {
     return "unread";
   }
   let newest = armedLast;
-  // NOTE: Hoisted so the watermark advance at the tail can name what it closed: one id per message
+  // The newest handed-over message, whose text the watcher's endpoint gets when it forwards text.
+  let arming: { id: number; text: string | null } | null = null;
+  // Hoisted so the watermark advance at the tail can name what it closed: one id per message
   // this route folded into memory.
   const handedIds: number[] = [];
   let inboxChatwootId: number | null = null;
@@ -1149,7 +1333,7 @@ async function ingestObservedBurst(args: {
       const replied = marks?.lastRepliedMessageId ?? null;
       const handled = marks?.lastHandledMessageId ?? null;
       inboxChatwootId = marks?.inbox?.chatwootInboxId ?? null;
-      // NOTE: The floor the walk reads down to: the watermark while it sits below the armed burst
+      // The floor the walk reads down to: the watermark while it sits below the armed burst
       // (never lower than the reply, which a claim writes first). Past the burst, an observed message
       // moved it and it says nothing about the burst, so the floor is the last reply.
       const watermarkPastBurst =
@@ -1162,13 +1346,13 @@ async function ingestObservedBurst(args: {
         base,
         makeClient: deps?.makeClient,
       });
-      // NOTE: Paged backward until the floor is in view: traffic after the flip can push the armed
+      // Paged backward until the floor is in view: traffic after the flip can push the armed
       // messages off the newest page. A short page is the conversation's first; the walk is bounded.
       let rows = parseChatwootMessages(
         await client.getMessages(conversationId),
       );
       const messages = [...rows];
-      // NOTE: Whether the walk saw the floor (the first page, or a message at or below it). Only then
+      // Whether the walk saw the floor (the first page, or a message at or below it). Only then
       // is the whole burst in hand and may the watermark move past it.
       let floorInView = false;
       for (let pages = 1; ; pages += 1) {
@@ -1177,7 +1361,7 @@ async function ingestObservedBurst(args: {
           break;
         }
         const oldest = rows.reduce(
-          (min, m) => (m.id < min ? m.id : min),
+          (min, m) => Math.min(min, m.id),
           Number.POSITIVE_INFINITY,
         );
         if (!Number.isFinite(oldest) || oldest <= (floor ?? 0)) {
@@ -1194,7 +1378,7 @@ async function ingestObservedBurst(args: {
         }
         messages.unshift(...rows);
       }
-      // NOTE: The flush's catch-up read, from this walk's floor, so the observer also remembers a
+      // The flush's catch-up read, from this walk's floor, so the observer also remembers a
       // reaction no page carries.
       const caught = await withCaughtUp(client, conversationId, messages, {
         armedLast,
@@ -1204,7 +1388,7 @@ async function ingestObservedBurst(args: {
       });
       if (caught !== messages) messages.splice(0, messages.length, ...caught);
       overlayMediaAnnotations(tenantId, instanceId, messages);
-      // NOTE: Selected by identity, like the flush, because this path marks the burst too. The walk
+      // Selected by identity, like the flush, because this path marks the burst too. The walk
       // itself stays bounded by the scalar floor; an open message outside it is the next flush's.
       const selState = await readSelectionState({
         tenantId,
@@ -1248,6 +1432,9 @@ async function ingestObservedBurst(args: {
         });
         handedIds.push(m.id);
         if (newest === null || m.id > newest) newest = m.id;
+        if (arming === null || m.id > arming.id) {
+          arming = { id: m.id, text: m.content ?? null };
+        }
       }
       // NOTE: Retire the ledger rows of what the observer now has, or the stranded-delivery sweep
       // would re-run a message already remembered. Best-effort, like the flush's.
@@ -1277,19 +1464,33 @@ async function ingestObservedBurst(args: {
         String(conversationId),
         burst.length,
       );
-      // NOTE: A watcher's verdict on the burst is armed the way the receiver arms one per handed-over
-      // message: best-effort, after the memory has it.
-      await armObserve({
+      // A watcher's verdict on the burst is armed the way the receiver arms one per handed-over
+      // message: best-effort, after the memory has it, and only where the contact gate (conditions,
+      // and the endpoint under the same rules) lets the watcher observe this conversation.
+      const permit = await observerArmPermit({
         tenantId,
         instanceId,
         conversationId,
         agentId: ctx.agentId,
-        reason: "burst",
-        cfg: readMonitoringConfig(ctx.settings),
-        // NOTE: In Chatwoot's own id sequence, the order the tick's reset fence is asked in.
-        atMessageId: handedIds.length > 0 ? Math.max(...handedIds) : null,
+        settings: ctx.settings,
         base,
+        fetchImpl: deps?.contactAuthFetch,
+        message: arming,
       });
+      if (permit) {
+        await armObserve({
+          tenantId,
+          instanceId,
+          conversationId,
+          agentId: ctx.agentId,
+          reason: "burst",
+          cfg: readMonitoringConfig(ctx.settings),
+          // NOTE: In Chatwoot's own id sequence, the order the tick's reset fence is asked in.
+          atMessageId: handedIds.length > 0 ? Math.max(...handedIds) : null,
+          gateAskedAt: permit.askedAt,
+          base,
+        });
+      }
       if (!floorInView) {
         // NOTE: Failed rather than left for a later flush: no flush re-reads beyond one page, so
         // the part the bound left out would be lost quietly. The dead-letter keeps it visible.
@@ -1311,7 +1512,7 @@ async function ingestObservedBurst(args: {
       return "failed";
     }
   }
-  // NOTE: The redirect follow-up on a widget conversation is retired here too, since no turn ran to
+  // The redirect follow-up on a widget conversation is retired here too, since no turn ran to
   // cancel it: left armed, a flip back to production would send a template to a lead who already
   // answered. Best-effort, as the receiver's own retirement is.
   const redirectCfg = readChannelRedirectConfig(ctx.settings);
@@ -1390,7 +1591,7 @@ export async function flushDebounceJob(
       },
     });
     if (!conv?.inboxId) return null;
-    // NOTE: Read above the gate so a gate that CLOSES can still say whose conversation it was: the
+    // Read above the gate so a gate that CLOSES can still say whose conversation it was: the
     // line it writes is filtered by agent on the Logs page, and one written without an agent id is
     // invisible in exactly the view an operator investigating one agent is looking at.
     //
@@ -1469,7 +1670,7 @@ export async function flushDebounceJob(
       threadId,
     });
     if (!loaded) {
-      // NOTE: The config refuses a monitoring agent like a disabled one, but a disabled agent's burst
+      // The config refuses a monitoring agent like a disabled one, but a disabled agent's burst
       // waits for the switch while an observing agent's is the observer's to read. Classified from a
       // read taken AFTER the refusal, since a flip can land between `agentRow` and the config load.
       const now = await db.agent.findUnique({
@@ -1503,7 +1704,7 @@ export async function flushDebounceJob(
   });
   // No conversation / no config → nothing to do (not a failure).
   if (ctx === null) return { outcome: "done" };
-  // NOTE: The lower bound of every range a gate exit writes is the per-message floor, not the
+  // The lower bound of every range a gate exit writes is the per-message floor, not the
   // watermark: an open message can sit below the mark, and below the floor the scalars decide.
   const gateExitFrom = ctx.perMessageFloor ?? ctx.watermark ?? null;
 
@@ -1559,7 +1760,7 @@ export async function flushDebounceJob(
       },
     );
     const last = readLastMessageId(job.payload);
-    // NOTE: The gate closed before the mode was read, so the observer is asked here from a read of
+    // The gate closed before the mode was read, so the observer is asked here from a read of
     // its own; the burst is marked only once the observer has it, as the other exits do.
     const handedAtGate = await handOverGateExitIfObserving({
       tenantId,
@@ -1608,7 +1809,7 @@ export async function flushDebounceJob(
     return { outcome: "done" };
   }
 
-  // NOTE: The burst selector, shared by the spend-ceiling branch and the turn so both answer about the
+  // The burst selector, shared by the spend-ceiling branch and the turn so both answer about the
   // same floor. The answered floor is re-read here, after the authorization call, since a message
   // refused meanwhile has moved it; never lower than the watermark read at claim time.
   const selectPending = async (messages: ChatwootMessageRow[]) => {
@@ -1620,7 +1821,7 @@ export async function flushDebounceJob(
     const armed = ctx.watermark;
     const floor =
       fresh === null ? armed : armed === null ? fresh : Math.max(fresh, armed);
-    // NOTE: Above the per-message floor the scalar does not decide: a claim on 1002 raises it over an
+    // Above the per-message floor the scalar does not decide: a claim on 1002 raises it over an
     // unclaimed 1001 too. `selectOpenMessages` is the shared rule (docs/debounce.md).
     const state = await readSelectionState({
       tenantId,
@@ -1640,7 +1841,7 @@ export async function flushDebounceJob(
     });
   };
 
-  // NOTE: An agent flipped to monitoring during one of this flush's waits makes the burst the
+  // An agent flipped to monitoring during one of this flush's waits makes the burst the
   // observer's, so each exit (ceiling, authorization, turn) asks after its own I/O. Answers whether
   // the observer HAS the burst: one it could not read stays unmarked.
   const handOverIfObserving = async (): Promise<
@@ -1675,7 +1876,7 @@ export async function flushDebounceJob(
     reactionArmed: readReactionArmed(job.payload),
     reactionFrom: readReactionFrom(job.payload),
   };
-  // NOTE: Nothing left to answer means nothing to refuse: a retry after an attempt that answered and
+  // Nothing left to answer means nothing to refuse: a retry after an attempt that answered and
   // died before completing must not send a refusal. Only while the scalar speaks for the whole
   // backlog (no per-message floor); otherwise the `over` branch re-selects and stays silent if empty.
   const alreadyAnswered =
@@ -1683,16 +1884,52 @@ export async function flushDebounceJob(
     armedLast !== null &&
     ctx.watermark !== null &&
     ctx.watermark >= armedLast;
-  // NOTE: The ceiling is asked again at the turn, minutes after the webhook's ask, and a refusal here
+  // The contact-authorization gate in two stages (docs/contact-auth.md): the RULE first, before the
+  // spend ceiling, since it costs nothing and a burst this agent does not serve should not draw the
+  // ceiling's sentence, handoff and note; the ENDPOINT where the gate always stood, below.
+  const authCfg = ctx.loaded.contactAuthConfig;
+  const askAuth = (stage: ContactAuthStage) =>
+    authorizeContact({
+      tenantId,
+      agentId: ctx.loaded.agentId,
+      contactDbId: ctx.loaded.contactDbId,
+      conversationDbId: ctx.convDbId,
+      conversationId,
+      inboxId: ctx.inboxChatwootId,
+      channelType: ctx.loaded.channelType,
+      // The burst is many messages, not one: there is no single text to forward, and an unlock code
+      // is something the customer sends on a message of their own, which the webhook path checks.
+      messageText: null,
+      // Its own asking, for the reason the nudge has one: it carries no message text and must never
+      // join (or be joined by) the flight of an incoming message that does.
+      requestKey: "debounce",
+      stage,
+      cfg: ctx.loaded.contactAuthConfig,
+      base,
+      fetchImpl: deps?.contactAuthFetch,
+    });
+  const ruleVerdict =
+    authCfg.enabled && contactAuthHasRuleStage(authCfg)
+      ? await askAuth("rule")
+      : null;
+  // The rule's answer is the gate's when it refused, or when there is no endpoint stage after it.
+  const ruleFinal =
+    ruleVerdict !== null &&
+    (ruleVerdict.outcome !== "allowed" || !contactAuthHasEndpointStage(authCfg))
+      ? ruleVerdict
+      : null;
+  const ruleRefused = ruleFinal !== null && ruleFinal.outcome !== "allowed";
+  // The ceiling is asked again at the turn, minutes after the webhook's ask, and a refusal here
   // is the first one, so this flush owes the whole contract (docs/spend-ceiling.md).
-  const flushCeiling = alreadyAnswered
-    ? null
-    : await spendCeilingVerdict({
-        tenantId,
-        source: "inbox",
-        base,
-      });
-  // NOTE: Every ceiling write, the flow line included (it pages alerts and spends the notice window),
+  const flushCeiling =
+    alreadyAnswered || ruleRefused
+      ? null
+      : await spendCeilingVerdict({
+          tenantId,
+          source: "inbox",
+          base,
+        });
+  // Every ceiling write, the flow line included (it pages alerts and spends the notice window),
   // first asks whether `/reset` retired the burst; a retired burst refused nobody and keeps its
   // watermark. Lenient `jobRetired`: an unreadable row costs a sentence sent once too often.
   // Whether the announcement reached the conversation. From then on its remaining acts are this
@@ -1728,7 +1965,7 @@ export async function flushDebounceJob(
     }
     return true;
   };
-  // NOTE: And an empty burst (deleted, or nothing answerable) has nothing to refuse either. Asked
+  // And an empty burst (deleted, or nothing answerable) has nothing to refuse either. Asked
   // with the turn's own selection, and only when over the ceiling: the other states select for real.
   const ceilingBurst =
     flushCeiling?.state === "over"
@@ -1792,7 +2029,7 @@ export async function flushDebounceJob(
       String(flushCeiling.usedUsd),
       String(flushCeiling.ceilingUsd),
     );
-    // NOTE: The persona's token: these are bot-token endpoints (docs/chatwoot.md). Null when the
+    // The persona's token: these are bot-token endpoints (docs/chatwoot.md). Null when the
     // persona has no Chatwoot bot, and then ChatwootMissingTokenError is the correct report.
     const ceilingClient = () =>
       loadChatwootClient(tenantId, instanceId, {
@@ -1800,7 +2037,7 @@ export async function flushDebounceJob(
         makeClient: deps?.makeClient,
         botToken: ctx.loaded.agentBotToken ?? undefined,
       });
-    // NOTE: Ownership, asked right before each customer-facing act, as the webhook's primitives do:
+    // Ownership, asked right before each customer-facing act, as the webhook's primitives do:
     // a human who claimed the conversation meanwhile is neither talked over nor has it reopened.
     const stillOurs = async (act: string): Promise<boolean> => {
       const owned = await conversationStillOurs({
@@ -1837,7 +2074,7 @@ export async function flushDebounceJob(
           const client = await ceilingClient();
           if (!(await stillOurs("message")) || !(await stillWanted("message")))
             return false;
-          // NOTE: the reply gate too (docs/LIVARE-F21-PORTAO-ETIQUETA.md): the sentence is the agent
+          // The reply gate too (docs/LIVARE-F21-PORTAO-ETIQUETA.md): the sentence is the agent
           // speaking, and a conversation without the label hears nothing from it.
           const gate = await replyGateVerdictNow({
             tenantId,
@@ -1958,30 +2195,14 @@ export async function flushDebounceJob(
     return { outcome: "done" };
   }
 
-  // NOTE: The contact-authorization gate again, where the turn begins: a refused message can ride
+  // The contact-authorization gate again, where the turn begins: a refused message can ride
   // into a flush an earlier message armed, and a revocation can land inside the window. A refusal
   // ends the flush like a takeover (burst handled, nothing posted); the customer copy and handoff
   // belong to the webhook's refused delivery.
   let authContext: AuthContext | null = null;
   if (ctx.loaded.contactAuthConfig.enabled) {
-    const auth = await authorizeContact({
-      tenantId,
-      agentId: ctx.loaded.agentId,
-      contactDbId: ctx.loaded.contactDbId,
-      conversationDbId: ctx.convDbId,
-      conversationId,
-      inboxId: ctx.inboxChatwootId,
-      channelType: ctx.loaded.channelType,
-      // The burst is many messages, not one: there is no single text to forward, and an unlock code
-      // is something the customer sends on a message of their own, which the webhook path checks.
-      messageText: null,
-      // Its own asking, for the reason the nudge has one: it carries no message text and must never
-      // join (or be joined by) the flight of an incoming message that does.
-      requestKey: "debounce",
-      cfg: ctx.loaded.contactAuthConfig,
-      base,
-      fetchImpl: deps?.contactAuthFetch,
-    });
+    const auth =
+      ruleFinal ?? (await askAuth(ruleVerdict ? "endpoint" : "both"));
     emitFlowEvent(
       {
         tenantId,
@@ -2101,7 +2322,7 @@ export async function flushDebounceJob(
     }
   }
 
-  // NOTE: A turn already running on this graph thread defers the flush: two concurrent invokes each
+  // A turn already running on this graph thread defers the flush: two concurrent invokes each
   // read-modify-write the channel and store the burst twice. Keyed by graph thread (per contact-inbox),
   // and done here, not in `coalesceAndRunTurn`, whose re-engage caller has nowhere to defer to.
   const graphThreadId = resolveGraphThreadId(
@@ -2110,7 +2331,7 @@ export async function flushDebounceJob(
     conversationId,
     ctx.contactInboxId,
   );
-  // NOTE: The in-process maps cannot see another replica, so the durable claim in the thread's row is
+  // The in-process maps cannot see another replica, so the durable claim in the thread's row is
   // read too, as every other writer on the thread does. Only for a key that has a row: the
   // per-conversation fallback has no `agent_threads` row, and there the maps are the whole answer.
   const durableClaim =
@@ -2135,10 +2356,10 @@ export async function flushDebounceJob(
       String(conversationId),
     );
   }
-  // NOTE: The deferral deadline is the burst's, computed out here so both exclusion paths (this
+  // The deferral deadline is the burst's, computed out here so both exclusion paths (this
   // branch, and the stand-down at acquisition) honour one ceiling.
   const nowMs = Date.now();
-  // NOTE: A deadline, not a counter: `rescheduleJob` resets `attempts`, and a payload counter is
+  // A deadline, not a counter: `rescheduleJob` resets `attempts`, and a payload counter is
   // erased by the next re-arm. `deferringSince` is stamped on the first deferral and survives
   // re-arms, since a message during a CLAIMED flush opens a new burst with a fresh `burstStartedAt`.
   const deferringSince =
@@ -2204,9 +2425,27 @@ export async function flushDebounceJob(
     }
     // Set by the claim, read once the turn is over: see the branch at the tail of this function.
     let claimLostPartial = false;
+    // Set by the burst selection. Only a flush whose own message has nothing to answer arms the delayed
+    // close: an empty burst with nothing pending, or a turn that ran and sent nothing, is not that,
+    // and the job it would arm only takes the traffic lane's slots to find out.
+    const triggerId =
+      typeof job.payload.lastMessageId === "number"
+        ? job.payload.lastMessageId
+        : null;
+    let unanswerable = false;
     const outcome = await coalesceAndRunTurn(
       {
+        onEmptyBurst: (page) => {
+          unanswerable = page.some(
+            (m) =>
+              m.id === triggerId &&
+              m.messageType === "incoming" &&
+              !m.private &&
+              !hasAnswerableContent(m),
+          );
+        },
         signal: params.signal,
+        afterThrow: jobRetriesAfterFailure(job) ? "retry" : "dead_letter",
         tenantId,
         instanceId,
         conversationId,
@@ -2237,6 +2476,9 @@ export async function flushDebounceJob(
         // else settled them while the model was running.
         claimHandledCeiling: (target) => target - 1,
         initiatedBy: "automatic",
+        // NOTE: Some transports attach the file after creating the message: the arrival pass saw
+        // nothing to read, and this is the last read before the turn renders the file as unread.
+        fillMissingMedia: "untried",
         managedBotId: ctx.loaded.agentBotId,
         whatsappProvider: ctx.loaded.whatsappProvider,
         onClaimLost: (reason) => {
@@ -2258,7 +2500,7 @@ export async function flushDebounceJob(
     }
     // NOTE: Nothing to answer: the flush does not decide the conversation's fate on the hot path; it
     // arms the delayed judgement, which reads everything fresh.
-    if (outcome === "empty" && ctx.convDbId !== null) {
+    if (outcome === "empty" && unanswerable && ctx.convDbId !== null) {
       await armNothingToAnswer({
         tenantId,
         instanceId,
@@ -2267,10 +2509,7 @@ export async function flushDebounceJob(
         conversationDbId: ctx.convDbId,
         agentId: ctx.loaded.agentId,
         agentBotId: ctx.loaded.agentBotId,
-        triggerMessageId:
-          typeof job.payload.lastMessageId === "number"
-            ? job.payload.lastMessageId
-            : null,
+        triggerMessageId: triggerId,
         base,
       });
     }
@@ -2368,6 +2607,7 @@ export async function announceDeadDebounceFlush(
   if (!threadId) return;
   const parsed = parseThreadId(threadId);
   if (!parsed || parsed.tenantId !== job.tenantId) return;
+  await writeUnansweredLine(job, threadId, parsed, base);
   await announceFailedTurn({
     tenantId: job.tenantId,
     instanceId: parsed.instanceId,
@@ -2385,9 +2625,74 @@ export async function announceDeadDebounceFlush(
       );
       return { path: "job", deadLettered: row?.status === "DEAD" };
     },
+    // The burst's newest message: one mirrored past it is a newer delivery still on its way to
+    // re-arming this row, with no turn claim yet for the fence to see.
+    aboutMessageId: readLastMessageId(job.payload),
     error,
     base,
   });
+}
+
+// The outcome line the runs' own `generate` lines left to the death: each of them was `info`, because
+// a run with another one behind it had not lost the customer yet. This is the one that alerts. Read
+// against the row, like the note, so a burst re-armed by a new message (a turn that is coming) is not
+// reported as lost. Best-effort: a failed read or write costs the line, never the note.
+async function writeUnansweredLine(
+  job: ClaimedJob,
+  threadId: string,
+  parsed: { instanceId: bigint; conversationId: number },
+  base: PrismaClient,
+): Promise<void> {
+  try {
+    const [row, conv] = await runScopedOn(base, sysCtx(job.tenantId), (db) =>
+      Promise.all([
+        db.schedulerJob.findUnique({
+          where: { id: job.id },
+          select: { status: true, attempts: true },
+        }),
+        db.conversation.findUnique({
+          where: {
+            tenantId_chatwootInstanceId_chatwootConversationId: {
+              tenantId: job.tenantId,
+              chatwootInstanceId: parsed.instanceId,
+              chatwootConversationId: parsed.conversationId,
+            },
+          },
+          select: {
+            id: true,
+            inboxId: true,
+            inbox: { select: { agentId: true } },
+          },
+        }),
+      ]),
+    );
+    if (row?.status !== "DEAD") return;
+    await writeFlowEvent(
+      {
+        tenantId: job.tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: conv?.id ?? null,
+        agentId: conv?.inbox?.agentId ?? null,
+        inboxId: conv?.inboxId ?? null,
+        threadId,
+        base,
+      },
+      {
+        stage: "generate",
+        level: "error",
+        status: "error",
+        detail: { outcome: "unanswered", runs: row.attempts },
+        errorMessage: `The customer's message went unanswered: the turn failed on all ${row.attempts} runs.`,
+      },
+    );
+  } catch (e) {
+    logger.warn(
+      "debounce flush: could not write the unanswered line (thread=%s): %s",
+      threadId,
+      err(e),
+    );
+  }
 }
 
 let registered = false;

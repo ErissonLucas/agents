@@ -24,7 +24,7 @@ interface DataBoundaryProps {
   children: ReactNode;
 }
 
-// NOTE: Static keys so the default skeleton rows don't key off the array index.
+// Static keys so the default skeleton rows don't key off the array index.
 const DEFAULT_SKELETON_KEYS = [
   "db-skeleton-0",
   "db-skeleton-1",
@@ -94,7 +94,7 @@ export function DataBoundary({
     return (
       <Card className="p-0">
         {empty ?? (
-          <p className="py-10 text-center text-sm text-text-muted">
+          <p className="text-text-muted py-10 text-center text-sm">
             {t("common.nothingHere", "Nothing here yet.")}
           </p>
         )}

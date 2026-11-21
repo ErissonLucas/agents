@@ -128,7 +128,8 @@ export function RyzeSection({
   const load = useCallback(async () => {
     try {
       const { data } = await api.api.v1.ryze.gateways.get();
-      if (data) {
+      // NOTE: an answer without the list leaves the section empty instead of crashing the page.
+      if (data && Array.isArray(data.gateways)) {
         setGateways(data.gateways);
         onInboxes?.(
           data.gateways
@@ -570,6 +571,7 @@ export function RyzeSection({
               <Input
                 type="password"
                 showPasswordToggle
+                secret
                 value={token}
                 onChange={(e) => setToken(e.target.value)}
               />

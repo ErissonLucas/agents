@@ -1,21 +1,18 @@
 import type { BehaviorTab } from "@/client/pages/agents/BehaviorTab";
 import { EMPTY_CONTACT_AUTH_RULE_FORM } from "@/client/pages/agents/contactAuthRuleForm";
+import { readOtherInboxesState } from "@/client/pages/agents/OtherInboxesFields";
 import { observationToForm } from "@/client/pages/agents/observationFormState";
+import { SERVICE_WINDOW_FORM_DEFAULTS } from "@/client/pages/agents/ServiceWindowTemplates";
 import { readTtsFormState } from "@/client/pages/agents/ttsFormState";
 
 // One filled-in prop bag for the Behavior tab, for the tests that have to RENDER it.
 //
-// ANNOTATED, NOT CAST, and that is the whole point of the shape below. The bag used to end in
-// `as unknown as React.ComponentProps<typeof BehaviorTab>`, which absorbs a missing prop by
-// absorbing everything: a prop the component REQUIRES and the bag omits is then invisible to tsc
-// and surfaces as `TypeError: undefined is not an object` inside `render`, in whichever file
-// happens to render the tab. Measured: the fallback-provider block (#143) added three required
-// props, the whole suite still type-checked, and seven tests failed on a component they say
-// nothing about. The intersection keeps the missing-key check that a cast throws away.
+// ANNOTATED, NOT CAST: `as unknown as React.ComponentProps<typeof BehaviorTab>` would absorb a
+// missing required prop, invisible to tsc, surfacing as `TypeError: undefined is not an object`
+// inside `render` in whichever file renders the tab. The intersection keeps the missing-key check.
 //
-// The `Record<string, unknown>` half is what makes it a SUPERSET: the two editions do not carry
-// the same props (the observability debug mode reached the Free repo before master), and a bag
-// written against one tree throws on render in the other. The extras are absorbed there.
+// The `Record<string, unknown>` half makes it a SUPERSET: the editions' trees can carry different
+// props, and a bag written against one tree would throw on render in the other.
 export type BehaviorTabProps = React.ComponentProps<typeof BehaviorTab> &
   Record<string, unknown>;
 
@@ -32,6 +29,7 @@ export function behaviorTabProps(
       ttsVoice: null,
       ttsModel: null,
       ttsNormalizeCredential: null,
+      ttsFallbackCredential: null,
       visionCredential: null,
       visionExtractionPrompt: null,
       ttsSpokenNoticeText: null,
@@ -42,6 +40,7 @@ export function behaviorTabProps(
       modelFallbackCredential: null,
       awayMessage: null,
       followUpSteps: [],
+      snoozedFollowUpSteps: [],
     },
     agentId: "1",
     agentName: "Recepção",
@@ -86,6 +85,8 @@ export function behaviorTabProps(
       handoffEnabled: false,
       handoffTeamId: "",
       handoffTeamInstanceId: "",
+      endpointEnabled: false,
+      operatorNoteEnabled: true,
     },
     setContactAuth: noop,
     tts: readTtsFormState(undefined),
@@ -94,6 +95,8 @@ export function behaviorTabProps(
     agentModelName: "gpt-4o",
     agentModelCredentialRef: "",
     agentModelBaseUrl: "",
+    callFloor: null,
+    draftPrompt: "",
     ttsNormalizeCredBaseUrl: null,
     split: {
       enabled: false,
@@ -110,6 +113,7 @@ export function behaviorTabProps(
       separator: "blank" as const,
     },
     setSignature: () => {},
+    signatureSeed: { current: null },
     vision: {
       enabled: true,
       provider: "openai",
@@ -117,10 +121,19 @@ export function behaviorTabProps(
       credentialRef: "",
       baseURL: "",
       extractionPrompt: "Leia.",
+      pdfText: true,
+      maxOutputTokens: null,
+      reasoningEffort: null,
     },
     setVision: noop,
     visionCredBaseUrl: null,
-    limits: { maxToolCalls: "10", maxHistoryTokens: "", retrySilence: true },
+    limits: {
+      maxToolCalls: "10",
+      maxHistoryTokens: "",
+      retrySilence: true,
+      maxTurnsPerHour: "60",
+      maxProactivePerDay: "10",
+    },
     setLimits: noop,
     memory: {
       compactionEnabled: false,
@@ -140,6 +153,7 @@ export function behaviorTabProps(
       model: "",
       credentialRef: "",
       baseURL: "",
+      timeoutSeconds: "",
     },
     setModelFallback: noop,
     modelFallbackCredBaseUrl: null,
@@ -147,15 +161,19 @@ export function behaviorTabProps(
       logToolValues: false,
       fullDetail: false,
       fullDetailUntil: null,
+      fullDetailRetentionDays: null,
     },
     savedObservability: {
       logToolValues: false,
       fullDetail: false,
       fullDetailUntil: null,
+      fullDetailRetentionDays: null,
     },
     langfuseSendContent: false,
     setObservability: noop,
     takeover: { onHumanReply: true },
+    otherInboxes: readOtherInboxesState({}),
+    setOtherInboxes: () => {},
     setTakeover: () => {},
     replyGate: {
       enabled: false,
@@ -164,22 +182,23 @@ export function behaviorTabProps(
       removeOnHandoff: true,
     },
     setReplyGate: () => {},
+    conversationNotes: { toolsUsed: "off", errors: "off" },
+    setConversationNotes: () => {},
     attributeContext: { conversation: [], contact: [], task: [] },
+    contactFields: { context: [], writable: [] },
+    setContactFields: () => {},
     setAttributeContext: noop,
-    serviceWindow: {
-      enabled: false,
-      windowHours: "24",
-      templateName: "",
-      templateLanguage: "",
-      templateParams: "",
-      templateContent: "",
-    },
+    serviceWindow: { ...SERVICE_WINDOW_FORM_DEFAULTS, enabled: false },
     setServiceWindow: noop,
     followUp: { enabled: false, steps: [], pauseWhileAppointment: false },
     setFollowUp: noop,
+    snoozedFollowUp: { enabled: false, signature: false, cadences: [] },
+    setSnoozedFollowUp: noop,
     redirectSuppressesFollowUp: false,
     onScheduleSaved: noop,
-    dirty: false,
+    // Edited: Save is enabled only on an edited tab (agents#1365), and a tab rendered on its own is
+    // here to ask what blocks a save, so it stands for one with an edit.
+    dirty: true,
     saving: false,
     onSave: noop,
     onDiscard: noop,

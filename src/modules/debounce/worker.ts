@@ -1,9 +1,15 @@
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
-import config from "@/config";
+import config, { debounceTurnSlots } from "@/config";
+import { modelPermitReading } from "@/graph/model-limit";
 import { asSuperAdminOn } from "@/lib/tenancy";
-import { emitCapacityWait } from "@/modules/flowlog/capacity";
+import { tickFailures } from "@/lib/tick-failure";
+import { runWithWorkLabel } from "@/lib/work-label";
+import {
+  type CapacityOccupancy,
+  emitCapacityWait,
+} from "@/modules/flowlog/capacity";
 import {
   claimDueDebounceJobs,
   findWaitingDebounceJobs,
@@ -20,9 +26,10 @@ import { debounceDedupeKey } from "./service";
 // scheduler's reaper/sweep that fast (the reaper still re-pends a stranded CLAIMED debounce job).
 // Single replica (globalThis singleton survives `bun --hot`); FOR UPDATE SKIP LOCKED keeps the claim
 // correct if briefly doubled. SLOTS, NOT BATCHES: each tick fills only the free slots without awaiting
-// the jobs it started. The lane is sized by the model semaphore (config.agent.modelConcurrency), the
-// only throttle on model calls: more slots would leave claimed rows waiting for a permit while the
-// reaper's stale window runs on them. See docs/debounce.md.
+// the jobs it started. The lane is sized by DEBOUNCE_TURN_SLOTS (`debounceTurnSlots`), apart from the
+// model permits: a slot is held for the whole turn and a permit only for the model call inside it
+// A claimed row that waits for a permit is still bounded by its run's deadline, which
+// takes it out of the semaphore's queue (runModelCall's `signal`). See docs/debounce.md.
 
 // The rows this process is executing RIGHT NOW, kept out of the claim itself. Without the batch
 // barrier a row can become claimable while its own run is still in flight, by two production
@@ -53,6 +60,21 @@ const lane: {
   claimedWhileAsking: new Set(),
 };
 
+// Since when every slot has been running a job, for the instance sampler. Not `lane.fullSince`,
+// which only a tick that claims less than it could clears: jobs that finish between ticks free their
+// slots without a tick seeing it.
+const occupancy: { slots: number; fullSince: number | null } = {
+  slots: 0,
+  fullSince: null,
+};
+
+// How long every slot has been busy, in ms; 0 when one is free.
+export function debounceLaneFullMs(now: number = Date.now()): number {
+  return occupancy.fullSince === null
+    ? 0
+    : Math.max(0, now - occupancy.fullSince);
+}
+
 // A row announced as waiting for a slot. `waitedMs` is measured when it is announced, so it is at
 // least the threshold and not the whole wait.
 export interface LaneWait {
@@ -61,6 +83,8 @@ export interface LaneWait {
   dedupeKey: string;
   waitedMs: number;
   thresholdMs: number;
+  // The lane and the semaphore when it is announced, and which of them binds.
+  occupancy: CapacityOccupancy;
 }
 
 // `claim`/`run` are injectable so the drain can be tested without a DB or Chatwoot, and so are the
@@ -118,9 +142,27 @@ async function announceLaneWait(
   );
 }
 
+// The lane is full when this is read. Its slots bind unless the model has no free permit, in which
+// case more slots would only queue on the semaphore.
+function laneOccupancy(slots: number): CapacityOccupancy {
+  const model = modelPermitReading();
+  return {
+    limit:
+      model.inFlight >= model.permits
+        ? "AGENT_MODEL_CONCURRENCY"
+        : "DEBOUNCE_TURN_SLOTS",
+    laneInFlight: inFlight.size,
+    laneSlots: slots,
+    modelInFlight: model.inFlight,
+    modelPermits: model.permits,
+    modelWaiting: model.waiting,
+  };
+}
+
 async function announceWaiting(
   base: PrismaClient,
   now: number,
+  slots: number,
   deps: DebounceTickDeps,
 ): Promise<void> {
   const fullSince = lane.fullSince;
@@ -142,6 +184,7 @@ async function announceWaiting(
   // The rows in flight when the question was asked are excluded from the query itself.
   if (lane.generation !== generation) return;
   const announcements: Array<void | Promise<void>> = [];
+  const occupancy = laneOccupancy(slots);
   for (const row of rows) {
     const waitedMs = now - Math.max(row.runAt.getTime(), fullSince);
     if (
@@ -160,6 +203,7 @@ async function announceWaiting(
             dedupeKey: row.dedupeKey,
             waitedMs,
             thresholdMs,
+            occupancy,
           },
           base,
         ))(),
@@ -177,10 +221,26 @@ async function announceWaiting(
 // Claims up to the free slots and starts the jobs, and returns as soon as they are STARTED.
 // `settled` resolves when every job this tick started has finished; the worker never waits on it,
 // tests do.
-export async function runDebounceTick(
+// The claim runs as `debounce` (each job it starts as `job:<KIND>`), so a statement that times out
+// here names the lane (docs/logs.md, "Database").
+export function runDebounceTick(
   base: PrismaClient,
   slots: number,
   deps: DebounceTickDeps = {},
+): Promise<{
+  claimed: number;
+  settled: Promise<void>;
+  reported: Promise<void>;
+}> {
+  return runWithWorkLabel("debounce", () =>
+    runDebounceTickUnlabeled(base, slots, deps),
+  );
+}
+
+async function runDebounceTickUnlabeled(
+  base: PrismaClient,
+  slots: number,
+  deps: DebounceTickDeps,
 ): Promise<{
   claimed: number;
   settled: Promise<void>;
@@ -196,7 +256,7 @@ export async function runDebounceTick(
     return {
       claimed: 0,
       settled: Promise.resolve(),
-      reported: noteFullLane(base, now, deps),
+      reported: noteFullLane(base, now, slots, deps),
     };
   }
   const jobs = await claim(free, base, now, undefined, [...inFlight]);
@@ -204,6 +264,11 @@ export async function runDebounceTick(
     inFlight.add(job.id);
     lane.announced.delete(job.id);
     if (lane.asking) lane.claimedWhileAsking.add(job.id);
+  }
+  occupancy.slots = slots;
+  // Read the clock again: a slow claim ran with slots free, and that time is not saturation.
+  if (inFlight.size >= slots) {
+    occupancy.fullSince ??= (deps.now?.() ?? new Date()).getTime();
   }
   // allSettled: runClaimed never re-throws (it fails the job internally), but a stray throw must not
   // strand a slot. The async wrapper turns a synchronous throw into a rejection, so `finally` runs.
@@ -214,10 +279,11 @@ export async function runDebounceTick(
           deadlineMs: deps.deadlineMs ?? jobDeadlineMs(SCHEDULER_STALE_MS),
         }))().finally(() => {
         inFlight.delete(job.id);
+        if (inFlight.size < occupancy.slots) occupancy.fullSince = null;
       }),
     ),
   ).then(() => {});
-  // NOTE: fewer than the free slots means everything due fitted, so nothing waits and the saturation
+  // Fewer than the free slots means everything due fitted, so nothing waits and the saturation
   // (if there was one) is over. Exactly as many leaves the lane full, with maybe more behind it.
   let reported = Promise.resolve();
   if (jobs.length < free) {
@@ -225,7 +291,7 @@ export async function runDebounceTick(
     lane.fullSince = null;
     lane.announced.clear();
   } else {
-    reported = noteFullLane(base, now, deps);
+    reported = noteFullLane(base, now, slots, deps);
   }
   return { claimed: jobs.length, settled, reported };
 }
@@ -238,12 +304,13 @@ export async function runDebounceTick(
 function noteFullLane(
   base: PrismaClient,
   now: Date,
+  slots: number,
   deps: DebounceTickDeps,
 ): Promise<void> {
   lane.fullSince ??= now.getTime();
   if (lane.asking) return Promise.resolve();
   lane.asking = true;
-  return announceWaiting(base, now.getTime(), deps)
+  return announceWaiting(base, now.getTime(), slots, deps)
     .catch((err) => {
       logger.warn({ err }, "debounce lane: asking who is waiting failed");
     })
@@ -272,28 +339,38 @@ export interface StartOptions {
   deps?: DebounceTickDeps;
 }
 
+// The timers are created under `debounce` (each pass's own label is entered again in its tick, which a
+// wake from another context also reaches; docs/logs.md, "Database").
 export function startDebounceWorker(opts: StartOptions = {}): () => void {
-  const h = holder();
-  if (h.timer) return stopDebounceWorker;
-  const base = opts.base ?? basePrisma;
-  const intervalMs = opts.intervalMs ?? config.debounceWorker.intervalMs;
-  h.timer = setInterval(() => {
-    // NOTE: `running` covers the CLAIM only, so two claims never overlap. The tick resolves once its
-    // jobs have started, and the next tick fills whatever slots have freed by then.
-    if (h.running) return;
-    h.running = true;
-    void runDebounceTick(
-      base,
-      opts.slots ?? config.agent.modelConcurrency,
-      opts.deps,
-    )
-      .catch((e) => logger.error({ err: e }, "debounce tick failed"))
-      .finally(() => {
-        h.running = false;
-      });
-  }, intervalMs);
-  logger.info("debounce worker started (interval=%dms)", intervalMs);
-  return stopDebounceWorker;
+  return runWithWorkLabel("debounce", () => {
+    const h = holder();
+    if (h.timer) return stopDebounceWorker;
+    const base = opts.base ?? basePrisma;
+    const intervalMs = opts.intervalMs ?? config.debounceWorker.intervalMs;
+    const slots = opts.slots ?? debounceTurnSlots();
+    const failures = tickFailures();
+    h.timer = setInterval(() => {
+      // NOTE: `running` covers the CLAIM only, so two claims never overlap. The tick resolves once its
+      // jobs have started, and the next tick fills whatever slots have freed by then.
+      if (h.running) return;
+      h.running = true;
+      void runDebounceTick(base, slots, opts.deps)
+        .then(
+          () => failures.succeeded(),
+          (e) => failures.failed(e, { err: e }, "debounce tick failed"),
+        )
+        .finally(() => {
+          h.running = false;
+        });
+    }, intervalMs);
+    logger.info(
+      "debounce worker started (interval=%dms, slots=%d, model permits=%d)",
+      intervalMs,
+      slots,
+      config.agent.modelConcurrency,
+    );
+    return stopDebounceWorker;
+  });
 }
 
 export function stopDebounceWorker(): void {

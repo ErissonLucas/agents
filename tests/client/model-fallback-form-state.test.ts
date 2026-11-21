@@ -27,6 +27,7 @@ describe("agent editor fallback-provider round-trip", () => {
         model: "claude-haiku-4-5",
         credentialRef: "vault:7",
         baseURL: "https://proxy.example/v1",
+        timeoutMs: 20_000,
       },
     };
     const round = modelFallbackToStored(modelFallbackToForm(stored));
@@ -35,6 +36,7 @@ describe("agent editor fallback-provider round-trip", () => {
       model: "claude-haiku-4-5",
       credentialRef: "vault:7",
       baseURL: "https://proxy.example/v1",
+      timeoutMs: 20_000,
     });
   });
 
@@ -46,6 +48,7 @@ describe("agent editor fallback-provider round-trip", () => {
       model: null,
       credentialRef: null,
       baseURL: null,
+      timeoutMs: null,
     });
   });
 
@@ -123,13 +126,14 @@ describe("the fallback's endpoint never freezes a hidden section", () => {
 // THE EDITOR'S TWO VERDICTS, as a table. They answer the same question the backend answers, and a
 // divergence is silent in both directions: `fallbackIsConfigured` gates the endpoint checks, so
 // answering NO switches off the checks that block the save; `fallbackModelIsMissing` renders the
-// field error AND blocks it. Review found both halves of that, one round apart.
+// field error AND blocks it.
 describe("the editor's fallback verdicts", () => {
   const form = (over: Partial<ModelFallbackState>): ModelFallbackState => ({
     provider: "",
     model: "",
     credentialRef: "",
     baseURL: "",
+    timeoutSeconds: "",
     ...over,
   });
 

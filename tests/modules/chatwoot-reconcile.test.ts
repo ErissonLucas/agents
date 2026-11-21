@@ -3,14 +3,13 @@ import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { setPublisher } from "@/api/features/realtime/realtime.service";
 import { reconcileMirrorFromLive } from "@/modules/chatwoot/reconcile";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// The three guards that make it safe to apply a REST snapshot to the mirror after any write. They
-// existed inline on the proactive-nudge path and nothing exercised them; the console's buttons are
-// now a second caller (issue #77), so each one gets a case here.
-//
-// The window they protect is the same in both callers: a webhook can commit BETWEEN the GET and this
-// write, which makes the snapshot in hand the older truth even though it was read later.
+// The three guards that make it safe to apply a REST snapshot to the mirror after any write, for
+// both callers (the proactive-nudge path and the console's buttons). A webhook can commit BETWEEN
+// the GET and this write, which makes the snapshot in hand the older truth even though it was read
+// later.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -28,8 +27,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -86,6 +85,7 @@ async function readRow(conversationId: number) {
       assigneeType: true,
       assigneeId: true,
       chatwootStatusAt: true,
+      chatwootOwnershipChangedAt: true,
       chatwootAssigneeAt: true,
       statusClaimStampedAt: true,
       statusClaimRefusedAt: true,
@@ -100,14 +100,17 @@ async function applyFor(
     status: string;
     assigneeType?: string | null;
     assigneeId?: number | null;
+    assigneeStated?: boolean;
     lastActivitySec?: number;
     updatedAt: number | null;
   },
   ownsStatusClaim: Date | null = null,
   base: PrismaClient = appDb,
+  ownershipIsDecision?: boolean,
 ) {
   return reconcileMirrorFromLive({
     ownsStatusClaim,
+    ownershipIsDecision,
     tenantId,
     instanceId,
     conversationId,
@@ -120,6 +123,9 @@ async function applyFor(
       inboxId: null,
       updatedAt: live.updatedAt,
       latestMessageId: null,
+      ...(live.assigneeStated === undefined
+        ? {}
+        : { assigneeStated: live.assigneeStated }),
     },
     base,
   });
@@ -172,11 +178,49 @@ describe.skipIf(!dbUp)("reconcileMirrorFromLive", () => {
     expect(row.chatwootAssigneeAt).toBe(T + 1);
   });
 
-  // ── THE LOCAL STATUS CLAIM (issue #436) ──
-  //
-  // A live read is not evidence about a transition still on the wire: Chatwoot may not have committed
-  // it yet, and the snapshot carries no way to say so. The claim is the writer of that transition
-  // announcing it, and this is the second reader of it after the mirror.
+  test("a read that does not state the assignee leaves the stored holder", async () => {
+    const id = await seedRow({
+      status: "open",
+      assigneeType: "User",
+      assigneeId: 33,
+      chatwootStatusAt: T,
+      chatwootAssigneeAt: T,
+    });
+    const result = await applyFor(id, {
+      status: "resolved",
+      assigneeStated: false,
+      updatedAt: T + 1,
+    });
+    const row = await readRow(id);
+    expect(row.status).toBe("resolved");
+    expect([row.assigneeType, row.assigneeId]).toEqual(["User", 33]);
+    expect(row.chatwootAssigneeAt).toBe(T);
+    expect(result.applied).toBe(true);
+  });
+
+  // The assignee mark cannot outrank a read that said nothing about the assignee: a claim refusing
+  // its status is still the claim, and the console must not stand down as if something newer won.
+  test("a newer assignee mark does not outrank a read silent on the assignee", async () => {
+    const id = await seedRow({
+      status: "open",
+      statusClaimUntil: new Date(Date.now() + 30_000),
+      statusClaimFrom: "pending",
+      statusClaimStampedAt: null,
+      chatwootStatusAt: T,
+      chatwootAssigneeAt: T + 60,
+    });
+    const result = await applyFor(id, {
+      status: "pending",
+      assigneeStated: false,
+      updatedAt: T + 1,
+    });
+    expect(result.outrankedByVersion).toBe(false);
+  });
+
+  // NOTE: ── THE LOCAL STATUS CLAIM ── A live read is not evidence about a transition still on the
+  // wire: Chatwoot may not have committed it yet, and the snapshot carries no way to say so. The
+  // claim is the writer of that transition announcing it, and this is its second reader after the
+  // mirror.
   test("a claim somebody else holds fences the status this read carries", async () => {
     const id = await seedRow({
       status: "open",
@@ -352,10 +396,10 @@ describe.skipIf(!dbUp)("reconcileMirrorFromLive", () => {
       status: "open",
       statusClaimUntil: until,
       statusClaimFrom: "pending",
-      // The shape issue #468 round 6 found: a pair of `conversation_*` events for a write that
-      // happened BEFORE the claim — a customer message reopening the conversation — refused on the
-      // way in. Nothing about them is news, and letting either one through would put the agent back
-      // into a conversation a colleague is holding.
+      // NOTE: A pair of `conversation_*` events for a write that happened BEFORE the claim (a
+      // customer message reopening the conversation), refused on the way in. Nothing about them is
+      // news, and letting either one through would put the agent back into a conversation a
+      // colleague is holding.
       statusClaimRefusedAt: T + 1,
       chatwootStatusAt: T,
     });
@@ -526,14 +570,31 @@ describe.skipIf(!dbUp)("reconcileMirrorFromLive", () => {
       chatwootAssigneeAt: T + 1,
     });
     const before = await readRow(id);
-    await applyFor(id, {
-      status: "open",
-      assigneeType: "User",
-      assigneeId: 7,
-      updatedAt: T + 1,
-    });
-    const after = await readRow(id);
-    expect(after.updatedAt.getTime()).toBe(before.updatedAt.getTime());
+    const writes: string[] = [];
+    const watching = appDb.$extends({
+      query: {
+        conversation: {
+          async $allOperations({ operation, args, query }) {
+            if (/^(update|upsert|create|delete)/.test(operation))
+              writes.push(operation);
+            return query(args);
+          },
+        },
+      },
+    }) as unknown as PrismaClient;
+    await applyFor(
+      id,
+      {
+        status: "open",
+        assigneeType: "User",
+        assigneeId: 7,
+        updatedAt: T + 1,
+      },
+      null,
+      watching,
+    );
+    expect(writes).toEqual([]);
+    expect(await readRow(id)).toEqual(before);
   });
 
   test("a Chatwoot too old to send a version still applies, ordered by activity alone", async () => {
@@ -542,5 +603,117 @@ describe.skipIf(!dbUp)("reconcileMirrorFromLive", () => {
     const row = await readRow(id);
     expect(row.status).toBe("resolved");
     expect(row.chatwootStatusAt).toBeNull();
+  });
+
+  // ── THE STATUS CHANGE MARK ── `chatwootStatusAt` advances on every ordered read; the
+  // ownership mark only when the status moved, or when the read follows an operator's status command.
+  // The human-reply takeover compares against it, so a restatement must leave it where it was.
+  test("a status that moved stamps the ownership mark", async () => {
+    const id = await seedRow({ status: "pending", chatwootStatusAt: T });
+    await applyFor(id, { status: "open", updatedAt: T + 1 });
+    expect((await readRow(id)).chatwootOwnershipChangedAt).toBe(T + 1);
+  });
+
+  test("a restated status advances the version and leaves the ownership mark", async () => {
+    const id = await seedRow({ status: "pending", chatwootStatusAt: T });
+    await applyFor(id, { status: "pending", updatedAt: T + 1 });
+    const row = await readRow(id);
+    expect(row.chatwootStatusAt).toBe(T + 1);
+    expect(row.chatwootOwnershipChangedAt).toBeNull();
+  });
+
+  test("an operator's status command stamps the ownership mark even when it restates", async () => {
+    const id = await seedRow({ status: "pending", chatwootStatusAt: T });
+    await applyFor(
+      id,
+      { status: "pending", updatedAt: T + 1 },
+      null,
+      appDb,
+      true,
+    );
+    expect((await readRow(id)).chatwootOwnershipChangedAt).toBe(T + 1);
+  });
+
+  // The command's read lost the status ordering to a newer restatement: the status stays, and the
+  // decision is still dated at the read's version, since the restatement moved only the status mark.
+  test("an operator's command that loses the status ordering still dates the decision", async () => {
+    for (const [decision, changedAt, want] of [
+      [true, T, T + 2],
+      [false, T, T],
+      [true, null, null],
+    ] as const) {
+      const id = await seedRow({ status: "pending", chatwootStatusAt: T + 5 });
+      await suDb.conversation.updateMany({
+        where: { tenantId, chatwootConversationId: id },
+        data: { chatwootOwnershipChangedAt: changedAt },
+      });
+      await applyFor(
+        id,
+        { status: "pending", updatedAt: T + 2 },
+        null,
+        appDb,
+        decision,
+      );
+      const row = await readRow(id);
+      expect(row.chatwootStatusAt).toBe(T + 5);
+      expect(row.chatwootOwnershipChangedAt).toBe(want);
+    }
+  });
+
+  test("a holder that moved stamps the ownership mark, a restated one does not", async () => {
+    for (const [assigneeId, want] of [
+      [5, T + 1],
+      [9, null],
+    ] as const) {
+      const id = await seedRow({
+        status: "pending",
+        assigneeType: "AgentBot",
+        assigneeId: 9,
+        chatwootStatusAt: T,
+        chatwootAssigneeAt: T,
+      });
+      await applyFor(id, {
+        status: "pending",
+        assigneeType: "AgentBot",
+        assigneeId,
+        updatedAt: T + 1,
+      });
+      expect((await readRow(id)).chatwootOwnershipChangedAt).toBe(want);
+    }
+  });
+
+  test("the first ownership stamp on a row without one does not sit below the status mark", async () => {
+    const id = await seedRow({
+      status: "pending",
+      assigneeType: "AgentBot",
+      assigneeId: 9,
+      chatwootStatusAt: T + 5,
+      chatwootAssigneeAt: T,
+    });
+    await applyFor(id, {
+      status: "pending",
+      assigneeType: "User",
+      assigneeId: 5,
+      updatedAt: T + 2,
+    });
+    const row = await readRow(id);
+    expect(row.assigneeType).toBe("User");
+    expect(row.chatwootOwnershipChangedAt).toBe(T + 5);
+  });
+
+  test("the ownership mark never walks backwards", async () => {
+    const id = await seedRow({ status: "open", chatwootStatusAt: T });
+    await suDb.conversation.updateMany({
+      where: { tenantId, chatwootConversationId: id },
+      data: { chatwootOwnershipChangedAt: T + 5 },
+    });
+    await applyFor(
+      id,
+      { status: "pending", updatedAt: T + 1 },
+      null,
+      appDb,
+      true,
+    );
+    expect((await readRow(id)).chatwootOwnershipChangedAt).toBe(T + 5);
   });
 });

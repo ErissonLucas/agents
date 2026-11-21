@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import { AppError } from "@/lib/errors";
 import type { TenantContext } from "@/lib/tenancy";
 import { runScopedOn } from "@/lib/tenancy";
+import { exportAgent, importAgent } from "@/modules/agents/transfer";
 import {
   codeToolReferences,
   createCodeTool,
@@ -21,10 +22,13 @@ import {
 } from "@/modules/documents/templates";
 import { lockToolNames } from "@/modules/tool-definitions/namespace";
 import { createToolDefinition } from "@/modules/tool-definitions/service";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { blockedByChain, waitUntilBlocked } from "@/tests/utils/pg-waits";
+import { until } from "@/tests/utils/poll";
 
-// The operator-authored code tool's service (issue #363): the row is the operator's, invalid code
-// SAVES with a warning, one name namespace with HTTP tools and natives, and the audit trail carries
-// the shape without the body.
+// The operator-authored code tool's service: the row is the operator's, invalid code SAVES with a
+// warning, one name namespace with HTTP tools and natives, and the audit trail carries the shape
+// without the body.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -42,8 +46,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -218,7 +222,7 @@ describe.skipIf(!dbUp)("code tools service", () => {
     expect(reverse?.translationKey).toBe("errors.documentToolNameTaken");
 
     // The same question on the UPDATE door: a rename onto a slug whose tool name is taken. The
-    // create and the update reach the row through different code, and only one of them was asking.
+    // create and the update reach the row through different code, so each has to ask.
     const free = await createDocumentTemplate(
       ctx(),
       {
@@ -296,38 +300,44 @@ describe.skipIf(!dbUp)("code tools service", () => {
   });
 
   test("every writer of a tool name queues behind one lock, the import included", async () => {
-    // The namespace spans two tables, so no unique index covers it: under READ COMMITTED both
-    // writes can read a free name and insert, and `dropDuplicateToolNames` then decides at assembly
-    // which tool the agent gets, with a flow-log line as the only trace. What makes that impossible
-    // is that both `assertNameFree`s take the same transaction lock first (namespace.ts).
-    //
-    // Measured rather than raced: two concurrent creates usually serialize on the pool and would
-    // pass with no lock at all. Here the first transaction takes the lock for the SAME name and
-    // holds it while it sleeps; the second's create can only get past its check once the first
-    // commits, so its own duration is the proof. Without the lock it finishes immediately and this
-    // fails on the elapsed time.
-    const HELD_MS = 400;
+    // The namespace spans two tables, so no unique index covers it: under READ COMMITTED both writes
+    // can read a free name and insert, and `dropDuplicateToolNames` then picks the tool at assembly with a
+    // flow-log line as the only trace. Both `assertNameFree`s take the same transaction lock first
+    // (src/modules/tool-definitions/namespace.ts). Held rather than raced, because two concurrent
+    // creates usually serialize on the pool and would pass with no lock: the first transaction holds the
+    // lock, and the second create showing up parked behind it, not done, is the proof.
     const name = "corrida_de_nome";
-    let createMs = 0;
-    await Promise.all([
-      runScopedOn(suDb, ctx(), async (db) => {
-        await lockToolNames(db);
-        await db.$executeRawUnsafe(`SELECT pg_sleep(${HELD_MS / 1000})`);
-      }),
-      (async () => {
-        // Started after the holder has the lock, so the wait measured is the lock's.
-        await new Promise((r) => setTimeout(r, 50));
-        const t0 = Date.now();
-        await createCodeTool(ctx(), { ...VALID, name }, appDb);
-        createMs = Date.now() - t0;
-      })(),
-    ]);
-    expect(createMs).toBeGreaterThan(HELD_MS - 100);
-    // The import writes past both services, so it is asked the same question: it takes the lock
-    // before its own pre-check, and cannot be inside one while a create is.
-    const transferSrc = await Bun.file("src/modules/agents/transfer.ts").text();
-    expect(transferSrc).toContain("await lockToolNames(db);");
-    // ...and once it is the owner, the other table's write is refused on the name.
+    const locked = Promise.withResolvers<number>();
+    const release = Promise.withResolvers<void>();
+    const holder = runScopedOn(suDb, ctx(), async (db) => {
+      await lockToolNames(db);
+      const [me] = await db.$queryRaw<{ pid: number }[]>`
+        SELECT pg_backend_pid() AS pid`;
+      locked.resolve(me?.pid ?? -1);
+      await release.promise;
+    });
+    let created = false;
+    try {
+      const holderPid = await locked.promise;
+      // Started after the holder has the lock: it has to park behind it, not finish beside it.
+      const creating = createCodeTool(ctx(), { ...VALID, name }, appDb).finally(
+        () => {
+          created = true;
+        },
+      );
+      creating.catch(() => {});
+      await until(
+        "the create parked behind the names lock, or done without it",
+        async () => created || (await blockedByChain(suDb, holderPid)) >= 1,
+      );
+      expect(created).toBe(false);
+      release.resolve();
+      await creating;
+    } finally {
+      release.resolve();
+      await holder;
+    }
+    // Once it is the owner, the other table's write is refused on the name.
     const taken = await refusal(
       createToolDefinition(
         ctx(),
@@ -344,10 +354,64 @@ describe.skipIf(!dbUp)("code tools service", () => {
     await suDb.codeToolDefinition.deleteMany({ where: { tenantId } });
   });
 
+  // The import writes past both services, so it is asked the same question: it takes the lock
+  // before its own pre-check, and cannot be inside one while a create is. Proved by holding the lock
+  // and asking Postgres whether the import is parked behind it.
+  test("an agent import queues behind the same tool-name lock", async () => {
+    const agent = await suDb.agent.create({
+      data: { tenantId, name: "Importada", systemPrompt: "x" },
+      select: { id: true },
+    });
+    const doc = await exportAgent(ctx(), agent.id, appDb, {
+      includeComponents: true,
+    });
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let announce!: (pid: number) => void;
+    const gotIt = new Promise<number>((r) => {
+      announce = r;
+    });
+    // The holder stays open until the import is seen parked, so its lifetime is the rendezvous, not
+    // a request's: on the default 5 s budget an import slow to reach the lock expires the HOLDER,
+    // and the test fails on its commit instead of saying whether the import queued. Its budget is
+    // the wait's own, which `waitUntilBlocked` bounds well inside it.
+    const holding = runScopedOn(
+      suDb,
+      ctx(),
+      async (db) => {
+        await lockToolNames(db);
+        const [me] = await db.$queryRaw<Array<{ pid: number }>>`
+          SELECT pg_backend_pid()::int AS pid`;
+        announce(me?.pid as number);
+        await held;
+      },
+      { maxWait: 10_000, timeout: 30_000 },
+    );
+    const holder = await gotIt;
+    const importing = importAgent(ctx(), doc, appDb);
+    let blockedAt = -1;
+    try {
+      blockedAt = await waitUntilBlocked(suDb, holder, 1);
+    } finally {
+      release();
+      // Both settle before anything is asserted, so a failure names its cause and no import is still
+      // writing when the file's cleanup deletes the tenant.
+      const [holderResult, imported] = await Promise.allSettled([
+        holding,
+        importing,
+      ]);
+      expect(holderResult.status).toBe("fulfilled");
+      expect(imported.status).toBe("fulfilled");
+    }
+    expect(blockedAt).toBeGreaterThanOrEqual(0);
+  });
+
   test("blank metadata and a reserved field name are refused where they are typed", async () => {
-    // `min(1)` counts characters, so a label of spaces used to store a row with no visible name and
-    // a description of spaces a tool with no instruction — and the description is the only thing
-    // that tells the model when to call it.
+    // NOTE: `min(1)` counts characters, so a label of spaces would store a row with no visible name and a
+    // description of spaces a tool with no instruction, and the description is the only thing that tells
+    // the model when to call it.
     for (const [field, patch] of [
       ["label", { label: "   " }],
       ["description", { description: "  " }],
@@ -414,9 +478,9 @@ describe.skipIf(!dbUp)("code tools service", () => {
   });
 
   test("a name that was legal before the newer rules can still be saved, as long as it does not move", async () => {
-    // The console sends the whole row on every save, and these rules arrived after rows existed:
-    // refusing an unchanged name would lock an operator out of editing a tool that was legal when
-    // they created it. Only a name that MOVES is asked the question.
+    // The console sends the whole row on every save, and rows may predate these rules: refusing an
+    // unchanged name would lock an operator out of editing a tool that was legal when they created it.
+    // Only a name that MOVES is asked the question.
     const legacy = await suDb.codeToolDefinition.create({
       data: {
         tenantId,
@@ -515,8 +579,8 @@ describe.skipIf(!dbUp)("code tools service", () => {
     );
     expect(tool.name).toBe("checar_cpf");
 
-    // A row written before that rule (or past the service) still counts, by the name it reaches
-    // the model under.
+    // NOTE: A row stored in another spelling (legacy, or written past the service) still counts, by the
+    // name it reaches the model under.
     await suDb.toolDefinition.create({
       data: {
         tenantId,
@@ -584,6 +648,7 @@ describe.skipIf(!dbUp)("code tools service", () => {
       name: "validar_cpf",
       label: "Validar CPF",
       enabled: true,
+      silenceTruncationAlert: false,
       inputFieldCount: 1,
     });
     expect(rows[1]?.before).toMatchObject({ undisclosedChanged: true });

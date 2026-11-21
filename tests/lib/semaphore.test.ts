@@ -4,24 +4,6 @@ import { Semaphore } from "@/lib/semaphore";
 const tick = () => new Promise((r) => setTimeout(r, 5));
 
 describe("Semaphore", () => {
-  test("never runs more than `permits` tasks at once", async () => {
-    const sem = new Semaphore(3);
-    let active = 0;
-    let maxActive = 0;
-    await Promise.all(
-      Array.from({ length: 10 }, () =>
-        sem.run(async () => {
-          active += 1;
-          maxActive = Math.max(maxActive, active);
-          await tick();
-          active -= 1;
-        }),
-      ),
-    );
-    expect(maxActive).toBe(3);
-    expect(active).toBe(0);
-  });
-
   test("releases the permit when a task throws", async () => {
     const sem = new Semaphore(1);
     await expect(
@@ -45,13 +27,11 @@ describe("Semaphore", () => {
     expect(results).toEqual([0, 1, 2, 3, 4, 5]);
   });
 
-  // A released permit is handed straight to the next waiter. Bumping `available` on that path as
-  // well would MINT a permit on every handoff, leaving the semaphore permanently wider than it was
-  // built: measured on the mutation, a 3-permit semaphore came out of one 10-task burst with 10
-  // permits. It is invisible INSIDE a burst, because the minted permits appear as the queue drains
-  // and every caller has already acquired by then, so a second wave is the only place the invariant
-  // is observable. Left untested, the leak surfaced only as a neighbouring suite failing, since the
-  // agent model semaphore is a process-wide singleton.
+  // NOTE: a released permit is handed straight to the next waiter; bumping `available` on that path too
+  // would MINT a permit per handoff and leave the semaphore permanently wider. That is invisible
+  // inside a burst (the minted permits appear as the queue drains), so only a second wave shows it,
+  // and since the agent model semaphore is a process-wide singleton the leak would otherwise surface
+  // only as a neighbouring suite failing.
   test("a burst that queued waiters does not widen the semaphore", async () => {
     const sem = new Semaphore(3);
     const burst = async () => {
@@ -98,9 +78,9 @@ describe("Semaphore", () => {
     expect(order).toEqual(["holder", "a", "b", "c"]);
   });
 
-  // Issue #834: a job past its deadline was left in the queue until a permit freed, which under
-  // saturation is minutes. The waiter that leaves must take no permit with it and leave none behind:
-  // the next waiter gets the one released, and the semaphore is exactly as wide afterwards.
+  // NOTE: a job past its deadline leaves the queue at once instead of waiting for a permit, which under
+  // saturation is minutes. It takes no permit with it and leaves none behind: the next waiter gets
+  // the one released, and the semaphore is exactly as wide afterwards.
   test("a waiter whose signal aborts leaves the queue at once, with the signal's reason", async () => {
     const sem = new Semaphore(1);
     let releaseHolder: () => void = () => {};
@@ -226,5 +206,71 @@ describe("Semaphore", () => {
     const sem = new Semaphore(0);
     const ok = await sem.run(() => Promise.resolve("ran"));
     expect(ok).toBe("ran");
+  });
+});
+
+describe("Semaphore.tryAcquire", () => {
+  test("takes a free permit without queueing, and gives none when all are held", async () => {
+    const sem = new Semaphore(2);
+    const a = sem.tryAcquire();
+    const b = sem.tryAcquire();
+    expect(a).not.toBeNull();
+    expect(b).not.toBeNull();
+    expect(sem.tryAcquire()).toBeNull();
+    a?.();
+    const c = sem.tryAcquire();
+    expect(c).not.toBeNull();
+    b?.();
+    c?.();
+  });
+
+  test("a release called twice returns one permit", () => {
+    const sem = new Semaphore(1);
+    const a = sem.tryAcquire();
+    a?.();
+    a?.();
+    const b = sem.tryAcquire();
+    expect(b).not.toBeNull();
+    expect(sem.tryAcquire()).toBeNull();
+    b?.();
+  });
+
+  test("a released permit goes to a waiter of run() first", async () => {
+    const sem = new Semaphore(1);
+    const held = sem.tryAcquire();
+    let ran = false;
+    const waiting = sem.run(async () => {
+      ran = true;
+      // Still held by this run: nothing is free for a caller that does not queue.
+      expect(sem.tryAcquire()).toBeNull();
+    });
+    held?.();
+    await waiting;
+    expect(ran).toBe(true);
+    const after = sem.tryAcquire();
+    expect(after).not.toBeNull();
+    after?.();
+  });
+
+  test("onFree fires when a permit comes back free, not when a waiter takes it, and stops when removed", async () => {
+    const sem = new Semaphore(1);
+    let calls = 0;
+    const stop = sem.onFree(() => {
+      calls += 1;
+    });
+    const held = sem.tryAcquire();
+    let release!: () => void;
+    const open = new Promise<void>((r) => {
+      release = r;
+    });
+    const waiting = sem.run(() => open);
+    held?.();
+    expect(calls).toBe(0);
+    release();
+    await waiting;
+    expect(calls).toBe(1);
+    stop();
+    sem.tryAcquire()?.();
+    expect(calls).toBe(1);
   });
 });

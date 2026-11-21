@@ -9,17 +9,17 @@ import { runAgentTurn } from "@/graph/runtime";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
 import { DEBUG_MAX_STRING, emitFlowEvent } from "@/modules/flowlog/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 import { flowLogRow } from "../utils/flowlog";
 import { UsageReportingModel } from "../utils/scripted-models";
 
-// Issue #58 END TO END, at the effect the operator complained about: "I cannot see the whole prompt
-// on the Logs page." The unit tests next door prove the reader and the ceiling; this one runs a real
-// turn and reads the row, because that is the only place the complaint lives.
+// End to end, at the effect: the whole system prompt visible on the Logs page. The unit tests next
+// door prove the reader and the ceiling; this one runs a real turn and reads the row.
 //
 // The agent's own prompt is deliberately longer than the 2,000-character cut, with a marker in its
-// last sentence. Whether that marker is IN THE ROW is the whole assertion, and it is the same
-// question three times: with the mode off, with it armed, and with a window that has closed.
+// last sentence. Whether that marker is IN THE ROW is the whole assertion, asked three times: with
+// the mode off, with it armed, and with a window that has closed.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -37,8 +37,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -126,6 +126,7 @@ async function generateRow(convId: number) {
   const threadId = `${tenantId}:${instanceId}:${convId}`;
   for (let i = 0; i < 200; i++) {
     const row = await flowLogRow(suDb, {
+      orderBy: { id: "asc" },
       where: { tenantId, threadId, stage: "generate" },
       select: { detail: true },
     });
@@ -229,7 +230,7 @@ describe.skipIf(!dbUp)("the log debug mode, on a real turn", () => {
     contactId = contact.id;
   });
 
-  // The complaint, reproduced: the operator's last rule is not in the row.
+  // NOTE: Mode off: the operator's last rule is not in the row.
   test("with the mode off, the operator's own prompt stops at the cut", async () => {
     await setWindow(null);
     const prompt = await runTurn(9701);
@@ -238,7 +239,7 @@ describe.skipIf(!dbUp)("the log debug mode, on a real turn", () => {
     expect(prompt).not.toContain(TAIL);
   });
 
-  // The fix, at the same place: same agent, same prompt, one setting.
+  // NOTE: Same agent, same prompt, one setting.
   test("with the mode armed, the whole prompt is in the row", async () => {
     await setWindow(new Date(Date.now() + 3_600_000));
     const prompt = await runTurn(9702);
@@ -247,9 +248,8 @@ describe.skipIf(!dbUp)("the log debug mode, on a real turn", () => {
     expect(prompt).not.toContain("[truncated]");
   });
 
-  // A raised SIZE ceiling is not a raised PII ceiling. The audit's mask is what keeps the contact's
-  // name out of the column, and lifting the cut must not reach it — the two axes were kept apart on
-  // purpose, and this is where that separation is measured rather than asserted in a comment.
+  // NOTE: A raised SIZE ceiling is not a raised PII ceiling. The audit's mask keeps the contact's name out
+  // of the column, and lifting the cut must not reach it: the two axes are kept apart on purpose.
   test("the whole prompt still carries no contact value", async () => {
     const prompt = await runTurn(9703);
     expect(prompt).not.toContain(NAME);
@@ -284,6 +284,7 @@ describe.skipIf(!dbUp)("the log debug mode, on a real turn", () => {
     let row: { detail: unknown } | null = null;
     for (let i = 0; i < 200 && row === null; i++) {
       row = await flowLogRow(suDb, {
+        orderBy: { id: "asc" },
         where: { tenantId, turnId },
         select: { detail: true },
       });
@@ -304,5 +305,37 @@ describe.skipIf(!dbUp)("the log debug mode, on a real turn", () => {
     expect(prompt).toContain(HEAD);
     expect(prompt).toContain("[truncated]");
     expect(prompt).not.toContain(TAIL);
+  });
+
+  // The durable size axis, on the same real turn. The log line stays cut, and the whole
+  // audited prompt is kept beside it, still with the contact's value masked.
+  test("an agent that keeps full turn detail keeps the whole audited prompt beside the cut line", async () => {
+    const agent = await suDb.agent.findUniqueOrThrow({
+      where: { id: agentId },
+      select: { settings: true },
+    });
+    await suDb.agent.update({
+      where: { id: agentId },
+      data: {
+        settings: {
+          ...(agent.settings as Record<string, unknown>),
+          observability: { fullDetailRetentionDays: 7 },
+        },
+      },
+    });
+    const prompt = await runTurn(9706);
+    expect(prompt).toContain("[truncated]");
+    expect(prompt).not.toContain(TAIL);
+    let kept: { body: string }[] = [];
+    for (let i = 0; i < 200 && kept.length === 0; i++) {
+      kept = await suDb.$queryRaw<{ body: string }[]>`
+        SELECT c.body FROM full_detail_refs r
+          JOIN full_detail_contents c ON c.tenant_id = r.tenant_id AND c.hash = r.content_hash
+         WHERE r.tenant_id = ${tenantId} AND r.kind = 'system_prompt'`;
+      if (kept.length === 0) await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(kept).toHaveLength(1);
+    expect(kept[0]?.body).toContain(TAIL);
+    expect(kept[0]?.body).not.toContain(NAME);
   });
 });

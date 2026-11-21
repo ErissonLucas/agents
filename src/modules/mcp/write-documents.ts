@@ -7,6 +7,7 @@ import {
   deleteDocumentTemplate,
   documentTemplateWriteProblem,
   getDocumentTemplate,
+  nextNumberUnderPrefix,
   normalizeTemplateName,
   previewDocumentTemplate,
   updateDocumentTemplate,
@@ -47,7 +48,10 @@ function projection(t: {
   fields: { name: string; type: string; required?: boolean }[];
   style: Record<string, unknown>;
   numberPrefix: string | null;
+  nextNumber: number;
   enabled: boolean;
+  requiresApproval: boolean;
+  approvalTtlHours: number;
 }) {
   return {
     name: t.name,
@@ -57,7 +61,10 @@ function projection(t: {
     fields: t.fields.map((f) => `${f.name}:${f.type}${f.required ? "*" : ""}`),
     style: t.style,
     numberPrefix: t.numberPrefix,
+    nextNumber: t.nextNumber,
     enabled: t.enabled,
+    requiresApproval: t.requiresApproval,
+    approvalTtlHours: t.approvalTtlHours,
   };
 }
 
@@ -69,7 +76,10 @@ export interface DocumentTemplateWriteArgs {
   fields?: unknown;
   style?: unknown;
   number_prefix?: string | null;
+  next_number?: number;
   enabled?: boolean;
+  requires_approval?: boolean;
+  approval_ttl_hours?: number;
   starter?: string;
   locale?: string;
   dry_run?: boolean;
@@ -102,7 +112,7 @@ export async function documentTemplateCreate(
     // Normalized HERE, once, because every use below is downstream of it: the gate, the rendered
     // preview's title and the reported name. The apply trims, so anything shown untrimmed is a
     // value the write does not keep.
-    name: normalizeTemplateName(args.name ?? starter?.name ?? ""),
+    name: normalizeTemplateName(args.name ?? starter?.suggestedName ?? ""),
     slug: args.slug,
     description:
       args.description !== undefined
@@ -115,7 +125,10 @@ export async function documentTemplateCreate(
       args.number_prefix !== undefined
         ? args.number_prefix
         : (starter?.numberPrefix ?? null),
+    nextNumber: args.next_number,
     enabled: args.enabled,
+    requiresApproval: args.requires_approval,
+    approvalTtlHours: args.approval_ttl_hours,
   };
   if (!input.name) return err("name is required");
   try {
@@ -130,6 +143,8 @@ export async function documentTemplateCreate(
           slug: input.slug,
           description: input.description,
           numberPrefix: input.numberPrefix,
+          approvalTtlHours: input.approvalTtlHours,
+          nextNumber: input.nextNumber,
         },
         base,
       );
@@ -193,10 +208,17 @@ export async function documentTemplateUpdate(
   if (args.fields !== undefined) patch.fields = args.fields;
   if (args.style !== undefined) patch.style = args.style;
   if (args.number_prefix !== undefined) patch.numberPrefix = args.number_prefix;
+  if (args.next_number !== undefined) patch.nextNumber = args.next_number;
   if (args.enabled !== undefined) patch.enabled = args.enabled;
+  if (args.requires_approval !== undefined) {
+    patch.requiresApproval = args.requires_approval;
+  }
+  if (args.approval_ttl_hours !== undefined) {
+    patch.approvalTtlHours = args.approval_ttl_hours;
+  }
   if (Object.keys(patch).length === 0) {
     return err(
-      "no updatable fields provided (name, slug, description, blocks, fields, style, number_prefix, enabled)",
+      "no updatable fields provided (name, slug, description, blocks, fields, style, number_prefix, next_number, enabled, requires_approval, approval_ttl_hours)",
     );
   }
   try {
@@ -235,7 +257,27 @@ export async function documentTemplateUpdate(
         ...(patch.numberPrefix !== undefined
           ? { numberPrefix: patch.numberPrefix }
           : {}),
+        // The apply recomputes it against the destination prefix even when the patch does not set it,
+        // so a prefix move shows its number moving too.
+        ...(patch.nextNumber !== undefined
+          ? { nextNumber: patch.nextNumber }
+          : patch.numberPrefix !== undefined
+            ? {
+                nextNumber: await nextNumberUnderPrefix(
+                  ctx,
+                  id,
+                  patch.numberPrefix,
+                  base,
+                ),
+              }
+            : {}),
         ...(patch.enabled !== undefined ? { enabled: patch.enabled } : {}),
+        ...(patch.requiresApproval !== undefined
+          ? { requiresApproval: patch.requiresApproval }
+          : {}),
+        ...(patch.approvalTtlHours !== undefined
+          ? { approvalTtlHours: patch.approvalTtlHours }
+          : {}),
         // Every property the patch can carry, and for the same reason each one is here: the diff is
         // the client's only picture of what applying would do. A projection that takes the patch for
         // some properties and the stored value for others answers "nothing changes" to a write that

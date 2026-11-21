@@ -1,0 +1,313 @@
+import { CLIENT_AUDIENCES } from "@/graph/usage-sources";
+
+// THE PAGE'S ONE FILTER, IN THE URL. Period, agent, inbox and source live in the query string, so a
+// view can be shared as a link and Back returns to the previous view. Every block reads the window
+// computed here, in the operator's own days (docs/ui.md, "A day is defined by the viewer's browser
+// timezone"), and the previous period is the same number of days immediately before it.
+
+export const RANGES = ["7d", "30d", "90d", "12m", "all", "custom"] as const;
+export type Range = (typeof RANGES)[number];
+export const SOURCES = ["inbox", "playground", "client", "all"] as const;
+export type Source = (typeof SOURCES)[number];
+// Who the client channel served, a refinement of the client segment only.
+export const AUDIENCES = ["all", ...CLIENT_AUDIENCES] as const;
+export type Audience = (typeof AUDIENCES)[number];
+
+const RANGE_DAYS: Record<Exclude<Range, "custom" | "all">, number> = {
+  "7d": 7,
+  "30d": 30,
+  "90d": 90,
+  "12m": 365,
+};
+
+export interface DashboardFilters {
+  range: Range;
+  // Local days, inclusive, `YYYY-MM-DD`. Set only for a custom range.
+  from: string | null;
+  to: string | null;
+  agentId: string | null;
+  inboxId: string | null;
+  source: Source;
+  // Read and sent only under the client segment; anywhere else it is "all".
+  audience: Audience;
+}
+
+export const DEFAULT_FILTERS: DashboardFilters = {
+  range: "30d",
+  from: null,
+  to: null,
+  agentId: null,
+  inboxId: null,
+  source: "inbox",
+  audience: "all",
+};
+
+const DAY = /^\d{4}-\d{2}-\d{2}$/;
+const ID = /^\d{1,19}$/;
+
+function validDay(s: string | null): s is string {
+  if (!s || !DAY.test(s)) return false;
+  const d = new Date(`${s}T00:00:00`);
+  return !Number.isNaN(d.getTime()) && localDayKey(d) === s;
+}
+
+// Read the filters from the query string. Whatever does not parse falls back to its default rather
+// than reaching the API: a hand-edited link opens on a valid view, never on an error page.
+export function readFilters(params: URLSearchParams): DashboardFilters {
+  const range = params.get("range");
+  const source = params.get("source");
+  const from = params.get("from");
+  const to = params.get("to");
+  const agent = params.get("agent");
+  const inbox = params.get("inbox");
+  const audience = params.get("audience");
+  const custom =
+    range === "custom" && validDay(from) && validDay(to) && from <= to;
+  const segment = (SOURCES as readonly string[]).includes(source ?? "")
+    ? (source as Source)
+    : DEFAULT_FILTERS.source;
+  return {
+    range: custom
+      ? "custom"
+      : (RANGES as readonly string[]).includes(range ?? "") &&
+          range !== "custom"
+        ? (range as Range)
+        : DEFAULT_FILTERS.range,
+    from: custom ? from : null,
+    to: custom ? to : null,
+    agentId: agent && ID.test(agent) ? agent : null,
+    inboxId: inbox && ID.test(inbox) ? inbox : null,
+    source: segment,
+    audience:
+      segment === "client" &&
+      (AUDIENCES as readonly string[]).includes(audience ?? "")
+        ? (audience as Audience)
+        : DEFAULT_FILTERS.audience,
+  };
+}
+
+// The query string for a set of filters. A value at its default is left out, so the plain page has
+// a plain URL and "all agents" is the absence of the parameter.
+export function writeFilters(f: DashboardFilters): URLSearchParams {
+  const p = new URLSearchParams();
+  if (f.range !== DEFAULT_FILTERS.range) p.set("range", f.range);
+  if (f.range === "custom" && f.from && f.to) {
+    p.set("from", f.from);
+    p.set("to", f.to);
+  }
+  if (f.agentId) p.set("agent", f.agentId);
+  if (f.inboxId) p.set("inbox", f.inboxId);
+  if (f.source !== DEFAULT_FILTERS.source) p.set("source", f.source);
+  if (f.source === "client" && f.audience !== DEFAULT_FILTERS.audience)
+    p.set("audience", f.audience);
+  return p;
+}
+
+// Local day key (YYYY-MM-DD) of a Date in the browser's zone.
+export function localDayKey(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function startOfLocalDay(key: string): Date {
+  return new Date(`${key}T00:00:00`);
+}
+
+function addDays(d: Date, n: number): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + n);
+}
+
+export interface Window {
+  // Instants, half-open [since, until). `since` null for "all".
+  since: Date | null;
+  until: Date;
+  // The local days the window covers, first and last inclusive; null first day for "all".
+  firstDay: string | null;
+  lastDay: string;
+  days: number | null;
+}
+
+// The window a set of filters names, at `now`. A preset ends today and covers N local days; a custom
+// range covers its two days inclusive.
+export function windowOf(f: DashboardFilters, now: Date = new Date()): Window {
+  if (f.range === "custom" && f.from && f.to) {
+    const since = startOfLocalDay(f.from);
+    const until = addDays(startOfLocalDay(f.to), 1);
+    const days = Math.round((until.getTime() - since.getTime()) / 86_400_000);
+    return { since, until, firstDay: f.from, lastDay: f.to, days };
+  }
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const until = addDays(today, 1);
+  if (f.range === "all") {
+    return {
+      since: null,
+      until,
+      firstDay: null,
+      lastDay: localDayKey(today),
+      days: null,
+    };
+  }
+  const n = RANGE_DAYS[f.range as keyof typeof RANGE_DAYS];
+  const since = addDays(today, -(n - 1));
+  return {
+    since,
+    until,
+    firstDay: localDayKey(since),
+    lastDay: localDayKey(today),
+    days: n,
+  };
+}
+
+// The period before: the same number of days, starting that many days earlier. A window still
+// running at `now` is compared up to the same local time of day, N days back: the last 7 days at
+// 10:00 against the 7 before them up to 10:00, never against whole days, which would read as a drop
+// every morning. None for "all".
+export function previousWindow(
+  w: Window,
+  now: Date = new Date(),
+): Window | null {
+  if (!w.since || w.days === null) return null;
+  const since = addDays(w.since, -w.days);
+  const until =
+    w.since.getTime() <= now.getTime() && now.getTime() < w.until.getTime()
+      ? new Date(
+          now.getFullYear(),
+          now.getMonth(),
+          now.getDate() - w.days,
+          now.getHours(),
+          now.getMinutes(),
+          now.getSeconds(),
+          now.getMilliseconds(),
+        )
+      : w.since;
+  return {
+    since,
+    until,
+    firstDay: localDayKey(since),
+    lastDay: localDayKey(addDays(w.since, -1)),
+    days: w.days,
+  };
+}
+
+// The window as the API reads it at `now`: one still running ends at `now`, the instant its previous
+// period is cut at, so both periods cover the same elapsed time however long the streams take to
+// start. Its days, and the drill-down links, keep the whole window.
+export function readUpTo(w: Window, now: Date): Window {
+  const running =
+    (!w.since || w.since.getTime() <= now.getTime()) &&
+    now.getTime() < w.until.getTime();
+  return running ? { ...w, until: now } : w;
+}
+
+// Every local day of a window, for charts that show the days with no data as zero. "All" starts at
+// the earliest day any series has.
+export function daysOf(w: Window, earliest?: string | null): string[] {
+  const first = w.firstDay ?? earliest ?? w.lastDay;
+  const out: string[] = [];
+  let cur = startOfLocalDay(first);
+  const end = startOfLocalDay(w.lastDay);
+  while (cur.getTime() <= end.getTime()) {
+    out.push(localDayKey(cur));
+    cur = addDays(cur, 1);
+  }
+  return out;
+}
+
+export const OPERATOR_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+// The API query for a window and the filters: the same object for every block of the page.
+export function apiQuery(
+  f: DashboardFilters,
+  w: Window,
+): {
+  since?: string;
+  until: string;
+  tz: string;
+  source?: Exclude<Source, "all">;
+  audience?: Exclude<Audience, "all">;
+  agentId?: string;
+  inboxId?: string;
+} {
+  return {
+    ...(w.since ? { since: w.since.toISOString() } : {}),
+    until: w.until.toISOString(),
+    tz: OPERATOR_TZ,
+    ...(f.source === "all" ? {} : { source: f.source }),
+    ...(f.source === "client" && f.audience !== "all"
+      ? { audience: f.audience }
+      : {}),
+    ...(f.agentId ? { agentId: f.agentId } : {}),
+    ...(f.inboxId ? { inboxId: f.inboxId } : {}),
+  };
+}
+
+// The conversation list opened on a figure: the same view, the day (or the whole window) and the
+// outcome the figure counts.
+export function drillDownHref(
+  f: DashboardFilters,
+  w: Pick<Window, "since" | "until">,
+  outcome: "all" | "involved" | "resolved_by_agent" | "handoff",
+): string {
+  const p = new URLSearchParams();
+  if (w.since) p.set("createdSince", w.since.toISOString());
+  p.set("createdUntil", w.until.toISOString());
+  p.set("outcome", outcome);
+  if (f.agentId) p.set("agentId", f.agentId);
+  if (f.inboxId) p.set("inboxId", f.inboxId);
+  return `/conversations?${p.toString()}`;
+}
+
+export type TrendMetric =
+  | "involvement"
+  | "resolution"
+  | "automation"
+  | "handoff";
+
+// The conversations behind each rate: its numerator's outcome.
+export const METRIC_DRILL: Record<
+  TrendMetric,
+  "involved" | "resolved_by_agent" | "handoff"
+> = {
+  involvement: "involved",
+  resolution: "resolved_by_agent",
+  automation: "resolved_by_agent",
+  handoff: "handoff",
+};
+
+// A point of the funnel-over-time chart. On the total chart each line is a rate, so a hit line names
+// its outcome; on a split chart each line is an agent or inbox, so a hit line narrows the view to it
+// and the selected rate names the outcome. A click between lines is the whole day: every conversation
+// on the total chart, the selected rate's on a split one.
+export function trendPointHref(
+  f: DashboardFilters,
+  day: string,
+  breakdown: "none" | "agent" | "inbox",
+  metric: TrendMetric,
+  seriesKey?: string,
+): string {
+  const w = dayWindow(day);
+  if (breakdown === "none") {
+    const hit = seriesKey as TrendMetric | undefined;
+    return drillDownHref(
+      f,
+      w,
+      hit && hit in METRIC_DRILL ? METRIC_DRILL[hit] : "all",
+    );
+  }
+  const id = seriesKey?.startsWith("s") ? seriesKey.slice(1) : null;
+  const view =
+    id === null
+      ? f
+      : breakdown === "agent"
+        ? { ...f, agentId: id }
+        : { ...f, inboxId: id };
+  return drillDownHref(view, w, METRIC_DRILL[metric]);
+}
+
+// One local day as a window, for the drill-down of a point.
+export function dayWindow(key: string): { since: Date; until: Date } {
+  const since = startOfLocalDay(key);
+  return { since, until: addDays(since, 1) };
+}

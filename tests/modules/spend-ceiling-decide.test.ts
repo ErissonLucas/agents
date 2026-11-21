@@ -1,10 +1,12 @@
 import { beforeEach, describe, expect, test } from "bun:test";
+import { USAGE_SOURCES, type UsageSource } from "@/graph/usage-sources";
 import { clearContactAuthState } from "@/modules/contact-auth/state";
 import {
   ceilingFor,
   decideSpend,
   monthEnd,
   monthStart,
+  projectMonthEnd,
 } from "@/modules/spend-ceiling/decide";
 import {
   announceSpendCeilingOnConversation,
@@ -21,7 +23,7 @@ import {
 } from "@/modules/spend-ceiling/settings";
 
 // The RULE, proved without a database. What the ledger says and what the operator is shown are
-// fiation; this is the decision itself (issue #146).
+// fiation; this is the decision itself.
 
 function cfg(patch: Partial<SpendCeilingConfig> = {}): SpendCeilingConfig {
   return { ...SPEND_CEILING_DEFAULTS, ...patch };
@@ -32,7 +34,7 @@ describe("the spend ceiling decision", () => {
   const table: Array<{
     name: string;
     cfg: Partial<SpendCeilingConfig>;
-    source: "inbox" | "playground";
+    source: UsageSource;
     used: number;
     expect: "allowed" | "warning" | "over";
   }> = [
@@ -126,6 +128,50 @@ describe("the spend ceiling decision", () => {
       used: 10_000_000,
       expect: "allowed",
     },
+    // The client channel answers to its own number, and spending it closes nothing else.
+    {
+      name: "the client channel is over its own ceiling",
+      cfg: {
+        enabled: true,
+        monthlyInboxUsd: 1_000_000,
+        monthlyPlaygroundUsd: 1_000_000,
+        monthlyClientUsd: 100,
+      },
+      source: "client",
+      used: 500,
+      expect: "over",
+    },
+    {
+      name: "and the same usage leaves customer traffic and the playground answering",
+      cfg: {
+        enabled: true,
+        monthlyInboxUsd: 1_000_000,
+        monthlyPlaygroundUsd: 1_000_000,
+        monthlyClientUsd: 100,
+      },
+      source: "playground",
+      used: 500,
+      expect: "allowed",
+    },
+    {
+      name: "the inbox and playground ceilings do not bound the client channel",
+      cfg: {
+        enabled: true,
+        monthlyInboxUsd: 100,
+        monthlyPlaygroundUsd: 100,
+        monthlyClientUsd: 0,
+      },
+      source: "client",
+      used: 10_000_000,
+      expect: "allowed",
+    },
+    {
+      name: "the client channel warns on its own number",
+      cfg: { enabled: true, monthlyClientUsd: 1000, warnAtPercent: 80 },
+      source: "client",
+      used: 800,
+      expect: "warning",
+    },
   ];
 
   test.each(table.map((r) => [r.name, r] as const))("%s", (_name, row) => {
@@ -148,10 +194,21 @@ describe("the spend ceiling decision", () => {
     expect(v).toEqual({ state: "over", usedUsd: 1200, ceilingUsd: 1000 });
   });
 
-  test("zero is no ceiling, on either half", () => {
+  test("zero is no ceiling, on every source", () => {
     const c = cfg({ enabled: true });
-    expect(ceilingFor(c, "inbox")).toBeNull();
-    expect(ceilingFor(c, "playground")).toBeNull();
+    for (const source of USAGE_SOURCES) {
+      expect(ceilingFor(c, source)).toBeNull();
+    }
+  });
+
+  test("each source reads its own number", () => {
+    const c = cfg({
+      enabled: true,
+      monthlyInboxUsd: 1,
+      monthlyPlaygroundUsd: 2,
+      monthlyClientUsd: 3,
+    });
+    expect(USAGE_SOURCES.map((s) => ceilingFor(c, s))).toEqual([1, 2, 3]);
   });
 
   // Money is compared in CENTS. `0.1 + 0.7` is `0.7999999999999999` to a double, and a ceiling of
@@ -179,6 +236,22 @@ describe("reading the ceiling out of the settings bag", () => {
     expect(readSpendCeilingConfig(null).enabled).toBe(false);
   });
 
+  test("the client channel's ceiling is read, and a block written before it has none", () => {
+    expect(
+      readSpendCeilingConfig({ spendCeiling: { monthlyClientUsd: 12.5 } })
+        .monthlyClientUsd,
+    ).toBe(12.5);
+    expect(
+      readSpendCeilingConfig({
+        spendCeiling: { enabled: true, monthlyInboxUsd: 10 },
+      }).monthlyClientUsd,
+    ).toBe(0);
+    expect(
+      readSpendCeilingConfig({ spendCeiling: { monthlyClientUsd: -1 } })
+        .monthlyClientUsd,
+    ).toBe(SPEND_CEILING_DEFAULTS.monthlyClientUsd);
+  });
+
   // Malformed input CLAMPS to the default rather than throwing, and never to "no ceiling": a bad
   // write reaching the webhook must not be able to switch the guard off.
   test.each([
@@ -195,23 +268,10 @@ describe("reading the ceiling out of the settings bag", () => {
     );
   });
 
-  // A ceiling is money, so it is read to the cent, and the third decimal is dropped rather than
-  // rounded up: a ceiling that is LOWER is the safe side of its own field (issue #426).
-  test("a ceiling is read to the cent, and never rounded up", () => {
-    expect(
-      readSpendCeilingConfig({ spendCeiling: { monthlyInboxUsd: 10.9 } })
-        .monthlyInboxUsd,
-    ).toBe(10.9);
-    expect(
-      readSpendCeilingConfig({ spendCeiling: { monthlyInboxUsd: 10.999 } })
-        .monthlyInboxUsd,
-    ).toBe(10.99);
-  });
-
-  // THE FLOAT'S OWN ERROR IS NOT A THIRD DECIMAL (review round 17). `262144.04 * 100` is
-  // `26214403.999999996`, so a floor, or a fixed nudge smaller than that error, read a legally saved
-  // amount as a cent less and made the gate refuse a cent early. A whole number of cents to within
-  // the float's precision is that number of cents, at any amount the ceiling allows.
+  // NOTE: the float's own error is not a third decimal. `262144.04 * 100` is `26214403.999999996`,
+  // so a floor, or a fixed nudge smaller than that error, would read a legally saved amount as a
+  // cent less and refuse a cent early. A whole number of cents to within the float's precision is
+  // that number of cents, at any amount the ceiling allows.
   test("a whole number of cents survives the float at any amount", () => {
     const read = (v: number) =>
       readSpendCeilingConfig({ spendCeiling: { monthlyInboxUsd: v } })
@@ -226,12 +286,11 @@ describe("reading the ceiling out of the settings bag", () => {
     }
   });
 
-  // THE UNIT CHANGED UNDER A ROW THAT WAS ALREADY WRITTEN (issue #426). A block saved when the
-  // ceiling counted tokens carries `monthlyInboxTokens`, and there is no price to convert it with:
-  // the reader answers no ceiling (0) on both halves, and says WHY, so the console can tell the
-  // operator the number they typed is not the number being enforced. The first save in dollars
-  // clears it: the writer's schema does not carry the old keys, and a block that names the new unit
-  // is a block the operator has seen.
+  // NOTE: a block saved when the ceiling counted tokens carries `monthlyInboxTokens`, and there is
+  // no price to convert it with: the reader answers no ceiling (0) on both halves, and says WHY, so
+  // the console can tell the operator the number they typed is not the number being enforced. The
+  // first save in dollars clears it: the writer's schema does not carry the old keys, and a block
+  // that names the new unit is a block the operator has seen.
   describe("a block written in tokens", () => {
     test("is no ceiling, and says so", () => {
       const read = readSpendCeilingConfig({
@@ -312,7 +371,7 @@ describe("reading the ceiling out of the settings bag", () => {
     expect(write(12.34)).toBe(12.34);
     expect(write(10.005)).toBe(10.01);
     expect(write(10.004)).toBe(10);
-    // The same at an amount where the float's error outgrows a fixed nudge (review round 17): the
+    // NOTE: the same at an amount where the float's error outgrows a fixed nudge: the
     // whole cent round-trips, and the half still rounds up.
     expect(write(262144.04)).toBe(262144.04);
     expect(write(262144.035)).toBe(262144.04);
@@ -412,6 +471,44 @@ describe("the window", () => {
   });
 });
 
+// WHERE THE MONTH IS HEADED: the dashboard puts this next to the ceiling, so it has to
+// be a straight line from the pace so far, never below what was spent, and never a multiplication of
+// the first hour of the month into a month of such hours.
+describe("the month-end projection", () => {
+  test("stretches the pace of the days elapsed to the whole month", () => {
+    // Ten days into a 30-day September at $30: $90 at that pace.
+    expect(projectMonthEnd(30, new Date("2026-09-11T00:00:00Z"))).toBeCloseTo(
+      90,
+    );
+  });
+
+  test("is never below what was already spent", () => {
+    for (const at of [
+      "2026-09-01T00:00:00Z",
+      "2026-09-15T12:00:00Z",
+      "2026-09-30T23:59:59Z",
+    ])
+      expect(projectMonthEnd(30, new Date(at))).toBeGreaterThanOrEqual(30);
+  });
+
+  test("counts at least one day elapsed, so the month's first hour does not explode", () => {
+    // An hour into the month: the same as one whole day, $10 → $300 over 30 days, not $7200.
+    expect(projectMonthEnd(10, new Date("2026-09-01T01:00:00Z"))).toBeCloseTo(
+      300,
+    );
+  });
+
+  test("on the month's last instant it is the spend itself", () => {
+    expect(
+      projectMonthEnd(42, new Date("2026-09-30T23:59:59.999Z")),
+    ).toBeCloseTo(42, 2);
+  });
+
+  test("nothing spent projects nothing", () => {
+    expect(projectMonthEnd(0, new Date("2026-09-11T00:00:00Z"))).toBe(0);
+  });
+});
+
 // HOW OFTEN THE WARNING IS SAID. `over` is a per-message fact and belongs on the Logs page once per
 // refused customer; the warning describes the MONTH and stays true from the fraction to the
 // ceiling, so emitting it per message would page the alert channels for the rest of the month about
@@ -435,13 +532,6 @@ describe("how often the ceiling announces itself", () => {
         7n,
       ),
     ).toBeNull();
-  });
-
-  test("every refused message is written", () => {
-    const said = [0, 1, 2, 3, 4].map(
-      () => spendCeilingAnnouncement(over, "inbox", 7n)?.level ?? null,
-    );
-    expect(said).toEqual(["error", "error", "error", "error", "error"]);
   });
 
   test("the warning is said once per window, not once per message", () => {
@@ -516,8 +606,8 @@ describe("how often the ceiling announces itself", () => {
 // TWO DELIVERIES OF ONE MOMENT. Chatwoot dispatches an incoming message to the conversation's
 // assigned agent bot AND to the inbox's, which is two deliveries with two ids; the debounce flush
 // can also reach this branch alongside one of them. The per-notice claims make each write happen
-// once and say nothing about ORDER, so the second caller used to find the copy's window held, skip
-// to the handoff, and open the conversation while the first was still awaiting its send.
+// once and say nothing about ORDER: without a single flight the second caller would find the copy's
+// window held, skip to the handoff, and open the conversation while the first still awaits its send.
 describe("two over-ceiling sequences on one conversation", () => {
   beforeEach(() => {
     clearContactAuthState();

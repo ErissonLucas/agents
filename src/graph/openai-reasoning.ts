@@ -1,46 +1,9 @@
-// Which OpenAI endpoint a turn goes to, and what reasoning effort travels on it. Pure policy, kept
-// out of the client factory because the whole thing is a table of measured API behaviour rather
-// than wiring.
-//
-// Measured against the live API on 2026-08-15, one function tool attached, four models across two
-// generations (`gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.4-mini`, `gpt-5.5`):
-//
-// | endpoint             | effort sent      | result                                              |
-// | -------------------- | ---------------- | --------------------------------------------------- |
-// | /v1/chat/completions | absent           | 400 on the gpt-5.6 family, 200 on everything older   |
-// | /v1/chat/completions | "none"           | 200 everywhere                                       |
-// | /v1/chat/completions | low..max         | 400 EVERYWHERE, including gpt-5.4-mini and gpt-5.5   |
-// | /v1/responses        | absent, none..max| 200 everywhere                                       |
-//
-// Measured again on 2026-09-23 on `gpt-6-luna` (issue #804): the same table. An absent effort with
-// tools is a 400 on completions (its server-side default is not "none" either), "none" is a 200, and
-// the Responses endpoint takes every effort except "minimal". So the gpt-6 family joins the pattern
-// below.
-//
-// The rejection reads "Function tools with reasoning_effort are not supported for <model> in
-// /v1/chat/completions. To use function tools, use /v1/responses or set reasoning_effort to
-// 'none'." So the ceiling is the ENDPOINT's, not the family's: on completions the only effort that
-// coexists with function tools is "none", and the gpt-5.6 family is special only in that its
-// server-side default is not "none" (which is what issue #66 hit). Any effort above "none" is
-// therefore a transport decision, and that is the single rule this module encodes.
-//
-// "none" takes the same endpoint as every other explicit choice, even though completions accepts it
-// (measured 200 there, with and without tools). The two endpoints spell the parameter differently
-// and neither takes the other's spelling ("Unknown parameter: 'reasoning'" on completions,
-// "Unsupported parameter: 'reasoning_effort'. In the Responses API, this parameter has moved to
-// 'reasoning.effort'" on responses), while @langchain/openai routes some models to /v1/responses on
-// its own regardless of what we ask (_modelPrefersResponsesAPI: gpt-5.2-pro, gpt-5.4-pro,
-// gpt-5.5-pro, and any id containing "codex"). Keeping "none" on completions would therefore mean
-// PREDICTING the adapter's routing in order to pick the spelling, i.e. maintaining a copy of its
-// model list. Sending every explicit choice to one endpoint removes the prediction.
-//
-// "minimal" is deliberately absent from the vocabulary: every model measured rejects it
-// ("Unsupported value: 'minimal' is not supported with the '<model>' model"). "max" is present
-// because the API's own error message advertises it on the gpt-5.6 family and it answered 200
-// there, even though the installed openai SDK's `ReasoningEffort` type does not list it. Which
-// efforts a given model accepts is the API's business, not ours: gpt-5.4-mini rejects "max" with a
-// message naming the model and the values it does take, and inventing our own per-model allowlist
-// here would be a table to maintain forever (the lesson from issue #64's tool-schema sanitizer).
+// Which OpenAI endpoint a turn goes to, and what reasoning effort travels on it (pure policy). On
+// /v1/chat/completions the only effort that coexists with function tools is "none", so any explicit
+// effort goes to /v1/responses; "none" goes there too, because the endpoints spell the parameter
+// differently and keeping it on completions would mean predicting @langchain/openai's own routing.
+// "minimal" is absent (every model rejects it); per-model acceptance is left to the API, not an
+// allowlist here. The endpoint/effort table is in docs/graph.md, "OpenAI reasoning effort".
 
 export const REASONING_EFFORTS = [
   "none",
@@ -53,7 +16,7 @@ export const REASONING_EFFORTS = [
 
 export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
-// NOTE: matches a bare id ("gpt-5.6-luna", "gpt-6-luna"), a routed one ("openai/gpt-6-luna",
+// Matches a bare id ("gpt-5.6-luna", "gpt-6-luna"), a routed one ("openai/gpt-6-luna",
 // OpenRouter) and a fine-tuned one ("ft:gpt-6-luna:acme::x1"), which inherits the base model's
 // server-side default and so inherits the rejection too. A point release of gpt-6 ("gpt-6.1-luna")
 // is the same family. "gpt-5.60", "gpt-5.6x", "gpt-60", "gpt-6x" and "not-gpt-6-luna" deliberately
@@ -69,10 +32,9 @@ export interface OpenAITransportPlan {
   effort?: ReasoningEffort;
   // Effort to pin ONLY on the tool-bound model. Reserved for the case where nobody asked for an
   // effort and the provider's own default is what breaks: pinning it on the constructor would
-  // switch reasoning off on the calls that never carried tools and never failed. This is the one
-  // effort still spelled for completions, so the factory drops it when the adapter is not taking
-  // the request there — which is a fact about a built instance, not a policy, and so is decided in
-  // ./models rather than guessed here.
+  // switch reasoning off on the calls that never carried tools and never failed. The adapter may
+  // still send the call to /v1/responses on its own, so ./models writes it in the spelling of the
+  // endpoint the built instance picks, which is a fact about that instance and not a policy here.
   toolEffort?: ReasoningEffort;
 }
 
@@ -89,4 +51,35 @@ export function planOpenAITransport(
       : { responses: false };
   }
   return { responses: true, effort: requested };
+}
+
+// The lowest effort a model accepts, read off its refusal of the tool pin. Measured on 2026-10-07:
+// gpt-6-astra and gpt-6.1-sol refuse "none" on both endpoints (400, code "unsupported_value", param
+// `reasoning_effort` or `reasoning.effort`) and name what they take ("Supported values are: 'low',
+// 'medium', 'high', and 'xhigh'."), while gpt-6-luna and gpt-6-sol take it. So which models refuse it is
+// the API's answer, not a list kept here: the refusal says the floor. Null for anything else (another
+// status, another code, a refusal of the parameter itself, a list naming no effort we know), which is
+// left to fail as it did.
+export function toolEffortFloorOf(err: unknown): ReasoningEffort | null {
+  if (typeof err !== "object" || err === null) return null;
+  const e = err as {
+    status?: unknown;
+    code?: unknown;
+    param?: unknown;
+    message?: unknown;
+  };
+  if (e.status !== 400 || e.code !== "unsupported_value") return null;
+  if (e.param !== "reasoning_effort" && e.param !== "reasoning.effort") {
+    return null;
+  }
+  const listed = /Supported values are:([^\n]*)/i.exec(String(e.message ?? ""));
+  if (!listed?.[1]) return null;
+  const named = new Set(
+    [...listed[1].matchAll(/'([a-z]+)'/g)].map((m) => m[1]),
+  );
+  return (
+    REASONING_EFFORTS.find(
+      (effort) => effort !== "none" && named.has(effort),
+    ) ?? null
+  );
 }

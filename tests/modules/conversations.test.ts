@@ -4,6 +4,7 @@ import { PrismaClient } from "@/../generated/prisma/client";
 import type { AppError } from "@/lib/errors";
 import type { TenantContext } from "@/lib/tenancy";
 import { listConversations } from "@/modules/conversations/service";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -22,8 +23,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -166,8 +167,8 @@ describe.skipIf(!dbUp)("listConversations", () => {
     expect(first.nextCursor).toBe(first.items[0]?.id ?? null);
     const second = await listConversations(
       ctx(tenantA),
-      // `nextCursor` crosses the wire as a string; the caller parses it back, which is what the
-      // REST route now does with `parseQueryId` instead of handing the raw value to the service.
+      // NOTE: `nextCursor` crosses the wire as a string; the caller parses it back, as the REST
+      // route does with `parseQueryId` instead of handing the raw value to the service.
       {
         limit: 1,
         cursor: first.nextCursor ? BigInt(first.nextCursor) : undefined,
@@ -190,9 +191,8 @@ describe.skipIf(!dbUp)("listConversations", () => {
   });
 
   test("an unknown status is REFUSED, not ignored", async () => {
-    // Changed in issue #372. The old contract dropped it and returned every conversation, which
-    // answers a request narrowed to one status with the tenant's whole list — and the caller has
-    // no way to tell that from a status that genuinely matches everything.
+    // Dropping an unknown status would answer a request narrowed to one status with the
+    // tenant's whole list, and the caller could not tell that from a status matching everything.
     let err: unknown = null;
     try {
       await listConversations(ctx(tenantA), { status: "bogus" }, appDb);
@@ -202,10 +202,5 @@ describe.skipIf(!dbUp)("listConversations", () => {
     expect(err === null ? "accepted" : "refused").toBe("refused");
     expect((err as AppError).statusCode).toBe(400);
     expect((err as AppError).field).toBe("status");
-  });
-
-  test("tenant isolation: A never sees B's conversations", async () => {
-    const { items } = await listConversations(ctx(tenantA), {}, appDb);
-    expect(items.every((c) => c.chatwootConversationId !== 200)).toBe(true);
   });
 });

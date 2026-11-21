@@ -3,9 +3,11 @@ import type { App } from "@/app";
 import { getActiveTenantId } from "@/client/lib/activeTenant";
 import i18n from "@/client/lib/i18n";
 import { noteServerDate } from "@/client/lib/serverClock";
+import { noteServedBuild } from "@/client/lib/staleBuild";
 import { recoverFromRejectedSelector } from "@/client/lib/tenantSelectorRecovery";
+import { holdingWrites } from "@/client/lib/unsavedGuard";
 
-// NOTE: `parseDate: false` disables Eden treaty's default JSON reviver that
+// `parseDate: false` disables Eden treaty's default JSON reviver that
 // auto-converts any string matching an ISO 8601 / RFC 1123 / dd-mm-yyyy regex
 // into a `Date`. The conversion is invisible to the type system (Eden infers
 // the wire-format shape, where `Date` already flattens to `string`), so call
@@ -18,29 +20,40 @@ export const api = treaty<App>(window.location.origin, {
     const headers: Record<string, string> = {
       "Accept-Language": i18n.language,
     };
-    // The selected tenant: any tenant for a SUPER_ADMIN, one of the person's memberships otherwise
-    // (issue #756). Sent unconditionally; a value the session may not use is refused with the id
-    // named, and `recoverFromRejectedSelector` below drops it.
+    // The selected tenant: any tenant for a SUPER_ADMIN, one of the person's memberships
+    // otherwise. Sent unconditionally; a value the session may not use is refused with the id named,
+    // and `recoverFromRejectedSelector` below drops it.
     const tenantId = getActiveTenantId();
     if (tenantId) headers["X-Tenant-Id"] = tenantId;
     return headers;
   },
-  onResponse: (response) => {
-    // First and unconditional: a 401 and a 429 carry the same `Date` as a 200, and the console's
-    // debug-window deadline is judged against the server's clock, not the browser's.
-    noteServerDate(response);
-    if (response.status === 401) {
-      window.dispatchEvent(new CustomEvent("auth:unauthorized"));
-    } else if (response.status === 429) {
-      // Surfaced as a coalesced global toast (see GlobalApiToasts) so every page gets clear
-      // rate-limit feedback, not just the ones that read err.status into a DataBoundary.
-      window.dispatchEvent(new CustomEvent("api:rate-limited"));
-    } else {
-      // NOTE: keyed on the header the boundary sets and never on the status: a 404 is also how an
-      // agent, a document or a tenant the page NAMED comes back missing, and none of those says
-      // anything about what the browser is holding. `mediaFetch` answers the same header.
-      recoverFromRejectedSelector(response);
-    }
-  },
+  onResponse: onApiResponse,
+  // Every write holds a stale tab's reload until its answer is read (client/lib/unsavedGuard.ts).
+  fetcher: holdingWrites(),
   parseDate: false,
 });
+
+// What every response says before its body is read. Eden hands this hook a CLONE of the response and
+// reads the original; only the headers and status are read here, so the clone's body is cancelled at
+// once: left open, it buffers every chunk the original receives, and a dashboard stream that runs for
+// minutes would hold all of its snapshots in memory. Cancelling one branch leaves the other reading.
+export function onApiResponse(response: Response): void {
+  response.body?.cancel().catch(() => {});
+  // First and unconditional: a 401 and a 429 carry the same `Date` as a 200, and the console's
+  // debug-window deadline is judged against the server's clock, not the browser's.
+  noteServerDate(response);
+  // NOTE: every status, for the same reason: a 401 after a deploy comes from the new build too.
+  noteServedBuild(response);
+  if (response.status === 401) {
+    window.dispatchEvent(new CustomEvent("auth:unauthorized"));
+  } else if (response.status === 429) {
+    // Surfaced as a coalesced global toast (see GlobalApiToasts) so every page gets clear
+    // rate-limit feedback, not just the ones that read err.status into a DataBoundary.
+    window.dispatchEvent(new CustomEvent("api:rate-limited"));
+  } else {
+    // NOTE: keyed on the header the boundary sets and never on the status: a 404 is also how an
+    // agent, a document or a tenant the page NAMED comes back missing, and none of those says
+    // anything about what the browser is holding. `mediaFetch` answers the same header.
+    recoverFromRejectedSelector(response);
+  }
+}

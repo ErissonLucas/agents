@@ -3,9 +3,9 @@ import type { LimitsState } from "./BehaviorTab";
 
 // The agent editor's Limits block, as a pair of pure functions: stored settings → form state →
 // stored settings. The Behavior save REPLACES the whole `limits` block with what the form holds, so a
-// key the form does not carry is DELETED on the next save. `retrySilence` (issue #885) has no control
-// on the tab and rides through the form untouched; the round-trip test checks the pair against the
-// reader's own keys, so the next key cannot be added and forgotten here.
+// key the form does not carry is DELETED on the next save. `retrySilence` has no control on the tab
+// and rides through the form untouched; the round-trip test checks the pair against the reader's own
+// keys, so the next key cannot be added and forgotten here.
 
 export function limitsToForm(settings: unknown): LimitsState {
   const read = readLimitsConfig(settings);
@@ -16,6 +16,11 @@ export function limitsToForm(settings: unknown): LimitsState {
     maxHistoryTokens:
       read.maxHistoryTokens == null ? "" : String(read.maxHistoryTokens),
     retrySilence: read.retrySilence,
+    // NOTE: Empty means no limit, as with the history ceiling; a key never set shows the default.
+    maxTurnsPerHour:
+      read.maxTurnsPerHour === 0 ? "" : String(read.maxTurnsPerHour),
+    maxProactivePerDay:
+      read.maxProactivePerDay === 0 ? "" : String(read.maxProactivePerDay),
   };
 }
 
@@ -23,6 +28,8 @@ export function limitsToStored(form: LimitsState): {
   maxToolCalls: number;
   maxHistoryTokens: number | null;
   retrySilence: boolean;
+  maxTurnsPerHour: number;
+  maxProactivePerDay: number;
 } {
   return {
     maxToolCalls: Number(form.maxToolCalls) || 10,
@@ -31,5 +38,9 @@ export function limitsToStored(form: LimitsState): {
     // configured" means everywhere else in this payload.
     maxHistoryTokens: Number(form.maxHistoryTokens) || null,
     retrySilence: form.retrySilence,
+    // NOTE: An emptied field is "no limit", which has to be stored as 0: null and absent both read as
+    // the default, so they would silently turn the limit back on.
+    maxTurnsPerHour: Number(form.maxTurnsPerHour) || 0,
+    maxProactivePerDay: Number(form.maxProactivePerDay) || 0,
   };
 }

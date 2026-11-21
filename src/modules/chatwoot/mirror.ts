@@ -1,13 +1,22 @@
-import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
+import { Prisma, type PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { withEntityLock } from "@/lib/locks";
+import { isForeignKeyViolation, isUniqueViolation } from "@/lib/pg-error";
 import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { endsTestPark } from "@/modules/agents/test-mode";
+import { ADDITIONAL_CONTACT_FIELDS } from "@/modules/chatwoot/contact-fields";
 import { clearsResolutionOrigin } from "@/modules/conversations/resolution-origin";
 import { retireJobsByDedupeKeyOn } from "@/modules/scheduler/service";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import { isNewIncomingMessage } from "./normalize";
-import { decideConversationWrites, type StatePayload } from "./state-order";
+import {
+  decideConversationWrites,
+  type FactWrite,
+  type RelationName,
+  type StatePayload,
+} from "./state-order";
+import { announceStatusChange } from "./status-announce";
 import type { NormalizedChatwootEvent } from "./types";
 
 // Fire an outbound event from inside the mirror's scoped tx. Best-effort for the DOMAIN: a fan-out
@@ -32,7 +41,8 @@ async function emitMirrorEvent(
 
 // Mirror Chatwoot conversation/inbox/contact METADATA into our DB (no message body by default).
 // Powers the UI conversation list + read API; the runtime reads it for routing. Contact and
-// Inbox upserts are atomic (ON CONFLICT, safe under concurrency); the Conversation read-modify-
+// Inbox are resolved first, in their own short transaction, and written only when something changed
+// (a missing row is inserted with ON CONFLICT DO NOTHING); the Conversation read-modify-
 // write is serialized per conversation by an advisory lock, and what each delivery is allowed to
 // write is decided by `state-order.ts` (Chatwoot does not guarantee order, and a message event
 // carries a frozen conversation snapshot that must not regress status/assignee).
@@ -43,9 +53,8 @@ function sysCtx(tenantId: bigint): TenantContext {
 
 export interface MirrorResult {
   conversationRowId: bigint | null;
-  // The mirrored INBOX row this event belongs to, upserted here on every event. Exposed because a
-  // caller that finds no agent has nothing else to name the inbox with — `rt` is null precisely
-  // then, which is the state issue #318 is about. Null when the payload named no inbox.
+  // The mirrored inbox row this event belongs to, upserted on every event. A caller that finds no
+  // agent (`rt` null) has nothing else to name the inbox with. Null when the payload named no inbox.
   inboxRowId: bigint | null;
   // The assignee BEFORE this event applied — captured for the REENGAGE flow, which
   // must see the prior human assignee before the mirror overwrites it.
@@ -62,16 +71,13 @@ export interface MirrorResult {
   assigneeId: number | null;
   assigneeType: string | null;
   lastEventAt: Date | null;
+  // Set when a write this event owes was held back by something that passes: a redirect ladder that
+  // could not be retired, or a live status claim that refused the status. A later delivery of the
+  // same event can decide differently, so it must run the mirror again rather than reuse this run.
+  heldBack?: true;
 }
 
-function isUniqueViolation(err: unknown): boolean {
-  return (
-    typeof err === "object" &&
-    err !== null &&
-    (err as { code?: unknown }).code === "P2002"
-  );
-}
-
+// biome-ignore lint/plugin/require-resolution-hooks: processChatwootDelivery runs them off the transition this reports
 export async function mirrorChatwootEvent(
   tenantId: bigint,
   instanceId: bigint,
@@ -117,8 +123,28 @@ export async function mirrorChatwootEvent(
     status: n.status ?? null,
     assigneeStated: n.assigneeType !== undefined,
     assigneeType: n.assigneeType ?? null,
+    assigneeId: n.assigneeId ?? null,
     redirectOriginStated: n.redirectOriginDisplayId !== undefined,
     redirectOriginCleared: n.redirectOriginDisplayId === null,
+    factsStated: {
+      labels: n.labels !== undefined,
+      customAttributes: n.customAttributes !== undefined,
+      conversationType: n.conversationType !== undefined,
+      kanbanAttributes: n.kanbanAttributes !== undefined,
+    },
+    kanbanCardId: n.kanbanCardId ?? null,
+    kanbanCardAt: n.kanbanCardAt ?? null,
+    relationsStated: {
+      contact: n.contact?.id != null,
+      contactInbox: n.contactInboxId != null,
+      inbox: n.inboxId != null,
+    },
+    // The event that exists only for a status transition says so by its name: the fork dispatches it
+    // after commit, when the model's own change record is already gone, so it carries no
+    // `changed_attributes`. A holder change has no event of its own and says so in that list.
+    ownershipChangeStated:
+      n.event === "conversation_status_changed" ||
+      changedAttributesNameOwnership(n.changedAttributes),
   };
   // The inbound watermark (`lastInboundAt`) advances only on a brand-new incoming customer message
   // (message_created), never on a message_updated — our own STT/vision write-back re-dispatches one
@@ -129,6 +155,8 @@ export async function mirrorChatwootEvent(
     isNewIncomingMessage(n) && !opts.suppressInboundWatermark
       ? (newLastEventAt ?? now)
       : null;
+  // The same message by identity (schema: `lastInboundMessageId`), forward only.
+  const inboundId = inboundAt != null ? (n.message?.id ?? null) : null;
 
   // Chatwoot's first-response SLA, taken from the payload as it stands. Not ordered against what is
   // stored and not guarded by the staleness decision below: both values are computed at the source
@@ -144,31 +172,73 @@ export async function mirrorChatwootEvent(
     slaWrites.chatwootCreatedAt = n.conversationCreatedAt;
   if (n.firstReplyCreatedAt != null)
     slaWrites.chatwootFirstReplyAt = n.firstReplyCreatedAt;
+  // A public message the platform posted as a user, which Chatwoot takes for a person's reply. The
+  // KPI leaves out the conversation whose first reply it is; see `chatwootPlatformReplyAt`.
+  const platformReplyAt =
+    n.message?.platformSent === true && !n.message.private
+      ? (n.message.createdAt ?? null)
+      : null;
+  // The REST partial spells the first reply in whole seconds (`.to_i`) and the webhook with
+  // milliseconds. The coarse spelling of a reading already stored finely is the same reading, and
+  // keeping the milliseconds is what lets the KPI tell apart two messages sent in the same second.
+  const firstReplyWrite = (stored: Date | null | undefined) => {
+    const incoming = slaWrites.chatwootFirstReplyAt;
+    const coarser =
+      incoming != null &&
+      stored != null &&
+      Math.floor(stored.getTime() / 1000) * 1000 === incoming.getTime();
+    return incoming != null &&
+      !coarser &&
+      incoming.getTime() !== stored?.getTime()
+      ? { chatwootFirstReplyAt: incoming }
+      : {};
+  };
+  const platformReplyWrite = (stored: Date | null | undefined) =>
+    platformReplyAt != null &&
+    (stored == null || platformReplyAt.getTime() < stored.getTime())
+      ? { chatwootPlatformReplyAt: platformReplyAt }
+      : {};
 
-  // TWICE AT MOST, and the second run is the fix (issue #476 review, found by the manual test). The
-  // contact and inbox upserts run BEFORE the per-conversation lock below, and Prisma's upsert is a
-  // select followed by an insert: two deliveries of the same event — an observer's route and the
-  // responder's, milliseconds apart — both find no contact row and one of them loses the insert
-  // with a unique violation. Inside this transaction that failure is terminal (P2002 aborts the
-  // whole tx), so the retry is the transaction run again: the row exists now, the upsert takes its
-  // update path, and the mirror is idempotent by construction. Before this existed the losing
-  // delivery stayed PROCESSING for the sweep, and the observer never saw the first message of any
-  // new contact on an inbox it shared with a responder.
-  let attempt = 0;
-  const run = (): Promise<MirrorResult> =>
-    runScopedOn(base, sysCtx(tenantId), async (db) => {
-      const contactId = await upsertContact(
+  // The contact and the inbox are resolved in a transaction of their own, committed BEFORE the
+  // conversation's. Every conversation of an inbox shares its row, and a row lock taken inside the
+  // conversation's transaction is held across the wait for the conversation lock, which serializes a
+  // busy inbox on one row. Each write is also conditional on a change, so an unchanged inbox or
+  // contact is not written at all, and the conversation lock is the only lock the conversation
+  // transaction takes.
+  // A recovery's body states the contact as its live reading has it, so that reading's activity
+  // positions the identity, not the stranded message's older clock (`createActivityAt`).
+  const contactEventAt =
+    n.createActivityAt != null &&
+    (newLastEventAt === null ||
+      n.createActivityAt * 1000 > newLastEventAt.getTime())
+      ? new Date(n.createActivityAt * 1000)
+      : newLastEventAt;
+  const resolveRows = () =>
+    runScopedOn(base, sysCtx(tenantId), async (db) => ({
+      contactId: await upsertContact(
         db,
         tenantId,
         instanceId,
         n,
-        newLastEventAt,
-      );
-      const inboxRowId = await upsertInbox(db, tenantId, instanceId, n);
+        contactEventAt,
+      ),
+      inboxRowId: await upsertInbox(db, tenantId, instanceId, n),
+    }));
+  let { contactId, inboxRowId } = await resolveRows();
 
+  // Twice at most. Two deliveries of one event (an observer's route and the responder's) can both
+  // miss the conversation row and one loses its insert with a unique violation. P2002 aborts the
+  // whole tx, so the retry reruns it: the conversation now exists, and the mirror is idempotent.
+  // Without it the losing delivery sits PROCESSING until the sweep.
+  // A row resolved above can be deleted before the conversation's write references it (an inbox
+  // removed meanwhile), which fails that write on its foreign key: resolve the rows again, once.
+  let attempt = 0;
+  let reresolved = false;
+  const run = (): Promise<MirrorResult> =>
+    runScopedOn(base, sysCtx(tenantId), async (db) => {
       const threadId = `${tenantId}:${instanceId}:${convId}`;
       return withEntityLock(db, threadId, async () => {
-        const existing = await db.conversation.findUnique({
+        const loaded = await db.conversation.findUnique({
           where: {
             tenantId_chatwootInstanceId_chatwootConversationId: {
               tenantId,
@@ -180,6 +250,7 @@ export async function mirrorChatwootEvent(
             id: true,
             lastEventAt: true,
             chatwootStatusAt: true,
+            chatwootOwnershipChangedAt: true,
             chatwootAssigneeAt: true,
             assigneeId: true,
             assigneeType: true,
@@ -187,23 +258,47 @@ export async function mirrorChatwootEvent(
             status: true,
             resolvedBy: true,
             resolvedByAt: true,
+            testParkedOpenAt: true,
+            testParkedAssigneeId: true,
             redirectOriginDisplayId: true,
             // Read so the stale branch can tell a reading it already has from one it does not, and
             // skip the UPDATE in the common case rather than rewriting the same two values.
             chatwootCreatedAt: true,
             chatwootFirstReplyAt: true,
+            chatwootPlatformReplyAt: true,
             chatwootRedirectOriginAt: true,
+            chatwootLabelsAt: true,
+            chatwootCustomAttributesAt: true,
+            chatwootConversationTypeAt: true,
+            chatwootKanbanAttributesAt: true,
+            chatwootKanbanCardId: true,
+            chatwootKanbanCardAt: true,
+            chatwootRedirectOriginClearedAt: true,
+            chatwootContactAt: true,
+            chatwootContactInboxAt: true,
+            chatwootInboxAt: true,
             // Read for the stale branch, which advances this watermark only when the payload really is
             // ahead of it. See the write there.
             lastInboundAt: true,
-            // The local claim, which is the one ordering input that does not come from the source
-            // (issue #436). See ./status-claim.ts.
+            lastInboundMessageId: true,
+            sweepOnly: true,
+            // Read so an empty relation is filled by any payload naming it, and so a recovery's inherited
+            // pairing fills an empty one and never replaces a stored one.
+            inboxId: true,
+            contactId: true,
+            contactInboxId: true,
+            // NOTE: the local claim, the one ordering input that does not come from the source.
+            // See ./status-claim.ts.
             statusClaimUntil: true,
             statusClaimFrom: true,
             statusClaimStampedAt: true,
             statusClaimRefusedAt: true,
           },
         });
+        // A row only the occurrences sweep inserted (occurrences/sweep.ts) holds none of the
+        // conversation's state: the first webhook mirrors the conversation as new, over that row.
+        const sweptRow = loaded?.sweepOnly ? loaded : null;
+        const existing = sweptRow ? null : loaded;
         const prevAssigneeId = existing?.assigneeId ?? null;
         const decision = decideConversationWrites(
           statePayload,
@@ -212,8 +307,10 @@ export async function mirrorChatwootEvent(
                 status: existing.status,
                 activityAt: existing.lastEventAt,
                 statusAt: existing.chatwootStatusAt,
+                ownershipChangedAt: existing.chatwootOwnershipChangedAt,
                 assigneeAt: existing.chatwootAssigneeAt,
                 assigneeType: existing.assigneeType,
+                assigneeId: existing.assigneeId,
                 redirectOriginAt: existing.chatwootRedirectOriginAt,
                 // The mark OR a stored origin: a Chatwoot too old to send `updated_at` writes the
                 // pairing and stamps nothing, so the mark alone would read those conversations as
@@ -221,51 +318,60 @@ export async function mirrorChatwootEvent(
                 redirectOriginKnown:
                   existing.chatwootRedirectOriginAt != null ||
                   existing.redirectOriginDisplayId != null,
+                redirectOriginClearedAt:
+                  existing.chatwootRedirectOriginClearedAt,
                 statusClaimUntil: existing.statusClaimUntil,
                 statusClaimFrom: existing.statusClaimFrom,
                 statusClaimStampedAt: existing.statusClaimStampedAt,
                 statusClaimRefusedAt: existing.statusClaimRefusedAt,
+                factMarks: {
+                  labels: existing.chatwootLabelsAt,
+                  customAttributes: existing.chatwootCustomAttributesAt,
+                  conversationType: existing.chatwootConversationTypeAt,
+                  kanbanAttributes: existing.chatwootKanbanAttributesAt,
+                },
+                kanbanCardId: existing.chatwootKanbanCardId,
+                kanbanCardAt: existing.chatwootKanbanCardAt,
+                relationMarks: {
+                  contact: existing.chatwootContactAt,
+                  contactInbox: existing.chatwootContactInboxAt,
+                  inbox: existing.chatwootInboxAt,
+                },
+                relationsStored: {
+                  contact: existing.contactId != null,
+                  contactInbox: existing.contactInboxId != null,
+                  inbox: existing.inboxId != null,
+                },
               }
             : null,
           now,
         );
-        // Whether this event kills a recorded resolution origin, asked ONCE for both exits below: the
-        // stale branch returns before the update, and rounds 5 and 6 of this change were the same rule
-        // stated twice and getting a different axis wrong each time. The rule itself, and why it takes
-        // these three facts and not `decision.stale`, is in `clearsResolutionOrigin`.
+        // Whether this event kills a recorded resolution origin, asked once for both exits
+        // below (the stale branch returns before the update), so the rule is not stated twice. Why it
+        // takes these three facts and not `decision.stale` is in `clearsResolutionOrigin`.
         const dropsResolutionOrigin =
           existing != null &&
           clearsResolutionOrigin({
             storedStatus: existing.status,
             statedStatus: statePayload.status,
             appliedStatus: decision.status,
-            // NOTE: Exactly what the flag means: a conversation event speaks about status, a message
-            // snapshot embeds one but is meant to move no state (issue #61). NOT `&& version != null`:
-            // `decideConversationWrites` orders a versionless conversation event by `last_activity_at`
-            // and lets it move status, so requiring a version silently exempted every Chatwoot older
-            // than 4.0.2 from the rule below.
+            // NOTE: a conversation event speaks about status; a message snapshot embeds one but moves
+            // no state. Not `&& version != null`: a versionless conversation event is ordered by
+            // `last_activity_at` and may move status, so requiring a version would exempt every
+            // Chatwoot older than 4.0.2 from the rule.
             sourceMayStateStatus: statePayload.fromConversationEvent,
             reopens: statePayload.reopensConversation,
             statedVersion: statePayload.version,
             stampedAfterVersion: existing.resolvedByAt,
           });
 
-        // The pairing is the redirect episode's IDENTITY, so a genuinely different one means this
-        // widget conversation is in a NEW episode and the per-episode one-shots belong to the old one.
-        // `redirectLinkedAt` gates the cross-link and `redirectClosedAt` is the at-most-once claim for
-        // the goodbye: left standing, the second episode gets neither — the cross-link reads a
-        // watermark the first episode set, and the closing CAS asks for a null the first episode spent.
-        // Both symptoms predate #222 and neither could be fixed before it, because until the fork
-        // recorded the pairing nothing on this side could tell one episode from the next.
-        //
-        // Asked of a PREVIOUSLY STATED origin, not of the stored value, and that is the whole
-        // distinction: stored null is both "the fork never spoke about this conversation" (every
-        // conversation, before fazer-ai/chatwoot#418 is deployed) and "the fork said there is none".
-        // Being told is what separates them, and it leaves two possible traces — the mark, or a stored
-        // origin from an instance too old to send a version to stamp one with. Leaning the
-        // other way would release the episode of every live conversation on the day the fork ships,
-        // re-running each cross-link and posting its private notes a second time; leaning this way
-        // leaves exactly the behaviour of today for a pairing we are only now learning.
+        // The pairing is the redirect episode's identity, so a different one starts a new episode
+        // and the per-episode one-shots (`redirectLinkedAt` for the cross-link, `redirectClosedAt` for
+        // the goodbye) belong to the old one. Asked of a previously STATED origin, not the stored
+        // value: stored null means both "the fork never spoke" and "the fork said none", and being told
+        // (the mark, or a stored origin from an instance too old to stamp one) separates them. Leaning
+        // the other way would release every live conversation's episode the day the fork ships,
+        // re-running each cross-link and its private notes.
         const releasesEpisode =
           existing != null &&
           decision.redirectOrigin &&
@@ -273,39 +379,11 @@ export async function mirrorChatwootEvent(
             existing.redirectOriginDisplayId != null) &&
           (n.redirectOriginDisplayId ?? null) !==
             existing.redirectOriginDisplayId;
-        // Written with the pairing wherever the pairing is written, the stale branch included: that
-        // branch is where the pairing's own conversation_updated ORDINARILY lands, since
-        // `last_activity_at` does not move on a column write.
-        // The other half of the release, and it has to be ATOMIC with the pairing write, not merely
-        // after it. The ladder messages the paired WhatsApp thread and RESOLVES it, and retiring is the
-        // one signal that reaches a worker which has already claimed — a cancel touches PENDING rows
-        // only.
-        //
-        // Outside this transaction the ordering goes wrong in a way that has nothing to do with
-        // failure: the pairing's `conversation_updated` and the cloned `message_created` that follows
-        // it are two deliveries, and processed concurrently the message can arm the NEW episode's
-        // ladder between the pairing committing and a retirement running afterwards — which would then
-        // mark the new episode's own job DONE, on a dedupe key that carries no generation to tell them
-        // apart. Inside, the UPDATE takes the row lock on that key and holds it to commit, so an arm
-        // racing it blocks and lands after. Work armed for the next episode survives; work armed for
-        // the previous one does not.
-        //
-        // A SAVEPOINT, because catching the rejection would not contain the failure. A statement that
-        // Postgres rejects — a deadlock, a statement timeout — aborts the whole transaction at the
-        // server, and every statement after it fails with `current transaction is aborted` no matter
-        // what JavaScript did with the error. Without the savepoint this catch reads as a degradation
-        // and delivers a rollback of the whole mirror write.
-        //
-        // And letting it escape is worse still: this path is detached with Chatwoot's 200 already sent,
-        // so a rejection leaves the delivery row on PROCESSING with nothing running and that event
-        // never comes back — a transient deadlock in the scheduler would drop the pairing permanently.
-        //
-        // What must NOT survive the rollback is the pairing. The ladder carries no episode of its own,
-        // so committing the new pairing over a ladder that could not be retired hands the PREVIOUS
-        // episode's schedule to the NEW one: its next stage re-reads the pairing and nudges, then
-        // resolves, a conversation that has just started. So the pairing stands still with it, and
-        // nothing is lost by that — every later payload for this conversation restates the pairing and
-        // the mark it is ordered by has not moved either, so the next delivery applies both together.
+        // Written with the pairing wherever the pairing is written, the stale branch included
+        // (a column write does not move `last_activity_at`). Retiring the ladder is atomic with the
+        // pairing write, inside a savepoint, and a failed retirement holds the pairing back so the old
+        // episode's schedule is never handed to the new one. Why each of those is required:
+        // docs/chatwoot.md, "Mirror sync".
         let retiredLadder = true;
         if (releasesEpisode && opts.redirectLadderDedupeKey) {
           await db.$executeRawUnsafe("SAVEPOINT retire_redirect_ladder");
@@ -344,23 +422,21 @@ export async function mirrorChatwootEvent(
           releasesEpisode && retiredLadder
             ? { redirectLinkedAt: null, redirectClosedAt: null }
             : {};
+        const relations = relationWrites(decision.relations, {
+          contactId,
+          inboxId: inboxRowId,
+          contactInboxId: n.contactInboxId ?? null,
+          contactInboxInferred: n.factsOnCreateOnly === true,
+          contactInboxStored: existing?.contactInboxId != null,
+        });
 
         if (existing && decision.stale) {
-          // NOTE: A stale event says nothing about the conversation's STATE, with three exceptions, all
-          // written here because this branch returns before the update.
-          //
-          // One is a close of ours that this ordering refused. Another is the redirect pairing, which
-          // is ordered by a mark of its own and is routinely carried by a payload that is behind on
-          // everything else — see the stale branch of `decideConversationWrites`. `decision` decides
-          // both; this only spends the UPDATE when there is something to write, since every
-          // out-of-order delivery lands here.
-          //
-          // The third is the SLA pair, for the same reason stated the other way round: the ORDER this
-          // event lost is about the conversation's STATE. The SLA pair is not state this side
-          // maintains — it is two immutable readings Chatwoot computed from its own messages table —
-          // so losing the ordering says nothing about them, and a row that has never seen them yet is
-          // exactly the row a late delivery can still teach. Compared rather than written blind so the
-          // common stale delivery, which repeats what is stored, adds no UPDATE.
+          // A stale event says nothing about the conversation's state, with three exceptions
+          // written here because this branch returns before the update: a close of ours this ordering
+          // refused, the redirect pairing (ordered by its own mark, see `decideConversationWrites`),
+          // and the SLA pair (two immutable readings Chatwoot computed from its messages table, which
+          // a late delivery can still teach). Each is compared first, so the common stale delivery
+          // that repeats what is stored adds no UPDATE.
           const staleSla: typeof slaWrites = {};
           if (
             slaWrites.chatwootCreatedAt != null &&
@@ -368,12 +444,10 @@ export async function mirrorChatwootEvent(
               existing.chatwootCreatedAt?.getTime()
           )
             staleSla.chatwootCreatedAt = slaWrites.chatwootCreatedAt;
-          if (
-            slaWrites.chatwootFirstReplyAt != null &&
-            slaWrites.chatwootFirstReplyAt.getTime() !==
-              existing.chatwootFirstReplyAt?.getTime()
-          )
-            staleSla.chatwootFirstReplyAt = slaWrites.chatwootFirstReplyAt;
+          Object.assign(
+            staleSla,
+            firstReplyWrite(existing.chatwootFirstReplyAt),
+          );
           const staleWrites = {
             ...(dropsResolutionOrigin && existing.resolvedBy != null
               ? { resolvedBy: null, resolvedByAt: null }
@@ -384,36 +458,35 @@ export async function mirrorChatwootEvent(
             ...(redirectOriginAt != null
               ? { chatwootRedirectOriginAt: redirectOriginAt }
               : {}),
+            ...(decision.redirectOriginClearedAt != null
+              ? {
+                  chatwootRedirectOriginClearedAt:
+                    decision.redirectOriginClearedAt,
+                }
+              : {}),
             ...episodeRelease,
             ...staleSla,
-            // THE INBOUND WATERMARK IS MONOTONIC, and it is not state this branch's ordering decides.
-            // What a stale delivery lost is the order of the conversation's STATE; `lastInboundAt` is
-            // the time of a CUSTOMER MESSAGE, and a message really newer than the stored watermark is
-            // newer whatever the state did meanwhile. Same shape as the SLA pair above, for the same
-            // reason: a row that has never seen this reading is exactly the row a late delivery can
-            // still teach.
-            //
-            // MEASURED, on the delivery recovery (#295): a conversation whose activity had moved past
-            // the stranded message — an away message posted after it — reconciles to that later time,
-            // so the rebuilt body lands here, and the customer got their reply while `lastInboundAt`
-            // came out NULL. That column anchors BOTH the follow-up "new episode" gate and the
-            // WhatsApp 24h service window, so leaving it behind makes a later proactive send read as
-            // in-window when it is not.
-            //
-            // Never backwards: `inboundAt` is written only when it is ahead of what is stored.
-            //
-            // NOT also guarded on the payload having MEASURED a timestamp, though a review round asked
-            // for it: an event carrying no `last_activity_at` never reaches this branch at all, because
-            // `decideConversationWrites` has nothing to order it BY and applies it. MEASURED — the
-            // guard was written, and the case built for it moved the watermark through the applied
-            // branch instead. A branch no input can take reads as a rule and is a comment. The harm it
-            // was aimed at is real and belongs where the undated body comes from: ./recover-delivery.ts
-            // refuses to rebuild one.
+            ...platformReplyWrite(existing.chatwootPlatformReplyAt),
+            ...(decision.ownershipChangedAt != null
+              ? { chatwootOwnershipChangedAt: decision.ownershipChangedAt }
+              : {}),
+            // NOTE: the inbound watermark is monotonic and not decided by this branch's ordering:
+            // `lastInboundAt` is the time of a customer message, and a newer one is newer whatever the
+            // state did. It anchors the follow-up "new episode" gate and the WhatsApp 24h window, so a
+            // recovered body landing here must still advance it. Never backwards. No guard on the
+            // payload carrying a timestamp: an undated event never reaches this branch
+            // (`decideConversationWrites` has nothing to order it by and applies it), and
+            // ./recover-delivery.ts refuses to rebuild an undated body.
             ...(inboundAt != null &&
             (existing.lastInboundAt === null ||
               inboundAt.getTime() > existing.lastInboundAt.getTime())
               ? { lastInboundAt: inboundAt }
               : {}),
+            ...forwardInboundId(existing.lastInboundMessageId, inboundId),
+            // NOTE: the relations, from NULL only here (the decision holds a stale payload to that). A
+            // row without its route runs no pre-turn gate, without its contact fails the contact gate
+            // closed, and without its pairing keys its turn on the conversation.
+            ...relations,
           };
           if (Object.keys(staleWrites).length > 0) {
             await db.conversation.update({
@@ -432,52 +505,82 @@ export async function mirrorChatwootEvent(
             assigneeId: existing.assigneeId,
             assigneeType: existing.assigneeType,
             lastEventAt: existing.lastEventAt,
+            ...(retiredLadder ? {} : { heldBack: true as const }),
           };
         }
 
         if (!existing) {
           const createdStatus = decision.status ?? "open";
-          const createdLastEventAt = decision.activityAt;
-          const created = await db.conversation.create({
-            data: {
-              tenantId,
-              chatwootInstanceId: instanceId,
-              chatwootConversationId: convId,
-              contactInboxId: n.contactInboxId,
-              inboxId: inboxRowId,
-              contactId,
-              status: createdStatus,
-              assigneeId: n.assigneeId ?? null,
-              assigneeType: n.assigneeType ?? null,
-              assigneeName: n.assigneeName ?? null,
-              threadId,
-              lastEventAt: createdLastEventAt,
-              chatwootStatusAt: decision.statusAt,
-              chatwootAssigneeAt: decision.assigneeAt,
-              chatwootRedirectOriginAt: decision.redirectOriginAt,
-              lastInboundAt: inboundAt,
-              // A row created mid-dialogue needs no special case here: what it stores is what
-              // Chatwoot measured over the whole conversation, not what we happened to witness.
-              ...slaWrites,
+          // A recovery's row is stamped no older than the live reading its facts came from; the
+          // inbound watermark below keeps the message's own clock.
+          const createdLastEventAt =
+            n.createActivityAt != null &&
+            (decision.activityAt === null ||
+              n.createActivityAt * 1000 > decision.activityAt.getTime())
+              ? new Date(n.createActivityAt * 1000)
+              : decision.activityAt;
+          const fresh = {
+            contactInboxId: n.contactInboxId,
+            inboxId: inboxRowId,
+            contactId,
+            ...relations,
+            status: createdStatus,
+            assigneeId: n.assigneeId ?? null,
+            assigneeType: n.assigneeType ?? null,
+            assigneeName: n.assigneeName ?? null,
+            threadId,
+            lastEventAt: createdLastEventAt,
+            chatwootStatusAt: decision.statusAt,
+            chatwootOwnershipChangedAt: decision.ownershipChangedAt,
+            chatwootAssigneeAt: decision.assigneeAt,
+            chatwootRedirectOriginAt: decision.redirectOriginAt,
+            chatwootLabelsAt: decision.facts.labels.at,
+            chatwootCustomAttributesAt: decision.facts.customAttributes.at,
+            chatwootConversationTypeAt: decision.facts.conversationType.at,
+            chatwootKanbanAttributesAt: decision.facts.kanbanAttributes.at,
+            chatwootRedirectOriginClearedAt: decision.redirectOriginClearedAt,
+            lastInboundAt: inboundAt,
+            lastInboundMessageId: inboundId,
+            // A row created mid-dialogue needs no special case here: what it stores is what
+            // Chatwoot measured over the whole conversation, not what we happened to witness.
+            ...slaWrites,
+            ...platformReplyWrite(null),
 
-              ...(n.customAttributes
-                ? {
-                    customAttributes:
-                      n.customAttributes as Prisma.InputJsonValue,
-                  }
-                : {}),
-              ...(n.kanbanAttributes
-                ? {
-                    kanbanAttributes:
-                      n.kanbanAttributes as Prisma.InputJsonValue,
-                  }
-                : {}),
-              ...(decision.redirectOrigin
-                ? { redirectOriginDisplayId: n.redirectOriginDisplayId ?? null }
-                : {}),
-            },
-            select: { id: true },
-          });
+            ...(n.customAttributes
+              ? {
+                  customAttributes: n.customAttributes as Prisma.InputJsonValue,
+                }
+              : {}),
+            ...(n.kanbanAttributes
+              ? {
+                  kanbanAttributes: n.kanbanAttributes as Prisma.InputJsonValue,
+                  chatwootKanbanCardId: n.kanbanCardId ?? null,
+                  chatwootKanbanCardAt: n.kanbanCardAt ?? null,
+                }
+              : {}),
+            ...(n.conversationType
+              ? { conversationType: n.conversationType }
+              : {}),
+            ...(n.labels !== undefined ? { labels: n.labels } : {}),
+            ...(decision.redirectOrigin
+              ? { redirectOriginDisplayId: n.redirectOriginDisplayId ?? null }
+              : {}),
+          };
+          const created = sweptRow
+            ? await db.conversation.update({
+                where: { id: sweptRow.id },
+                data: { ...fresh, sweepOnly: false },
+                select: { id: true },
+              })
+            : await db.conversation.create({
+                data: {
+                  tenantId,
+                  chatwootInstanceId: instanceId,
+                  chatwootConversationId: convId,
+                  ...fresh,
+                },
+                select: { id: true },
+              });
           await emitMirrorEvent(db, tenantId, "conversation.created", {
             conversation_id: String(created.id),
             inbox_id: inboxRowId != null ? String(inboxRowId) : null,
@@ -500,6 +603,8 @@ export async function mirrorChatwootEvent(
         }
 
         const effectiveLastEventAt = decision.activityAt;
+        const factsUpdate = !n.factsOnCreateOnly;
+        const facts = decision.facts;
         const appliedStatus = decision.status;
         const nextStatus = appliedStatus ?? existing.status;
         const assigneeKnown = decision.assignee;
@@ -512,13 +617,7 @@ export async function mirrorChatwootEvent(
         await db.conversation.update({
           where: { id: existing.id },
           data: {
-            ...(decision.unversioned && n.contactInboxId != null
-              ? { contactInboxId: n.contactInboxId }
-              : {}),
-            ...(decision.unversioned && inboxRowId != null
-              ? { inboxId: inboxRowId }
-              : {}),
-            ...(decision.unversioned && contactId != null ? { contactId } : {}),
+            ...relations,
             ...(appliedStatus != null ? { status: appliedStatus } : {}),
             // NOTE: The same question the stale branch asked, and the same answer: see
             // `dropsResolutionOrigin` above.
@@ -532,9 +631,22 @@ export async function mirrorChatwootEvent(
                   assigneeName: n.assigneeName ?? null,
                 }
               : {}),
+            ...(assigneeKnown &&
+            endsTestPark(
+              {
+                parkedAt: existing.testParkedOpenAt,
+                parkedAssigneeId: existing.testParkedAssigneeId,
+              },
+              { assigneeType: nextAssigneeType, assigneeId: nextAssigneeId },
+            )
+              ? { testParkedOpenAt: null, testParkedAssigneeId: null }
+              : {}),
             lastEventAt: effectiveLastEventAt,
             ...(decision.statusAt != null
               ? { chatwootStatusAt: decision.statusAt }
+              : {}),
+            ...(decision.ownershipChangedAt != null
+              ? { chatwootOwnershipChangedAt: decision.ownershipChangedAt }
               : {}),
             // The claim's own record of what it could not place, which the takeover's reconcile reads
             // back and answers. See `statusClaimRefusedAt` on the decision.
@@ -545,17 +657,59 @@ export async function mirrorChatwootEvent(
               ? { chatwootAssigneeAt: decision.assigneeAt }
               : {}),
             ...(inboundAt != null ? { lastInboundAt: inboundAt } : {}),
-            ...slaWrites,
+            ...forwardInboundId(existing.lastInboundMessageId, inboundId),
+            ...(slaWrites.chatwootCreatedAt != null
+              ? { chatwootCreatedAt: slaWrites.chatwootCreatedAt }
+              : {}),
+            ...firstReplyWrite(existing.chatwootFirstReplyAt),
+            ...platformReplyWrite(existing.chatwootPlatformReplyAt),
             // NOTE: The bags are ASSIGNED (the payload always ships the whole jsonb), but only when the
             // event carried one: a payload without them must not wipe the stored snapshot.
-            ...(decision.unversioned && n.customAttributes
+            // A recovery's body states them for the row it CREATES only (`factsOnCreateOnly`): read
+            // before a webhook that created the row since, they never update it.
+            ...(factsUpdate &&
+            facts.customAttributes.write &&
+            n.customAttributes
               ? {
                   customAttributes: n.customAttributes as Prisma.InputJsonValue,
+                  ...factMark(
+                    "chatwootCustomAttributesAt",
+                    facts.customAttributes,
+                  ),
                 }
               : {}),
-            ...(decision.unversioned && n.kanbanAttributes
+            // The card's id and clock travel with its attributes, so the clock stored always
+            // describes the attributes stored.
+            ...(factsUpdate &&
+            facts.kanbanAttributes.write &&
+            n.kanbanAttributes
               ? {
                   kanbanAttributes: n.kanbanAttributes as Prisma.InputJsonValue,
+                  ...factMark(
+                    "chatwootKanbanAttributesAt",
+                    facts.kanbanAttributes,
+                  ),
+                  chatwootKanbanCardId: n.kanbanCardId ?? null,
+                  chatwootKanbanCardAt: n.kanbanCardAt ?? null,
+                }
+              : {}),
+            ...(factsUpdate &&
+            facts.conversationType.write &&
+            n.conversationType
+              ? {
+                  conversationType: n.conversationType,
+                  ...factMark(
+                    "chatwootConversationTypeAt",
+                    facts.conversationType,
+                  ),
+                }
+              : {}),
+            // The label list, on the bags' terms: assigned whole, by recency and its own mark, and
+            // only when carried.
+            ...(factsUpdate && facts.labels.write && n.labels !== undefined
+              ? {
+                  labels: n.labels,
+                  ...factMark("chatwootLabelsAt", facts.labels),
                 }
               : {}),
             // NOTE: Fenced by its OWN version mark, not by the recency the bags use. A widget
@@ -572,17 +726,23 @@ export async function mirrorChatwootEvent(
             ...(redirectOriginAt != null
               ? { chatwootRedirectOriginAt: redirectOriginAt }
               : {}),
+            ...(decision.redirectOriginClearedAt != null
+              ? {
+                  chatwootRedirectOriginClearedAt:
+                    decision.redirectOriginClearedAt,
+                }
+              : {}),
             ...episodeRelease,
           },
         });
         const inboxIdStr = inboxRowId != null ? String(inboxRowId) : null;
-        if (appliedStatus != null && appliedStatus !== existing.status) {
-          await emitMirrorEvent(db, tenantId, "conversation.status_changed", {
-            conversation_id: String(existing.id),
-            inbox_id: inboxIdStr,
-            status: nextStatus,
-            previous_status: existing.status,
-            assignee_type: nextAssigneeType,
+        if (appliedStatus != null) {
+          await announceStatusChange(db, tenantId, {
+            conversationId: existing.id,
+            inboxId: inboxRowId,
+            status: appliedStatus,
+            previousStatus: existing.status,
+            assigneeType: nextAssigneeType,
           });
         }
         // NOTE: Handoff = the assignee transitions to a human (User). Detect the bot→human edge:
@@ -611,6 +771,9 @@ export async function mirrorChatwootEvent(
           assigneeId: nextAssigneeId,
           assigneeType: nextAssigneeType,
           lastEventAt: effectiveLastEventAt,
+          ...(retiredLadder && !decision.claimRefused
+            ? {}
+            : { heldBack: true as const }),
         };
       });
     });
@@ -618,6 +781,15 @@ export async function mirrorChatwootEvent(
     try {
       return await run();
     } catch (err) {
+      if (isForeignKeyViolation(err) && !reresolved) {
+        reresolved = true;
+        logger.info(
+          "chatwoot: a row the mirror resolved was gone at the conversation write (conv=%s); resolving again",
+          String(convId),
+        );
+        ({ contactId, inboxRowId } = await resolveRows());
+        continue;
+      }
       attempt += 1;
       if (attempt > 1 || !isUniqueViolation(err)) throw err;
       logger.info(
@@ -648,68 +820,54 @@ async function upsertContact(
   const attrs = JSON.stringify(
     c.identifier ? { identifier: c.identifier } : {},
   );
+  const additional: Record<string, string> = {};
+  for (const [key, value] of Object.entries(c.additionalAttributes ?? {})) {
+    if (value) additional[key] = value;
+  }
 
-  // Keyed by INSTANCE too: a Chatwoot contact id is unique inside one account, and two accounts
-  // under the same tenant were collapsing contact 42 into one row.
-  const row = await db.contact.upsert({
-    where: {
-      tenantId_chatwootInstanceId_chatwootContactId: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        chatwootContactId: c.id,
-      },
-    },
-    create: {
+  // Keyed by instance too: a Chatwoot contact id is unique only inside one account, and two
+  // accounts under one tenant can share an id. Read first: the contact exists on all but its first
+  // delivery, and an upsert there is an insert attempt per delivery. A missing one is inserted with
+  // ON CONFLICT DO NOTHING, so two deliveries creating it at once both land on the one row instead of
+  // one of them losing with a unique violation. Identity is written below, under a compare-and-set:
+  // written unconditionally here, a delivery arriving late would restore what a newer one changed.
+  const key = {
+    tenantId_chatwootInstanceId_chatwootContactId: {
       tenantId,
       chatwootInstanceId: instanceId,
       chatwootContactId: c.id,
-      name: c.name ?? null,
-      email: c.email ?? null,
-      phone: c.phone ?? null,
-      attributes: (c.identifier
-        ? { identifier: c.identifier }
-        : {}) as Prisma.InputJsonValue,
     },
-    // Identity is written below, under a compare-and-set. Unconditionally here, a delivery arriving
-    // late would restore what a newer one changed or cleared.
-    update: {},
-    select: { id: true },
-  });
+  };
+  let row = await db.contact.findUnique({ where: key, select: { id: true } });
+  if (!row) {
+    await db.contact.createMany({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootContactId: c.id,
+        name: c.name ?? null,
+        email: c.email ?? null,
+        phone: c.phone ?? null,
+        attributes: (c.identifier
+          ? { identifier: c.identifier }
+          : {}) as Prisma.InputJsonValue,
+        additionalAttributes: additional as Prisma.InputJsonValue,
+      },
+      skipDuplicates: true,
+    });
+    row = await db.contact.findUniqueOrThrow({
+      where: key,
+      select: { id: true },
+    });
+  }
 
-  // The upsert runs BEFORE the conversation's stale check (the conversation row needs the contact
-  // id), and one contact is shared by all its conversations, so the conversation guard cannot cover
-  // it: the watermark has to be per-contact. ONE statement ⇒ the compare-and-set is atomic under
-  // concurrent deliveries, and every field is settled inside the same visit to the row.
-  //
-  // A watermark PER FIELD, not per row. A payload states a SUBSET of the identity, so a row-wide
-  // position would be advanced by an event that never spoke about the field it then protects: a
-  // name-only event at t3 would reject a phone clear from t2 arriving behind it, and the gate would
-  // go on asking about a number the customer no longer has. Absent means "I know nothing about
-  // this", and knowing nothing may not move anything, value or position.
-  //
-  // These are SOURCE positions, never receipt times: stamping an undated payload with our own clock
-  // would make it beat every real Chatwoot timestamp and poison the ordering. An undated payload
-  // therefore has NO position, and a write with no position is a write decided by arrival order —
-  // the one thing this block exists to prevent — so it writes nothing at all. It used to be let
-  // through as a "bootstrap" for a row nothing had positioned yet, except that the watermark stayed
-  // null afterwards, so the next undated payload bootstrapped it again, and the one after that: two
-  // degraded deliveries naming different phones settled it by whoever arrived last. The bootstrap
-  // belongs to the `create` above, which runs exactly once per row. Identity only reaches us on
-  // conversation and message events, which carry `last_activity_at` (bots never receive
-  // `contact_updated`), so this is the degraded path, and the degraded path fails closed: a contact
-  // with nothing positioned reads as `no_identity` at the gate.
-  //
-  // Each field has two ways to be written, and they are the two CASE arms below:
-  //
-  //   * STRICTLY NEWER than the field's position: the stated value wins and the position moves.
-  //   * EQUAL to it: a tie, decided by DISAGREEMENT rather than arrival order. `last_activity_at`
-  //     has one-second resolution, so two events inside one second cannot be ordered at all. Two
-  //     payloads that AGREE are one event delivered twice and settle nothing new. Two that state
-  //     different values are a conflict nothing can break, and there the field is emptied: keeping
-  //     either is a coin toss about whose phone number this is, and the gate would carry the winner
-  //     to the operator's endpoint as fact. The position does not move — a tie positions nothing.
-  //
-  // Anything older than the position falls through to ELSE and changes nothing.
+  // NOTE: a per-field compare-and-set watermark, in one statement so it is atomic under concurrent
+  // deliveries. Per contact because the upsert runs before the conversation's stale check and one
+  // contact is shared by all its conversations; per field because a payload states a subset of the
+  // identity, and absent may move nothing. Positions are source times, never receipt times: an
+  // undated payload writes nothing and the bootstrap is the `create` above. Strictly newer wins and
+  // moves the position; an equal position that disagrees empties the field (a one-second tie nothing
+  // can break); older changes nothing. Full reasoning: docs/chatwoot.md, "Mirror sync".
   if (eventAt && (nameStated || emailStated || phoneStated || attrsStated)) {
     await db.$executeRaw`
       UPDATE contacts SET
@@ -742,26 +900,106 @@ async function upsertContact(
           WHEN ${attrsStated} AND (attributes_at IS NULL OR attributes_at < ${eventAt}) THEN ${eventAt}
           ELSE attributes_at END
       WHERE id = ${row.id} AND tenant_id = ${tenantId}
+        -- NOTE: Only when one of the CASEs above moves something: a newer position (which moves the
+        -- watermark even for the same value, or a late snapshot could overwrite it), or a tie that
+        -- disagrees with a field not yet emptied. A repeated snapshot writes nothing.
+        AND (
+          (${nameStated} AND (name_at IS NULL OR name_at < ${eventAt}
+            OR (name_at = ${eventAt} AND name IS NOT NULL AND name IS DISTINCT FROM ${c.name ?? null}::text)))
+          OR (${emailStated} AND (email_at IS NULL OR email_at < ${eventAt}
+            OR (email_at = ${eventAt} AND email IS NOT NULL AND email IS DISTINCT FROM ${c.email ?? null}::text)))
+          OR (${phoneStated} AND (phone_at IS NULL OR phone_at < ${eventAt}
+            OR (phone_at = ${eventAt} AND phone IS NOT NULL AND phone IS DISTINCT FROM ${c.phone ?? null}::text)))
+          OR (${attrsStated} AND (attributes_at IS NULL OR attributes_at < ${eventAt}
+            OR (attributes_at = ${eventAt} AND attributes <> '{}'::jsonb AND attributes IS DISTINCT FROM ${attrs}::jsonb)))
+        )
     `;
   }
 
-  if (c.customAttributes) {
+  // NOTE: The additional fields follow the identity rule (absent keeps, strictly newer wins, older
+  // changes nothing) under their OWN position, so a city edit never moves the identifier's. On a tie
+  // only the keys the two snapshots disagree on are emptied.
+  if (eventAt && c.additionalAttributes !== undefined) {
+    const bag = JSON.stringify(additional);
+    await db.$executeRaw`
+      UPDATE contacts SET
+        additional_attributes = CASE
+          WHEN additional_attributes_at IS NULL OR additional_attributes_at < ${eventAt} THEN ${bag}::jsonb
+          WHEN additional_attributes_at = ${eventAt} THEN additional_attributes - ARRAY(
+            SELECT k FROM unnest(${ADDITIONAL_CONTACT_FIELDS}::text[]) AS k
+            WHERE additional_attributes -> k IS DISTINCT FROM ${bag}::jsonb -> k
+          )
+          ELSE additional_attributes END,
+        additional_attributes_at = CASE
+          WHEN additional_attributes_at IS NULL OR additional_attributes_at < ${eventAt} THEN ${eventAt}
+          ELSE additional_attributes_at END
+      WHERE id = ${row.id} AND tenant_id = ${tenantId}
+        -- NOTE: Same predicate as the identity: newer, or a tie that still has a disagreeing key to drop.
+        AND (
+          additional_attributes_at IS NULL OR additional_attributes_at < ${eventAt}
+          OR (additional_attributes_at = ${eventAt} AND EXISTS (
+            SELECT 1 FROM unnest(${ADDITIONAL_CONTACT_FIELDS}::text[]) AS k
+            WHERE additional_attributes ? k
+              AND additional_attributes -> k IS DISTINCT FROM ${bag}::jsonb -> k
+          ))
+        )
+    `;
+  }
+
+  // NOTE: With the contact's own clock (`meta.sender.updated_at`) and a row that has one, the clock
+  // alone orders the bag: strictly newer writes whatever its position, equal or older writes nothing.
+  // The clock moves with its bag even when the bag is unchanged, since it also moves on every incoming
+  // message. A row with no clock takes the position rule and is stamped. A payload without the clock
+  // keeps the position rule, and a bag it writes clears the clock, which must describe the bag stored.
+  // Reasoning: docs/chatwoot.md, "Mirror sync".
+  if (c.customAttributes && c.updatedAt != null) {
+    const bag = JSON.stringify(c.customAttributes);
+    const positioned = eventAt
+      ? Prisma.sql`(custom_attributes_at IS NULL OR custom_attributes_at <= ${eventAt})`
+      : Prisma.sql`custom_attributes_at IS NULL`;
+    await db.$executeRaw`
+      UPDATE contacts
+      SET custom_attributes = ${bag}::jsonb,
+          custom_attributes_clock = ${c.updatedAt},
+          custom_attributes_at = GREATEST(custom_attributes_at, ${eventAt})
+      WHERE id = ${row.id} AND tenant_id = ${tenantId}
+        AND CASE WHEN custom_attributes_clock IS NOT NULL
+              THEN custom_attributes_clock < ${c.updatedAt}
+              ELSE ${positioned} END
+    `;
+  } else if (c.customAttributes) {
     const bag = JSON.stringify(c.customAttributes);
     await (eventAt
       ? db.$executeRaw`
           UPDATE contacts
-          SET custom_attributes = ${bag}::jsonb, custom_attributes_at = ${eventAt}
+          SET custom_attributes = ${bag}::jsonb, custom_attributes_at = ${eventAt},
+              custom_attributes_clock = NULL
           WHERE id = ${row.id} AND tenant_id = ${tenantId}
             AND (custom_attributes_at IS NULL OR custom_attributes_at <= ${eventAt})
+            AND (custom_attributes_at IS DISTINCT FROM ${eventAt}
+              OR custom_attributes IS DISTINCT FROM ${bag}::jsonb)
         `
       : db.$executeRaw`
           UPDATE contacts
-          SET custom_attributes = ${bag}::jsonb
+          SET custom_attributes = ${bag}::jsonb, custom_attributes_clock = NULL
           WHERE id = ${row.id} AND tenant_id = ${tenantId}
             AND custom_attributes_at IS NULL
+            AND custom_attributes IS DISTINCT FROM ${bag}::jsonb
         `);
   }
   return row.id;
+}
+
+// The newest source instant a payload carries, as the position of the inbox metadata it states.
+// Chatwoot reads the inbox's name and channel when it renders the event, and the payload carries no
+// instant of its own for them: the conversation's `updated_at` and `last_activity_at` are the closest
+// clocks, both written by the source. Null when the payload carries neither.
+function inboxMetadataPosition(n: NormalizedChatwootEvent): Date | null {
+  const seconds = [n.conversationUpdatedAt, n.lastActivityAt].filter(
+    (v): v is number => typeof v === "number" && Number.isFinite(v),
+  );
+  if (seconds.length === 0) return null;
+  return new Date(Math.max(...seconds) * 1000);
 }
 
 async function upsertInbox(
@@ -771,26 +1009,192 @@ async function upsertInbox(
   n: NormalizedChatwootEvent,
 ): Promise<bigint | null> {
   if (n.inboxId == null) return null;
-  const row = await db.inbox.upsert({
-    where: {
-      tenantId_chatwootInstanceId_chatwootInboxId: {
-        tenantId,
-        chatwootInstanceId: instanceId,
-        chatwootInboxId: n.inboxId,
-      },
-    },
-    create: {
+  const key = {
+    tenantId_chatwootInstanceId_chatwootInboxId: {
       tenantId,
       chatwootInstanceId: instanceId,
       chatwootInboxId: n.inboxId,
-      name: n.inboxName ?? `inbox ${n.inboxId}`,
-      channelType: n.channel ?? null,
     },
-    update: {
-      ...(n.inboxName != null ? { name: n.inboxName } : {}),
-      ...(n.channel != null ? { channelType: n.channel } : {}),
-    },
+  };
+  const placeholder = `inbox ${n.inboxId}`;
+  const position = inboxMetadataPosition(n);
+  // Read, not upsert. Every delivery of an inbox names the same row, and an upsert rewrites it (ON
+  // CONFLICT DO UPDATE writes even an identical value, and burns a sequence value).
+  let row = await db.inbox.findUnique({
+    where: key,
     select: { id: true },
   });
+  if (!row) {
+    // Many deliveries of a new inbox can miss the row at once; DO NOTHING lands them all on one. A
+    // delivery whose insert lost goes on to the conditional update below with its own snapshot.
+    const inserted = await db.inbox.createMany({
+      data: {
+        tenantId,
+        chatwootInstanceId: instanceId,
+        chatwootInboxId: n.inboxId,
+        name: n.inboxName ?? placeholder,
+        channelType: n.channel ?? null,
+        metadataAt: position,
+        metadataClock: n.inboxName != null ? (n.inboxUpdatedAt ?? null) : null,
+      },
+      skipDuplicates: true,
+    });
+    row = await db.inbox.findUniqueOrThrow({
+      where: key,
+      select: { id: true },
+    });
+    if (inserted.count > 0) return row.id;
+  }
+  const name = n.inboxName ?? null;
+  const channel = n.channel ?? null;
+  if (name === null && channel === null) return row.id;
+  const positioned = position
+    ? Prisma.sql`(metadata_at IS NULL OR metadata_at <= ${position})`
+    : Prisma.sql`(metadata_at IS NULL)`;
+  // The inbox's own clock (`inbox.updated_at`, message events only), counted only beside the name it
+  // versions: a payload that omits the name cannot move a clock over a name it never stated. With it
+  // and a row that has one, the clock alone decides, as for the contact's bag; a row with no clock yet
+  // takes the position rule and is stamped; without it (every `conversation_*` event) the position rule.
+  const clock = name !== null ? (n.inboxUpdatedAt ?? null) : null;
+  const accepts =
+    clock !== null
+      ? Prisma.sql`(CASE WHEN metadata_clock IS NOT NULL THEN metadata_clock < ${clock} ELSE ${positioned} END)`
+      : positioned;
+  const clockMoves =
+    clock !== null
+      ? Prisma.sql`(${accepts} AND metadata_clock IS DISTINCT FROM ${clock})`
+      : Prisma.sql`FALSE`;
+  // A payload without the clock that REPLACES a stated name or channel clears the clock, which no
+  // longer describes what is stored; filling a field never stated (the placeholder name, a NULL
+  // channel, what a `conversation_*` event does) leaves it, since the clock never covered it.
+  const clockCleared =
+    clock === null
+      ? Prisma.sql`(${accepts} AND (
+          (${name}::text IS NOT NULL AND name <> ${placeholder} AND name IS DISTINCT FROM ${name}::text)
+          OR (${channel}::text IS NOT NULL AND channel_type IS NOT NULL AND channel_type IS DISTINCT FROM ${channel}::text)))`
+      : Prisma.sql`FALSE`;
+  // One statement, decided against the row as it stands when the UPDATE reaches it (an earlier read
+  // may be stale); a WHERE that matches nothing writes nothing. A payload positioned at or after the
+  // last change writes every field it states, so a field left out cannot keep an older value under
+  // the newer position. A tie goes to the last writer: the position is the conversation's clock, and
+  // an event of an unchanged conversation can be the first to carry a rename. An unchanged payload
+  // does NOT move the position (that write per delivery is what this removes); an undated one writes
+  // only over a row never positioned. A field never stated (the placeholder name, a null channel)
+  // takes the first stated value at any position, and the position only moves forward.
+  await db.$executeRaw`
+    UPDATE inboxes SET
+      name = CASE
+        WHEN ${accepts} AND ${name}::text IS NOT NULL THEN ${name}::text
+        WHEN name = ${placeholder} AND ${name}::text IS NOT NULL THEN ${name}::text
+        ELSE name END,
+      channel_type = CASE
+        WHEN ${accepts} AND ${channel}::text IS NOT NULL THEN ${channel}::text
+        WHEN channel_type IS NULL AND ${channel}::text IS NOT NULL THEN ${channel}::text
+        ELSE channel_type END,
+      metadata_clock = CASE WHEN ${clockMoves} THEN ${clock}::float8
+        WHEN ${clockCleared} THEN NULL ELSE metadata_clock END,
+      metadata_at = GREATEST(metadata_at, ${position}),
+      updated_at = now()
+    WHERE id = ${row.id}
+      AND (
+        (${accepts} AND (
+          (${name}::text IS NOT NULL AND name IS DISTINCT FROM ${name}::text)
+          OR (${channel}::text IS NOT NULL AND channel_type IS DISTINCT FROM ${channel}::text)))
+        OR ${clockMoves}
+        OR (name = ${placeholder} AND ${name}::text IS NOT NULL AND ${name}::text <> ${placeholder})
+        OR (channel_type IS NULL AND ${channel}::text IS NOT NULL)
+      )`;
   return row.id;
+}
+
+// The columns whose change moves who holds a conversation in the fork: the status, the human
+// assignee, the bot assignee, and the type that says which of the two is meant.
+const OWNERSHIP_ATTRIBUTES = [
+  "status",
+  "assignee_id",
+  "assignee_agent_bot_id",
+  "ai_assignee_type",
+];
+
+// Whether a conversation event's `changed_attributes` names one of them. Chatwoot renders it as a
+// list of one-key objects (`[{ status: { previous_value, current_value } }]`); anything else, or its
+// absence on a message payload, is no statement.
+function changedAttributesNameOwnership(changed: unknown): boolean {
+  if (!Array.isArray(changed)) return false;
+  return changed.some(
+    (entry) =>
+      entry !== null &&
+      typeof entry === "object" &&
+      OWNERSHIP_ATTRIBUTES.some((key) => Object.hasOwn(entry as object, key)),
+  );
+}
+
+// Message ids are the source's sequence per account, so a smaller one is an older message arriving
+// late (a retry, a recovery) and never moves the mark back.
+function forwardInboundId(
+  stored: number | null,
+  inbound: number | null,
+): { lastInboundMessageId?: number } {
+  return inbound != null && (stored === null || inbound > stored)
+    ? { lastInboundMessageId: inbound }
+    : {};
+}
+
+const RELATION_COLUMNS: Record<
+  RelationName,
+  {
+    value: "contactId" | "contactInboxId" | "inboxId";
+    mark: "chatwootContactAt" | "chatwootContactInboxAt" | "chatwootInboxAt";
+  }
+> = {
+  contact: { value: "contactId", mark: "chatwootContactAt" },
+  contactInbox: { value: "contactInboxId", mark: "chatwootContactInboxAt" },
+  inbox: { value: "inboxId", mark: "chatwootInboxAt" },
+};
+
+// The relation columns a decision lets this payload write, each with its mark. A recovery's body
+// (`factsOnCreateOnly`) carries an INHERITED pairing, an inference: it fills an empty one, never
+// replaces one a webhook stored, and stamps no mark, so a webhook naming the real one is not refused.
+function relationWrites(
+  decided: Record<RelationName, FactWrite>,
+  p: {
+    contactId: bigint | null;
+    inboxId: bigint | null;
+    contactInboxId: number | null;
+    contactInboxInferred: boolean;
+    contactInboxStored: boolean;
+  },
+): {
+  contactId?: bigint;
+  contactInboxId?: number;
+  inboxId?: bigint;
+  chatwootContactAt?: number;
+  chatwootContactInboxAt?: number;
+  chatwootInboxAt?: number;
+} {
+  const values = {
+    contact: p.contactId,
+    contactInbox: p.contactInboxId,
+    inbox: p.inboxId,
+  };
+  const out: Record<string, bigint | number> = {};
+  for (const relation of Object.keys(RELATION_COLUMNS) as RelationName[]) {
+    const value = values[relation];
+    const { write, at } = decided[relation];
+    if (!write || value == null) continue;
+    const inferred = relation === "contactInbox" && p.contactInboxInferred;
+    if (inferred && p.contactInboxStored) continue;
+    const columns = RELATION_COLUMNS[relation];
+    out[columns.value] = value;
+    if (at != null && !inferred) out[columns.mark] = at;
+  }
+  return out;
+}
+
+// A fact's mark moves with the fact, and only when the decision gives it a version to move to.
+function factMark<K extends string>(
+  column: K,
+  fact: FactWrite,
+): Partial<Record<K, number>> {
+  return fact.at != null ? ({ [column]: fact.at } as Record<K, number>) : {};
 }

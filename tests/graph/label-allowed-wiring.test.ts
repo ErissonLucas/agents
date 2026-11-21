@@ -12,9 +12,10 @@ import { CROSS_INBOX_CASE_DEFAULTS } from "@/modules/cross-inbox-case/settings";
 import { HANDOFF_DEFAULTS } from "@/modules/handoff/settings";
 import { SEND_IMAGE_DEFAULTS } from "@/modules/images/settings";
 import { KANBAN_DEFAULTS } from "@/modules/kanban/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { clearFlowLog, flowLogRows } from "../utils/flowlog";
 
-// Issue #638: the list reaches the tool through the toolset the runtime builds, not only through a
+// The allowed-labels list reaches the tool through the toolset the runtime builds, not only through a
 // ctx a unit test hands to `buildNativeTools` itself. Asked of `buildToolset` with the native
 // builder injected, so what is checked is exactly the object the runtime passes on.
 
@@ -34,8 +35,8 @@ if (appUrl && suUrl) {
     await app.$queryRaw`SELECT 1`;
     await su.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 
@@ -66,6 +67,8 @@ function config(): AgentConfig {
     protectedLabels: ["agente-off"],
     allowedLabels: ["vip", "suporte"],
     outsideAllowedLabels: "accept",
+    labelRemoval: "allowed",
+    writableAttributes: [{ scope: "contact", key: "nome" }],
   } as unknown as AgentConfig;
 }
 
@@ -85,8 +88,8 @@ describe.skipIf(!dbUp)("the allowed list reaches set_labels", () => {
     await app?.$disconnect();
   });
 
-  // Review round 2: a responder turn passes no reporter of its own, and a write under `accept` was
-  // counted nowhere. The toolset now writes it as its own `tool` line.
+  // NOTE: A responder turn passes no reporter of its own, so without the toolset's own `tool` line a
+  // write under `accept` would be counted nowhere.
   test("a turn without its own reporter gets the write as a tool line", async () => {
     let seen: Record<string, unknown> | undefined;
     const turnId = `labels-638-${process.pid}`;
@@ -119,6 +122,7 @@ describe.skipIf(!dbUp)("the allowed list reaches set_labels", () => {
       outsideAllowed: 1,
     });
     const rows = await flowLogRows(su as PrismaClient, {
+      orderBy: { id: "asc" },
       where: { tenantId, turnId },
     });
     expect(rows.map((r) => r.detail)).toEqual([
@@ -154,6 +158,67 @@ describe.skipIf(!dbUp)("the allowed list reaches set_labels", () => {
     });
     expect(seen?.allowedLabels).toEqual(["vip", "suporte"]);
     expect(seen?.outsideAllowedLabels).toBe("accept");
+    expect(seen?.labelRemoval).toBe("allowed");
     expect(seen?.protectedLabels).toEqual(["agente-off"]);
+  });
+
+  test("buildToolset hands the writable attributes on, and a refusal becomes an info tool line", async () => {
+    let seen: Record<string, unknown> | undefined;
+    const turnId = `attr-1564-${process.pid}`;
+    await buildToolset(
+      config(),
+      {
+        tenantId,
+        instanceId: 1n,
+        base: app as PrismaClient,
+        client: {} as unknown as ChatwootClient,
+        conversationId: 77,
+        threadId: `t-${process.pid}`,
+      },
+      {
+        flow: { tenantId, turnId, source: "inbox", base: app as PrismaClient },
+        buildNativeTools: (native) => {
+          seen = native as unknown as Record<string, unknown>;
+          return [];
+        },
+      },
+    );
+    expect(seen?.writableAttributes).toEqual([
+      { scope: "contact", key: "nome" },
+    ]);
+    // NOTE: this client cannot list anything, so the vocab read fails and the tool is told so.
+    expect(seen?.vocabUnavailable).toBe(true);
+    const report = seen?.onAttributeRefused as (r: unknown) => void;
+    report({ scope: "contact", rule: "pattern", key: "nome" });
+    report({ scope: "conversation", rule: "not_allowed" });
+    const rows = await flowLogRows(su as PrismaClient, {
+      orderBy: { id: "asc" },
+      where: { tenantId, turnId },
+    });
+    expect(
+      rows.map((r) => ({ level: r.level, status: r.status, detail: r.detail })),
+    ).toEqual([
+      {
+        level: "info",
+        status: "skipped",
+        detail: {
+          tool: "set_custom_attribute",
+          phase: "attribute_refused",
+          scope: "contact",
+          rule: "pattern",
+          key: "nome",
+        },
+      },
+      {
+        level: "info",
+        status: "skipped",
+        detail: {
+          tool: "set_custom_attribute",
+          phase: "attribute_refused",
+          scope: "conversation",
+          rule: "not_allowed",
+        },
+      },
+    ]);
   });
 });

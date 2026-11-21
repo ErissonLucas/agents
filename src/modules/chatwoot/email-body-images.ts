@@ -1,16 +1,11 @@
-// THE PICTURES A MAILBOX KEPT INSIDE AN EMAIL BODY (issue #864).
+// The pictures a mailbox kept inside an email body. Chatwoot's mailbox does not make an inline image
+// an attachment: a `cid:` reference in the HTML body is rewritten to the blob's URL, and with no
+// HTML (a bare inline part) `<img src="<blob url>">` is appended to the text body
+// (`MailboxHelper#process_inline_attachments`). Either way `message.attachments` is empty.
 //
-// Chatwoot's mailbox does not make an inline image an attachment. With an HTML body that references
-// it by `cid:`, the reference is rewritten to the blob's URL in `email.html_content.full`; with no
-// HTML at all (Apple Mail on iPhone sends the photo as a bare inline part), `<img src="<blob url>">`
-// is appended to `email.text_content.full` (`MailboxHelper#process_inline_attachments`). Either way
-// `message.attachments` is empty. On one production mailbox that was 2,397 of the 4,197 email
-// messages that declared an attachment in 14 days.
-//
-// Only Chatwoot's own blob URLs count: a remote image in quoted HTML was never uploaded by anybody
-// in this conversation. The host is checked later, against the instance, by whoever downloads. A
-// path starting at `/rails/active_storage/` is kept as written: it is relative to the Chatwoot host,
-// where the dashboard renders it, and whoever downloads resolves it against the instance's address.
+// Only Chatwoot's own blob URLs count; a remote image in quoted HTML was never uploaded by anybody
+// here. A `/rails/active_storage/` path is kept relative, as the dashboard renders it, and whoever
+// downloads checks the host and resolves it against the instance's address.
 
 // An `<img>` tag whose attributes may hold a quoted `>`, and the attributes inside it one at a time,
 // as HTML tokenizes them: a value is double-quoted, single-quoted or bare (a bare one runs to
@@ -118,6 +113,27 @@ export function bodyImagesBesides(
 // instance's address; an absolute URL is left as it is.
 export function onChatwootHost(url: string, baseUrl: string): string {
   return url.startsWith(BLOB_PATH) ? new URL(url, baseUrl).href : url;
+}
+
+// A body image Chatwoot wrote with its public address (its FRONTEND_URL) while this connection reaches
+// it on a private base: the same Active Storage path, fetched through the base, so the host check
+// below accepts it. Only the host the operator declared as this Chatwoot's public address is mapped;
+// any other host is left as it is, and stays remote.
+export function throughBase(
+  url: string,
+  baseUrl: string,
+  publicUrl: string | null | undefined,
+): string {
+  if (!publicUrl) return url;
+  try {
+    const u = new URL(url);
+    const pub = new URL(publicUrl);
+    if (u.host !== pub.host || !inActiveStorage(url)) return url;
+    if (pub.protocol === "https:" && u.protocol !== "https:") return url;
+    return new URL(`${u.pathname}${u.search}`, baseUrl).href;
+  } catch {
+    return url;
+  }
 }
 
 // Whether a body image is this Chatwoot's: on its host, and still under Active Storage once

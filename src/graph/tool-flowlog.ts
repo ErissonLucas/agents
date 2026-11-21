@@ -1,9 +1,13 @@
 import { BaseCallbackHandler } from "@langchain/core/callbacks/base";
 import type { Serialized } from "@langchain/core/load/serializable";
+import type { MessageContent } from "@langchain/core/messages";
 import type { StructuredToolInterface } from "@langchain/core/tools";
 import { toJsonSchema } from "@langchain/core/utils/json_schema";
-import { SKIP_REPLY_TOOL } from "@/graph/silence";
-import { sanitizeErrorMessage } from "@/lib/redact";
+import { contentToText } from "@/graph/message-text";
+import { SKIP_REPLY_TOOL, skipReplyReasonOf } from "@/graph/silence";
+import { measureText } from "@/graph/token-count";
+import { HANDOFF_TOOL_NAME } from "@/graph/tools/catalog";
+import { redactSecretsUnbounded, sanitizeErrorMessage } from "@/lib/redact";
 import { emitFlowEvent, type FlowContext } from "@/modules/flowlog/service";
 import { type DeclaredKeys, describeShape } from "@/modules/flowlog/shape";
 
@@ -25,7 +29,7 @@ function declaredKeysByTool(
         map.set(t.name, new Set(Object.keys(props)));
       }
     } catch {
-      // NOTE: an unreadable schema simply contributes no names — the safe direction.
+      // NOTE: an unreadable schema simply contributes no names, the safe direction.
     }
   }
   return map;
@@ -48,11 +52,9 @@ function parseToolInput(
   }
 }
 
-// A tool run's output reaches the callback as a ToolMessage-like object; surface its `content` (the
-// text the model sees) rather than the LangChain wrapper. Other shapes pass through unchanged.
-// How many times a tool had to ask its provider again before it answered, when it says so in its
-// artifact (`search_knowledge`'s query embedding, issue #844). Only a positive count: the key is
-// absent on a line that retried nothing, so its presence is the signal.
+// How many times a tool had to ask its provider again before it answered, when its artifact says so
+// (`search_knowledge`'s query embedding). Only a positive count: the key is absent on a line that
+// retried nothing, so its presence is the signal.
 function toolRetries(output: unknown): number | undefined {
   const artifact =
     output && typeof output === "object" && "artifact" in output
@@ -65,6 +67,8 @@ function toolRetries(output: unknown): number | undefined {
   return typeof n === "number" && n > 0 ? n : undefined;
 }
 
+// A tool run's output reaches the callback as a ToolMessage-like object; surface its `content` (the
+// text the model sees) rather than the LangChain wrapper. Other shapes pass through unchanged.
 function toolOutputValue(output: unknown): unknown {
   if (output && typeof output === "object" && "content" in output) {
     return (output as { content: unknown }).content;
@@ -72,20 +76,12 @@ function toolOutputValue(output: unknown): unknown {
   return output;
 }
 
-// NOTE: A ToolMessage with status "error" is a tool-marked integration failure (failableTool/toolFailure —
-// the friendly string went to the model, but the call must be logged as a failure). Thrown errors
-// take the handleToolError path instead; this only classifies returned outputs.
-// The cause line of a failure a tool RETURNED (as opposed to threw). The string it returned serves
-// two contracts at once: the model needs the provider's body to answer, and this column is
-// documented to carry none of it. An operator's HTTP tool answers `HTTP 422\n{"erro":"CPF … não
-// encontrado"}` (`src/graph/tools/http.ts`), and its `detail.output` was already being reduced to a
-// shape on the very same emit. What is kept is the part WE wrote: `toolFailure(...)` is only ever
-// called with a message we compose, and the newline that follows it in the HTTP builder is ours too,
-// so the first line is the diagnosis (`HTTP 422`, `Google Calendar returned HTTP 401.`) and
-// everything after it came from the other end. `logToolValues` keeps the whole string, exactly as it
-// keeps the arguments and the result.
+// The cause line of a failure a tool RETURNED (as opposed to threw). The model needs the provider's
+// body and this column is documented to carry none of it, so only the first line is kept: it is the
+// part WE wrote (a `toolFailure(...)` message, `HTTP 422` from ./tools/http.ts), and everything after
+// it came from the other end. `logToolValues` keeps the whole string, like the arguments and result.
 function failureCause(value: unknown, logValues: boolean): string {
-  // NOTE: `JSON.stringify` is TYPED as string but returns undefined for `undefined`, and this
+  // `JSON.stringify` is TYPED as string but returns undefined for `undefined`, and this
   // callback takes `unknown` from LangChain, so the coalesce is a runtime guard the type does not
   // give us.
   const text =
@@ -94,7 +90,33 @@ function failureCause(value: unknown, logValues: boolean): string {
   return text.split("\n", 1)[0] ?? "";
 }
 
-function isErrorToolOutput(output: unknown): boolean {
+// A ToolMessage with status "error" is a tool-marked integration failure (failableTool/toolFailure),
+// logged as a failure although the model got a friendly string. Thrown errors take handleToolError.
+// The text a tool result is kept as. Plain text and a list of text blocks as the model read them; any
+// other shape (an object, or content blocks that are not all text, such as an MCP image) as JSON, so a
+// block `contentToText` would drop is kept rather than leaving an empty text that reads as whole. A
+// structured value is masked first, keys and string values, as its log line is.
+function keptText(value: unknown): string {
+  if (typeof value === "string") return value;
+  // Each block is scrubbed before the join: joining can glue a token to the previous block's last
+  // word, and the value patterns need the boundary the join removed.
+  if (Array.isArray(value) && value.every(isTextBlock)) {
+    return contentToText(redactSecretsUnbounded(value) as MessageContent);
+  }
+  return JSON.stringify(redactSecretsUnbounded(value)) ?? "";
+}
+
+function isTextBlock(block: unknown): boolean {
+  if (typeof block === "string") return true;
+  return (
+    !!block &&
+    typeof block === "object" &&
+    (block as { type?: unknown }).type === "text" &&
+    typeof (block as { text?: unknown }).text === "string"
+  );
+}
+
+export function isErrorToolOutput(output: unknown): boolean {
   return (
     !!output &&
     typeof output === "object" &&
@@ -103,23 +125,16 @@ function isErrorToolOutput(output: unknown): boolean {
   );
 }
 
-// Logs each tool call the agent makes during a turn as a `tool` execution-flow line (name + status +
-// duration + the redacted args/result), so the operator can SEE which tools ran AND expand the marker
-// to inspect what was passed and returned (parity with the playground trace). Bound to the running
-// turn's FlowContext (shares its turnId, so the tool lines group under the same turn). Like
-// AgentStatusReporter, LangChain sets `runName` to the tool's registered name for tool runs (the
-// serialized `tool` is a not-implemented stub); fall back to a generic label when absent. The
-// args/result ride in `detail`, which emitFlowEvent passes through redactSecretsDeep (credential-named
-// keys dropped, secret-shaped strings scrubbed, everything truncated) before the write. Emits are
-// fire-and-forget (emitFlowEvent never throws into the turn).
+// Logs each tool call of a turn as a `tool` execution-flow line (name, status, duration, redacted
+// args/result), grouped under the turn's FlowContext. LangChain sets `runName` to the tool's
+// registered name (the serialized `tool` is a stub), with a generic label as fallback. `detail` goes
+// through redactSecretsDeep inside emitFlowEvent, and emits are fire-and-forget.
 export class ToolFlowLogger extends BaseCallbackHandler {
   name = "fazerai-tool-flowlog";
-  // INLINE, not on LangChain's background queue. Left at the default, a handler runs on one
-  // process-wide queue (concurrency 1, `LANGCHAIN_CALLBACKS_BACKGROUND` unset) behind every other
-  // backgrounded callback, so under load `handleToolEnd` ran AFTER the turn had returned: the line
-  // was not even scheduled when a reader settled, and `turnDelivered` was asked late, answering for
-  // a moment after the tool ended. Awaiting costs nothing here: every handler is synchronous and
-  // the write itself stays fire-and-forget (emitFlowEvent).
+  // INLINE, not on LangChain's background queue: by default a handler runs on one process-wide queue
+  // (concurrency 1) behind every other backgrounded callback, so under load `handleToolEnd` would run
+  // after the turn returned and `turnDelivered` would answer for the wrong moment. Awaiting costs
+  // nothing: every handler here is synchronous and the write stays fire-and-forget.
   override awaitHandlers = true;
 
   private readonly flow: FlowContext;
@@ -134,18 +149,36 @@ export class ToolFlowLogger extends BaseCallbackHandler {
   // cause is a string the operator has to be able to read, not a shape.
   private readonly logValues: boolean;
   private readonly declaredKeys: Map<string, ReadonlySet<string>>;
-  // Whether the TURN has put something in front of the customer, asked at the moment a line is
-  // written. Only `skip_reply` carries the answer, because only its marker asserts a silence: the
-  // operator's timeline reads "decided not to respond" off a turn that transferred WITH a closing
-  // line, and no tool name and no recorded argument can tell that turn from the one that transferred
-  // with nothing to say (issue #726). Absent on the paths that have no turn to ask (playground, the
-  // observe runner), and absent is not `false`: the reader treats it as unknown and keeps today's
-  // label rather than claiming a silence it cannot check.
+  // Whether the TURN has put something in front of the customer, asked when a line is written. Only
+  // `skip_reply` carries it: its marker asserts a silence, and no tool name or argument tells a
+  // transfer WITH a closing line from one with nothing to say. Absent where there is no turn to ask
+  // (playground, observe runner), and absent is not `false`: the reader treats it as unknown.
   private readonly turnDelivered?: () => boolean;
+  private readonly handedOff?: () => boolean;
+  private readonly onToolStart?: () => void;
   private readonly starts = new Map<
     string,
     { tool: string; at: number; args: unknown }
   >();
+  // What each tool did across the turn, for the one line `settle` writes: a failed call is `info` when
+  // it happens, because the model may call the tool again and succeed, and only a tool that failed on
+  // every call it made is the turn's degraded outcome.
+  private readonly outcomes = new Map<
+    string,
+    {
+      failed: number;
+      succeeded: number;
+      cause: string;
+      warned: boolean;
+      // A call succeeded AFTER the last failure: what the turn-errors message calls recovered.
+      recovered: boolean;
+    }
+  >();
+  // Every tool the turn started, in the order of its first call, with how many calls it made.
+  private readonly called = new Map<string, number>();
+  // Set by the first `settle`. A call still running when the turn ended (a deadline rejects before
+  // LangChain delivers the tool's own end or error) reports after it, and is judged when it lands.
+  private settled = false;
 
   constructor(
     flow: FlowContext,
@@ -153,11 +186,17 @@ export class ToolFlowLogger extends BaseCallbackHandler {
       logValues?: boolean;
       tools?: readonly StructuredToolInterface[];
       turnDelivered?: () => boolean;
+      // Whether this turn's transfer to a person actually happened (`handoffState.completed`).
+      handedOff?: () => boolean;
+      // Told as each tool call starts, before it can act.
+      onToolStart?: () => void;
     } = {},
   ) {
     super();
     this.flow = flow;
     this.turnDelivered = opts.turnDelivered;
+    this.handedOff = opts.handedOff;
+    this.onToolStart = opts.onToolStart;
     this.logValues = opts.logValues === true;
     this.describe = this.logValues ? (value) => value : describeShape;
     this.declaredKeys = declaredKeysByTool(opts.tools ?? []);
@@ -173,6 +212,8 @@ export class ToolFlowLogger extends BaseCallbackHandler {
     runName?: string,
   ): void {
     const tool = runName && runName.length > 0 ? runName : "tool";
+    this.onToolStart?.();
+    this.called.set(tool, (this.called.get(tool) ?? 0) + 1);
     this.starts.set(runId, {
       tool,
       at: Date.now(),
@@ -190,31 +231,118 @@ export class ToolFlowLogger extends BaseCallbackHandler {
     this.starts.delete(runId);
     const failed = isErrorToolOutput(output);
     const value = toolOutputValue(output);
+    const resultText =
+      typeof value === "string" || Array.isArray(value)
+        ? contentToText(value as MessageContent)
+        : (JSON.stringify(value) ?? "");
     const retries = toolRetries(output);
-    // NOTE: Integration failure returned as a friendly string (failableTool): ONE line, level warn —
-    // same level as handleToolError, so alert channels (minLevel warn) can subscribe (issue #40).
+    const cause = failed
+      ? sanitizeErrorMessage(failureCause(value, this.logValues))
+      : "";
+    this.tally(s.tool, failed ? cause : null);
+    // NOTE: an integration failure returned as a friendly string (failableTool) is `status: error`
+    // and `info`: whether it degraded the turn is known at `settle`, once every call has ended.
     emitFlowEvent(this.flow, {
       stage: "tool",
-      level: failed ? "warn" : "info",
+      level: "info",
       status: failed ? "error" : "ok",
       durationMs: Date.now() - s.at,
       detail: {
         tool: s.tool,
         args: s.args,
         output: this.describe(value, null),
+        // Logged whatever `logToolValues` says: a size is not customer data, and it is what tells which
+        // tool inflated a turn's input.
+        resultSize: measureText(resultText),
         ...(retries !== undefined ? { retries } : {}),
         // NOTE: Asked HERE and not at handleToolStart, because a model may emit `skip_reply`
         // alongside the tool that speaks (the documented parallel batch), and ToolNode runs a batch
         // concurrently: at the start of a 0ms decision the companion has not recorded anything yet.
         ...this.deliveryStamp(s.tool),
+        ...skipReasonStamp(s.tool, output),
+        ...this.handoffStamp(s.tool),
       },
-      ...(failed
-        ? {
-            errorMessage: sanitizeErrorMessage(
-              failureCause(value, this.logValues),
-            ),
-          }
+      ...(failed ? { errorMessage: cause } : {}),
+      // The result whole, beside the cut `output`, when the agent keeps full turn detail.
+      // Only when values are logged: the size axis never widens the PII one, so a turn that logs
+      // shapes keeps no text anywhere.
+      ...(this.logValues && this.flow.fullDetailRetentionDays
+        ? { full: { kind: "tool_output" as const, text: keptText(value) } }
         : {}),
+    });
+  }
+
+  // The tools this turn started so far, first call first. A call still running counts: it started.
+  calledTools(): { name: string; calls: number }[] {
+    return [...this.called].map(([name, calls]) => ({ name, calls }));
+  }
+
+  // The tools that failed at least once this turn, first call first: how many calls failed, whether
+  // a call of the same tool succeeded after the last failure, and the last cause (sanitized).
+  failedTools(): {
+    name: string;
+    failed: number;
+    recovered: boolean;
+    cause: string;
+  }[] {
+    const out = [];
+    for (const name of this.called.keys()) {
+      const o = this.outcomes.get(name);
+      if (o && o.failed > 0)
+        out.push({
+          name,
+          failed: o.failed,
+          recovered: o.recovered,
+          cause: o.cause,
+        });
+    }
+    return out;
+  }
+
+  private tally(tool: string, failure: string | null): void {
+    const o = this.outcomes.get(tool) ?? {
+      failed: 0,
+      succeeded: 0,
+      cause: "",
+      warned: false,
+      recovered: false,
+    };
+    if (failure === null) {
+      o.succeeded += 1;
+      if (o.failed > 0) o.recovered = true;
+    } else {
+      o.failed += 1;
+      o.cause = failure;
+      o.recovered = false;
+    }
+    this.outcomes.set(tool, o);
+    if (this.settled) this.settleTool(tool, o);
+  }
+
+  // The turn's outcome per tool, called once the model is done calling them: one `warn` for each tool
+  // that failed on every call it made, naming the tool, how many calls failed and the last cause. A
+  // tool that failed and then succeeded leaves its `info` lines and nothing else. Idempotent.
+  settle(): void {
+    this.settled = true;
+    for (const [tool, o] of this.outcomes) this.settleTool(tool, o);
+  }
+
+  private settleTool(
+    tool: string,
+    o: { failed: number; succeeded: number; cause: string; warned: boolean },
+  ): void {
+    if (o.warned || o.failed === 0 || o.succeeded > 0) return;
+    // A call of this tool still running may yet succeed; its own end judges the tool when it lands.
+    for (const s of this.starts.values()) if (s.tool === tool) return;
+    o.warned = true;
+    emitFlowEvent(this.flow, {
+      stage: "tool",
+      level: "warn",
+      status: "error",
+      detail: { tool, failedCalls: o.failed },
+      errorMessage: sanitizeErrorMessage(
+        `${tool} failed on every call this turn (${o.failed}): ${o.cause}`,
+      ),
     });
   }
 
@@ -226,17 +354,40 @@ export class ToolFlowLogger extends BaseCallbackHandler {
     return { turnDelivered: this.turnDelivered() };
   }
 
+  // `handoff_to_human` returns normally when it declines (the run was called off while its note was
+  // in flight), so a clean return is not a transfer. The turn's own mark is: the dashboard counts the
+  // agent's handoffs by it. Absent where nobody can answer, as the delivery stamp is.
+  private handoffStamp(tool: string): { handedOff?: boolean } {
+    if (tool !== HANDOFF_TOOL_NAME || !this.handedOff) return {};
+    return { handedOff: this.handedOff() };
+  }
+
   override handleToolError(err: unknown, runId: string): void {
     const s = this.starts.get(runId);
     if (!s) return;
     this.starts.delete(runId);
+    const cause = sanitizeErrorMessage(err);
+    this.tally(s.tool, cause);
     emitFlowEvent(this.flow, {
       stage: "tool",
-      level: "warn",
+      level: "info",
       status: "error",
       durationMs: Date.now() - s.at,
       detail: { tool: s.tool, args: s.args },
-      errorMessage: sanitizeErrorMessage(err),
+      errorMessage: cause,
     });
   }
+}
+
+// `skip_reply`'s reason, recorded as its value: a closed vocabulary (acknowledged, not_for_us,
+// needs_human) the model picks, not text it writes, so it says nothing about the customer and the
+// shape rule for tool arguments (docs/logs.md) does not need to hide it. The dashboard counts the
+// silences by it. Absent on every other tool's line, and on a skip whose result carried no mark.
+function skipReasonStamp(
+  tool: string,
+  output: unknown,
+): { skipReason?: string } {
+  if (tool !== SKIP_REPLY_TOOL) return {};
+  const reason = skipReplyReasonOf(output);
+  return reason ? { skipReason: reason } : {};
 }

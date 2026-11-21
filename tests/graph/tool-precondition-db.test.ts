@@ -16,12 +16,13 @@ import { CROSS_INBOX_CASE_DEFAULTS } from "@/modules/cross-inbox-case/settings";
 import { HANDOFF_DEFAULTS } from "@/modules/handoff/settings";
 import { SEND_IMAGE_DEFAULTS } from "@/modules/images/settings";
 import { KANBAN_DEFAULTS } from "@/modules/kanban/settings";
+import { dbProbeFailed } from "@/tests/db-gate";
 import { seedChatwootInstance } from "../utils/chatwoot";
 
-// The effect the issue is about is NOT a return value: `handoff_to_human` reassigns a conversation
-// and posts, irreversibly. So the assertion here is that the side effect DID NOT HAPPEN, read from a
-// spy, while the state that decides it is read from a real Postgres through the real loader — the
-// half a pure test cannot cover, because the loader is where scope, RLS and the jsonb shape live.
+// The guarded effect is NOT a return value: `handoff_to_human` reassigns a conversation and posts,
+// irreversibly. So the assertion here is that the side effect DID NOT HAPPEN, read from a spy, while
+// the state that decides it is read from a real Postgres through the real loader (the half a pure
+// test cannot cover, because the loader is where scope, RLS and the jsonb shape live).
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
 let dbUp = false;
@@ -38,8 +39,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -135,7 +136,7 @@ describe.skipIf(!dbUp)(
       const { tool: inner, calls } = spyHandoff();
       const guarded = guardedTool(
         inner,
-        cond,
+        [cond],
         preconditionStateLoader({
           base: appDb,
           tenantId,
@@ -178,7 +179,7 @@ describe.skipIf(!dbUp)(
       const { tool: inner, calls } = spyHandoff();
       const guarded = guardedTool(
         inner,
-        cond,
+        [cond],
         preconditionStateLoader({
           base: appDb,
           tenantId,
@@ -192,12 +193,11 @@ describe.skipIf(!dbUp)(
     });
 
     test("a MET condition is still stopped by the fence, and the turn's own wiring hands it in", async () => {
-      // The read above is a wait between the graph's ask at dispatch and the call it authorises, so
-      // a tool whose first act is a WRITE loses that cover the moment a precondition is configured
-      // on it (issue #568, review round 24). Asked through `buildToolset` rather than `guardedTool`
-      // because the fence's ARGUMENT POSITION is the half a unit test cannot see: passed one slot
-      // over, the wrapper reads `undefined`, every assertion about the fence still passes, and
-      // nothing is guarded. Measured while writing this: that is exactly what happened.
+      // The read above is a wait between the graph's ask at dispatch and the call it
+      // authorises, so a tool whose first act is a WRITE loses that cover once a precondition is
+      // configured on it. Asked through `buildToolset` rather than `guardedTool` because the fence's
+      // ARGUMENT POSITION is what a unit test cannot see: passed one slot over, the wrapper reads
+      // `undefined`, every assertion about the fence still passes, and nothing is guarded.
       const cfg = {
         agentId: 1n,
         contactDbId: null,
@@ -219,7 +219,7 @@ describe.skipIf(!dbUp)(
         ragConfig: undefined,
         timezone: "America/Sao_Paulo",
         toolGuidance: {},
-        toolPreconditions: { private_note: cond },
+        toolPreconditions: { private_note: [cond] },
         transferWithSummary: true,
       } as unknown as AgentConfig;
       const posted: unknown[] = [];
@@ -261,7 +261,7 @@ describe.skipIf(!dbUp)(
         // has to answer, and a loader that forgot to scope would let this through.
         const guarded = guardedTool(
           inner,
-          cond,
+          [cond],
           preconditionStateLoader({
             base: appDb,
             tenantId: other.id,

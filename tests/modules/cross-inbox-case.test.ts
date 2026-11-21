@@ -1,14 +1,26 @@
 import { describe, expect, test } from "bun:test";
 import { ToolMessage } from "@langchain/core/messages";
 import { owesHandbackNote } from "@/graph/handback";
+import { sideEffectFlowEvent } from "@/graph/prepare";
 import { interpolatePromptVars } from "@/graph/prompt";
 import { OPEN_CASE_HANDED_MARK } from "@/graph/tools/catalog";
-import { buildNativeTools } from "@/graph/tools/native";
-import { ChatwootApiError, ChatwootClient } from "@/modules/chatwoot/client";
+import { CLIENT_CHANNEL_NATIVES } from "@/graph/tools/channel-natives";
+import {
+  buildChannelNativeTools,
+  buildNativeTools,
+} from "@/graph/tools/native";
+import { mergeBehaviorSettings } from "@/modules/agents/behavior-settings";
+import {
+  ChatwootApiError,
+  ChatwootCalledOffError,
+  ChatwootClient,
+} from "@/modules/chatwoot/client";
 import { withConversationLabels } from "@/modules/chatwoot/labels";
+import { markValue } from "@/modules/chatwoot/liquid";
 import {
   type CaseClient,
   customerTyped,
+  type DetachedCaseOrigin,
   destinationIdentity,
   normalizeEmail,
   OPENING_OUTSIDE_WINDOW_PREFIX,
@@ -18,7 +30,10 @@ import {
 import {
   CROSS_INBOX_CASE_DEFAULTS,
   CROSS_INBOX_CASE_SUBJECT_MAX,
+  openingAsksMessage,
   readCrossInboxCaseConfig,
+  renderCaseNote,
+  renderCaseOpening,
   renderCaseSubject,
   subjectAsksSummary,
 } from "@/modules/cross-inbox-case/settings";
@@ -42,10 +57,16 @@ interface Conv {
 
 function fakeChatwoot(
   opts: {
-    inboxes?: Record<number, { name: string; channel_type: string }>;
+    inboxes?: Record<
+      number,
+      { name: string; channel_type: string; medium?: string }
+    >;
     contacts?: Record<number, { email?: string | null; phone?: string | null }>;
     convs?: Conv[];
     incoming?: string[];
+    // The origin's whole history, oldest first, served the way Chatwoot pages it: the newest page of
+    // 20 by default, and the 20 before a message id with `before`. Replaces `incoming` when given.
+    history?: Array<{ type: "in" | "out"; content: string }>;
     failOn?: Set<string>;
     continueOpen?: boolean;
     // Chatwoot's lock_to_single_conversation: the contact's LAST conversation in the inbox comes back
@@ -61,9 +82,14 @@ function fakeChatwoot(
     listDelayMs?: number;
     // The account's label catalog (`GET /labels`); "fail" answers it with a 500.
     catalog?: string[] | "fail";
+    // The conversation filter (`POST /conversations/filter`) answers with a 500.
+    filterFails?: boolean;
     // The destination inbox's agent bot, which Chatwoot assigns to a conversation it creates there
-    // (without the type, as measured on the fork).
+    // (the fork assigns it without the type).
     inboxBot?: number;
+    // The origin's messages as REST rows (with attachments), served to `getMessages` instead of
+    // `incoming`/`history`. Files download as 8 bytes from the instance's host.
+    originRows?: Array<Record<string, unknown>>;
   } = {},
 ) {
   const calls: Array<{ fn: string; args: unknown[] }> = [];
@@ -99,7 +125,9 @@ function fakeChatwoot(
     fail(fn);
   };
   const client: CaseClient = {
-    conversationUrl: (id: number) =>
+    conversationKey: (id: number) =>
+      `https://cw.example/app/accounts/1/conversations/${id}`,
+    conversationLink: (id: number) =>
       `https://cw.example/app/accounts/1/conversations/${id}`,
     getInbox: async (id: number) => {
       record("getInbox", [id]);
@@ -119,6 +147,10 @@ function fakeChatwoot(
         meta.assignee_type = "AgentBot";
       }
       if (c.teamId) meta.team = { id: c.teamId };
+      meta.sender = {
+        id: c.contactId,
+        email: contacts.get(c.contactId)?.email ?? null,
+      };
       return {
         id: c.id,
         inbox_id: c.inboxId,
@@ -178,11 +210,37 @@ function fakeChatwoot(
         .filter((c) => c.contactId === contactId)
         .sort((a, b) => b.id - a.id)
         .slice(0, opts.listNewest ?? Number.MAX_SAFE_INTEGER)
-        .map((c) => ({ id: c.id, inboxId: c.inboxId, status: c.status }));
+        .map((c) => ({
+          id: c.id,
+          inboxId: c.inboxId,
+          status: c.status,
+          customAttributes: { ...c.attrs },
+        }));
       if (opts.listDelayMs) {
         await new Promise((res) => setTimeout(res, opts.listDelayMs));
       }
       return listed;
+    },
+    listUnresolvedContactConversations: async (
+      contactId: number,
+      inboxId: number,
+    ) => {
+      record("listUnresolvedContactConversations", [contactId, inboxId]);
+      if (opts.filterFails) throw new ChatwootApiError(500, "filter");
+      return convs
+        .filter(
+          (c) =>
+            c.contactId === contactId &&
+            c.inboxId === inboxId &&
+            c.status !== "resolved",
+        )
+        .map((c) => ({
+          id: c.id,
+          inboxId: c.inboxId,
+          status: c.status,
+          canReply: null,
+          customAttributes: { ...c.attrs },
+        }));
     },
     createConversation: async (p) => {
       record("createConversation", [p]);
@@ -244,8 +302,25 @@ function fakeChatwoot(
       record("sendPrivateNote", [id, content]);
       return {};
     },
-    getMessages: async (id: number) => {
-      record("getMessages", [id]);
+    getMessages: async (id: number, o?: { before?: number }) => {
+      record("getMessages", [id, o]);
+      if (opts.originRows) {
+        return {
+          payload: opts.originRows.filter(
+            (m) => o?.before == null || Number(m.id) < o.before,
+          ),
+        };
+      }
+      if (opts.history) {
+        const rows = opts.history
+          .map((m, i) => ({
+            id: i + 1,
+            message_type: m.type === "in" ? 0 : 1,
+            content: m.content,
+          }))
+          .filter((m) => o?.before == null || m.id < o.before);
+        return { payload: rows.slice(-20) };
+      }
       return {
         payload: [
           ...(opts.incoming ?? []).map((content) => ({
@@ -300,8 +375,38 @@ function fakeChatwoot(
       Object.assign(conv(id).attrs, attrs);
       return {};
     },
+    isInstanceUrl: (url: string) => url.startsWith("https://cw.example/"),
+    downloadAttachment: async (url: string) => {
+      record("downloadAttachment", [url]);
+      return {
+        bytes: new Uint8Array(8).buffer,
+        contentType: "application/pdf",
+      };
+    },
+    sendFilesAsAdmin: async (id: number, files: unknown[], o?: unknown) => {
+      record("sendFilesAsAdmin", [id, files, o]);
+      return {};
+    },
   } as CaseClient;
   return { client, calls, convs, contacts };
+}
+
+// A contact message carrying files, as the REST list serves it.
+function fileRow(id: number, fileIds: number[], contactId = 5) {
+  return {
+    id,
+    created_at: id,
+    message_type: 0,
+    private: false,
+    sender_type: "Contact",
+    sender_id: contactId,
+    content: null,
+    attachments: fileIds.map((fid) => ({
+      id: fid,
+      file_type: "file",
+      data_url: `https://cw.example/rails/active_storage/blobs/${fid}/doc-${fid}.pdf`,
+    })),
+  };
 }
 
 const WRITES = new Set([
@@ -315,6 +420,7 @@ const WRITES = new Set([
   "sendPrivateNote",
   "setConversationLabels",
   "setConversationCustomAttributes",
+  "sendFilesAsAdmin",
 ]);
 
 function input(over: Partial<OpenCaseInput> = {}): OpenCaseInput {
@@ -370,6 +476,9 @@ describe("settings", () => {
       resolveOrigin: false,
       caseLabels: [],
       subjectTemplate: null,
+      openingTemplate: null,
+      noteTemplate: null,
+      carryAttachments: CROSS_INBOX_CASE_DEFAULTS.carryAttachments,
     });
     const bad = readCrossInboxCaseConfig({
       crossInboxCase: { targetInboxId: 0, caseAttributeKey: "Protocolo X" },
@@ -423,7 +532,7 @@ describe("pure helpers", () => {
   });
 
   test("a whole address, never a piece of a longer one", () => {
-    // Review round 1: a substring match let a truncated address through.
+    // NOTE: a substring match would let a truncated address through.
     expect(customerTyped(["joanna@example.com.br"], "anna@example.com")).toBe(
       false,
     );
@@ -470,7 +579,7 @@ describe("openCaseInInbox", () => {
     expect(writesOf(f.calls)).toEqual([]);
   });
 
-  test("the whole case: open conversation, number back on the origin, opening message, two-sided links, labels", async () => {
+  test("the whole case: open conversation, number back on the origin, opening message, one note each side, labels", async () => {
     const f = fakeChatwoot();
     const r = await openCaseInInbox(
       f.client,
@@ -506,10 +615,9 @@ describe("openCaseInInbox", () => {
     const sends = f.calls.filter((c) => c.fn === "sendMessageAsAdmin");
     expect(sends.map((c) => c.args)).toEqual([
       [100, "Olá! Abrimos seu atendimento por aqui.", { private: false }],
-      [100, "Motivo: cliente pediu atendente humano", { private: true }],
       [
         100,
-        "⬅️ Caso aberto a partir da conversa: https://cw.example/app/accounts/1/conversations/7",
+        "**Caso aberto a partir de outra conversa:** [ver conversa de origem](https://cw.example/app/accounts/1/conversations/7)\n\n**Motivo:**\ncliente pediu atendente humano",
         { private: true },
       ],
     ]);
@@ -526,6 +634,46 @@ describe("openCaseInInbox", () => {
       writesOf(f.calls).indexOf("createConversation") + 1,
     );
     expect(after[0]).toBe("setConversationCustomAttributes");
+  });
+
+  test("a connection with a public address links the case and its origin through it", async () => {
+    const f = fakeChatwoot();
+    // The API base is private; people open Chatwoot at another address.
+    const client = {
+      ...f.client,
+      conversationLink: (id: number) =>
+        `https://desk.example/app/accounts/1/conversations/${id}`,
+    };
+    const r = await openCaseInInbox(client, input());
+    expect(r).toMatchObject({
+      kind: "opened",
+      caseId: 100,
+      caseUrl: "https://desk.example/app/accounts/1/conversations/100",
+    });
+    expect(
+      f.calls.filter((c) => c.fn === "sendPrivateNote").map((c) => c.args),
+    ).toEqual([
+      [
+        7,
+        "➡️ Caso aberto na caixa E-mail SAC: https://desk.example/app/accounts/1/conversations/100",
+      ],
+    ]);
+    const opening = f.calls.find(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        c.args[0] === 100 &&
+        String(c.args[1]).includes("ver conversa de origem"),
+    );
+    expect(String(opening?.args[1])).toContain(
+      "(https://desk.example/app/accounts/1/conversations/7)",
+    );
+    // Asked again, the open case comes back with the same public link.
+    const again = await openCaseInInbox(client, input());
+    expect(again).toMatchObject({
+      kind: "already_open",
+      caseId: 100,
+      caseUrl: "https://desk.example/app/accounts/1/conversations/100",
+    });
   });
 
   test("an origin label already there is not written twice", async () => {
@@ -567,7 +715,7 @@ describe("openCaseInInbox", () => {
       f.calls
         .filter((c) => c.fn === "sendMessageAsAdmin")
         .map((c) => (c.args[2] as { private: boolean }).private),
-    ).toEqual([true, true]);
+    ).toEqual([true]);
   });
 
   test("an open case this conversation already opened is the answer, not a second one", async () => {
@@ -593,13 +741,77 @@ describe("openCaseInInbox", () => {
     });
     const r = await openCaseInInbox(f.client, input());
     expect(r).toMatchObject({ kind: "already_open", caseId: 55 });
-    // Nothing is opened or sent. The one write is the case's owner: with no person on it,
-    // whatever bot may hold it is cleared, and that is idempotent.
-    expect(writesOf(f.calls)).toEqual(["unassignConversation"]);
+    // Nothing is opened or sent to the customer. The case's owner is settled (with no person on it,
+    // whatever bot may hold it is cleared, and that is idempotent), and the reason goes to the case
+    // as a note, since it is what the customer added since the case opened.
+    expect(writesOf(f.calls)).toEqual([
+      "unassignConversation",
+      "sendMessageAsAdmin",
+    ]);
+    const note = f.calls.find((c) => c.fn === "sendMessageAsAdmin");
+    expect(note?.args[0]).toBe(55);
+    expect(note?.args[1]).toContain("cliente pediu atendente humano");
+    expect(note?.args[1]).toContain("**Informação adicional do cliente**");
+    expect(note?.args[2]).toEqual({ private: true });
+  });
+
+  test("the note on a remembered case carries the addition literally", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: { case_conversation_id: 55 },
+          labels: [],
+        },
+        {
+          id: 55,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    await openCaseInInbox(f.client, input({ reason: "valor {{ total }}" }));
+    const note = f.calls.find((c) => c.fn === "sendMessageAsAdmin");
+    expect(note?.args[1]).toContain("valor {{ '{{' }} total }}");
+  });
+
+  test("withdrawn before the note on a remembered case: the note is not written", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: { case_conversation_id: 55 },
+          labels: [],
+        },
+        {
+          id: 55,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    const r = await openCaseInInbox(
+      f.client,
+      input({ stillWanted: async () => false }),
+    );
+    expect(r).toMatchObject({ kind: "already_open", partial: ["called_off"] });
+    expect(f.calls.some((c) => c.fn === "sendMessageAsAdmin")).toBe(false);
   });
 
   test("a remembered case that went pending or snoozed is reopened before it is reported open", async () => {
-    // Review round 4: out of the team's open queue is not "already with the team".
+    // NOTE: out of the team's open queue is not "already with the team".
     for (const status of ["pending", "snoozed"]) {
       const f = fakeChatwoot({
         convs: [
@@ -711,7 +923,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("a destination that is this conversation's own inbox opens nothing", async () => {
-    // Review round 4: the create could hand back the origin itself and flip it open under the turn.
+    // The create can hand back the origin itself and flip it open under the turn.
     const f = fakeChatwoot({
       continueOpen: true,
       inboxes: { 10: { name: "WhatsApp", channel_type: "Channel::Api" } },
@@ -726,7 +938,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("a closed reply window keeps the opening off the customer's channel and leaves it for the team", async () => {
-    // Review round 4: an official WhatsApp destination rejects a free-form first message.
+    // An official WhatsApp destination rejects a free-form first message.
     const f = fakeChatwoot({
       canReply: false,
       inboxes: {
@@ -760,7 +972,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("a continued case older than the listing reaches is still told apart by its number", async () => {
-    // Review round 5: the listing is the newest 25, and absence from it is not a new case.
+    // The listing is the newest 25, and absence from it is not a new case.
     const f = fakeChatwoot({
       continueOpen: true,
       listNewest: 1,
@@ -803,8 +1015,8 @@ describe("openCaseInInbox", () => {
   });
 
   test("two origins of one contact opening at once send one opening, to one case", async () => {
-    // Review round 9: the per-origin queues ran side by side, both listed before either created, and
-    // an inbox that continues open conversations handed both the same case as "opened".
+    // per-origin queues alone run side by side, both list before either creates, and an inbox
+    // that continues open conversations hands both the same case as "opened".
     const f = fakeChatwoot({
       continueOpen: true,
       listDelayMs: 30,
@@ -831,7 +1043,8 @@ describe("openCaseInInbox", () => {
       openCaseInInbox(f.client, input({ originConversationId: 7 })),
       openCaseInInbox(f.client, input({ originConversationId: 8 })),
     ]);
-    expect([a.kind, b.kind].sort()).toEqual(["continued", "opened"]);
+    // The second lists after the first created, and finds the case it opened.
+    expect([a.kind, b.kind].sort()).toEqual(["appended", "opened"]);
     const openings = f.calls.filter(
       (c) =>
         c.fn === "sendMessageAsAdmin" &&
@@ -840,13 +1053,8 @@ describe("openCaseInInbox", () => {
     expect(openings).toHaveLength(1);
   });
 
-  test("a new case is numbered above what the contact had, and reads as opened", async () => {
-    const f = fakeChatwoot({ listNewest: 1 });
-    expect((await openCaseInInbox(f.client, input())).kind).toBe("opened");
-  });
-
   test("a policy transfer that did not land stops the opening", async () => {
-    // Review round 5: read as a plain drop, the case opened and resolveOrigin closed the origin.
+    // Read as a plain drop, the case would open and resolveOrigin would close the origin.
     const f = fakeChatwoot();
     const r = await openCaseInInbox(
       f.client,
@@ -857,7 +1065,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("the opening the customer receives is signed; the note of a closed window is not", async () => {
-    // Review round 5: Chatwoot does not sign API sends.
+    // Chatwoot does not sign API sends.
     const sign = (t: string) => `${t}\n\nAna, fazer.ai`;
     const open = fakeChatwoot();
     await openCaseInInbox(open.client, input({ signCustomerMessage: sign }));
@@ -874,6 +1082,53 @@ describe("openCaseInInbox", () => {
     expect(
       closed.calls.some((c) => String(c.args[1]).includes("Ana, fazer.ai")),
     ).toBe(false);
+  });
+
+  // The opening and the reason note are the model's words, and Chatwoot renders both as
+  // Liquid, so they go escaped (the wire shape is pinned in chatwoot-liquid.test.ts). The links are
+  // ours and carry no Liquid. A signer, when there is one, owns the whole opening: it attaches the
+  // operator's signature, which keeps its Liquid, and escapes the model's part itself (src/graph/prepare.ts).
+  test("the opening and the reason reach the case literally", async () => {
+    const f = fakeChatwoot();
+    await openCaseInInbox(
+      f.client,
+      input({
+        customerMessage: "Abrimos seu caso {{contact.email}} ref {{foo}}",
+        reason: "cliente pediu {{contact.phone_number}}",
+      }),
+    );
+    const sends = f.calls
+      .filter((c) => c.fn === "sendMessageAsAdmin")
+      .map((c) => c.args[1]);
+    expect(sends[0]).toBe(
+      "Abrimos seu caso {{ '{{' }}contact.email}} ref {{ '{{' }}foo}}",
+    );
+    expect(sends[1]).toContain(
+      "**Motivo:**\ncliente pediu {{ '{{' }}contact.phone_number}}",
+    );
+    const closed = fakeChatwoot({ canReply: false });
+    await openCaseInInbox(
+      closed.client,
+      input({ customerMessage: "Abrimos {{contact.email}}" }),
+    );
+    const note = closed.calls.find(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" && String(c.args[1]).includes("Abrimos"),
+    );
+    expect(String(note?.args[1])).toEndWith(
+      "Abrimos {{ '{{' }}contact.email}}",
+    );
+    const signed = fakeChatwoot();
+    await openCaseInInbox(
+      signed.client,
+      input({
+        customerMessage: "Abrimos {{foo}}",
+        signCustomerMessage: (t) => `WIRE(${t})`,
+      }),
+    );
+    expect(
+      signed.calls.find((c) => c.fn === "sendMessageAsAdmin")?.args[1],
+    ).toBe("WIRE(Abrimos {{foo}})");
   });
 
   test("a case that was resolved, or lives in another inbox, does not block a new one", async () => {
@@ -913,6 +1168,257 @@ describe("openCaseInInbox", () => {
       ],
     });
     expect((await openCaseInInbox(f.client, input())).kind).toBe("opened");
+  });
+
+  describe("the contact's case opened from another conversation", () => {
+    // The origin was resolved with the case open, and the customer wrote again: the channel opened
+    // conversation 8, which knows nothing about case 60.
+    const withCase = (status: string, over: Partial<Conv> = {}) =>
+      fakeChatwoot({
+        listNewest: 25,
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "resolved",
+            attrs: { case_conversation_id: 60 },
+            labels: [],
+          },
+          {
+            id: 8,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+          {
+            id: 60,
+            inboxId: 40,
+            contactId: 5,
+            status,
+            attrs: { origin_conversation_id: 7 },
+            labels: [],
+            ...over,
+          },
+        ],
+      });
+
+    test("the addition goes to that case as a note, and the new conversation is linked to it", async () => {
+      const f = withCase("open");
+      const r = await openCaseInInbox(
+        f.client,
+        input({
+          originConversationId: 8,
+          reason: "cliente mandou o print do erro",
+          customerMessage: "Olá! Abrimos seu atendimento.",
+        }),
+      );
+      expect(r).toMatchObject({ kind: "appended", caseId: 60 });
+      expect(f.calls.some((c) => c.fn === "createConversation")).toBe(false);
+      expect(f.convs).toHaveLength(3);
+      const toCase = f.calls.filter(
+        (c) => c.fn === "sendMessageAsAdmin" && c.args[0] === 60,
+      );
+      // One private note, and nothing to the customer there: the case already has its opening.
+      expect(toCase).toHaveLength(1);
+      expect(toCase[0]?.args[2]).toEqual({ private: true });
+      expect(toCase[0]?.args[1]).toContain("cliente mandou o print do erro");
+      expect(toCase[0]?.args[1]).toContain("/conversations/8");
+      // An addition, not a case being opened: its own header, and not the operator's note layout.
+      expect(toCase[0]?.args[1]).toContain(
+        "**Informação adicional do cliente**",
+      );
+      expect(toCase[0]?.args[1]).not.toContain("Caso aberto");
+      expect(f.convs.find((c) => c.id === 8)?.attrs).toEqual({
+        case_conversation_id: 60,
+      });
+      expect(
+        f.calls.find((c) => c.fn === "sendPrivateNote")?.args,
+      ).toMatchObject([8, expect.stringContaining("/conversations/60")]);
+    });
+
+    test("the operator's note layout is for opening a case, and the addition goes in literally", async () => {
+      const f = withCase("open");
+      await openCaseInInbox(
+        f.client,
+        input({
+          originConversationId: 8,
+          reason: "valor {{ total }}",
+          config: {
+            ...CROSS_INBOX_CASE_DEFAULTS,
+            targetInboxId: 40,
+            noteTemplate: "NOVO CASO: {{motivo}}",
+          },
+        }),
+      );
+      const note = String(
+        f.calls.find((c) => c.fn === "sendMessageAsAdmin" && c.args[0] === 60)
+          ?.args[1],
+      );
+      expect(note).not.toContain("NOVO CASO");
+      expect(note).toContain("valor {{ '{{' }} total }}");
+    });
+
+    test("a case that went pending is reopened before the addition is reported", async () => {
+      const f = withCase("pending");
+      const r = await openCaseInInbox(
+        f.client,
+        input({ originConversationId: 8 }),
+      );
+      expect(r).toMatchObject({ kind: "appended", caseId: 60 });
+      expect(f.convs.find((c) => c.id === 60)?.status).toBe("open");
+    });
+
+    test("a resolved case, a case in another inbox, or a conversation this tool did not open gets a new case", async () => {
+      for (const [status, over] of [
+        ["resolved", {}],
+        ["open", { inboxId: 41 }],
+        ["open", { attrs: {} }],
+      ] as const) {
+        const f = withCase(status, over);
+        const r = await openCaseInInbox(
+          f.client,
+          input({ originConversationId: 8 }),
+        );
+        expect(r.kind).toBe("opened");
+        expect(f.calls.some((c) => c.fn === "createConversation")).toBe(true);
+      }
+    });
+
+    test("the newest of two open cases is the one appended to", async () => {
+      const f = withCase("open");
+      f.convs.push({
+        id: 61,
+        inboxId: 40,
+        contactId: 5,
+        status: "open",
+        attrs: { origin_conversation_id: 3 },
+        labels: [],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ originConversationId: 8 }),
+      );
+      expect(r).toMatchObject({ kind: "appended", caseId: 61 });
+    });
+
+    test("a case older than the listing reaches is found through the filter", async () => {
+      const f = withCase("open");
+      // Thirty newer conversations push the case out of the contact's newest page.
+      for (let i = 0; i < 30; i++) {
+        f.convs.push({
+          id: 200 + i,
+          inboxId: 10,
+          contactId: 5,
+          status: "resolved",
+          attrs: {},
+          labels: [],
+        });
+      }
+      const r = await openCaseInInbox(
+        f.client,
+        input({ originConversationId: 8 }),
+      );
+      expect(r).toMatchObject({ kind: "appended", caseId: 60, partial: [] });
+      expect(f.calls.some((c) => c.fn === "createConversation")).toBe(false);
+    });
+
+    test("the filter is asked only when the listing is full", async () => {
+      const f = withCase("resolved");
+      const r = await openCaseInInbox(
+        f.client,
+        input({ originConversationId: 8 }),
+      );
+      expect(r.kind).toBe("opened");
+      expect(
+        f.calls.some((c) => c.fn === "listUnresolvedContactConversations"),
+      ).toBe(false);
+    });
+
+    test("a filter that fails opens a case, as the tool does without one, and says so", async () => {
+      const f = fakeChatwoot({
+        filterFails: true,
+        listNewest: 25,
+        convs: [
+          {
+            id: 8,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+          ...Array.from({ length: 30 }, (_, i) => ({
+            id: 20 + i,
+            inboxId: 10,
+            contactId: 5,
+            status: "resolved",
+            attrs: {},
+            labels: [],
+          })),
+        ],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ originConversationId: 8 }),
+      );
+      expect(r.kind).toBe("opened");
+      expect((r as { partial: string[] }).partial).toContain(
+        "open_case_lookup",
+      );
+    });
+
+    test("withdrawn after the addition landed: it is still reported as delivered", async () => {
+      const f = withCase("open");
+      const r = await openCaseInInbox(
+        f.client,
+        input({
+          originConversationId: 8,
+          // Wanted until the note is on the case, withdrawn for every write after it.
+          stillWanted: async () =>
+            !f.calls.some((c) => c.fn === "sendMessageAsAdmin"),
+        }),
+      );
+      expect(r).toMatchObject({
+        kind: "appended",
+        additionDelivered: true,
+        partial: ["called_off"],
+      });
+      expect(f.calls.some((c) => c.fn === "sendPrivateNote")).toBe(false);
+    });
+
+    test("withdrawn before the note on the case: the addition is reported as not delivered", async () => {
+      const f = withCase("open");
+      let asks = 0;
+      const r = await openCaseInInbox(
+        f.client,
+        input({
+          originConversationId: 8,
+          // The asks before the create, then the ones after it: the note's is the last to pass.
+          stillWanted: async () => ++asks <= 3,
+        }),
+      );
+      expect(r).toMatchObject({ kind: "appended", additionDelivered: false });
+      expect(
+        f.calls.some((c) => c.fn === "sendMessageAsAdmin" && c.args[0] === 60),
+      ).toBe(false);
+    });
+
+    test("withdrawn before the addition is written: nothing is", async () => {
+      const f = withCase("open");
+      let asks = 0;
+      const r = await openCaseInInbox(
+        f.client,
+        input({
+          originConversationId: 8,
+          stillWanted: async () => ++asks < 2,
+        }),
+      );
+      expect(r.kind).toBe("called_off");
+      expect(writesOf(f.calls)).toEqual([]);
+    });
   });
 
   test("the inbox continues the contact's open case: no second conversation, no second opening email, labels kept", async () => {
@@ -978,6 +1484,177 @@ describe("openCaseInInbox", () => {
     ).toHaveLength(1);
   });
 
+  describe("an address typed before the newest page of the conversation", () => {
+    const noEmail = { 5: { email: null, phone: "+5511999" } };
+    const chatter = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({
+        type: (i % 2 === 0 ? "out" : "in") as "in" | "out",
+        content: i % 2 === 0 ? `resposta ${i}` : `mensagem ${i}`,
+      }));
+    const pagesAsked = (calls: Array<{ fn: string; args: unknown[] }>) =>
+      calls.filter((c) => c.fn === "getMessages");
+
+    test("typed only in the first message of a long conversation, the case opens", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [
+          { type: "in", content: "Olá, meu e-mail é ana@exemplo.com" },
+          ...chatter(44),
+        ],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toMatchObject({ kind: "opened", identity: "written" });
+      expect(f.contacts.get(5)?.email).toBe("ana@exemplo.com");
+      expect(pagesAsked(f.calls).length).toBeGreaterThan(1);
+    });
+
+    test("the message 21st from the end is read", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [
+          { type: "in", content: "meu e-mail: ana@exemplo.com" },
+          ...chatter(20),
+        ],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toMatchObject({ kind: "opened" });
+    });
+
+    test("an address never typed is still refused after reading the whole conversation", async () => {
+      const f = fakeChatwoot({ contacts: noEmail, history: chatter(65) });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+      expect(writesOf(f.calls)).toEqual([]);
+      // The walk reached the first message and stopped there.
+      expect(pagesAsked(f.calls).length).toBe(4);
+    });
+
+    test("an old address written only by the agent does not count", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [
+          { type: "out", content: "É ana@exemplo.com?" },
+          ...chatter(44),
+        ],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+    });
+
+    test("an old address that only contains the one asked is refused", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [
+          { type: "in", content: "joanna@exemplo.com.br" },
+          ...chatter(44),
+        ],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "anna@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+    });
+
+    test("a short conversation is read in one page, as before", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [{ type: "in", content: "ana@exemplo.com" }, ...chatter(5)],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toMatchObject({ kind: "opened" });
+      expect(pagesAsked(f.calls)).toHaveLength(1);
+    });
+
+    test("found on the newest page, no older page is asked", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [...chatter(44), { type: "in", content: "ana@exemplo.com" }],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toMatchObject({ kind: "opened" });
+      expect(pagesAsked(f.calls)).toHaveLength(1);
+    });
+
+    test("the walk is bounded: an address older than a thousand messages is refused", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        history: [{ type: "in", content: "ana@exemplo.com" }, ...chatter(1100)],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+      expect(pagesAsked(f.calls)).toHaveLength(50);
+    });
+
+    test("a server that ignores `before` does not keep the walk going", async () => {
+      const f = fakeChatwoot({ contacts: noEmail, history: chatter(45) });
+      const newest = await f.client.getMessages(7);
+      let asked = 0;
+      const client: CaseClient = {
+        ...f.client,
+        getMessages: async () => {
+          asked += 1;
+          return newest;
+        },
+      };
+      const r = await openCaseInInbox(
+        client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+      expect(asked).toBe(2);
+    });
+
+    test("a conversation with no customer message ends the walk and refuses", async () => {
+      const f = fakeChatwoot({ contacts: noEmail, history: [] });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "ana@exemplo.com" }),
+      );
+      expect(r).toEqual({
+        kind: "rejected_email",
+        why: "not_in_conversation",
+      });
+      expect(pagesAsked(f.calls)).toHaveLength(1);
+    });
+  });
+
   describe("the email an email inbox needs", () => {
     const noEmail = { 5: { email: null, phone: "+5511999" } };
 
@@ -1024,6 +1701,74 @@ describe("openCaseInInbox", () => {
       expect(f.contacts.get(5)?.email).toBe("ana@exemplo.com");
       expect(f.contacts.size).toBe(1);
       expect(f.convs.find((c) => c.id === 100)?.contactId).toBe(5);
+    });
+
+    // SMTP refuses an accented mailbox name, so a case opened on one never reaches the customer.
+    test("an accent on a provider that forbids it is dropped, and the case note says what was written", async () => {
+      for (const typed of [
+        "jéssica.x@gmail.com",
+        "jéssica.x@gmail.com",
+        "jéssica.x@Yahoo.com.br",
+      ]) {
+        const f = fakeChatwoot({
+          contacts: noEmail,
+          incoming: [`meu e-mail é ${typed}`],
+        });
+        const r = await openCaseInInbox(f.client, input({ email: typed }));
+        const written = typed.replace(/^.*@/, "jessica.x@");
+        expect(r).toMatchObject({ kind: "opened", identity: "written" });
+        expect(f.contacts.get(5)?.email).toBe(written);
+        const notes = f.calls
+          .filter((c) => c.fn === "sendMessageAsAdmin" && c.args[0] === 100)
+          .map((c) => String(c.args[1]));
+        expect(
+          notes.some((n) => n.includes(typed) && n.includes(written)),
+        ).toBe(true);
+      }
+    });
+
+    test("an accent anywhere else is refused before anything is written", async () => {
+      for (const typed of [
+        "josé@empresa.com.br",
+        "jéssica.x@meugmail.com",
+        "jéssica.x@meuyahoo.com.br",
+        "josé@live.dev",
+        "josé@yahoo.co.de",
+        "太郎@gmail.com",
+      ]) {
+        const f = fakeChatwoot({
+          contacts: noEmail,
+          incoming: [`meu e-mail é ${typed}`],
+        });
+        const r = await openCaseInInbox(f.client, input({ email: typed }));
+        expect(r).toEqual({ kind: "rejected_email", why: "non_ascii" });
+        expect(writesOf(f.calls)).toEqual([]);
+      }
+    });
+
+    test("a domain outside ASCII is written in its punycode form", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        incoming: ["meu e-mail é maria@acentuação.com.br"],
+      });
+      const r = await openCaseInInbox(
+        f.client,
+        input({ email: "maria@acentuação.com.br" }),
+      );
+      expect(r).toMatchObject({ kind: "opened", identity: "written" });
+      expect(f.contacts.get(5)?.email).toBe("maria@xn--acentuao-xza3b.com.br");
+    });
+
+    test("a domain that is not a hostname is refused, not cut down or converted", async () => {
+      for (const typed of ["maria@empresa.com/ação", "maria@ação..com.br"]) {
+        const f = fakeChatwoot({
+          contacts: noEmail,
+          incoming: [`meu e-mail é ${typed}`],
+        });
+        const r = await openCaseInInbox(f.client, input({ email: typed }));
+        expect(r).toEqual({ kind: "rejected_email", why: "invalid" });
+        expect(writesOf(f.calls)).toEqual([]);
+      }
     });
 
     test("held by another contact, merge off: the case opens on that contact, nothing is merged", async () => {
@@ -1093,6 +1838,39 @@ describe("openCaseInInbox", () => {
       ).toEqual([100, 30, 7].sort());
     });
 
+    test("called off while the email write waits on the contact's queue: no write, no case", async () => {
+      const f = fakeChatwoot({
+        contacts: noEmail,
+        incoming: ["ana@exemplo.com"],
+      });
+      let wanted = true;
+      let reachedPut = false;
+      f.client.updateContact = async (
+        _id: number,
+        _fields: unknown,
+        opts?: { stillWanted?: () => Promise<boolean> },
+      ) => {
+        // NOTE: The run is withdrawn while this write waits its turn; the real client asks the
+        // fence inside the queue and refuses with ChatwootCalledOffError.
+        wanted = false;
+        if (opts?.stillWanted && !(await opts.stillWanted())) {
+          throw new ChatwootCalledOffError("contacts/5");
+        }
+        reachedPut = true;
+        return {};
+      };
+      const r = await openCaseInInbox(
+        f.client,
+        input({
+          email: "ana@exemplo.com",
+          stillWanted: async () => wanted,
+        }),
+      );
+      expect(r.kind).toBe("called_off");
+      expect(reachedPut).toBe(false);
+      expect(f.calls.filter((c) => c.fn === "createConversation")).toEqual([]);
+    });
+
     test("a refused write that is not a 422 fails, and nobody's address is looked up or merged", async () => {
       const f = fakeChatwoot({
         contacts: { ...noEmail, 9: { email: "ana@exemplo.com" } },
@@ -1142,7 +1920,7 @@ describe("openCaseInInbox", () => {
     });
 
     test("called off during the holder search, merge on: nothing is merged", async () => {
-      // Review round 3: the merge is the one write nothing undoes.
+      // The merge is the one write nothing undoes.
       let wanted = true;
       const f = fakeChatwoot({
         contacts: { ...noEmail, 9: { email: "ana@exemplo.com" } },
@@ -1209,7 +1987,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("called off during the last read before the create: no case, no opening", async () => {
-    // Review round 1: the only ask sat before this read, so a withdrawal inside it still opened.
+    // An ask only before this read would miss a withdrawal inside it.
     const f = fakeChatwoot();
     let wanted = true;
     const list = f.client.listContactConversations;
@@ -1247,9 +2025,9 @@ describe("openCaseInInbox", () => {
           (c.args[2] as { private: boolean }).private === false,
       ),
     ).toEqual([]);
-    // The case still opens, with its notes: the team still owes the customer.
+    // The case still opens, with its note: the team still owes the customer.
     expect(f.calls.filter((c) => c.fn === "sendMessageAsAdmin")).toHaveLength(
-      2,
+      1,
     );
   });
 
@@ -1271,7 +2049,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("a withdrawal queued ahead of the label write keeps it from putting a label back", async () => {
-    // Review round 3: the fence ran before the queue's wait, and a reset inside it was undone.
+    // A fence asked before the queue's wait would undo a reset queued inside it.
     const f = fakeChatwoot();
     let wanted = true;
     const reset = withConversationLabels(1n, 7, async () => {
@@ -1326,7 +2104,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("the origin label waits in the queue every label writer shares", async () => {
-    // Review round 1: a `set_labels` beside it read the same set, and the last write erased the other.
+    // Outside the queue, a `set_labels` beside it reads the same set and the last write erases the other.
     const f = fakeChatwoot();
     const get = f.client.getConversationLabels;
     f.client.getConversationLabels = async (id: number) => {
@@ -1401,7 +2179,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("a closed case that cannot be reopened fails the opening, and nothing claims it", async () => {
-    // Review round 3: a swallowed reopen reported an open case, and resolveOrigin closed the origin.
+    // A swallowed reopen would report an open case, and resolveOrigin would close the origin.
     const f = fakeChatwoot({
       lockToSingle: true,
       failOn: new Set(["toggleStatus"]),
@@ -1436,7 +2214,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("labels a new case got after its create are kept", async () => {
-    // Review round 2: a new case was assumed to have no labels, and the write replaced the set.
+    // The label write replaces the set, so a new case is not assumed to have no labels.
     const f = fakeChatwoot({
       afterCreate: (id) => {
         const c = f.convs.find((x) => x.id === id);
@@ -1451,7 +2229,7 @@ describe("openCaseInInbox", () => {
   });
 
   test("called off after the create: nothing more is written, the attribute writer is fenced too", async () => {
-    // Review round 2: the opening message, notes and labels went out after a withdrawal.
+    // None of the opening message, notes or labels may go out after a withdrawal.
     let wanted = true;
     const f = fakeChatwoot({
       afterCreate: () => {
@@ -1664,6 +2442,39 @@ describe("the tool", () => {
     return { t, toggles };
   }
 
+  // The note left when the case could not be opened quotes the model's reason, which Chatwoot renders
+  // as Liquid like any note, so it goes escaped.
+  test("the note of a case that failed to open quotes the reason literally", async () => {
+    const f = fakeChatwoot({ failOn: new Set(["createConversation"]) });
+    const { t } = toolFor(f);
+    await t.invoke({ reason: "pediu {{contact.phone_number}}" });
+    const note = f.calls.find(
+      (c) =>
+        c.fn === "sendPrivateNote" &&
+        String(c.args[1]).includes("Não consegui abrir o caso"),
+    );
+    expect(String(note?.args[1])).toEndWith(
+      "Motivo informado: pediu {{ '{{' }}contact.phone_number}}",
+    );
+  });
+
+  test("an accented address the provider cannot take asks the model to confirm it without the accent", async () => {
+    const f = fakeChatwoot({
+      contacts: { 5: { email: null, phone: "+5511999" } },
+      incoming: ["meu e-mail é josé@empresa.com.br"],
+    });
+    const { t } = toolFor(f);
+    const answer = String(
+      await t.invoke({
+        reason: "quer reembolso",
+        email: "josé@empresa.com.br",
+      }),
+    );
+    expect(answer).toContain("accent");
+    expect(answer).toContain("call this tool again");
+    expect(f.convs.some((c) => c.inboxId === 40)).toBe(false);
+  });
+
   test("the schema has no destination: the operator picks it, never the model", () => {
     const { t } = toolFor(fakeChatwoot());
     const shape = (t.schema as { shape: Record<string, unknown> }).shape;
@@ -1727,6 +2538,134 @@ describe("the tool", () => {
     ]);
   });
 
+  test("appended: the model is told the addition reached the open case, and the description says when to call again", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: {},
+          labels: [],
+        },
+        {
+          id: 60,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: 3 },
+          labels: [],
+        },
+      ],
+    });
+    const { t } = toolFor(f);
+    const out = String(await t.invoke({ reason: "o print do erro" }));
+    expect(out).toContain("already has an open case with the team");
+    expect(out).toContain("#60");
+    expect(out).toContain("added to that case as an internal note");
+    expect(out).not.toContain("Case opened");
+    expect(t.description).toContain(
+      "When the customer adds something after their case was opened",
+    );
+  });
+
+  test("already open: an addition that did not land is not told as delivered", async () => {
+    const f = fakeChatwoot({
+      failOn: new Set(["sendMessageAsAdmin"]),
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: { case_conversation_id: 55 },
+          labels: [],
+        },
+        {
+          id: 55,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    const { t } = toolFor(f);
+    const out = String(await t.invoke({ reason: "x" }));
+    expect(out).toContain("could NOT be added to that case");
+    expect(out).not.toContain("was added to that case");
+  });
+
+  test("appended: a withdrawal after the note landed does not tell the model the addition was lost", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: {},
+          labels: [],
+        },
+        {
+          id: 60,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: 3 },
+          labels: [],
+        },
+      ],
+    });
+    const { t } = toolFor(f, {
+      stillWanted: async () =>
+        !f.calls.some((c) => c.fn === "sendMessageAsAdmin"),
+    });
+    const out = String(await t.invoke({ reason: "x" }));
+    expect(out).toContain("was added to that case");
+    expect(out).not.toContain("could NOT");
+  });
+
+  test("appended: a note that did not land reaches the flow log", async () => {
+    const f = fakeChatwoot({
+      failOn: new Set(["sendMessageAsAdmin"]),
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: {},
+          labels: [],
+        },
+        {
+          id: 60,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: 3 },
+          labels: [],
+        },
+      ],
+    });
+    const seen: Array<{ phase: string; detail: unknown }> = [];
+    const { t } = toolFor(f, {
+      onSideEffectError: (e: { phase: string; detail: unknown }) => {
+        seen.push({ phase: e.phase, detail: e.detail });
+      },
+    });
+    const out = String(await t.invoke({ reason: "x" }));
+    // The addition did not reach the case, so the model is not told it did.
+    expect(out).toContain("could NOT be added to that case");
+    expect(out).not.toContain("reached the team handling their case");
+    expect(seen).toContainEqual({
+      phase: "follow_up_writes",
+      detail: { caseId: 60, failed: ["destination_note"] },
+    });
+  });
+
   test("opened: the model is told to tell the customer, and that the origin is not closed", async () => {
     const { t, toggles } = toolFor(fakeChatwoot());
     const out = String(await t.invoke({ reason: "x" }));
@@ -1779,10 +2718,198 @@ describe("the tool", () => {
       const t = withClose(f, true, { turnState });
       const out = String(await t.invoke({ reason: "x" }));
       expect(turnState.resolveRequested).toBe(true);
+      // The close is the case's, so the operator's resolve labels do not ride it.
+      expect((turnState as { caseClosing?: boolean }).caseClosing).toBe(true);
       expect(out).toContain("marked resolved after your reply");
       expect(t.description).toContain("closed after your reply");
       // The origin's status is left to the runtime, which closes after delivery.
       expect(f.convs.find((c) => c.id === 7)?.status).toBe("pending");
+    });
+
+    test("on, and the addition went to the contact's open case: the close is still scheduled", async () => {
+      const f = fakeChatwoot({
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+          {
+            id: 60,
+            inboxId: 40,
+            contactId: 5,
+            status: "open",
+            attrs: { origin_conversation_id: 3 },
+            labels: [],
+          },
+        ],
+      });
+      const turnState = turn();
+      const t = withClose(f, true, { turnState });
+      const out = String(await t.invoke({ reason: "x" }));
+      expect(turnState.resolveRequested).toBe(true);
+      expect(out).toContain("marked resolved after your reply");
+    });
+
+    test("on, and the addition did not reach the case: nothing is scheduled", async () => {
+      const f = fakeChatwoot({
+        failOn: new Set(["sendMessageAsAdmin"]),
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+          {
+            id: 60,
+            inboxId: 40,
+            contactId: 5,
+            status: "open",
+            attrs: { origin_conversation_id: 3 },
+            labels: [],
+          },
+        ],
+      });
+      const turnState = turn();
+      const t = withClose(f, true, { turnState });
+      const out = String(await t.invoke({ reason: "x" }));
+      expect(turnState.resolveRequested).toBe(false);
+      expect(out).toContain("NOT closed");
+    });
+
+    test("on: an addition that fails after a close this tool scheduled in the turn withdraws that close", async () => {
+      const failOn = new Set<string>();
+      const f = fakeChatwoot({
+        failOn,
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+        ],
+      });
+      const turnState = turn();
+      const t = withClose(f, true, { turnState });
+      await t.invoke({ reason: "primeiro" });
+      expect(turnState.resolveRequested).toBe(true);
+      // The second call finds the case this conversation just opened, and its note fails.
+      failOn.add("sendMessageAsAdmin");
+      const out = String(await t.invoke({ reason: "segundo" }));
+      expect(out).toContain("could NOT be added");
+      expect(turnState.resolveRequested).toBe(false);
+      expect((turnState as { caseClosing?: boolean }).caseClosing).toBe(false);
+    });
+
+    test("on: an addition that failed earlier in the turn keeps a later successful one from scheduling the close", async () => {
+      const failOn = new Set<string>(["sendMessageAsAdmin"]);
+      const f = fakeChatwoot({
+        failOn,
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: { case_conversation_id: 55 },
+            labels: [],
+          },
+          {
+            id: 55,
+            inboxId: 40,
+            contactId: 5,
+            status: "open",
+            attrs: {},
+            labels: [],
+          },
+        ],
+      });
+      const turnState = turn();
+      const t = withClose(f, true, { turnState });
+      await t.invoke({ reason: "primeiro" });
+      failOn.delete("sendMessageAsAdmin");
+      const out = String(await t.invoke({ reason: "segundo" }));
+      expect(out).toContain("was added to that case");
+      expect(turnState.resolveRequested).toBe(false);
+      expect(out).toContain("NOT closed");
+    });
+
+    test("on: withdrawing the case's close keeps a close the model asked for after it", async () => {
+      const failOn = new Set<string>();
+      const f = fakeChatwoot({
+        failOn,
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: {},
+            labels: [],
+          },
+        ],
+      });
+      const turnState: ReturnType<typeof turn> & {
+        resolveByModel?: boolean;
+        caseClosing?: boolean;
+      } = turn();
+      const t = withClose(f, true, { turnState });
+      const [resolve] = buildNativeTools(
+        {
+          client: {
+            ...f.client,
+            muted: false,
+          } as unknown as ChatwootClient,
+          conversationId: 7,
+          turnState,
+        },
+        ["resolve_conversation"],
+      );
+      if (!resolve) throw new Error("resolve_conversation not built");
+      await t.invoke({ reason: "primeiro" });
+      // The model closes the conversation itself after the case opened.
+      await resolve.invoke({});
+      failOn.add("sendMessageAsAdmin");
+      await t.invoke({ reason: "segundo" });
+      expect(turnState.resolveRequested).toBe(true);
+      expect(turnState.caseClosing).toBe(false);
+    });
+
+    test("on: a failed addition leaves a close the model asked for with resolve_conversation alone", async () => {
+      const f = fakeChatwoot({
+        failOn: new Set(["sendMessageAsAdmin"]),
+        convs: [
+          {
+            id: 7,
+            inboxId: 10,
+            contactId: 5,
+            status: "pending",
+            attrs: { case_conversation_id: 55 },
+            labels: [],
+          },
+          {
+            id: 55,
+            inboxId: 40,
+            contactId: 5,
+            status: "open",
+            attrs: {},
+            labels: [],
+          },
+        ],
+      });
+      const turnState = { ...turn(), resolveRequested: true };
+      const t = withClose(f, true, { turnState });
+      await t.invoke({ reason: "x" });
+      expect(turnState.resolveRequested).toBe(true);
     });
 
     test("on, and the case was already open: the close is still scheduled", async () => {
@@ -1948,7 +3075,7 @@ describe("the tool", () => {
   });
 
   test("a failed opening with no line is a silent transfer", async () => {
-    // Review round 10: without the silence mark the model's next reply could still go out.
+    // Without the silence mark the model's next reply could still go out.
     const f = fakeChatwoot({ failOn: new Set(["createConversation"]) });
     const handoffState: {
       customerMessage: string | null;
@@ -1964,11 +3091,44 @@ describe("the tool", () => {
     });
   });
 
+  test("a failed opening whose line is only a placeholder is a silent transfer", async () => {
+    const f = fakeChatwoot({ failOn: new Set(["createConversation"]) });
+    const handoffState: {
+      customerMessage: string | null;
+      completed: boolean;
+      declinedToSpeak?: boolean;
+    } = { customerMessage: null, completed: false };
+    const { t } = toolFor(f, { handoffState });
+    const out = String(await t.invoke({ reason: "x", handoff_message: "N/A" }));
+    expect(handoffState).toMatchObject({
+      customerMessage: null,
+      completed: true,
+      declinedToSpeak: true,
+    });
+    expect(out).toContain("No message will reach the customer");
+  });
+
+  test("an opening whose customer_message is only a placeholder sends no public text", async () => {
+    const f = fakeChatwoot();
+    const screened: string[] = [];
+    const { t } = toolFor(f, {
+      screenCustomerText: async (text: string) => {
+        screened.push(text);
+        return "send" as const;
+      },
+    });
+    await t.invoke({ reason: "x", customer_message: "EMPTY" });
+    expect(screened).toEqual([]);
+    expect(f.calls.some((c) => JSON.stringify(c.args).includes("EMPTY"))).toBe(
+      false,
+    );
+  });
+
   test("the model is told when the opening stayed a note, and when there was nowhere to move the case", async () => {
     const closed = toolFor(fakeChatwoot({ canReply: false }));
     expect(
       String(await closed.t.invoke({ reason: "x", customer_message: "Olá" })),
-    ).toContain("Do not say a message was sent to them there");
+    ).toContain("Do not say a message was sent to them by email");
     const same = toolFor(
       fakeChatwoot({
         inboxes: { 40: { name: "WhatsApp", channel_type: "Channel::Api" } },
@@ -2007,8 +3167,8 @@ describe("the tool", () => {
   });
 
   test("the model is told to call it directly, not to ask for an email first", () => {
-    // Issue #882: told only "when it asks for an email, ask the customer", a model asked for an
-    // address the contact already had, before calling the tool at all.
+    // Told only "when it asks for an email, ask the customer", a model asks for an address the
+    // contact already has, before calling the tool at all.
     const { t } = toolFor(fakeChatwoot());
     expect(t.description).toContain(
       "Call it directly: it reads the contact's email and phone itself, so do not ask the customer for them first.",
@@ -2023,7 +3183,7 @@ describe("the tool", () => {
   });
 
   test("a failed request after the turn was withdrawn hands nothing off", async () => {
-    // Review round 3: the fallback transferred a conversation the operator had just cleared.
+    // The fallback must not transfer a conversation the operator has just cleared.
     const f = fakeChatwoot({ failOn: new Set(["createConversation"]) });
     let wanted = true;
     const create = f.client.createConversation;
@@ -2102,7 +3262,7 @@ describe("the tool", () => {
   });
 });
 
-// Review round 4: the reply window is read off what the create answers, as Chatwoot reports it.
+// The reply window is read off what the create answers, as Chatwoot reports it.
 describe("the client reads the create's reply window", () => {
   const created = async (body: Record<string, unknown>) => {
     const fetchImpl = (async () =>
@@ -2134,7 +3294,7 @@ describe("the client reads the create's reply window", () => {
   });
 });
 
-// Review round 5: when the tool handed the conversation to people, a later return to the bot owes the
+// When the tool handed the conversation to people, a later return to the bot owes the
 // thread the same hand-back note a `handoff_to_human` does.
 describe("the hand-back rule reads the tool's transfer", () => {
   const result = (content: string, name = "open_case_in_inbox") =>
@@ -2160,7 +3320,7 @@ describe("the hand-back rule reads the tool's transfer", () => {
   });
 });
 
-// The email subject of a case (issue #883): the operator's template, with the prompt's context
+// The email subject of a case: the operator's template, with the prompt's context
 // variables and a one-line summary the model writes.
 describe("the case's email subject", () => {
   const vars = { nome_contato: "Ana Souza", contact_name: "Ana Souza" };
@@ -2195,9 +3355,10 @@ describe("the case's email subject", () => {
 
   test("clipped to a header's length without splitting a character, and empty is no subject", () => {
     const long = `${"x".repeat(CROSS_INBOX_CASE_SUBJECT_MAX - 1)}😀 e mais texto`;
-    const out = renderCaseSubject("{{resumo}}", long, interpolate) ?? "";
-    expect(out.length).toBeLessThanOrEqual(CROSS_INBOX_CASE_SUBJECT_MAX);
-    expect(out.endsWith("\ud83d")).toBe(false);
+    // NOTE: the emoji straddles the cap, so it goes whole and every character before it stays.
+    expect(renderCaseSubject("{{resumo}}", long, interpolate)).toBe(
+      "x".repeat(CROSS_INBOX_CASE_SUBJECT_MAX - 1),
+    );
     expect(renderCaseSubject("{{resumo}}", "  ", interpolate)).toBeNull();
     expect(renderCaseSubject(null, "reembolso", interpolate)).toBeNull();
   });
@@ -2364,9 +3525,9 @@ describe("the case's email subject", () => {
   });
 });
 
-// A case the tool opened, continued or reopened could sit `open` with another agent's bot still
-// assigned and no team. The destination's agent only answers `pending`, and the fork counts the bot as
-// an owner, so no "open with no owner" rule routed it: nobody saw the case.
+// A case the tool opened, continued or reopened must not sit `open` with another agent's bot still
+// assigned and no team: the destination's agent only answers `pending`, and the fork counts the bot
+// as an owner, so no "open with no owner" rule routes it and nobody sees the case.
 describe("who holds the case (issue #908)", () => {
   // A fresh one per use: the service writes the case number on it.
   const originConv = (): Conv => ({
@@ -2410,18 +3571,9 @@ describe("who holds the case (issue #908)", () => {
     ]);
   });
 
-  test("a bot the JSON does show (typed) is cleared the same way", async () => {
-    const f = fakeChatwoot({
-      continueOpen: true,
-      convs: [originConv(), emailAgentsCase({ botTyped: true })],
-    });
-    await openCaseInInbox(f.client, input());
-    expect(f.convs.find((x) => x.id === 55)?.bot).toBeNull();
-  });
-
   test("a person already on the case: nothing is written, the team neither", async () => {
-    // The fork drops an assignee who is not in a newly set team, so even the team would take the
-    // case from the person working it (measured live on the fork).
+    // The fork drops an assignee who is not in a newly set team, so even the team would take
+    // the case from the person working it.
     const f = fakeChatwoot({
       continueOpen: true,
       convs: [originConv(), emailAgentsCase({ bot: null, human: 21 })],
@@ -2593,7 +3745,8 @@ describe("who holds the case (issue #908)", () => {
       partial: [],
       caseOwnerUnread: "before_clear",
     });
-    expect(writesOf(f.calls)).toEqual([]);
+    // NOTE: no owner write; the one write is the reason's note, which does not depend on the owner.
+    expect(writesOf(f.calls)).toEqual(["sendMessageAsAdmin"]);
   });
 
   describe("the tool", () => {
@@ -2727,7 +3880,1499 @@ describe("who holds the case (issue #908)", () => {
       ]);
       expect(messages[0]).toContain("could not be read");
       expect(messages[0]).toContain("nothing was written");
-      expect(writesOf(f.calls)).toEqual([]);
+      expect(writesOf(f.calls)).toEqual(["sendMessageAsAdmin"]);
     });
+  });
+});
+
+// The operator's opening email and the single note on the case: the model writes only its part, the
+// operator writes the rest, and the team reads the case from one note.
+describe("the operator's opening and the case note (issue #923)", () => {
+  const vars = {
+    nome_contato: "Ana Souza",
+    contact_name: "Ana Souza",
+    primeiro_nome: "Ana",
+    contact_first_name: "Ana",
+  };
+  const interpolate = (t: string) => interpolatePromptVars(t, vars);
+  const ORIGIN = "https://cw.example/app/accounts/1/conversations/7";
+  const TEMPLATE =
+    "Olá, {{primeiro_nome}}!\n\nSua solicitação nº {{numero_caso}} foi recebida.\n\n{{mensagem}}\n\nAtenciosamente,\nEquipe";
+  const withTemplates = (
+    opening: string | null,
+    note: string | null = null,
+    over: Partial<OpenCaseInput> = {},
+  ) =>
+    input({
+      config: {
+        ...CROSS_INBOX_CASE_DEFAULTS,
+        targetInboxId: 40,
+        openingTemplate: opening,
+        noteTemplate: note,
+      },
+      interpolate,
+      ...over,
+    });
+  const sends = (f: ReturnType<typeof fakeChatwoot>, priv: boolean) =>
+    f.calls
+      .filter(
+        (c) =>
+          c.fn === "sendMessageAsAdmin" &&
+          (c.args[2] as { private: boolean }).private === priv,
+      )
+      .map((c) => String(c.args[1]));
+
+  describe("settings", () => {
+    test("both templates default to none, and are read trimmed", () => {
+      expect(CROSS_INBOX_CASE_DEFAULTS.openingTemplate).toBeNull();
+      expect(CROSS_INBOX_CASE_DEFAULTS.noteTemplate).toBeNull();
+      const c = readCrossInboxCaseConfig({
+        crossInboxCase: {
+          targetInboxId: 40,
+          openingTemplate: "  Olá {{mensagem}} ",
+          noteTemplate: " {{motivo}}\n",
+        },
+      });
+      expect(c.openingTemplate).toBe("Olá {{mensagem}}");
+      expect(c.noteTemplate).toBe("{{motivo}}");
+      const empty = readCrossInboxCaseConfig({
+        crossInboxCase: {
+          targetInboxId: 40,
+          openingTemplate: " ",
+          noteTemplate: "",
+        },
+      });
+      expect(empty.openingTemplate).toBeNull();
+      expect(empty.noteTemplate).toBeNull();
+    });
+
+    test("the message is asked for without a template, and by a template that has the placeholder", () => {
+      expect(openingAsksMessage(null)).toBe(true);
+      expect(openingAsksMessage("Olá {{mensagem}}")).toBe(true);
+      expect(openingAsksMessage("Olá {{ message }}")).toBe(true);
+      expect(openingAsksMessage("Olá, caso {{numero_caso}}")).toBe(false);
+    });
+
+    test("the opening: context variables, the case number, and the model's text kept literal", () => {
+      expect(
+        renderCaseOpening(TEMPLATE, "Vamos verificar.", 123, interpolate),
+      ).toBe(
+        "Olá, Ana!\n\nSua solicitação nº 123 foi recebida.\n\nVamos verificar.\n\nAtenciosamente,\nEquipe",
+      );
+      expect(
+        renderCaseOpening(
+          "{{case_number}}: {{message}}",
+          "Confira {{numero_caso}} e {{primeiro_nome}}",
+          9,
+          interpolate,
+        ),
+      ).toBe("9: Confira {{ '{{' }}numero_caso}} e {{ '{{' }}primeiro_nome}}");
+    });
+
+    test("the default note: the subject as the title, a link to the origin, the reason", () => {
+      const note = renderCaseNote(
+        null,
+        {
+          subject: "Pedido de Ana: troca",
+          reason: "Linha um\nLinha dois",
+          originUrl: ORIGIN,
+        },
+        interpolate,
+      );
+      const lines = note.split("\n").filter((l) => l.trim() !== "");
+      expect(lines[0]).toBe("### Pedido de Ana: troca");
+      expect(note).toContain(`](${ORIGIN})`);
+      expect(note).toContain("Linha um\nLinha dois");
+      const bare = renderCaseNote(
+        null,
+        { subject: null, reason: "x", originUrl: ORIGIN },
+        interpolate,
+      );
+      expect(bare).not.toContain("###");
+      expect(bare).toContain(`](${ORIGIN})`);
+    });
+
+    test("the note template takes its variables in both languages, and the model's text stays literal", () => {
+      expect(
+        renderCaseNote(
+          "{{assunto}}|{{subject}}|{{motivo}}|{{reason}}|{{link_origem}}|{{origin_url}}|{{primeiro_nome}}",
+          { subject: "S", reason: "R {{assunto}}", originUrl: ORIGIN },
+          interpolate,
+        ),
+      ).toBe(
+        `S|S|R {{ '{{' }}assunto}}|R {{ '{{' }}assunto}}|${ORIGIN}|${ORIGIN}|Ana`,
+      );
+      expect(
+        renderCaseNote(
+          null,
+          { subject: "Troca {{x}}", reason: "R", originUrl: ORIGIN },
+          interpolate,
+        ),
+      ).toStartWith("### Troca {{ '{{' }}x}}\n");
+    });
+  });
+
+  describe("the service", () => {
+    test("a template with the message: one opening, rendered around the model's part, with the case number and no signature", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(TEMPLATE, null, {
+          customerMessage: "Vamos verificar seu pedido.",
+          signCustomerMessage: (t) => `${t}\n-- Assinatura`,
+        }),
+      );
+      expect(sends(f, false)).toEqual([
+        "Olá, Ana!\n\nSua solicitação nº 100 foi recebida.\n\nVamos verificar seu pedido.\n\nAtenciosamente,\nEquipe",
+      ]);
+    });
+
+    // The model's part goes in escaped once, whether the opening is sent or kept as a note; the
+    // operator's text around it keeps its Liquid for Chatwoot to render.
+    test("a template's model part is escaped once, sent or kept as a note, and the operator's Liquid stays", async () => {
+      const tpl = "{{contact.name}}, caso {{numero_caso}}: {{mensagem}}";
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(tpl, null, { customerMessage: "veja {{contact.email}}" }),
+      );
+      expect(sends(f, false)).toEqual([
+        "{{contact.name}}, caso 100: veja {{ '{{' }}contact.email}}",
+      ]);
+      const closed = fakeChatwoot({ canReply: false });
+      await openCaseInInbox(
+        closed.client,
+        withTemplates(tpl, null, { customerMessage: "veja {{contact.email}}" }),
+      );
+      expect(
+        sends(closed, true).some((n) =>
+          n.endsWith(
+            "{{contact.name}}, caso 100: veja {{ '{{' }}contact.email}}",
+          ),
+        ),
+      ).toBe(true);
+    });
+
+    // A context variable is the contact's data, and a code span of the operator's around a value
+    // would show its escape: both come out as the customer and the team should read them.
+    test("a contact's name and a value inside the operator's code span come out as written", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(
+          "Olá, {{primeiro_nome}}! {{mensagem}}",
+          "Motivo: `{{motivo}}`",
+          {
+            customerMessage: "Ok.",
+            reason: "pediu {{foo}}",
+            interpolate: (t) =>
+              interpolatePromptVars(
+                t,
+                { primeiro_nome: "{{contact.email}}{{mensagem}}" },
+                { wrap: markValue },
+              ),
+          },
+        ),
+      );
+      expect(sends(f, false)).toEqual([
+        "Olá, {{ '{{' }}contact.email}}{{ '{{' }}mensagem}}! Ok.",
+      ]);
+      expect(sends(f, true)).toContain(
+        "Motivo: {{ '%60' | url_decode }}pediu {{ '{{' }}foo}}{{ '%60' | url_decode }}",
+      );
+    });
+
+    test("a fixed template goes out even when the model wrote nothing", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(
+          "Olá, {{primeiro_nome}}! Caso nº {{numero_caso}}.",
+          null,
+          {
+            customerMessage: null,
+          },
+        ),
+      );
+      expect(sends(f, false)).toEqual(["Olá, Ana! Caso nº 100."]);
+    });
+
+    test("a template that needs the model's part sends nothing without it", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(TEMPLATE, null, { customerMessage: null }),
+      );
+      expect(sends(f, false)).toEqual([]);
+    });
+
+    test("a model part the output check refuses discards the whole opening; the case and its note still land", async () => {
+      const f = fakeChatwoot();
+      const r = await openCaseInInbox(
+        f.client,
+        withTemplates(TEMPLATE, null, {
+          customerMessage: "PROIBIDO",
+          screenCustomerMessage: async (t) =>
+            t.includes("PROIBIDO") ? "drop" : "send",
+        }),
+      );
+      expect(r).toMatchObject({ kind: "opened", openingBlocked: true });
+      expect(sends(f, false)).toEqual([]);
+      expect(sends(f, true)).toHaveLength(1);
+    });
+
+    test("a refused part discards a fixed opening too, when a caller passed one", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates("Caso nº {{numero_caso}}.", null, {
+          customerMessage: "PROIBIDO",
+          screenCustomerMessage: async (t) =>
+            t.includes("PROIBIDO") ? "drop" : "send",
+        }),
+      );
+      expect(sends(f, false)).toEqual([]);
+    });
+
+    test("a closed reply window leaves the rendered opening to the team", async () => {
+      const f = fakeChatwoot({
+        canReply: false,
+        inboxes: {
+          40: { name: "WhatsApp oficial", channel_type: "Channel::Whatsapp" },
+        },
+      });
+      await openCaseInInbox(
+        f.client,
+        withTemplates("Caso nº {{numero_caso}}."),
+      );
+      expect(sends(f, false)).toEqual([]);
+      expect(sends(f, true)[0]).toBe(
+        `${OPENING_OUTSIDE_WINDOW_PREFIX}Caso nº 100.`,
+      );
+    });
+
+    test("the case gets ONE note, headed by the subject, with the origin link and the reason", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(null, null, {
+          subject: "Pedido de Ana: troca",
+          reason: "Linha um\nLinha dois",
+        }),
+      );
+      const notes = sends(f, true);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]).toStartWith("### Pedido de Ana: troca\n");
+      expect(notes[0]).toContain(`](${ORIGIN})`);
+      expect(notes[0]).toContain("Linha um\nLinha dois");
+    });
+
+    test("the operator's note template replaces the layout", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(null, "{{motivo}} em {{link_origem}}", {
+          reason: "troca",
+        }),
+      );
+      expect(sends(f, true)).toEqual([`troca em ${ORIGIN}`]);
+    });
+
+    test("a refused subject is not the note's title either", async () => {
+      const f = fakeChatwoot();
+      await openCaseInInbox(
+        f.client,
+        withTemplates(null, null, {
+          subject: "Assunto proibido",
+          screenCustomerMessage: async (t) =>
+            t === "Assunto proibido" ? "drop" : "send",
+        }),
+      );
+      expect(sends(f, true)[0]).not.toContain("Assunto proibido");
+    });
+
+    test("a note that does not land is one partial step", async () => {
+      const f = fakeChatwoot({ failOn: new Set(["sendMessageAsAdmin"]) });
+      const r = await openCaseInInbox(
+        f.client,
+        withTemplates(null, null, { customerMessage: null }),
+      );
+      expect((r as { partial: string[] }).partial).toEqual([
+        "destination_note",
+      ]);
+    });
+  });
+
+  describe("the tool", () => {
+    function openingTool(
+      f: ReturnType<typeof fakeChatwoot>,
+      template: string | null,
+      sign?: (t: string) => string,
+    ) {
+      const client = { ...f.client, muted: false } as unknown as ChatwootClient;
+      const [t] = buildNativeTools(
+        {
+          client,
+          conversationId: 7,
+          crossInboxCase: {
+            config: {
+              ...CROSS_INBOX_CASE_DEFAULTS,
+              targetInboxId: 40,
+              openingTemplate: template,
+            },
+            contactId: 5,
+            interpolate,
+            sign,
+          },
+        },
+        ["open_case_in_inbox"],
+      );
+      if (!t) throw new Error("tool not built");
+      return t;
+    }
+    const keys = (template: string | null) =>
+      Object.keys(
+        (
+          openingTool(fakeChatwoot(), template).schema as {
+            shape: Record<string, unknown>;
+          }
+        ).shape,
+      );
+
+    test("a fixed opening takes the message argument out of the schema", () => {
+      expect(keys("Olá, caso {{numero_caso}}")).not.toContain(
+        "customer_message",
+      );
+      expect(keys(TEMPLATE)).toContain("customer_message");
+      expect(keys(null)).toContain("customer_message");
+    });
+
+    test("the description says the opening is fixed when it is", () => {
+      const d = (t: string | null) =>
+        openingTool(fakeChatwoot(), t).description;
+      expect(d("Olá, caso {{numero_caso}}")).not.toContain("customer_message");
+      expect(d(TEMPLATE)).toContain("customer_message");
+    });
+
+    test("the tool renders the operator's opening, unsigned", async () => {
+      const f = fakeChatwoot();
+      const t = openingTool(f, TEMPLATE, (x) => `${x} -- Ana`);
+      await t.invoke({ reason: "x", customer_message: "Parte do modelo." });
+      expect(sends(f, false)).toEqual([
+        "Olá, Ana!\n\nSua solicitação nº 100 foi recebida.\n\nParte do modelo.\n\nAtenciosamente,\nEquipe",
+      ]);
+    });
+  });
+});
+
+describe("carrying the customer's files (issue #1128)", () => {
+  test("a settings patch of one field keeps the others stored", () => {
+    const stored = mergeBehaviorSettings(
+      {},
+      {
+        crossInboxCase: {
+          carryAttachments: { mode: "attendance", maxFiles: 4 },
+        },
+      },
+    );
+    const next = mergeBehaviorSettings(stored, {
+      crossInboxCase: { carryAttachments: { fileTypes: ["file"] } },
+    });
+    expect(
+      readCrossInboxCaseConfig(next as Record<string, unknown>)
+        .carryAttachments,
+    ).toEqual({ mode: "attendance", fileTypes: ["file"], maxFiles: 4 });
+  });
+
+  const carry = (
+    mode: "off" | "attendance" | "conversation",
+    over: Partial<OpenCaseInput> = {},
+  ) =>
+    input({
+      config: {
+        ...CROSS_INBOX_CASE_DEFAULTS,
+        targetInboxId: 40,
+        carryAttachments: { mode, fileTypes: ["image", "file"], maxFiles: 10 },
+      },
+      ...over,
+    });
+
+  test("off, or the block omitted, makes exactly the same requests", async () => {
+    const rows = [fileRow(1, [11]), fileRow(2, [12])];
+    const omitted = fakeChatwoot({ originRows: rows });
+    await openCaseInInbox(omitted.client, input());
+    const off = fakeChatwoot({ originRows: rows });
+    await openCaseInInbox(off.client, carry("off"));
+    expect(off.calls).toEqual(omitted.calls);
+    expect(off.calls.some((c) => c.fn === "downloadAttachment")).toBe(false);
+    expect(off.calls.some((c) => c.fn === "sendFilesAsAdmin")).toBe(false);
+  });
+
+  test("on: one private note with the files right after the case note, and the result counts it", async () => {
+    const f = fakeChatwoot({
+      originRows: [fileRow(1, [11]), fileRow(2, [12, 13])],
+    });
+    const r = await openCaseInInbox(f.client, carry("conversation"));
+    expect(r).toMatchObject({
+      kind: "opened",
+      caseId: 100,
+      attachments: { carried: 3, skipped: 0, failed: 0 },
+    });
+    const order = writesOf(f.calls);
+    const note = order.indexOf(
+      "sendMessageAsAdmin",
+      order.indexOf("sendMessageAsAdmin") + 1,
+    );
+    expect(order[note + 1]).toBe("sendFilesAsAdmin");
+    const files = f.calls.find((c) => c.fn === "sendFilesAsAdmin");
+    expect(files?.args[0]).toBe(100);
+    expect(files?.args[2]).toMatchObject({ private: true });
+    // The customer receives nothing more than without the block: one public opening.
+    const publicSends = f.calls.filter(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        (c.args[2] as { private: boolean }).private === false,
+    );
+    expect(publicSends).toHaveLength(1);
+  });
+
+  test("a case already open for this conversation gets only the files it did not have", async () => {
+    const f = fakeChatwoot({
+      originRows: [fileRow(301, [11]), fileRow(302, [12]), fileRow(303, [13])],
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: { case_conversation_id: 100 },
+          labels: [],
+        },
+        {
+          id: 100,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {
+            origin_conversation_id: 7,
+            carried_attachment_ids: "301:11,302:12",
+          },
+          labels: [],
+        },
+      ],
+    });
+    const r = await openCaseInInbox(f.client, carry("conversation"));
+    expect(r).toMatchObject({
+      kind: "already_open",
+      attachments: { carried: 1, skipped: 0, failed: 0 },
+    });
+    const files = f.calls.filter((c) => c.fn === "sendFilesAsAdmin");
+    expect(files).toHaveLength(1);
+    const sent = (files[0]?.args[1] ?? []) as Array<{ fileName: string }>;
+    expect(sent.map((x) => x.fileName)).toEqual(["doc-13.pdf"]);
+    expect(
+      f.convs.find((c) => c.id === 100)?.attrs.carried_attachment_ids,
+    ).toBe("301:11,302:12,303:13");
+  });
+
+  test("a case the destination continues keeps its record: no second opening, only the new file", async () => {
+    const f = fakeChatwoot({
+      continueOpen: true,
+      originRows: [fileRow(301, [11]), fileRow(302, [12])],
+      convs: [
+        {
+          id: 7,
+          inboxId: 10,
+          contactId: 5,
+          status: "pending",
+          attrs: {},
+          labels: [],
+        },
+        {
+          id: 100,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { carried_attachment_ids: "301:11" },
+          labels: [],
+        },
+      ],
+    });
+    const r = await openCaseInInbox(f.client, carry("conversation"));
+    expect(r).toMatchObject({ kind: "continued", caseId: 100 });
+    expect((r as { attachments?: unknown }).attachments).toEqual({
+      carried: 1,
+      skipped: 0,
+      failed: 0,
+    });
+    const publicSends = f.calls.filter(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        (c.args[2] as { private: boolean }).private === false,
+    );
+    expect(publicSends).toHaveLength(0);
+  });
+
+  test("the tool reports the counts to the flow log and answers the model the same as without them", async () => {
+    const run = async (mode: "off" | "conversation") => {
+      const f = fakeChatwoot({
+        originRows: [fileRow(1, [11]), fileRow(2, [12])],
+      });
+      const reports: Array<{
+        phase: string;
+        detail?: Record<string, unknown>;
+        level?: string;
+        status?: string;
+      }> = [];
+      const client = { ...f.client, muted: false } as unknown as ChatwootClient;
+      const [t] = buildNativeTools(
+        {
+          client,
+          conversationId: 7,
+          crossInboxCase: {
+            config: {
+              ...CROSS_INBOX_CASE_DEFAULTS,
+              targetInboxId: 40,
+              carryAttachments: { mode, fileTypes: ["file"], maxFiles: 1 },
+            },
+            contactId: 5,
+          },
+          onSideEffectError: (e) => reports.push(e),
+        },
+        ["open_case_in_inbox"],
+      );
+      if (!t) throw new Error("tool not built");
+      const out = await t.invoke({ reason: "cliente mandou o comprovante" });
+      return { out, reports };
+    };
+    const control = await run("off");
+    const on = await run("conversation");
+    expect(on.out).toEqual(control.out);
+    expect(
+      control.reports.filter((r) => r.phase === "case_attachments"),
+    ).toEqual([]);
+    const line = on.reports.find((r) => r.phase === "case_attachments");
+    expect(line?.detail).toMatchObject({
+      caseId: 100,
+      carried: 1,
+      skipped: 1,
+      failed: 0,
+    });
+    expect(line?.status).toBe("ok");
+    expect(line?.level).toBeUndefined();
+  });
+
+  test("a walk cut by its page limit is a warn line that says so", async () => {
+    const f = fakeChatwoot({});
+    // A conversation that never ends: every page is full and older than the cursor.
+    const client = {
+      ...f.client,
+      muted: false,
+      getMessages: async (_id: number, o?: { before?: number }) => {
+        const top = o?.before ?? 100_000;
+        return {
+          payload: Array.from({ length: 20 }, (_, i) => ({
+            id: top - 1 - i,
+            created_at: top - 1 - i,
+            message_type: 1,
+          })),
+        };
+      },
+    } as unknown as ChatwootClient;
+    const reports: Array<{
+      phase: string;
+      detail?: Record<string, unknown>;
+      level?: string;
+    }> = [];
+    const [t] = buildNativeTools(
+      {
+        client,
+        conversationId: 7,
+        crossInboxCase: {
+          config: {
+            ...CROSS_INBOX_CASE_DEFAULTS,
+            targetInboxId: 40,
+            carryAttachments: {
+              mode: "conversation",
+              fileTypes: ["file"],
+              maxFiles: 1,
+            },
+          },
+          contactId: 5,
+        },
+        onSideEffectError: (e) => reports.push(e),
+      },
+      ["open_case_in_inbox"],
+    );
+    if (!t) throw new Error("tool not built");
+    await t.invoke({ reason: "cliente mandou o comprovante" });
+    const line = reports.find((r) => r.phase === "case_attachments");
+    expect(line?.level).toBe("warn");
+    expect(line?.detail).toMatchObject({ carried: 0, truncated: true });
+  });
+
+  test("a carry called off after the files came down is a warn line naming the reason and the files left behind", async () => {
+    const f = fakeChatwoot({
+      originRows: [fileRow(1, [75]), fileRow(2, [76])],
+    });
+    // The customer writes while the files are coming down: the turn's fence answers no from then on.
+    let wanted = true;
+    const client = {
+      ...f.client,
+      muted: false,
+      downloadAttachment: async (url: string) => {
+        wanted = false;
+        return f.client.downloadAttachment(url);
+      },
+    } as unknown as ChatwootClient;
+    const reports: Array<{
+      phase: string;
+      detail?: Record<string, unknown>;
+      level?: string;
+      err?: unknown;
+    }> = [];
+    const [t] = buildNativeTools(
+      {
+        client,
+        conversationId: 7,
+        stillWanted: async () => wanted,
+        crossInboxCase: {
+          config: {
+            ...CROSS_INBOX_CASE_DEFAULTS,
+            targetInboxId: 40,
+            carryAttachments: {
+              mode: "conversation",
+              fileTypes: ["file"],
+              maxFiles: 5,
+            },
+          },
+          contactId: 5,
+        },
+        onSideEffectError: (e) => reports.push(e),
+      },
+      ["open_case_in_inbox"],
+    );
+    if (!t) throw new Error("tool not built");
+    await t.invoke({ reason: "cliente mandou o comprovante" });
+    expect(f.calls.some((c) => c.fn === "sendFilesAsAdmin")).toBe(false);
+    const line = reports.find((r) => r.phase === "case_attachments");
+    expect(line?.level).toBe("warn");
+    expect(line?.detail).toMatchObject({
+      caseId: 100,
+      carried: 0,
+      calledOff: true,
+      notCarried: [75, 76],
+    });
+    const message = (line?.err as Error | undefined)?.message;
+    expect(message).toContain("called off");
+    expect(message).toContain("75, 76");
+  });
+
+  test("a carry that went through is an ok line, one that failed a warn error line", () => {
+    const ok = sideEffectFlowEvent({
+      tool: "open_case_in_inbox",
+      phase: "case_attachments",
+      detail: { carried: 2 },
+      err: new Error("customer files: 2 carried"),
+      status: "ok",
+    });
+    expect(ok).toMatchObject({ level: "info", status: "ok" });
+    expect(ok.errorMessage).toBeUndefined();
+    expect(
+      sideEffectFlowEvent({
+        tool: "open_case_in_inbox",
+        phase: "case_attachments",
+        err: new Error("1 failed"),
+        level: "warn",
+      }),
+    ).toMatchObject({
+      level: "warn",
+      status: "error",
+      errorMessage: "1 failed",
+    });
+  });
+});
+
+// The client channel opens a case from a thread that is not a Chatwoot conversation: nothing is read
+// from or written to an origin conversation, the thread says which case it opened, and the team's
+// note links to where the thread can be read.
+describe("a case opened from a thread outside Chatwoot", () => {
+  const ORIGIN_URL = "https://agents.example/logs?turnId=t1&source=all";
+  function detachedOrigin(known: number | null = null) {
+    const recorded: number[] = [];
+    let current = known;
+    const origin: DetachedCaseOrigin = {
+      key: "client-thread:th-1",
+      url: ORIGIN_URL,
+      knownCaseId: async () => current,
+      recordCase: async (id) => {
+        recorded.push(id);
+        current = id;
+      },
+    };
+    return { origin, recorded };
+  }
+  const detachedInput = (origin: DetachedCaseOrigin, over = {}) =>
+    input({
+      originConversationId: 0,
+      detachedOrigin: origin,
+      recipientEmail: "ana@exemplo.com",
+      config: {
+        ...CROSS_INBOX_CASE_DEFAULTS,
+        targetInboxId: 40,
+        originLabel: "caso-aberto",
+      },
+      ...over,
+    });
+
+  test("opens the case, records it on the thread and touches no other conversation", async () => {
+    const f = fakeChatwoot({ convs: [] });
+    const { origin, recorded } = detachedOrigin();
+    const r = await openCaseInInbox(f.client, detachedInput(origin));
+    expect(r).toMatchObject({ kind: "opened", caseId: 100, partial: [] });
+    expect(recorded).toEqual([100]);
+    expect(f.convs.find((c) => c.id === 100)?.attrs).toEqual({
+      origin_conversation_id: ORIGIN_URL,
+    });
+    const opening = f.calls.find(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        !(c.args[2] as { private: boolean }).private,
+    );
+    // The recipient goes on the message: delivery runs later, after the contact may have changed.
+    expect(opening?.args[2]).toEqual({
+      private: false,
+      toEmails: ["ana@exemplo.com"],
+    });
+    const touched = f.calls
+      .filter((c) => typeof c.args[0] === "number" && c.fn !== "getInbox")
+      .filter((c) => !["getContact", "listContactConversations"].includes(c.fn))
+      .map((c) => c.args[0]);
+    expect(new Set(touched)).toEqual(new Set([100]));
+    expect(f.calls.some((c) => c.fn === "sendPrivateNote")).toBe(false);
+    const note = f.calls.find(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        (c.args[2] as { private: boolean }).private,
+    );
+    expect(String(note?.args[1])).toContain(ORIGIN_URL);
+  });
+
+  test("the opening goes to the host's address even when the contact holds another one by then", async () => {
+    const f = fakeChatwoot({
+      convs: [],
+      contacts: { 5: { email: "outro@exemplo.com" } },
+    });
+    const { origin } = detachedOrigin();
+    await openCaseInInbox(f.client, detachedInput(origin));
+    const opening = f.calls.find(
+      (c) =>
+        c.fn === "sendMessageAsAdmin" &&
+        !(c.args[2] as { private: boolean }).private,
+    );
+    expect(opening?.args[2]).toMatchObject({
+      toEmails: ["ana@exemplo.com"],
+    });
+  });
+
+  test("a case the thread opened and that is still open takes the addition, and nothing is created", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 100,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: ORIGIN_URL },
+          labels: [],
+        },
+      ],
+    });
+    const { origin } = detachedOrigin(100);
+    const r = await openCaseInInbox(
+      f.client,
+      detachedInput(origin, { reason: "mais um detalhe" }),
+    );
+    expect(r).toMatchObject({ kind: "already_open", caseId: 100 });
+    expect(f.calls.some((c) => c.fn === "createConversation")).toBe(false);
+    const note = f.calls.find((c) => c.fn === "sendMessageAsAdmin");
+    expect(String(note?.args[1])).toContain(ORIGIN_URL);
+  });
+
+  test("a case the thread opened for another contact is not added to: the contact changed", async () => {
+    const f = fakeChatwoot({
+      contacts: {
+        5: { email: "antigo@exemplo.com" },
+        6: { email: "novo@exemplo.com" },
+      },
+      convs: [
+        {
+          id: 100,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: ORIGIN_URL },
+          labels: [],
+        },
+      ],
+    });
+    const { origin, recorded } = detachedOrigin(100);
+    const r = await openCaseInInbox(
+      f.client,
+      detachedInput(origin, { originContactId: 6 }),
+    );
+    expect(r.kind).toBe("opened");
+    const created = f.calls.filter((c) => c.fn === "createConversation");
+    expect(
+      created.map((c) => (c.args[0] as { contactId: number }).contactId),
+    ).toEqual([6]);
+    expect(
+      f.calls.some(
+        (c) =>
+          c.fn === "sendMessageAsAdmin" &&
+          c.args[0] === 100 &&
+          String(c.args[1]).includes("Informação adicional"),
+      ),
+    ).toBe(false);
+    expect(recorded).toHaveLength(1);
+  });
+
+  test("an address just changed opens a new case: the open one would still reply to the old address", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 50,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: ORIGIN_URL },
+          labels: [],
+        },
+      ],
+    });
+    const { origin, recorded } = detachedOrigin(50);
+    const r = await openCaseInInbox(
+      f.client,
+      detachedInput(origin, { freshCase: true }),
+    );
+    expect(r.kind).toBe("opened");
+    expect(f.calls.filter((c) => c.fn === "createConversation")).toHaveLength(
+      1,
+    );
+    expect(
+      f.calls.some((c) => c.fn === "sendMessageAsAdmin" && c.args[0] === 50),
+    ).toBe(false);
+    expect(recorded).toHaveLength(1);
+  });
+
+  test("an inbox that hands back the open conversation despite a changed address gets the team told the current one", async () => {
+    const f = fakeChatwoot({
+      continueOpen: true,
+      convs: [
+        {
+          id: 50,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    const { origin } = detachedOrigin(null);
+    const r = await openCaseInInbox(
+      f.client,
+      detachedInput(origin, { freshCase: true }),
+    );
+    expect(r).toMatchObject({ kind: "continued", caseId: 50 });
+    const notes = f.calls
+      .filter(
+        (c) =>
+          c.fn === "sendMessageAsAdmin" &&
+          (c.args[2] as { private: boolean }).private,
+      )
+      .map((c) => String(c.args[1]));
+    expect(
+      notes.some(
+        (n) => n.includes("ana@exemplo.com") && n.includes("e-mail anterior"),
+      ),
+    ).toBe(true);
+  });
+
+  test("any old conversation the inbox hands back to a thread gets the current address, changed or not", async () => {
+    const f = fakeChatwoot({
+      continueOpen: true,
+      convs: [
+        {
+          id: 50,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    const { origin } = detachedOrigin(null);
+    const r = await openCaseInInbox(f.client, detachedInput(origin));
+    expect(r).toMatchObject({ kind: "continued", caseId: 50 });
+    expect(
+      f.calls.some(
+        (c) =>
+          c.fn === "sendMessageAsAdmin" &&
+          String(c.args[1]).includes("e-mail anterior"),
+      ),
+    ).toBe(true);
+  });
+
+  test("a destination that is not an email inbox is refused, even with a case already open there", async () => {
+    for (const channel_type of ["Channel::Whatsapp", "Channel::Api"]) {
+      const f = fakeChatwoot({
+        inboxes: { 40: { name: "Outro", channel_type } },
+        convs: [
+          {
+            id: 100,
+            inboxId: 40,
+            contactId: 5,
+            status: "open",
+            attrs: { origin_conversation_id: ORIGIN_URL },
+            labels: [],
+          },
+        ],
+      });
+      const { origin } = detachedOrigin(100);
+      const r = await openCaseInInbox(f.client, detachedInput(origin));
+      expect(r).toEqual({
+        kind: "unsupported_channel",
+        channelType: channel_type,
+      });
+      expect(writesOf(f.calls)).toEqual([]);
+    }
+  });
+
+  test("an email destination and a contact with no email: nothing opens, and no messages are read for an address", async () => {
+    const f = fakeChatwoot({ convs: [], contacts: { 5: { email: null } } });
+    const { origin } = detachedOrigin();
+    const r = await openCaseInInbox(
+      f.client,
+      detachedInput(origin, { email: "ana@exemplo.com" }),
+    );
+    expect(r.kind).toBe("needs_email");
+    expect(f.calls.some((c) => c.fn === "getMessages")).toBe(false);
+    expect(writesOf(f.calls)).toEqual([]);
+  });
+
+  test("two calls of one turn open one case: the second reads what the first recorded", async () => {
+    const f = fakeChatwoot({ convs: [] });
+    const { origin } = detachedOrigin();
+    const [a, b] = await Promise.all([
+      openCaseInInbox(f.client, detachedInput(origin)),
+      openCaseInInbox(f.client, detachedInput(origin, { reason: "outra" })),
+    ]);
+    expect([a.kind, b.kind]).toEqual(["opened", "already_open"]);
+    expect(f.calls.filter((c) => c.fn === "createConversation")).toHaveLength(
+      1,
+    );
+  });
+});
+
+describe("the tool on the client channel", () => {
+  function clientTool(
+    f: ReturnType<typeof fakeChatwoot>,
+    over: {
+      contact?: () => Promise<{
+        id: number;
+        addressUpdated: boolean;
+        email: string;
+      } | null>;
+      detached?: boolean;
+      reported?: Array<{ phase: string; detail?: unknown }>;
+    } = {},
+  ) {
+    const recorded: number[] = [];
+    const tools = buildChannelNativeTools(
+      {
+        client: {} as ChatwootClient,
+        conversationId: 0,
+        onSideEffectError: (e) => over.reported?.push(e),
+        crossInboxCase: {
+          config: { ...CROSS_INBOX_CASE_DEFAULTS, targetInboxId: 40 },
+          contactId: null,
+          ...(over.detached === false
+            ? {}
+            : {
+                detached: {
+                  client: f.client,
+                  caseTeamId: 9,
+                  serialKey: "client-case:1:7",
+                  contact:
+                    over.contact ??
+                    (async () => ({
+                      id: 5,
+                      addressUpdated: false,
+                      email: "ana@exemplo.com",
+                    })),
+                  origin: {
+                    key: "client-thread:th-1",
+                    url: "https://agents.example/logs?turnId=t1",
+                    knownCaseId: async () => recorded.at(-1) ?? null,
+                    recordCase: async (id: number) => {
+                      recorded.push(id);
+                    },
+                  },
+                },
+              }),
+        },
+      },
+      ["open_case_in_inbox"],
+      CLIENT_CHANNEL_NATIVES,
+    );
+    return { tools, recorded };
+  }
+
+  test("without the thread's origin the tool is not offered, so the conversation version never runs here", () => {
+    expect(clientTool(fakeChatwoot(), { detached: false }).tools).toEqual([]);
+  });
+
+  test("the model passes no address and no handoff line: nobody here can take either", () => {
+    const [t] = clientTool(fakeChatwoot()).tools;
+    if (!t) throw new Error("tool not built");
+    const shape = (t.schema as { shape: Record<string, unknown> }).shape;
+    expect(Object.keys(shape).sort()).toEqual([
+      "customer_message",
+      "labels",
+      "reason",
+    ]);
+  });
+
+  test("opens the case for the host's contact and gives it to the pinned team", async () => {
+    const f = fakeChatwoot({ convs: [] });
+    const { tools, recorded } = clientTool(f);
+    const out = String(
+      await tools[0]?.invoke({ reason: "quer falar com o financeiro" }),
+    );
+    expect(out).toContain("Case opened");
+    // The model never sees the address, and the destination is an email inbox: it says "by email".
+    expect(out).toContain("The team replies by email");
+    expect(recorded).toEqual([100]);
+    expect(f.convs.find((c) => c.id === 100)).toMatchObject({
+      contactId: 5,
+      teamId: 9,
+    });
+  });
+
+  test("two calls of one turn after an address change open one case: the second sees what the first recorded", async () => {
+    const f = fakeChatwoot({
+      convs: [
+        {
+          id: 50,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: "x" },
+          labels: [],
+        },
+      ],
+    });
+    let recordedUnderNewAddress: number | null = null;
+    const [t] = buildChannelNativeTools(
+      {
+        client: {} as ChatwootClient,
+        conversationId: 0,
+        crossInboxCase: {
+          config: { ...CROSS_INBOX_CASE_DEFAULTS, targetInboxId: 40 },
+          contactId: null,
+          detached: {
+            client: f.client,
+            caseTeamId: null,
+            serialKey: "client-case:1:8",
+            // The old case was opened under the previous address until a case is recorded under
+            // the current one.
+            contact: async () => ({
+              id: 5,
+              addressUpdated: recordedUnderNewAddress === null,
+              email: "ana@exemplo.com",
+            }),
+            origin: {
+              key: "client-thread:th-2",
+              url: "https://agents.example/logs?turnId=t2",
+              knownCaseId: async () => recordedUnderNewAddress ?? 50,
+              recordCase: async (id: number) => {
+                recordedUnderNewAddress = id;
+              },
+            },
+          },
+        },
+      },
+      ["open_case_in_inbox"],
+      CLIENT_CHANNEL_NATIVES,
+    );
+    if (!t) throw new Error("tool not built");
+    await Promise.all([
+      t.invoke({ reason: "primeiro" }),
+      t.invoke({ reason: "segundo" }),
+    ]);
+    expect(f.calls.filter((c) => c.fn === "createConversation")).toHaveLength(
+      1,
+    );
+  });
+
+  test("a call that changes the contact's address waits until another call of the same account has opened its case", async () => {
+    const f = fakeChatwoot({ convs: [], contacts: { 5: { email: null } } });
+    const openings: Array<{ id: number; to: string | null | undefined }> = [];
+    const send = f.client.sendMessageAsAdmin;
+    f.client.sendMessageAsAdmin = async (id, content, o) => {
+      if (!o?.private) openings.push({ id, to: f.contacts.get(5)?.email });
+      return send(id, content, o);
+    };
+    const toolFor = (thread: string, email: string) => {
+      let recorded: number | null = null;
+      const [t] = buildChannelNativeTools(
+        {
+          client: {} as ChatwootClient,
+          conversationId: 0,
+          crossInboxCase: {
+            config: { ...CROSS_INBOX_CASE_DEFAULTS, targetInboxId: 40 },
+            contactId: null,
+            detached: {
+              client: f.client,
+              caseTeamId: null,
+              serialKey: "client-case:1",
+              // Reconciling writes this thread's address on the shared contact.
+              contact: async () => {
+                const c = f.contacts.get(5);
+                if (c) c.email = email;
+                return { id: 5, addressUpdated: true, email };
+              },
+              origin: {
+                key: `client-thread:${thread}`,
+                url: `https://agents.example/${thread}`,
+                knownCaseId: async () => recorded,
+                recordCase: async (id: number) => {
+                  recorded = id;
+                },
+              },
+            },
+          },
+        },
+        ["open_case_in_inbox"],
+        CLIENT_CHANNEL_NATIVES,
+      );
+      if (!t) throw new Error("tool not built");
+      return t;
+    };
+    await Promise.all([
+      toolFor("a", "um@exemplo.com").invoke({
+        reason: "a",
+        customer_message: "Recebemos.",
+      }),
+      toolFor("b", "dois@exemplo.com").invoke({
+        reason: "b",
+        customer_message: "Recebemos.",
+      }),
+    ]);
+    expect(openings.map((o) => o.to)).toEqual([
+      "um@exemplo.com",
+      "dois@exemplo.com",
+    ]);
+  });
+
+  test("a destination that is not an email inbox is refused before the contact is touched", async () => {
+    const f = fakeChatwoot({
+      convs: [],
+      inboxes: { 40: { name: "WhatsApp", channel_type: "Channel::Whatsapp" } },
+    });
+    let resolved = false;
+    const out = String(
+      await clientTool(f, {
+        contact: async () => {
+          resolved = true;
+          return { id: 5, addressUpdated: false, email: "ana@exemplo.com" };
+        },
+      }).tools[0]?.invoke({ reason: "x" }),
+    );
+    expect(out).toContain("cannot receive cases");
+    expect(resolved).toBe(false);
+    expect(writesOf(f.calls)).toEqual([]);
+  });
+
+  test("a user the host gave no email for opens nothing and reads nothing in the account", async () => {
+    const f = fakeChatwoot({ convs: [] });
+    const out = String(
+      await clientTool(f, { contact: async () => null }).tools[0]?.invoke({
+        reason: "x",
+      }),
+    );
+    expect(out).toContain("did not provide this user's email");
+    expect(f.calls.map((c) => c.fn)).toEqual(["getInbox"]);
+  });
+
+  test("a missing email says the team cannot be reached from this chat, and not to ask for it", async () => {
+    const f = fakeChatwoot({ convs: [], contacts: { 5: { email: null } } });
+    const out = String(await clientTool(f).tools[0]?.invoke({ reason: "x" }));
+    expect(out).toContain("did not provide this user's email");
+    expect(out).toContain("Do not ask for their email");
+  });
+
+  test("a case whose owner could not be read reaches the operator, not just the model", async () => {
+    const f = fakeChatwoot({
+      convs: [],
+      failOn: new Set(["getConversation"]),
+    });
+    const reported: Array<{ phase: string; detail?: unknown }> = [];
+    await clientTool(f, { reported }).tools[0]?.invoke({ reason: "x" });
+    expect(reported).toEqual([
+      expect.objectContaining({
+        phase: "case_owner_unread",
+        detail: { caseId: 100, at: "before_clear" },
+      }),
+    ]);
+  });
+
+  test("a contact that cannot be resolved fails the call without opening anything", async () => {
+    const f = fakeChatwoot({ convs: [] });
+    const { tools } = clientTool(f, {
+      contact: async () => {
+        throw new ChatwootApiError(500, "POST /contacts");
+      },
+    });
+    const out = await tools[0]?.invoke({ reason: "x" });
+    expect(String(out)).toContain("resolve_contact");
+    expect(writesOf(f.calls)).toEqual([]);
+  });
+});
+
+// The result names where the team answers, because "there" read as this conversation to the factual
+// check and to the agent's model alike.
+describe("where the result says the team replies", () => {
+  const ORIGIN: Conv = {
+    id: 7,
+    inboxId: 10,
+    contactId: 5,
+    status: "pending",
+    attrs: {},
+    labels: [],
+  };
+  const LOCATIVE = /\b(there|here)\b/i;
+  const CONTACTS = { 5: { email: "ana@example.com", phone: "+5511999" } };
+
+  function inboxTool(
+    f: ReturnType<typeof fakeChatwoot>,
+    config: Partial<typeof CROSS_INBOX_CASE_DEFAULTS> = {},
+  ) {
+    const client = {
+      ...f.client,
+      muted: false,
+      toggleStatus: async () => ({}),
+    } as unknown as ChatwootClient;
+    const [t] = buildNativeTools(
+      {
+        client,
+        conversationId: 7,
+        crossInboxCase: {
+          config: {
+            ...CROSS_INBOX_CASE_DEFAULTS,
+            targetInboxId: 40,
+            ...config,
+          },
+          contactId: 5,
+        },
+      },
+      ["open_case_in_inbox"],
+    );
+    if (!t) throw new Error("tool not built");
+    return t;
+  }
+
+  const destination = (channel_type: string, medium?: string) => ({
+    40: { name: "Equipe", channel_type, ...(medium ? { medium } : {}) },
+  });
+
+  test("a phone case carries no address, even when the contact has an email", async () => {
+    const f = fakeChatwoot({
+      contacts: CONTACTS,
+      inboxes: destination("Channel::Whatsapp"),
+    });
+    const r = await openCaseInInbox(f.client, input());
+    expect(r).toMatchObject({
+      kind: "opened",
+      reply: { channel: "whatsapp", address: null },
+    });
+  });
+
+  test("an email case says the team replies by email, to the case's address, and not in this conversation", async () => {
+    const out = String(
+      await inboxTool(fakeChatwoot({ contacts: CONTACTS })).invoke({
+        reason: "x",
+        customer_message: "Olá",
+      }),
+    );
+    expect(out).toContain("Case opened: conversation #100");
+    expect(out).toContain("by email, to ana@example.com");
+    expect(out).toContain("not in this conversation");
+    expect(out).not.toMatch(LOCATIVE);
+  });
+
+  test("the address the customer typed is the one named", async () => {
+    const f = fakeChatwoot({
+      contacts: { 5: { email: null, phone: "+5511999" } },
+      incoming: ["meu email é carla@example.com"],
+    });
+    const out = String(
+      await inboxTool(f).invoke({ reason: "x", email: "carla@example.com" }),
+    );
+    expect(out).toContain("by email, to carla@example.com");
+    expect(out).not.toContain("ana@example.com");
+  });
+
+  test.each([
+    ["Channel::Whatsapp", undefined, "on WhatsApp"],
+    ["Channel::TwilioSms", "whatsapp", "on WhatsApp"],
+    ["Channel::TwilioSms", "sms", "by SMS"],
+    ["Channel::Sms", undefined, "by SMS"],
+    ["Channel::WebWidget", undefined, "in the website chat"],
+    ["Channel::Api", undefined, "API channel"],
+  ])(
+    "a %s (%s) case names its channel and promises no email",
+    async (type, medium, says) => {
+      const f = fakeChatwoot({
+        contacts: CONTACTS,
+        inboxes: destination(type, medium),
+      });
+      const out = String(await inboxTool(f).invoke({ reason: "x" }));
+      expect(out).toContain("Case opened");
+      expect(out).toContain(says);
+      expect(out).toContain("not in this conversation");
+      expect(out).not.toMatch(/email/i);
+      expect(out).not.toMatch(LOCATIVE);
+    },
+  );
+
+  test("a continued email case names the email channel", async () => {
+    const f = fakeChatwoot({
+      contacts: CONTACTS,
+      continueOpen: true,
+      convs: [
+        ORIGIN,
+        {
+          id: 30,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: {},
+          labels: [],
+        },
+      ],
+    });
+    const out = String(await inboxTool(f).invoke({ reason: "x" }));
+    expect(out).toContain("already had an open case in the destination inbox");
+    expect(out).toContain("#30");
+    expect(out).toContain("by email, to ana@example.com");
+    expect(out).not.toMatch(LOCATIVE);
+  });
+
+  test("a second call on the same conversation says where the answer comes from", async () => {
+    const f = fakeChatwoot({ contacts: CONTACTS });
+    const t = inboxTool(f);
+    await t.invoke({ reason: "x" });
+    const out = String(await t.invoke({ reason: "o print" }));
+    expect(out).toContain("already opened a case that is still open");
+    expect(out).toContain("by email, to ana@example.com");
+    expect(out).toContain("not in this conversation");
+    expect(out).not.toMatch(LOCATIVE);
+  });
+
+  test("an addition to a case opened from another conversation names the channel both times", async () => {
+    const f = fakeChatwoot({
+      contacts: CONTACTS,
+      convs: [
+        ORIGIN,
+        {
+          id: 60,
+          inboxId: 40,
+          contactId: 5,
+          status: "open",
+          attrs: { origin_conversation_id: 3 },
+          labels: [],
+        },
+      ],
+    });
+    const out = String(await inboxTool(f).invoke({ reason: "o print" }));
+    expect(out).toContain("#60");
+    expect(out).toContain("no message was sent to them by email");
+    expect(out).toContain("by email, to ana@example.com");
+    expect(out).not.toMatch(LOCATIVE);
+  });
+
+  test("an opening held outside the reply window names the channel nothing went out on", async () => {
+    const f = fakeChatwoot({
+      contacts: CONTACTS,
+      inboxes: destination("Channel::Whatsapp"),
+      canReply: false,
+    });
+    const out = String(
+      await inboxTool(f).invoke({ reason: "x", customer_message: "Olá" }),
+    );
+    expect(out).toContain("was NOT sent");
+    expect(out).toContain("Do not say a message was sent to them on WhatsApp");
+    expect(out).not.toMatch(LOCATIVE);
+  });
+
+  test.each([
+    ["no template", null],
+    ["a template with the message", "Caso {{numero_caso}}: {{mensagem}}"],
+    ["a fixed template", "Abrimos o caso {{numero_caso}}."],
+  ])(
+    "the inbox description with %s leaves no place to guess",
+    (_name, openingTemplate) => {
+      const t = inboxTool(fakeChatwoot({ contacts: CONTACTS }), {
+        openingTemplate,
+      });
+      expect(t.description).not.toMatch(LOCATIVE);
+    },
+  );
+
+  test("on the client channel the result says email without showing the address, and so does the description", async () => {
+    const f = fakeChatwoot({ contacts: CONTACTS, convs: [] });
+    const recorded: number[] = [];
+    const [t] = buildChannelNativeTools(
+      {
+        client: {} as ChatwootClient,
+        conversationId: 0,
+        crossInboxCase: {
+          config: { ...CROSS_INBOX_CASE_DEFAULTS, targetInboxId: 40 },
+          contactId: null,
+          detached: {
+            client: f.client,
+            caseTeamId: 9,
+            serialKey: "client-case:1:7",
+            contact: async () => ({
+              id: 5,
+              addressUpdated: false,
+              email: "ana@example.com",
+            }),
+            origin: {
+              key: "client-thread:th-1",
+              url: "https://agents.example/logs?turnId=t1",
+              knownCaseId: async () => recorded.at(-1) ?? null,
+              recordCase: async (id: number) => {
+                recorded.push(id);
+              },
+            },
+          },
+        },
+      },
+      ["open_case_in_inbox"],
+      CLIENT_CHANNEL_NATIVES,
+    );
+    if (!t) throw new Error("tool not built");
+    expect(t.description).not.toMatch(LOCATIVE);
+    for (const reason of ["quer falar com o financeiro", "mais um detalhe"]) {
+      const out = String(await t.invoke({ reason }));
+      expect(out).toContain("by email");
+      expect(out).toContain("not in this chat");
+      expect(out).not.toContain("ana@");
+      expect(out).not.toMatch(LOCATIVE);
+    }
   });
 });

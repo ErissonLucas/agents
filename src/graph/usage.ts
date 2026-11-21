@@ -17,6 +17,8 @@ import {
 } from "@/modules/pricing/overrides";
 import { type PricedTokens, priceCall } from "@/modules/pricing/price";
 import { reportedCostFromUsage } from "@/modules/pricing/reported";
+import { UNMETERED_PRICE_TABLE } from "@/modules/pricing/reprice";
+import { announceUnpricedModel } from "@/modules/pricing/unpriced-alert";
 import { PRICE_TABLE_VERSION } from "@/modules/pricing/version";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
 
@@ -26,24 +28,20 @@ import { emitOutbound } from "@/modules/webhooks/outbound/service";
 // the ALS at runtime) and the write goes through a scoped tx so RLS pins the row. Capture
 // is best-effort: it never throws into the reply path.
 
-export type UsageSource = "inbox" | "playground";
+import type { UsageSource } from "./usage-sources";
 
-// HOW A CALL NAMES THE MODEL THAT ANSWERED IT, when that is not the one the agent is configured with.
-//
-// The capture is built once per turn and holds the configured id, which is right for every call
-// until a fallback provider takes one (issue #143). Nothing LangChain hands the handler settles it:
-// measured, `invocation_params.model` carries the configured id on openai/anthropic/deepseek and is
-// UNDEFINED on google, and `response_metadata.model_name` carries the vendor's dated snapshot
-// (`gpt-5.4-mini-2026-03-17`), which would silently rewrite the value of every row already in the
-// ledger and move the dashboard's per-model break-down with it.
-//
-// So the caller says. The graph node is the only thing that knows which of its two models it just
-// invoked, and it says so in the CALL's own metadata — measured to merge with the turn's metadata
-// and to reach the inherited handlers, unlike `callbacks`, which replaces them and would have cost
-// the Langfuse trace.
+export { USAGE_SOURCES, type UsageSource } from "./usage-sources";
+
+// HOW A CALL NAMES THE MODEL THAT ANSWERED IT, when a fallback took the call instead of the configured
+// model the capture holds. Nothing LangChain hands the handler settles it: `invocation_params.model`
+// is undefined on google, and `response_metadata.model_name` is the vendor's dated snapshot, which
+// would change the value existing ledger rows (and the dashboard's per-model split) group by. So the
+// graph node, the only one that knows which model it invoked, puts it in the CALL's metadata, which
+// merges with the turn's and reaches the inherited handlers (`callbacks` would replace them and lose
+// the Langfuse trace).
 export const USAGE_MODEL_METADATA_KEY = "fazerai_usage_model";
-// The provider of that same model, beside it: the price table needs both (issue #863), and a fallback
-// can sit on another provider than the primary it replaced.
+// The provider of that same model, beside it: the price table needs both, and a fallback can sit on
+// another provider than the primary it replaced.
 export const USAGE_PROVIDER_METADATA_KEY = "fazerai_usage_provider";
 
 export interface UsageRow {
@@ -54,30 +52,34 @@ export interface UsageRow {
   inboxId: bigint | null;
   threadId: string | null;
   // The turn this call belongs to, when its caller knows one: the id the ExecutionLog and the
-  // Langfuse trace of that turn already carry (issue #839).
+  // Langfuse trace of that turn already carry.
   turnId: string | null;
   model: string;
   node: string | null;
-  // "inbox" (real customer traffic) | "playground" (operator test turns).
+  // Which traffic the call served: see USAGE_SOURCES.
   source: UsageSource;
+  // A client-channel call for an anonymous visitor's session. Absent is false.
+  anonymous?: boolean;
   promptTokens: number;
   completionTokens: number;
   // Cached-input accounting: a discounted SUBSET of promptTokens, never additive.
   cachedReadTokens: number;
   cacheCreationTokens: number;
-  // How long the call took, as the capture measured it (issue #855). Null when nothing measured it.
+  // Of cacheCreationTokens, the writes made under the 1-hour TTL (priced at their own rate).
+  cacheCreation1hTokens: number;
+  // How long the call took, as the capture measured it. Null when nothing measured it.
   durationMs: number | null;
-  // What the call cost in USD, from the price table (issue #863) or as the provider reported it
-  // (issue #866). Null when neither could price it.
+  // What the call cost in USD, from the price table or as the provider reported it. Null when
+  // neither could price it.
   costUsd: number | null;
-  // What priced it: the table (`litellm@<commit>`), the tenant's own price (issue #865), or the
-  // cost OpenRouter reported (`openrouter:reported`, issue #866).
+  // What priced it: the table (`litellm@<commit>+openrouter@<hash>`), the tenant's own price (`tenant-override@...`),
+  // or the cost OpenRouter reported (`openrouter:reported`).
   priceTable: string;
 }
 
 export type UsagePersist = (row: UsageRow) => Promise<void>;
 
-// WHAT ONE TURN SPENT, summed in process for the caller that shows it (the playground, issue #839).
+// WHAT ONE TURN SPENT, summed in process for the caller that shows it (the playground).
 //
 // The same numbers the ledger rows carry, from the same two places that write them (`UsageCapture`
 // and `recordDirectUsage`), so a turn's line and the ledger cannot disagree about a call. A
@@ -90,11 +92,13 @@ export interface TurnUsage {
   promptTokens: number;
   cachedReadTokens: number;
   cacheCreationTokens: number;
+  // Of cacheCreationTokens, the 1-hour writes.
+  cacheCreation1hTokens: number;
   completionTokens: number;
-  // The calls by the step that made them, keyed by the ledger's `node` (issue #858): the detail the
-  // screens show, so "3 calls" says which three. A row with no node is the agent's (#316).
+  // The calls by the step that made them, keyed by the ledger's `node`: the detail the screens
+  // show, so "3 calls" says which three. A row with no node is the agent's.
   byNode: Record<string, number>;
-  // USD over the calls the price table could price (issue #863), and how many it could not. A total
+  // USD over the calls the price table could price, and how many it could not. A total
   // with unpriced calls is a floor, and the screens say so rather than show it as the whole.
   costUsd: number;
   unpricedCalls: number;
@@ -102,10 +106,10 @@ export interface TurnUsage {
   // names the current table's date only when this is zero, since a reopened turn keeps the figure
   // its own table gave it.
   olderTablePricedCalls: number;
-  // Of the priced calls, how many the tenant's own prices priced rather than the table (issue #865),
-  // so the popover can say where its figure came from.
+  // Of the priced calls, how many the tenant's own prices priced rather than the table, so the
+  // popover can say where its figure came from.
   tenantPricedCalls: number;
-  // And how many carry the cost OpenRouter reported for them (issue #866).
+  // And how many carry the cost OpenRouter reported for them.
   reportedPricedCalls: number;
 }
 
@@ -115,6 +119,7 @@ export function emptyTurnUsage(): TurnUsage {
     promptTokens: 0,
     cachedReadTokens: 0,
     cacheCreationTokens: 0,
+    cacheCreation1hTokens: 0,
     completionTokens: 0,
     byNode: {},
     costUsd: 0,
@@ -125,8 +130,8 @@ export function emptyTurnUsage(): TurnUsage {
   };
 }
 
-// The node a row is counted under on screen: a row from before the column was always written is the
-// agent's, the same reading `NON_AGENT_TURN_NODES` gives it.
+// The node a row is counted under on screen: a row with no node is the agent's, the same reading
+// `NON_AGENT_TURN_NODES` gives it.
 export function usageNode(node: string | null): string {
   return node ?? "agent";
 }
@@ -137,9 +142,7 @@ export function usdOrNull(d: { toString(): string } | null): number | null {
   return d === null ? null : Number(d.toString());
 }
 
-// One ledger group (a `groupBy` bucket) added into a running usage, so every reader folds rows the
-// same way.
-// A row some price table priced, and not the table in the tree now (issue #863).
+// A row some price table priced, and not the table in the tree now.
 export function isOlderTable(priceTable: string | null | undefined): boolean {
   return (
     typeof priceTable === "string" &&
@@ -148,6 +151,8 @@ export function isOlderTable(priceTable: string | null | undefined): boolean {
   );
 }
 
+// One ledger group (a `groupBy` bucket) added into a running usage, so every reader folds rows the
+// same way.
 export function addUsageGroup(
   into: TurnUsage,
   g: {
@@ -156,6 +161,7 @@ export function addUsageGroup(
     promptTokens: number | null;
     cachedReadTokens: number | null;
     cacheCreationTokens: number | null;
+    cacheCreation1hTokens?: number | null;
     completionTokens: number | null;
     // The group's summed cost and how many of its rows carried one (`_count` of the column).
     costUsd: number | null;
@@ -168,6 +174,7 @@ export function addUsageGroup(
   into.promptTokens += g.promptTokens ?? 0;
   into.cachedReadTokens += g.cachedReadTokens ?? 0;
   into.cacheCreationTokens += g.cacheCreationTokens ?? 0;
+  into.cacheCreation1hTokens += g.cacheCreation1hTokens ?? 0;
   into.completionTokens += g.completionTokens ?? 0;
   into.costUsd += g.costUsd ?? 0;
   into.unpricedCalls += g.calls - g.pricedCalls;
@@ -181,7 +188,7 @@ export function addUsageGroup(
 
 // How long the turn took and how much of that was spent waiting on a model. Kept beside the usage
 // rather than in it: the ledger has no timing, so a reopened session's total could not carry it,
-// and a number the live total has and the reopened one lacks is two books again.
+// and a number the live total has and the reopened one lacks would be two books.
 export interface TurnTiming {
   // Wall time of the whole turn, as the server measured it.
   turnMs: number;
@@ -222,6 +229,8 @@ export async function sumTurnUsage<T>(
         cachedReadTokens: after.cachedReadTokens - before.cachedReadTokens,
         cacheCreationTokens:
           after.cacheCreationTokens - before.cacheCreationTokens,
+        cacheCreation1hTokens:
+          after.cacheCreation1hTokens - before.cacheCreation1hTokens,
         completionTokens: after.completionTokens - before.completionTokens,
         costUsd: after.costUsd - before.costUsd,
         unpricedCalls: after.unpricedCalls - before.unpricedCalls,
@@ -258,6 +267,7 @@ function noteTurnUsage(row: UsageRow): void {
   sink.usage.promptTokens += row.promptTokens;
   sink.usage.cachedReadTokens += row.cachedReadTokens;
   sink.usage.cacheCreationTokens += row.cacheCreationTokens;
+  sink.usage.cacheCreation1hTokens += row.cacheCreation1hTokens;
   sink.usage.completionTokens += row.completionTokens;
   if (row.costUsd === null) sink.usage.unpricedCalls += 1;
   else {
@@ -270,37 +280,64 @@ function noteTurnUsage(row: UsageRow): void {
   sink.usage.byNode[node] = (sink.usage.byNode[node] ?? 0) + 1;
 }
 
-// Every `node` the ledger can carry, against the one question a reader asking about the AGENT has to
-// settle first: did the agent take the turn this call was billed for?
-//
-// "There is a billed call on this conversation" is not that question, and the two came apart the
-// moment the ledger got complete (#316). Vision runs on the incoming attachment BEFORE the
-// bot-ownership gate decides anything, so an image sent into a conversation a human owns bills the
-// tenant while the agent never speaks. Every other node is downstream of a turn that did run.
-//
-// The map is TOTAL on purpose, and the fence in tests/modules/billed-call-usage.test.ts keeps it
-// that way: a node value missing from it is a red test, never a silent default. Defaulting to true
-// inflates involvement exactly the way vision just did; defaulting to false deflates it as quietly.
-export const USAGE_NODE_IS_AGENT_TURN: Readonly<Record<string, boolean>> =
-  Object.freeze({
-    agent: true,
-    nudge: true,
-    guardrail: true,
-    tts_normalize: true,
-    memory_compact: true,
-    vision: false,
-    // The OBSERVE job classifying a conversation the agent watches (issue #477): a model call on a
-    // conversation nobody of ours answers, so it is involvement in nothing the agent said.
-    observer: false,
-  });
+// Every `node` the ledger can carry, against the question a reader asking about the AGENT settles
+// first: did the agent take the turn this call was billed for? "A billed call on this conversation"
+// is not that question: vision runs on the incoming attachment BEFORE the bot-ownership gate, so an
+// image sent into a human-owned conversation bills the tenant while the agent never speaks. The map
+// is TOTAL by type: its keys ARE `UsageNode`, which every sink takes, so a call billed under a node
+// with no answer here does not compile. A default of true would inflate involvement, and false would
+// deflate it as quietly.
+const IS_AGENT_TURN = {
+  agent: true,
+  nudge: true,
+  guardrail: true,
+  // The factual-grounding reviewer (modules/guardrails/grounding-gate.ts), inside the reply turn it
+  // reviews. Its own node so its rate and cost read apart from the moderation calls.
+  guardrail_grounding: true,
+  tts_normalize: true,
+  // The `customer_choice` precondition's judge, inside the turn whose tool call it decides. Not a turn
+  // of its own: the reactive turn and the nudge that call it bill their own `agent`/`nudge` row, and
+  // an observer's tick calls it too, on a conversation nobody of ours answers.
+  choice_check: false,
+  memory_compact: true,
+  vision: false,
+  // The OBSERVE job classifying a conversation the agent watches: a model call on a
+  // conversation nobody of ours answers, so it is involvement in nothing the agent said.
+  observer: false,
+  // The OBSERVE job on the `decisions` engine: a classification call (modules/decisions), same
+  // conversation and same answer as `observer`.
+  decision: false,
+  // The SUGGESTION_REVIEW job judging a proposed knowledge entry: nothing the agent said.
+  suggestion_review: false,
+  // The OTHER_INBOX_SUMMARY job summarizing the contact's conversation in another inbox: a
+  // conversation this turn did not take, read as context.
+  other_inbox_summary: false,
+  // The OCCURRENCE_ROUND job's four model steps (modules/occurrences): reading each conversation of
+  // the monitored inboxes, fitting reference spellings to canonical names, assigning reason sentences
+  // to themes, and consolidating the open themes. The monitor reads on its own, never in a turn.
+  occurrence_reading: false,
+  occurrence_canonical: false,
+  occurrence_assignment: false,
+  occurrence_consolidation: false,
+  // The reading's recovery of a voice note or image upstream Chatwoot no longer holds, with the inbox
+  // agent's speech-to-text and vision, billed to the monitor and never to the agent.
+  occurrence_transcription: false,
+  occurrence_vision: false,
+} as const satisfies Record<string, boolean>;
 
-// Consumed as an EXCLUSION, with `node: null` kept beside it: a row from before this column was
-// always written is an agent turn, because the agent path was the only one in the ledger then. An
-// inclusion list would drop those rows instead, and move every historical involvement number.
-export const NON_AGENT_TURN_NODES: readonly string[] = Object.freeze(
-  Object.entries(USAGE_NODE_IS_AGENT_TURN)
-    .filter(([, isTurn]) => !isTurn)
-    .map(([node]) => node),
+// The step a billed call is recorded under. `UsageCapture`, `recordDirectUsage` and `buildCallbacks`
+// take only this, so the vocabulary is the map above and nothing else.
+export type UsageNode = keyof typeof IS_AGENT_TURN;
+
+export const USAGE_NODE_IS_AGENT_TURN: Readonly<Record<UsageNode, boolean>> =
+  Object.freeze(IS_AGENT_TURN);
+
+// Consumed as an EXCLUSION, with `node: null` kept beside it: a row with no node is an agent turn,
+// and an inclusion list would drop those rows and move every past involvement number.
+export const NON_AGENT_TURN_NODES: readonly UsageNode[] = Object.freeze(
+  (Object.keys(USAGE_NODE_IS_AGENT_TURN) as UsageNode[]).filter(
+    (node) => !USAGE_NODE_IS_AGENT_TURN[node],
+  ),
 );
 
 function sysCtx(tenantId: bigint): TenantContext {
@@ -311,7 +348,7 @@ export function isTenantPrice(priceTable: string | null | undefined): boolean {
   return priceTable?.startsWith("tenant-override@") ?? false;
 }
 
-// The price of one call as this tenant pays it (issues #863, #865): its own price for the provider
+// The price of one call as this tenant pays it: its own price for the provider
 // and model when it saved one, the table's otherwise. An unreadable settings row prices from the
 // table and says so in the log; pricing never fails the capture it belongs to.
 async function priceRow(
@@ -344,8 +381,8 @@ async function priceRow(
       "usage: tenant prices unreadable, pricing from the table",
     );
   }
-  // The tenant's own price first, because it is what the account says it pays; then what OpenRouter
-  // said it charged (issue #866); then the table.
+  // The tenant's own price first, because it is what the account says it pays; then what
+  // OpenRouter said it charged; then the table.
   const priced = priceCall(provider, model, tokens, new Date(), overrides);
   if (isTenantPrice(priced.priceTable) || reported === null) return priced;
   return { costUsd: reported, priceTable: OPENROUTER_REPORTED_PRICE_TABLE };
@@ -369,46 +406,64 @@ export function defaultUsagePersist(
           model: row.model,
           node: row.node ?? undefined,
           source: row.source,
+          anonymous: row.anonymous ?? false,
           promptTokens: row.promptTokens,
           completionTokens: row.completionTokens,
           cachedReadTokens: row.cachedReadTokens,
           cacheCreationTokens: row.cacheCreationTokens,
+          cacheCreation1hTokens: row.cacheCreation1hTokens,
           durationMs:
             row.durationMs === null ? undefined : Math.round(row.durationMs),
           costUsd: row.costUsd ?? undefined,
           priceTable: row.priceTable,
         },
       });
-      // Fleet event (the subscriber consolidates). Same scoped tx as the row; allowlisted
-      // numerics/ids only. Best-effort for the domain — never break usage capture on a fan-out
-      // failure (this whole persist is already wrapped in a try/catch by the caller).
+      // NOTE: Fleet event (the subscriber consolidates), in the same scoped tx as the row;
+      // allowlisted numerics/ids only. A fan-out failure never breaks usage capture: the caller
+      // wraps this whole persist in a try/catch.
       await emitOutbound(db, row.tenantId, "llm.usage", {
         agent_id: row.agentId != null ? String(row.agentId) : null,
         conversation_id:
           row.conversationId != null ? String(row.conversationId) : null,
         inbox_id: row.inboxId != null ? String(row.inboxId) : null,
+        // NOTE: the same id as the ledger row and the turn's execution-log lines, so a subscriber
+        // joins a call to its turn exactly; null for a call no turn made (memory compaction).
+        turn_id: row.turnId ?? null,
         source: row.source,
         model: row.model,
         // NOTE: the call type ("agent", "nudge", "tts_normalize", …). A fleet subscriber that only
-        // sums tokens now sees the same split the dashboard does, instead of one undifferentiated
-        // total in which a secondary call looks like a second customer turn.
+        // sums tokens sees the same split the dashboard does, so a secondary call does not look
+        // like a second customer turn.
         node: row.node,
         prompt_tokens: row.promptTokens,
         completion_tokens: row.completionTokens,
         cached_read_tokens: row.cachedReadTokens,
         cache_creation_tokens: row.cacheCreationTokens,
+        cache_creation_1h_tokens: row.cacheCreation1hTokens,
       });
     });
+    // An unmetered call has no price to configure: the alert's remedy (a price, then a reprice)
+    // does not apply to it.
+    if (row.costUsd === null && row.priceTable !== UNMETERED_PRICE_TABLE) {
+      await announceUnpricedModel({
+        tenantId: row.tenantId,
+        model: row.model,
+        source: row.source,
+        base,
+      });
+    }
   };
 }
 
 export interface TokenUsage {
   promptTokens: number;
   completionTokens: number;
-  // Cached input — a discounted SUBSET of promptTokens (never added on top): read-from-cache
+  // Cached input, a discounted SUBSET of promptTokens (never added on top): read-from-cache
   // (OpenAI/Anthropic/Google) and cache-write (Anthropic, premium).
   cachedReadTokens: number;
   cacheCreationTokens: number;
+  // Of cacheCreationTokens, the writes under the 1-hour TTL (Anthropic's per-TTL split).
+  cacheCreation1hTokens: number;
 }
 
 function num(v: unknown): number {
@@ -417,18 +472,16 @@ function num(v: unknown): number {
 }
 
 // Pulls prompt/completion + cached token counts from an LLMResult across the provider shapes
-// LangChain exposes: the normalized `usage_metadata` on the generation message (preferred —
-// consistent across providers; carries `input_token_details.{cache_read,cache_creation}` in
-// LangChain v1.x), then the OpenAI-style `llmOutput.tokenUsage`, then the Anthropic-style
-// `llmOutput.usage`. Cached counts are best-effort across the legacy bags too.
-//
-// The question every branch here answers is not "did it carry a number" but "did it carry every
-// counter the provider BILLED" (issue #334). Two of them used to answer no.
+// LangChain exposes: the normalized `usage_metadata` on the generation message (preferred, since it
+// is consistent across providers and carries `input_token_details.{cache_read,cache_creation}`),
+// then the OpenAI-style `llmOutput.tokenUsage`, then the Anthropic-style `llmOutput.usage`. Every
+// branch must count every counter the provider BILLED, not merely some number.
 export function extractTokenUsage(output: LLMResult): TokenUsage {
   let promptTokens = 0;
   let completionTokens = 0;
   let cachedReadTokens = 0;
   let cacheCreationTokens = 0;
+  let cacheCreation1hTokens = 0;
   for (const gens of output.generations ?? []) {
     for (const gen of gens) {
       // biome-ignore lint/suspicious/noExplicitAny: generation message shape is provider-dependent.
@@ -437,27 +490,37 @@ export function extractTokenUsage(output: LLMResult): TokenUsage {
         const input = num(meta.input_tokens);
         const generated = num(meta.output_tokens);
         promptTokens += input;
-        // NOTE: the remainder of the provider's OWN total is generation the integration could not name,
-        // and it is billed all the same. Gemini is the live case: `convertUsageMetadata` maps
-        // `output_tokens` from `candidatesTokenCount` alone and reads `thoughtsTokenCount` nowhere,
-        // so with thinking on (the default of the current generation) every turn recorded less
-        // output than it cost. The API reference defines the total as prompt + thoughts +
-        // candidates, so the gap IS the thinking, and `total_tokens` is the only trace of it that
-        // survives into `usage_metadata`.
-        //   Inert everywhere else by construction: OpenAI's total is prompt + completion exactly
-        // (reasoning already inside completion), Anthropic's is summed upstream before it gets
-        // here, and a response with no total at all leaves the term at zero.
-        //   The premise that the gap is only thinking is fenced, not assumed: Gemini also folds
-        // `toolUsePromptTokenCount` into the total, which is populated only by its BUILT-IN tools
-        // (Search grounding, code execution, URL context). We enable none — client-side function
-        // declarations are ordinary prompt tokens — and tests/graph/usage-provider-counts.test.ts
-        // goes red the day one is turned on.
+        // NOTE: The remainder of the provider's OWN total is billed generation the integration
+        // could not name. Gemini's `output_tokens` comes from `candidatesTokenCount` alone, and its
+        // total is prompt + thoughts + candidates, so the gap IS the thinking. Inert elsewhere:
+        // OpenAI's total is prompt + completion, Anthropic's is summed upstream, no total is zero.
+        // Gemini also folds `toolUsePromptTokenCount` (its BUILT-IN tools only; our function
+        // declarations are ordinary prompt tokens) into the total; we enable none, and
+        // tests/graph/usage-provider-counts.test.ts goes red if one is turned on.
         completionTokens +=
           generated + Math.max(0, num(meta.total_tokens) - input - generated);
         const det = meta.input_token_details;
         if (det) {
           cachedReadTokens += num(det.cache_read);
-          cacheCreationTokens += num(det.cache_creation);
+          if (det.cache_creation_1h !== undefined) {
+            // The 1-hour share `splitOneHourWrites` moved out of `cache_creation`: the two add up
+            // to the call's writes.
+            cacheCreationTokens +=
+              num(det.cache_creation) + num(det.cache_creation_1h);
+            cacheCreation1hTokens += num(det.cache_creation_1h);
+          } else {
+            // An unsplit message (a stream merged by its caller): `cache_creation` is the total,
+            // and the 1-hour share is in the raw usage ChatAnthropic keeps on the message.
+            const writes = num(det.cache_creation);
+            cacheCreationTokens += writes;
+            cacheCreation1hTokens += Math.min(
+              writes,
+              anthropicOneHourWrites(
+                // biome-ignore lint/suspicious/noExplicitAny: provider-shaped response metadata.
+                (gen as any).message?.response_metadata?.usage,
+              ),
+            );
+          }
         }
       }
     }
@@ -468,6 +531,10 @@ export function extractTokenUsage(output: LLMResult): TokenUsage {
       completionTokens,
       cachedReadTokens,
       cacheCreationTokens,
+      cacheCreation1hTokens: Math.min(
+        cacheCreation1hTokens,
+        cacheCreationTokens,
+      ),
     };
   }
   // biome-ignore lint/suspicious/noExplicitAny: llmOutput is an untyped provider bag.
@@ -477,18 +544,19 @@ export function extractTokenUsage(output: LLMResult): TokenUsage {
     return {
       promptTokens: num(tu.promptTokens),
       completionTokens: num(tu.completionTokens),
-      // OpenAI raw exposes the cached subset under prompt_tokens_details.cached_tokens.
+      // NOTE: OpenAI raw exposes the cached subset under prompt_tokens_details.cached_tokens.
       cachedReadTokens: num(tu.promptTokensDetails?.cachedTokens),
       cacheCreationTokens: 0,
+      cacheCreation1hTokens: 0,
     };
   }
   const u = out.usage;
   if (u && (u.input_tokens != null || u.output_tokens != null)) {
-    // NOTE: Anthropic raw exposes cache read/write as their own counters, and they are ADDITIVE
+    // Anthropic raw exposes cache read/write as their own counters, and they are ADDITIVE
     // here. `input_tokens` is documented as the tokens that were NOT read from or used to create a
     // cache, so the billed input is the sum of the three. That is the opposite of what this row means by
     // `cachedReadTokens` (a discounted SUBSET of `promptTokens`), which is why the sum happens here
-    // rather than at the reader — and it is what `ChatAnthropic` itself does in `buildUsageMetadata`
+    // rather than at the reader, and it is what `ChatAnthropic` itself does in `buildUsageMetadata`
     // before handing over the normalized path above.
     const cacheRead = num(u.cache_read_input_tokens);
     const cacheCreation = num(u.cache_creation_input_tokens);
@@ -497,6 +565,7 @@ export function extractTokenUsage(output: LLMResult): TokenUsage {
       completionTokens: num(u.output_tokens),
       cachedReadTokens: cacheRead,
       cacheCreationTokens: cacheCreation,
+      cacheCreation1hTokens: Math.min(anthropicOneHourWrites(u), cacheCreation),
     };
   }
   return {
@@ -504,22 +573,30 @@ export function extractTokenUsage(output: LLMResult): TokenUsage {
     completionTokens: 0,
     cachedReadTokens: 0,
     cacheCreationTokens: 0,
+    cacheCreation1hTokens: 0,
   };
 }
 
-// The `price_table` of a row whose cost OpenRouter itself reported (issue #866).
+// Anthropic's `usage.cache_creation.ephemeral_1h_input_tokens`: the writes made under the 1-hour TTL,
+// a subset of `cache_creation_input_tokens`. Zero for any other shape.
+function anthropicOneHourWrites(usage: unknown): number {
+  if (!usage || typeof usage !== "object") return 0;
+  const split = (usage as { cache_creation?: unknown }).cache_creation;
+  if (!split || typeof split !== "object") return 0;
+  return num(
+    (split as { ephemeral_1h_input_tokens?: unknown })
+      .ephemeral_1h_input_tokens,
+  );
+}
+
+// The `price_table` of a row whose cost OpenRouter itself reported.
 export const OPENROUTER_REPORTED_PRICE_TABLE = "openrouter:reported";
 
-// WHAT OPENROUTER SAID THE CALL COST, when it said so in a way that can stand for the whole charge.
-//
-// OpenRouter returns `usage.cost` on every chat completion, streamed or not, without being asked
-// (its usage-accounting page: `usage: { include: true }` is "deprecated and [has] no effect"), and
-// `ChatOpenAI` copies the raw `usage` object whole into the AI message's `response_metadata.usage`,
-// on the non-streamed path and on the streamed one's final chunk alike. The unit is credits, and its
-// FAQ says the credit system's "base currency is US dollars".
-//
-// What the figure is, and when it cannot stand, is `reportedCostFromUsage`'s
-// (src/modules/pricing/reported.ts), shared with the image reader's direct call.
+// WHAT OPENROUTER SAID THE CALL COST, when it can stand for the whole charge. OpenRouter returns
+// `usage.cost` (credits, whose base currency is USD) on every chat completion without being asked,
+// and `ChatOpenAI` copies the raw `usage` into `response_metadata.usage`, on the non-streamed path
+// and on the streamed one's final chunk alike. When the figure cannot stand is decided by
+// `reportedCostFromUsage` (src/modules/pricing/reported.ts), shared with the image reader.
 export function reportedCostUsd(
   provider: string,
   output: LLMResult,
@@ -541,12 +618,8 @@ export function reportedCostUsd(
 
 // The attribution a SECONDARY billed call inherits from the turn it belongs to. A turn's own call
 // gets these from the loaded agent config; a call made beside it (the guardrail analysis, a vision
-// extraction) holds a FlowContext and nothing else, and that context already carries exactly the
-// five fields a row needs.
-//
-// Reading them from one place is what keeps the two apart from a third possibility, measured in
-// #316 and the reason this exists: a billed call attributed to NOTHING, because the code that made
-// it had no way to say where it came from and so wrote no row at all.
+// extraction) holds only a FlowContext, which carries exactly the fields a row needs. One reader
+// means no billed call is left with no way to say where it came from, and so no row at all.
 export function usageAttribution(flow: FlowContext): {
   tenantId: bigint;
   agentId: bigint | null;
@@ -555,6 +628,7 @@ export function usageAttribution(flow: FlowContext): {
   threadId: string | null;
   turnId: string | null;
   source: UsageSource;
+  anonymous: boolean;
   base?: PrismaClient;
 } {
   return {
@@ -564,37 +638,33 @@ export function usageAttribution(flow: FlowContext): {
     inboxId: flow.inboxId ?? null,
     threadId: flow.threadId ?? null,
     turnId: flow.turnId ?? null,
-    // FlowSource and UsageSource are the same two values ("inbox" | "playground") for the same
-    // reason: a row and a log line about one call must not disagree about which traffic it was.
+    // NOTE: FlowSource IS UsageSource: a row and a log line about one call must not disagree about
+    // which traffic it was.
     source: flow.source,
+    anonymous: flow.anonymous ?? false,
     base: flow.base,
   };
 }
 
 // Records a billed call that did NOT go through LangChain, so no callback could have seen it: a
-// provider reached by raw fetch (vision). Best-effort, like the callback path — a ledger write
-// never breaks the call it is about.
-//
-// BOTH BOOKS, from one call site (#426, review round 2). The row below is the ledger; the dollar
-// ceiling reads Langfuse, which only prices the generations it was shown, and a call the LangChain
-// handler never saw is a call Langfuse never costed. So the same function writes the generation
-// too (`recordDirectGeneration`), with the tenant's own Langfuse resolved here rather than carried
-// in: the callers hold a `FlowContext`, and a context that had to carry a Langfuse credential to
-// every attachment would be the next thing a call site forgets to thread. A tenant with no Langfuse
-// keeps the row and skips the trace, which is the same asymmetry the turn path has.
+// provider reached by raw fetch (vision). Best-effort: a ledger write never breaks its call. It
+// writes the ledger row, which every cost figure reads, and a Langfuse generation
+// (`recordDirectGeneration`) so the call shows up in the turn's trace like any other. The tenant's
+// Langfuse is resolved here rather than carried in the `FlowContext`, so no call site has to thread
+// a credential. A tenant with no Langfuse keeps the row and skips the trace, as on the turn path.
 export async function recordDirectUsage(
   flow: FlowContext,
   row: {
     provider: string;
     model: string;
-    node: string;
+    node: UsageNode;
     promptTokens: number;
     completionTokens: number;
     cachedReadTokens?: number;
     cacheCreationTokens?: number;
     // How long the caller waited on the provider, retries included, when it measured it.
     durationMs?: number;
-    // What the provider said the call cost, when it did (issue #866).
+    // What the provider said the call cost, when it did.
     reportedCostUsd?: number | null;
   },
 ): Promise<void> {
@@ -608,6 +678,8 @@ export async function recordDirectUsage(
     completionTokens: row.completionTokens,
     cachedReadTokens: row.cachedReadTokens ?? 0,
     cacheCreationTokens: row.cacheCreationTokens ?? 0,
+    // A direct call carries no cache mark, so it never writes under the 1-hour TTL.
+    cacheCreation1hTokens: 0,
     durationMs: row.durationMs ?? null,
     ...(await priceRow(
       attr.tenantId,
@@ -659,6 +731,34 @@ export async function recordDirectUsage(
   }
 }
 
+// A billed call whose provider reports no usage the table can price (a speech-to-text provider
+// answers words, not tokens): one row per call, with no tokens and no cost, so the step's own line
+// counts it and the ledger says it was not priced instead of showing it as free.
+export async function recordUnmeteredCall(
+  flow: FlowContext,
+  row: { model: string; node: UsageNode; durationMs?: number },
+): Promise<void> {
+  const usageRow: UsageRow = {
+    ...usageAttribution(flow),
+    model: row.model,
+    node: row.node,
+    promptTokens: 0,
+    completionTokens: 0,
+    cachedReadTokens: 0,
+    cacheCreationTokens: 0,
+    cacheCreation1hTokens: 0,
+    durationMs: row.durationMs ?? null,
+    costUsd: null,
+    priceTable: UNMETERED_PRICE_TABLE,
+  };
+  noteTurnUsage(usageRow);
+  try {
+    await defaultUsagePersist(flow.base)(usageRow);
+  } catch (err) {
+    logger.warn({ err, node: row.node }, "usage: unmetered capture failed");
+  }
+}
+
 export interface UsageCaptureParams {
   tenantId: bigint;
   agentId?: bigint | null;
@@ -666,11 +766,12 @@ export interface UsageCaptureParams {
   inboxId?: bigint | null;
   threadId?: string | null;
   turnId?: string | null;
-  // The provider of `model`, for its price (issue #863).
+  // The provider of `model`, for its price.
   provider: string;
   model: string;
-  node?: string | null;
+  node?: UsageNode | null;
   source?: UsageSource;
+  anonymous?: boolean;
   persist?: UsagePersist;
   base?: PrismaClient;
 }
@@ -688,8 +789,9 @@ export class UsageCapture extends BaseCallbackHandler {
   private readonly turnId: string | null;
   private readonly provider: string;
   private readonly model: string;
-  private readonly node: string | null;
+  private readonly node: UsageNode | null;
   private readonly source: UsageSource;
+  private readonly anonymous: boolean;
   private readonly persist: UsagePersist;
   private readonly base: PrismaClient | undefined;
 
@@ -705,6 +807,7 @@ export class UsageCapture extends BaseCallbackHandler {
     this.model = params.model;
     this.node = params.node ?? null;
     this.source = params.source ?? "inbox";
+    this.anonymous = params.anonymous ?? false;
     this.persist = params.persist ?? defaultUsagePersist(params.base);
     this.base = params.base;
   }
@@ -729,11 +832,9 @@ export class UsageCapture extends BaseCallbackHandler {
   ): Promise<void> {
     this.runStart.set(runId, performance.now());
     const named = metadata?.[USAGE_MODEL_METADATA_KEY];
-    // PRESENT, not truthy. An empty name is what a model-less `openai-compatible` fallback is
-    // called — the server picks, so there is no id to record, and `""` is exactly what this ledger
-    // already stores for a PRIMARY pointed at such an endpoint (`cfg.mc.model`). Discarding it as
-    // falsy sent the row to `this.model` instead, which is the primary's name: a call that never
-    // reached that vendor, billed to it, in the one column this table has for saying who answered.
+    // NOTE: PRESENT, not truthy. A model-less `openai-compatible` fallback is named `""` (the
+    // server picks), as the ledger stores for such a PRIMARY (`cfg.mc.model`); dropping it as falsy
+    // would bill the row to `this.model`, the primary's name, a vendor that call never reached.
     if (typeof named === "string") this.runModel.set(runId, named);
     const namedProvider = metadata?.[USAGE_PROVIDER_METADATA_KEY];
     if (typeof namedProvider === "string")
@@ -752,6 +853,7 @@ export class UsageCapture extends BaseCallbackHandler {
       completionTokens,
       cachedReadTokens,
       cacheCreationTokens,
+      cacheCreation1hTokens,
     } = extractTokenUsage(output);
     // The pair, never one half: a named model is priced as its own provider's or not at all.
     const named = this.runModel.get(runId);
@@ -776,10 +878,12 @@ export class UsageCapture extends BaseCallbackHandler {
       model,
       node: this.node,
       source: this.source,
+      anonymous: this.anonymous,
       promptTokens,
       completionTokens,
       cachedReadTokens,
       cacheCreationTokens,
+      cacheCreation1hTokens,
       durationMs,
       ...(await priceRow(
         this.tenantId,
@@ -789,6 +893,7 @@ export class UsageCapture extends BaseCallbackHandler {
           promptTokens,
           cachedReadTokens,
           cacheCreationTokens,
+          cacheCreation1hTokens,
           completionTokens,
         },
         this.base,

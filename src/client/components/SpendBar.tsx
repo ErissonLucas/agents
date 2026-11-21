@@ -11,21 +11,22 @@ type Usage = NonNullable<
 >;
 export type SpendUsageEntry = Usage["entries"][number];
 
-export const SPEND_NOT_CONFIGURED = "langfuse-not-configured";
-
-// THE BAR AND ITS CAVEATS, SHARED BY THE TWO SCREENS THAT SHOW THEM (issue #427). The ceiling is
-// set in the Advanced panel and watched on the dashboard, and the two would drift the moment one of
-// them learned about a new snapshot state the other did not: the colour thresholds, the "of"
-// phrasing and every warning below the bar live here once. What the state MEANS is the gate's own
-// verdict, sent by the API, so the screen and the runtime cannot disagree either.
+// THE BAR AND ITS CAVEATS, SHARED BY THE TWO SCREENS THAT SHOW THEM. The ceiling is set in the
+// Advanced panel and watched on the dashboard, and the two would drift the moment one of them
+// learned about a new snapshot state the other did not: the colour thresholds, the "of" phrasing
+// and every warning below the bar live here once. What the state MEANS is the gate's own verdict,
+// sent by the API, so the screen and the runtime cannot disagree either. With the ceiling off there is
+// nothing to fill a bar against: the figure stands alone.
 export function SpendBar({
   label,
   entry,
   money,
+  enabled,
 }: {
   label: string;
   entry: SpendUsageEntry | undefined;
   money: Intl.NumberFormat;
+  enabled: boolean;
 }) {
   const { t } = useTranslation();
   const used = entry?.usedUsd ?? 0;
@@ -36,7 +37,7 @@ export function SpendBar({
   return (
     <>
       <div className="flex items-baseline justify-between gap-2">
-        <span className="font-medium text-sm text-text-secondary">{label}</span>
+        <span className="text-text-secondary text-sm font-medium">{label}</span>
         <span
           className={cn("text-sm tabular-nums", {
             "text-text-muted": state === "allowed",
@@ -44,65 +45,67 @@ export function SpendBar({
             "text-error": state === "over",
           })}
         >
-          {ceiling === null
-            ? t("spendCeiling.usage.noCeiling", "{{used}} (no ceiling)", {
-                used: money.format(used),
-              })
-            : t("spendCeiling.usage.ofCeiling", "{{used}} of {{ceiling}}", {
-                used: money.format(used),
-                ceiling: money.format(ceiling),
-              })}
+          {!enabled
+            ? money.format(used)
+            : ceiling === null
+              ? t("spendCeiling.usage.noCeiling", "{{used}} (no ceiling)", {
+                  used: money.format(used),
+                })
+              : t("spendCeiling.usage.ofCeiling", "{{used}} of {{ceiling}}", {
+                  used: money.format(used),
+                  ceiling: money.format(ceiling),
+                })}
         </span>
       </div>
-      <div
-        className="h-1.5 w-full overflow-hidden rounded-full bg-bg-tertiary"
-        role="progressbar"
-        aria-label={label}
-        aria-valuenow={ceiling === null ? undefined : Math.round(pct)}
-        aria-valuemin={0}
-        aria-valuemax={100}
-      >
+      {enabled && (
         <div
-          className={cn("h-full rounded-full transition-all", {
-            "bg-accent": state === "allowed",
-            "bg-warning": state === "warning",
-            "bg-error": state === "over",
-          })}
-          style={{ width: `${ceiling === null ? 0 : pct}%` }}
-        />
-      </div>
+          className="bg-bg-tertiary h-1.5 w-full overflow-hidden rounded-full"
+          role="progressbar"
+          aria-label={label}
+          aria-valuenow={ceiling === null ? undefined : Math.round(pct)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+        >
+          <div
+            className={cn("h-full rounded-full transition-all", {
+              "bg-accent-solid": state === "allowed",
+              "bg-warning": state === "warning",
+              "bg-error": state === "over",
+            })}
+            style={{ width: `${ceiling === null ? 0 : pct}%` }}
+          />
+        </div>
+      )}
     </>
   );
 }
 
 // Everything the figure above cannot be trusted for, said beside it or said nowhere: when it was
-// last refreshed, whether the poll is failing, whether the row is a sentinel the gate lets through,
-// and how much of the month Langfuse actually priced.
+// last refreshed, whether the poll is failing, and which calls of the month it leaves out for want of
+// a price. With the ceiling off the figure is summed at read time, so only that last line applies.
+// `briefUnpriced` says only how many calls are left out, for a page that already names the models and
+// links to their prices beside the figure.
 export function SpendHealthLines({
   entry,
   when,
-  money,
+  enabled,
+  briefUnpriced,
 }: {
   entry: SpendUsageEntry | undefined;
   when: (iso: string) => string;
-  money: Intl.NumberFormat;
+  enabled: boolean;
+  briefUnpriced?: boolean;
 }) {
   const { t } = useTranslation();
   if (!entry) return null;
-  const failing =
-    entry.pollError && entry.pollError !== SPEND_NOT_CONFIGURED
-      ? entry.pollError
-      : null;
-  const uncosted =
-    entry.ledgerCalls > 0 && entry.costedCalls < entry.ledgerCalls;
   return (
-    <div className="flex flex-col gap-0.5 text-text-muted text-xs">
-      {entry.polledAt && (
+    <div className="text-text-muted flex flex-col gap-0.5 text-xs">
+      {enabled && entry.polledAt && (
         <span className={cn({ "text-warning": entry.stale })}>
           {entry.stale
             ? t(
                 "spendCeiling.usage.stale",
-                "Not refreshed since {{when}}. The last figure stands, and it can only undercount.",
+                "Not refreshed since {{when}}. The last figure stands.",
                 { when: when(entry.polledAt) },
               )
             : t("spendCeiling.usage.updated", "Refreshed {{when}}", {
@@ -110,15 +113,7 @@ export function SpendHealthLines({
               })}
         </span>
       )}
-      {entry.pollError === SPEND_NOT_CONFIGURED && (
-        <span className="text-warning">
-          {t(
-            "spendCeiling.usage.unenforced",
-            "Not enforced on this half: the last reading found no Langfuse, so calls go through until it is configured and read again.",
-          )}
-        </span>
-      )}
-      {entry.polledAt === null && entry.pollError !== SPEND_NOT_CONFIGURED && (
+      {enabled && entry.polledAt === null && (
         <span className="text-warning">
           {t(
             "spendCeiling.usage.unpolled",
@@ -126,39 +121,32 @@ export function SpendHealthLines({
           )}
         </span>
       )}
-      {failing && entry.pollFailedAt && (
+      {enabled && entry.pollError && entry.pollFailedAt && (
         <span className="text-warning">
           {t(
             "spendCeiling.usage.pollFailing",
-            "Reading the cost from Langfuse has been failing since {{when}}: {{error}}",
-            { when: when(entry.pollFailedAt), error: failing },
+            "Reading the month's cost has been failing since {{when}}: {{error}}",
+            { when: when(entry.pollFailedAt), error: entry.pollError },
           )}
         </span>
       )}
-      {uncosted && (
+      {entry.unpricedCalls > 0 && briefUnpriced && (
         <span className="text-warning">
           {t(
-            "spendCeiling.usage.coverage",
-            "Langfuse priced {{costed}} of the {{ledger}} calls this month, so the figure undercounts.",
-            { costed: entry.costedCalls, ledger: entry.ledgerCalls },
+            "spendCeiling.usage.unpricedBrief",
+            "{{n}} calls this month have no price and are not in this figure.",
+            { count: entry.unpricedCalls, n: entry.unpricedCalls },
           )}
         </span>
       )}
-      {entry.carriedUsd > 0 && (
-        <span>
-          {t(
-            "spendCeiling.usage.carried",
-            "Includes {{carried}} spent in a Langfuse project this tenant no longer points at, carried over when it switched mid-month, so the figure is higher than the current project's own total.",
-            { carried: money.format(entry.carriedUsd) },
-          )}
-        </span>
-      )}
-      {entry.unpricedModels.length > 0 && (
+      {entry.unpricedCalls > 0 && !briefUnpriced && (
         <span className="text-warning">
           {t(
             "spendCeiling.usage.unpriced",
-            "No price in Langfuse for: {{models}}",
+            "{{n}} calls this month have no price and are not in the figure: {{models}}. Set this account's own price for the model, then re-price them.",
             {
+              count: entry.unpricedCalls,
+              n: entry.unpricedCalls,
               models: entry.unpricedModels.join(", "),
             },
           )}

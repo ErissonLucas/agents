@@ -6,58 +6,24 @@ import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import { redactEndpoint } from "@/modules/audit/projection";
 import { consoleUrl } from "@/modules/mcp/console-links";
+import { proactiveBreakerSettingsUrl } from "@/modules/proactive-breaker/service";
+import { turnLimitSettingsUrl } from "@/modules/turn-limit/service";
 import { resolveSigningSecret } from "@/modules/vault/service";
 import { outboundHeaders } from "@/modules/webhooks/outbound/signing";
+import { approvalRequestOfCause, RECOVERY_RATE_KEY } from "./alerts";
 
-// THE ONE PLACE THAT TURNS AN ALERT INTO AN HTTP REQUEST (issue #605).
-//
-// Two callers: the worker delivering a queued alert, and the console's Test button probing a channel
-// before an incident does. They agree on everything that decides whether an alert ARRIVES — the
-// decrypted URL, the SSRF guard, the signing secret, the body shape, the headers, the refusal to
-// follow a redirect, the timeout — and differ only in what they do with the answer: the worker moves
-// a row through DELIVERED / PENDING / DEAD, the probe hands the outcome to a person.
-//
-// It is one function rather than two because a test button that exercises a DIFFERENT path from the
-// real send is worse than no button: it approves a channel whose alerts will never arrive, which is
-// the failure the issue is about, one level up. This repo already has the other shape next door —
-// `webhooks/outbound/test.ts` re-states the outbound worker's rules in its own words and the two are
-// kept in step by hand — and the alerting module is where that cost is highest, because nothing
-// downstream notices when this bus goes quiet.
+// The one place an alert becomes an HTTP request. The worker and the console's Test button both
+// call it, so a green test is evidence about the path a real alert takes; they differ only in what
+// they do with the answer (move a delivery row, or show the outcome to a person).
 
 const REQUEST_TIMEOUT_MS = 10_000;
 const MAX_ERROR_LEN = 500;
 
-// THE CHANNEL'S URL IS A SECRET, AND ONE FETCH ERROR QUOTES IT BACK (holdout of #605, s10).
-//
-// A Discord webhook URL embeds a bot token, which is why the column is an `encryptJson` blob and the
-// DTO returns `scheme://host/…`. Bun's `UnexpectedRedirect` names the URL it was fetching, in full,
-// and that string is what the worker stores in `alert_deliveries.last_error` — measured there on the
-// base, so the leak predates this change — and what the new test route, the MCP tool and the console
-// toast now put in front of an operator and into anything that logs a response.
-//
-// Every URL in the message is reduced to the same masked form the read already shows, and nothing
-// else is touched: the neighbouring failures were characterised in the same holdout and none of them
-// carries more than the host (`getaddrinfo ENOTFOUND <host>`, "Unable to connect", "unknown
-// certificate verification error", "The operation timed out."). A host is what `redactEndpoint`
-// keeps, so the advice the operator needs survives the redaction.
-//
-// TWO PASSES, AND THE FIRST ONE IS THE ONE THAT HAS TO BE RIGHT (review round 3).
-//
-// The exact destination is KNOWN here — it was just decrypted — so it is replaced by literal string
-// match, which cannot be defeated by what a URL happens to contain. A regex alone can: the first
-// version of this stopped at `]`, so `https://[2606:4700::1111]/hooks/private-token` matched only up
-// to the bracket, failed to parse, collapsed to "…" and left `]/hooks/private-token` standing. The
-// same hole opens on any path character the class excludes. Guessing where a URL ENDS is the wrong
-// job to give the thing guarding a token.
-//
-// The regex is the backstop, for URLs this function does not know: a redirect TARGET the destination
-// chose, or a second URL some future error text quotes. It now stops only at whitespace and quotes,
-// and over-matching is harmless because every match is replaced by `scheme://host/…` regardless —
-// trailing punctuation swept in with it is dropped by the same rewrite.
-//
-// It requires a scheme on purpose. A bare host in a DNS failure is not matched and stays readable,
-// which is the difference between telling someone their hostname does not resolve and telling them
-// "…".
+// A channel URL is a secret (a Discord webhook embeds a bot token), and some fetch errors (Bun's
+// `UnexpectedRedirect`) quote it in full. The known destination is masked first by literal match,
+// because a regex cannot be trusted to find where a URL ends; this regex is the backstop for URLs
+// the caller does not know, such as a redirect target. Every match collapses to `scheme://host/…`,
+// so over-matching is harmless, and the required scheme leaves a bare host in a DNS error readable.
 const URL_IN_TEXT = /\b[a-z][a-z0-9+.-]*:\/\/[^\s"']+/gi;
 
 function maskUrlsIn(text: string, known?: string): string {
@@ -68,10 +34,10 @@ function maskUrlsIn(text: string, known?: string): string {
   return withoutKnown.replace(URL_IN_TEXT, (u) => redactEndpoint(u));
 }
 
-// `sanitizeErrorMessage` rather than a bare cut: this string is stored in `last_error`, and the
-// exceptions a delivery produces wrap what the remote endpoint answered. See issue #243 and the
-// function's own header for why a NUL or an orphan surrogate costs the whole write. The masking runs
-// FIRST, so the 500-character cut cannot leave half a token behind by truncating mid-URL.
+// `sanitizeErrorMessage` rather than a bare cut: this string is stored in `last_error` and wraps
+// what the remote endpoint answered, and a NUL or an orphan surrogate costs the whole write (see
+// that function's header). The masking runs FIRST, so the 500-character cut cannot leave half a
+// token.
 export function alertErrMsg(err: unknown, url?: string): string {
   return sanitizeErrorMessage(
     maskUrlsIn(err instanceof Error ? err.message : String(err), url),
@@ -92,12 +58,84 @@ export interface AlertSendTarget {
   level: string;
   summary: string;
   count: number;
-  // Where the first event of the window happened (issue #665). The tenant is what the links carry
-  // so the console opens on it; the two ids are null on a probe and on a row written before the
-  // columns existed, and then the body carries no link.
+  // Where the first event of the window happened. The tenant is what the links carry so the console
+  // opens on it; the two ids are null on a probe and on a row written before the columns existed,
+  // and then the body carries no link.
   tenantId: bigint | null;
   turnId: string | null;
   conversationId: bigint | null;
+  // The agent of the first event, for a link to its settings. Absent on a probe.
+  agentId?: bigint | null;
+  // Set on a cause alert: its burst gathers every line of the cause, whatever level each was
+  // written at, so the list it links to is not narrowed by level.
+  causeKey: string | null;
+  // Where the alert came from, read when it is sent. Null on a send that resolved none.
+  context?: AlertContext | null;
+}
+
+// What an operator needs to place an alert without opening it: names the operator configured (the
+// tenant, the agent, the inbox) and the conversation's number in Chatwoot, never anything of the
+// customer's. `firstAt` is when the window's first event happened, shown on a burst.
+export interface AlertContext {
+  tenantName: string | null;
+  agentName: string | null;
+  inboxName: string | null;
+  chatwootConversationId: number | null;
+  firstAt: Date | null;
+}
+
+// Read under the alert's own tenant. Best-effort by the caller: a context that cannot be read leaves
+// the alert as it was, never undelivered.
+export async function loadAlertContext(
+  base: PrismaClient,
+  a: {
+    tenantId: bigint;
+    conversationId: bigint | null;
+    agentId: bigint | null;
+    firstAt?: Date | null;
+  },
+): Promise<AlertContext> {
+  const ctx: TenantContext = {
+    tenantId: a.tenantId,
+    userId: null,
+    role: "TENANT_ADMIN",
+  };
+  return runScopedOn(base, ctx, async (db) => {
+    const [tenant, conv, agent] = await Promise.all([
+      db.tenant.findUnique({
+        where: { id: a.tenantId },
+        select: { name: true },
+      }),
+      a.conversationId == null
+        ? null
+        : db.conversation.findUnique({
+            where: { id: a.conversationId },
+            select: {
+              chatwootConversationId: true,
+              inbox: { select: { name: true } },
+            },
+          }),
+      a.agentId == null
+        ? null
+        : db.agent.findUnique({
+            where: { id: a.agentId },
+            select: { name: true },
+          }),
+    ]);
+    return {
+      tenantName: tenant?.name ?? null,
+      agentName: agent?.name ?? null,
+      inboxName: conv?.inbox?.name ?? null,
+      chatwootConversationId: conv?.chatwootConversationId ?? null,
+      firstAt: a.firstAt ?? null,
+    };
+  });
+}
+
+// Discord reads markdown, and an operator-chosen name may carry `*`, `_` or a backtick; escaped so the
+// name prints as written instead of reformatting the line.
+function discordText(s: string): string {
+  return s.replace(/([\\*_~`|>[\]()#-])/g, "\\$1");
 }
 
 export interface AlertSendDeps {
@@ -106,6 +144,13 @@ export interface AlertSendDeps {
   assertSafe?: (url: string) => Promise<URL>;
   now?: () => number;
   requestTimeoutMs?: number;
+  // The signing secret of a channel with no tenant, whose secret lives on its own row and not in a
+  // tenant's vault (src/modules/instance-health/channels.ts). When set, `secretRef` and the vault
+  // are not read.
+  resolveSecret?: () => Promise<{
+    secret: string | null;
+    unsignedReason: string | null;
+  }>;
 }
 
 // Where the send stopped. `url` and `secret` mean NOTHING left the process, which is the distinction
@@ -123,11 +168,10 @@ export interface AlertSendResult {
   error: string | null;
   // Whether the payload went out HMAC-signed.
   signed: boolean;
-  // Set when the channel names a signing secret and it did not resolve, so this went out unsigned:
-  // the sentence to show the operator and to store on the row (issue #724). Separate from `signed`
-  // on purpose, and a sentence rather than a flag, because unsigned-because-none-configured,
-  // unsigned-because-the-credential-was-deleted and unsigned-because-it-was-never-filled are the
-  // same wire request and three different errands.
+  // Set when the channel names a signing secret that did not resolve, so this went out unsigned:
+  // the sentence to show the operator and to store on the row. A sentence rather than a flag,
+  // because the unsigned causes (none configured, credential deleted, never filled) are one wire
+  // request and three different fixes.
   unsignedReason: string | null;
   // Wall time of the request itself, null when none was made.
   durationMs: number | null;
@@ -143,33 +187,109 @@ type AlertBodyInput = Pick<
   | "tenantId"
   | "turnId"
   | "conversationId"
+  | "causeKey"
+  | "context"
+  | "agentId"
 >;
 
-// WHERE THE OPERATOR GOES FROM THE ALERT (issue #665), and the count decides it. The ids name the
-// FIRST event of the window, so on a burst they name one member of it, and a burst's members can be
-// unrelated conversations: a link to the first one would point at one of several and hide the rest.
-// So a burst links to the stage+level list, and a single event links to its own turn, plus its
-// conversation when the mirror knew one (a stranded delivery is filed unattached when it did not).
-//
-// No `source` on either: the page defaults to real traffic, and only real traffic alerts
-// (`emitFlowEvent` dispatches `source === "inbox"` alone). `consoleUrl` names the tenant, because
-// the console resolves it from the browser and an operator of several tenants would otherwise land
-// on whichever one they last had open.
-export function alertLinks(a: AlertBodyInput): string[] {
+// The cause key of an instance alert is this prefix plus the signal (src/modules/instance-health).
+export const INSTANCE_CAUSE_PREFIX = "instance:";
+export const INSTANCE_HEALTH_PATH = "/admin/instance-health";
+
+// Where the operator goes from the alert. The ids name the FIRST event of the window, and a burst's
+// members can be unrelated conversations, so a burst links to the stage+level list and a single
+// event links to its own turn (plus its conversation when the mirror knew one). Both carry
+// `source=all`: inbox and client traffic both page, a burst can mix them, and the page's default
+// (`inbox`) would hide a client line. `consoleUrl` names the tenant so an operator of several
+// tenants lands on the right one. Each link carries the label the body prints for it, so the
+// burst's says how many lines the list holds.
+export function alertLinks(
+  a: AlertBodyInput,
+): { label: string; url: string }[] {
   const opts = { tenantId: a.tenantId };
-  if (a.count > 1) {
+  // An instance alert is about the process, not a tenant: its one link is the screen that shows it.
+  if (a.causeKey?.startsWith(INSTANCE_CAUSE_PREFIX)) {
+    return [
+      { label: "Instance health", url: consoleUrl(INSTANCE_HEALTH_PATH) },
+    ];
+  }
+  // A document approval links to the request's page, where the decision is made, and to the
+  // conversation it came from. The link is the page and nothing else: the session is the credential.
+  const approvalId = approvalRequestOfCause(a.causeKey);
+  if (approvalId !== null) {
+    const links = [
+      {
+        label: "Review document",
+        url: consoleUrl(`/document-approvals/${approvalId}`, opts),
+      },
+    ];
+    if (a.conversationId != null) {
+      links.push({
+        label: "View conversation",
+        url: consoleUrl(`/conversations/${a.conversationId}`, opts),
+      });
+    }
+    return links;
+  }
+  // A rate alert is about many failures from the start, so its link is the list even at count 1.
+  if (a.count > 1 || a.causeKey?.startsWith("rate:")) {
     const q = new URLSearchParams();
     if (a.stage) q.set("stage", a.stage);
-    q.set("level", a.level);
-    return [consoleUrl(`/logs?${q}`, opts)];
+    if (a.causeKey === null) q.set("level", a.level);
+    q.set("source", "all");
+    // A rate's count is how many times it fired, not how many failures it counted (the summary
+    // says that), so its link names the list instead of a number.
+    // The recovery rate counts deliveries that ended well, so its list is not one of failures.
+    const label =
+      a.causeKey === RECOVERY_RATE_KEY
+        ? "View recoveries"
+        : a.causeKey?.startsWith("rate:")
+          ? "View failures"
+          : `View all ${a.count}`;
+    return [{ label, url: consoleUrl(`/logs?${q}`, opts) }];
   }
   if (!a.turnId) return [];
-  const q = new URLSearchParams({ turnId: a.turnId });
-  const links = [consoleUrl(`/logs?${q}`, opts)];
+  const q = new URLSearchParams({ turnId: a.turnId, source: "all" });
+  const links = [{ label: "View log", url: consoleUrl(`/logs?${q}`, opts) }];
   if (a.conversationId != null) {
-    links.push(consoleUrl(`/conversations/${a.conversationId}`, opts));
+    links.push({
+      label: "View conversation",
+      url: consoleUrl(`/conversations/${a.conversationId}`, opts),
+    });
+  }
+  // NOTE: A tripped turn or proactive limit is a setting the operator may want to raise during
+  // legitimate use, so the alert goes straight to it.
+  if (
+    (a.stage === "turn_limit" || a.stage === "proactive_limit") &&
+    a.agentId != null
+  ) {
+    links.push({
+      label: "Change the limit",
+      url: turnLimitSettingsUrl(a.tenantId, a.agentId),
+    });
+  }
+  // NOTE: A tripped account breaker stops every agent's proactive messages until someone acts, so
+  // the alert goes straight to the card that resumes it.
+  if (a.stage === "proactive_breaker") {
+    links.push({
+      label: "Resume or change the limit",
+      url: proactiveBreakerSettingsUrl(a.tenantId),
+    });
   }
   return links;
+}
+
+function documentApprovalOf(
+  a: AlertBodyInput,
+): { requestId: string; url: string } | null {
+  const requestId = approvalRequestOfCause(a.causeKey);
+  if (requestId === null) return null;
+  return {
+    requestId,
+    url: consoleUrl(`/document-approvals/${requestId}`, {
+      tenantId: a.tenantId,
+    }),
+  };
 }
 
 const DISCORD_MAX = 1900;
@@ -182,19 +302,41 @@ export function buildAlertBody(a: AlertBodyInput): {
 } {
   const times = a.count > 1 ? ` (×${a.count})` : "";
   if (a.type === "discord") {
-    const icon = a.level === "error" ? "🔴" : "🟠";
-    const head = `${icon} **fazer.ai agents** \`${a.stage ?? "—"}\` ${a.level}${times}\n${a.summary}`;
-    // In angle brackets so Discord does not unfurl the console's login page under every alert.
-    // Appended AFTER the clip, which takes its room out of the summary: the link is the part an
-    // operator acts on, and a long summary must not cut it in half.
+    // `info` reaches a destination only as an instance signal's recovery (or a probe).
+    const icon = a.level === "error" ? "🔴" : a.level === "info" ? "🟢" : "🟠";
+    const c = a.context ?? null;
+    // The tenant first: one channel often serves several, and it is the first question an alert
+    // raises. Without one (a send that resolved no context), the product name as before.
+    const who = c?.tenantName
+      ? `**${discordText(c.tenantName)}**`
+      : "**fazer.ai agents**";
+    const facts = [
+      c?.agentName ? `Agent: ${discordText(c.agentName)}` : null,
+      c?.inboxName ? `Inbox: ${discordText(c.inboxName)}` : null,
+      c?.chatwootConversationId != null
+        ? `Conversation #${c.chatwootConversationId}`
+        : null,
+      // Discord renders `<t:…>` in each reader's own time zone.
+      a.count > 1 && c?.firstAt
+        ? `since <t:${Math.floor(c.firstAt.getTime() / 1000)}:t>`
+        : null,
+    ].filter((f): f is string => f !== null);
+    const head = `${icon} ${who} · \`${a.stage ?? "—"}\` ${a.level}${times}\n${a.summary}${
+      facts.length > 0 ? `\n-# ${facts.join(" · ")}` : ""
+    }`;
+    // Masked links, so the line reads as two words instead of two 80-character URLs, with the URL
+    // still in angle brackets so Discord does not unfurl the console's login page under every
+    // alert. Appended AFTER the clip, which takes its room out of the summary: the link is the part
+    // an operator acts on, and a long summary must not cut it in half.
     const links = alertLinks(a)
-      .map((u) => `<${u}>`)
+      .map((l) => `[${l.label}](<${l.url}>)`)
       .join(" · ");
     const content = links
       ? `${clipText(head, DISCORD_MAX - links.length - 1)}\n${links}`
       : clipText(head, DISCORD_MAX);
     return {
-      rawBody: JSON.stringify({ content }),
+      // No mention resolves: a name or a summary carrying `@everyone` must not ping the channel.
+      rawBody: JSON.stringify({ content, allowed_mentions: { parse: [] } }),
       contentType: "application/json",
     };
   }
@@ -210,6 +352,20 @@ export function buildAlertBody(a: AlertBodyInput): {
       turnId: a.turnId,
       conversationId:
         a.conversationId == null ? null : String(a.conversationId),
+      // Additive to version 1: names for a reader that shows the alert to a person.
+      tenant: {
+        id: a.tenantId == null ? null : String(a.tenantId),
+        name: a.context?.tenantName ?? null,
+      },
+      agentName: a.context?.agentName ?? null,
+      inboxName: a.context?.inboxName ?? null,
+      chatwootConversationId: a.context?.chatwootConversationId ?? null,
+      firstAt: a.context?.firstAt?.toISOString() ?? null,
+      // Additive too: the same console links Discord prints, for a receiver that forwards the alert
+      // to a person, who needs somewhere to act (the turn limit's setting among them).
+      links: alertLinks(a),
+      // Additive to version 1: the page a person decides a document approval on.
+      documentApproval: documentApprovalOf(a),
     }),
     contentType: "application/json",
   };
@@ -234,9 +390,10 @@ function stopped(
 
 // `ctx` scopes the vault read (RLS active). The worker passes a synthetic TENANT_ADMIN context for
 // the delivery's own tenant (it claims cross-tenant and has no user); the route passes the caller's.
+// An instance channel has no tenant: it passes null and its own `deps.resolveSecret`.
 export async function sendAlert(
   base: PrismaClient,
-  ctx: TenantContext,
+  ctx: TenantContext | null,
   a: AlertSendTarget,
   deps: AlertSendDeps = {},
 ): Promise<AlertSendResult> {
@@ -256,22 +413,19 @@ export async function sendAlert(
     return stopped("url", alertErrMsg(err));
   }
 
-  // Optional HMAC secret (generic webhook), resolved through a tenant-scoped read.
-  //
-  // A ref that names nothing -- deleted entry, or one created and never filled -- comes back with no
-  // secret rather than throwing, and the send goes out UNSIGNED. Holding the alert back instead
-  // would be the worse trade: the receiver that does not verify loses an incident notification over
-  // a credential problem it does not care about, and nothing downstream notices this bus going
-  // quiet. What changes with #724 is that the fact travels with the answer, per state, so the probe
-  // and the delivery row can both say which errand the operator is on.
+  // Optional HMAC secret (generic webhook), resolved through a tenant-scoped read. A ref that
+  // names nothing (deleted, or created and never filled) yields no secret and the send goes out
+  // UNSIGNED rather than holding the alert back; `unsignedReason` carries which case it was.
   let secret: string | null = null;
   let unsignedReason: string | null = null;
   if (a.type === "webhook") {
     try {
       const ref = a.secretRef;
-      const resolved = await runScopedOn(base, ctx, (db) =>
-        resolveSigningSecret(db, ref),
-      );
+      const resolved = deps.resolveSecret
+        ? await deps.resolveSecret()
+        : ctx === null
+          ? { secret: null, unsignedReason: null }
+          : await runScopedOn(base, ctx, (db) => resolveSigningSecret(db, ref));
       secret = resolved.secret;
       unsignedReason = resolved.unsignedReason;
     } catch (err) {

@@ -11,8 +11,13 @@ interface SelectableCardProps {
   icon?: LucideIcon;
   // Top-right slot — e.g. a kind <Badge> or a "Disabled" tag.
   badge?: ReactNode;
+  // A short measurement beside the title (the tokens a tool adds to every call), kept apart from the
+  // badge so a card can carry both.
+  meta?: ReactNode;
   disabled?: boolean;
   className?: string;
+  // An anchor a link can land on; the card is then the control the focus goes to.
+  id?: string;
 }
 
 // A toggleable selection card (icon + title + description + badge), used across the agent editor
@@ -25,21 +30,25 @@ export function SelectableCard({
   description,
   icon: Icon,
   badge,
+  meta,
   disabled,
   className,
+  id,
 }: SelectableCardProps) {
   return (
     // biome-ignore lint/a11y/useSemanticElements: a styled selection card needs a button with the checkbox role, not a bare <input>.
     <button
       type="button"
       role="checkbox"
+      id={id}
+      data-focus-control={id ? "" : undefined}
       aria-checked={selected}
       disabled={disabled}
       onClick={onToggle}
       className={cn(
         "group flex w-full items-start gap-3 rounded-lg border p-3 text-left transition-colors disabled:opacity-50",
         selected
-          ? "border-accent bg-accent/10"
+          ? "border-accent bg-accent-soft"
           : "border-border bg-bg-secondary hover:bg-bg-hover",
         className,
       )}
@@ -54,12 +63,20 @@ export function SelectableCard({
           <Icon className="h-5 w-5" aria-hidden="true" />
         </span>
       )}
-      <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="flex items-center gap-2">
-          <span className="truncate font-medium text-sm text-text-primary">
+      {/* `data-selectable-content` lets a wrapper that overlays a control on the card (EditableCard's
+          pencil) reserve room for it without reaching into this layout. The title wraps rather than
+          truncates, and the badge drops to its own line when the two do not fit side by side, so a
+          long tool name never cuts the title down to a few letters. */}
+      <span
+        data-selectable-content
+        className="flex min-w-0 flex-1 flex-col gap-0.5"
+      >
+        <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+          <span className="text-text-primary min-w-0 text-sm font-medium break-words">
             {title}
           </span>
-          {badge}
+          {badge && <span className="max-w-full min-w-0">{badge}</span>}
+          {meta}
         </span>
         {description && (
           <span className="text-text-muted text-xs">{description}</span>
@@ -69,8 +86,8 @@ export function SelectableCard({
         className={cn(
           "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors",
           selected
-            ? "border-accent bg-accent text-accent-foreground"
-            : "border-border text-transparent group-hover:border-text-muted",
+            ? "border-accent-solid bg-accent-solid text-accent-foreground"
+            : "border-border group-hover:border-text-muted text-transparent",
         )}
         aria-hidden="true"
       >

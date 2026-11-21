@@ -5,8 +5,12 @@ import {
   type MessageContent,
   RemoveMessage,
   SystemMessage,
+  type ToolMessage,
 } from "@langchain/core/messages";
-import type { StructuredToolInterface } from "@langchain/core/tools";
+import type {
+  StructuredToolInterface,
+  ToolRunnableConfig,
+} from "@langchain/core/tools";
 import {
   END,
   MessagesAnnotation,
@@ -21,6 +25,7 @@ import { selectHistoryWindow } from "@/graph/history-window";
 import { contentToText } from "@/graph/message-text";
 import { PRIMARY_TIMEOUT_MS } from "@/graph/model-fallback";
 import {
+  type FallbackFailedInfo,
   type ModelLabels,
   type ModelRetryInfo,
   type PermitWaitInfo,
@@ -31,8 +36,45 @@ import {
   USAGE_MODEL_METADATA_KEY,
   USAGE_PROVIDER_METADATA_KEY,
 } from "@/graph/usage";
-import { calledOffToolResult } from "./markers";
-import { SKIP_REPLY_TOOL, skipReplyRan } from "./silence";
+import {
+  clearAccountFailure,
+  markReportedElsewhere,
+  providerFailure,
+} from "@/lib/provider-failure";
+import type { PermitClass } from "@/lib/semaphore";
+import { hiddenNotesOf, hiddenNotesThisTurn } from "./anthropic-progress-notes";
+import {
+  clientToolsNode,
+  pendingClientCalls,
+  withServerCallsOnly,
+} from "./client-tools";
+import { setAsideContradictedHandoffs } from "./contradicted-handoff";
+import {
+  calledOffToolResult,
+  droppedCallCount,
+  droppedCallsStamp,
+} from "./markers";
+import {
+  admitRevisionCalls,
+  type RevisionInfo,
+  revisionTools,
+  revisionToolsNote,
+  setAsideRevisionCalls,
+  textOnly,
+} from "./revision-calls";
+import {
+  customerFacingReply,
+  SKIP_REPLY_TOOL,
+  saysNothing,
+  skipReplyRan,
+} from "./silence";
+import {
+  type CallReport,
+  fenceReporterOf,
+  withFenceReporter,
+} from "./tools/fence-report";
+import { isReadTool } from "./tools/reads";
+import { unansweredInputs } from "./unanswered-inputs";
 
 // The second provider as the graph needs it: the built model plus the two labels that name it on
 // the usage row and the flow trail. Built and bounded by `prepare.buildModelAndGraph`; the node only
@@ -41,8 +83,8 @@ export interface FallbackModel {
   model: BaseChatModel;
   provider: string;
   modelId: string;
-  // The deadline on each call to it (issue #819). Absent means `PRIMARY_TIMEOUT_MS`, the ceiling its
-  // SDK is built with, which the Google adapter drops and this race holds.
+  // The deadline on each call to it. Absent means `PRIMARY_TIMEOUT_MS`, the ceiling its SDK is built
+  // with, which the Google adapter drops and this race holds.
   deadlineMs?: number;
 }
 
@@ -59,8 +101,8 @@ export interface BuildAgentGraphParams {
   checkpointer?: BaseCheckpointSaver;
   tools?: StructuredToolInterface[];
   // Soft+hard cap on tool executions within ONE turn (default 10). At maxToolCalls-2 the agent gets
-  // a "wrap up now" instruction; at maxToolCalls it is invoked WITHOUT tools, forcing a text answer
-  // instead of LangGraph's GraphRecursionError. See src/modules/agents/limits.ts.
+  // a "wrap up now" instruction; at maxToolCalls it is invoked WITHOUT tools and told so, forcing a
+  // text answer instead of LangGraph's GraphRecursionError. See src/modules/agents/limits.ts.
   maxToolCalls?: number;
   // Fired once when the hard limit forces a no-tools answer (runtime emits a flow warn so it shows
   // up in the turn trail / Logs). Best-effort; never throws.
@@ -70,31 +112,33 @@ export interface BuildAgentGraphParams {
   // and the fault rate stays invisible.
   onModelRetry?: (info: ModelRetryInfo) => void;
   // Fired when this node's model call has waited past the capacity threshold for a permit of the
-  // process-wide semaphore (issue #812), so the runtime can put a `capacity` warn on the trail.
+  // process-wide semaphore, so the runtime can put a `capacity` warn on the trail.
   onModelPermitWait?: (info: PermitWaitInfo) => void;
-  // The second provider, already built and already bounded (see ./model-fallback). Absent for every
-  // agent that configured none, which is every agent today, and absent means the node behaves
-  // exactly as it did.
+  // Whose call this node makes on the model semaphore: `reply` (absent) for a customer's turn,
+  // `background` for a run nobody is waiting on (the observer).
+  modelPriority?: PermitClass;
+  // The second provider, already built and already bounded (see ./model-fallback). Absent when the
+  // agent configured none, and then the node never falls back.
   fallback?: FallbackModel;
   // What the agent's OWN model is, for the lines this node's callbacks carry. Not read to dial
-  // anything — `model` above is what dials.
+  // anything: `model` above is what dials.
   primary: ModelLabels;
   onModelFallback?: (info: {
     provider: string;
     model: string;
     reason: string;
+    // The PRIMARY's failure, in `providerFailure`'s closed word: the line is labelled with the
+    // fallback, and a degraded primary still has to count toward its own rate (flowlog/alerts.ts).
+    failure: string;
   }) => void;
-  onModelFallbackFailed?: (info: {
-    provider: string;
-    model: string;
-    reason: string;
-  }) => void;
+  // `failure` is `providerFailure`'s closed word, for the line's `detail.failure` (flowlog/alerts.ts).
+  onModelFallbackFailed?: (info: FallbackFailedInfo) => void;
   // Ceiling on the history tokens handed to the model (agent.settings.limits.maxHistoryTokens).
-  // null/undefined = send the whole thread, which is the historical behavior.
+  // null/undefined sends the whole thread.
   maxHistoryTokens?: number | null;
   // Whether each person's message reaches the model behind the date it was sent, and in which
-  // timezone (agent.settings.memory.historyDates, issue #755; see ./history-dates.ts). null/undefined
-  // sends the history as it is stored, which is what every caller that does not pass it gets.
+  // timezone (agent.settings.memory.historyDates; see ./history-dates.ts). null/undefined sends the
+  // history as it is stored.
   historyDates?: { timezone: string } | null;
   // Fired when a turn actually dropped messages, so the runtime can put it in the turn trail.
   // Trimming that leaves no trace is indistinguishable, from the operator's chair, from the agent
@@ -104,54 +148,58 @@ export interface BuildAgentGraphParams {
     dropped: number;
     tokens: number;
   }) => void;
-  // THE TURN'S OWN "IS THIS STILL WANTED", ASKED AT THE TOOL BOUNDARY (issue #449).
-  //
-  // The runtime asks it at every seam it owns — before the divider, after the claim, before the
-  // invoke, and at each outward write — and the one stretch none of those covers is INSIDE the
-  // invoke, because a tool call happens within a step rather than between two. So a `/reset` landing
-  // once the model call is in flight is refused on its memory step, says so, clears everything else
-  // it can reach, and then this graph's tools write an attribute, a label and a kanban card back
-  // onto the conversation the operator was just told about.
-  //
-  // NO `strict` HERE, and its absence is the contract rather than a simplification. Everywhere else
-  // that option chooses whether an unreadable answer STOPS the run by throwing, and this seam cannot
-  // be stopped that way: see `refuseCalledOffCalls`. So it asks one question with two answers, the
-  // caller binds the strictness it wants, and an error is not one of the answers.
-  //
-  // Absent for every caller with nothing to call the run off — the playground, and any caller that
-  // scheduled no work — and absent means the tool node behaves exactly as it did. Both the reactive
-  // turn and the NUDGE pass one: a nudge runs from a job that `/reset` retires, which is the same
-  // withdrawal by another route (review round 1 found the nudge missing here).
+  // Fired on the round that took unanswered tool calls out of the history (see
+  // `repairDanglingToolCalls`), with how many. Once per repair: the repaired message is written back
+  // to the thread, so no later round or turn finds the same calls again.
+  onDanglingToolCalls?: (info: { calls: number }) => void;
+  // Fired on the round that took the residue of failed attempts out of the history (see
+  // ./unanswered-inputs.ts), with how many of each kind. Once per repair, for the same reason.
+  onUnansweredInputs?: (info: {
+    directives: number;
+    duplicates: number;
+  }) => void;
+  // Fired when a batch's handoff was answered without running because the same batch closes the
+  // conversation (./contradicted-handoff.ts), with how many.
+  onContradictedHandoff?: (info: { calls: number }) => void;
+  // The turn's own "is this still wanted", asked at the tool boundary. The runtime asks it at every
+  // seam it owns, but a tool call happens INSIDE the invoke, so without it a `/reset` landing mid-call
+  // is reported done while this graph's tools write an attribute, a label and a kanban card back onto
+  // the conversation. No `strict` option: this seam cannot stop the run by throwing (see
+  // `refuseCalledOffCalls`), so the caller binds the strictness it wants and an error is not an answer.
+  // Absent for callers with nothing to call off (the playground); the reactive turn and the nudge both
+  // pass one, since a nudge runs from a job that `/reset` retires.
   stillWanted?: () => Promise<boolean>;
-  // A TURN WITH NO REPLY CHANNEL, which is an observation (issue #629). Its frame says that any text
-  // the model writes reaches nobody and its Chatwoot client is muted, so the tool budget's wrap-up
-  // telling it to answer the customer contradicts the frame on the very round it lands on — for a
-  // watcher at `maxToolCalls: 3`, the round after its first tool call. Measured there: `gpt-5.6-luna`
-  // wrote nothing in 15 of 15, while `claude-haiku-4.5` and `gemini-3.5-flash` each argued back in
-  // prose that goes nowhere and is paid for by the token. Absent means the ordinary turn, which does
-  // answer somebody.
+  // A turn with no reply channel (an observation): its frame says any text reaches nobody and its
+  // Chatwoot client is muted, so the tool budget's wrap-up telling it to answer the customer would
+  // contradict the frame, and models then either go silent or argue back in prose that goes nowhere
+  // and is paid for by the token. Absent means the ordinary turn, which does answer somebody.
   noReplyChannel?: boolean;
-  // WHAT THE MODEL IS TOLD ABOUT A SPOKEN REPLY (issue #859): asked on EVERY round, and answering the
-  // notice's text while the reply still goes as a voice note, null once it does not (the model chose
-  // text, or the customer asked for text mid-turn), so no round after the change reads an instruction
-  // forbidding the lists it chose text to write. It travels exactly where the tool budget's wrap-up
-  // does (see `LATE_SYSTEM_MESSAGE`): a system message after the history where the provider keeps one
-  // there, the end of the system prompt where it does not, and a human message never. Either way
-  // everything before it is the same bytes a text turn sends, so the cached prefix survives, and it
-  // is persisted on no round.
+  // On such a turn, how many calls so far ran and wrote nothing (the observation's own count, job.ts),
+  // read around each tool step: a step that grew it was refused somewhere, and the turn goes on so
+  // the model can see why. Absent reads as nothing refused.
+  noEffectCount?: () => number;
+  // What the model is told about a spoken reply, asked on EVERY round: the notice's text while the
+  // reply still goes as a voice note, null once it does not (the model chose text, or the customer
+  // asked for text mid-turn), so no later round forbids the lists text was chosen to carry. It travels
+  // where the wrap-up does (see `LATE_SYSTEM_MESSAGE`), never as a human message, so everything before
+  // it is the bytes a text turn sends and the cached prefix survives. It is persisted on no round.
   spokenNotice?: () => string | null;
-  // The deadline on each call to the PRIMARY, retries included (issue #809): the fallback's 45 s when
-  // one was built (the primary then has one attempt), the agent's `modelCallTimeoutMs` when none was
-  // (see buildModelAndGraph). Absent means that same default (issue #819: no call runs unbounded).
+  // Facts of the conversation that hold for the whole turn, read once by the caller before it: a
+  // document still waiting on the team's approval. They travel where the spoken notice does, after the
+  // history, so the cached prefix survives and a customer cannot forge them.
+  standingNotices?: string[];
+  // The deadline on each call to the PRIMARY, retries included: the fallback's ceiling when one was built
+  // (the primary then has one attempt), the agent's `modelCallTimeoutMs` when none was (see
+  // buildModelAndGraph). Absent means that same default, so no call runs unbounded.
   primaryDeadlineMs?: number;
-  // The signal of the scheduler job this graph runs for (issue #811). It is NOT handed to
+  // The signal of the scheduler job this graph runs for. It is NOT handed to
   // `graph.invoke`: aborting an invoke between a checkpointed tool call and its result leaves the
   // thread with a call no `ToolMessage` answers, which the providers then reject on every later turn
   // (see `refuseCalledOffCalls`), and the invoke would reject while the tool is still running. It
   // reaches the model call, and the tool boundary refuses calls once it has aborted, the same way a
   // called-off turn does, so the graph ends in a consistent state and only after its work has stopped.
   signal?: AbortSignal;
-  // AN UNEXPLAINED SILENCE IS ASKED ONCE MORE (issue #885). A turn that would end with nothing for
+  // An unexplained silence is asked once more. A turn that would end with nothing for
   // the customer, no handoff and no `skip_reply` is sent back to the model in the same round, with a
   // late instruction naming both exits: answer, or declare the silence. Asked at the moment it would
   // run, because only the caller knows whether the turn already reached the customer or handed the
@@ -165,10 +213,40 @@ export interface BuildAgentGraphParams {
   // the model is asked again in the same round with the note as a late system instruction. Once per
   // invocation, so the tool budget, the deadlines and the permit stay the turn's. Absent means never.
   checkReply?: (text: string, toolsCalled: string[]) => Promise<string | null>;
+  // The factual-grounding review (modules/guardrails/grounding-gate.ts), asked with the turn as it
+  // would end: the history plus the final answer. A note back means "revise": the model is asked once
+  // more with it, and only that second answer returns to the thread. Asked at most once per invocation.
+  reviewReply?: (turn: BaseMessage[], reply: string) => Promise<string | null>;
+  // Asked when a note comes back: the rewrite may then call the plan's sources that are reads, up to
+  // its cap, and what it writes is reviewed once by `review`. Absent or null, the rewrite runs without
+  // tools and is not reviewed again.
+  revisionPlan?: () => RevisionPlan | null;
+  // Fired with the rewrite's text after a revise ("" when there is none), so the caller can stop a
+  // refused draft that would otherwise be recovered and delivered.
+  onReplyRevised?: (text: string) => void;
+  // Whether the caller would deliver the reply written beside an earlier call when the turn ends on
+  // an empty answer (the runtime's recovery). Absent means it would not, and that text is not
+  // reviewed: only what goes out is.
+  recoversReply?: () => boolean;
+  // Tools the host application runs in the browser (see ./client-tools.ts). A call to one suspends
+  // the turn instead of running. Absent on every path but the client channel.
+  clientToolNames?: ReadonlySet<string>;
 }
 
-// What the retry of an unexplained silence got back (issue #885): text for the customer, the
-// declared silence, other tool calls (the turn goes on), or nothing again.
+export type { RevisionInfo } from "./revision-calls";
+
+export interface RevisionPlan {
+  sourceTools: readonly string[];
+  maxToolCalls: number;
+  review: (
+    turn: BaseMessage[],
+    reply: string,
+    info: RevisionInfo,
+  ) => Promise<void>;
+}
+
+// What the retry of an unexplained silence got back: text for the customer, the declared silence,
+// other tool calls (the turn goes on), or nothing again.
 export type SilenceRetryOutcome = "answered" | "skip_reply" | "tools" | "empty";
 export interface SilenceRetryInfo {
   outcome: SilenceRetryOutcome;
@@ -178,17 +256,13 @@ export interface SilenceRetryInfo {
 export const SILENCE_RETRY_MARK =
   "[Sistema] Este turno terminou sem mensagem para o cliente";
 
-const DEFAULT_MAX_TOOL_CALLS = 10;
+export const DEFAULT_MAX_TOOL_CALLS = 10;
 
-// LANGGRAPH COUNTS SUPER-STEPS, NOT TOOL CALLS, and its default is 25 — so a budget the operator is
-// allowed to set (1-50) can be unreachable by the graph that is supposed to honour it. One round of
-// "the model calls a tool, the tool node runs it" is TWO steps, so the default runs out after about
-// twelve rounds and the turn dies with `GraphRecursionError` instead of ending at the budget with a
-// text answer, after the tools it already ran have had their side effects.
-//
-// Sized to the budget rather than raised to a round number: `2 * max` for the rounds, `+1` for the
-// final model call that produces the answer, `+3` of margin for the graph's own entry and exit. It
-// never goes BELOW LangGraph's default, so an agent with a small budget keeps the room it has today.
+// LangGraph counts super-steps, not tool calls, and defaults to 25, so an operator budget (1-50) could
+// be unreachable: one round of tool call plus tool node is TWO steps, and the turn would die with
+// `GraphRecursionError` after its tools had side effects, instead of ending at the budget with text.
+// Sized to the budget: `2 * max` for the rounds, `+1` for the final answer, `+3` for entry and exit.
+// Never below LangGraph's default, so a small budget keeps that room.
 export function recursionLimitFor(maxToolCalls?: number): number {
   return Math.max(25, 2 * (maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS) + 4);
 }
@@ -205,26 +279,20 @@ function toolCallsSinceLastHuman(history: BaseMessage[]): number {
   return count;
 }
 
-// True when the model's most recent act was to decide NOT to answer. `skip_reply` performs nothing
-// and IS that decision (since #454 it is also how a follow-up says so), so the soft wrap-up
-// instruction must not land on the round after it: "Conclua agora: responda ao cliente" is the exact
-// opposite of what the model just chose, and an agent with a small `maxToolCalls` crosses the soft
-// limit on that very round. The COUNT is left alone deliberately — the cap still has to bound a model
-// that calls skip_reply in a loop.
+// True when the model's most recent act was deciding NOT to answer through `skip_reply` (also how a
+// follow-up says so), so the soft wrap-up ("Conclua agora: responda ao cliente") must not land on the
+// round after it, which a small `maxToolCalls` crosses on that very round. The COUNT is left alone:
+// the cap still has to bound a model that calls skip_reply in a loop.
 function justDecidedToStaySilent(history: BaseMessage[]): boolean {
   return lastBatch(history).skipped;
 }
 
-// THE TURN'S BATCHES, newest first, each carrying the answers the decision needs. ONE scan, because
-// three questions are asked of it and a second walk would be a second chance to disagree about where
-// a batch starts:
-//
-//   `skipped` — the model chose silence, which is what suppresses the wrap-up instruction;
-//   `alone`   — the decision is ALL it did, which is what makes the turn silent;
-//   `caller`  — the AI message that requested the batch, whose text is taken back out.
-//
-// The first two are separate because they differ on a PARALLEL batch, and merging them is what
-// rounds 17 and 18 of #454 kept finding.
+// The turn's batches, newest first, each carrying what the decision needs, in ONE scan so the three
+// questions cannot disagree about where a batch starts:
+//   `skipped`: the model chose silence, which suppresses the wrap-up instruction;
+//   `alone`: the decision is ALL it did, which makes the turn silent;
+//   `caller`: the AI message that requested the batch, whose text is taken back out.
+// `skipped` and `alone` differ on a PARALLEL batch, so they cannot be merged.
 type Batch = { skipped: boolean; alone: boolean; caller: BaseMessage | null };
 
 function turnBatches(history: BaseMessage[]): Batch[] {
@@ -234,22 +302,21 @@ function turnBatches(history: BaseMessage[]): Batch[] {
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
     const t = m?.getType();
-    // The turn starts at the last human message: a batch from an EARLIER turn is not this one's.
+    // NOTE: the turn starts at the last human message: a batch from an EARLIER turn is not this one's.
     if (t === "human") break;
     if (t === "tool") {
-      // NOTE: The CONTIGUOUS batch, not the last message: a model can emit parallel calls (`skip_reply`
-      // alongside `react_to_message`, which is the documented way to answer with a reaction alone), and
-      // whichever result lands last is an ordering accident. Returning on the first `ToolMessage` read
-      // the accident instead of the decision.
+      // NOTE: the CONTIGUOUS batch, not the last message: a model can emit parallel calls (`skip_reply`
+      // alongside `react_to_message`, the documented way to answer with a reaction alone), and which
+      // result lands last is an ordering accident.
       sawTool = true;
-      // NOTE: The ACK, not the name. A precondition on `skip_reply` returns a normal tool result under
-      // that same name saying the call did NOT run — read by name, an operator's own guard would
-      // end the turn with no text where the customer is waiting for one. `skipReplyRan` recognises
-      // our no-op and nothing else, so anything unrecognised falls through to "answer them".
+      // NOTE: the ACK, not the name. A precondition on `skip_reply` returns a normal tool result under
+      // that same name saying the call did NOT run; read by name, an operator's own guard would end the
+      // turn with no text where the customer is waiting for one. `skipReplyRan` recognises our no-op
+      // and nothing else, so anything unrecognised falls through to "answer them".
       if (skipReplyRan(m as Parameters<typeof skipReplyRan>[0])) skipped = true;
       continue;
     }
-    // NOTE: The batch ends at the AI message that requested it — anything before is an earlier round.
+    // NOTE: the batch ends at the AI message that requested it; anything before is an earlier round.
     if (sawTool) {
       out.push({ skipped, alone: onlySkipped(m), caller: m ?? null });
       sawTool = false;
@@ -265,51 +332,29 @@ function lastBatch(history: BaseMessage[]): Batch {
   );
 }
 
-// DID THIS TURN DECIDE SILENCE ON ITS OWN, anywhere since the last human message — a different
-// question from `justDecidedToStaySilent`, and issue #639 is the gap between them.
-//
-// A LONE `skip_reply` used to END the turn. Ending it and keeping it SILENT are two different
-// guarantees, and `docs/graph.md` only ever argued for the second; the first costs the operator
-// everything they asked for after the decision, and the shape that reaches it is ordinary — a prompt
-// that forbids parallel calls (the agent in the report carries one for `set_labels`, #604) with
-// `skip_reply` named before the rest. Measured live on the issue, the two failing cells are exactly
-// the two that name it first, and no wording fixes it: the note that takes gpt-5.2 from 0/12 to
-// 12/12 does nothing on gpt-5.6-luna, because it asks the model to disobey the operator's ordering.
-//
-// So the turn continues and the decision STICKS: the wrap-up stays suppressed, the hard limit stops
-// trying to force an answer, and the final text is taken out in code rather than being the model's
-// to withhold. Read over the whole turn and not off the last batch, because the batch after the
-// decision is the operator's `resolve_conversation`, and last-batch semantics would let the turn end
-// by writing to the customer — the very hazard the terminal branch existed for.
-//
-// ALONE, and that word is the scope. A PARALLEL batch does not make the turn silent, because there
-// the model has something to change its mind ABOUT: round 18 installed exactly that, so a companion
-// that FAILED lets it answer the customer instead. A decision taken by itself rests on nothing that
-// could have failed.
+// Whether this turn decided silence on its own anywhere since the last human message (unlike
+// `justDecidedToStaySilent`, which reads the last batch). A lone `skip_reply` does not END the turn:
+// a prompt that forbids parallel calls with `skip_reply` named first would otherwise lose every step
+// the operator asked for after the decision, and no prompt wording fixes that ordering. So the turn
+// continues and the decision sticks: the wrap-up stays suppressed, the hard limit stops forcing an
+// answer, and the final text is taken out in code. Read over the whole turn because the batch after
+// the decision is the operator's `resolve_conversation`. ALONE is the scope: in a parallel batch a
+// companion that failed gives the model something to change its mind about, so it may answer.
 function decidedToStaySilentAlone(history: BaseMessage[]): boolean {
   return turnBatches(history).some((b) => b.skipped && b.alone);
 }
 
-// …AND THE TURN STILL HAS TO END. With the decision no longer terminal, what stops a model that
-// answers every round with the same lone `skip_reply` is the SECOND one: asked again after deciding
-// alone, it did nothing new, and no third round can add anything. The budget bounds it too, but far
-// later and through a path built for another purpose — this ends it where the information ends.
-//
-// It is also what keeps round 18's shape: a parallel batch followed by a lone `skip_reply` costs one
-// round more than it used to, and that round is the whole fix — it is where the operator's remaining
-// step gets to run. A model with nothing left to do spends it and stops.
 // Every call the last assistant turn asked for already has its answer in this turn's history, so the
 // tools step will produce nothing and the round after it sees exactly what this one saw. See the
 // call site for why this is asked of the calls and not of the step's output.
 function repeatsAnsweredCalls(history: BaseMessage[]): boolean {
-  // No check on the message TYPE, and the mutation battery is why: only an assistant turn carries
-  // `tool_calls`, so anything else falls out at the empty list below. A guard for it survived every
-  // mutation, which is what a dead condition looks like.
+  // No check on the message TYPE: only an assistant turn carries `tool_calls`, so anything else
+  // falls out at the empty list below.
   const calls = (history.at(-1) as AIMessage | undefined)?.tool_calls ?? [];
   if (calls.length === 0) return false;
-  // THIS TURN'S answers, and the bound is load-bearing: a call id is only unique within the request
-  // that minted it, and a model that reuses one across turns (a stub reusing `call_attr`, a provider
-  // numbering from zero) would otherwise look like it was repeating a call it never made here.
+  // THIS TURN'S answers, and the bound is load-bearing: a call id is only unique within the
+  // request that minted it, and a model that reuses one across turns (a stub reusing `call_attr`, a
+  // provider numbering from zero) would otherwise look like it was repeating a call it never made here.
   const answered = new Set<string>();
   for (let i = history.length - 1; i >= 0; i--) {
     const m = history[i];
@@ -318,29 +363,161 @@ function repeatsAnsweredCalls(history: BaseMessage[]): boolean {
     const id = (m as { tool_call_id?: string }).tool_call_id;
     if (typeof id === "string") answered.add(id);
   }
-  // `every`, and the mutation battery says `some` behaves identically today: a batch that repeats one
-  // id and mints another gets the new one RUN, so the tools step appends a result and the last message
-  // is no longer this assistant turn — the function is never consulted with a mixed batch. It is
-  // spelled `every` because that is the claim being made (nothing new can come of this batch), and
-  // because the equivalence rests on `ToolNode` skipping only the answered call rather than the step.
+  // NOTE: `every` is the claim being made (nothing new can come of this batch). `some` behaves the same
+  // today, since a batch that mints a new id gets it run and the last message is then no longer this
+  // assistant turn, but that rests on `ToolNode` skipping only the answered call rather than the step.
   return calls.every((c) => typeof c.id === "string" && answered.has(c.id));
 }
 
-// The repeated batch is taken OUT of the channel, and this is not tidiness. `ToolNode` answered none
-// of its calls — every id already had an answer, which is what the stall IS — so the message stays in
-// the history as an assistant turn whose `tool_call_id`s are never answered: `isEmptyAssistantTurn`
-// keeps it, because it carries calls, and the NEXT customer turn hands a provider a history OpenAI
-// and Anthropic both refuse, which stops the thread answering at all. Found by review round 1 of
-// #639, and newly reachable here because a lone `skip_reply` no longer ends the turn before it.
-//
-// Nothing is lost by removing it: the batch is a verbatim repeat of one still in the history WITH
-// its results, and text the model wrote beside it was never delivered (the turn ends on the empty
-// message), so leaving it is the sentence-the-customer-never-read hazard this file already avoids.
+// The repeated batch is taken OUT of the channel. `ToolNode` answered none of its calls (every id
+// already had an answer, which is what the stall is), so it would stay as an assistant turn with
+// unanswered `tool_call_id`s that `isEmptyAssistantTurn` keeps, and the next customer turn would hand
+// OpenAI and Anthropic a history both refuse. Nothing is lost: it repeats a batch still in the history
+// with its results, and text written beside it was never delivered.
 function dropRepeatedBatch(history: BaseMessage[]): BaseMessage[] {
   const id = history.at(-1)?.id;
   return typeof id === "string" ? [new RemoveMessage({ id })] : [];
 }
 
+// The calls an assistant message asked for that no `ToolMessage` answers before the next assistant
+// message. A turn killed between checkpointing the calls and running them (a deploy, a crash, the
+// job deadline) leaves exactly this in the thread, and every later request is refused ("No tool
+// output found for function call"), so the conversation is dead until a `/reset`. Read from
+// `tool_calls`, the calls `ToolNode` would have run; a stalled repeat (see `repeatsAnsweredCalls`)
+// is answered EARLIER in the turn, so the caller leaves the last message out when it is one.
+function danglingToolCalls(messages: BaseMessage[]): Map<number, Set<string>> {
+  const found = new Map<number, Set<string>>();
+  messages.forEach((m, i) => {
+    if (m.getType() !== "ai") return;
+    const calls = (m as AIMessage).tool_calls ?? [];
+    const answered = new Set<string>();
+    for (let j = i + 1; j < messages.length; j++) {
+      const next = messages[j];
+      if (next?.getType() === "ai") break;
+      const id = (next as { tool_call_id?: string }).tool_call_id;
+      if (typeof id === "string") answered.add(id);
+    }
+    const missing = calls
+      .map((c) => c.id)
+      .filter(
+        (id): id is string => typeof id === "string" && !answered.has(id),
+      );
+    if (missing.length > 0) found.set(i, new Set(missing));
+  });
+  return found;
+}
+
+// The Responses API items without the dropped calls. A `reasoning` item owns the items after it, up
+// to the next one, and is refused without them ("provided without its required following item"),
+// while an item it owns is refused without it; so a reasoning item goes exactly when everything it
+// owned went, wherever it sits, and stays while any of its items stays.
+function withoutDroppedItems(
+  output: { type?: unknown; call_id?: unknown }[],
+  isDropped: (id: unknown) => boolean,
+): unknown[] {
+  const kept: unknown[] = [];
+  let reasoning: unknown = null;
+  let owned: unknown[] = [];
+  const flush = () => {
+    if (reasoning !== null && owned.length > 0) kept.push(reasoning);
+    kept.push(...owned);
+    reasoning = null;
+    owned = [];
+  };
+  for (const item of output) {
+    if (item?.type === "reasoning") {
+      flush();
+      reasoning = item;
+    } else if (!(item?.type === "function_call" && isDropped(item.call_id))) {
+      owned.push(item);
+    }
+  }
+  flush();
+  return kept;
+}
+
+// The assistant message without the calls that never ran, replaced by ID so the repair lands in the
+// thread. Dropped, not answered with a synthetic result, which the next round would read as a call
+// that happened. Every copy a provider replays goes: `tool_calls`, the Chat Completions copy in
+// `additional_kwargs`, and the Responses items in `response_metadata.output`, replayed VERBATIM by
+// `@langchain/openai`, with the reasoning that led only to them. The message is stamped with how many
+// went (see `onlySkipped`). Text beside the call and calls that did run stay; a message left with
+// neither is what `isEmptyAssistantTurn` keeps out of the prompt, reasoning and all.
+function withoutCalls(message: AIMessage, dropped: Set<string>): AIMessage {
+  const isDropped = (id: unknown) => typeof id === "string" && dropped.has(id);
+  const toolCalls = (message.tool_calls ?? []).filter((c) => !isDropped(c.id));
+  const content = Array.isArray(message.content)
+    ? (message.content.filter((b) => {
+        const block = b as { type?: unknown; id?: unknown };
+        const isCall =
+          block.type === "tool_use" ||
+          block.type === "tool_call" ||
+          block.type === "function_call";
+        return !(isCall && isDropped(block.id));
+      }) as MessageContent)
+    : message.content;
+  const kwargs: Record<string, unknown> = { ...message.additional_kwargs };
+  if (Array.isArray(kwargs.tool_calls)) {
+    const kept = (kwargs.tool_calls as { id?: unknown }[]).filter(
+      (c) => !isDropped(c?.id),
+    );
+    if (kept.length > 0) kwargs.tool_calls = kept;
+    else delete kwargs.tool_calls;
+  }
+  const meta: Record<string, unknown> = { ...message.response_metadata };
+  if (Array.isArray(meta.output)) {
+    meta.output = withoutDroppedItems(
+      meta.output as { type?: unknown; call_id?: unknown }[],
+      isDropped,
+    );
+  }
+  Object.assign(kwargs, droppedCallsStamp(message, dropped.size));
+  return new AIMessage({
+    ...(typeof message.id === "string" ? { id: message.id } : {}),
+    content,
+    tool_calls: toolCalls,
+    ...(message.invalid_tool_calls?.length
+      ? { invalid_tool_calls: message.invalid_tool_calls }
+      : {}),
+    additional_kwargs: kwargs,
+    response_metadata: meta,
+    ...(message.usage_metadata
+      ? { usage_metadata: message.usage_metadata }
+      : {}),
+    ...(message.name ? { name: message.name } : {}),
+  });
+}
+
+// The history with every unanswered call taken out, and the replacements that write it back. No
+// `REMOVE_ALL_MESSAGES`: like compaction, the repair names the messages it changes. A message with
+// no id cannot be replaced and is left alone; the reducer gives every stored message one.
+function repairDanglingToolCalls(messages: BaseMessage[]): {
+  messages: BaseMessage[];
+  replacements: BaseMessage[];
+  calls: number;
+} {
+  const stalled = repeatsAnsweredCalls(messages);
+  const scope = stalled ? messages.slice(0, -1) : messages;
+  const found = danglingToolCalls(scope);
+  const repaired = [...messages];
+  const replacements: BaseMessage[] = [];
+  let calls = 0;
+  for (const [i, dropped] of found) {
+    const original = messages[i] as AIMessage;
+    if (typeof original.id !== "string") continue;
+    const replacement = withoutCalls(original, dropped);
+    repaired[i] = replacement;
+    replacements.push(replacement);
+    calls += dropped.size;
+  }
+  return { messages: repaired, replacements, calls };
+}
+
+// The turn still has to end: what stops a model that answers every round with the same lone
+// `skip_reply` is the SECOND one, since asked again after deciding alone it did nothing new. The
+// budget bounds it too, but later and through a path built for another purpose. A parallel batch
+// followed by a lone `skip_reply` costs one round more, and that round is where the operator's
+// remaining step runs.
 function reaffirmedSilenceAlone(history: BaseMessage[]): boolean {
   const [last, previous] = turnBatches(history);
   return (
@@ -351,58 +528,26 @@ function reaffirmedSilenceAlone(history: BaseMessage[]): boolean {
   );
 }
 
-// WHETHER THE DECISION WAS THE WHOLE OF WHAT THE MODEL DID, read off the CALLS rather than off their
-// results — and that is the shape rounds 17 and 18 arrived at from opposite ends.
-//
-// Round 17 asked whether the companion SUCCEEDED, and answered it from the result: an error status,
-// or a precondition refusal. Round 18 showed why that cannot be answered there. A tool can decline
-// through a perfectly ordinary success result, because business-level refusals are normal operation
-// and `failure.ts` forbids them from using `toolFailure`: `react_to_message` says so when the last
-// message is itself a reaction, `send_image` when the host is not allowed. Telling those apart from
-// a tool that really acted needs a per-tool contract about what "did nothing" looks like — a
-// taxonomy every future tool would have to join, and would silently fail to.
-//
-// So the question is asked of the batch instead, and answered conservatively, the way
-// `actedOnTheWorld` answers its own: a batch that called ANYTHING else produced information the
-// model has not seen, so it decides again. Only a batch that is nothing but this decision may end
-// the turn on it.
-//
-// THE COST, said out loud: the documented `react_to_message` + `skip_reply` batch now takes one more
-// model round, on which the model sees the reaction's result and either calls `skip_reply` alone
-// (terminal) or answers. That is the point — when the reaction did not happen, answering is exactly
-// what the customer needs.
+// Whether the decision was the whole of what the model did, read off the CALLS, not their results.
+// A tool can decline through an ordinary success result (business refusals must not use `toolFailure`,
+// per `failure.ts`: `react_to_message` on a reaction, `send_image` on a disallowed host), and telling
+// those apart would need a per-tool "did nothing" contract every future tool would silently fail to
+// join. So, like `actedOnTheWorld`, a batch that called ANYTHING else gave the model unseen
+// information and it decides again. The cost: `react_to_message` + `skip_reply` takes one more round,
+// where a reaction that did not happen lets the model answer the customer.
 function onlySkipped(caller: BaseMessage | undefined): boolean {
   const ai = caller as AIMessage | undefined;
   const calls = ai?.tool_calls ?? [];
-  // NOTE: INVALID CALLS COUNT AS COMPANIONS. A provider can emit a good `skip_reply` beside a call whose
-  // arguments do not parse, and LangChain files that one under `invalid_tool_calls` — so a check
-  // that read `tool_calls` alone saw a batch that was nothing but the decision, ended the turn, and
-  // denied the model the round where it would have seen the failure and answered (round 26).
+  // NOTE: invalid calls count as companions. A provider can emit a good `skip_reply` beside a call
+  // whose arguments do not parse, which LangChain files under `invalid_tool_calls`; reading
+  // `tool_calls` alone would end the turn and deny the model the round where it sees the failure.
   if ((ai?.invalid_tool_calls?.length ?? 0) > 0) return false;
+  // NOTE: and so do calls the dangling-call repair took out: the batch was parallel when the model
+  // wrote it, and its companion never running is something the model may answer about.
+  if (droppedCallCount(caller) > 0) return false;
   return calls.length > 0 && calls.every((c) => c.name === SKIP_REPLY_TOOL);
 }
 
-// WHAT THE MODEL WROTE BESIDE THE DECISION, taken back out. A model can put text in the very message
-// that calls `skip_reply` ("Vou deixar quieto por ora"), and that text is never delivered: the
-// runtime posts the LAST assistant message, which is the empty one this turn ends on. Left in the
-// channel it is a sentence the customer never saw, read by the next turn as something they were
-// told — the false memory `refused-turn.ts` exists to prevent, arriving through the silence protocol
-// instead of through a refusal.
-//
-// SCOPED TO THE DECISION, and deliberately not to every tool call. A preamble beside an ORDINARY
-// call ("Vou verificar seu pedido") is followed by a reply that may lean on it, and rewriting the
-// history of every tool-calling turn is a different change on a path this issue is not about. Here
-// we know what the model chose: nothing at all reached the customer.
-//
-// Replaced by ID so the reducer swaps it in place, and everything BUT the content rides along: the
-// tool calls, because the results already in the channel name them and an orphaned `tool_call_id` is
-// a provider error on the next turn; the metadata, because a message rebuilt from its id and content
-// alone silently drops the model's own usage and response fields, which is a second edit nobody
-// asked for. Content is the only thing this is allowed to change.
-//
-// No "already empty, skip it" shortcut: with everything else carried over, replacing an empty
-// message with an empty message is the same message, so the branch would be a condition no test
-// could tell from its absence — and one of those is how a rule gets read as protection it is not.
 // The message's blocks with the TEXT taken out and everything else left alone. A string collapses to
 // an empty list (there was nothing but text in it); an array keeps every block that is not text,
 // which is what carries Anthropic's signed `thinking` / `redacted_thinking` through unchanged.
@@ -413,16 +558,11 @@ function textlessContent(content: MessageContent): MessageContent {
   ) as MessageContent;
 }
 
-// ...AND THE RAW PROVIDER OUTPUT, because for some models the history is serialized from THAT and
-// not from `content`. `@langchain/openai` keeps the Responses API's `output` array in
-// `response_metadata` and replays it, so a message whose `content` is blanked would still hand the
-// narration back to the model, which is the false memory this whole rule exists to remove.
-//
-// The PART type is what decides, and it is the only condition here. A second check on the ITEM type
-// ("only a message loses its text") was written first and removed: `function_call` carries its
-// arguments as a string and `reasoning` carries `reasoning_text` parts, so neither is reachable by
-// the filter below, and a condition no fixture can tell from its absence reads as protection it is
-// not. An adapter that keeps no `output` array pays nothing.
+// ...and the raw provider output, because `@langchain/openai` replays the Responses API's `output`
+// array from `response_metadata`, so blanking `content` alone would still hand the narration back.
+// Only the PART type decides: `function_call` carries arguments as a string and `reasoning` carries
+// `reasoning_text` parts, so a check on the ITEM type would be a condition no fixture can tell from
+// its absence. An adapter that keeps no `output` array pays nothing.
 function textlessResponseMetadata(
   meta: Record<string, unknown> | undefined,
 ): Record<string, unknown> | undefined {
@@ -437,28 +577,23 @@ function textlessResponseMetadata(
         (part as { type?: unknown })?.type !== "output_text" &&
         (part as { type?: unknown })?.type !== "text",
     );
-    // NOTE: AN ITEM THAT WAS NOTHING BUT TEXT GOES WITH IT. Left behind with an empty content array it is
-    // the Responses API's own version of Anthropic's empty text block: the replay is rejected and
-    // the round a companion bought fails instead of running. Dropped only when the filter emptied
-    // it — an item that ARRIVED empty is the provider's own and not this rule's to remove
-    // (round 28).
+    // NOTE: an item that was nothing but text goes with it: left with an empty content array, the
+    // replay is rejected like Anthropic's empty text block, and the round a companion bought fails.
+    // Dropped only when the filter emptied it; an item that arrived empty is the provider's own.
     if (before.length > 0 && after.length === 0) return [];
     return [{ ...(item as object), content: after }];
   });
   return { ...meta, output: rewritten };
 }
 
-// THE LAST WORD OF A SILENT TURN, taken out here instead of being the model's to withhold (issue
-// #639). The turn no longer ends ON the decision, so the message the runtime posts is whatever the
-// model wrote in the round after it — and a turn that chose silence writing to the customer is the
-// exact hazard the terminal branch existed for. Removing the TEXT and nothing else is the same rule
-// `silenceNarration` follows, and for the same reason: `thinking` blocks are signed protocol data,
-// and usage is what the turn is billed by.
+// The last word of a silent turn, taken out here instead of being the model's to withhold: the turn
+// does not end ON the decision, so the posted message is whatever the model wrote in the round after.
+// Removes the TEXT and nothing else, as `silenceNarration` does: `thinking` blocks are signed protocol
+// data, and usage is what the turn is billed by.
 function withoutText(message: BaseMessage): BaseMessage {
   const ai = message as AIMessage;
-  // NO tool calls carried, unlike `silenceNarration`: this one is only ever handed the message that
-  // ENDS the turn, which by definition requests nothing. Copying an empty list either way is how a
-  // mutation that dropped them stayed green — the difference is unreachable, so it is not written.
+  // NOTE: no tool calls carried, unlike `silenceNarration`: this is only handed the message that ENDS
+  // the turn, which requests none, so the difference is unreachable and not written.
   return new AIMessage({
     ...(typeof ai.id === "string" ? { id: ai.id } : {}),
     content: textlessContent(ai.content),
@@ -469,92 +604,74 @@ function withoutText(message: BaseMessage): BaseMessage {
   });
 }
 
+// What the model wrote beside the decision, taken back out. Text in the message that calls
+// `skip_reply` is never delivered (the runtime posts the LAST assistant message), so left in the
+// channel it is a sentence the customer never saw that the next turn reads as told: the false memory
+// `refused-turn.ts` prevents. Scoped to the decision: a preamble beside an ordinary call may be leaned
+// on by the reply. Replaced by ID with everything but the content carried: the tool calls, since an
+// orphaned `tool_call_id` is a provider error, and the metadata, since a rebuild drops usage and
+// response fields. No "already empty" shortcut: that branch would be a condition no test could see.
 function silenceNarration(history: BaseMessage[]): BaseMessage[] {
   const { caller } = lastBatch(history);
   if (!caller || typeof caller.id !== "string") return [];
-  const ai = caller as AIMessage;
-  return [
-    new AIMessage({
-      id: ai.id,
-      // A BLOCK LIST WITHOUT THE TEXT, never `""` and never a blanket `[]`.
-      //
-      // Not `""`: this message KEEPS its tool calls, so `isEmptyAssistantTurn` rightly leaves it in
-      // the history the model is sent — and `@langchain/anthropic` renders string content as a text
-      // block, which Anthropic refuses when it is empty ("text content blocks must be non-empty").
-      // An empty block LIST renders no text block at all (round 21).
-      //
-      // Not `[]` either: a provider can return blocks BESIDE the text, and Anthropic's `thinking`
-      // and `redacted_thinking` are signed and must be replayed unchanged before the tool result
-      // they precede. Emptying the list deletes protocol data, and the very next round — the one a
-      // parallel companion buys — fails at the provider. TEXT is the only thing this may remove
-      // (round 27).
-      content: textlessContent(ai.content),
-      tool_calls: ai.tool_calls ?? [],
-      // NOTE: Carried like the valid ones: they are part of what the model asked for, and a rebuild that
-      // dropped them would erase the record of a call that failed to parse.
-      ...(ai.invalid_tool_calls?.length
-        ? { invalid_tool_calls: ai.invalid_tool_calls }
-        : {}),
-      additional_kwargs: ai.additional_kwargs,
-      response_metadata: textlessResponseMetadata(ai.response_metadata),
-      ...(ai.usage_metadata ? { usage_metadata: ai.usage_metadata } : {}),
-      ...(ai.name ? { name: ai.name } : {}),
-    }),
-  ];
+  return [textlessCopy(caller as AIMessage, caller.id)];
 }
 
-// An assistant turn that said nothing and did nothing, which is what a silent turn leaves behind —
-// the terminal marker below, and, before this file ever wrote one, the empty message a model returns
-// when it is told to produce none. It carries no information for the next turn, and it is not free
-// to keep: `@langchain/anthropic` renders string content as a text block, and Anthropic refuses a
-// text block that is empty ("text content blocks must be non-empty"), so a thread that accumulated
-// one would stop answering entirely on the providers that check. Dropped from what the model is
-// SENT, never from the channel — the marker is what keeps `lastAssistantText` reading "" instead of
-// the skip tool's acknowledgement, which would otherwise be delivered to the customer as the reply.
-//
-// A message with tool_calls is not this, whatever its content: it is the call, and removing it
-// orphans every `tool_call_id` after it.
-//
-// `invalid_tool_calls` is the opposite case, and the asymmetry is the point. A call that failed to
-// parse is never executed, so `toolsCondition` ends the graph and no `ToolMessage` ever answers it —
-// and `@langchain/openai` stores the RAW calls in `additional_kwargs.tool_calls` and replays those
-// whenever `tool_calls` is empty, so keeping such a turn hands the provider an assistant tool call
-// with no response and every later turn on that thread is rejected. Dropping it is what keeps the
-// thread usable; a repair round, not a filter exception, is what would preserve the record.
-//
-// And "no TEXT" is not the question (round 31). A provider can answer with reasoning and nothing
-// else, and Anthropic's `thinking` is signed; such a turn is output, not absence, and reading it as
-// empty deletes from every later prompt exactly what `textlessContent` above takes such care to keep.
-//
-// BUT ONLY WHERE IT SURVIVES THE TRIP (round 2 of the follow-up). A non-text block is re-serialized
-// by the vendor that emitted it and by nobody else: `@langchain/openai` builds an assistant message
-// as `contentBlocks.filter(b => b.type === "text")`, so an Anthropic `thinking` block sent to OpenAI
-// after a provider switch or a cross-vendor fallback arrives as `content: []` and the request is
-// refused — the thread then stops answering entirely, which is worse than the context this keeps.
-// So the exemption asks two things, and drops the turn (the pre-#455 behavior, always safe) whenever
-// either is unanswerable: the block came from a provider that replays its own blocks, and EVERY
-// model that can receive this turn is that same provider.
-//
-// ADDING A PROVIDER TO `models.ts` DOES NOT ADD IT HERE, and should not. Absence is the safe answer:
-// the turn is dropped, which costs context and never breaks a thread. Membership is earned by
-// reading how that vendor's adapter builds an assistant message from a `content` array — if it
-// filters to text blocks, as `@langchain/openai` does, the vendor does NOT belong here however well
-// it round-trips its own reasoning inside a single call.
+// An assistant message with its text taken out and everything else carried, replacing it by `id`.
+function textlessCopy(ai: AIMessage, id: string): AIMessage {
+  return new AIMessage({
+    id,
+    // NOTE: a block list without the text, never `""` and never a blanket `[]`. Not `""`: this
+    // message keeps its tool calls, so `isEmptyAssistantTurn` leaves it in the prompt, and
+    // `@langchain/anthropic` renders a string as a text block Anthropic refuses when empty. Not `[]`:
+    // Anthropic's signed `thinking`/`redacted_thinking` must be replayed unchanged before the tool
+    // result they precede, or the next round fails at the provider.
+    content: textlessContent(ai.content),
+    tool_calls: ai.tool_calls ?? [],
+    // NOTE: Carried like the valid ones: they are part of what the model asked for, and a rebuild that
+    // dropped them would erase the record of a call that failed to parse.
+    ...(ai.invalid_tool_calls?.length
+      ? { invalid_tool_calls: ai.invalid_tool_calls }
+      : {}),
+    additional_kwargs: ai.additional_kwargs,
+    response_metadata: textlessResponseMetadata(ai.response_metadata),
+    ...(ai.usage_metadata ? { usage_metadata: ai.usage_metadata } : {}),
+    ...(ai.name ? { name: ai.name } : {}),
+  });
+}
+
+// The reply `replyWrittenThisTurn` would recover, taken out of the thread once a factual-grounding
+// revise replaced it, so the refused draft is neither delivered nor read by the next turn as said.
+function recoveredDraftRemoved(messages: BaseMessage[]): BaseMessage[] {
+  const m = recoveredReplyMessage(messages);
+  return m && typeof m.id === "string" ? [textlessCopy(m, m.id)] : [];
+}
+
+// Providers whose adapter re-serializes their own non-text blocks. `@langchain/openai` filters an
+// assistant message to text blocks, so an Anthropic `thinking` block sent to OpenAI after a provider
+// switch or fallback arrives as `content: []` and is refused, stopping the thread. So a turn is kept
+// only when its block came from a member AND every model that can receive it is that provider;
+// otherwise it is dropped, which costs context and never breaks a thread. A provider added to
+// `models.ts` does not join by default: membership is earned by reading how its adapter builds an
+// assistant message from a `content` array.
 const REPLAYS_OWN_BLOCKS: ReadonlySet<string> = new Set(["anthropic"]);
 
-// The providers that take a system message AFTER the history, and keep it where it was put. Read by
-// the tool budget's wrap-up instruction (issue #628), which is the one system message the node sends
-// anywhere but first.
-//
-// Membership is earned the same way as above, by what the vendor accepts and not by what it is
-// likely to accept. `openai` is in because both of its adapter paths (Completions and Responses) keep
-// the message in place and send it as `developer` on a GPT-5 model, the API accepts that role at the
-// end, and the round still read the cache (gpt-5.6-luna through OpenRouter pinned to OpenAI, 8 of
-// 8). And because the provider has no endpoint of its own to point elsewhere: `openai` ignores
-// `baseURL`. The Google and Anthropic adapters throw on it before a request is made; `openai-compatible` and `openrouter` reach servers whose
-// rules this cannot know, and absence is the safe answer — the instruction stays in the prompt.
+// Providers that take a system message AFTER the history and keep it there, read by the tool budget's
+// wrap-up, the one system message the node sends anywhere but first. Membership is earned by what the
+// vendor accepts: `openai` keeps it in place on both adapter paths (sent as `developer` on GPT-5), the
+// cache still reads, and it ignores `baseURL` so it points nowhere else. The Google and Anthropic
+// adapters throw on it; `openai-compatible` and `openrouter` reach servers whose rules are unknown, so
+// for them the instruction stays in the prompt.
 const LATE_SYSTEM_MESSAGE: ReadonlySet<string> = new Set(["openai"]);
 
+// An assistant turn that said nothing and did nothing (the terminal marker, or the empty message a
+// model returns when told to produce none), dropped from what the model is SENT, never from the
+// channel, where the marker keeps `lastAssistantText` reading "" rather than the skip tool's ack.
+// Kept, it breaks Anthropic, which refuses an empty text block. A message with tool_calls is never
+// this (removing it orphans every `tool_call_id` after it). One with only `invalid_tool_calls` is: no
+// `ToolMessage` ever answers it and `@langchain/openai` replays the raw calls, so keeping it gets every
+// later turn rejected. Non-text blocks (signed `thinking`) are output, not absence, and are kept only
+// where they survive the trip (see `REPLAYS_OWN_BLOCKS`).
 function isEmptyAssistantTurn(
   m: BaseMessage,
   destinations: ReadonlySet<string>,
@@ -574,15 +691,11 @@ function isEmptyAssistantTurn(
   return contentToText(ai.content).trim() === "";
 }
 
-// Applies the per-agent history ceiling, if there is one. Best-effort: trimming is an optimization
-// and must never cost a customer their answer, so a throw falls back to the full history — slow and
-// expensive, but exactly the behavior that shipped before the ceiling existed.
-//
-// Counted AS SENT (issue #755, review r1): with dates on, each person's message reaches the provider
-// behind one, and on a history of short messages that prefix is most of the weight — measured, 2,000
-// alternating "ok"s went from 10,000 estimated tokens to 21,000. Counting the stored text would let a
-// ceiling set against the provider's limit pass twice that. The window still keeps the STORED
-// messages; the date is rendered on the way out, as before.
+// Applies the per-agent history ceiling, if there is one. Best-effort: trimming must never cost a
+// customer their answer, so a throw falls back to the full history. Counted AS SENT: with dates on,
+// each person's message carries a date prefix that dominates a history of short messages, so counting
+// stored text would let a ceiling set against the provider's limit pass about twice that. The window
+// still keeps the STORED messages; the date is rendered on the way out.
 function applyHistoryCeiling(
   full: BaseMessage[],
   maxHistoryTokens: number | null | undefined,
@@ -621,6 +734,7 @@ export function buildAgentGraph({
   onToolLimit,
   onModelRetry,
   onModelPermitWait,
+  modelPriority,
   primary,
   fallback,
   onModelFallback,
@@ -628,26 +742,38 @@ export function buildAgentGraph({
   maxHistoryTokens,
   historyDates,
   onHistoryTrim,
+  onDanglingToolCalls,
+  onUnansweredInputs,
+  onContradictedHandoff,
   stillWanted,
   noReplyChannel,
+  noEffectCount,
   spokenNotice,
+  standingNotices,
   primaryDeadlineMs,
   signal: jobSignal,
   retrySilence,
   onSilenceRetry,
   checkReply,
+  reviewReply,
+  revisionPlan,
+  onReplyRevised,
+  recoversReply,
+  clientToolNames,
 }: BuildAgentGraphParams) {
   const hasTools = !!tools && tools.length > 0;
   const llm = hasTools ? (model.bindTools?.(tools) ?? model) : model;
-  // Bound to the SAME toolset, or the fallback would answer a question the primary was asked with
-  // tools it cannot call — and the tool-call budget below counts calls, not models.
+  // Bound to the SAME toolset, or the fallback would answer a question the primary was asked
+  // with tools it cannot call; the tool-call budget below counts calls, not models.
   const fallbackLlm =
     fallback && hasTools
       ? (fallback.model.bindTools?.(tools) ?? fallback.model)
       : fallback?.model;
   const max = maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS;
+  // A toolset other than the turn's, asked by the factual-grounding rewrite.
+  type Bound = { primary: typeof llm; fallback?: typeof llm };
 
-  // NOTE: Every model that can receive this turn's history, not just the one that starts it: the
+  // Every model that can receive this turn's history, not just the one that starts it: the
   // fallback takes over mid-invocation and is handed the same array, so a turn kept for the primary
   // alone would reach the second vendor unrenderable. See `isEmptyAssistantTurn`.
   const destinations: ReadonlySet<string> = new Set(
@@ -660,37 +786,39 @@ export function buildAgentGraph({
     destinations.size > 0 &&
     [...destinations].every((d) => LATE_SYSTEM_MESSAGE.has(d));
 
-  // ONCE THE FALLBACK HAS THE TURN, IT KEEPS IT.
-  //
-  // A tool call routes back through this node, and without this the node asks the primary again on
-  // every round. Measured on a three-round turn (two tool calls, then the answer) with the primary
-  // failing: the primary was asked 3 times, the trail got 3 "fallback took the turn" warns for one
-  // failover, and at 200ms per failure the turn cost 609.3ms of which ~600 was the primary. At the
-  // ceiling instead of 200ms that is 45s PER ROUND — worse than the 77-99s this whole change exists
-  // to remove, which is what makes it a defeat of the goal rather than an inefficiency.
-  //
-  // A closure and not a state channel, and the lifetime is the argument: `buildModelAndGraph` builds
-  // this graph inside the turn and invokes it once (webhook, nudge and playground alike), so this
-  // variable IS "this invocation". Putting it in graph state would persist it through the
-  // checkpointer and demote the primary for every later turn on the same conversation, which is the
-  // opposite of what a transient outage should cost.
+  // Once the fallback has the turn, it keeps it. A tool call routes back through this node, and
+  // asking the failing primary again every round would add a warn and up to its full deadline PER
+  // ROUND, defeating the fallback's point. A closure, not a state channel: this graph is built inside
+  // the turn and invoked once, so the variable IS "this invocation", while graph state would persist
+  // through the checkpointer and demote the primary for every later turn on the conversation.
   let fallbackHasTheTurn = false;
+  // Whether the failure that handed the fallback the turn would repeat: when it would not, a later
+  // round's fallback failing for its own account does not end the job, since the next attempt asks the
+  // primary again.
+  let primaryFailsUntilAccountFixed = false;
 
-  // ONCE PER TURN, and the same closure argument the flag above makes: `buildModelAndGraph` builds
-  // this graph inside the turn and invokes it once, so this variable IS "this invocation".
-  //
-  // The cap is one EVENT — the turn ran out of tool budget — and its handlers write an operator line
-  // and can page. It used to be one call by construction, because the hard limit ended the turn. It
-  // stopped being one when a parallel batch containing `skip_reply` became non-terminal (round 18)
-  // and then kept `skip_reply` bound at the cap (round 22): the batch reports the limit, the
-  // reaffirmation round re-enters the terminal branch and reports it again, with a bigger count. Two
-  // warnings for one event, the second one describing a round that spent nothing.
+  // Once per turn, by the same closure argument. The cap is one EVENT whose handlers write an
+  // operator line and can page, but it can be reached twice: a parallel batch with `skip_reply` is not
+  // terminal and `skip_reply` stays bound at the cap, so the reaffirmation round re-enters the terminal
+  // branch and would report it again with a bigger count.
   let toolLimitReported = false;
-  // ONCE PER TURN, the same closure argument: the silence retry (issue #885) runs at most once in
-  // this invocation, however many rounds follow it.
+  // Once per turn, by the same closure argument: the silence retry runs at most once in this
+  // invocation, however many rounds follow it.
   let silenceRetried = false;
   // The held reply's retry, once per invocation for the same reason.
   let replyRetried = false;
+  // Same closure argument: the factual-grounding revision runs at most once per invocation.
+  let replyRevised = false;
+  // The rewrite in progress, across the rounds its calls take: set when a note comes back, cleared on
+  // the answer that ends it. `admitted` is the call ids the tool node may run from the latest round.
+  let revision: {
+    note: string;
+    plan: RevisionPlan | null;
+    tools: StructuredToolInterface[];
+    attempts: number;
+    admitted: Set<string>;
+    info: RevisionInfo;
+  } | null = null;
   const reportToolLimit = (info: {
     maxToolCalls: number;
     toolCalls: number;
@@ -701,16 +829,15 @@ export function buildAgentGraph({
   };
 
   const agentNodeBody = async (state: typeof MessagesAnnotation.State) => {
-    // Exactly one system message, and it must be first: prepend the configured prompt and drop any
-    // system message that leaked into the history (e.g. a proactive nudge persisted as a
-    // SystemMessage by an older build). Providers like Google reject a second one outright with
-    // "System messages are only permitted as the first passed message". The one exception is sent,
-    // never persisted, and only where it is accepted: see `LATE_SYSTEM_MESSAGE`.
+    // Exactly one system message, and it must be first: prepend the configured prompt and drop
+    // any that leaked into the history (a nudge persisted as a SystemMessage). Google rejects a second
+    // one ("System messages are only permitted as the first passed message"). The one exception is
+    // sent, never persisted, and only where it is accepted: see `LATE_SYSTEM_MESSAGE`.
     const full = state.messages.filter(
       (m) => m.getType() !== "system" && !isEmptyAssistantTurn(m, destinations),
     );
 
-    // NOTE: Bound the history BEFORE the tool-call budget below, so both read the same window. The
+    // Bound the history BEFORE the tool-call budget below, so both read the same window. The
     // window always keeps the last human message and everything after it, so the tool count is not
     // affected by the trim; this ordering is about the two never disagreeing.
     const history = applyHistoryCeiling(
@@ -720,53 +847,35 @@ export function buildAgentGraph({
       historyDates,
     );
 
-    // Tool-call budget for this turn. Hard limit reached → invoke the RAW model (no tools bound), so
-    // the response carries no tool_calls and toolsCondition routes to END. Approaching it (N-2) →
+    // Tool-call budget for this turn. Hard limit reached: invoke the RAW model (no tools bound),
+    // so the response carries no tool_calls and toolsCondition routes to END. Approaching it (N-2):
     // append a "wrap up" instruction but keep tools available for the imprescindible case.
     const toolCalls = hasTools ? toolCallsSinceLastHuman(history) : 0;
     const hardLimit = hasTools && toolCalls >= max;
     const staySilent = hasTools && justDecidedToStaySilent(history);
-    // The decision, taken alone, for the REST of the turn (issue #639, and see the function).
+    // The decision, taken alone, for the REST of the turn (see the function).
     const silentTurn = hasTools && decidedToStaySilentAlone(history);
-    // ONLY THE MESSAGE THAT ENDS THE TURN, which is the one carrying no calls: a message that still
-    // requests tools is not what the runtime posts, and blanking a preamble beside an ordinary call
-    // is a different change on a path this issue is not about (the same line `silenceNarration`
-    // draws). `narration` already covers the text written beside the decision itself.
+    // Only the message that ends the turn, the one carrying no calls: a message still requesting
+    // tools is not what the runtime posts, and a preamble beside an ordinary call is left alone (the
+    // same line `silenceNarration` draws). `narration` covers the text beside the decision itself.
     const silenced = (m: BaseMessage): BaseMessage =>
       silentTurn && ((m as AIMessage).tool_calls?.length ?? 0) === 0
         ? withoutText(m)
         : m;
-    // THE DECISION STICKS, and it no longer ENDS the turn (issue #639). The old branch returned
-    // here on a lone `skip_reply` with no further model round, which is what cost the operator every
-    // step they wrote after it. What that branch was protecting is kept by `silentTurn` instead: the
-    // wrap-up below stays suppressed, the hard limit stops trying to force an answer, and the final
-    // text is taken out on the way back — in code, rather than being the model's to keep.
-    //
-    // The count is still untouched, which is what bounds a model that loops on `skip_reply`: at the
-    // budget the raw model is invoked with no tools at all, so the next message carries no calls and
-    // `toolsCondition` routes to END.
-    // BLANKED THE MOMENT THE DECISION IS SEEN, not only when the turn ends on it. A model can put
-    // text in the message that calls `skip_reply`, and on a PARALLEL batch that message is not the
-    // end of the turn — so a branch that only blanked on the way out left the narration standing
-    // whenever a companion tool bought another round, and the turn could still finish silent (round
-    // 20). Undelivered either way: the runtime posts the LAST assistant message.
+    // The decision sticks without ending the turn: `silentTurn` keeps the wrap-up suppressed,
+    // stops the hard limit forcing an answer, and takes the final text out in code. The count is
+    // untouched, which bounds a model looping on `skip_reply`: at the budget the raw model runs with
+    // no tools, so `toolsCondition` routes to END. The narration is blanked the moment the decision is
+    // seen: on a PARALLEL batch the calling message is not the end of the turn, and a companion's
+    // extra round would leave it standing. Undelivered either way: the runtime posts the LAST message.
     const narration = staySilent ? silenceNarration(history) : [];
-    // THE TURN ENDS WHERE THE INFORMATION ENDS: a lone `skip_reply` asked for again, right after one,
-    // adds nothing a further round could act on (see `reaffirmedSilenceAlone`). Everything the old
-    // terminal branch did on the way out is done here, minus the part that cost the operator their
-    // remaining steps.
-    // …and the OTHER way a silent turn runs out of things to do: the budget. A turn that decided
-    // silence alone and has spent its tool calls cannot act again and may not speak, so asking the
-    // model at all buys a completion whose only possible use is text this path would blank. The old
-    // terminal branch got here for free by never leaving; this pays the same by not asking.
-    // THE STALL, and it became reachable when the lone decision stopped ending the turn (#639).
-    // `ToolNode` SKIPS a call whose `tool_call_id` already has an answer in the history, so a model
-    // that repeats a batch verbatim gets no new result and is asked again with the same history,
-    // forever: the budget does not bound it either, because that counts tool RESULTS and none are
-    // being produced. Asked of the CALLS rather than of the tools step's output, deliberately — an
-    // empty step is not by itself a stall (a tool that answered nothing still leaves the model free
-    // to reply, which is what a `/reset` landing mid-turn relies on), while a batch whose every id
-    // is already answered provably cannot produce one.
+    // The turn ends where the information ends, in three cases. A lone `skip_reply` asked for
+    // again right after one adds nothing a further round could act on (see `reaffirmedSilenceAlone`).
+    // A turn that decided silence alone and spent its budget can neither act nor speak, so a model call
+    // would only buy text this path blanks. And the stall: `ToolNode` skips a call whose id already has
+    // an answer, so a verbatim repeat gets no result and is asked again forever (the budget counts
+    // RESULTS). Asked of the CALLS, not the step's output: an empty step still leaves the model free to
+    // reply, which a `/reset` landing mid-turn relies on.
     const stalled = repeatsAnsweredCalls(history);
     if (
       stalled ||
@@ -774,56 +883,80 @@ export function buildAgentGraph({
       (silentTurn && hardLimit)
     ) {
       if (hardLimit) reportToolLimit({ maxToolCalls: max, toolCalls });
+      // The reply the runtime may still recover from beside an earlier call, reviewed here too: with
+      // no model call left to rewrite it, a revise reads as an empty rewrite.
+      const recovered =
+        reviewReply &&
+        !replyRevised &&
+        !noReplyChannel &&
+        !silentTurn &&
+        recoversReply?.()
+          ? customerFacingReply(replyWrittenThisTurn(history)).text
+          : "";
+      if (reviewReply && recovered) {
+        const note = await reviewReply(history, recovered);
+        if (note) {
+          replyRevised = true;
+          onReplyRevised?.("");
+        }
+      }
+      // A rewrite that stalls here ends with nothing written, which sends the Output template.
+      if (revision) {
+        const r = revision;
+        revision = null;
+        await r.plan?.review(history, "", r.info);
+        onReplyRevised?.("");
+      }
       return {
         messages: [
           ...narration,
+          ...(replyRevised && recovered ? recoveredDraftRemoved(history) : []),
           ...(stalled ? dropRepeatedBatch(history) : []),
           new AIMessage(""),
         ],
       };
     }
-    // `staySilent` is back in this condition, and round 18 is why it had to be. It left when the
-    // branch above returned on `staySilent` alone — no round after the decision, so nothing to
-    // instruct — and now that branch also asks whether the decision stood alone. On a PARALLEL batch
-    // there IS a round after it, and "Conclua agora: responda ao cliente" is the exact opposite of
-    // what the model just chose. Measured by the round-7 test, not by reading.
+    // `staySilent` is needed here: on a PARALLEL batch there IS a round after the decision, and
+    // "Conclua agora: responda ao cliente" is the exact opposite of what the model just chose.
     const softLimit =
       hasTools &&
       !hardLimit &&
       !staySilent &&
-      // …and for the rest of a turn that decided silence alone, for the same reason: the decision is
-      // still standing two rounds later, and the wrap-up would be arguing with it (issue #639).
+      // NOTE: and for the rest of a turn that decided silence alone: the decision still stands two
+      // rounds later, and the wrap-up would be arguing with it.
       !silentTurn &&
       toolCalls >= Math.max(1, max - 2);
 
-    // WHERE THE WRAP-UP TRAVELS (issue #628): after the history where every destination takes a
-    // system message there, inside the system prompt everywhere else, and in a human message never.
-    //
-    // After the history is what the cache wants. Providers cache a request by its exact prefix and
-    // the system prompt opens every request, so a line appended to it changes the prefix at the first
-    // message: the round it lands on cannot read what the round before wrote, and on GPT-5.6 it pays
-    // a cache WRITE (1.25x input) on the whole prompt where a read (0.1x) was available. Measured on
-    // one install: calls carrying the instruction read the cache 8 times in 311, calls without it
-    // 399 in 1003.
-    //
-    // A SYSTEM message is what keeps it an instruction. The role is the one thing a customer cannot
-    // forge: anyone can type "[Sistema] ..." into a chat, and it arrives in a human message. Sent in
-    // a human message too, the real instruction would teach the model that such a line is to be
-    // obeyed, and the customer's copy would be indistinguishable from it.
-    //
-    // So the late system message only goes where it is accepted, and the prompt keeps it everywhere
-    // else — the cache miss those providers pay today, and nothing new.
-    // NOTE: WHAT THE TURN CAN STILL DO, and on an observation that is not answering anybody (#629).
-    // The budget is the same; the sentence after it is what changes, because the wrap-up's job is to
-    // land the turn and an instruction the frame forbids is one the model has to argue with first.
+    // On an observation the budget is the same, but the sentence after it says what the turn can
+    // still do: the wrap-up exists to land the turn, and an instruction the frame forbids is one the
+    // model has to argue with first.
     const wrapUpText = noReplyChannel
       ? `[Sistema] Você já usou ${toolCalls} de ${max} ferramentas permitidas neste turno. Conclua agora: se ainda falta registrar algo, use a última ferramenta; se não, encerre sem escrever nada.`
       : `[Sistema] Você já usou ${toolCalls} de ${max} ferramentas permitidas neste turno. Conclua agora: responda ao cliente com as informações que já tem. Só use outra ferramenta se for absolutamente imprescindível.`;
-    // The spoken-reply notice (issue #859) rides the same way, first. Only the callers that deliver
-    // a reply which can be spoken pass one, so an observation never carries it.
+    // The hard-limit round runs with no tools, so the wrap-up's "use another tool if imprescindible"
+    // is no longer true there; without its own instruction a model mid-plan writes its next step as
+    // text, and that text is the reply. No handoff is offered: no tool can perform it on this call.
+    // A turn that just chose silence keeps `skip_reply` on this round and is left as it was.
+    const capText = noReplyChannel
+      ? `[Sistema] Você usou as ${max} ferramentas permitidas neste turno e não há mais ferramentas disponíveis. Encerre sem escrever nada.`
+      : `[Sistema] Você usou as ${max} ferramentas permitidas neste turno e não há mais ferramentas disponíveis. Sua próxima mensagem vai ao cliente exatamente como você escrever: responda com as informações que já tem e, se faltar algo, diga ao cliente o que falta.`;
+    const toldOfCap = hardLimit && !staySilent;
+    // The spoken-reply notice rides with the wrap-up, first. Only the callers that deliver a reply
+    // which can be spoken pass one, so an observation never carries it.
     const noticeText = spokenNotice?.()?.trim();
     const notice = noticeText ? [noticeText] : [];
-    const lateTexts = [...notice, ...(softLimit ? [wrapUpText] : [])];
+    const lateTexts = [
+      ...notice,
+      ...(standingNotices ?? []),
+      ...(softLimit ? [wrapUpText] : []),
+      ...(toldOfCap ? [capText] : []),
+    ];
+    // The wrap-up travels after the history where every destination takes a system message
+    // there, inside the system prompt elsewhere, and in a human message never. After the history keeps
+    // the cached prefix: a line appended to the system prompt changes the prefix at the first message,
+    // and the round pays a cache WRITE on the whole prompt where a read was available. A SYSTEM message
+    // keeps it an instruction: a customer can type "[Sistema] ..." but cannot forge the role, and a
+    // real instruction in a human message would teach the model to obey the customer's copy.
     const prompt = lateSystemAccepted
       ? systemPrompt
       : [systemPrompt, ...lateTexts].join("\n\n");
@@ -833,26 +966,12 @@ export function buildAgentGraph({
     if (hardLimit) {
       reportToolLimit({ maxToolCalls: max, toolCalls });
     }
-    // THE HARD LIMIT MUST NOT TALK A DECISION OUT OF ITSELF, and a PARALLEL batch is where it could.
-    // The hard-limit path invokes the RAW model with no tools bound, which exists to force a text
-    // answer — and round 18 made that batch non-terminal, so a model that chose silence and had a
-    // companion to inspect landed there and could be made to write. Round 9 already named that
-    // defect; this is the same one, arriving through the parallel door.
-    //
-    // So the budget stops the tools that ACT and leaves the one that does not: with `skip_reply`
-    // alone bound, the model sees the companion's result and either reaffirms silence (a batch that
-    // is nothing but the decision, which ends the turn) or answers, which is exactly what the
-    // customer needs when the companion failed. It cannot loop: the reaffirmation is terminal.
-    //
-    // A turn that decided silence ALONE is the other case, and it takes no tools at all: there is
-    // nothing for the model to reconsider and nothing left it may say, so the raw model's answer
-    // carries no calls, `toolsCondition` ends the turn, and the text comes out below. That is also
-    // what stops a model looping on `skip_reply` now that the decision is no longer terminal — the
-    // budget it spends looping is what brings it here (issue #639).
-    // No `!silentTurn` here, though the two cases are different: a turn that decided silence alone
-    // and hit the budget already returned above, so this line is only ever reached by the parallel
-    // one. The extra term survived every mutation, which is the shape of a condition that cannot
-    // change an answer.
+    // The hard limit must not talk a decision out of itself. Its path invokes the model with no
+    // tools to force a text answer, and a parallel batch with `skip_reply` is not terminal, so a model
+    // that chose silence could be made to write. So the budget keeps `skip_reply` alone bound: the
+    // model sees the companion's result and either reaffirms silence (terminal, so no loop) or answers,
+    // which the customer needs when the companion failed. A turn that decided silence ALONE takes no
+    // tools and already returned above, which is why no `!silentTurn` term is needed here.
     const silenceOnly =
       hardLimit && staySilent
         ? (tools ?? []).filter((t) => t.name === SKIP_REPLY_TOOL)
@@ -867,10 +986,9 @@ export function buildAgentGraph({
         ? (fallback.model.bindTools?.(silenceOnly) ?? fallback.model)
         : fallback?.model;
 
-    // SENT WITHOUT THE NARRATION, not merely persisted without it. The blanking above is a reducer
-    // update that lands AFTER this call, so a parallel batch's extra round would otherwise reach the
-    // model still carrying the sentence the customer never received — and the model can lean on it,
-    // or repeat it, in the answer that does go out (round 22).
+    // SENT without the narration, not merely persisted without it: the blanking above is a
+    // reducer update that lands AFTER this call, so a parallel batch's extra round would reach the model
+    // still carrying the sentence the customer never received, for it to lean on or repeat.
     const sent = narration.length
       ? history.map((m) => narration.find((n) => n.id === m.id) ?? m)
       : history;
@@ -881,26 +999,30 @@ export function buildAgentGraph({
     const messages = [new SystemMessage(prompt), ...shown, ...wrapUp];
     // The SAME question, to the other provider, when there is one. Same messages and same prompt:
     // this is not a second, cheaper attempt, it is the attempt the customer is waiting for.
-    const secondFor = (msgs: BaseMessage[]) =>
+    const secondFor = (msgs: BaseMessage[], bound?: Bound) =>
       fallback && fallbackLlm
         ? {
             labels: { provider: fallback.provider, model: fallback.modelId },
-            // The same 45 s the fallback's SDK is given, held by the race on an adapter that drops it.
+            // The same ceiling the fallback's SDK is given, held by the race on an adapter that drops it.
             deadlineMs: fallback.deadlineMs ?? PRIMARY_TIMEOUT_MS,
             run: (deadline: AbortSignal) => {
               // NOTE: a primary ended by the job's deadline reads as a timeout, which is what hands
-              // the turn to the fallback; after the deadline there is no turn to hand (issue #811).
+              // the turn to the fallback; after the deadline there is no turn to hand.
               if (jobSignal?.aborted) return Promise.reject(jobSignal.reason);
               const signal = jobSignal
                 ? AbortSignal.any([deadline, jobSignal])
                 : deadline;
               return (
-                hardLimit ? (cappedFallback ?? fallback.model) : fallbackLlm
+                bound
+                  ? (bound.fallback ?? fallback.model)
+                  : hardLimit
+                    ? (cappedFallback ?? fallback.model)
+                    : fallbackLlm
               ).invoke(msgs, {
                 signal,
-                // Metadata rather than callbacks, and measured: metadata MERGES with the turn's and
-                // reaches the handlers it already had, while `callbacks` replaces them — which
-                // would have billed this call to the primary's name or dropped the Langfuse trace.
+                // NOTE: metadata rather than callbacks: metadata MERGES with the turn's handlers,
+                // while `callbacks` replaces them, which would bill this call to the primary's name or
+                // drop the Langfuse trace.
                 metadata: {
                   [USAGE_MODEL_METADATA_KEY]: fallback.modelId,
                   [USAGE_PROVIDER_METADATA_KEY]: fallback.provider,
@@ -911,9 +1033,13 @@ export function buildAgentGraph({
         : null;
 
     // One question to the model, the fallback's rules included. A function because the silence
-    // retry below (issue #885) asks it a second time, with different messages, under the same rules.
-    const ask = async (msgs: BaseMessage[]): Promise<BaseMessage> => {
-      const second = secondFor(msgs);
+    // retry below asks it a second time, with different messages, under the same rules. `bound`
+    // replaces the turn's toolset: the raw model, or the sources, for the factual-grounding rewrite.
+    const ask = async (
+      msgs: BaseMessage[],
+      bound?: Bound,
+    ): Promise<BaseMessage> => {
+      const second = secondFor(msgs, bound);
       // Already demoted this invocation: the fallback IS the model now, so it gets the
       // empty-completion retry under its own name, and a failure of its own is reported as that
       // rather than as a second failover the operator never caused.
@@ -925,28 +1051,33 @@ export function buildAgentGraph({
             primary: second.labels,
             onRetry: onModelRetry,
             onPermitWait: onModelPermitWait,
+            priority: modelPriority,
           });
         } catch (err) {
-          // NOTE: a call the job's deadline ended failed on the job, not on the provider (issue #811).
-          if (!jobSignal?.aborted) {
-            onModelFallbackFailed?.({
+          // NOTE: a call the job's deadline ended failed on the job, not on the provider.
+          if (!jobSignal?.aborted && onModelFallbackFailed) {
+            const failure = providerFailure(err);
+            onModelFallbackFailed({
               ...second.labels,
               reason: err instanceof Error ? err.message : "provider error",
+              failure,
             });
+            markReportedElsewhere(err, failure);
           }
+          if (!primaryFailsUntilAccountFixed) clearAccountFailure(err);
           throw err;
         }
       }
 
-      const primaryLlm = hardLimit ? capped : llm;
-      // NOTE: an explicit `signal` REPLACES the one LangGraph propagates to this call instead of joining
-      // it (measured). The job's deadline is joined here with the call's own, which `runModelCall`
-      // hands in, so a deadline that ends the job ends this call too (issue #811).
+      const primaryLlm = bound ? bound.primary : hardLimit ? capped : llm;
+      // NOTE: an explicit `signal` REPLACES the one LangGraph propagates to this call instead of
+      // joining it. The job's deadline is joined here with the call's own, which `runModelCall` hands
+      // in, so a deadline that ends the job ends this call too.
       return runModelCall(
         (deadline) => {
-          // NOTE: a job past its deadline starts no primary call, which a permit wait or a slow tool can
-          // otherwise reach with the signal already aborted: an adapter that ignores the signal would
-          // still bill a reply nobody can deliver (issue #811).
+          // NOTE: a job past its deadline starts no primary call, which a permit wait or a slow tool
+          // can otherwise reach with the signal already aborted: an adapter that ignores the signal
+          // would still bill a reply nobody can deliver.
           if (jobSignal?.aborted) return Promise.reject(jobSignal.reason);
           const signal = jobSignal
             ? AbortSignal.any([deadline, jobSignal])
@@ -959,22 +1090,41 @@ export function buildAgentGraph({
           primary,
           onRetry: onModelRetry,
           onPermitWait: onModelPermitWait,
+          priority: modelPriority,
           fallback: second
             ? {
                 labels: second.labels,
                 run: second.run,
                 deadlineMs: second.deadlineMs,
                 // NOTE: after the job's deadline no fallback starts (see `second.run`), so there is no
-                // failover to report and no failed provider: the primary failed on the job's deadline
-                // (issue #811).
-                onFallback: ({ reason }) => {
+                // failover to report and no failed provider: the primary failed on the job's deadline.
+                onFallback: ({
+                  reason,
+                  failure,
+                  primaryFailsUntilAccountFixed: repeats,
+                }) => {
                   if (jobSignal?.aborted) return;
                   fallbackHasTheTurn = true;
-                  onModelFallback?.({ ...second.labels, reason });
+                  primaryFailsUntilAccountFixed = repeats;
+                  onModelFallback?.({ ...second.labels, reason, failure });
                 },
-                onFallbackFailed: ({ reason }) => {
+                onFallbackFailed: ({
+                  reason,
+                  failure,
+                  primaryReason,
+                  primaryFailure,
+                }) => {
                   if (jobSignal?.aborted) return;
-                  onModelFallbackFailed?.({ ...second.labels, reason });
+                  onModelFallbackFailed?.({
+                    ...second.labels,
+                    reason,
+                    failure,
+                    primary: {
+                      ...primary,
+                      reason: primaryReason,
+                      failure: primaryFailure,
+                    },
+                  });
                 },
               }
             : undefined,
@@ -982,13 +1132,67 @@ export function buildAgentGraph({
       );
     };
 
+    // One round of the factual-grounding rewrite. The note travels like the silence retry's
+    // instruction, on every round, so it is in front of the model when it writes the answer. Calls go
+    // to the tool node only while the cap has room; the first `room` of a batch are offered, and of
+    // those only the sources run (`setAsideRevisionCalls`). A call written with no round left is
+    // dropped, and the text beside it is the rewrite.
+    const askRevision = async (
+      r: NonNullable<typeof revision>,
+    ): Promise<BaseMessage> => {
+      // Bounded by the turn's own budget too: the rewrite's calls are the turn's calls.
+      const room = r.plan
+        ? Math.min(r.plan.maxToolCalls - r.attempts, max - toolCalls)
+        : 0;
+      const canCall = room > 0 && !hardLimit && r.tools.length > 0;
+      const bound: Bound = canCall
+        ? {
+            primary: model.bindTools?.(r.tools) ?? model,
+            fallback: fallback
+              ? (fallback.model.bindTools?.(r.tools) ?? fallback.model)
+              : undefined,
+          }
+        : { primary: model, fallback: fallback?.model };
+      let res = await ask(
+        lateSystemAccepted
+          ? [...messages, new SystemMessage(r.note)]
+          : [new SystemMessage(`${prompt}\n\n${r.note}`), ...shown, ...wrapUp],
+        bound,
+      );
+      const usage = (res as AIMessage).usage_metadata;
+      r.info.inputTokens += usage?.input_tokens ?? 0;
+      r.info.outputTokens += usage?.output_tokens ?? 0;
+      const calls = (res as AIMessage).tool_calls ?? [];
+      if (calls.length > 0 && canCall) {
+        r.attempts += Math.min(calls.length, room);
+        r.admitted = admitRevisionCalls(
+          calls,
+          new Set(r.tools.map((t) => t.name)),
+          room,
+        );
+        return res;
+      }
+      if (calls.length > 0) {
+        r.info.refused.push(...calls.map((c) => c.name));
+        res = textOnly(res);
+      }
+      // NOTE: a rewrite that is only a `—` is no rewrite, for the callbacks below and for the thread.
+      if (fillerOnly(res)) res = withoutText(res);
+      const reply = customerFacingReply(contentToText(res.content)).text;
+      revision = null;
+      await r.plan?.review([...history, res], reply, r.info);
+      onReplyRevised?.(reply);
+      return res;
+    };
+    if (revision) return { messages: [await askRevision(revision)] };
+
     let response = await ask(messages);
-    // THE UNEXPLAINED SILENCE, ASKED ONCE MORE (issue #885). Only a final answer that says nothing:
-    // no text, no calls, in a turn that declared no silence (`calledSkipThisTurn` covers the round
-    // right after the decision too), whose reply the model did not already write beside a tool call
-    // (issue #886 delivers that one), and not at the hard limit, where the model runs without the
-    // tools the instruction names. The caller's predicate is asked last, at the moment it would run:
-    // it knows what this node cannot (a transfer that completed, something already delivered).
+    // NOTE: the unexplained silence, asked once more. Only a final answer that says nothing: nothing
+    // to read (`saysNothing`), no calls, in a turn that declared no silence (`calledSkipThisTurn` covers the round right after
+    // the decision too), whose reply the model did not already write beside a tool call (that one is
+    // delivered as is), and not at the hard limit, where the model runs without the tools the
+    // instruction names. The caller's predicate is asked last, at the moment it would run: it knows
+    // what this node cannot (a transfer that completed, something already delivered).
     if (
       retrySilence &&
       !silenceRetried &&
@@ -1001,18 +1205,23 @@ export function buildAgentGraph({
     ) {
       silenceRetried = true;
       const canSkip = (tools ?? []).some((t) => t.name === SKIP_REPLY_TOOL);
-      const text = silenceRetryText(canSkip);
-      // WHERE IT TRAVELS is where the tool budget's wrap-up does (issue #628), and for the same
-      // reasons: after the history as a system message where every destination keeps one there,
-      // inside the one system prompt everywhere else, and in a human message never. The empty
-      // answer is NOT sent back: it said nothing, and an empty assistant turn is the shape some
-      // providers refuse. Neither is persisted: only the second answer returns to the thread.
+      const text = silenceRetryText(
+        canSkip,
+        hiddenNotesThisTurn(history).length > 0,
+      );
+      // It travels where the tool budget's wrap-up does, for the same reasons: after the history
+      // as a system message where every destination keeps one there, inside the one system prompt
+      // everywhere else, and in a human message never. The empty answer is NOT sent back: it said
+      // nothing, and an empty assistant turn is the shape some providers refuse. Neither is persisted:
+      // only the second answer returns to the thread.
       const retried = lateSystemAccepted
         ? [...messages, new SystemMessage(text)]
         : [new SystemMessage(`${prompt}\n\n${text}`), ...shown, ...wrapUp];
       response = await ask(retried);
       onSilenceRetry?.({ outcome: silenceRetryOutcome(response) });
     }
+    // NOTE: from here on a `—` is the empty answer: neither check below takes it as a candidate.
+    if (fillerOnly(response)) response = withoutText(response);
     // THE HELD REPLY, ASKED ONCE MORE (see `checkReply`). Only a final answer with text in a turn
     // that is not silent; it travels where the silence retry's instruction does, and the held answer
     // is not sent back, so the model reads the rule and a summary instead of its own words.
@@ -1034,16 +1243,101 @@ export function buildAgentGraph({
         ? [...messages, new SystemMessage(heldNote)]
         : [new SystemMessage(`${prompt}\n\n${heldNote}`), ...shown, ...wrapUp];
       response = await ask(retried);
+      if (fillerOnly(response)) response = withoutText(response);
     }
-    return { messages: [...narration, silenced(response)] };
+    // The factual-grounding review's candidate, on a turn that answers somebody and did not decide
+    // silence: the final text, or, when that is empty, the reply written beside an earlier call that
+    // the runtime recovers and delivers (`replyWrittenThisTurn`). A revise note travels like the
+    // silence retry's instruction, with the draft quoted inside it rather than sent as an assistant turn.
+    const candidate =
+      reviewReply &&
+      !replyRevised &&
+      !noReplyChannel &&
+      !silentTurn &&
+      ((response as AIMessage).tool_calls?.length ?? 0) === 0
+        ? customerFacingReply(
+            contentToText(response.content).trim() ||
+              (recoversReply?.()
+                ? replyWrittenThisTurn([...history, response])
+                : ""),
+          ).text
+        : "";
+    let draftRemoved: BaseMessage[] = [];
+    if (reviewReply && candidate) {
+      const note = await reviewReply([...history, response], candidate);
+      if (note) {
+        replyRevised = true;
+        if (!contentToText(response.content).trim())
+          draftRemoved = recoveredDraftRemoved([...history, response]);
+        const plan = revisionPlan?.() ?? null;
+        const sources = plan
+          ? revisionTools(
+              tools ?? [],
+              plan.sourceTools,
+              clientToolNames ?? new Set(),
+            )
+          : [];
+        revision = {
+          note:
+            plan && sources.length > 0
+              ? `${note}\n\n${revisionToolsNote(
+                  sources.map((t) => t.name),
+                  plan.maxToolCalls,
+                )}`
+              : note,
+          plan,
+          tools: sources,
+          attempts: 0,
+          admitted: new Set(),
+          info: {
+            toolCalls: 0,
+            tools: [],
+            refused: [],
+            inputTokens: 0,
+            outputTokens: 0,
+          },
+        };
+        response = await askRevision(revision);
+      }
+    }
+    return { messages: [...narration, ...draftRemoved, silenced(response)] };
   };
 
-  // The node as the graph runs it. A model call ended by the job's deadline (issue #811) fails with
-  // whatever the provider layer made of the abort ("timeout", or "provider error"); the run is
-  // reported with the job's own error instead, which is ours to publish and names the deadline.
+  // The node as the graph runs it. A model call ended by the job's deadline fails with whatever
+  // the provider layer made of the abort ("timeout", or "provider error"); the run is reported with
+  // the job's own error instead, which is ours to publish and names the deadline.
   const agentNode = async (state: typeof MessagesAnnotation.State) => {
     try {
-      return await agentNodeBody(state);
+      // Before anything reads the history, so the budget, the window and the provider all see the
+      // repaired one. The replacements go FIRST in the update: the body can replace the same message
+      // again (`silenceNarration`), and the reducer applies them in order.
+      const residue = unansweredInputs(state.messages);
+      const gone = new Set(residue.ids);
+      const repair = repairDanglingToolCalls(
+        gone.size === 0
+          ? state.messages
+          : state.messages.filter((m) => !gone.has(m.id as string)),
+      );
+      if (repair.replacements.length === 0 && gone.size === 0)
+        return await agentNodeBody(state);
+      const update = await agentNodeBody({
+        ...state,
+        messages: repair.messages,
+      });
+      if (repair.replacements.length > 0)
+        onDanglingToolCalls?.({ calls: repair.calls });
+      if (gone.size > 0)
+        onUnansweredInputs?.({
+          directives: residue.directives,
+          duplicates: residue.duplicates,
+        });
+      return {
+        messages: [
+          ...residue.ids.map((id) => new RemoveMessage({ id })),
+          ...repair.replacements,
+          ...update.messages,
+        ],
+      };
     } catch (err) {
       if (jobSignal?.aborted && jobSignal.reason instanceof Error) {
         throw jobSignal.reason;
@@ -1052,43 +1346,56 @@ export function buildAgentGraph({
     }
   };
 
-  // ONCE PER TURN, the same closure argument the two flags above make. It says the tool boundary
+  // Once per turn, the same closure argument the flags above make. It says the tool boundary
   // refused this turn's calls, which is what routes the graph to END instead of back to the model.
   let calledOffAtTools = false;
+  // Once per turn as well: the step just run ended an observation (see `endsOnWrites`).
+  let endedOnWrites = false;
   const toolNode = hasTools ? new ToolNode(tools) : null;
+  const toolsByName = new Map((tools ?? []).map((t) => [t.name, t]));
 
-  // THE REFUSAL IS A TOOL RESULT, AND THE TURN ENDS ON IT. Two requirements, and each of the two
-  // obvious shortcuts breaks one of them:
-  //
-  //   - routing away from the tool node leaves an `AIMessage` carrying `tool_calls` that no
-  //     `ToolMessage` answers, and that thread is what the NEXT turn loads. `@langchain/openai`
-  //     replays those calls out of `additional_kwargs` (issue #454), so the vendor is handed a call
-  //     with no answer and rejects the whole history — the conversation stops working, which is a
-  //     worse outcome than the write this refusal exists to prevent;
-  //   - answering "refused" back INTO the model invites it to call the same tool again, round after
-  //     round to the recursion limit, spending tokens on a conversation the operator has already
-  //     cleared. So the graph ENDS here. The runtime's own gate refuses the send of a turn that was
-  //     called off, which is what keeps this text out of the conversation.
-  //
-  // AND IT REFUSES BY RETURNING, NEVER BY THROWING, which is why the ask is wrapped. The contract in
-  // ./reset-episode.ts reserves the throwing answer for seams that are asked "before anything is
-  // written" — and by the time this node runs, the assistant turn carrying the calls is ALREADY
-  // checkpointed. Measured against the real checkpointer with a tools node that throws: the thread
-  // comes back `[human, ai(tool_calls=call_x)]`, no `ToolMessage`, which is the broken sequence
-  // above, reached by the mechanism meant to prevent it. Several of the fences the runtime hands
-  // down read a job row and throw on a database transient whatever the strictness, so this is not a
-  // hypothetical caller.
-  //
-  // An unreadable mark therefore lets the tools run, which is the same trade the sends make: it is
-  // not evidence that anybody withdrew the run, and a turn whose database is failing is failing
-  // through the machinery that already exists.
+  // An observation ends after a step of writes alone, every one accepted: its client is muted, so the
+  // closing model call could only write text nobody receives, and it resends the whole window to do
+  // it. A read in the step keeps the call (its result is what the next step acts on), and so does any
+  // call that failed or was refused, so the model can see why and fix it. A name the toolset does not
+  // have is answered with an error, which keeps the call too. A responder always goes on: its last
+  // message is the reply.
+  const endsOnWrites = (
+    calls: { name: string; id?: string }[],
+    results: BaseMessage[],
+    refused: boolean,
+  ): boolean => {
+    if (!noReplyChannel || refused || calls.length === 0) return false;
+    const writes = calls.every((c) => {
+      const t = toolsByName.get(c.name);
+      return t !== undefined && !isReadTool(t);
+    });
+    if (!writes) return false;
+    const answered = new Map(
+      results
+        .filter((m) => m.getType() === "tool")
+        .map((m) => [(m as ToolMessage).tool_call_id, m as ToolMessage]),
+    );
+    return calls.every((c) => {
+      const r = c.id ? answered.get(c.id) : undefined;
+      return r !== undefined && r.status !== "error";
+    });
+  };
+  const clientNames: ReadonlySet<string> = clientToolNames ?? new Set();
+
+  // The refusal is a tool result, and the turn ends on it. Routing away from the tool node would
+  // leave `tool_calls` no `ToolMessage` answers, which `@langchain/openai` replays so the vendor
+  // rejects every later turn; answering "refused" into the model invites it to call again up to the
+  // recursion limit. It refuses by RETURNING: the assistant turn with the calls is already
+  // checkpointed, so a throw leaves exactly that unanswered call, and several fences throw on a
+  // database transient whatever the strictness (./reset-episode.ts reserves throwing for seams asked
+  // before anything is written). An unreadable mark lets the tools run, the same trade the sends make.
   const refuseCalledOffCalls = async (
     state: typeof MessagesAnnotation.State,
   ): Promise<{ messages: BaseMessage[] } | null> => {
     if (!stillWanted && !jobSignal) return null;
-    // No guard on an empty list, and the mutation battery is why: `toolsCondition` routes here only
-    // when the last message is an assistant turn carrying tool calls, so the empty case is not a
-    // case. A check for it survived every mutation, which is what a dead condition looks like.
+    // No guard on an empty list: `toolsCondition` routes here only when the last message is an
+    // assistant turn carrying tool calls.
     const last = state.messages.at(-1);
     const calls =
       last?.getType() === "ai" ? ((last as AIMessage).tool_calls ?? []) : [];
@@ -1101,8 +1408,8 @@ export function buildAgentGraph({
           );
           return true;
         });
-    // NOTE: a run its job's deadline ended is called off like any other (issue #811), and it is read
-    // AFTER the fence, whose reads are the stretch a deadline can fire in.
+    // A run its job's deadline ended is called off like any other, and it is read AFTER the
+    // fence, whose reads are the stretch a deadline can fire in.
     const wanted = fenceSays && !jobSignal?.aborted;
     if (wanted) return null;
     calledOffAtTools = true;
@@ -1110,14 +1417,11 @@ export function buildAgentGraph({
       "graph: the turn was called off mid-invoke, so %d tool call(s) were refused instead of run",
       calls.length,
     );
-    // AND AN EMPTY ASSISTANT TURN AFTER THEM, which is not decoration. The runtime reads the reply
-    // off the LAST message of the result whatever its type (`lastAssistantText`), so a turn ending on
-    // a `ToolMessage` offers the refusal's own sentence as the text to post. Today the gate at each
-    // send refuses it — but the fences this graph is handed are not all monotonic: the
-    // channel-redirect one answers false while an agent is disabled and TRUE once it is re-enabled,
-    // so "called off here, still called off at the send" is a property of the caller rather than of
-    // this seam. The empty turn is the same terminator the silence protocol ends on, and it makes
-    // the refusal unpostable by construction rather than by the gate agreeing with this node.
+    // NOTE: and an empty assistant turn after them. The runtime reads the reply off the LAST message
+    // whatever its type (`lastAssistantText`), so ending on a `ToolMessage` offers the refusal's text
+    // to post. The send gate refuses it, but not every fence is monotonic (the channel-redirect one
+    // answers TRUE again once an agent is re-enabled), so the empty terminator, the one the silence
+    // protocol ends on, makes the refusal unpostable by construction.
     return {
       messages: [...calls.map(calledOffToolResult), new AIMessage("")],
     };
@@ -1129,21 +1433,111 @@ export function buildAgentGraph({
 
   if (hasTools) {
     builder
-      // EVERY TOOL GOES THROUGH HERE, which is the reason the guard lives at the node and not in the
-      // tools themselves: native, HTTP, MCP, integrations and documents are all assembled into this
-      // one list, and a guard written per tool is the per-call-site enforcement this repo keeps
-      // having to undo — the tool added next week would simply not have it.
-      .addNode("tools", async (state: typeof MessagesAnnotation.State) => {
-        const refused = await refuseCalledOffCalls(state);
-        // biome-ignore lint/style/noNonNullAssertion: hasTools is what built it.
-        return refused ?? (await toolNode!.invoke(state));
-      })
+      // NOTE: every tool goes through here, which is why the guard lives at the node: native, HTTP,
+      // MCP, integrations and documents are all assembled into this one list, and a per-tool guard is
+      // one the next tool added would simply not have.
+      .addNode(
+        "tools",
+        async (
+          state: typeof MessagesAnnotation.State,
+          config: ToolRunnableConfig,
+        ) => {
+          const refused = await refuseCalledOffCalls(state);
+          if (refused) return refused;
+          // During the factual-grounding rewrite only the calls its round admitted run, and the rest
+          // are refused here, client calls included: one left in the batch would suspend the turn.
+          const aside = revision
+            ? setAsideRevisionCalls(state, revision.admitted)
+            : null;
+          if (revision && aside) {
+            revision.info.toolCalls += aside.ran.length;
+            revision.info.tools.push(...aside.ran);
+            revision.info.refused.push(...aside.refused);
+          }
+          if (aside && !aside.view) return { messages: aside.answers };
+          const asideAnswers = aside?.answers ?? [];
+          const serverView = withServerCallsOnly(
+            aside?.view ?? state,
+            clientNames,
+          );
+          if (!serverView) return { messages: asideAnswers };
+          // A fence that refused a call says so on the call's config, not in its result
+          // (fence-report.ts); heard here, and passed on to a reporter already there.
+          let fenced = false;
+          const outer = fenceReporterOf(config);
+          const heard = noReplyChannel
+            ? withFenceReporter(config, (r: CallReport) => {
+                if (!("committed" in r)) fenced = true;
+                outer?.(r);
+              })
+            : config;
+          const before = noEffectCount?.() ?? 0;
+          const contradicted = setAsideContradictedHandoffs(serverView);
+          if (!contradicted) {
+            // biome-ignore lint/style/noNonNullAssertion: hasTools is what built it.
+            const ran = await toolNode!.invoke(serverView, heard);
+            const last = serverView.messages.at(-1) as AIMessage;
+            const nothingWritten = (noEffectCount?.() ?? 0) > before;
+            if (
+              endsOnWrites(
+                last.tool_calls ?? [],
+                ran.messages,
+                fenced || nothingWritten,
+              )
+            ) {
+              endedOnWrites = true;
+              // The empty terminator the called-off path ends on, for the same reason: the runtime
+              // reads the turn's text off the LAST message, which must not be a tool result.
+              return { messages: [...ran.messages, new AIMessage("")] };
+            }
+            return asideAnswers.length
+              ? { messages: [...asideAnswers, ...ran.messages] }
+              : ran;
+          }
+          // A handoff set aside is a call that did not run, so the turn goes on.
+          onContradictedHandoff?.({ calls: contradicted.answers.length });
+          // biome-ignore lint/style/noNonNullAssertion: hasTools is what built it.
+          const ran = await toolNode!.invoke(contradicted.view, heard);
+          return {
+            messages: [
+              ...asideAnswers,
+              ...contradicted.answers,
+              ...ran.messages,
+            ],
+          };
+        },
+      )
+      // NOTE: built on every graph so the edges type-check, and unreachable without client tools:
+      // with an empty set no call is ever pending for it.
+      .addNode("client_tools", clientToolsNode(clientNames))
+      .addEdge("client_tools", "agent")
       // toolsCondition routes to "tools" when the last AIMessage has tool calls, else to END.
       .addConditionalEdges("agent", toolsCondition)
-      .addConditionalEdges("tools", () => (calledOffAtTools ? END : "agent"), [
-        END,
+      .addConditionalEdges(
+        "tools",
+        (state: typeof MessagesAnnotation.State) =>
+          calledOffAtTools || endedOnWrites
+            ? END
+            : pendingClientCalls(state.messages, clientNames).length > 0
+              ? "client_tools"
+              : "agent",
+        [END, "agent", "client_tools"],
+      );
+  } else if (clientToolNames) {
+    // NOTE: a client-channel graph keeps the node a suspended turn sits on even when this round
+    // brings no tools at all. Without it the checkpointer's pending interrupt has no node to belong
+    // to, `getState` drops it, and a turn still waiting for the browser reads as abandoned.
+    builder
+      .addNode("client_tools", clientToolsNode(clientNames))
+      .addEdge("client_tools", "agent")
+      .addConditionalEdges(
         "agent",
-      ]);
+        (state: typeof MessagesAnnotation.State) =>
+          pendingClientCalls(state.messages, clientNames).length > 0
+            ? "client_tools"
+            : END,
+        [END, "client_tools"],
+      );
   } else {
     builder.addEdge("agent", END);
   }
@@ -1174,27 +1568,23 @@ export function lastAssistantText(messages: BaseMessage[]): string {
   return contentToText(content).trim();
 }
 
-// THE REPLY THE MODEL ALREADY WROTE, when the turn ends on an empty message (issue #886). A model
-// can put its whole answer in the same assistant message that calls a tool (`resolve_conversation`,
-// `set_labels`, `private_note`) and then close the turn with an empty one: `resolve_conversation`
-// answers that the close waits for "your final reply", and a model that already wrote it reads that
-// as done. `lastAssistantText` reads only the LAST message, so the answer never left and the turn
-// looked like an unexplained silence (#773). Measured on 51 real `silenceUnexplained` turns read
-// from the checkpoint: 8 were this, every one a complete answer to the customer's message.
-//
-// The FINAL message is not read here: whether it said anything is the caller's question, asked of
-// the text it already drafted (`customerFacingReply(...).wroteText`), so the one reader of the turn's
-// final text stays the guarded one. Returns "" when there is nothing to recover:
-// - no earlier assistant message IN THIS TURN carries text. The bound is the last human message, as
-//   in `silenceWasChosen`: the thread is checkpointed per contact-inbox, and an answer given in an
-//   earlier turn was already delivered then;
-// - the turn called `skip_reply`. Text beside that call is withdrawn on purpose (above), and a
-//   declared silence is never overridden by something the model wrote before declaring it. Read from
-//   the CALL, not the ack, because this is the conservative side: a refused `skip_reply` still means
-//   the model was deciding to say nothing, and recovering against that would speak for it.
+// The reply the model already wrote, when the turn ends on an empty message. A model can put its
+// whole answer in the message that calls a tool (`resolve_conversation`, `set_labels`,
+// `private_note`) and close the turn with an empty one, and `lastAssistantText` reads only the LAST.
+// The final message is not read here: the caller asks its own guarded draft. Returns "" when no
+// earlier assistant message IN THIS TURN (bounded at the last human message, since an earlier turn's
+// answer was delivered then) has text, or when the turn called `skip_reply`: a declared silence is
+// never overridden, and it is read from the CALL, since a refused `skip_reply` still meant silence.
 // The LAST earlier text wins: it is the latest thing the model meant to say.
 export function replyWrittenThisTurn(messages: BaseMessage[]): string {
-  let found = "";
+  const m = recoveredReplyMessage(messages);
+  return m ? contentToText(m.content).trim() : "";
+}
+
+// The message whose text `replyWrittenThisTurn` recovers, the one place that choice is made, so the
+// draft a revise takes out is the same message the recovery would have delivered.
+function recoveredReplyMessage(messages: BaseMessage[]): AIMessage | null {
+  let found: AIMessage | null = null;
   for (let i = messages.length - 2; i >= 0; i--) {
     const m = messages[i];
     if (!m) continue;
@@ -1202,21 +1592,58 @@ export function replyWrittenThisTurn(messages: BaseMessage[]): string {
     if (m.getType() !== "ai") continue;
     const ai = m as AIMessage;
     if ((ai.tool_calls ?? []).some((c) => c.name === SKIP_REPLY_TOOL))
-      return "";
-    if (!found) found = contentToText(ai.content).trim();
+      return null;
+    if (found) continue;
+    const last = lastWritten(ai);
+    if (last === "text") found = ai;
+    // NOTE: a note the provider hid (./anthropic-progress-notes) is the latest thing the model meant
+    // to say, and nothing can deliver it, so a preamble before it ("vou buscar") is no reply.
+    else if (last === "note") return null;
   }
   return found;
 }
 
-// THE RETRY OF AN UNEXPLAINED SILENCE (issue #885), the helpers the agent node asks.
+// What an assistant message wrote last, in block order: text a person can read (a `—` is not), a
+// note the provider hid, or neither.
+function lastWritten(ai: AIMessage): "text" | "note" | null {
+  if (!Array.isArray(ai.content))
+    return saysNothing(contentToText(ai.content)) ? null : "text";
+  const hides = hiddenNotesOf(ai).length > 0;
+  for (let i = ai.content.length - 1; i >= 0; i--) {
+    const b = ai.content[i] as { type?: unknown; thinking?: unknown };
+    if (
+      hides &&
+      b?.type === "thinking" &&
+      typeof b.thinking === "string" &&
+      b.thinking.trim()
+    )
+      return "note";
+    if (!saysNothing(contentToText([ai.content[i]] as MessageContent)))
+      return "text";
+  }
+  return null;
+}
+
+// The retry of an unexplained silence, the helpers the agent node asks.
 //
-// A final answer that says nothing: no text and no tool call. A call the provider could not parse
-// (`invalid_tool_calls`) counts as nothing too: no tool runs for it and the turn ends there, so the
-// customer is exactly as unanswered, and the retry is the model's one chance to act properly.
+// A final answer that says nothing: no letter, digit or emoji (`saysNothing`), and no tool call. A
+// call the provider could not parse (`invalid_tool_calls`) counts as nothing too: no tool runs for it
+// and the turn ends there, so the customer is exactly as unanswered, and the retry is the model's one
+// chance to act properly.
 function saidNothing(m: BaseMessage): boolean {
   const ai = m as AIMessage;
   if ((ai.tool_calls?.length ?? 0) > 0) return false;
-  return contentToText(ai.content).trim() === "";
+  return saysNothing(contentToText(ai.content));
+}
+
+// A final answer that wrote something with nothing to read in it (`—`, `...`): a model that believes
+// it already answered closes the turn this way. It is the empty answer for every reader: retried
+// like one, recovered over like one, and never delivered.
+function fillerOnly(m: BaseMessage): boolean {
+  const ai = m as AIMessage;
+  if ((ai.tool_calls?.length ?? 0) > 0) return false;
+  const text = contentToText(ai.content);
+  return text.trim() !== "" && saysNothing(text);
 }
 
 // Whether this turn already DECLARED silence, bounded at the last human message like
@@ -1239,12 +1666,16 @@ function calledSkipThisTurn(history: BaseMessage[]): boolean {
   return false;
 }
 
-// BOTH EXITS, NAMED, and the second one is the point. Measured on 51 real turns, most of these
-// silences follow a thank-you and were RIGHT, only undeclared; a few were customers owed an answer.
-// An instruction that only said "answer" would turn the first group into replies nobody asked for,
-// so it names the silence as an equal exit and says what separates the two. Where `skip_reply` is not
-// granted there is only one exit to name, and a turn that stays empty after it keeps today's ending.
-function silenceRetryText(canSkip: boolean): string {
+// Both exits, named, and the second one is the point: most of these silences follow a thank-you and
+// are RIGHT, only undeclared, while a few are customers owed an answer. An instruction that only said
+// "answer" would turn the first group into replies nobody asked for, so it names the silence as an
+// equal exit and says what separates the two. Where `skip_reply` is not granted there is only one exit
+// to name, and a turn that stays empty after it ends empty.
+// After a hidden note (./anthropic-progress-notes) the model believes it already answered, so the
+// instruction says the earlier text never reached the customer and asks for the message in full.
+function silenceRetryText(canSkip: boolean, noteHidden: boolean): string {
+  if (noteHidden)
+    return `${SILENCE_RETRY_MARK}. O texto que você escreveu antes de chamar ferramentas não é entregue: o cliente ainda não recebeu nada neste turno. Escreva agora, por inteiro, a mensagem que ele deve receber.${canSkip ? " Se de fato não há nada a dizer (um agradecimento, um ok), chame `skip_reply` com o motivo." : ""}`;
   return canSkip
     ? `${SILENCE_RETRY_MARK} e sem \`skip_reply\`, e um turno assim deixa o cliente sem saber se foi atendido. Decida agora, uma coisa só: se a última mensagem do cliente pede ou espera algo de você, responda; se não há nada a dizer (um agradecimento, um ok, uma despedida), chame \`skip_reply\` com o motivo. Não escreva só para não ficar em silêncio.`
     : `${SILENCE_RETRY_MARK}. Decida agora: se a última mensagem do cliente pede ou espera algo de você, responda; se não há nada a dizer, encerre sem escrever nada.`;
@@ -1260,5 +1691,5 @@ function silenceRetryOutcome(m: BaseMessage): SilenceRetryOutcome {
     return calls.some((c) => c.name === SKIP_REPLY_TOOL)
       ? "skip_reply"
       : "tools";
-  return contentToText(m.content).trim() ? "answered" : "empty";
+  return saysNothing(contentToText(m.content)) ? "empty" : "answered";
 }

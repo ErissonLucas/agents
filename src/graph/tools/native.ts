@@ -8,9 +8,14 @@ import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
 import {
+  applyResolveLabels,
+  type ResolveLabelsResult,
+} from "@/graph/resolve-labels";
+import {
   SKIP_REPLY_ACK,
   SKIP_REPLY_DETAIL_KEY,
   SKIP_REPLY_MARK,
+  SKIP_REPLY_OFFERED_REASONS,
   SKIP_REPLY_REASON_KEY,
   SKIP_REPLY_REASONS,
   SKIP_REPLY_TOOL,
@@ -18,18 +23,37 @@ import {
 } from "@/graph/silence";
 import { SKIP_NOTE_DETAIL_MAX as SKIP_DETAIL_MAX } from "@/graph/skip-handover";
 import { failableTool, toolFailure } from "@/graph/tools/failure";
+import { withKeyedQueue } from "@/lib/locks";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { clipText } from "@/lib/text";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
 import {
+  type AttributeRefusal,
+  type AttributeRefusalReporter,
+  checkAttributeValue,
+} from "@/modules/chatwoot/attribute-rules";
+import { SCOPE_MODEL } from "@/modules/chatwoot/attributes";
+import {
+  ChatwootApiError,
   ChatwootCalledOffError,
   type ChatwootClient,
   type CustomAttributeDef,
   type RyzeCarouselCard,
   type RyzeReplyButton,
 } from "@/modules/chatwoot/client";
+import {
+  type AdditionalContactField,
+  type ContactField,
+  type ContactFieldsConfig,
+  isAdditionalContactField,
+} from "@/modules/chatwoot/contact-fields";
 import { type KanbanContext, matchKanbanStep } from "@/modules/chatwoot/kanban";
-import { withConversationLabels } from "@/modules/chatwoot/labels";
+import {
+  closeConversationLabelsTail,
+  conversationLabelsTail,
+  withConversationLabels,
+} from "@/modules/chatwoot/labels";
+import { literalForChatwoot } from "@/modules/chatwoot/liquid";
 import {
   attributesForModel,
   type ChatwootVocab,
@@ -40,12 +64,18 @@ import {
   recordResolutionOrigin,
 } from "@/modules/conversations/record-resolution";
 import {
+  type CaseClient,
+  type CaseInbox,
   type CustomerTextVerdict,
+  type DetachedCaseOrigin,
+  deliverableEmail,
+  normalizeEmail,
   type OpenCaseResult,
   openCaseInInbox,
 } from "@/modules/cross-inbox-case/service";
 import {
   type CrossInboxCaseConfig,
+  openingAsksMessage,
   subjectAsksSummary,
 } from "@/modules/cross-inbox-case/settings";
 import type { HandoffConfig } from "@/modules/handoff/settings";
@@ -76,11 +106,16 @@ import {
   partsInTimezone,
 } from "../time";
 import { CalculatorError, evaluateExpression } from "./calculator";
+import type { NativeToolName } from "./catalog";
 import {
-  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
-  NATIVE_TOOL_CATEGORY,
-  type NativeToolName,
-} from "./catalog";
+  INBOX_NATIVES,
+  isUnsupported,
+  type NativeHandlers,
+  type NativeSupport,
+  OBSERVER_NATIVES,
+  PLAYGROUND_NATIVES,
+} from "./channel-natives";
+import { customerLine } from "./customer-line";
 import { modelVisibleLabels, SHOWN_LABELS_MAX } from "./label-view";
 
 // Native Chatwoot tools the agent can call mid-turn, all over the bot token. Each is bound to a
@@ -95,6 +130,7 @@ import {
   RESOLVE_DONE,
 } from "./catalog";
 import type { NoEffectReporter } from "./effect-free";
+import { type FenceReporter, fenceReporterOf } from "./fence-report";
 import { describeLabelWrite, type LabelWriteReporter } from "./label-writes";
 
 export {
@@ -138,6 +174,18 @@ export interface TurnState {
   // captions written for them — in whatever order the hosts happened to answer. The order the model
   // asked for is the one that matches the words around them.
   attachmentsSeq: number;
+  // The operator's labels resolve_conversation asked the deferred close to write, and
+  // whether a case opened this turn is what closes the conversation instead: a case means the team
+  // has it, so the labels do not go. See graph/resolve-labels.ts resolveLabelsFor.
+  resolveLabels?: string[];
+  // The case inbox the deferred close checks before writing them (graph/resolve-labels.ts).
+  resolveCaseHold?: CaseInbox | null;
+  caseClosing?: boolean;
+  // resolve_conversation asked for the close: a close the case scheduled and then withdrew leaves it.
+  resolveByModel?: boolean;
+  // An addition of this turn did not reach its case, so the case schedules no close for the rest of
+  // the turn: the origin is the only place those words are.
+  caseAdditionLost?: boolean;
   // A message this turn put in front of the customer from OUTSIDE the reply path, and the one thing
   // here that has already LEFT: the slow-tool acknowledgement ("só um instante"), which `emitAck`
   // (prepare.ts) sends straight through the Chatwoot client. It counts no balloon and queues no
@@ -160,17 +208,20 @@ export interface HandoffTurnState {
   // The closing line the model wants the customer to read before the transfer. RECORDED here, never
   // sent from the tool: the runtime is the single writer of customer-facing text, so this line goes
   // out through the same output guardrail, the same modality choice and the same pacing as any other
-  // reply (issue #160). Null when the model supplied none.
+  // reply. Null when the model supplied none.
   customerMessage: string | null;
   // The conversation left `pending`, so the human queue owns it and the bot is done talking.
   completed: boolean;
-  // The model was OFFERED the argument and passed it EMPTY, which since issue #662 is how it says
-  // "this case receives no reply at all". Distinct from `customerMessage === null`, which is also
+  // The model was OFFERED the argument and passed it EMPTY, which is how it says "this case
+  // receives no reply at all". Distinct from `customerMessage === null`, which is also
   // what a muted turn and a transfer that threw leave behind: this one is a decision, and the
   // runtime honours it by sending nothing rather than falling back to the model's own next text.
   // Optional because the turn-state shape is spelled out by hand at five call sites that build the
   // toolset, and absent is exactly what it means: nobody declared anything.
   declinedToSpeak?: boolean;
+  // `customerMessage` is the operator's hand-over message, set by an output check that handed the
+  // conversation over, not a line the model wrote: it keeps Chatwoot's Liquid instead of being escaped.
+  lineByOperator?: boolean;
   // THIS turn changed the conversation's owner itself: its transfer, or the nudge's IMMEDIATE close
   // (the reactive turn defers its close past the graph). Two marks, because they answer different
   // things: `ownerChanged` is set when a change LANDED and never cleared, and `ownerChangesInFlight`
@@ -178,7 +229,7 @@ export interface HandoffTurnState {
   // can read the mirror the status webhook already moved while the transfer's own call has not
   // returned; and a later call that throws must not erase a change that already landed. The tool
   // boundary's ownership question reads both (`ownerChangedByTurn`): a status the turn wrote is not a
-  // person taking over (issue #717, review rounds 1 to 3).
+  // person taking over.
   ownerChanged?: boolean;
   ownerChangesInFlight?: number;
 }
@@ -187,12 +238,10 @@ export function ownerChangedByTurn(state: HandoffTurnState): boolean {
   return state.ownerChanged === true || (state.ownerChangesInFlight ?? 0) > 0;
 }
 
-// The status change a tool of this turn makes on purpose, marked from before the call so the tool
-// boundary's ownership question does not read it as somebody else's.
-// The same bookkeeping for a transfer made by a caller OUTSIDE this file (the output check's `handoff`
-// verdict on text a tool sends, issue #700), whose result says whether the owner actually changed.
-// Counted in flight while it runs, so a sibling call's fence does not read the transfer's own status
-// webhook as a person taking over and skip the pinned assignment.
+// A transfer made by a caller OUTSIDE this file (the output check's `handoff` verdict on text a tool
+// sends), marked like a tool's own status change. Counted in flight while it runs, so a sibling
+// call's fence does not read the transfer's own status webhook as a person taking over and skip the
+// pinned assignment; `changed` says from its result whether the owner actually changed.
 export async function ownTransfer<T>(
   state: HandoffTurnState | undefined,
   transfer: () => Promise<T>,
@@ -209,6 +258,8 @@ export async function ownTransfer<T>(
   }
 }
 
+// The status change a tool of this turn makes on purpose, marked from before the call so the tool
+// boundary's ownership question does not read it as somebody else's.
 async function ownStatusChange(
   ctx: { handoffState?: HandoffTurnState },
   write: () => Promise<unknown>,
@@ -224,51 +275,33 @@ async function ownStatusChange(
   }
 }
 
-// Whether the handoff supplies this turn's customer-facing text, which is the ONE question both
-// runtimes ask. Two conditions and not one, because a transfer that THREW leaves the model's own
-// final text as the only thing the customer would get, and that text is still theirs. A transfer
-// that SUCCEEDED with nothing to say is a different case since issue #662, and it has its own
-// predicate below: the model declared the silence, so there is no fallback to fall back to.
-//
-// A transfer that threw halfway answers false, and has to. sendPrivateNote and toggleStatus are not
-// best-effort, so either can throw AFTER the model composed a line promising a human; the
-// conversation then stays `pending`, i.e. still the bot's and queued to nobody, and the model gets
-// the tool error plus one more step. That recovery reply is what the customer reads instead, and
-// the undelivered promise is discarded with the turn that failed to keep it.
-// A TYPE guard and not a boolean, so the line it proves is there is typed as being there. Both
-// callers read `customerMessage` immediately after asking, and both used to cast it to `string` on
-// their own word: a cast is what a compiler accepts INSTEAD of a proof, so the guard could have been
-// deleted at either call site and nothing would have complained until a turn with no transfer
-// handed a null to the guardrail.
+// Whether the handoff supplies this turn's customer-facing text, the ONE question both runtimes
+// ask. A transfer that THREW halfway answers false: sendPrivateNote and toggleStatus can throw after
+// the model composed a line promising a human, the conversation stays `pending` (still the bot's,
+// queued to nobody), and the model's recovery reply after the tool error is what the customer reads.
+// A transfer that completed with nothing to say is `handoffDeclaredSilence` below. A TYPE guard, so
+// both callers read `customerMessage` as a string with no cast that would outlive deleting the check.
 export function handoffAnsweredTheTurn(
   state: HandoffTurnState | undefined,
 ): state is HandoffTurnState & { customerMessage: string } {
   return !!state && !!state.customerMessage && state.completed;
 }
 
-// The other half of the same question, and the reason it is a separate one: a transfer that left
-// nothing to say used to mean "the model said nothing", and the runtime answered that by letting the
-// model's own final text through (the fallback `handoffAnsweredTheTurn` is written around). Since
-// issue #662 the model cannot reach that state by forgetting, so reaching it means it CHOSE
-// silence, and the tool now tells it so, in as many words. Delivering its next line anyway would
-// make that
-// sentence false, which is the defect #662 was: measured once in 18 live turns of declared silence,
-// on a credit-bureau notice, as `Encaminhado para a equipe responsável.` sent to the customer.
+// The other half: a transfer that completed with the argument passed EMPTY. The model cannot reach
+// that state by forgetting, so reaching it means it CHOSE silence, and the tool tells it so.
+// Delivering its next line anyway (a "Encaminhado para a equipe responsável.") would make that
+// sentence false, so there is no fallback to the model's own final text here.
 export function handoffDeclaredSilence(
   state: HandoffTurnState | undefined,
 ): boolean {
   return !!state && state.completed && !!state.declinedToSpeak;
 }
 
-// WHAT ACTUALLY REACHED THE CUSTOMER, asked when the turn is over — the other half of the pair, and
-// a different question from the one below.
-//
-// Below is what the turn had COMMITTED to at some instant mid-turn, which is all a live indicator
-// can ever have. This one is asked after the sends: the closing line and the queue have either gone
-// out or been dropped, and nothing is left to walk back. THREE sources and not one, because the
-// three ways a turn reaches a customer are counted in three different units: text in balloons, files
-// in the attachment loop, and the slow-tool acknowledgement in neither, since it goes straight out
-// through the Chatwoot client (issue #726, review round 3).
+// WHAT ACTUALLY REACHED THE CUSTOMER, asked after the sends; `turnDeliveredToCustomer` below is what
+// the turn had COMMITTED to mid-turn, all a live indicator can have. THREE sources, because the three
+// ways a turn reaches a customer are counted in three units: text in balloons, files in the
+// attachment loop, and the slow-tool acknowledgement in neither, since it goes straight out through
+// the Chatwoot client. See docs/logs.md on `turnDelivered`.
 export function turnReachedTheCustomer(sent: {
   balloons: number | null;
   attachment: boolean;
@@ -281,37 +314,26 @@ export function turnReachedTheCustomer(sent: {
   );
 }
 
-// WHETHER THIS TURN PUT SOMETHING IN FRONT OF THE CUSTOMER, asked of the turn's own state rather
-// than of what ran. The question exists for one reader — the marker `skip_reply` leaves behind,
-// which asserts a silence — and the surface it answers for is the operator's timeline (issue #726).
-//
-// It is not "which tools were called", and that distinction is the whole of it. `handoff_to_human`
-// is the reported case and it answers BOTH ways: with a `customerMessage` the customer reads a line,
-// and with the empty one (#662) nobody is spoken to, which is the turn where the silence sentence is
-// the only true thing on the screen. Reading the name would pass the first and invert the second.
-//
-// Neither half has been SENT when this is asked, and both are still the right answer. The runtime is
-// the single writer of customer-facing text, so a handoff's line goes out after the graph returns,
-// and `send_image` queues bytes the delivery loop posts later. What the turn has done is commit to
-// putting something there, and by the time the operator reads the marker it is on the screen.
-//
-// `imagesInFlight`/`documentsInFlight` are counted alongside the queue for the reason they exist:
-// the reservation is taken before the download, so a batch that has not finished downloading yet has
-// already decided to send. Reading only the queue would answer "nothing" for the window in between.
+// WHETHER THIS TURN PUT SOMETHING IN FRONT OF THE CUSTOMER, asked of the turn's own state rather than
+// of which tools ran, for the marker `skip_reply` leaves on the operator's timeline. The tool's name
+// cannot answer it: `handoff_to_human` with a `customerMessage` speaks, and with an empty one nobody
+// is spoken to. Neither has been SENT when this is asked (the runtime posts the handoff line and the
+// queued files after the graph returns), but the turn has committed to them. `imagesInFlight` and
+// `documentsInFlight` count too: the reservation precedes the download, so a batch still downloading
+// has already decided to send. See docs/logs.md on `turnDelivered`.
 export function turnDeliveredToCustomer(
   turnState: TurnState | undefined,
   handoffState: HandoffTurnState | undefined,
 ): boolean {
-  // ASKED FIRST, and the order here is the order of irreversibility. Everything below is a
+  // NOTE: ASKED FIRST, and the order here is the order of irreversibility. Everything below is a
   // commitment the turn can still walk back — the closing line and the queue have not left when this
   // is asked — and a slow-tool acknowledgement is already on the customer's phone. So it outranks
   // the declared silence, which drops what has NOT gone out and cannot un-send what has.
   if (turnState?.spokeOutsideTheReply) return true;
-  // The declared silence answers for everything BELOW it, and it is not only "the closing line is
-  // empty": the runtime drops the attachment queue with it, because "this case receives no reply at
-  // all" cannot mean "no text, plus the document you queued two hops ago". So a turn that queued a
-  // picture AND declared the silence delivers nothing, and asking the queue alone would answer that
-  // it did (review round 1).
+  // NOTE: The declared silence answers for everything BELOW it: the runtime drops the attachment
+  // queue with it, because "this case receives no reply at all" cannot mean "no text, plus the
+  // document you queued two hops ago". So a turn that queued a picture AND declared the silence
+  // delivers nothing, and asking the queue alone would answer that it did.
   if (handoffDeclaredSilence(handoffState)) return false;
   if (handoffAnsweredTheTurn(handoffState)) return true;
   if (!turnState) return false;
@@ -354,9 +376,12 @@ export interface PendingAttachment {
 export interface ToolCtx {
   client: ChatwootClient;
   conversationId: number;
-  // Absent (nudge turns, playground, hand-built ctx) ⇒ resolve_conversation keeps the legacy
-  // immediate toggle. Only runLoadedTurn passes it.
+  // Absent (nudge turns, playground, hand-built ctx) ⇒ resolve_conversation toggles immediately.
+  // Only runLoadedTurn passes it.
   turnState?: TurnState;
+  // A follow-up turn: nobody is waiting for an answer, so `skip_reply` keeps the reasons that hand
+  // the conversation to the team. On a turn that answers a customer it offers only `acknowledged`.
+  proactive?: boolean;
   // Present on every real customer-messaging path. A successful handoff customerMessage is terminal:
   // the caller must not also post the model's final assistant text.
   handoffState?: HandoffTurnState;
@@ -377,7 +402,7 @@ export interface ToolCtx {
   tenantId?: bigint;
   base?: PrismaClient;
   contactDbId?: bigint | null;
-  // NOTE: Our Conversation row id, for the write-through that keeps the mirrored attribute bags in
+  // Our Conversation row id, for the write-through that keeps the mirrored attribute bags in
   // step right after set_custom_attribute writes to Chatwoot (see mirrorAttributeWrite). Absent ⇒
   // the write-through is skipped and the mirror catches up on the next webhook event.
   conversationDbId?: bigint | null;
@@ -390,8 +415,8 @@ export interface ToolCtx {
   // set_voice_preference description so the model knows the existing value before changing it.
   // true = audio, false = text, null/undefined = not set yet.
   contactVoiceReply?: boolean | null;
-  // Whether THIS turn's reply goes as a voice note once the stored preference is the given value
-  // (issue #859). Present on the turns that deliver a reply that can be spoken; set_voice_preference
+  // Whether THIS turn's reply goes as a voice note once the stored preference is the given value.
+  // Present on the turns that deliver a reply that can be spoken; set_voice_preference
   // then tells the model how the reply it is writing will go out, because the preference it just
   // saved applies to this very reply and a model told "voice note" at the start would otherwise
   // write for the ear a reply that is sent as text, or the reverse.
@@ -403,30 +428,57 @@ export interface ToolCtx {
   // set_labels / set_custom_attribute enumerate KNOWN values in their descriptions instead of
   // letting the model guess. Absent ⇒ the tools fall back to generic descriptions.
   vocab?: ChatwootVocab;
-  // WHAT THE MODEL WAS SHOWN, per scope. Under the replace contract (issue #568) this was the only
-  // thing that gave `set_labels` the right to REMOVE, because removal happened by omission and
-  // "left out" is only meaningful against a list the model actually saw. Since #695 a removal comes
-  // from the model naming the label in `remove`, so this is GROUNDING and no longer authority: what
-  // it buys is that the model asks for the canonical value instead of inventing a synonym for one
-  // it cannot see, and a scope missing here costs a redundant `add` rather than a deletion.
-  // Read at turn prep alongside the vocab; the card's set comes free with the kanban snapshot, and
-  // the `task` scope re-reads the card at write time (holdout s6).
+  // TRUE WHEN TURN PREP TRIED TO READ `vocab` AND FAILED. set_custom_attribute then reads the
+  // definitions itself at call time, and refuses when that read fails too: a missing catalog is not an
+  // attribute without a definition, and treating it as one would accept anything.
+  vocabUnavailable?: boolean;
+  // WHAT THE MODEL WAS SHOWN, per scope: GROUNDING, not authority. A removal comes from the model
+  // naming the label in `remove`; this lets it ask for the canonical value instead of inventing a
+  // synonym, and a scope missing here costs a redundant `add` rather than a deletion. Read at turn
+  // prep alongside the vocab; the card's set comes with the kanban snapshot, and the `task` scope
+  // re-reads the card at write time.
   shownLabels?: {
     conversation?: string[];
     contact?: string[];
     task?: string[];
   };
-  // LABELS `set_labels` MAY NEITHER ADD NOR REMOVE (issue #568 review). Operator control labels
-  // live on the same conversation as the classifier's, and this list is what keeps the agent from
-  // moving one on purpose — not what keeps it alive, which is now the delta's job. It stopped
-  // meaning "and never sees" in #695: see applyLabelDelta for why the refusal is reported by name.
-  // Comes from `settings.setLabels.protected`; empty or absent ⇒ the tool reaches everything.
+  // THE CONVERSATION'S LABELS AS THE CALLER JUST READ THEM, with when. Handed over by a caller that
+  // read them moments before its writes (the `decisions` tick, whose read and write are one provider
+  // call apart): while it is fresh, `set_labels` applies its delta to this set instead of reading
+  // again, and leaves here the set it wrote. Absent, or older than `LABELS_READ_FRESH_MS`, the tool
+  // reads. The cost is the window: a label another writer puts on in between is not in the set that
+  // goes back, so a caller whose model thinks for seconds does not hand this over.
+  conversationLabelsRead?: { labels: string[]; at: number };
+  // WHETHER EACH CONVERSATION WRITE GOES OUT ALONE, asked at every call. True for a caller whose
+  // fence reads what these tools write (a watcher under a contact gate with conditions): calls
+  // sharing one write would share one verdict, reached before any of them had written.
+  writesAlone?: () => boolean;
+  // LABELS `set_labels` MAY NEITHER ADD NOR REMOVE. Operator control labels live on the same
+  // conversation as the classifier's, and this list keeps the agent from moving one on purpose (the
+  // delta already keeps an unnamed label standing). The model still sees them: see applyLabelDelta
+  // for why the refusal is reported by name. Comes from `settings.setLabels.protected`; empty or
+  // absent ⇒ the tool reaches everything.
   protectedLabels?: string[];
-  // THE LABELS `set_labels` MAY ADD (issue #638), from `settings.setLabels.allowed`; empty or absent
+  // THE LABELS resolve_conversation WRITES ITSELF before it closes, from
+  // `settings.resolveConversation.assignLabels`; empty or absent ⇒ the close writes none.
+  resolveLabels?: string[];
+  // Where a contact waiting on a case holds those labels off, on this conversation's account (see
+  // graph/resolve-labels.ts). Absent or null ⇒ nothing is checked.
+  resolveCaseHold?: CaseInbox | null;
+  // THE LABELS `set_labels` MAY ADD, from `settings.setLabels.allowed`; empty or absent
   // ⇒ any title, and one Chatwoot does not have is created there. `outsideAllowedLabels` says what a
   // title outside the list meets: `refuse` (default) or `accept`. See applyLabelDelta.
   allowedLabels?: string[];
   outsideAllowedLabels?: "refuse" | "accept";
+  // WHICH LABELS IT MAY REMOVE, from `settings.setLabels.removal`: `allowed` limits removal to the
+  // list above (an empty list removes nothing). Absent ⇒ `any`. See applyLabelDelta.
+  labelRemoval?: "any" | "allowed";
+  // THE ATTRIBUTES `set_custom_attribute` MAY WRITE, from `settings.setCustomAttribute.allowed`;
+  // empty or absent ⇒ any key. Each key is also held to its Chatwoot definition (attribute-rules.ts).
+  writableAttributes?: Array<{
+    scope: "conversation" | "contact" | "task";
+    key: string;
+  }>;
   // THE CALLER'S FENCE, asked again by set_labels from inside the conversation's label queue. The
   // graph already asks it at the tool boundary; waiting for that queue is a wait AFTER the ask, and
   // `/reset` clears the episode's labels in this very queue, so a write admitted at the boundary can
@@ -446,7 +498,10 @@ export interface ToolCtx {
   // convention as ToolpackCtx: the SSRF assertion resolves DNS, so a hermetic test has to stub it.
   fetchImpl?: typeof fetch;
   assertSafe?: ImageFetchDeps["assertSafe"];
-  // `open_case_in_inbox` (issue #700): the agent's destination config and the origin conversation's
+  // The contact fields this agent sees and may change (agent.settings.contactFields). update_contact
+  // is built only when `writable` names at least one field, and its schema offers only those.
+  contactFields?: ContactFieldsConfig;
+  // `open_case_in_inbox`: the agent's destination config and the origin conversation's
   // contact, as Chatwoot knows it. Absent, or with no destination inbox, the tool is not built.
   crossInboxCase?: {
     config: CrossInboxCaseConfig;
@@ -456,6 +511,38 @@ export interface ToolCtx {
     contactId: number | null;
     // The agent's signature, applied to the opening the customer receives (docs/signature.md).
     sign?: (text: string) => string;
+    // The prompt's context variables, for the operator's opening and note templates.
+    interpolate?: (template: string) => string;
+    // Set on a channel with no Chatwoot conversation behind it (the client channel): the client of
+    // the destination's account, the contact the case is opened for (found or created on the call)
+    // and the thread it is opened from. The tool then takes the shape that channel can carry out.
+    detached?: {
+      client: CaseClient;
+      // The team pinned for handoffs in the destination's account, which the case is given to.
+      caseTeamId: number | null;
+      // The calls that run one at a time, from the contact to the recorded case: every call that can
+      // reconcile the same contact, since another one could change its address in between.
+      serialKey: string;
+      // An anonymous visitor: no host states an address, so the case goes to the one the visitor
+      // typed in this chat, passed by the model in `email` and checked with `userTyped`.
+      anonymous?: boolean;
+      userTyped?: (email: string) => Promise<boolean>;
+      // The contact the case is opened for; null when there is no address (the host gave none, or
+      // an anonymous visitor's call passed none), "held" when an anonymous visitor's address is
+      // another contact's.
+      contact: (typedEmail?: string) => Promise<
+        | {
+            id: number;
+            addressUpdated: boolean;
+            email: string;
+          }
+        | null
+        | "held"
+      >;
+      origin: DetachedCaseOrigin;
+    };
+    // Where the origin's current attendance starts, for `carryAttachments.mode = attendance`.
+    attendanceStartedAt?: () => Promise<Date | null>;
   };
   // The turn's OUTPUT guardrail, for customer-facing text a tool sends itself (the opening message of
   // `open_case_in_inbox`). Bound by the runtime that owns the gate, so this file does not import it,
@@ -466,28 +553,26 @@ export interface ToolCtx {
   // model-facing description so transfer/funnel logic lives WITH the tool instead of buried in the
   // prompt. Populated at turn prep from agent.settings (handoff.instructions / kanban.instructions).
   toolInstructions?: Partial<Record<NativeToolName, string>>;
-  // NOTE: Reports a side effect that failed INSIDE a tool that still returns success to the model
+  // Reports a side effect that failed INSIDE a tool that still returns success to the model
   // (e.g. the handoff happened but the assignment failed). prepare.ts binds this to a flowlog
   // `tool`-stage warn so the failure reaches the Logs page and alert channels; absent
   // (playground/tests) ⇒ the failure stays log-only. NEVER changes the tool's return value.
   onSideEffectError?: SideEffectErrorReporter;
-  // CALLED BY A HANDLER THAT REFUSED WITHOUT WRITING (review round 36). Every effect-bearing handler
-  // asks the caller's fence again inside itself — after its own read, before its own write — and the
-  // exits below return a sentence saying the run was called off. Nothing left the process on those,
-  // so a counter outside has to be told, or it reads them as writes that happened. NOT called where
+  // CALLED BY A HANDLER THAT RETURNED WITHOUT WRITING, so a counter outside does not read the exit
+  // as a write that happened. Two kinds of exit: the caller's fence, asked again inside the handler
+  // (after its own read, before its own write), said the run was called off; or there was nothing to
+  // write (a scope the conversation does not have, a funnel step that does not exist, a card already
+  // in the step asked for, an update with no fields). Reading those as writes costs the retry the
+  // observer's tick needs, for an `on_resolve` watcher the only pass it gets. NOT called where
   // something already went out: `handoff_to_human` after its note was filed is not one of these.
-  //
-  // ...AND BY EVERY OTHER EXIT THAT RETURNS BEFORE THE WRITE (review round 39), which is the same
-  // fact arriving through a different door: a scope the conversation does not have (no kanban card,
-  // no contact mirrored into Chatwoot), a funnel step that does not exist, a card already in the
-  // step asked for, an update with no fields. The counter cannot tell those from a write by reading
-  // the returned sentence, and reading them as writes costs the retry that the observer's tick
-  // needs — for an `on_resolve` watcher, the only pass it will ever get.
   onNoEffect?: NoEffectReporter;
   // Called by `set_labels` after a write that MOVED something, with what moved (label-writes.ts).
   // Threaded beside `onNoEffect` because it is the same kind of fact arriving from the same place:
   // what the call did, told by the handler that knows, rather than parsed out of its sentence.
   onLabelsWritten?: LabelWriteReporter;
+  // Called by `set_custom_attribute` when it refused a write, before anything reached Chatwoot.
+  // prepare.ts binds it to an info `tool` line; the value never travels, only the rule it broke.
+  onAttributeRefused?: AttributeRefusalReporter;
 }
 
 // Assembles a tool's final model-facing description in a fixed order: the static capability text,
@@ -551,15 +636,11 @@ function handoffTool(ctx: ToolCtx) {
       ? "Escalate the conversation to a human agent. Set `assignTo` to one of the agents/teams listed in `<handoff_targets>` below to route there; omit it to fall back to default routing. Optionally include a short summary (posted as a private note)."
       : "Escalate the conversation to a human agent. Optionally include a short summary (posted as a private note) and `assignTo` — the name of the agent or team to route to (use one of the names from your instructions); omit it to fall back to default routing."
     : "Escalate the conversation to a human agent. Optionally include a short summary that is posted as a private note before the handoff. Use when the customer needs human help or asks for it.";
-  // Always nudge a customer-facing reply before the handoff so the persona does not go silent on them.
-  //
-  // ...EXCEPT ON A MUTED TURN, where the promise would be false (review round 35). The line is
-  // RECORDED on `handoffState` for the caller to deliver, and an observation has no caller that
-  // delivers: it throws its final output away. So the transfer happens, the customer hears nothing,
-  // and the model was told they were answered. A watcher escalating to a human is legitimate;
-  // telling it to write a message that goes nowhere is not, and the argument goes with the sentence.
-  // (The observation DOES carry a `handoffState` since issue #671, so `resolve_conversation` can see
-  // the transfer; what it does not carry is anything that reads the line back out.)
+  // Always ask for a customer-facing reply before the handoff so the persona does not go
+  // silent, EXCEPT on a muted turn: the line is RECORDED on `handoffState` for the caller to deliver,
+  // and an observation throws its final output away, so the model would be told the customer was
+  // answered. The observation still carries a `handoffState` (so `resolve_conversation` sees the
+  // transfer), but nothing reads the line back out; the argument goes with the sentence.
   const speaks = !ctx.client?.muted;
   const baseDescription = speaks
     ? `${coreDescription} \`customerMessage\` is REQUIRED: write the reply the customer will read (e.g. that a human will continue). Pass an EMPTY STRING only when this case must receive no reply at all — a formal or legal notice, an automated platform notification, or a customer already being handled by a human elsewhere.`
@@ -568,13 +649,11 @@ function handoffTool(ctx: ToolCtx) {
     .string()
     .optional()
     .describe("Short private-note summary for the human taking over.");
-  // REQUIRED, and that is the fix for issue #662: an omitted argument and a deliberate silence were
-  // the same call, so the customer could be left with nothing by a model that simply forgot, and no
-  // record could tell the two apart. Declared empty, the silence is a decision the model made,
-  // visible in the tool's own log line (`describeShape` reports `string(0)`, while an omitted
-  // argument does not appear at all). Measured: a call without it is refused by the schema with a
-  // text that NAMES the argument ("at customerMessage") and instructs no silence, so the model's
-  // next attempt has both options in front of it.
+  // REQUIRED, so a model that forgot and a deliberate silence are different calls. Declared
+  // empty, the silence is a decision visible in the tool's own log line (`describeShape` reports
+  // `string(0)`; an omitted argument does not appear). A call without it is refused by the schema
+  // with a text that NAMES the argument ("at customerMessage") and instructs no silence, so the
+  // model's next attempt has both options in front of it.
   const customerMessageField = speaks
     ? {
         customerMessage: z
@@ -585,58 +664,61 @@ function handoffTool(ctx: ToolCtx) {
       }
     : {};
   return tool(
-    async ({
-      reason,
-      assignTo,
-      customerMessage,
-    }: {
-      reason?: string;
-      assignTo?: string;
-      // Required on a speaking turn and absent from the schema on a muted one, so `undefined` here
-      // means the muted branch and never a model that forgot (see the schema below).
-      customerMessage?: string;
-    }) => {
-      // Transfer-with-summary: a private note for the human BEFORE handing off, gated by the
+    async (
+      {
+        reason,
+        assignTo,
+        customerMessage,
+      }: {
+        reason?: string;
+        assignTo?: string;
+        // Required on a speaking turn and absent from the schema on a muted one, so `undefined` here
+        // means the muted branch and never a model that forgot (see the schema below).
+        customerMessage?: string;
+      },
+      config?: ToolRunnableConfig,
+    ) => {
+      // NOTE: Transfer-with-summary: a private note for the human BEFORE handing off, gated by the
       // per-agent toggle (default on).
       if (reason && ctx.transferWithSummary !== false) {
-        await ctx.client.sendPrivateNote(ctx.conversationId, reason);
-        // ASKED AGAIN, between the note and the status change, and only when the note was actually
-        // sent — the third handler in this file that WAITS before writing, and the rule is the same
-        // one `set_labels` applies inside its queue and `resolve_conversation` after its read: the
-        // graph's ask at the tool boundary happened before this wait, and an observation holds no
-        // thread claim to keep a `/reset` or a detach out of it. The note is already filed and stays
-        // filed; what this stops is the pair below, which takes the conversation out of `pending`
-        // and assigns it — a routing change on an episode the operator was just told was cleared
-        // (round 18).
+        // NOTE: The model's words, escaped for Chatwoot's Liquid.
+        await ctx.client.sendPrivateNote(
+          ctx.conversationId,
+          literalForChatwoot(reason),
+        );
+        // Said the moment it is filed: whatever ends this call afterwards (a throw, the tick's
+        // deadline), the note is in the conversation.
+        fenceReporterOf(config)?.({ committed: true });
+        // NOTE: ASKED AGAIN between the note and the status change, only when the note was sent: the
+        // graph's ask at the tool boundary came before this wait, and an observation holds no thread
+        // claim to keep a `/reset` or a detach out of it. The note stays filed; this stops the pair
+        // below (out of `pending`, then assigned), a routing change on an episode the operator was
+        // just told was cleared. Same rule `set_labels` applies in its queue and
+        // `resolve_conversation` after its read.
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
           return "Did not hand off (the run was called off while the note was in flight); the note was already filed.";
         }
       }
-      // Set status `open` → the conversation leaves `pending`, so the attribution gate stops the
+      // NOTE: Set status `open` → the conversation leaves `pending`, so the attribution gate stops the
       // bot and the human queue picks it up.
       await ownStatusChange(ctx, () =>
         ctx.client.toggleStatus(ctx.conversationId, "open"),
       );
-      // Only here: everything above can throw, and a handoff that did not reach this line has not
-      // happened. The optional assignment below is best-effort by design — the conversation is
-      // already out of `pending`, so a routing miss does not put it back.
-      //
-      // The closing line is recorded HERE, from THIS invocation's argument, and never above: the
-      // caller delivers it, and it must belong to the transfer that actually happened. A model whose
-      // first attempt threw is handed the error and calls the tool again, and a second attempt that
-      // succeeds with no line of its own would otherwise deliver the first one's promise and
-      // suppress the recovery text the model wrote instead.
-      //
-      // Recorded rather than sent from here: sending it from inside the tool is what put the most
-      // rule-bound message of the turn outside the output guardrail, outside TTS and outside the
-      // pacing every other reply gets (#160). The cost is ordering — the customer reads it just
-      // after the transfer instead of just before, which Chatwoot never shows them.
+      fenceReporterOf(config)?.({ committed: true });
+      // NOTE: Only here: everything above can throw, and a handoff that did not reach this line has
+      // not happened; the assignment below is best-effort, as the conversation is already out of
+      // `pending`. The closing line comes from THIS invocation's argument: a model whose first
+      // attempt threw calls again, and a successful retry with no line must not deliver the first
+      // one's promise. Recorded rather than sent from the tool, so it passes the output guardrail,
+      // TTS and the pacing every reply gets; the cost is that the customer reads it just after the
+      // transfer instead of just before, which Chatwoot does not show them.
       if (ctx.handoffState) {
         // BOTH fields come from THIS invocation, so a second successful call cannot leave the first
         // one's promise standing next to its own silence: the turn would then be holding a line to
         // deliver and a declaration not to, and whichever the runtime asked about first would win.
-        const spoken = customerMessage?.trim() ?? "";
+        const spoken = customerLine(customerMessage);
         ctx.handoffState.customerMessage = spoken || null;
+        ctx.handoffState.lineByOperator = false;
         ctx.handoffState.declinedToSpeak = speaks && !spoken;
         ctx.handoffState.completed = true;
       }
@@ -674,11 +756,11 @@ function handoffTool(ctx: ToolCtx) {
             await ctx.client.assignTeam(ctx.conversationId, target.id);
             assigned = ` Assigned to team ${target.name}.`;
           } else {
-            // No match: surface it instead of failing silently — a private note tells the human the
+            // NOTE: No match: surface it instead of failing silently — a private note tells the human the
             // intended target, and the conversation falls back to default routing.
             await ctx.client.sendPrivateNote(
               ctx.conversationId,
-              `Tentei encaminhar para "${assignTo}", mas não encontrei um agente ou time com esse nome no Chatwoot. Deixei no roteamento padrão.`,
+              `Tentei encaminhar para "${literalForChatwoot(assignTo)}", mas não encontrei um agente ou time com esse nome no Chatwoot. Deixei no roteamento padrão.`,
             );
             assigned = ` No agent/team named "${assignTo}" was found; left for default routing.`;
           }
@@ -696,27 +778,20 @@ function handoffTool(ctx: ToolCtx) {
           err: e,
         });
       }
-      // WHAT THE MODEL READS AFTER TRANSFERRING, and it used to read the same sentence in all three
-      // cases: "The bot will stay silent now." On the branch where the model had supplied no line
-      // that sentence was an INSTRUCTION, and the model obeyed it: the runtime's fallback for a
-      // transfer with nothing to say existed precisely so the model's next hop could speak, and the
-      // tool was telling it not to. Measured on an email inbox: 2 of 130 turns ended transferred,
-      // with a private note filed, and nothing at all for the customer (issue #662). It protected
-      // nothing on the other branch either: when a line IS supplied, `runtime.ts` blanks the model's
-      // own text, which is the duplicate-reply guard from issue #158, and never depended on this
-      // sentence.
-      //
-      // Each of the three sentences below is a promise the product keeps: the declared silence is
-      // enforced by `handoffDeclaredSilence` above, so "no message will be sent" is not advice.
+      // WHAT THE MODEL READS AFTER TRANSFERRING, one sentence per case, each a promise the
+      // product keeps: the declared silence is enforced by `handoffDeclaredSilence` above, so "no
+      // message will be sent" is not advice. None of them tells the model to stay silent: a model
+      // obeys that as an instruction. When a line IS supplied, `runtime.ts` blanks the model's own
+      // text (the duplicate-reply guard), which does not depend on this sentence.
       const silenceNote = !speaks
         ? " This turn does not answer the customer, so nothing is sent to them."
-        : customerMessage?.trim()
+        : customerLine(customerMessage)
           ? " The message you wrote will be delivered to the customer; do not repeat it."
           : " No message will be sent to the customer, as you indicated.";
       return `${HANDOFF_DONE_PREFIX} (status set to open).${assigned}${silenceNote}`;
     },
     {
-      // From the catalog, because the hand-back decision matches results by this exact name
+      // NOTE: From the catalog, because the hand-back decision matches results by this exact name
       // (../handback.ts). Spelled here as a literal, a rename would leave that match silently false.
       name: HANDOFF_TOOL_NAME,
       description: withOperatorNote(
@@ -725,9 +800,9 @@ function handoffTool(ctx: ToolCtx) {
         "handoff_to_human",
         targetsXml,
       ),
-      // The two shapes differ ONLY by `assignTo`, and the shared fields are defined once above:
-      // written twice, a mutation that restored `.optional()` on the `agent_choice` copy survived
-      // the whole suite, because the test exercises the other shape (issue #662).
+      // NOTE: The two shapes differ ONLY by `assignTo`, and the shared fields are defined once above:
+      // written twice, the `agent_choice` copy could regain `.optional()` with no test noticing,
+      // because the test exercises the other shape.
       schema: agentChoice
         ? z.object({
             reason: reasonField,
@@ -746,8 +821,13 @@ function handoffTool(ctx: ToolCtx) {
 
 function privateNoteTool(ctx: ToolCtx) {
   return tool(
-    async ({ content }: { content: string }) => {
-      await ctx.client.sendPrivateNote(ctx.conversationId, content);
+    async ({ content }: { content: string }, config?: ToolRunnableConfig) => {
+      await ctx.client.sendPrivateNote(
+        ctx.conversationId,
+        literalForChatwoot(content),
+      );
+      // Said as it lands: a deadline can end the call before it returns, and the note is still filed.
+      fenceReporterOf(config)?.({ committed: true });
       return "Private note posted (visible to agents, not the customer).";
     },
     {
@@ -769,10 +849,62 @@ function attributeElements(defs: CustomAttributeDef[]): string {
       d.displayType === "list" && d.values.length > 0
         ? xmlAttr("values", d.values.slice(0, 12).join("|"))
         : "";
-    return `    <attribute${xmlAttr("key", d.key)}${values}/>`;
+    const type = TYPED_ATTRIBUTE_FORMAT[d.displayType]
+      ? xmlAttr("format", TYPED_ATTRIBUTE_FORMAT[d.displayType] ?? "")
+      : "";
+    const cue = d.regexPattern && d.regexCue ? xmlAttr("rule", d.regexCue) : "";
+    return `    <attribute${xmlAttr("key", d.key)}${values}${type}${cue}/>`;
   });
   if (defs.length > CAP) els.push(`    <more count="${defs.length - CAP}"/>`);
   return els.join("\n");
+}
+
+// What a typed definition accepts, as the model is told it up front and again when a value is refused.
+const TYPED_ATTRIBUTE_FORMAT: Record<string, string> = {
+  number: "a number, digits with an optional decimal point (e.g. 1500 or 12.5)",
+  currency:
+    "a number, digits with an optional decimal point (e.g. 1500 or 12.5)",
+  percent:
+    "a number, digits with an optional decimal point (e.g. 1500 or 12.5)",
+  date: "a date as YYYY-MM-DD",
+  checkbox: "true or false",
+  link: "a full URL starting with http:// or https://",
+};
+
+// The sentence a refused attribute write returns to the model: the rule it broke, then what to do.
+// Never the value: the model has it, and the line is read back on the trail.
+function attributeRefusalText(
+  scopeName: string,
+  key: string,
+  rule: AttributeRefusal["rule"],
+  def: CustomAttributeDef | undefined,
+  writable: ReadonlyArray<{ scope: string; key: string }>,
+): string {
+  const what = `the ${scopeName} attribute \`${key}\``;
+  const ask = " Nothing was saved. Ask the customer again instead of guessing.";
+  switch (rule) {
+    case "not_allowed": {
+      const shown = writable
+        .slice(0, 20)
+        .map((w) => `${w.key} (${w.scope})`)
+        .join(", ");
+      return `Not written: this agent may not write ${what}. It may write only: ${shown}.`;
+    }
+    case "clear_with_value":
+      return `Not written: clear=true empties ${what}, so it takes no value. Call again with clear=true and an empty value to clear it, or without clear to set it.`;
+    case "empty":
+      return `Not written: the value for ${what} is empty. To clear it on purpose, call again with clear=true; otherwise ask the customer for it.`;
+    case "list":
+      return `Not written: ${what} only takes one of these options, spelled exactly: ${(def?.values ?? []).slice(0, 20).join(" | ")}.${ask}`;
+    case "pattern":
+      return `Not written: the value does not match the format the operator set for ${what}${def?.regexCue ? `: ${def.regexCue}` : ""}.${ask}`;
+    case "pattern_timeout":
+      return `Not written: the value for ${what} could not be checked against the operator's format in time. Nothing was saved; tell the customer it will be recorded by the team.`;
+    case "definitions_unavailable":
+      return `Not written: the rules for ${what} could not be read from Chatwoot right now. Nothing was saved; try again later in the conversation.`;
+    default:
+      return `Not written: ${what} takes ${TYPED_ATTRIBUTE_FORMAT[def?.displayType ?? ""] ?? "a different value"}.${ask}`;
+  }
 }
 
 // The known attributes per scope as an XML block (containers mirror the `scope` arg). A scope with no
@@ -794,17 +926,13 @@ function knownAttributesXml(
   return `<known_attributes>\n${blocks.join("\n")}\n</known_attributes>`;
 }
 
-// NOTE: Write-through of a just-written attribute into OUR mirrored bag, so the attribute-context
-// block (built from the mirror at turn prep) reflects it immediately. Chatwoot is still the source
-// of truth: the next webhook event overwrites the bag wholesale. This only closes the window where a
-// proactive nudge — which is not preceded by an inbound event — would otherwise read a stale value,
-// and it matters most for the contact scope (Chatwoot does not deliver contact_updated to bots).
-//
-// The merge is a single `jsonb || jsonb` UPDATE rather than a read-modify-write: a turn can emit
-// several set_custom_attribute calls and the tool node runs them CONCURRENTLY, so a read-then-write
-// would let two calls on the same scope clobber each other's key. Postgres takes the row lock for
-// the duration of the statement, so the distinct keys both survive.
-// Best-effort: any failure is logged and swallowed, never surfaced to the model.
+// Write-through of a just-written attribute into OUR mirrored bag, so the attribute-context block
+// reflects it immediately. Chatwoot stays the source of truth (the next webhook event overwrites the
+// bag); this closes the window where a proactive nudge, with no inbound event before it, reads a
+// stale value, above all on the contact scope (Chatwoot does not deliver contact_updated to bots).
+// One `jsonb || jsonb` UPDATE, not a read-modify-write: the tool node runs a turn's
+// set_custom_attribute calls CONCURRENTLY, and the statement's row lock keeps two keys on one scope
+// from clobbering each other. Best-effort: a failure is logged, never surfaced to the model.
 async function mirrorAttributeWrite(
   ctx: ToolCtx,
   scope: "conversation" | "contact" | "task",
@@ -815,48 +943,59 @@ async function mirrorAttributeWrite(
   const base = ctx.base;
   const tenantId = ctx.tenantId;
   const patch = JSON.stringify({ [key]: value });
+  const target =
+    scope === "contact" ? ctx.contactDbId : (ctx.conversationDbId ?? null);
+  // In the order the writes reached Chatwoot: calls that shared one write return together, and two
+  // of them naming the same key would otherwise race here, leaving the mirror on the value Chatwoot
+  // did not keep.
+  const inOrder = <T>(fn: () => Promise<T>) =>
+    target == null
+      ? fn()
+      : withKeyedQueue(
+          `attribute-mirror:${String(tenantId)}:${scope}:${String(target)}`,
+          fn,
+        );
   try {
-    await runScopedOn(base, sysCtx(tenantId), async (db) => {
-      if (scope === "contact") {
-        if (ctx.contactDbId == null) return;
-        // NOTE: The write-through also ADVANCES the contact's source watermark. Chatwoot accepted
-        // this key a moment ago, so every event generated before now carries a pre-write snapshot —
-        // and one of those, delivered late but still stamped after the last mirrored event, would
-        // otherwise pass upsertContact's compare-and-set and replace the whole bag, erasing the key
-        // we just wrote. It matters here and not on the conversation scopes because agent bots
-        // never get contact_updated, so nothing would put the key back. GREATEST (which ignores
-        // NULL) keeps it from moving backwards if Chatwoot's clock runs ahead of ours.
-        //
-        // `AT TIME ZONE 'UTC'` is load-bearing: the column is TIMESTAMP (no zone) holding UTC, and
-        // bare NOW() is timestamptz. Mixing them makes GREATEST resolve through the SESSION
-        // TimeZone, which nothing here pins — under a non-UTC session the stored value reads as
-        // offset-hours in the future and wins, so the barrier silently never advances.
-        await db.$executeRaw`
+    await inOrder(() =>
+      runScopedOn(base, sysCtx(tenantId), async (db) => {
+        if (scope === "contact") {
+          if (ctx.contactDbId == null) return;
+          // NOTE: The write-through also ADVANCES the contact's source watermark: an event generated
+          // before now carries a pre-write snapshot, and one delivered late but stamped after the last
+          // mirrored event would pass upsertContact's compare-and-set and erase this key, which nothing
+          // puts back (bots never get contact_updated). GREATEST (NULL-ignoring) never moves it back.
+          // `AT TIME ZONE 'UTC'` is load-bearing: the column is TIMESTAMP holding UTC and bare NOW() is
+          // timestamptz, so GREATEST would resolve through the unpinned SESSION TimeZone, and under a
+          // non-UTC session the stored value reads as hours ahead and the barrier never advances.
+          // The contact's clock is cleared too: this bag is newer than any version it could name.
+          await db.$executeRaw`
           UPDATE contacts
           SET custom_attributes = custom_attributes || ${patch}::jsonb,
               custom_attributes_at = GREATEST(
                 custom_attributes_at,
                 (NOW() AT TIME ZONE 'UTC')
-              )
+              ),
+              custom_attributes_clock = NULL
           WHERE id = ${ctx.contactDbId} AND tenant_id = ${tenantId}
         `;
-        return;
-      }
-      if (ctx.conversationDbId == null) return;
-      if (scope === "task") {
-        await db.$executeRaw`
+          return;
+        }
+        if (ctx.conversationDbId == null) return;
+        if (scope === "task") {
+          await db.$executeRaw`
           UPDATE conversations
           SET kanban_attributes = kanban_attributes || ${patch}::jsonb
           WHERE id = ${ctx.conversationDbId} AND tenant_id = ${tenantId}
         `;
-        return;
-      }
-      await db.$executeRaw`
+          return;
+        }
+        await db.$executeRaw`
         UPDATE conversations
         SET custom_attributes = custom_attributes || ${patch}::jsonb
         WHERE id = ${ctx.conversationDbId} AND tenant_id = ${tenantId}
       `;
-    });
+      }),
+    );
   } catch (e) {
     logger.warn(
       "attribute mirror write-through failed (scope=%s): %s",
@@ -872,113 +1011,240 @@ async function mirrorAttributeWrite(
   }
 }
 
-// Set a custom attribute on the conversation OR the contact. The valid keys (and list values) of
-// each scope are enumerated in the description from the account's definitions (ctx.vocab), so the
-// model writes a KNOWN key instead of inventing one. Contact scope resolves the Chatwoot contact id
-// from our mirror and merges (the client read-merge-writes so other contact attributes are kept).
 // What the model is told when the client refused a queued write because the run was called off. A
 // sentence, not a tool failure: nothing is broken, the world moved.
 const CALLED_OFF_ATTRIBUTE =
   "Could not set the attribute (the run was called off while this write waited its turn).";
 
+// Set a custom attribute on the conversation OR the contact. The valid keys (and list values) of
+// each scope are enumerated in the description from the account's definitions (ctx.vocab), so the
+// model writes a KNOWN key instead of inventing one. Contact scope resolves the Chatwoot contact id
+// from our mirror. Every scope merges: the client read-merge-writes, so the other keys are kept.
 function setCustomAttributeTool(ctx: ToolCtx) {
-  const convDefs = attributesForModel(ctx.vocab, "conversation_attribute");
-  const contactDefs = attributesForModel(ctx.vocab, "contact_attribute");
-  const taskDefs = attributesForModel(ctx.vocab, "task_attribute");
+  const writable = ctx.writableAttributes ?? [];
+  const writableHas = (scope: string, key: string) =>
+    writable.some((w) => w.scope === scope && w.key === key);
+  // With a list, the model is shown exactly the keys it may write, each with its definition when the
+  // account has one: a key it can never write is a key it would be refused on, and a listed key with
+  // no definition (or an unreadable catalog) is still one it may write.
+  const shown = (defs: CustomAttributeDef[], scope: string) =>
+    writable.length === 0
+      ? defs
+      : writable
+          .filter((w) => w.scope === scope)
+          .map(
+            (w) =>
+              defs.find((d) => d.key === w.key) ?? {
+                key: w.key,
+                displayName: w.key,
+                model: "",
+                displayType: "",
+                values: [],
+                regexPattern: null,
+                regexCue: null,
+              },
+          );
+  const allConvDefs = attributesForModel(ctx.vocab, "conversation_attribute");
+  const allContactDefs = attributesForModel(ctx.vocab, "contact_attribute");
+  const allTaskDefs = attributesForModel(ctx.vocab, "task_attribute");
+  const convDefs = shown(allConvDefs, "conversation");
+  const contactDefs = shown(allContactDefs, "contact");
+  const taskDefs = shown(allTaskDefs, "task");
+  const defsOf = {
+    conversation: allConvDefs,
+    contact: allContactDefs,
+    task: allTaskDefs,
+  };
   // 'task' scope is only offered when this conversation actually has a linked card (ctx.kanban).
   const taskScope = !!ctx.kanban;
   const scopeSchema = taskScope
     ? z.enum(["conversation", "contact", "task"])
     : z.enum(["conversation", "contact"]);
-  const description = ctx.vocab
+  // CALLS ENTER THE CLIENT'S WRITE QUEUE IN THE ORDER THEY WERE MADE. The checks before a write wait
+  // (a pattern thread, a definitions read), and two calls on one key (a decisions rule that sets it and
+  // the next that clears it) would otherwise queue in whichever order their checks finished. The checks
+  // run side by side; only the write waits for the call before it to have queued its own, or to have
+  // returned without one, so parallel writes still reach the queue together and share a request.
+  let turnstile: Promise<void> = Promise.resolve();
+  const listed = !!ctx.vocab || writable.length > 0;
+  const description = listed
     ? `Set a custom attribute on the conversation, the contact${taskScope ? ", or this conversation's kanban card" : ""}. Use \`scope\` to choose; the known keys (and allowed values for list types) per scope are listed in \`<known_attributes>\` below.`
     : "Set a custom attribute on the conversation (scope='conversation', default) or the contact (scope='contact').";
-  const attributesXml = ctx.vocab
+  const attributesXml = listed
     ? knownAttributesXml(convDefs, contactDefs, taskScope ? taskDefs : null)
     : undefined;
   return tool(
-    async ({
-      key,
-      value,
-      scope,
-    }: {
-      key: string;
-      value: string;
-      scope?: "conversation" | "contact" | "task";
-    }) => {
-      if (scope === "task") {
-        if (!ctx.kanban) {
+    async (
+      {
+        key: rawKey,
+        value: rawValue,
+        scope,
+        clear,
+      }: {
+        key: string;
+        value: string;
+        scope?: "conversation" | "contact" | "task";
+        clear?: boolean;
+      },
+      config?: ToolRunnableConfig,
+    ) => {
+      const before = turnstile;
+      let admit = () => {};
+      const mine = new Promise<void>((r) => {
+        admit = r;
+      });
+      // The next call is let through only once this one AND every call before it are through.
+      turnstile = Promise.all([before, mine]).then(() => {});
+      const admitted = <T>(write: Promise<T>): Promise<T> => {
+        admit();
+        return write;
+      };
+      try {
+        const noEffect = () => {
           ctx.onNoEffect?.("set_custom_attribute");
-          return "Could not set the task attribute (this conversation has no linked card).";
+          fenceReporterOf(config)?.({ noEffect: true });
+        };
+        const key = rawKey.trim();
+        const target = scope ?? "conversation";
+        let defs: CustomAttributeDef[] | null = defsOf[target];
+        if (ctx.vocabUnavailable) {
+          defs = await ctx.client
+            .listCustomAttributeDefinitions()
+            .then((all) => all.filter((d) => d.model === SCOPE_MODEL[target]))
+            .catch(() => null);
         }
-        await ctx.client.setKanbanTaskCustomAttributes(ctx.kanban.taskId, {
-          [key]: value,
-        });
-        await mirrorAttributeWrite(ctx, "task", key, value);
-        return `Task attribute ${key} set.`;
-      }
-      if (scope === "contact") {
-        if (!ctx.base || ctx.tenantId == null || ctx.contactDbId == null) {
-          ctx.onNoEffect?.("set_custom_attribute");
-          return "Could not set the contact attribute (no contact in scope).";
+        const def = defs?.find((d) => d.key === key);
+        // Every refusal is decided here, before any lookup or write: a refused value never reaches
+        // Chatwoot or the mirror, so a precondition on the same key keeps reading the previous state.
+        const refuse = (rule: AttributeRefusal["rule"]): string => {
+          noEffect();
+          // Only operator vocabulary goes on the line. A key the model invented is its own text,
+          // and a phone number or a name fits a slug just as well as a field does.
+          const known = def !== undefined || writableHas(target, key);
+          ctx.onAttributeRefused?.({
+            scope: target,
+            rule,
+            ...(known ? { key } : {}),
+          });
+          return attributeRefusalText(target, key, rule, def, writable);
+        };
+        if (writable.length > 0 && !writableHas(target, key))
+          return refuse("not_allowed");
+        if (defs === null) return refuse("definitions_unavailable");
+        let value: string;
+        if (clear) {
+          if (rawValue.trim() !== "") return refuse("clear_with_value");
+          value = "";
+        } else {
+          const checked = await checkAttributeValue(def, rawValue);
+          if (!checked.ok) return refuse(checked.rule);
+          value = checked.value;
         }
-        const tenantId = ctx.tenantId;
-        const contactDbId = ctx.contactDbId;
-        const contact = await runScopedOn(ctx.base, sysCtx(tenantId), (db) =>
-          db.contact.findUnique({
-            where: { id: contactDbId },
-            select: { chatwootContactId: true },
-          }),
-        );
-        if (!contact?.chatwootContactId) {
-          ctx.onNoEffect?.("set_custom_attribute");
-          return "Could not set the contact attribute (contact not linked to Chatwoot).";
+        await before;
+        if (scope === "task") {
+          if (!ctx.kanban) {
+            noEffect();
+            return "Could not set the task attribute (this conversation has no linked card).";
+          }
+          try {
+            await admitted(
+              ctx.client.setKanbanTaskCustomAttributes(
+                ctx.kanban.taskId,
+                { [key]: value },
+                { stillWanted: ctx.stillWanted },
+              ),
+            );
+          } catch (e) {
+            if (e instanceof ChatwootCalledOffError) {
+              noEffect();
+              return CALLED_OFF_ATTRIBUTE;
+            }
+            throw e;
+          }
+          // Written: said now, before the mirror, which a deadline can still interrupt.
+          fenceReporterOf(config)?.({ committed: true });
+          await mirrorAttributeWrite(ctx, "task", key, value);
+          return `Task attribute ${key} ${clear ? "cleared" : "set"}.`;
         }
-        // ASKED AGAIN, after the lookup and before the write. See the fence rule at the top of this
-        // file: the graph's ask happens at DISPATCH, and this handler waits on a database read after
-        // it. A contact attribute outlives the conversation it was written from, so a value written
-        // after a `/reset` — or after the agent was switched off — is one nothing later corrects.
-        if (ctx.stillWanted && !(await ctx.stillWanted())) {
-          ctx.onNoEffect?.("set_custom_attribute");
-          return "Could not set the contact attribute (the run was called off while this write waited).";
+        if (scope === "contact") {
+          if (!ctx.base || ctx.tenantId == null || ctx.contactDbId == null) {
+            noEffect();
+            return "Could not set the contact attribute (no contact in scope).";
+          }
+          const tenantId = ctx.tenantId;
+          const contactDbId = ctx.contactDbId;
+          const base = ctx.base;
+          // A failed lookup wrote nothing, and the call says so before it propagates.
+          const contact = await runScopedOn(base, sysCtx(tenantId), (db) =>
+            db.contact.findUnique({
+              where: { id: contactDbId },
+              select: { chatwootContactId: true },
+            }),
+          ).catch((e: unknown) => {
+            fenceReporterOf(config)?.({ noEffect: true });
+            throw e;
+          });
+          if (!contact?.chatwootContactId) {
+            noEffect();
+            return "Could not set the contact attribute (contact not linked to Chatwoot).";
+          }
+          // NOTE: ASKED AGAIN, after the lookup and before the write: the graph's ask happens at
+          // DISPATCH, and this handler waits on a database read after it. A contact attribute outlives
+          // the conversation it was written from, so a value written after a `/reset` (or after the
+          // agent was switched off) is one nothing later corrects.
+          if (ctx.stillWanted && !(await ctx.stillWanted())) {
+            noEffect();
+            return "Could not set the contact attribute (the run was called off while this write waited).";
+          }
+          try {
+            await admitted(
+              ctx.client.setContactCustomAttributes(
+                contact.chatwootContactId,
+                { [key]: value },
+                // NOTE: ASKED ONCE MORE, from inside the client's queue this time. The ask above happens
+                // before the call; the write itself waits for a keyed queue and re-reads the bag, and
+                // that wait is as much a wait as this handler's own.
+                { stillWanted: ctx.stillWanted },
+              ),
+            );
+          } catch (e) {
+            if (e instanceof ChatwootCalledOffError) {
+              noEffect();
+              return CALLED_OFF_ATTRIBUTE;
+            }
+            throw e;
+          }
+          fenceReporterOf(config)?.({ committed: true });
+          await mirrorAttributeWrite(ctx, "contact", key, value);
+          return `Contact attribute ${key} ${clear ? "cleared" : "set"}.`;
         }
         try {
-          await ctx.client.setContactCustomAttributes(
-            contact.chatwootContactId,
-            { [key]: value },
-            // ASKED ONCE MORE, from inside the client's queue this time. The ask above happens
-            // before the call; the write itself waits for a keyed queue and re-reads the bag, and
-            // that wait is as much a wait as this handler's own (round 25).
-            { stillWanted: ctx.stillWanted },
+          await admitted(
+            ctx.client.setConversationCustomAttributes(
+              ctx.conversationId,
+              { [key]: value },
+              // NOTE: The conversation branch has no wait of its own before the call, so this is the ONLY
+              // fence it gets — and it needs one, because `/reset` clears a conversation's attributes
+              // inside exactly the window the queue and the re-read open.
+              {
+                stillWanted: ctx.stillWanted,
+                ...(ctx.writesAlone ? { alone: ctx.writesAlone } : {}),
+              },
+            ),
           );
         } catch (e) {
           if (e instanceof ChatwootCalledOffError) {
-            ctx.onNoEffect?.("set_custom_attribute");
+            noEffect();
             return CALLED_OFF_ATTRIBUTE;
           }
           throw e;
         }
-        await mirrorAttributeWrite(ctx, "contact", key, value);
-        return `Contact attribute ${key} set.`;
+        fenceReporterOf(config)?.({ committed: true });
+        await mirrorAttributeWrite(ctx, "conversation", key, value);
+        return `Conversation attribute ${key} ${clear ? "cleared" : "set"}.`;
+      } finally {
+        admit();
       }
-      try {
-        await ctx.client.setConversationCustomAttributes(
-          ctx.conversationId,
-          { [key]: value },
-          // The conversation branch has no wait of its own before the call, so this is the ONLY
-          // fence it gets — and it needs one, because `/reset` clears a conversation's attributes
-          // inside exactly the window the queue and the re-read open.
-          { stillWanted: ctx.stillWanted },
-        );
-      } catch (e) {
-        if (e instanceof ChatwootCalledOffError) {
-          ctx.onNoEffect?.("set_custom_attribute");
-          return CALLED_OFF_ATTRIBUTE;
-        }
-        throw e;
-      }
-      await mirrorAttributeWrite(ctx, "conversation", key, value);
-      return `Conversation attribute ${key} set.`;
     },
     {
       name: "set_custom_attribute",
@@ -995,6 +1261,12 @@ function setCustomAttributeTool(ctx: ToolCtx) {
           .optional()
           .describe(
             `Where to store it: 'conversation' (default), 'contact'${taskScope ? ", or 'task'" : ""}.`,
+          ),
+        clear: z
+          .boolean()
+          .optional()
+          .describe(
+            "true empties the attribute (pass an empty value). An empty value without it is refused.",
           ),
       }),
     },
@@ -1013,58 +1285,24 @@ function existingLabelsXml(labels: string[]): string {
   return `<existing_labels>\n${els.join("\n")}\n</existing_labels>`;
 }
 
-// Sets the labels (tags) on the conversation, the contact, or this conversation's kanban card
-// (scope, default 'conversation'). Every backing endpoint REPLACES the whole set, and this tool
-// used to expose that shape instead of hiding it — the model passed the complete list the scope
-// should have. Issue #695 turned that around: the model names `add` and `remove`, and the complete
-// list is computed HERE, from a read taken at write time. Adding, removing and swapping are still
-// one gesture with one write, so a swap never leaves the scope holding both values or neither; what
-// changed is that a label the model did not name is no longer at the mercy of it remembering to
-// repeat the label back.
-//
-// The replacement the endpoint wants is built by applyLabelDelta below.
-//
-// Shapes confirmed against the chatwoot-pro fork: conversation + contact labels GET → { payload: [] },
-// POST /{conversations|contacts}/{id}/labels { labels } replaces (LabelConcern); task labels via PATCH
-// /kanban/tasks/{id} { task: { labels } } (update_labels), with the current set read from the card
-// snapshot. NOTE: the enumerated labels are the account's Label titles; task tags may use a separate
-// taggable namespace on the fork — confirm live before relying on the suggestion for task scope.
-
-// THE MODEL NAMES THE DELTA, so the tool never has to infer one. This replaced a diff against
-// what the model was SHOWN (`applyLabelIntent`, issue #695): under a replace contract the complete
-// list was the only thing the model could send, removal happened by OMISSION, and the whole defence
-// against a concurrent writer was to compare that list with a per-turn snapshot of what the model
-// had seen. Naming the delta makes that defence a property instead of a mechanism:
-//
-//   not named          -> not touched, whoever put it there and whenever;
-//   named in `remove`  -> removed, even if the model was never shown it;
-//   named in `add`     -> added, even if it is already there (no-op, not an error).
-//
-// The second line is the one the old contract could not express, and the first is the one it could
-// only approximate. A label an operator, an automation, the observer or n8n added between the turn's
-// read and this call is now safe for free, and so is one past the 40-label ceiling.
-//
-// THE GUARD SUBTRACTS FROM BOTH DIRECTIONS and is REPORTED. `settings.setLabels.protected` keeps
-// meaning "this tool may neither add nor remove it" — both halves, because a tenant relies on the
-// add half to keep one agent's taxonomy out of another agent's reach. What it stops meaning is
-// "never sees": under a delta, being shown a label no longer puts it at risk, so protecting and
-// hiding come apart. That is the whole point of the change, and hiding is what made a fenced agent
-// invent a label it could not see on 2026-09-11.
-//
-// THE OPERATOR'S LIST, when there is one (issue #638), fences ADDITIONS only. Under `refuse` a title
-// outside it is not written and is named back (`refusedOutside`), and it holds the call's removals
-// exactly as a guarded addition does, for the same reason: a swap whose new value cannot land must
-// not leave the scope without the old one. Under `accept` it is written as before, and
-// `acceptedOutside` names what went in outside the list so the trail can COUNT it (never title it:
-// those are the model's strings). Removal is not limited: taking off a label the taxonomy never had
-// is exactly what an operator cleaning up after the model wants. Both keys are present only when a
-// list is, so a caller without one reads the same object it always did.
+// THE MODEL NAMES THE DELTA: not named, not touched; named in `remove`, removed even if never shown;
+// named in `add`, added (a no-op when already there). `guarded` (settings.setLabels.protected) is
+// refused in both directions and reported; `allowed` fences additions, `refuse` naming back
+// `refusedOutside` and `accept` reporting `acceptedOutside` (both keys only when a list exists),
+// and under `removal: "allowed"` it fences removals too: a label outside the list is not removed and
+// is named back in `refusedForeign` (an empty list then removes nothing). A refused addition of a
+// label not already standing holds the call's removals (`heldRemove`); a refused removal holds
+// nothing. The rules and why each holds: docs/graph.md, "`set_labels`: the model names the delta".
 export function applyLabelDelta(
   add: readonly string[],
   remove: readonly string[],
   current: string[],
   guarded?: string[],
-  allowed?: { labels: readonly string[]; mode: "refuse" | "accept" },
+  allowed?: {
+    labels: readonly string[];
+    mode: "refuse" | "accept";
+    removal?: "any" | "allowed";
+  },
 ): {
   next: string[];
   added: string[];
@@ -1074,6 +1312,7 @@ export function applyLabelDelta(
   heldRemove: string[];
   refusedOutside?: string[];
   acceptedOutside?: string[];
+  refusedForeign?: string[];
 } {
   const clean = (xs: readonly string[]): string[] => [
     ...new Set(xs.map((l) => l.trim()).filter(Boolean)),
@@ -1083,32 +1322,11 @@ export function applyLabelDelta(
   const wantRemove = clean(remove);
   const refusedAdd = wantAdd.filter((l) => guard.has(l));
   const refusedRemove = wantRemove.filter((l) => guard.has(l));
-  // A REMOVAL IS NOT APPLIED WHEN THE GUARD REFUSED ANY ADDITION OF THE SAME CALL (issue #712).
-  // The two halves used to be weighed one by one, so a swap the guard caught on one side landed
-  // the other side, and a mutually exclusive taxonomy ended the turn with NO category — the more
-  // expensive of the two half-written states, because it destroys a classification instead of
-  // adding a second one. The removal was asked for to make room for an addition; when that
-  // addition cannot happen, applying the removal alone delivers a state nobody requested.
-  //
-  // OVER WHAT THE GUARD REFUSED, never over what the write ended up doing. `add: ["a"]` where `a`
-  // already stands moves nothing and is still a legitimate request (#695 s14); conditioning on
-  // "nothing was added" would let a redundant addition block every removal beside it.
-  //
-  // REMOVALS ONLY, never additions, and that asymmetry is imposed from outside rather than
-  // chosen: #695 sealed s8 (`add: ["cancelamento", "reembolso"]` with `cancelamento` guarded must
-  // still write `reembolso`) and s9 (a guarded REMOVE must still let its addition through, so a
-  // conversation CAN still end with both categories). Holding the whole call would reverse both.
-  // The "both categories" direction is therefore still reachable, on purpose, and #712 says so.
-  //
-  // A REFUSED ADDITION OF A LABEL ALREADY STANDING DOES NOT HOLD ANYTHING. It asked for nothing:
-  // under the delta, naming a present label is a no-op, so there was no exchange for the removal
-  // to be in service of. Without this, a model that reaffirms a guarded label it can now SEE —
-  // `add: [nova-categoria, agente-off]`, `remove: [categoria-antiga]`, with `agente-off` guarded
-  // and on the conversation, which is the real observer's configuration — would hold a swap that
-  // completes perfectly well and leave BOTH categories standing, where the same call landed the
-  // single correct one before this rule existed. Still conditioned on the guard's REFUSAL and not
-  // on the write's outcome: an agent with no guard refuses nothing and holds nothing, whatever its
-  // additions end up moving.
+  // A REMOVAL IS HELD when the guard or the list refused an addition of the same call that is
+  // not already standing: the removal made room for it, and applied alone it leaves a mutually
+  // exclusive taxonomy with NO category. Conditioned on the REFUSAL, never on what the write moved,
+  // and it holds removals only, never additions. See docs/graph.md, "`set_labels`: the model names
+  // the delta".
   const allowedSet =
     allowed && allowed.labels.length > 0
       ? new Set(clean(allowed.labels))
@@ -1120,7 +1338,16 @@ export function applyLabelDelta(
   const hold = [...refusedAdd, ...refusedOutside].some(
     (l) => !current.includes(l),
   );
-  const free = wantRemove.filter((l) => !guard.has(l));
+  // The agent's own labels, when removal is limited to them: anything else on the scope belongs to
+  // another writer, and stays without having to be listed in `protected`.
+  const owned =
+    allowed?.removal === "allowed" ? new Set(clean(allowed.labels)) : null;
+  const refusedForeign = owned
+    ? wantRemove.filter((l) => !guard.has(l) && !owned.has(l))
+    : [];
+  const free = wantRemove.filter(
+    (l) => !guard.has(l) && !refusedForeign.includes(l),
+  );
   // Named back only when the label is actually standing: reporting a hold on one that was not
   // there would claim an effect the call never had, which is the same lie in the other direction.
   const heldRemove = hold ? free.filter((l) => current.includes(l)) : [];
@@ -1148,28 +1375,16 @@ export function applyLabelDelta(
           acceptedOutside: added.filter((l) => !allowedSet.has(l)),
         }
       : {}),
+    ...(owned ? { refusedForeign } : {}),
   };
 }
 
-// What a write DID, in the model's own terms, and what the scope holds AFTERWARDS. Reports against
-// what was standing rather than against what the model asked for: "already as requested" is the
-// answer a second identical call has to get, or a model reading its own transcript concludes the
-// write did not land and tries again.
-//
-// THE RESULTING SET IS STATED because this line is the model's only way to learn it. The
-// `<current_labels>` block in the description is built once, at turn prep, so from the second call
-// onward it describes the past, including the model's own first write.
-//
-// A REFUSAL IS NAMED, and this is new with the delta contract. While a guarded label was hidden,
-// the model could not ask for it, so subtracting it silently had nothing to report to. Now it sees
-// the label, will therefore ask, and answering "already as requested" would be a false statement it
-// reads back out of its own transcript one call later (issue #695).
-//
-// A HELD REMOVAL IS NAMED TOO, and separately from a refusal (issue #712). The model wrote that
-// label and has no way to guess where it ended up; a report that simply omitted it would read as
-// a removal that happened, and the model records this string and decides its next turn from it.
-// The sentence states the RULE rather than a remedy on purpose: telling it to "ask again without
-// the addition" would hand it the recipe for the very state the hold exists to prevent.
+// What a write DID, in the model's own terms, and what the scope holds AFTERWARDS. Reported against
+// what was standing, so a second identical call reads "already as requested" rather than a failure
+// to retry. The resulting set is stated because `<current_labels>` is built at turn prep and is
+// stale from the second call on. A refusal and a held removal are each named: omitted, they read as
+// writes that happened. The held sentence states the RULE, not a remedy that would recreate the
+// state the hold prevents. See docs/graph.md, "`set_labels`: the model names the delta".
 function labelWriteReport(
   where: string,
   added: string[],
@@ -1179,6 +1394,7 @@ function labelWriteReport(
   refusedRemove: string[] = [],
   heldRemove: string[] = [],
   refusedOutside: string[] = [],
+  refusedForeign: string[] = [],
 ): string {
   // The report is the THIRD statement about the same list, so it is capped like the other two, and
   // it says how many it left out rather than presenting a partial set as the whole truth.
@@ -1203,47 +1419,38 @@ function labelWriteReport(
   const outside = refusedOutside.length
     ? ` Not in this agent's list of labels, so not added: ${quoted(refusedOutside)}.`
     : "";
+  const foreign = refusedForeign.length
+    ? ` Not this agent's labels, so not removed: ${quoted(refusedForeign)}.`
+    : "";
   const held = heldRemove.length
     ? ` ${quoted(heldRemove)} stays: a removal is not applied when the same call tried to add a label that is out of reach.`
     : "";
   if (parts.length === 0)
-    return refused.length || refusedOutside.length
-      ? `No label on the ${where} changed.${tail}${outside}${held} Now set: ${now}.`
+    return refused.length || refusedOutside.length || refusedForeign.length
+      ? `No label on the ${where} changed.${tail}${outside}${foreign}${held} Now set: ${now}.`
       : `Labels on the ${where} were already as requested. Now set: ${now}.`;
-  return `Labels on the ${where}: ${parts.join("; ")}.${tail}${outside}${held} Now set: ${now}.`;
+  return `Labels on the ${where}: ${parts.join("; ")}.${tail}${outside}${foreign}${held} Now set: ${now}.`;
 }
 
-// THE MODEL-VISIBLE SET, kept current for the rest of the turn. A turn has as many label writes as
-// the model has tool calls, and a `<current_labels>` block frozen at the turn-prep snapshot answers
-// the second call as if the first had not happened.
-//
-// INFORMATIONAL, NOT LOAD-BEARING, which is what changed with the delta contract (issue #695).
-// While removal happened by omission, this list WAS the reference every removal was computed
-// against, and getting it wrong erased data; now it only tells the model what is there, and a stale
-// entry costs a redundant `add` rather than a deletion. The guard is no longer subtracted here
-// either: a protected label is shown precisely so the model stops inventing a name for a value it
-// could not see.
+// THE MODEL-VISIBLE SET, kept current for the rest of the turn: a `<current_labels>` block frozen at
+// turn prep would answer the second call as if the first had not happened. INFORMATIONAL: no write
+// is computed from it, so a stale entry costs a redundant `add` rather than a deletion, and a
+// protected label stays in it so the model does not invent a name for a value it cannot see.
 function recordShown(
   ctx: ToolCtx,
   scope: "conversation" | "contact" | "task",
   next: string[],
 ): void {
   if (!ctx.shownLabels) ctx.shownLabels = {};
-  // Through the same projection the description renders, ceiling included.
+  // NOTE: Through the same projection the description renders, ceiling included.
   ctx.shownLabels[scope] = modelVisibleLabels(next);
 }
 
 // WHAT IS ON THE CONVERSATION RIGHT NOW, per scope, as the model sees it. This block and the `add`
-// argument's own sentence read the SAME `ctx.shownLabels`, on purpose: two statements about one
-// scope in one turn have to be one value. Rendered in the tool description rather than in the
-// system prompt for that reason — one value, one place, no way for the two to describe different
-// turns. Since #695 no WRITE is computed from it (the model names the delta), so a stale entry
-// costs a redundant `add` rather than a deletion; what it still decides is whether the model asks
-// for the canonical value or invents a synonym for one it cannot see.
-//
-// A scope absent here is a scope whose read failed or was never made, and it renders no element at
-// all rather than an empty one: `<conversation/>` would tell the model the conversation has no
-// labels, which is a different claim from "we could not find out".
+// argument's sentence read the SAME `ctx.shownLabels`, and it lives in the tool description rather
+// than the system prompt so the two are one value in one place. No write is computed from it; it
+// decides whether the model asks for the canonical value or invents a synonym. A scope absent here
+// (read failed or never made) renders no element, since an empty one would claim there are none.
 function currentLabelsXml(shown: ToolCtx["shownLabels"]): string {
   if (!shown) return "";
   const els: string[] = [];
@@ -1260,14 +1467,10 @@ function currentLabelsXml(shown: ToolCtx["shownLabels"]): string {
   return `<current_labels>\n${els.join("\n")}\n</current_labels>`;
 }
 
-// The same reading `currentLabelsXml` renders, as one sentence for the ARGUMENT's own description.
-// One function for both, because they are two model-facing statements about one fact and a second
-// reader written by hand is how they end up describing different turns (review round 35): the
-// argument used to name the CONVERSATION's labels whatever scope the call chose, so a `contact` call
-// was shown the wrong list — an invitation to copy conversation labels onto a contact.
-//
-// A scope that is absent is left OUT rather than reported empty, exactly as the block does: "there
-// are none" and "we did not read it" are different claims, and only the first belongs to a list.
+// The same reading `currentLabelsXml` renders, as one sentence for the ARGUMENT's own description,
+// per scope: a second reader written by hand drifts, and a `contact` call shown the conversation's
+// labels is an invitation to copy them onto the contact. An absent scope is left OUT rather than
+// reported empty, as in the block: "there are none" and "we did not read it" are different claims.
 function shownLabelsSentence(shown: ToolCtx["shownLabels"]): string {
   if (!shown) return "";
   const parts: string[] = [];
@@ -1279,13 +1482,79 @@ function shownLabelsSentence(shown: ToolCtx["shownLabels"]): string {
   return parts.length ? ` Currently set — ${parts.join("; ")}.` : "";
 }
 
+// WHICH CALLS ONE TURN MAY DISPATCH TOGETHER, because their tool commits calls that arrive together
+// as one write: the conversation's labels (the handler below) and the conversation's attributes
+// (`ChatwootClient.setConversationCustomAttributes`). Calls sharing a key reach Chatwoot as one read
+// and one write; `null` is a call that stays on its own. A caller that dispatches one call at a time
+// (the `decisions` engine) asks this to know which ones to send out side by side.
+export function sharedWriteKey(
+  tool: string,
+  args: Record<string, unknown>,
+): string | null {
+  const scope = args.scope ?? "conversation";
+  if (scope !== "conversation") return null;
+  if (tool === "set_labels") return "conversation-labels";
+  if (tool === "set_custom_attribute") return "conversation-attributes";
+  return null;
+}
+
+// One `set_labels` call on the conversation scope that has not been written yet.
+interface PendingLabelDelta {
+  add: string[];
+  remove: string[];
+  resolve: (report: string) => void;
+  reject: (reason: unknown) => void;
+  // The call's own fence reporter (fence-report.ts): the batch is written by whichever call opened
+  // it, so each delta carries its caller's.
+  fenced?: FenceReporter;
+}
+
+// Which fence of `applyLabelDelta` held part or all of one call, told to the caller that asked. A
+// protected label is named first: it is the fence the operator set on the labels themselves.
+function reportLabelFence(
+  report: FenceReporter | undefined,
+  o: {
+    added: string[];
+    removed: string[];
+    refusedAdd: string[];
+    refusedRemove: string[];
+    refusedOutside?: string[];
+    refusedForeign?: string[];
+  },
+): void {
+  if (!report) return;
+  const partial = o.added.length > 0 || o.removed.length > 0;
+  if (o.refusedAdd.length > 0 || o.refusedRemove.length > 0) {
+    report({ fence: "protected_label", partial });
+  } else if (
+    (o.refusedOutside ?? []).length > 0 ||
+    (o.refusedForeign ?? []).length > 0
+  ) {
+    report({ fence: "allowed_labels", partial });
+  }
+}
+
+// How long a caller's own read of the conversation's labels stands in for the tool's.
+const LABELS_READ_FRESH_MS = 10_000;
+
+// The `set_labels` calls one entry of the conversation's label queue will write together. While it
+// is the queue's tail, which it stops being when its read comes back, a call of the same turn (the
+// tool context is one turn's) joins it instead of queueing behind it.
+class LabelBatch {
+  readonly deltas: PendingLabelDelta[] = [];
+  constructor(readonly ctx: ToolCtx) {}
+}
+
+// Sets the labels (tags) on the conversation, the contact, or this conversation's kanban card (scope,
+// default 'conversation'). Endpoints, per the chatwoot-pro fork: conversation and contact labels GET
+// → { payload: [] }, POST /{conversations|contacts}/{id}/labels { labels } replaces; task labels via
+// PATCH /kanban/tasks/{id} { task: { labels } }. The enumerated labels are the account's Label
+// titles; task tags may use a separate taggable namespace on the fork, so confirm live before relying
+// on the suggestion for task scope. The delta: docs/graph.md, "`set_labels`: the model names the delta".
 function setLabelsTool(ctx: ToolCtx) {
-  // THE ACCOUNT'S VOCABULARY IS NO LONGER FILTERED HERE. It used to be, because `<existing_labels>`
-  // advertises every label the account has as a value the model may pick, and under the replace
-  // contract being offered one was the first half of being able to delete it by omission. Under the
-  // delta contract the guard is enforced on the way in, so the suggestion list can be whole — and a
-  // whole list is what stops an agent inventing `duvidas-evento` because the canonical value was
-  // fenced out of its sight (measured 2026-09-11, issue #695).
+  // The account's vocabulary is offered whole: the guard is enforced on the way in, and a
+  // whole list is what stops an agent inventing `duvidas-gerais` because the canonical value was
+  // out of its sight.
   const labelsXml = existingLabelsXml(ctx.vocab?.labels ?? []);
   // 'task' scope is only offered when this conversation actually has a linked card (ctx.kanban).
   const taskScope = !!ctx.kanban;
@@ -1293,8 +1562,8 @@ function setLabelsTool(ctx: ToolCtx) {
     ? z.enum(["conversation", "contact", "task"])
     : z.enum(["conversation", "contact"]);
   const currentXml = currentLabelsXml(ctx.shownLabels);
-  // NAMED UP FRONT, so a refusal is not the model's way of discovering the fence. Now that these
-  // are visible, a model that reads one off `<current_labels>` and decides it belongs elsewhere
+  // NAMED UP FRONT, so a refusal is not the model's way of discovering the fence: these are
+  // visible, and a model that reads one off `<current_labels>` and decides it belongs elsewhere
   // would otherwise spend a call to be told no. Capped like every other model-facing list.
   const guarded = [...new Set(ctx.protectedLabels ?? [])].filter(Boolean);
   const guardedShown = guarded.slice(0, SHOWN_LABELS_MAX);
@@ -1305,23 +1574,50 @@ function setLabelsTool(ctx: ToolCtx) {
           ", ",
         )}${guarded.length > guardedShown.length ? `, +${guarded.length - guardedShown.length} more` : ""}. Naming one of them in \`add\` when it is not already there also holds the call's \`remove\`, so a swap you cannot complete does not leave the scope empty.`
     : "";
-  // THE OPERATOR'S LIST (issue #638), named up front for the same reason the guard is: a refusal
+  // THE OPERATOR'S LIST, named up front for the same reason the guard is: a refusal
   // should not be how the model learns the taxonomy. Under `refuse` it REPLACES the "a label that
   // is not listed is created" sentence below, which would otherwise contradict it.
   const allowedList = [...new Set(ctx.allowedLabels ?? [])].filter(Boolean);
   const allowedMode = ctx.outsideAllowedLabels ?? "refuse";
-  const allowed = allowedList.length
-    ? { labels: allowedList, mode: allowedMode }
-    : undefined;
-  // WHOLE, not cut at SHOWN_LABELS_MAX like the other lists: a title the model is never shown is
-  // one it cannot pick, and the list is already bounded where it is stored (at most
-  // ALLOWED_LABELS_MAX, review round 1 of #638).
+  const removal = ctx.labelRemoval ?? "any";
+  // Present with an empty list too when removal is limited: no list then means no label is the
+  // agent's, so nothing is removed, rather than the fence quietly switching off.
+  const allowed =
+    allowedList.length || removal === "allowed"
+      ? { labels: allowedList, mode: allowedMode, removal }
+      : undefined;
+  // A call whose only effect was a refused removal still leaves its line: the refusal is what the
+  // operator has to see, and with nothing moved no write would report it.
+  const logRefusedOnly = (
+    scope: "conversation" | "contact" | "task",
+    o: { next: string[]; refusedForeign?: string[] },
+  ) => {
+    if ((o.refusedForeign ?? []).length > 0)
+      ctx.onLabelsWritten?.(
+        describeLabelWrite(scope, [], [], o.next, {
+          allowed: allowedList,
+          refusedForeign: o.refusedForeign,
+        }),
+      );
+  };
+  // WHOLE, not cut at SHOWN_LABELS_MAX like the other lists: a title the model is never shown
+  // is one it cannot pick, and the list is already bounded where it is stored (at most
+  // ALLOWED_LABELS_MAX).
   const allowedNamed = allowedList.map((l) => `'${l}'`).join(", ");
-  const allowedSentence = !allowed
+  const allowedSentence = !allowedList.length
     ? ""
     : allowedMode === "accept"
       ? ` The labels this agent is meant to use are: ${allowedNamed}. Add only these; a label outside the list is still written, but avoid it.`
-      : ` The only labels you may add are: ${allowedNamed}. A label outside this list is refused and not written; removing any label is still allowed.`;
+      : ` The only labels you may add are: ${allowedNamed}. A label outside this list is refused and not written.`;
+  // Said either way, so the model does not read the sentence above as covering removal too.
+  const removalSentence =
+    removal === "allowed"
+      ? allowedList.length
+        ? " You may remove only the labels in that list; any other label belongs to another system and stays."
+        : " You may not remove any label: none is this agent's."
+      : allowedList.length
+        ? " Removing any label is still allowed."
+        : "";
   const baseDescription = [
     `Add or remove labels (tags) on the conversation, the contact${taskScope ? ", or this conversation's kanban card" : ""}. Use scope to choose (default 'conversation').`,
     "Name ONLY what changes: a label you do not name is left exactly as it is. There is no need to repeat the labels that should stay, and repeating them is not harmless — it is a request to have them, which puts back one somebody has just taken off.",
@@ -1329,11 +1625,151 @@ function setLabelsTool(ctx: ToolCtx) {
     currentXml &&
       "What is set right now is in `<current_labels>` below; a scope not listed there could not be read.",
     labelsXml &&
-      !(allowed && allowedMode === "refuse") &&
+      !(allowedList.length && allowedMode === "refuse") &&
       "Prefer an EXISTING label from `<existing_labels>` below; a label that is not listed is created.",
   ]
     .filter(Boolean)
     .join(" ");
+  // One entry of the conversation's label queue, shared with the observer's verdict and the nudge's
+  // own merge: the endpoint replaces the whole set, so an unqueued read-then-POST erases what
+  // another writer added between the two. Every call the entry holds is applied to ONE read, one
+  // delta after the other in the order the calls were made, and the set they add up to goes out in
+  // one POST; each call still answers for its own delta, with the set as it stood after it. Never
+  // rejects: each call is answered through its own promise.
+  const writeLabelBatch = async (
+    batch: LabelBatch,
+    later: PendingLabelDelta[],
+  ): Promise<void> => {
+    // From here on nobody joins: a call that arrives now queues an entry of its own.
+    const close = () =>
+      closeConversationLabelsTail(ctx.tenantId, ctx.conversationId, batch);
+    try {
+      const known = ctx.conversationLabelsRead;
+      let current: string[];
+      if (known && Date.now() - known.at <= LABELS_READ_FRESH_MS) {
+        // No request to wait on, so one turn of the event loop instead: the calls dispatched beside
+        // this one are still on their way to the queue.
+        await new Promise((r) => setImmediate(r));
+        current = known.labels;
+      } else {
+        current = await ctx.client.getConversationLabels(ctx.conversationId);
+      }
+      close();
+      let state = current;
+      const outcomes = batch.deltas.map((d) => {
+        const outcome = applyLabelDelta(
+          d.add,
+          d.remove,
+          state,
+          guarded,
+          allowed,
+        );
+        state = outcome.next;
+        return { delta: d, ...outcome };
+      });
+      const report = (o: (typeof outcomes)[number]) =>
+        labelWriteReport(
+          "conversation",
+          o.added,
+          o.removed,
+          o.next,
+          o.refusedAdd,
+          o.refusedRemove,
+          o.heldRemove,
+          o.refusedOutside,
+          o.refusedForeign,
+        );
+      const moved = (o: (typeof outcomes)[number]) =>
+        o.added.length > 0 || o.removed.length > 0;
+      if (!outcomes.some(moved)) {
+        // NOTE: Nothing moved: see the sibling scopes.
+        recordShown(ctx, "conversation", state);
+        for (const o of outcomes) {
+          ctx.onNoEffect?.("set_labels");
+          reportLabelFence(o.delta.fenced, o);
+          logRefusedOnly("conversation", o);
+          o.delta.resolve(report(o));
+        }
+        return;
+      }
+      // NOTE: ASKED AGAIN HERE, inside the queue and after the GET, and not only at the tool boundary
+      // the graph already fences. Waiting for the queue is a wait like any other: `/reset`
+      // peels the episode's labels off in this very queue (webhook.ts), so a call that was
+      // wanted when it entered can land on a conversation the operator has just been told was
+      // cleared. Only an explicit `false` stops the write: a fence that could not answer is not
+      // a withdrawal.
+      if (ctx.stillWanted && !(await ctx.stillWanted())) {
+        for (const o of outcomes) {
+          ctx.onNoEffect?.("set_labels");
+          o.delta.fenced?.({ noEffect: true });
+          o.delta.resolve(
+            "Could not set the labels (the run was called off while this write waited its turn).",
+          );
+        }
+        return;
+      }
+      // Calls that must go alone, found here together because they joined before the fence ran:
+      // the first is written now and the others after it, one write each (`writeConversationLabels`).
+      if (outcomes.length > 1 && ctx.writesAlone?.()) {
+        later.push(...batch.deltas.splice(1));
+        outcomes.length = 1;
+        const first = outcomes[0];
+        if (first) state = first.next;
+        if (!first || !moved(first)) {
+          ctx.onNoEffect?.("set_labels");
+          if (first) {
+            reportLabelFence(first.delta.fenced, first);
+            logRefusedOnly("conversation", first);
+            first.delta.resolve(report(first));
+          }
+          return;
+        }
+      }
+      // A call this write moves nothing for is told its refusal before the write, which can still
+      // fail for the others: what it asked for was refused whatever becomes of theirs.
+      for (const o of outcomes) {
+        if (!moved(o)) reportLabelFence(o.delta.fenced, o);
+      }
+      // Forgotten before the write: a write that fails leaves nothing known about the set.
+      ctx.conversationLabelsRead = undefined;
+      const writtenAt = Date.now();
+      await ctx.client.setConversationLabels(ctx.conversationId, state);
+      if (known) ctx.conversationLabelsRead = { labels: state, at: writtenAt };
+      recordShown(ctx, "conversation", state);
+      for (const o of outcomes) {
+        if (moved(o)) {
+          // Written: said to the call (fence-report.ts), as every write a rule can run says it.
+          o.delta.fenced?.({ committed: true });
+          ctx.onLabelsWritten?.(
+            describeLabelWrite("conversation", o.added, o.removed, o.next, {
+              allowed: allowedList,
+              acceptedOutside: o.acceptedOutside,
+              refusedForeign: o.refusedForeign,
+            }),
+          );
+          reportLabelFence(o.delta.fenced, o);
+        } else {
+          ctx.onNoEffect?.("set_labels");
+          logRefusedOnly("conversation", o);
+        }
+        o.delta.resolve(report(o));
+      }
+    } catch (err) {
+      close();
+      // Settling twice is a no-op, so the calls already answered are not disturbed.
+      for (const d of batch.deltas) d.reject(err);
+    }
+  };
+  const writeConversationLabels = async (batch: LabelBatch): Promise<void> => {
+    const later: PendingLabelDelta[] = [];
+    await writeLabelBatch(batch, later);
+    // Inside this same entry of the queue, so a writer queued meanwhile stays behind all of them.
+    for (const d of later) {
+      const one = new LabelBatch(ctx);
+      one.deltas.push(d);
+      await writeConversationLabels(one);
+    }
+  };
   return tool(
     async (
       args: {
@@ -1341,40 +1777,39 @@ function setLabelsTool(ctx: ToolCtx) {
         remove?: string[];
         scope?: "conversation" | "contact" | "task";
       },
-      _config?: ToolRunnableConfig,
+      config?: ToolRunnableConfig,
     ) => {
       const { add = [], remove = [], scope } = args;
-      // THE OLD SHAPE IS REFUSED BY NAME, and this is not defensive programming. Operator prose in
-      // five free-text fields still describes the replace contract on every tenant that has not
-      // rewritten it, and a model following that prose sends `{labels: [...]}`. A strict schema
-      // would strip the key and leave an empty delta, so the call would answer "already as
-      // requested" and the model would record a classification that was never written — the most
-      // expensive failure this tool can produce (issue #695 holdout s3).
+      const fenced = fenceReporterOf(config);
+      // A call that could not write (no scope, called off), told to the call as well. A call that
+      // found nothing to change is not one: the labels already are what it asked for.
+      const noEffect = () => {
+        ctx.onNoEffect?.("set_labels");
+        fenced?.({ noEffect: true });
+      };
+      // THE RETIRED SHAPE IS REFUSED BY NAME: operator prose written for a complete-list
+      // contract makes a model send `{labels: [...]}`, and a strict schema would strip the key and
+      // leave an empty delta, so the call would answer "already as requested" for a classification
+      // that was never written.
       const legacy = (args as { labels?: unknown }).labels;
       if (Array.isArray(legacy)) {
-        ctx.onNoEffect?.("set_labels");
+        noEffect();
         return "Could not set the labels: this tool no longer takes a complete `labels` list. Name only what changes, with `add` and `remove` — a label you do not name is left as it is.";
       }
       if (add.length === 0 && remove.length === 0) {
-        ctx.onNoEffect?.("set_labels");
+        noEffect();
         return "Could not set the labels (neither `add` nor `remove` named anything).";
       }
       if (scope === "task") {
         if (!ctx.kanban) {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the labels (this conversation has no linked card).";
         }
-        // THE CARD IS READ FRESH, like the other two scopes. It used to be the turn-prep snapshot,
-        // on the grounds that resolving the card again costs the two or three calls
-        // `loadKanbanContext` makes — but that is the cost of resolving the card from the
-        // CONVERSATION, and the id is already in hand here, so one GET by id answers it. Under the
-        // replace contract the staleness was invisible (the model's list was the write either way);
-        // under the delta it would make "not named, not touched" false in exactly one scope, which
-        // is the promise the whole change is built on (issue #695 holdout s6).
-        //
-        // A read that fails REFUSES the write rather than falling back to the snapshot. Falling
-        // back would reintroduce the erasure silently, on the one path where nobody is looking,
-        // and the conversation scope already answers an unreadable state the same way.
+        // THE CARD IS READ FRESH, like the other two scopes: one GET by id, since the id is in
+        // hand. The turn-prep snapshot would make "not named, not touched" false on this scope. A
+        // read that fails REFUSES the write rather than falling back to the snapshot, which would
+        // reintroduce the erasure silently; the conversation scope answers an unreadable state the
+        // same way.
         let cardLabels: string[];
         try {
           const fresh = (await ctx.client.getKanbanTask(ctx.kanban.taskId)) as {
@@ -1384,7 +1819,7 @@ function setLabelsTool(ctx: ToolCtx) {
             ? fresh.labels.filter((l): l is string => typeof l === "string")
             : [];
         } catch {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the labels (the card could not be read just now). Try again.";
         }
         const {
@@ -1396,13 +1831,23 @@ function setLabelsTool(ctx: ToolCtx) {
           heldRemove,
           refusedOutside,
           acceptedOutside,
+          refusedForeign,
         } = applyLabelDelta(add, remove, cardLabels, guarded, allowed);
+        reportLabelFence(fenced, {
+          added,
+          removed,
+          refusedAdd,
+          refusedRemove,
+          refusedOutside,
+          refusedForeign,
+        });
         if (added.length === 0 && removed.length === 0) {
-          // NOTHING MOVED, so nothing was written: the POST is skipped entirely (review round 37).
+          // NOTE: NOTHING MOVED, so nothing is written: the POST is skipped entirely.
           // The dispatch was counted as an effect on the way in, and a call that changed no label
           // is a call the tick may safely run again.
           ctx.onNoEffect?.("set_labels");
           recordShown(ctx, "task", next);
+          logRefusedOnly("task", { next, refusedForeign });
           return labelWriteReport(
             "kanban card",
             added,
@@ -1412,24 +1857,25 @@ function setLabelsTool(ctx: ToolCtx) {
             refusedRemove,
             heldRemove,
             refusedOutside,
+            refusedForeign,
           );
         }
-        // ASKED AGAIN, after the GET and before the write, for the reason the two sibling scopes
-        // state above: the read is a WAIT, and `/reset` can retire the run while it is in flight.
-        // This scope had no read between the graph's dispatch check and its write until the fresh
-        // card read was added here, so the recheck arrives with it.
+        // NOTE: ASKED AGAIN, after the GET and before the write, for the reason the two sibling
+        // scopes state: the read is a WAIT, and `/reset` can retire the run while it is in flight.
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the card labels (the run was called off while this write waited).";
         }
         await ctx.client.setKanbanTaskLabels(ctx.kanban.taskId, next);
+        fenced?.({ committed: true });
         ctx.onLabelsWritten?.(
           describeLabelWrite("task", added, removed, next, {
             allowed: allowedList,
             acceptedOutside,
+            refusedForeign,
           }),
         );
-        // Kept in step anyway: the snapshot still feeds the description block and anything else in
+        // NOTE: Kept in step anyway: the snapshot still feeds the description block and anything else in
         // the turn that reads the card, and leaving it behind the write would show the model a set
         // its own call has already moved.
         ctx.kanban.card.labels = [...next];
@@ -1443,28 +1889,40 @@ function setLabelsTool(ctx: ToolCtx) {
           refusedRemove,
           heldRemove,
           refusedOutside,
+          refusedForeign,
         );
       }
       if (scope === "contact") {
         if (!ctx.base || ctx.tenantId == null || ctx.contactDbId == null) {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the contact labels (no contact in scope).";
         }
         const tenantId = ctx.tenantId;
         const contactDbId = ctx.contactDbId;
-        const contact = await runScopedOn(ctx.base, sysCtx(tenantId), (db) =>
-          db.contact.findUnique({
-            where: { id: contactDbId },
-            select: { chatwootContactId: true },
-          }),
+        // A database read: the Chatwoot client's own reads say for themselves that they sent nothing
+        // (sentNothing), this one says it here before it propagates.
+        const readOnly = async <T>(read: () => Promise<T>): Promise<T> => {
+          try {
+            return await read();
+          } catch (e) {
+            fenced?.({ noEffect: true });
+            throw e;
+          }
+        };
+        const contact = await readOnly(() =>
+          runScopedOn(ctx.base as PrismaClient, sysCtx(tenantId), (db) =>
+            db.contact.findUnique({
+              where: { id: contactDbId },
+              select: { chatwootContactId: true },
+            }),
+          ),
         );
         if (!contact?.chatwootContactId) {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the contact labels (contact not linked to Chatwoot).";
         }
-        const current = await ctx.client.getContactLabels(
-          contact.chatwootContactId,
-        );
+        const chatwootContactId = contact.chatwootContactId;
+        const current = await ctx.client.getContactLabels(chatwootContactId);
         const {
           next,
           added,
@@ -1474,10 +1932,20 @@ function setLabelsTool(ctx: ToolCtx) {
           heldRemove,
           refusedOutside,
           acceptedOutside,
+          refusedForeign,
         } = applyLabelDelta(add, remove, current, guarded, allowed);
+        reportLabelFence(fenced, {
+          added,
+          removed,
+          refusedAdd,
+          refusedRemove,
+          refusedOutside,
+          refusedForeign,
+        });
         if (added.length === 0 && removed.length === 0) {
           ctx.onNoEffect?.("set_labels");
           recordShown(ctx, "contact", next);
+          logRefusedOnly("contact", { next, refusedForeign });
           return labelWriteReport(
             "contact",
             added,
@@ -1487,20 +1955,23 @@ function setLabelsTool(ctx: ToolCtx) {
             refusedRemove,
             heldRemove,
             refusedOutside,
+            refusedForeign,
           );
         }
-        // ASKED AGAIN, after the GET and before the write — the fourth handler in this file that
-        // waits before writing, and the same rule as the other three. The conversation scope asks
-        // inside its queue; this scope has no queue, and the read above is just as much a wait.
+        // NOTE: ASKED AGAIN, after the GET and before the write, the same rule as every handler
+        // here that waits before writing. The conversation scope asks inside its queue; this scope
+        // has no queue, and the read above is just as much a wait.
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
-          ctx.onNoEffect?.("set_labels");
+          noEffect();
           return "Could not set the contact labels (the run was called off while this write waited).";
         }
         await ctx.client.setContactLabels(contact.chatwootContactId, next);
+        fenced?.({ committed: true });
         ctx.onLabelsWritten?.(
           describeLabelWrite("contact", added, removed, next, {
             allowed: allowedList,
             acceptedOutside,
+            refusedForeign,
           }),
         );
         recordShown(ctx, "contact", next);
@@ -1513,85 +1984,47 @@ function setLabelsTool(ctx: ToolCtx) {
           refusedRemove,
           heldRemove,
           refusedOutside,
+          refusedForeign,
         );
       }
-      // Inside the conversation's label queue, with the observer's verdict and the nudge's own
-      // merge: the endpoint replaces the whole set, so an unqueued read-then-POST here erases what
-      // another writer added between the two (issue #477 review, round 3). The queue serialises OUR
-      // writers; the delta is what survives the ones it does not reach — and unlike the diff it
-      // replaced, it survives them without needing to know what the model was shown.
-      return withConversationLabels(
-        ctx.tenantId,
-        ctx.conversationId,
-        async () => {
-          const current = await ctx.client.getConversationLabels(
-            ctx.conversationId,
-          );
-          const {
-            next,
-            added,
-            removed,
-            refusedAdd,
-            refusedRemove,
-            heldRemove,
-            refusedOutside,
-            acceptedOutside,
-          } = applyLabelDelta(add, remove, current, guarded, allowed);
-          if (added.length === 0 && removed.length === 0) {
-            // Nothing moved: see the sibling scopes above.
-            ctx.onNoEffect?.("set_labels");
-            recordShown(ctx, "conversation", next);
-            return labelWriteReport(
-              "conversation",
-              added,
-              removed,
-              next,
-              refusedAdd,
-              refusedRemove,
-              heldRemove,
-              refusedOutside,
-            );
-          }
-          // ASKED AGAIN HERE, inside the queue and after the GET, and not only at the tool boundary
-          // the graph already fences. Waiting for the queue is a wait like any other: `/reset`
-          // peels the episode's labels off in this very queue (webhook.ts), so a call that was
-          // wanted when it entered can land on a conversation the operator has just been told was
-          // cleared. Only an explicit `false` stops the write: a fence that could not answer is not
-          // a withdrawal.
-          if (ctx.stillWanted && !(await ctx.stillWanted())) {
-            ctx.onNoEffect?.("set_labels");
-            return "Could not set the labels (the run was called off while this write waited its turn).";
-          }
-          await ctx.client.setConversationLabels(ctx.conversationId, next);
-          ctx.onLabelsWritten?.(
-            describeLabelWrite("conversation", added, removed, next, {
-              allowed: allowedList,
-              acceptedOutside,
-            }),
-          );
-          recordShown(ctx, "conversation", next);
-          return labelWriteReport(
-            "conversation",
-            added,
-            removed,
-            next,
-            refusedAdd,
-            refusedRemove,
-            heldRemove,
-            refusedOutside,
-          );
-        },
-      );
+      // ONE WRITE FOR THE CALLS THAT ARRIVE TOGETHER: a call that finds this turn's own entry at
+      // the TAIL of the label queue, its read still out, joins that entry. Only the tail can be
+      // joined, so a call is never merged ahead of a writer queued in between.
+      return new Promise<string>((resolve, reject) => {
+        const mine: PendingLabelDelta = {
+          add,
+          remove,
+          resolve,
+          reject,
+          ...(fenced ? { fenced } : {}),
+        };
+        const alone = ctx.writesAlone?.() === true;
+        const tail = alone
+          ? undefined
+          : conversationLabelsTail(ctx.tenantId, ctx.conversationId);
+        if (tail instanceof LabelBatch && tail.ctx === ctx) {
+          tail.deltas.push(mine);
+          return;
+        }
+        const batch = new LabelBatch(ctx);
+        batch.deltas.push(mine);
+        void withConversationLabels(
+          ctx.tenantId,
+          ctx.conversationId,
+          () => writeConversationLabels(batch),
+          alone ? undefined : batch,
+        );
+      });
     },
     {
       name: "set_labels",
       description: withOperatorNote(
-        baseDescription + allowedSentence + guardedSentence,
+        baseDescription + allowedSentence + removalSentence + guardedSentence,
         ctx,
         "set_labels",
         [currentXml, labelsXml].filter(Boolean).join("\n"),
       ),
-      // LOOSE ON PURPOSE: a call carrying the retired `labels` key has to REACH the handler so it
+      // NOTE: LOOSE ON PURPOSE: a call carrying the retired `labels` key has to REACH the handler so it
       // can be refused by name. A strict object strips the key, and the refusal would arrive as
       // "nothing changed" — see the handler.
       schema: z.looseObject({
@@ -1619,29 +2052,54 @@ function setLabelsTool(ctx: ToolCtx) {
   );
 }
 
+// What the close could not do with the operator's labels goes to the flow log and the alert, never
+// to the model, which can do nothing about a label the account lacks or a write that failed.
+function reportResolveLabels(ctx: ToolCtx, result: ResolveLabelsResult) {
+  if (result.unknown.length > 0) {
+    ctx.onSideEffectError?.({
+      tool: "resolve_conversation",
+      phase: "resolve_labels_unknown",
+      detail: { labels: result.unknown },
+      err: new Error(
+        `resolve labels not in the account: ${result.unknown.join(", ")}`,
+      ),
+    });
+  }
+  if (result.outcome === "failed" || result.heldBy === "unread") {
+    ctx.onSideEffectError?.({
+      tool: "resolve_conversation",
+      phase: "resolve_labels",
+      err: result.error,
+      // NOTE: Labels held back because the contact's open case could not be ruled out are `info`:
+      // the conversation closed and the customer was answered, and nobody can act on a contact with
+      // that many conversations. A label write that failed stays a `warn`.
+      ...(result.outcome !== "failed" ? { level: "info" as const } : {}),
+    });
+  }
+}
+
 function resolveConversationTool(ctx: ToolCtx) {
   const deferred = ctx.turnState !== undefined;
   return tool(
     async () => {
-      // THE TRANSFER OF THIS TURN ALREADY HAPPENED, so the conversation belongs to the human queue
-      // and closing it is not ours to do. The reactive runtime has said this since issue #159, but
-      // it says it about the DEFERRED intent (`if (handoffState.completed) resolveRequested = false`)
-      // and this tool closes IMMEDIATELY whenever no `turnState` was handed down, which is every
-      // proactive turn and every observation. Measured on a nudge (issue #671): a transfer declaring
-      // silence followed by this tool left `toggleStatus open` then `toggleStatus resolved`, so the
-      // customer got nothing by the model's own declaration AND the conversation left the queue the
-      // transfer had just put it in. Asked before both branches because the answer is the same in
-      // both, and because the model should read what happened rather than a schedule that gets
-      // cancelled out of sight.
+      // NOTE: THE TRANSFER OF THIS TURN ALREADY HAPPENED, so the conversation belongs to the human
+      // queue and closing it is not ours to do. The reactive runtime drops a DEFERRED intent after a
+      // transfer, but this tool closes IMMEDIATELY whenever no `turnState` was handed down (every
+      // proactive turn and every observation), and that close would take the conversation out of
+      // the queue the transfer just put it in. Asked before both branches, so the model reads what
+      // happened rather than a schedule cancelled out of sight.
       if (ctx.handoffState?.completed) {
         return "Did not resolve: this turn transferred the conversation to a human, so it is theirs to close, not yours.";
       }
       const ts = ctx.turnState;
       if (ts) {
-        // Deferred: the runtime toggles the status after the final reply is delivered. The
+        // NOTE: Deferred: the runtime toggles the status after the final reply is delivered. The
         // wording stays conditional on purpose — the intent is discarded on takeover/supersede,
         // and a flat "resolved" would be a false claim in the checkpointed thread history.
         ts.resolveRequested = true;
+        ts.resolveByModel = true;
+        ts.resolveLabels = ctx.resolveLabels ?? [];
+        ts.resolveCaseHold = ctx.resolveCaseHold ?? null;
         return "Resolve scheduled: the conversation will be marked resolved after your final reply in this turn is delivered.";
       }
       // The row id and tenant are absent on hand-built contexts (and the playground never reaches a
@@ -1659,15 +2117,41 @@ function resolveConversationTool(ctx: ToolCtx) {
             ctx.observed ?? { status: "resolved", statusAt: null },
           )
         : { status: "resolved", statusAt: null };
-      // ASKED AGAIN HERE, after that read and before the toggle, for the same reason `set_labels`
-      // asks again inside its queue: the read above is a WAIT, and the graph's ask at the tool
-      // boundary happened before it. A `/reset` peels the episode off in that window, and an
+      // NOTE: ASKED AGAIN HERE, after that read and before the toggle, for the same reason
+      // `set_labels` asks again inside its queue: the read above is a WAIT, and the graph's ask at
+      // the tool boundary happened before it. A `/reset` peels the episode off in that window, and an
       // observation holds no thread claim to stop one (`runObserve` takes none), so without this the
-      // close lands on a conversation the operator has just been told was cleared — and it is a
-      // close, which nothing later undoes. Only an explicit `false` stops it: a fence that could not
-      // answer is not a withdrawal (round 17).
+      // close, which nothing later undoes, lands on a conversation the operator was told was
+      // cleared. Only an explicit `false` stops it: a fence that could not answer is not a withdrawal.
       if (ctx.stillWanted && !(await ctx.stillWanted())) {
         ctx.onNoEffect?.("resolve_conversation");
+        return "Did not resolve the conversation (the run was called off while this read was in flight).";
+      }
+      // Before the toggle, for the reason the deferred path writes them before its own: Chatwoot
+      // reads the survey rules when the status changes.
+      const labelled = await applyResolveLabels({
+        client: ctx.client,
+        tenantId: ctx.tenantId,
+        conversationId: ctx.conversationId,
+        // NOTE: Already closed by somebody else (read live above): theirs, not the agent's, so no label.
+        labels:
+          recordable && observed.status === "resolved"
+            ? []
+            : (ctx.resolveLabels ?? []),
+        stillWanted: ctx.stillWanted,
+        caseHold: ctx.resolveCaseHold ?? null,
+      });
+      reportResolveLabels(ctx, labelled);
+      // NOTE: Asked again whatever the labels came to: a held label, an unknown one and the POST are waits
+      // too. A label POST that went out may have landed, so only a close that sent none reports no
+      // effect.
+      if (
+        labelled.outcome === "called_off" ||
+        (ctx.stillWanted && !(await ctx.stillWanted()))
+      ) {
+        if (!labelled.dispatched) {
+          ctx.onNoEffect?.("resolve_conversation");
+        }
         return "Did not resolve the conversation (the run was called off while this read was in flight).";
       }
       await ownStatusChange(ctx, () =>
@@ -1778,7 +2262,7 @@ function kanbanMoveTool(ctx: ToolCtx) {
       }
       const taskId = ctx.kanban.taskId;
       await ctx.client.moveKanbanTask(taskId, step.id);
-      // Best-effort fleet event (ids only — no PII).
+      // NOTE: Best-effort fleet event (ids only, no PII).
       if (ctx.base && ctx.tenantId != null) {
         const tenantId = ctx.tenantId;
         try {
@@ -1901,6 +2385,217 @@ function updateKanbanTaskTool(ctx: ToolCtx) {
   );
 }
 
+const CONTACT_FIELD_SCHEMA: Record<ContactField, z.ZodString> = {
+  name: z
+    .string()
+    .max(120)
+    .describe(
+      "The customer's own name exactly as they stated or corrected it; never invent a surname.",
+    ),
+  email: z.string().max(254).describe("The customer's email address."),
+  company_name: z.string().max(120).describe("The customer's company."),
+  city: z.string().max(120).describe("The customer's city."),
+  country: z
+    .string()
+    .max(120)
+    .describe(
+      "The country's name as Chatwoot spells it in English (e.g. Brazil, Portugal).",
+    ),
+  description: z
+    .string()
+    .max(500)
+    .describe("A short note about the customer, in their own terms."),
+};
+
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const PHONE_SHAPE = /^\+?[\d\s().-]+$/;
+
+// One field's value as it is written, or the reason it is refused. Every value has its whitespace
+// collapsed; a name must carry a letter and must not be a phone number (the shape a model most
+// often mistakes for one), and an email must look like one. The letter test lives here and not in
+// the zod schema: `\p{L}` does not survive the JSON Schema some providers are handed.
+function contactFieldValue(
+  field: ContactField,
+  raw: string,
+): { value: string } | { refused: string } {
+  const value = raw.trim().replace(/\s+/g, " ");
+  if (!value) return { refused: `${field} is empty` };
+  if (field === "name") {
+    if (PHONE_SHAPE.test(value))
+      return { refused: "name must not be a phone number" };
+    if (!/\p{L}/u.test(value))
+      return { refused: "name must contain at least one letter" };
+  }
+  if (field === "email" && !EMAIL_SHAPE.test(value)) {
+    return { refused: "email is not an email address" };
+  }
+  return { value };
+}
+
+// Write-through of the fields just written into OUR mirror, so the contact block of the next turn
+// (and a proactive nudge, which has no inbound event before it) reads them at once. Each field's
+// source watermark moves to now, never back (GREATEST ignores NULL): Chatwoot does not deliver
+// contact_updated to bots, so the next event about this contact may carry a snapshot from before
+// the write, and the watermark is what keeps it from undoing it. `AT TIME ZONE 'UTC'` because the
+// columns are TIMESTAMP holding UTC (see mirrorAttributeWrite). Best-effort: logged, never surfaced.
+async function mirrorContactFieldsWrite(
+  ctx: ToolCtx,
+  written: Partial<Record<ContactField, string>>,
+): Promise<void> {
+  if (!ctx.base || ctx.tenantId == null || ctx.contactDbId == null) return;
+  const tenantId = ctx.tenantId;
+  const contactDbId = ctx.contactDbId;
+  const hasName = written.name !== undefined;
+  const hasEmail = written.email !== undefined;
+  const additional: Partial<Record<AdditionalContactField, string>> = {};
+  for (const [field, value] of Object.entries(written) as [
+    ContactField,
+    string,
+  ][]) {
+    if (isAdditionalContactField(field)) additional[field] = value;
+  }
+  const hasAdditional = Object.keys(additional).length > 0;
+  const patch = JSON.stringify(additional);
+  try {
+    await runScopedOn(
+      ctx.base,
+      sysCtx(tenantId),
+      (db) =>
+        db.$executeRaw`
+        UPDATE contacts SET
+          name = CASE WHEN ${hasName} THEN ${written.name ?? null}::text ELSE name END,
+          name_at = CASE WHEN ${hasName} THEN GREATEST(name_at, (NOW() AT TIME ZONE 'UTC')) ELSE name_at END,
+          email = CASE WHEN ${hasEmail} THEN ${written.email ?? null}::text ELSE email END,
+          email_at = CASE WHEN ${hasEmail} THEN GREATEST(email_at, (NOW() AT TIME ZONE 'UTC')) ELSE email_at END,
+          additional_attributes = CASE WHEN ${hasAdditional} THEN additional_attributes || ${patch}::jsonb ELSE additional_attributes END,
+          additional_attributes_at = CASE WHEN ${hasAdditional} THEN GREATEST(additional_attributes_at, (NOW() AT TIME ZONE 'UTC')) ELSE additional_attributes_at END
+        WHERE id = ${contactDbId} AND tenant_id = ${tenantId}
+      `,
+    );
+  } catch (e) {
+    logger.warn(
+      "contact mirror write-through failed: %s",
+      e instanceof Error ? e.message : String(e),
+    );
+    ctx.onSideEffectError?.({
+      tool: "update_contact",
+      phase: "mirror_write",
+      detail: { fields: Object.keys(written) },
+      err: e,
+    });
+  }
+}
+
+// Writes the contact's standard Chatwoot fields the operator made writable for this agent, in one
+// PUT. The schema carries only those fields, so a field the operator did not enable cannot even be
+// attempted. A write Chatwoot refuses (an email already on another contact of the account is the
+// ordinary case) comes back as a tool failure, never as a friendly sentence on an `ok` line.
+function updateContactTool(ctx: ToolCtx, writable: ContactField[]) {
+  const shape: Partial<Record<ContactField, z.ZodOptional<z.ZodString>>> = {};
+  for (const f of writable) shape[f] = CONTACT_FIELD_SCHEMA[f].optional();
+  return failableTool(
+    async (input: Partial<Record<ContactField, string>>) => {
+      const written: Partial<Record<ContactField, string>> = {};
+      const refused: string[] = [];
+      for (const f of writable) {
+        const raw = input[f];
+        if (raw === undefined) continue;
+        const r = contactFieldValue(f, raw);
+        if ("refused" in r) refused.push(r.refused);
+        else written[f] = r.value;
+      }
+      if (refused.length > 0) {
+        ctx.onNoEffect?.("update_contact");
+        return toolFailure(
+          `Nothing was updated: ${refused.join("; ")}. Ask the customer again rather than guessing.`,
+        );
+      }
+      if (Object.keys(written).length === 0) {
+        ctx.onNoEffect?.("update_contact");
+        return toolFailure(
+          `Nothing was updated: pass at least one of ${writable.join(", ")}.`,
+        );
+      }
+      if (!ctx.base || ctx.tenantId == null || ctx.contactDbId == null) {
+        ctx.onNoEffect?.("update_contact");
+        return "Could not update the contact (no contact in scope).";
+      }
+      const tenantId = ctx.tenantId;
+      const contactDbId = ctx.contactDbId;
+      const contact = await runScopedOn(ctx.base, sysCtx(tenantId), (db) =>
+        db.contact.findUnique({
+          where: { id: contactDbId },
+          select: { chatwootContactId: true },
+        }),
+      );
+      if (!contact?.chatwootContactId) {
+        ctx.onNoEffect?.("update_contact");
+        return "Could not update the contact (contact not linked to Chatwoot).";
+      }
+      // NOTE: Asked after the lookup and before the write, as set_custom_attribute does: a contact's
+      // data outlives the conversation, so a write after a `/reset` is one nothing later corrects.
+      if (ctx.stillWanted && !(await ctx.stillWanted())) {
+        ctx.onNoEffect?.("update_contact");
+        return "Could not update the contact (the run was called off while this write waited).";
+      }
+      const additional: Partial<Record<AdditionalContactField, string>> = {};
+      for (const [f, v] of Object.entries(written) as [
+        ContactField,
+        string,
+      ][]) {
+        if (isAdditionalContactField(f)) additional[f] = v;
+      }
+      try {
+        await ctx.client.updateContact(
+          contact.chatwootContactId,
+          {
+            ...(written.name !== undefined ? { name: written.name } : {}),
+            ...(written.email !== undefined ? { email: written.email } : {}),
+            ...(Object.keys(additional).length > 0
+              ? { additional_attributes: additional }
+              : {}),
+          },
+          // NOTE: The fence is asked again inside the contact's queue, since the wait for it is a
+          // wait too, and the mirror is written inside it, so two writes reach it in Chatwoot's order.
+          {
+            stillWanted: ctx.stillWanted,
+            afterWrite: () => mirrorContactFieldsWrite(ctx, written),
+          },
+        );
+      } catch (e) {
+        if (e instanceof ChatwootCalledOffError) {
+          ctx.onNoEffect?.("update_contact");
+          return "Could not update the contact (the run was called off while this write waited its turn).";
+        }
+        if (
+          e instanceof ChatwootApiError &&
+          e.status >= 400 &&
+          e.status < 500
+        ) {
+          return toolFailure(
+            written.email !== undefined && e.status === 422
+              ? "Chatwoot refused the update (HTTP 422). The email is most likely already on another contact of this account; tell the customer it could not be saved rather than retrying."
+              : `Chatwoot refused the update (HTTP ${e.status}). Nothing was saved.`,
+          );
+        }
+        throw e;
+      }
+      return `Contact updated: ${Object.keys(written).join(", ")}.`;
+    },
+    {
+      name: "update_contact",
+      description: withOperatorNote(
+        `Save the customer's own contact details on their Chatwoot contact: ${writable.join(", ")}. Only what the customer explicitly said in this conversation; never invent or complete a value. The current values are in <contact_fields>. Pass only the fields that change.`,
+        ctx,
+        "update_contact",
+      ),
+      // NOTE: minProperties reaches the model's JSON schema only; an empty call that slips through is
+      // still refused in the body.
+      schema: z.object(shape).meta({ minProperties: 1 }),
+    },
+  );
+}
+
 // Records the customer's audio-vs-text reply preference on the Contact (TTS "preference" mode). A
 // DB write (RLS-scoped), not a Chatwoot call — the elegant replacement for the n8n custom attribute.
 function setVoicePreferenceTool(ctx: ToolCtx) {
@@ -1966,12 +2661,12 @@ function reactToMessageTool(ctx: ToolCtx) {
         if (latest == null) {
           return "No customer message found to react to.";
         }
-        // The customer's last message is itself a reaction → WhatsApp can't react to a reaction, and
+        // NOTE: The customer's last message is itself a reaction → WhatsApp can't react to a reaction, and
         // reacting would target the wrong (penultimate) message. Refuse without calling the API.
         if (latest.isReaction) {
           return "The customer's last message is a reaction (emoji), and you can't react to a reaction. Do not react now.";
         }
-        // ASKED AGAIN, after the lookup that found the message to react to. A reaction is on the
+        // NOTE: ASKED AGAIN, after the lookup that found the message to react to. A reaction is on the
         // customer's phone, so this is the same question every customer-facing send asks before it
         // goes out — and the lookup above is a wait after the graph's ask at dispatch.
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
@@ -2185,12 +2880,23 @@ function sendCarouselTool(ctx: ToolCtx) {
   );
 }
 
-const SKIP_REPLY_DESCRIPTION =
+// What the model reads when it asks a turn that answers a customer for a reason that hands over. A
+// bare "expected acknowledged" teaches it to stay silent under the one reason left.
+const SKIP_REPLY_REFUSED_REASON =
+  "Only `acknowledged` is available here, and only when the message asks nothing. Nothing was skipped. If the team has to see this, call handoff_to_human (its customerMessage tells the customer a person will continue); otherwise answer the message, declining or redirecting if you must refuse.";
+
+const SKIP_REPLY_PROACTIVE_DESCRIPTION =
   "Decide NOT to send any reply this turn, then output NO reply text (end your turn). `reason` decides what happens next: `acknowledged` when a reply would add nothing (the customer sent just 'ok', 'obrigado' or an emoji, optionally after react_to_message) and the conversation stays with you; `not_for_us` when this is not a real conversation (an automated report, a payment notice, a newsletter, an unsolicited pitch); `needs_human` when it is a real request you cannot resolve. The last two hand the conversation to the team with a private note, and so does ANY skip on a conversation nobody on our side has answered yet.";
 
-// With `skipReply.handoff` off there is nobody to hand to, so the description promises nothing and
-// steers a real request the model cannot resolve into an answer instead of a silence.
+const SKIP_REPLY_DESCRIPTION =
+  "Decide NOT to send any reply this turn because the customer's last message asks nothing and a reply would add nothing (just 'ok', 'obrigado' or an emoji, optionally after react_to_message), then output NO reply text (end your turn). The conversation stays with you. Anything else is not this: answer the message (declining or redirecting when you must refuse), or, when the team has to see it (including an automated notification), call handoff_to_human. A skip on a conversation nobody on our side has answered yet still hands it to the team with a private note.";
+
+// With `skipReply.handoff` off a silence hands nothing over, so neither description promises the
+// team. The proactive one steers a real request the model cannot resolve into an answer instead.
 const SKIP_REPLY_DESCRIPTION_NO_TEAM =
+  "Decide NOT to send any reply this turn because the customer's last message asks nothing and a reply would add nothing (just 'ok', 'obrigado' or an emoji, optionally after react_to_message), then output NO reply text (end your turn). The conversation stays with you. Anything else is not this: answer the message, declining or redirecting when you must refuse.";
+
+const SKIP_REPLY_PROACTIVE_DESCRIPTION_NO_TEAM =
   "Decide NOT to send any reply this turn, then output NO reply text (end your turn). Use `acknowledged` when a reply would add nothing (just 'ok', 'obrigado' or an emoji, optionally after react_to_message), or `not_for_us` when this is not a real conversation (an automated report, a newsletter, a pitch). Nobody else reads this conversation, so a real request you cannot resolve is NOT a reason to skip: answer it, saying briefly what you cannot do.";
 
 // What `needs_human` returns when nobody is behind the agent. No mark, so the turn is not a silence:
@@ -2201,7 +2907,7 @@ export const SKIP_REPLY_NO_TEAM_RESULT =
 // Deliberately produce NO reply this turn. The agent calls this, then ends without any customer-facing
 // text, so the runtime posts nothing (it already skips an empty reply). The call is recorded in the
 // conversation timeline (via the tool flow log) as a "decided not to respond" marker, and its REASON
-// decides whether the conversation stays with the bot or goes to a person (issue #659, ../silence.ts).
+// decides whether the conversation stays with the bot or goes to a person (../silence.ts).
 function skipReplyTool(ctx: ToolCtx) {
   // A MUTED turn (an observer) runs no hand-over after it: nothing reads the reason back out of an
   // observation, which throws its final output away. So the promise is not made there, and the way
@@ -2216,15 +2922,15 @@ function skipReplyTool(ctx: ToolCtx) {
     ) => {
       if (noTeam && speaks && asked === "needs_human")
         return SKIP_REPLY_NO_TEAM_RESULT;
-      // NOTE: recorded as `acknowledged` when nobody is behind the agent, because the reason is
+      // Recorded as `acknowledged` when nobody is behind the agent, because the reason is
       // what later turns read as "a person took this" (../handback.ts) and nobody did.
       const reason: SkipReplyReason = noTeam ? "acknowledged" : asked;
       const note = detail?.trim() ? `${asked}: ${detail.trim()}` : asked;
-      // The ack is what the MODEL reads — LangGraph calls it again after a tool result, and this
+      // The ack is what the MODEL reads: LangGraph calls it again after a tool result, and this
       // sentence is the instruction that makes the turn end quiet.
       const ack = `${SKIP_REPLY_ACK} (${note}). Produce no message now.`;
-      // ...and the MARK is what identifies the tool, in `additional_kwargs`, out of reach of any
-      // response body (round 24). Returned as a whole `ToolMessage` for that, the same
+      // ...and the MARK is what identifies the tool, in `additional_kwargs`, out of reach of
+      // any response body. Returned as a whole `ToolMessage` for that, the same
       // direct-tool-output passthrough `failableTool` uses; without a tool_call in scope (a direct
       // invocation with plain args) it degrades to the plain string, as that one does.
       const id = config?.toolCall?.id;
@@ -2250,13 +2956,21 @@ function skipReplyTool(ctx: ToolCtx) {
     {
       name: "skip_reply",
       description: speaks
-        ? noTeam
-          ? SKIP_REPLY_DESCRIPTION_NO_TEAM
-          : SKIP_REPLY_DESCRIPTION
+        ? ctx.proactive
+          ? noTeam
+            ? SKIP_REPLY_PROACTIVE_DESCRIPTION_NO_TEAM
+            : SKIP_REPLY_PROACTIVE_DESCRIPTION
+          : noTeam
+            ? SKIP_REPLY_DESCRIPTION_NO_TEAM
+            : SKIP_REPLY_DESCRIPTION
         : "Record that this turn adds nothing, then output NO text (end your turn). This turn does not answer the customer, and `reason` is only recorded: nothing is handed over by it. To put a person on the conversation, call handoff_to_human.",
 
       schema: z.object({
-        reason: z.enum(SKIP_REPLY_REASONS),
+        reason: ctx.proactive
+          ? z.enum(SKIP_REPLY_REASONS)
+          : z.enum(SKIP_REPLY_OFFERED_REASONS, {
+              error: SKIP_REPLY_REFUSED_REASON,
+            }),
         detail: z
           .string()
           .max(SKIP_DETAIL_MAX)
@@ -2269,13 +2983,6 @@ function skipReplyTool(ctx: ToolCtx) {
   );
 }
 
-// Sends an image the agent already has a URL for (a product photo from an HTTP tool, an MCP tool or
-// a catalog integration) as a real attachment, instead of pasting a link the customer has to open.
-//
-// The URL is MODEL-supplied, so the hosts it may be fetched from are an operator decision that lives
-// in the agent's config, never in a tool argument: a prompt injection can write any URL it likes and
-// still not reach a host the operator did not list. See modules/images/fetch for the rest of the
-// fence (SSRF assertion, no redirects, byte cap on the body, type read from the file's signature).
 // The image half of the shared attachment queue, which is what both send_image ceilings are about.
 export function queuedImages(turnState: TurnState): PendingAttachment[] {
   return turnState.pendingAttachments.filter((a) => a.kind === "image");
@@ -2287,6 +2994,12 @@ function limitReached(): string {
   return `Limite de imagens deste turno atingido (${SEND_IMAGE_MAX_PER_TURN}). Envie as demais em outra mensagem ou responda com o link em texto.`;
 }
 
+// Sends an image the agent already has a URL for (a product photo from an HTTP tool, an MCP tool or
+// a catalog integration) as a real attachment, instead of pasting a link the customer has to open.
+// The URL is MODEL-supplied, so the hosts it may be fetched from are an operator decision that lives
+// in the agent's config, never in a tool argument: a prompt injection can write any URL it likes and
+// still not reach a host the operator did not list. See modules/images/fetch for the rest of the
+// fence (SSRF assertion, no redirects, byte cap on the body, type read from the file's signature).
 function sendImageTool(ctx: ToolCtx) {
   const cfg = ctx.sendImage ?? SEND_IMAGE_DEFAULTS;
   const hosts = cfg.allowedHosts;
@@ -2301,7 +3014,7 @@ function sendImageTool(ctx: ToolCtx) {
     }\n</imagens-permitidas>`;
   return failableTool(
     async ({ url, caption }: { url: string; caption?: string }) => {
-      // NOTE: Both refusals below are decided BEFORE the fetch. Downloading megabytes over ten
+      // Both refusals below are decided BEFORE the fetch. Downloading megabytes over ten
       // seconds only to throw the result away is work a model can ask for repeatedly, and the DNS
       // lookup alone is a signal leaving the box for a call whose answer is already "no".
       //
@@ -2313,16 +3026,13 @@ function sendImageTool(ctx: ToolCtx) {
       if (!turnState) {
         return "Não é possível enviar imagem neste momento (mensagem proativa). Responda com o link em texto.";
       }
-      // One model response can carry a whole batch of tool calls, and the graph's tool-call limit is
-      // only re-checked between responses, so the queue needs its own ceiling: every accepted image
-      // is held in memory until the turn ends and then uploaded one by one. The slot is taken here,
-      // BEFORE the await, because the batch runs concurrently — a check that spans the download
-      // would be read by every call while the queue is still empty. Bytes are enforced at the other
-      // end, where the real size is known; the count keeps the in-flight total bounded meanwhile.
-      // NOTE: counts IMAGES, not the queue. The queue also carries documents, which are our own
-      // rendered files bounded by their own rule — one per turn. Letting one eat an image slot would
-      // make a ceiling the operator reads as "images per message" mean something else depending on
-      // whether a document went out with them.
+      // One model response can carry a batch of tool calls, and the graph's tool-call limit is
+      // only re-checked between responses, so the queue needs its own ceiling (every accepted image
+      // is held in memory until the turn ends). The slot is taken BEFORE the await: the batch runs
+      // concurrently, and a check spanning the download would be read by every call while the queue
+      // is still empty. Bytes are enforced after the download, where the size is known. It counts
+      // IMAGES, not the queue: a document (one per turn) eating an image slot would change what the
+      // operator reads as "images per message".
       const tooManyQueued =
         queuedImages(turnState).length + turnState.imagesInFlight >=
         SEND_IMAGE_MAX_PER_TURN;
@@ -2337,7 +3047,7 @@ function sendImageTool(ctx: ToolCtx) {
           assertSafe: ctx.assertSafe,
         });
         if (!res.ok) {
-          // NOTE: A refusal the OPERATOR has to fix (no hosts configured, host not listed) is normal
+          // A refusal the OPERATOR has to fix (no hosts configured, host not listed) is normal
           // operation for the model — it should answer with a link instead — but it is not normal
           // for the operator, so only the transport failures are marked as integration failures.
           const message = sendImageRefusal(res.reason, res.detail);
@@ -2345,7 +3055,7 @@ function sendImageTool(ctx: ToolCtx) {
             ? toolFailure(message)
             : message;
         }
-        // NOTE: Re-read the queue and count THIS image in: the batch's other calls may have queued
+        // Re-read the queue and count THIS image in: the batch's other calls may have queued
         // while this one downloaded, and a budget that excludes the candidate lets the last accepted
         // image carry the total past the ceiling. No await between the read and the push, so the
         // pair is atomic.
@@ -2479,23 +3189,56 @@ function getCurrentTimeTool(ctx: ToolCtx) {
   );
 }
 
-// THE TOOLS A MUTED TURN CANNOT COMPLETE, hidden from it. An observer now runs the ordinary toolset
-// (issue #568), and two of those tools are customer-facing in their entirety: a reaction lands on the
-// customer's phone — the muted transport refuses that POST, and reaching that refusal is a defect by
-// construction — and an image is delivered by the turn's own gates, which an observation does not
-// have, so it refuses every call. Offered anyway they cost a model round each and answer with a
-// failure an operator reads as a broken integration. Read off the client's own `muted`, the same
-// field `armReminders` asks, so the two cannot disagree about what this turn may do.
-//
-// A private note is NOT here, and that is the same isention the mute itself makes: it is the one
-// thing an observer legitimately writes where a person will read it.
+// An addition whose note did not reach the case: withdrawn before it, or the write failed.
+function additionLost(r: OpenCaseResult): boolean {
+  return (
+    (r.kind === "appended" || r.kind === "already_open") &&
+    r.additionDelivered === false
+  );
+}
+
 // What the model reads after `open_case_in_inbox`, one sentence per outcome. The ones that ask for
 // something are instructions the model acts on in its reply; none of them tells it to stay silent,
 // because the customer still has to hear, on the channel they are on, where their case went.
+// Email cannot be delivered to a mailbox name with an accent, and on this domain the plain spelling
+// may belong to someone else, so the customer is the one to say which address is theirs.
+const NON_ASCII_EMAIL_TEXT = (who: "customer" | "user") =>
+  `Nothing was opened: that email address has an accent or another non-ASCII character before the @, and email cannot be delivered to it. Ask the ${who} to confirm their address written without the accent, then call this tool again with \`email\` set to exactly what they type.`;
+
+type CaseReply = Extract<OpenCaseResult, { reply: unknown }>["reply"];
+
+const REPLY_CHANNEL_PHRASE: Record<CaseReply["channel"], string> = {
+  email: "by email",
+  whatsapp: "on WhatsApp",
+  sms: "by SMS",
+  web_widget: "in the website chat",
+  api: "through the destination inbox's API channel",
+};
+
+// How the team answers the customer, said in full: "there" read as the origin conversation, both to
+// the factual check and to the agent's model.
+function caseReplyRoute(reply: CaseReply): string {
+  const via = REPLY_CHANNEL_PHRASE[reply.channel];
+  switch (reply.channel) {
+    case "email":
+      return `${via}, to ${reply.address ?? "the address on their contact"}`;
+    case "whatsapp":
+    case "sms":
+      return `${via}, at the phone number on their contact`;
+    default:
+      return via;
+  }
+}
+
+// `where` names the place the model is replying in; `route` replaces the destination's own route
+// where the model must not see the address.
 function openCaseOutcomeText(
   r: OpenCaseResult,
   closing: "scheduled" | "not_here" | null = null,
+  where: { here: string; route?: string } = { here: "this conversation" },
 ): string {
+  const answer = (reply: CaseReply) =>
+    `${where.route ?? caseReplyRoute(reply)}, not in ${where.here}`;
   const close =
     closing === "scheduled"
       ? " This conversation will be marked resolved after your reply in this turn is delivered."
@@ -2508,27 +3251,39 @@ function openCaseOutcomeText(
       const how =
         r.kind === "opened"
           ? `Case opened: conversation #${r.caseId} in the destination inbox.`
-          : `The customer already had an open case there, so it was continued: conversation #${r.caseId}. No new opening message was sent.`;
+          : `The customer already had an open case in the destination inbox, so it was continued: conversation #${r.caseId}. No new opening message was sent.`;
       const partial = r.partial.length
         ? ` Some follow-up writes did not land (${r.partial.join(", ")}); the case itself is open.`
         : "";
       const blocked = r.openingBlocked
         ? " The opening message was refused by the output check and was NOT sent; the case is open without it."
         : r.openingOutsideWindow
-          ? " The opening message was NOT sent: that channel only lets the team write first with an approved template, so it was left for the team as a note. Do not say a message was sent to them there."
+          ? ` The opening message was NOT sent: that channel only lets the team write first with an approved template, so it was left for the team as a note. Do not say a message was sent to them ${REPLY_CHANNEL_PHRASE[r.reply.channel]}.`
           : "";
-      return `${how}${partial}${blocked} Tell the customer, in your reply here, that their case was opened and the team will contact them there.${close}`;
+      return `${how}${partial}${blocked} Tell the customer in your reply that their case was opened and that the team will answer them ${answer(r.reply)}.${close}`;
     }
     case "already_open":
-      return `This conversation already opened a case that is still open: conversation #${r.caseId}. Nothing new was opened. Tell the customer their case is already with the team.${close}`;
+      return additionLost(r)
+        ? `This conversation already opened a case that is still open: conversation #${r.caseId}. Nothing new was opened, and what you passed in \`reason\` could NOT be added to that case, so the team does not have it. Do not tell the customer it reached the team; hand off to a human with handoff_to_human so a person sees it.${close}`
+        : `This conversation already opened a case that is still open: conversation #${r.caseId}. Nothing new was opened; what you passed in \`reason\` was added to that case as an internal note. Tell the customer their case is already with the team, and that the team will answer them ${answer(r.reply)}.${close}`;
+    case "appended": {
+      if (additionLost(r)) {
+        return `The customer already has an open case with the team, opened from another conversation: conversation #${r.caseId}. Nothing new was opened, but what you passed in \`reason\` could NOT be added to that case, so the team does not have it. Do not tell the customer it reached the team; hand off to a human with handoff_to_human so a person sees it.${close}`;
+      }
+      const partial = r.partial.length
+        ? ` Some writes did not land (${r.partial.join(", ")}).`
+        : "";
+      return `The customer already has an open case with the team, opened from another conversation: conversation #${r.caseId}. Nothing new was opened and no message was sent to them ${REPLY_CHANNEL_PHRASE[r.reply.channel]}; what you passed in \`reason\` was added to that case as an internal note, and this conversation is now linked to it.${partial} Tell the customer in your reply that what they added reached the team handling their case, and that the answer still comes ${answer(r.reply)}.${close}`;
+    }
     case "needs_email":
       return "Nothing was opened: the destination is an email inbox and this contact has no email address. Ask the customer for their email, then call this tool again with `email` set to exactly what they typed.";
     case "needs_phone":
       return "Nothing was opened: the destination needs the contact's phone number, and this contact has none. Hand off to a human instead.";
     case "rejected_email":
-      return r.why === "invalid"
-        ? "Nothing was opened: that is not a valid email address. Ask the customer to type their email again."
-        : "Nothing was opened: `email` must be an address the customer typed in this conversation, and this one is not among their messages. Ask the customer for their email and pass exactly what they typed.";
+      if (r.why === "invalid")
+        return "Nothing was opened: that is not a valid email address. Ask the customer to type their email again.";
+      if (r.why === "non_ascii") return NON_ASCII_EMAIL_TEXT("customer");
+      return "Nothing was opened: `email` must be an address the customer typed in this conversation, and this one is not among their messages. Ask the customer for their email and pass exactly what they typed.";
     case "unsupported_channel":
       return "Nothing was opened: the configured destination inbox cannot start conversations. Hand off to a human instead.";
     case "same_inbox":
@@ -2545,8 +3300,16 @@ function openCaseOutcomeText(
 }
 
 function openCaseInInboxTool(ctx: ToolCtx) {
+  const openingTemplate = ctx.crossInboxCase?.config.openingTemplate ?? null;
+  const asksMessage = openingAsksMessage(openingTemplate);
+  const opening =
+    openingTemplate === null
+      ? "`customer_message` is the first message the customer receives from the destination inbox (for an email inbox, the opening email), so write it as that message."
+      : asksMessage
+        ? "`customer_message` is your part of the first message the customer receives from the destination inbox: it goes inside the team's own opening text, so write only what is specific to this request."
+        : "The customer receives the team's fixed opening message from the destination inbox; you do not write it.";
   const description =
-    "Open the customer's case in the team's other inbox (configured by the operator: you choose WHETHER to open it, never where), without asking the customer to switch channels. Use it when the request has to be handled by the team that works in that inbox. `reason` becomes an internal note on the case. `customer_message` is the first message the customer receives THERE (for an email inbox, the opening email), so write it as that message. Call it directly: it reads the contact's email and phone itself, so do not ask the customer for them first. Only when the result says an email is missing, ask for it and call again with exactly the address they typed. Tell the customer here where their case went." +
+    `Open the customer's case in the team's other inbox (configured by the operator: you choose WHETHER to open it, never where), without asking the customer to switch channels. Use it when the request has to be handled by the team that works in that inbox. \`reason\` becomes an internal note on the case. ${opening} Call it directly: it reads the contact's email and phone itself, so do not ask the customer for them first. Only when the result says an email is missing, ask for it and call again with exactly the address they typed. Tell the customer, in this conversation, where their case went and how the team will answer them, as the result says. When the customer adds something after their case was opened, in this conversation or in a new one, call it again with the addition in \`reason\`: it goes to the open case as a note, and no second case is opened.` +
     (ctx.crossInboxCase?.config.resolveOrigin && ctx.turnState
       ? " Once the case is open, this conversation is closed after your reply is delivered."
       : " This tool does NOT close this conversation; close with resolve_conversation if that is the next step.");
@@ -2573,7 +3336,8 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         originConversationId: ctx.conversationId,
         originContactId: cic.contactId,
         reason: reason.trim(),
-        customerMessage: customer_message?.trim() || null,
+        customerMessage:
+          (asksMessage && customerLine(customer_message)) || null,
         email: email?.trim() || null,
         labels: (labels ?? [])
           .map((l) => l.trim().toLowerCase())
@@ -2583,7 +3347,9 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         tenantId: ctx.tenantId,
         screenCustomerMessage: ctx.screenCustomerText,
         signCustomerMessage: cic.sign,
-        // The team this agent hands conversations to, when the operator pinned one: the case goes to
+        interpolate: cic.interpolate,
+        attendanceStartedAt: cic.attendanceStartedAt,
+        // NOTE: The team this agent hands conversations to, when the operator pinned one: the case goes to
         // the same people. `ctx.handoff` is already the effective config, so a pin picked in another
         // account arrives here as `agent_choice` and no team is written. A pinned PERSON is not
         // assigned to the case: whose case it is inside the team stays the team's call.
@@ -2594,10 +3360,12 @@ function openCaseInInboxTool(ctx: ToolCtx) {
       });
       if (result.kind === "called_off") ctx.onNoEffect?.(OPEN_CASE_TOOL_NAME);
       if (result.kind !== "failed") {
-        // A configured case label the account does not have: the operator's to fix, so it goes to
+        // NOTE: A configured case label the account does not have: the operator's to fix, so it goes to
         // the flow log and the alert, and not to the model, which can do nothing about it.
         if (
-          (result.kind === "opened" || result.kind === "continued") &&
+          (result.kind === "opened" ||
+            result.kind === "continued" ||
+            result.kind === "appended") &&
           result.unknownCaseLabels?.length
         ) {
           ctx.onSideEffectError?.({
@@ -2612,7 +3380,8 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         if (
           (result.kind === "opened" ||
             result.kind === "continued" ||
-            result.kind === "already_open") &&
+            result.kind === "already_open" ||
+            result.kind === "appended") &&
           result.partial.length > 0
         ) {
           ctx.onSideEffectError?.({
@@ -2625,7 +3394,8 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         if (
           (result.kind === "opened" ||
             result.kind === "continued" ||
-            result.kind === "already_open") &&
+            result.kind === "already_open" ||
+            result.kind === "appended") &&
           result.caseOwnerUnread
         ) {
           ctx.onSideEffectError?.({
@@ -2639,30 +3409,85 @@ function openCaseInInboxTool(ctx: ToolCtx) {
             ),
           });
         }
+        // NOTE: What the files step did goes to the flow log, never to the model: the case is open either
+        // way, and a count in the result would invite the model to talk about it.
+        if (
+          (result.kind === "opened" ||
+            result.kind === "continued" ||
+            result.kind === "already_open" ||
+            result.kind === "appended") &&
+          result.attachments
+        ) {
+          const a = result.attachments;
+          if (
+            a.carried + a.skipped + a.failed > 0 ||
+            a.unread ||
+            a.truncated ||
+            a.calledOff
+          ) {
+            const notCarried = a.notCarried ?? [];
+            ctx.onSideEffectError?.({
+              tool: OPEN_CASE_TOOL_NAME,
+              phase: "case_attachments",
+              ...(a.failed > 0 || a.unread || a.truncated || a.calledOff
+                ? { level: "warn" as const }
+                : { status: "ok" as const }),
+              detail: {
+                caseId: result.caseId,
+                carried: a.carried,
+                skipped: a.skipped,
+                failed: a.failed,
+                ...(a.unread ? { unread: a.unread } : {}),
+                ...(a.truncated ? { truncated: true } : {}),
+                ...(a.calledOff ? { calledOff: true, notCarried } : {}),
+              },
+              err: new Error(
+                a.unread
+                  ? `customer files not carried: the ${a.unread === "attendance" ? "attendance boundary" : "case"} could not be read`
+                  : a.calledOff
+                    ? `customer files not carried: the run was called off before the upload${notCarried.length > 0 ? ` (attachments ${notCarried.join(", ")})` : ""}`
+                    : `customer files: ${a.carried} carried, ${a.skipped} skipped, ${a.failed} failed${a.truncated ? "; the walk stopped at its page limit, older files were not seen" : ""}`,
+              ),
+            });
+          }
+        }
         const caseOpen =
           result.kind === "opened" ||
           result.kind === "continued" ||
-          result.kind === "already_open";
+          result.kind === "already_open" ||
+          result.kind === "appended";
         // THE OPERATOR'S CLOSE RIDES THE SAME DEFERRED PATH `resolve_conversation` USES: after the
         // reply that tells the customer where the case went, and dropped when they write again
         // first. Only with a turn to defer to; a proactive turn has none, and closing immediately
         // there would take the conversation away before anything was said in it.
         let closing: "scheduled" | "not_here" | null = null;
         if (caseOpen) {
+          if (additionLost(result) && ctx.turnState) {
+            ctx.turnState.caseAdditionLost = true;
+          }
           if (
             cic.config.resolveOrigin &&
             ctx.turnState &&
-            !ctx.handoffState?.completed
+            !ctx.handoffState?.completed &&
+            !ctx.turnState.caseAdditionLost
           ) {
             ctx.turnState.resolveRequested = true;
+            ctx.turnState.caseClosing = true;
             closing = "scheduled";
           } else {
             closing = "not_here";
+            // NOTE: a close an earlier call of this turn scheduled for the case is withdrawn, and one the
+            // model asked for with resolve_conversation stands.
+            if (ctx.turnState?.caseClosing) {
+              ctx.turnState.resolveRequested =
+                ctx.turnState.resolveByModel === true;
+              ctx.turnState.caseClosing = false;
+            }
           }
         }
         return openCaseOutcomeText(result, closing);
       }
-      // THE FAILURE BRANCH IS A REQUIREMENT, NOT A DETAIL: the customer asked for help, and a case
+      // NOTE: THE FAILURE BRANCH IS A REQUIREMENT, NOT A DETAIL: the customer asked for help, and a case
       // that did not open must not leave them talking to a bot that cannot deliver it. The
       // conversation goes to the human queue (`open`, which also stops the bot here) with a note
       // saying why, and the tool result is marked as a failure so the flow log carries it.
@@ -2676,7 +3501,7 @@ function openCaseInInboxTool(ctx: ToolCtx) {
       );
       let fallback = "";
       try {
-        // FENCED LIKE handoff_to_human: before the note, and again between the note and the status
+        // NOTE: FENCED LIKE handoff_to_human: before the note, and again between the note and the status
         // change, which cannot be undone. A request that failed because the turn was reset or
         // withdrawn must not transfer the conversation the operator just cleared.
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
@@ -2685,7 +3510,7 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         }
         await ctx.client.sendPrivateNote(
           ctx.conversationId,
-          `⚠️ Não consegui abrir o caso na outra caixa (etapa: ${result.step}). O cliente está aguardando atendimento aqui. Motivo informado: ${reason.trim()}`,
+          `⚠️ Não consegui abrir o caso na outra caixa (etapa: ${result.step}). O cliente está aguardando atendimento aqui. Motivo informado: ${literalForChatwoot(reason.trim())}`,
         );
         if (ctx.stillWanted && !(await ctx.stillWanted())) {
           return "Did not hand off (the run was called off while the note was in flight); the note was already filed.";
@@ -2693,21 +3518,22 @@ function openCaseInInboxTool(ctx: ToolCtx) {
         await ownStatusChange(ctx, () =>
           ctx.client.toggleStatus(ctx.conversationId, "open"),
         );
-        // The customer's line goes through the handoff's own delivery: after the transfer, screened
+        // NOTE: The customer's line goes through the handoff's own delivery: after the transfer, screened
         // by the output check, and not dropped by the ownership recheck the transfer just tripped,
         // which is what happens to the model's next reply here. Without a line a person still sees
         // the conversation; the customer just reads nothing.
         if (ctx.handoffState) {
-          const line = handoff_message?.trim() ?? "";
+          const line = customerLine(handoff_message);
           ctx.handoffState.customerMessage = line || null;
-          // No line is a SILENT transfer, said so as `handoff_to_human` says it: otherwise the model's
+          ctx.handoffState.lineByOperator = false;
+          // NOTE: No line is a SILENT transfer, said so as `handoff_to_human` says it: otherwise the model's
           // next reply could still go out before the status webhook reaches the mirror.
           ctx.handoffState.declinedToSpeak = !line;
           ctx.handoffState.completed = true;
         }
-        fallback = handoff_message?.trim()
+        fallback = customerLine(handoff_message)
           ? ` ${OPEN_CASE_HANDED_MARK} instead, with a note saying why. Your handoff_message will be delivered to the customer; do not repeat it.`
-          : ` ${OPEN_CASE_HANDED_MARK} instead, with a note saying why. No message will reach the customer here.`;
+          : ` ${OPEN_CASE_HANDED_MARK} instead, with a note saying why. No message will reach the customer in this conversation.`;
       } catch (e) {
         ctx.onSideEffectError?.({
           tool: OPEN_CASE_TOOL_NAME,
@@ -2732,12 +3558,18 @@ function openCaseInInboxTool(ctx: ToolCtx) {
           .describe(
             "Why the case is being opened, for the team (internal note on the case).",
           ),
-        customer_message: z
-          .string()
-          .optional()
-          .describe(
-            "The first message the customer receives in the destination inbox. Omit to open the case without one.",
-          ),
+        ...(asksMessage
+          ? {
+              customer_message: z
+                .string()
+                .optional()
+                .describe(
+                  openingTemplate === null
+                    ? "The first message the customer receives in the destination inbox. Omit to open the case without one."
+                    : "Your part of the team's opening message in the destination inbox. Omit to open the case without an opening.",
+                ),
+            }
+          : {}),
         email: z
           .string()
           .optional()
@@ -2771,9 +3603,319 @@ function openCaseInInboxTool(ctx: ToolCtx) {
   );
 }
 
-const MUTED_CANNOT_COMPLETE = new Set<string>(
-  CUSTOMER_DELIVERY_NATIVE_TOOL_NAMES,
-);
+// What the model reads after `open_case_in_inbox` on a channel with nobody to hand the conversation
+// to and no messages of the user's to read an address from: the outcomes that would send it to
+// `handoff_to_human` or ask for an email say what this channel can do instead.
+// Where the team answers a case opened from a host application: this channel escalates to an email
+// inbox only, and the model never sees the address, so it can say "by email" and nothing more.
+const DETACHED_REPLY_CHANNEL =
+  "The team replies by email, to the address this user has in the application: tell the user that, in those words, without guessing the address.";
+const ANONYMOUS_REPLY_CHANNEL =
+  "The team replies by email, to the address the user gave in this chat: tell the user that.";
+
+// The note on a case opened for an anonymous visitor: the team replies to an address nobody proved.
+export function unverifiedAddressNote(email: string): string {
+  return `The reply address ${literalForChatwoot(email)} was typed by a visitor who was not signed in to the application, and is not verified: do not take it as proof of who they are.`;
+}
+
+function detachedOpenCaseOutcomeText(
+  r: OpenCaseResult,
+  anonymous = false,
+): string {
+  switch (r.kind) {
+    case "opened":
+    case "continued":
+    case "already_open":
+    case "appended":
+      return additionLost(r)
+        ? `The user already has an open case with the team: conversation #${r.caseId}. Nothing new was opened, and what you passed in \`reason\` could NOT be added to it, so the team does not have it. Do not tell the user it reached the team; tell them you could not pass it on right now.`
+        : `${openCaseOutcomeText(r, null, {
+            here: "this chat",
+            route: anonymous
+              ? "by email, to the address the user gave in this chat"
+              : "by email, to the address this user has in the application",
+          })} ${anonymous ? ANONYMOUS_REPLY_CHANNEL : DETACHED_REPLY_CHANNEL}`;
+    case "needs_email":
+      return anonymous
+        ? "Nothing was opened: the team replies by email and you passed no address. Ask the user for the email address where the team should reply, then call this again with it in `email`."
+        : "Nothing was opened: the team's inbox answers by email and the host application did not provide this user's email. Tell the user the team cannot be reached from this chat. Do not ask for their email: this chat cannot pass it on.";
+    // NOTE: this channel escalates to an email inbox only, so a phone destination is one it cannot use.
+    case "needs_phone":
+    case "unsupported_channel":
+    case "same_inbox":
+    case "not_configured":
+      return "Nothing was opened: the team's inbox cannot receive cases. Tell the user you could not pass the request on.";
+    case "handed_by_policy":
+      return "Did not open the case: the output check refused the opening message. Tell the user you could not pass the request on.";
+    // NOTE: only an anonymous visitor's call passes an address, and it is checked before the case.
+    case "rejected_email":
+    case "called_off":
+    case "failed":
+      return openCaseOutcomeText(r);
+  }
+}
+
+// `open_case_in_inbox` where the agent talks to its user inside a host application. Nobody answers in
+// this chat: the case goes to the team's inbox and the team replies through that inbox's own channel.
+// The contact comes from what the host stated about its user, never from the model.
+function detachedOpenCaseTool(
+  ctx: ToolCtx,
+  detached: NonNullable<NonNullable<ToolCtx["crossInboxCase"]>["detached"]>,
+) {
+  const cic = ctx.crossInboxCase;
+  const openingTemplate = cic?.config.openingTemplate ?? null;
+  const asksMessage = openingAsksMessage(openingTemplate);
+  const opening =
+    openingTemplate === null
+      ? "`customer_message` is the first message the user receives from the team's inbox (for an email inbox, the opening email), so write it as that message."
+      : asksMessage
+        ? "`customer_message` is your part of the first message the user receives from the team's inbox: it goes inside the team's own opening text, so write only what is specific to this request."
+        : "The user receives the team's fixed opening message from the team's inbox; you do not write it.";
+  const anonymous = detached.anonymous === true;
+  const address = anonymous
+    ? " This user is not signed in, so the team replies to an address the user gives you: ask for it before calling, and pass in `email` exactly what they typed, never one you guessed or completed."
+    : "";
+  const description = `Open the user's request as a case in the team's inbox (configured by the operator: you choose WHETHER to open it, never where). Use it when the request needs a person from the team. Nobody from the team answers in this chat: they reply through that inbox's own channel (for an email inbox, by email to the user). \`reason\` becomes an internal note on the case, so write what the team needs to act on it without asking again. ${opening}${address} Tell the user in this chat that their case was opened and where the team will reply. When the user adds something after the case was opened, call it again with the addition in \`reason\`: it goes to the open case as a note, and no second case is opened.`;
+  // One call at a time per `serialKey`, from the contact to the case: a second call compares the
+  // address with the case the first one recorded, and no call changes the contact's address between
+  // another's reconciliation and its opening.
+  const outcome = (r: OpenCaseResult) =>
+    detachedOpenCaseOutcomeText(r, anonymous);
+  const open = async ({
+    reason,
+    customer_message,
+    labels,
+    summary,
+    email,
+  }: {
+    reason: string;
+    customer_message?: string;
+    labels?: string[];
+    summary?: string;
+    email?: string;
+  }) => {
+    if (!cic) return outcome({ kind: "not_configured" });
+    // NOTE: the destination is checked before the contact is touched: a refused escalation must not
+    // create a contact or change its address.
+    if (cic.config.targetInboxId != null) {
+      try {
+        const inbox = await detached.client.getInbox(cic.config.targetInboxId);
+        const channelType = (inbox as { channel_type?: unknown } | null)
+          ?.channel_type;
+        if (channelType !== "Channel::Email")
+          return outcome({
+            kind: "unsupported_channel",
+            channelType: typeof channelType === "string" ? channelType : null,
+          });
+      } catch {
+        return toolFailure(
+          "Could not open the case (failed at: read_target_inbox). Tell the user you could not pass the request on to the team right now.",
+        );
+      }
+    }
+    // An anonymous visitor's address comes through the model: only a well-formed one the visitor
+    // typed on this thread is used, checked before any contact is touched.
+    let typed: string | undefined;
+    let typedAs: string | undefined;
+    if (anonymous && email?.trim()) {
+      const normalized = normalizeEmail(email);
+      const deliverable = normalized ? deliverableEmail(normalized) : null;
+      if (
+        !normalized ||
+        (deliverable && !deliverable.ok && deliverable.why === "invalid")
+      )
+        return "Nothing was opened: that is not a valid email address. Ask the user to type it again.";
+      if (!deliverable?.ok) return NON_ASCII_EMAIL_TEXT("user");
+      try {
+        if (!(await detached.userTyped?.(normalized)))
+          return "Nothing was opened: the user did not write that address in this chat. Ask them to type the address where the team should reply, and pass exactly what they wrote.";
+      } catch {
+        return toolFailure(
+          "Could not open the case (failed at: read_messages). Tell the user you could not pass the request on to the team right now.",
+        );
+      }
+      typed = deliverable.address;
+      if (deliverable.adjusted) typedAs = normalized;
+    }
+    let contact:
+      | { id: number; addressUpdated: boolean; email: string }
+      | null
+      | "held";
+    try {
+      contact = await detached.contact(typed);
+    } catch (err) {
+      logger.warn(
+        "open_case_in_inbox: the user's contact could not be resolved (%s): %s",
+        detached.origin.key,
+        err instanceof Error ? err.message : String(err),
+      );
+      return toolFailure(
+        "Could not open the case (failed at: resolve_contact). Tell the user you could not pass the request on to the team right now.",
+      );
+    }
+    if (contact === null) return outcome({ kind: "needs_email" });
+    if (contact === "held")
+      return "Nothing was opened: that address belongs to someone the team already knows, so a case cannot be opened for it from a chat where nobody signed in. Tell the user to sign in to the application to reach the team.";
+    const result = await openCaseInInbox(detached.client, {
+      config: cic.config,
+      originConversationId: 0,
+      originContactId: contact.id,
+      freshCase: contact.addressUpdated,
+      recipientEmail: contact.email,
+      ...(typedAs && contact.email === typed ? { emailTypedAs: typedAs } : {}),
+      detachedOrigin: detached.origin,
+      reason: reason.trim(),
+      customerMessage: (asksMessage && customerLine(customer_message)) || null,
+      email: null,
+      labels: (labels ?? [])
+        .map((l) => l.trim().toLowerCase())
+        .filter((l) => l.length > 0),
+      subject: cic.renderSubject?.(summary?.trim() || null) ?? null,
+      stillWanted: ctx.stillWanted,
+      tenantId: ctx.tenantId,
+      screenCustomerMessage: ctx.screenCustomerText,
+      signCustomerMessage: cic.sign,
+      interpolate: cic.interpolate,
+      caseTeamId: detached.caseTeamId,
+    });
+    if (result.kind === "called_off") ctx.onNoEffect?.(OPEN_CASE_TOOL_NAME);
+    if (result.kind === "failed") {
+      logger.warn(
+        "open_case_in_inbox failed (%s, step=%s): %s",
+        detached.origin.key,
+        result.step,
+        result.error instanceof Error
+          ? result.error.message
+          : String(result.error),
+      );
+      return toolFailure(
+        `Could not open the case (failed at: ${result.step}). Tell the user you could not pass the request on to the team right now.`,
+      );
+    }
+    if (
+      (result.kind === "opened" ||
+        result.kind === "continued" ||
+        result.kind === "already_open" ||
+        result.kind === "appended") &&
+      (result.partial.length > 0 || result.unknownCaseLabels?.length)
+    ) {
+      ctx.onSideEffectError?.({
+        tool: OPEN_CASE_TOOL_NAME,
+        phase: "follow_up_writes",
+        detail: {
+          caseId: result.caseId,
+          failed: result.partial,
+          unknownLabels: result.unknownCaseLabels ?? [],
+        },
+        err: new Error(
+          `writes did not land: ${[...result.partial, ...(result.unknownCaseLabels ?? []).map((l) => `label ${l}`)].join(", ")}`,
+        ),
+      });
+    }
+    if (
+      (result.kind === "opened" ||
+        result.kind === "continued" ||
+        result.kind === "already_open" ||
+        result.kind === "appended") &&
+      result.caseOwnerUnread
+    ) {
+      ctx.onSideEffectError?.({
+        tool: OPEN_CASE_TOOL_NAME,
+        phase: "case_owner_unread",
+        detail: { caseId: result.caseId, at: result.caseOwnerUnread },
+        err: new Error(
+          result.caseOwnerUnread === "before_clear"
+            ? "the case could not be read to settle its owner; nothing was written, so an agent bot on it stays and no team was set"
+            : "the case could not be read again before its team write; the bot was cleared and no team was written",
+        ),
+      });
+    }
+    // NOTE: a case opened for an anonymous visitor tells the team its address is unverified; an
+    // addition goes to a case that already says so.
+    if (anonymous && (result.kind === "opened" || result.kind === "continued"))
+      await detached.client
+        .sendMessageAsAdmin(
+          result.caseId,
+          unverifiedAddressNote(contact.email),
+          {
+            private: true,
+          },
+        )
+        .catch((err) =>
+          ctx.onSideEffectError?.({
+            tool: OPEN_CASE_TOOL_NAME,
+            phase: "unverified_email_note",
+            detail: { caseId: result.caseId },
+            err: err instanceof Error ? err : new Error(String(err)),
+          }),
+        );
+    return outcome(result);
+  };
+  return failableTool(
+    (args: Parameters<typeof open>[0]) =>
+      withKeyedQueue(detached.serialKey, () => open(args)),
+    {
+      name: OPEN_CASE_TOOL_NAME,
+      description: withOperatorNote(description, ctx, OPEN_CASE_TOOL_NAME),
+      schema: z.object({
+        reason: z
+          .string()
+          .min(1)
+          .describe(
+            "Why the case is being opened, for the team (internal note on the case).",
+          ),
+        ...(asksMessage
+          ? {
+              customer_message: z
+                .string()
+                .optional()
+                .describe(
+                  openingTemplate === null
+                    ? "The first message the user receives in the team's inbox. Omit to open the case without one."
+                    : "Your part of the team's opening message in the team's inbox. Omit to open the case without an opening.",
+                ),
+            }
+          : {}),
+        labels: z
+          .array(z.string())
+          .optional()
+          .describe("Labels that categorize the case in the destination."),
+        ...(anonymous
+          ? {
+              email: z
+                .string()
+                .optional()
+                .describe(
+                  "The email address the user typed in this chat for the team's reply, exactly as they wrote it.",
+                ),
+            }
+          : {}),
+        ...(subjectAsksSummary(cic?.config.subjectTemplate ?? null)
+          ? {
+              summary: z
+                .string()
+                .optional()
+                .describe(
+                  "One line saying what the request is about. It becomes part of the subject of the case's emails, which is what the user and the team read first.",
+                ),
+            }
+          : {}),
+      }),
+    },
+  );
+}
+
+// The shape of `open_case_in_inbox` this channel runs: from the conversation, or from the detached
+// origin the channel handed in, and none without a destination inbox or that origin.
+function openCaseTools(
+  ctx: ToolCtx,
+  support: NativeSupport,
+): StructuredToolInterface[] {
+  const cic = ctx.crossInboxCase;
+  if (cic?.config.targetInboxId == null) return [];
+  if (support !== "detached") return [openCaseInInboxTool(ctx)];
+  return cic.detached ? [detachedOpenCaseTool(ctx, cic.detached)] : [];
+}
 
 // allowed = undefined → all native tools; otherwise only the named subset (fail-closed).
 // No native tool takes CODE from the model: computation the model must not redo (check digits,
@@ -2782,6 +3924,21 @@ const MUTED_CANNOT_COMPLETE = new Set<string>(
 export function buildNativeTools(
   ctx: ToolCtx,
   allowed?: Iterable<string>,
+): StructuredToolInterface[] {
+  // NOTE: a muted client IS the observer: it is how an observation reaches the toolset.
+  return buildChannelNativeTools(
+    ctx,
+    allowed,
+    ctx.client?.muted ? OBSERVER_NATIVES : INBOX_NATIVES,
+  );
+}
+
+// The natives the agent was granted, as `natives` says this channel runs them: unsupported ones are
+// left out, simulated ones keep their name, description and schema and do nothing.
+export function buildChannelNativeTools(
+  ctx: ToolCtx,
+  allowed: Iterable<string> | undefined,
+  natives: NativeHandlers,
 ): StructuredToolInterface[] {
   const all: StructuredToolInterface[] = [
     handoffTool(ctx),
@@ -2796,21 +3953,31 @@ export function buildNativeTools(
     sendImageTool(ctx),
     sendButtonsTool(ctx),
     sendCarouselTool(ctx),
-    ...(ctx.crossInboxCase?.config.targetInboxId != null
-      ? [openCaseInInboxTool(ctx)]
-      : []),
+    ...openCaseTools(ctx, natives[OPEN_CASE_TOOL_NAME]),
     skipReplyTool(ctx),
     calculatorTool(ctx),
     getCurrentTimeTool(ctx),
   ];
-  // MATERIALIZED ONCE, before the filter runs. `allowed` is an `Iterable<string>`, and a one-shot
-  // one (a generator, a `Set.values()`) is CONSUMED by the first candidate — every tool after it
-  // would then be tested against an empty set and the agent would come up with no tools at all
-  // (review round 30). Cheaper too: one Set instead of one per candidate.
+  // MATERIALIZED ONCE, before the filter runs. `allowed` is an `Iterable<string>`, and a
+  // one-shot one (a generator, a `Set.values()`) is CONSUMED by the first candidate: every tool
+  // after it would then be tested against an empty set and the agent would come up with no tools.
+  // Cheaper too: one Set instead of one per candidate.
   const allowSet = allowed ? new Set(allowed) : null;
   const granted = allowSet ? all.filter((t) => allowSet.has(t.name)) : all;
-  if (!ctx.client?.muted) return granted;
-  return granted.filter((t) => !MUTED_CANNOT_COMPLETE.has(t.name));
+  // update_contact is outside the allowlist: the operator grants it by marking a field
+  // writable, so an empty `writable` is the fail-closed state and there is no second switch.
+  const writable = ctx.contactFields?.writable ?? [];
+  if (writable.length > 0) granted.push(updateContactTool(ctx, writable));
+  // A muted client is an observer whatever the channel (the playground estimates an observer's floor
+  // on its own map): what only delivers to the customer is not offered to it.
+  const muted = ctx.client?.muted === true;
+  return granted.flatMap((t) => {
+    const support = natives[t.name as NativeToolName];
+    if (isUnsupported(support)) return [];
+    if (muted && isUnsupported(OBSERVER_NATIVES[t.name as NativeToolName]))
+      return [];
+    return support === "simulated" ? [simulatedTool(t)] : [t];
+  });
 }
 
 // Replaces a tool's execution with a no-op that returns a synthetic success — keeps the model-facing
@@ -2823,23 +3990,10 @@ function simulatedTool(orig: StructuredToolInterface): StructuredToolInterface {
   );
 }
 
-// Playground variant of buildNativeTools: the CONVERSATION tools (handoff/resolve/note/…) are
-// SIMULATED (no Chatwoot call, no fleet event — kanban_move would otherwise emit a real outbound
-// event), so the agent's DECISION to call them is testable. UTILITY tools (calculator/clock) keep
-// their real, side-effect-free behavior. `allowed` is the agent's own native allowlist.
+// The playground's natives: see PLAYGROUND_NATIVES for which run and which are simulated.
 export function buildSimulatedNativeTools(
   ctx: ToolCtx,
   allowed?: Iterable<string>,
 ): StructuredToolInterface[] {
-  return buildNativeTools(ctx, allowed).map((tl) =>
-    // NOTE: `skip_reply` is simulated-by-nature: it performs nothing, and its RETURN is the whole tool —
-    // "Produce no message now" is an instruction the model reads and acts on, since LangGraph calls
-    // the model again after a tool result. Replacing it with the generic `[simulated]` line makes
-    // the playground write a follow-up that production stays silent on, which is the simulation
-    // lying about the one decision it exists to show (issue #454, review round 3).
-    NATIVE_TOOL_CATEGORY[tl.name as NativeToolName] === "utility" ||
-    tl.name === SKIP_REPLY_TOOL
-      ? tl
-      : simulatedTool(tl),
-  );
+  return buildChannelNativeTools(ctx, allowed, PLAYGROUND_NATIVES);
 }

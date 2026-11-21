@@ -1,0 +1,1294 @@
+import type { Prisma, PrismaClient } from "@/../generated/prisma/client";
+import logger from "@/api/lib/logger";
+import basePrisma from "@/api/lib/prisma";
+import { DEFAULT_TIMEZONE } from "@/graph/time";
+import { AppError, NotFoundError } from "@/lib/errors";
+import { afterDescNullsLast } from "@/lib/keyset";
+import { withEntityLock } from "@/lib/locks";
+import { isForeignKeyViolation, isUniqueViolation } from "@/lib/pg-error";
+import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
+import { clipText, makeStorable } from "@/lib/text";
+import { auditMutation } from "@/modules/audit/service";
+import { readDebugModes } from "@/modules/flowlog/debug-mode";
+import { emitFlowEvent } from "@/modules/flowlog/service";
+import { upsertJobRow, upsertJobRows } from "@/modules/scheduler/service";
+import {
+  type JobResult,
+  registerJobHandler,
+  wakeScheduler,
+} from "@/modules/scheduler/worker";
+import {
+  announceApprovalEvent,
+  announceApprovalEvents,
+  decidedData,
+  requestedData,
+} from "./approval-events";
+import { type DocumentStyle, parseDocumentStyle } from "./blocks";
+import { formatDate, formatDocumentNumber } from "./format";
+import {
+  APPROVAL_KEY_PREFIX,
+  type DocumentSnapshot,
+  documentFileName,
+  type FrozenDocument,
+  freezeDocumentSnapshot,
+  type IssuedDocumentResult,
+  issueDocument,
+  issueFrozenDocument,
+  printedDate,
+  sysCtx,
+} from "./issue";
+import { renderDocumentPdf } from "./render";
+import { readRenderContext } from "./templates";
+
+// A document a person approves before the customer gets it (docs/documents.md, Approval). The
+// request freezes the document with its date when the agent asks; approval issues that snapshot and
+// only then takes a number, so a rejected or expired request burns none.
+
+export type ApprovalStatus =
+  | "PENDING"
+  | "APPROVED"
+  | "REJECTED"
+  | "EXPIRED"
+  | "CANCELLED";
+
+// Printed where the number goes on a preview. Text, not a fake number: a reviewer who saw ORC-0042
+// would expect that number on the document approval issues, and the counter may have moved by then.
+const NUMBER_PLACEHOLDER: Record<DocumentStyle["locale"], string> = {
+  "pt-BR": "(numerado na aprovação)",
+  "en-US": "(numbered on approval)",
+};
+
+export interface ApprovalRequestDto {
+  id: string;
+  templateId: string | null;
+  title: string;
+  status: ApprovalStatus;
+  threadId: string | null;
+  conversationId: string | null;
+  expiresAt: Date;
+  reviewerUserId: string | null;
+  // Who decided, by the name the console shows (their email when they have none).
+  reviewerName: string | null;
+  note: string | null;
+  decidedAt: Date | null;
+  issuedDocumentId: string | null;
+  // The issued document's own number as printed (ORC-0003), the name the team and the customer use
+  // for it from then on; null until it is issued.
+  issuedNumber: string | null;
+  // What the decision came to in the conversation; null while it is on its way (schema.prisma).
+  outcome: ApprovalOutcome | null;
+  outcomeAt: Date | null;
+  createdAt: Date;
+}
+
+export type ApprovalOutcome =
+  | "DELIVERED"
+  | "NOTED"
+  | "NOT_SENT"
+  | "HANDED"
+  | "NO_AGENT";
+
+const SELECT = {
+  id: true,
+  templateId: true,
+  title: true,
+  numberPrefix: true,
+  status: true,
+  threadId: true,
+  idempotencyKey: true,
+  chatwootInstanceId: true,
+  conversationId: true,
+  expiresAt: true,
+  reviewerUserId: true,
+  note: true,
+  decidedAt: true,
+  issuedDocumentId: true,
+  issuedDocument: { select: { number: true, numberPrefix: true } },
+  outcome: true,
+  outcomeAt: true,
+  createdAt: true,
+} as const;
+
+function issuedNumber(
+  doc: { number: number | null; numberPrefix: string | null } | null,
+): string | null {
+  return doc?.number == null
+    ? null
+    : formatDocumentNumber(doc.number, doc.numberPrefix);
+}
+
+type Row = Prisma.DocumentApprovalRequestGetPayload<{
+  select: typeof SELECT;
+}>;
+
+// The frozen snapshot can run to megabytes, so only preview and issuance read it.
+const WITH_SNAPSHOT = { ...SELECT, snapshot: true } as const;
+
+function toDto(r: Row, reviewerName: string | null = null): ApprovalRequestDto {
+  return {
+    id: String(r.id),
+    templateId: r.templateId === null ? null : String(r.templateId),
+    title: r.title,
+    status: r.status as ApprovalStatus,
+    threadId: r.threadId,
+    conversationId: r.conversationId === null ? null : String(r.conversationId),
+    expiresAt: r.expiresAt,
+    reviewerUserId: r.reviewerUserId === null ? null : String(r.reviewerUserId),
+    reviewerName,
+    note: r.note,
+    decidedAt: r.decidedAt,
+    issuedDocumentId:
+      r.issuedDocumentId === null ? null : String(r.issuedDocumentId),
+    issuedNumber: issuedNumber(r.issuedDocument),
+    outcome: r.outcome as ApprovalOutcome | null,
+    outcomeAt: r.outcomeAt,
+    createdAt: r.createdAt,
+  };
+}
+
+// The names of the people who decided, by user id. `users` is a global identity table, outside tenant
+// RLS (docs/tenancy.md), so only the ids the tenant's own rows carry are read.
+export async function reviewerNames(
+  db: ScopedDb,
+  ids: (bigint | null)[],
+): Promise<Map<bigint, string>> {
+  const wanted = [...new Set(ids.filter((id): id is bigint => id !== null))];
+  if (wanted.length === 0) return new Map();
+  const users = await db.user.findMany({
+    where: { id: { in: wanted } },
+    select: { id: true, name: true, email: true },
+  });
+  return new Map(users.map((u) => [u.id, u.name?.trim() || u.email]));
+}
+
+async function toDtos(
+  db: ScopedDb,
+  rows: Row[],
+): Promise<ApprovalRequestDto[]> {
+  const names = await reviewerNames(
+    db,
+    rows.map((r) => r.reviewerUserId),
+  );
+  return rows.map((r) =>
+    toDto(
+      r,
+      r.reviewerUserId === null ? null : (names.get(r.reviewerUserId) ?? null),
+    ),
+  );
+}
+
+async function toDtoNamed(db: ScopedDb, row: Row): Promise<ApprovalRequestDto> {
+  const [dto] = await toDtos(db, [row]);
+  return dto as ApprovalRequestDto;
+}
+
+// What a decided or expired request says in its conversation is a job armed by the transition
+// itself, one per request: only the call that moved the status (or linked the approved document)
+// arms it, so a repeated decision answers nothing twice.
+export function outcomeJobKey(requestId: bigint): string {
+  return `doc-approval-outcome:${requestId}`;
+}
+
+// The note saying a request is open, on the outcome kind under its own key: sharing the decision's
+// row would let a claim taken before the decision deliver it, and the re-arm deliver it again. The
+// decision's run waits instead while this one is claimed (runOutcomeJob).
+export function openedJobKey(requestId: bigint): string {
+  return `doc-approval-opened:${requestId}`;
+}
+
+async function armApprovalOutcome(
+  db: ScopedDb,
+  tenantId: bigint,
+  requestId: bigint,
+  now: Date,
+): Promise<void> {
+  await upsertJobRow(db, {
+    tenantId,
+    kind: "DOCUMENT_APPROVAL_OUTCOME",
+    dedupeKey: outcomeJobKey(requestId),
+    runAt: now,
+    rearm: "new-work",
+    payload: { requestId: String(requestId) },
+  });
+}
+
+function notFound(): NotFoundError {
+  return new NotFoundError(
+    "document approval request not found",
+    "errors.documentApprovalNotFound",
+  );
+}
+
+// One tool key ends in ONE outcome, a document or a request, and each lives in its own table with
+// its own unique index. Both writers take this lock and re-ask the other table before inserting, so
+// two calls racing a switch of `requiresApproval` cannot leave one of each.
+async function claimKey(
+  db: ScopedDb,
+  tenantId: bigint,
+  idempotencyKey: string,
+): Promise<void> {
+  await withEntityLock(
+    db,
+    `document-key:${tenantId}:${idempotencyKey}`,
+    async () => {},
+  );
+}
+
+// The key was answered by the other outcome while this call was deciding.
+export class KeyAnswered extends Error {
+  constructor(readonly by: "document" | "request") {
+    super(`this key is already answered by a ${by}`);
+  }
+}
+
+export function expiryJobKey(requestId: bigint): string {
+  return `doc-approval:${requestId}`;
+}
+
+// The request for a frozen document. The key is the tool's, so a retried turn lands on the request it
+// already made: a second insert loses on the unique and the first one is returned.
+export async function createApprovalRequest(params: {
+  ctx: TenantContext;
+  base?: PrismaClient;
+  frozen: FrozenDocument;
+  idempotencyKey: string;
+  threadId?: string | null;
+  chatwootInstanceId?: bigint | null;
+  conversationId?: bigint | null;
+  now: Date;
+  // Runs inside the creating transaction, only for the call that inserts the request: a write that
+  // has to land with the request or not at all (the audit of a request asked again).
+  onCreate?: (db: ScopedDb, requestId: bigint) => Promise<void>;
+}): Promise<ApprovalRequestDto> {
+  const base = params.base ?? basePrisma;
+  const { ctx, frozen } = params;
+  const tenantId = ctx.tenantId as bigint;
+  const expiresAt = new Date(
+    params.now.getTime() + frozen.template.approvalTtlHours * 3_600_000,
+  );
+  // One transaction for the request and its expiry job: a request committed without the job would
+  // stay PENDING past its time, and a retried turn returns the request before it could re-arm.
+  const created = await runScopedOn(base, ctx, async (db) => {
+    await claimKey(db, tenantId, params.idempotencyKey);
+    const issued = await db.issuedDocument.findUnique({
+      where: {
+        tenantId_idempotencyKey: {
+          tenantId,
+          idempotencyKey: params.idempotencyKey,
+        },
+      },
+      select: { id: true },
+    });
+    if (issued) throw new KeyAnswered("document");
+    const row = await db.documentApprovalRequest.create({
+      data: {
+        tenantId,
+        templateId: frozen.template.id,
+        title: frozen.template.name,
+        numberPrefix: frozen.template.numberPrefix,
+        threadId: params.threadId ?? null,
+        chatwootInstanceId: params.chatwootInstanceId ?? null,
+        conversationId: params.conversationId ?? null,
+        idempotencyKey: params.idempotencyKey,
+        status: "PENDING",
+        snapshot: frozen.snapshot as unknown as Prisma.InputJsonValue,
+        expiresAt,
+      },
+      select: SELECT,
+    });
+    await upsertJobRow(db, {
+      tenantId,
+      kind: "DOCUMENT_APPROVAL_EXPIRY",
+      dedupeKey: expiryJobKey(row.id),
+      runAt: expiresAt,
+      rearm: "new-work",
+    });
+    await upsertJobRow(db, {
+      tenantId,
+      kind: "DOCUMENT_APPROVAL_OUTCOME",
+      dedupeKey: openedJobKey(row.id),
+      runAt: new Date(),
+      rearm: "new-work",
+      payload: { requestId: String(row.id), phase: "opened" },
+    });
+    await announceApprovalEvent(
+      db,
+      tenantId,
+      "document.approval_requested",
+      requestedData(row),
+    );
+    await params.onCreate?.(db, row.id);
+    return row;
+  }).catch((err: unknown) => {
+    if (err instanceof KeyAnswered) throw err;
+    // NOTE: a P2002 aborts the transaction it was raised in, so the winner is read in a new one.
+    if (isUniqueViolation(err)) {
+      return null;
+    }
+    // NOTE: the template deleted after it was read: the same event as "no such template", and the
+    // same terminal answer issuance gives it.
+    if (isForeignKeyViolation(err)) {
+      throw new NotFoundError(
+        "document template not found",
+        "errors.documentTemplateNotFound",
+      );
+    }
+    throw err;
+  });
+  if (created) {
+    await announceRequest(base, tenantId, created);
+    // The opening note is for a person watching the conversation now, not on the next interval.
+    wakeScheduler();
+    return toDto(created);
+  }
+  const existing = await runScopedOn(base, ctx, (db) =>
+    db.documentApprovalRequest.findUnique({
+      where: {
+        tenantId_idempotencyKey: {
+          tenantId,
+          idempotencyKey: params.idempotencyKey,
+        },
+      },
+      select: SELECT,
+    }),
+  );
+  if (!existing) {
+    throw new AppError("failed to persist the approval request", 500);
+  }
+  return toDto(existing);
+}
+
+// The team hears of a request the moment it exists: an `info` line the alert path sends to every
+// channel as a cause (it needs a person, whatever the channel's level), linking to the request's
+// page. Best-effort: the request stands, and it is in the console's list either way.
+async function announceRequest(
+  base: PrismaClient,
+  tenantId: bigint,
+  row: Row,
+): Promise<void> {
+  try {
+    const agent =
+      row.conversationId === null
+        ? null
+        : await runScopedOn(base, sysCtx(tenantId), async (db) => {
+            const conv = await db.conversation.findUnique({
+              where: { id: row.conversationId as bigint },
+              select: { inboxId: true },
+            });
+            if (!conv?.inboxId) return null;
+            const inbox = await db.inbox.findUnique({
+              where: { id: conv.inboxId },
+              select: { agentId: true },
+            });
+            if (!inbox?.agentId) return null;
+            return db.agent.findUnique({
+              where: { id: inbox.agentId },
+              select: { id: true, settings: true },
+            });
+          });
+    emitFlowEvent(
+      {
+        tenantId,
+        turnId: crypto.randomUUID(),
+        source: "inbox",
+        conversationId: row.conversationId,
+        agentId: agent?.id ?? null,
+        threadId: row.threadId,
+        base,
+        fullDetail: agent
+          ? readDebugModes(agent.settings, null).fullDetail
+          : false,
+      },
+      {
+        stage: "tool",
+        level: "info",
+        status: "ok",
+        detail: {
+          outcome: "document_approval_requested",
+          requestId: String(row.id),
+        },
+      },
+    );
+  } catch (err) {
+    logger.warn(
+      { err, tenantId: String(tenantId), requestId: String(row.id) },
+      "document approval: the request could not be announced",
+    );
+  }
+}
+
+export async function listApprovalRequests(
+  ctx: TenantContext,
+  opts: {
+    status?: ApprovalStatus;
+    // Only what waits on the team now: PENDING and inside its validity, as the queue counts it.
+    // Applied before the limit, so overdue rows the expiry has not closed never crowd one out.
+    waiting?: boolean;
+    conversationId?: bigint;
+    limit?: number;
+  } = {},
+  base: PrismaClient = basePrisma,
+): Promise<ApprovalRequestDto[]> {
+  return runScopedOn(base, ctx, async (db) => {
+    const rows = await db.documentApprovalRequest.findMany({
+      where: {
+        ...(opts.status ? { status: opts.status } : {}),
+        ...(opts.waiting
+          ? { status: "PENDING", expiresAt: { gt: new Date() } }
+          : {}),
+        ...(opts.conversationId === undefined
+          ? {}
+          : { conversationId: opts.conversationId }),
+      },
+      orderBy: { id: "desc" },
+      take: Math.min(Math.max(opts.limit ?? 50, 1), 200),
+      select: SELECT,
+    });
+    return toDtos(db, rows);
+  });
+}
+
+export interface PendingApprovalItem {
+  id: string;
+  title: string;
+  createdAt: Date;
+  expiresAt: Date;
+  conversationId: string | null;
+  chatwootConversationId: number | null;
+  contactName: string | null;
+}
+
+// What waits on the team now, for the console's approvals queue and its badge: PENDING and not past
+// its validity, which the expiry sweep may not have reached yet. Oldest first, the order a queue is
+// worked in.
+export const PENDING_PAGE_SIZE = 50;
+
+// How many requests wait on the team now: the badge's number, counted apart from the page it shows.
+export async function countPendingApprovals(
+  ctx: TenantContext,
+  base: PrismaClient = basePrisma,
+  now: Date = new Date(),
+): Promise<number> {
+  return runScopedOn(base, ctx, (db) =>
+    db.documentApprovalRequest.count({
+      where: { status: "PENDING", expiresAt: { gt: now } },
+    }),
+  );
+}
+
+// The conversation and the customer's name a queue row shows, read in two queries for the whole page.
+async function withConversations<
+  R extends {
+    id: bigint;
+    title: string;
+    createdAt: Date;
+    expiresAt: Date;
+    conversationId: bigint | null;
+  },
+>(
+  db: ScopedDb,
+  rows: R[],
+): Promise<
+  (R & { chatwootConversationId: number | null; contactName: string | null })[]
+> {
+  const convIds = rows
+    .map((r) => r.conversationId)
+    .filter((id): id is bigint => id !== null);
+  const convs =
+    convIds.length === 0
+      ? []
+      : await db.conversation.findMany({
+          where: { id: { in: convIds } },
+          select: {
+            id: true,
+            chatwootConversationId: true,
+            contactId: true,
+          },
+        });
+  const contactIds = convs
+    .map((c) => c.contactId)
+    .filter((id): id is bigint => id !== null);
+  const contacts =
+    contactIds.length === 0
+      ? []
+      : await db.contact.findMany({
+          where: { id: { in: contactIds } },
+          select: { id: true, name: true },
+        });
+  const convById = new Map(convs.map((c) => [c.id, c]));
+  const nameById = new Map(contacts.map((c) => [c.id, c.name]));
+  return rows.map((r) => {
+    const conv =
+      r.conversationId === null ? undefined : convById.get(r.conversationId);
+    return {
+      ...r,
+      chatwootConversationId: conv?.chatwootConversationId ?? null,
+      contactName:
+        conv?.contactId == null ? null : (nameById.get(conv.contactId) ?? null),
+    };
+  });
+}
+
+function queueItem(r: {
+  id: bigint;
+  title: string;
+  createdAt: Date;
+  expiresAt: Date;
+  conversationId: bigint | null;
+  chatwootConversationId: number | null;
+  contactName: string | null;
+}): PendingApprovalItem {
+  return {
+    id: String(r.id),
+    title: r.title,
+    createdAt: r.createdAt,
+    expiresAt: r.expiresAt,
+    conversationId: r.conversationId === null ? null : String(r.conversationId),
+    chatwootConversationId: r.chatwootConversationId,
+    contactName: r.contactName,
+  };
+}
+
+// One page of the queue, oldest first; `after` is the last id of the previous page.
+export async function listPendingApprovals(
+  ctx: TenantContext,
+  base: PrismaClient = basePrisma,
+  now: Date = new Date(),
+  page: { after?: bigint; limit?: number } = {},
+): Promise<PendingApprovalItem[]> {
+  return runScopedOn(base, ctx, async (db) => {
+    const rows = await db.documentApprovalRequest.findMany({
+      where: {
+        status: "PENDING",
+        expiresAt: { gt: now },
+        ...(page.after === undefined ? {} : { id: { gt: page.after } }),
+      },
+      orderBy: { id: "asc" },
+      take: page.limit ?? PENDING_PAGE_SIZE,
+      select: {
+        id: true,
+        title: true,
+        createdAt: true,
+        expiresAt: true,
+        conversationId: true,
+      },
+    });
+    return (await withConversations(db, rows)).map(queueItem);
+  });
+}
+
+export interface DecidedApprovalItem extends PendingApprovalItem {
+  status: Exclude<ApprovalStatus, "PENDING">;
+  decidedAt: Date | null;
+  reviewerName: string | null;
+  outcome: ApprovalOutcome | null;
+  // Null on an approval whose document was never issued (the failure after the claim): approving
+  // again completes it, and nothing is on its way.
+  issuedDocumentId: string | null;
+  issuedNumber: string | null;
+}
+
+// The history beside the queue: every request no longer waiting on the team, the latest DECISION first
+// (a request asked long ago and decided now belongs at the top, and that is where the view looks for
+// an outcome still landing); `cursor` is the last id of the previous page. A pending request past its
+// validity is the queue's until the expiry closes it, so it shows in neither for that moment.
+export async function listDecidedApprovals(
+  ctx: TenantContext,
+  base: PrismaClient = basePrisma,
+  page: { cursor?: bigint; limit?: number } = {},
+): Promise<DecidedApprovalItem[]> {
+  return runScopedOn(base, ctx, async (db) => {
+    const decided: Prisma.DocumentApprovalRequestWhereInput = {
+      status: { not: "PENDING" },
+    };
+    // A cursor outside this list ends it.
+    const anchor =
+      page.cursor === undefined
+        ? undefined
+        : await db.documentApprovalRequest.findFirst({
+            where: { AND: [decided, { id: page.cursor }] },
+            select: { id: true, decidedAt: true },
+          });
+    if (anchor === null) return [];
+    const rows = await db.documentApprovalRequest.findMany({
+      where: anchor
+        ? {
+            AND: [
+              decided,
+              afterDescNullsLast<Prisma.DocumentApprovalRequestWhereInput>(
+                "decidedAt",
+                { at: anchor.decidedAt, id: anchor.id },
+              ),
+            ],
+          }
+        : decided,
+      orderBy: [{ decidedAt: { sort: "desc", nulls: "last" } }, { id: "desc" }],
+      take: page.limit ?? PENDING_PAGE_SIZE,
+      select: {
+        id: true,
+        title: true,
+        createdAt: true,
+        expiresAt: true,
+        conversationId: true,
+        status: true,
+        decidedAt: true,
+        reviewerUserId: true,
+        outcome: true,
+        issuedDocumentId: true,
+        issuedDocument: { select: { number: true, numberPrefix: true } },
+      },
+    });
+    const names = await reviewerNames(
+      db,
+      rows.map((r) => r.reviewerUserId),
+    );
+    return (await withConversations(db, rows)).map((r) => ({
+      ...queueItem(r),
+      status: r.status as DecidedApprovalItem["status"],
+      decidedAt: r.decidedAt,
+      reviewerName:
+        r.reviewerUserId === null
+          ? null
+          : (names.get(r.reviewerUserId) ?? null),
+      outcome: r.outcome as ApprovalOutcome | null,
+      issuedDocumentId:
+        r.issuedDocumentId === null ? null : String(r.issuedDocumentId),
+      issuedNumber: issuedNumber(r.issuedDocument),
+    }));
+  });
+}
+
+async function loadRequest(
+  ctx: TenantContext,
+  id: bigint,
+  base: PrismaClient,
+): Promise<Row> {
+  const row = await runScopedOn(base, ctx, (db) =>
+    db.documentApprovalRequest.findUnique({ where: { id }, select: SELECT }),
+  );
+  if (!row) throw notFound();
+  return row;
+}
+
+async function loadRequestWithSnapshot(
+  ctx: TenantContext,
+  id: bigint,
+  base: PrismaClient,
+) {
+  const row = await runScopedOn(base, ctx, (db) =>
+    db.documentApprovalRequest.findUnique({
+      where: { id },
+      select: WITH_SNAPSHOT,
+    }),
+  );
+  if (!row) throw notFound();
+  return row;
+}
+
+export async function getApprovalRequest(
+  ctx: TenantContext,
+  id: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<ApprovalRequestDto> {
+  const row = await loadRequest(ctx, id, base);
+  return runScopedOn(base, ctx, (db) => toDtoNamed(db, row));
+}
+
+// The frozen document as the reviewer sees it, with a placeholder where the number goes. Rendered on
+// demand and never stored: it is not a document, and the counter is not touched.
+export async function renderApprovalPreview(
+  ctx: TenantContext,
+  id: bigint,
+  base: PrismaClient = basePrisma,
+): Promise<{ bytes: Uint8Array; fileName: string }> {
+  const row = await loadRequestWithSnapshot(ctx, id, base);
+  const stored = row.snapshot as unknown as DocumentSnapshot;
+  const style = parseDocumentStyle(stored.style);
+  const { logo } = await readRenderContext(ctx, base);
+  const bytes = await renderDocumentPdf({
+    blocks: stored.blocks,
+    fields: stored.fields,
+    style,
+    values: stored.values,
+    company: stored.company,
+    logo,
+    meta: {
+      number: NUMBER_PLACEHOLDER[style.locale],
+      date: formatDate(printedDate(stored), style.locale),
+      title: row.title,
+    },
+  });
+  return { bytes, fileName: documentFileName(row.title, null) };
+}
+
+// The key the approved document is issued under. It names the request by its id AND by a digest of
+// what only this request holds, so no row written before the request existed can carry it: an
+// upgraded install may have documents issued under any key the REST route ever accepted.
+function approvalDocumentKey(row: {
+  id: bigint;
+  idempotencyKey: string;
+  createdAt: Date;
+}): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(`${row.idempotencyKey}|${row.createdAt.toISOString()}`);
+  return `${APPROVAL_KEY_PREFIX}${row.id}:${hasher.digest("hex")}`;
+}
+
+// The key a request asked again is opened under, in the same reserved namespace and for the same
+// reason: no document a caller issued through the REST route can already hold it.
+function againKey(row: {
+  id: bigint;
+  idempotencyKey: string;
+  createdAt: Date;
+}): string {
+  const hasher = new Bun.CryptoHasher("sha256");
+  hasher.update(`${row.idempotencyKey}|${row.createdAt.toISOString()}`);
+  return `${APPROVAL_KEY_PREFIX}again:${row.id}:${hasher.digest("hex")}`;
+}
+
+// A decision in the tenant's trail, written in the transaction that made it. The status only: the
+// document's values and the reviewer's note are customer and team text, which the trail does not keep.
+async function auditDecision(
+  db: ScopedDb,
+  ctx: TenantContext,
+  requestId: bigint,
+  status: "APPROVED" | "REJECTED",
+): Promise<void> {
+  await auditMutation(db, ctx, {
+    action:
+      status === "APPROVED"
+        ? "document_approval.approve"
+        : "document_approval.reject",
+    target: `document_approval:${requestId}`,
+    before: { status: "PENDING" },
+    after: { status },
+  });
+}
+
+function notPending(status: string): AppError {
+  return new AppError(
+    `this approval request is ${status.toLowerCase()}, not pending`,
+    409,
+    "errors.documentApprovalNotPending",
+    { status },
+  );
+}
+
+function expired(): AppError {
+  return new AppError(
+    "this approval request expired",
+    409,
+    "errors.documentApprovalExpired",
+  );
+}
+
+// Approval issues the frozen snapshot under a key named for the request, not for the calendar day,
+// so an approval landing tomorrow keeps the date the reviewer saw. The status is CLAIMED first
+// (PENDING → APPROVED, only while unexpired): a rejection or the expiry racing it cannot both win,
+// and a second approval, in parallel or later, finds APPROVED and lands on the same issued row
+// through the key. A failure after the claim leaves an APPROVED request with no document, which
+// approving again completes; once the document exists, approving again returns it even with the
+// template deleted.
+export async function approveDocumentRequest(params: {
+  ctx: TenantContext;
+  requestId: bigint;
+  reviewerUserId?: bigint | null;
+  base?: PrismaClient;
+  storageDir?: string;
+  now?: Date;
+}): Promise<{ request: ApprovalRequestDto; document: IssuedDocumentResult }> {
+  const base = params.base ?? basePrisma;
+  const { ctx, requestId } = params;
+  const now = params.now ?? new Date();
+  const claimed = await runScopedOn(base, ctx, async (db) => {
+    const r = await db.documentApprovalRequest.updateMany({
+      where: { id: requestId, status: "PENDING", expiresAt: { gt: now } },
+      data: {
+        status: "APPROVED",
+        reviewerUserId: params.reviewerUserId ?? null,
+        decidedAt: now,
+      },
+    });
+    if (r.count === 1) await auditDecision(db, ctx, requestId, "APPROVED");
+    return r;
+  });
+  const row = await loadRequestWithSnapshot(ctx, requestId, base);
+  if (claimed.count === 0 && row.status !== "APPROVED") {
+    if (row.status === "PENDING") {
+      await expireDueApprovalRequests(ctx.tenantId as bigint, now, base);
+      throw expired();
+    }
+    throw notPending(row.status);
+  }
+  const idempotencyKey = approvalDocumentKey(row);
+  const document = await issueFrozenDocument({
+    ctx,
+    base,
+    storageDir: params.storageDir,
+    templateId: row.templateId,
+    title: row.title,
+    numberPrefix: row.numberPrefix,
+    snapshot: row.snapshot as unknown as DocumentSnapshot,
+    idempotencyKey,
+    threadId: row.threadId,
+    chatwootInstanceId: row.chatwootInstanceId,
+    conversationId: row.conversationId,
+  });
+  // The call that LINKS the document is the one that arms its delivery, in the same
+  // transaction: approving again, in parallel or later, finds it linked and delivers nothing twice.
+  let armed = false;
+  const linked = await runScopedOn(base, ctx, async (db) => {
+    const issued = await db.issuedDocument.findUniqueOrThrow({
+      where: {
+        tenantId_idempotencyKey: {
+          tenantId: ctx.tenantId as bigint,
+          idempotencyKey,
+        },
+      },
+      select: { id: true },
+    });
+    const link = await db.documentApprovalRequest.updateMany({
+      where: { id: requestId, issuedDocumentId: null },
+      data: { issuedDocumentId: issued.id },
+    });
+    if (link.count === 1) {
+      await armApprovalOutcome(db, ctx.tenantId as bigint, requestId, now);
+      armed = true;
+      const decided = await db.documentApprovalRequest.findUniqueOrThrow({
+        where: { id: requestId },
+        select: { conversationId: true, reviewerUserId: true, decidedAt: true },
+      });
+      await announceApprovalEvent(
+        db,
+        ctx.tenantId as bigint,
+        "document.approval_decided",
+        decidedData({
+          id: requestId,
+          conversationId: decided.conversationId,
+          status: "approved",
+          reviewerUserId: decided.reviewerUserId,
+          issuedDocumentId: issued.id,
+          decidedAt: decided.decidedAt ?? now,
+        }),
+      );
+    }
+    return toDtoNamed(
+      db,
+      await db.documentApprovalRequest.findUniqueOrThrow({
+        where: { id: requestId },
+        select: SELECT,
+      }),
+    );
+  });
+  // The reviewer is watching for it: the outcome runs now, not on the scheduler's next interval.
+  if (armed) wakeScheduler();
+  return { request: linked, document };
+}
+
+export async function rejectDocumentRequest(params: {
+  ctx: TenantContext;
+  requestId: bigint;
+  reviewerUserId?: bigint | null;
+  note?: string | null;
+  base?: PrismaClient;
+  now?: Date;
+}): Promise<ApprovalRequestDto> {
+  const base = params.base ?? basePrisma;
+  const { ctx, requestId } = params;
+  const now = params.now ?? new Date();
+  const note = params.note?.trim()
+    ? clipText(makeStorable(params.note.trim()), 2_000)
+    : null;
+  const claimed = await runScopedOn(base, ctx, async (db) => {
+    const r = await db.documentApprovalRequest.updateMany({
+      where: { id: requestId, status: "PENDING", expiresAt: { gt: now } },
+      data: {
+        status: "REJECTED",
+        reviewerUserId: params.reviewerUserId ?? null,
+        note,
+        decidedAt: now,
+      },
+    });
+    if (r.count === 1) {
+      await auditDecision(db, ctx, requestId, "REJECTED");
+      await armApprovalOutcome(db, ctx.tenantId as bigint, requestId, now);
+      const decided = await db.documentApprovalRequest.findUniqueOrThrow({
+        where: { id: requestId },
+        select: { conversationId: true },
+      });
+      await announceApprovalEvent(
+        db,
+        ctx.tenantId as bigint,
+        "document.approval_decided",
+        decidedData({
+          id: requestId,
+          conversationId: decided.conversationId,
+          status: "rejected",
+          reviewerUserId: params.reviewerUserId ?? null,
+          issuedDocumentId: null,
+          decidedAt: now,
+        }),
+      );
+    }
+    return r;
+  });
+  if (claimed.count === 1) wakeScheduler();
+  const row = await loadRequest(ctx, requestId, base);
+  if (claimed.count === 0) {
+    if (row.status === "PENDING") {
+      await expireDueApprovalRequests(ctx.tenantId as bigint, now, base);
+      throw expired();
+    }
+    throw notPending(row.status);
+  }
+  return runScopedOn(base, ctx, (db) => toDtoNamed(db, row));
+}
+
+function notExpired(status: string): AppError {
+  return new AppError(
+    `this approval request is ${status.toLowerCase()}, not expired`,
+    409,
+    "errors.documentApprovalNotExpired",
+    { status },
+  );
+}
+
+// The calendar a request asked again is dated in: the conversation's agent's business hours, the
+// one the agent's own call reads, else the default.
+async function timezoneOf(
+  db: ScopedDb,
+  conversationId: bigint | null,
+): Promise<string> {
+  if (conversationId === null) return DEFAULT_TIMEZONE;
+  const conv = await db.conversation.findUnique({
+    where: { id: conversationId },
+    select: { inboxId: true },
+  });
+  if (!conv?.inboxId) return DEFAULT_TIMEZONE;
+  const inbox = await db.inbox.findUnique({
+    where: { id: conv.inboxId },
+    select: { agentId: true },
+  });
+  if (!inbox?.agentId) return DEFAULT_TIMEZONE;
+  const agent = await db.agent.findUnique({
+    where: { id: inbox.agentId },
+    select: { businessHoursId: true },
+  });
+  if (!agent?.businessHoursId) return DEFAULT_TIMEZONE;
+  const hours = await db.businessHours.findUnique({
+    where: { id: agent.businessHoursId },
+    select: { timezone: true },
+  });
+  return hours?.timezone || DEFAULT_TIMEZONE;
+}
+
+// "Request again" on an expired request: the same values frozen again from the template as it is
+// now, dated today, as a NEW request for the same conversation. The expired one stays EXPIRED. The
+// key names the expired request, so asking twice opens one request, not two.
+export async function requestApprovalAgain(params: {
+  ctx: TenantContext;
+  requestId: bigint;
+  base?: PrismaClient;
+  now?: Date;
+}): Promise<ApprovalRequestDto> {
+  const base = params.base ?? basePrisma;
+  const { ctx, requestId } = params;
+  const now = params.now ?? new Date();
+  const row = await loadRequestWithSnapshot(ctx, requestId, base);
+  if (row.status !== "EXPIRED") throw notExpired(row.status);
+  // Asked before the template is: a replacement already made answers the retry (a lost response, a
+  // second click) even when the template has since been switched off or changed.
+  const again = againKey(row);
+  const existing = await runScopedOn(base, ctx, (db) =>
+    db.documentApprovalRequest.findFirst({
+      where: { idempotencyKey: again },
+      select: { id: true },
+    }),
+  );
+  if (existing) return toDto(await loadRequest(ctx, existing.id, base));
+  if (row.templateId === null) {
+    throw new NotFoundError(
+      "document template not found",
+      "errors.documentTemplateNotFound",
+    );
+  }
+  const stored = row.snapshot as unknown as DocumentSnapshot;
+  const timezone = await runScopedOn(base, ctx, (db) =>
+    timezoneOf(db, row.conversationId),
+  );
+  const frozen = await freezeDocumentSnapshot({
+    ctx,
+    base,
+    templateId: row.templateId,
+    values: stored.values,
+    now,
+    timezone,
+  });
+  const request = await createApprovalRequest({
+    ctx,
+    base,
+    frozen,
+    idempotencyKey: again,
+    threadId: row.threadId,
+    chatwootInstanceId: row.chatwootInstanceId,
+    conversationId: row.conversationId,
+    now,
+    // With the request or not at all, and only by the call that made it.
+    onCreate: (db, newId) =>
+      auditMutation(db, ctx, {
+        action: "document_approval.request_again",
+        target: `document_approval:${row.id}`,
+        before: { status: "EXPIRED" },
+        after: { requestId: String(newId) },
+      }),
+  });
+  return request;
+}
+
+// Moves the tenant's overdue PENDING requests to EXPIRED and returns their ids. Idempotent: a second
+// run finds nothing PENDING past its time.
+export async function expireDueApprovalRequests(
+  tenantId: bigint,
+  now: Date = new Date(),
+  base: PrismaClient = basePrisma,
+): Promise<bigint[]> {
+  const rows = await runScopedOn(base, sysCtx(tenantId), async (db) => {
+    const expired = await db.$queryRaw<
+      { id: bigint; conversation_id: bigint | null }[]
+    >`
+      UPDATE "document_approval_requests"
+         SET "status" = 'EXPIRED', "decided_at" = ${now}, "updated_at" = ${now}
+       WHERE "tenant_id" = ${tenantId}
+         AND "status" = 'PENDING'
+         AND "expires_at" <= ${now}
+      RETURNING "id", "conversation_id"
+    `;
+    // One statement for the whole backlog: a row per request would be N round trips inside the
+    // five-second transaction, and running past it rolls back the expiry along with every outcome.
+    await upsertJobRows(db, {
+      tenantId,
+      kind: "DOCUMENT_APPROVAL_OUTCOME",
+      rearm: "new-work",
+      runAt: now,
+      rows: expired.map((r) => ({
+        dedupeKey: outcomeJobKey(r.id),
+        payload: { requestId: String(r.id) },
+      })),
+    });
+    await announceApprovalEvents(
+      db,
+      tenantId,
+      "document.approval_decided",
+      expired.map((r) =>
+        decidedData({
+          id: r.id,
+          conversationId: r.conversation_id,
+          status: "expired",
+          reviewerUserId: null,
+          issuedDocumentId: null,
+          decidedAt: now,
+        }),
+      ),
+    );
+    return expired;
+  });
+  return rows.map((r) => r.id);
+}
+
+// The line every turn of a conversation carries while one of its documents waits on the team. The
+// tool result says it once, and it scrolls out of the history window, so this is what keeps the agent
+// from offering the document again or promising it. It names the documents and never a time: the
+// validity is how long the TEAM may take, not when the customer will receive anything.
+const PENDING_NOTICE_LIMIT = 5;
+
+export async function pendingApprovalNotice(
+  tenantId: bigint,
+  conversation: { conversationId: bigint | null; threadId: string },
+  base: PrismaClient = basePrisma,
+  now: Date = new Date(),
+): Promise<string | null> {
+  const rows = await runScopedOn(base, sysCtx(tenantId), (db) =>
+    db.documentApprovalRequest.groupBy({
+      by: ["title"],
+      where: {
+        status: "PENDING",
+        expiresAt: { gt: now },
+        ...(conversation.conversationId === null
+          ? { threadId: conversation.threadId }
+          : { conversationId: conversation.conversationId }),
+      },
+      _min: { id: true },
+      orderBy: { _min: { id: "asc" } },
+      take: PENDING_NOTICE_LIMIT,
+    }),
+  );
+  const titles = [
+    ...new Set(
+      rows.map((r) => clipText(r.title.replace(/\s+/g, " ").trim(), 80)),
+    ),
+  ].filter(Boolean);
+  if (titles.length === 0) return null;
+  const which =
+    titles.length === 1
+      ? `um documento aguardando a aprovação da equipe: ${titles[0]}`
+      : `documentos aguardando a aprovação da equipe: ${titles.join("; ")}`;
+  return `[Sistema] Nesta conversa há ${which}. Ainda não foi enviado ao cliente. Só fale disso se o cliente perguntar por esse documento: nesse caso, diga que a equipe está preparando, sem dizer quando fica pronto ou chega (nada de prazo, data, "hoje", "em breve", "logo" ou "em instantes"), e não diga que já foi enviado. Não chame a ferramenta do documento de novo para isso.`;
+}
+
+// What a turn hands the graph. A failed read costs the line, never the turn: the customer is still
+// answered, and the tool's own answer still refuses to issue twice.
+export async function approvalNoticesForTurn(
+  tenantId: bigint,
+  conversation: { conversationId: bigint | null; threadId: string },
+  base: PrismaClient = basePrisma,
+): Promise<string[]> {
+  try {
+    const line = await pendingApprovalNotice(tenantId, conversation, base);
+    return line ? [line] : [];
+  } catch (err) {
+    logger.warn(
+      { err, tenantId: String(tenantId), threadId: conversation.threadId },
+      "document approval: pending notice unreadable, turn runs without it",
+    );
+    return [];
+  }
+}
+
+async function runExpiry(
+  tenantId: bigint,
+  base: PrismaClient,
+): Promise<JobResult> {
+  await expireDueApprovalRequests(tenantId, new Date(), base);
+  return { outcome: "done" };
+}
+
+let registered = false;
+export function registerDocumentApprovalExpiryHandler(): void {
+  if (registered) return;
+  registerJobHandler("DOCUMENT_APPROVAL_EXPIRY", (job, base) =>
+    runExpiry(job.tenantId, base),
+  );
+  registered = true;
+}
+
+export type IssueOrRequest =
+  | { kind: "issued"; document: IssuedDocumentResult }
+  | { kind: "approval"; request: ApprovalRequestDto };
+
+// The agent's tool path. Whether the template asks for approval is read when the tool is CALLED, so
+// switching it on takes effect on the next call, not the next deploy. A key that already names a
+// request or a document is answered with it before the template is read, the retry rule
+// `issueDocument` follows: the snapshot was frozen then, and today's template must not refuse it.
+export async function issueOrRequestApproval(params: {
+  ctx: TenantContext;
+  base?: PrismaClient;
+  storageDir?: string;
+  templateId: bigint;
+  idempotencyKey: string;
+  values: unknown;
+  threadId?: string | null;
+  chatwootInstanceId?: bigint | null;
+  conversationId?: bigint | null;
+  withBytes?: boolean;
+  timezone?: string;
+  now: Date;
+}): Promise<IssueOrRequest> {
+  const base = params.base ?? basePrisma;
+  const { ctx } = params;
+  const tenantId = ctx.tenantId as bigint;
+  const [request, issued] = await runScopedOn(base, ctx, (db) =>
+    Promise.all([
+      db.documentApprovalRequest.findUnique({
+        where: {
+          tenantId_idempotencyKey: {
+            tenantId,
+            idempotencyKey: params.idempotencyKey,
+          },
+        },
+        select: SELECT,
+      }),
+      db.issuedDocument.findUnique({
+        where: {
+          tenantId_idempotencyKey: {
+            tenantId,
+            idempotencyKey: params.idempotencyKey,
+          },
+        },
+        select: { id: true },
+      }),
+    ]),
+  );
+  if (request) return { kind: "approval", request: toDto(request) };
+  const issue = (frozen?: FrozenDocument) =>
+    frozen
+      ? issueFrozenDocument({
+          ctx,
+          base,
+          storageDir: params.storageDir,
+          templateId: frozen.template.id,
+          title: frozen.template.name,
+          numberPrefix: frozen.template.numberPrefix,
+          snapshot: frozen.snapshot,
+          idempotencyKey: params.idempotencyKey,
+          threadId: params.threadId,
+          chatwootInstanceId: params.chatwootInstanceId,
+          conversationId: params.conversationId,
+          withBytes: params.withBytes,
+          guard: async (db) => {
+            await claimKey(db, tenantId, params.idempotencyKey);
+            const requested = await db.documentApprovalRequest.findUnique({
+              where: {
+                tenantId_idempotencyKey: {
+                  tenantId,
+                  idempotencyKey: params.idempotencyKey,
+                },
+              },
+              select: { id: true },
+            });
+            if (requested) throw new KeyAnswered("request");
+          },
+        })
+      : issueDocument({ ...params, base });
+  if (issued) return { kind: "issued", document: await issue() };
+  const frozen = await freezeDocumentSnapshot({
+    ctx,
+    base,
+    templateId: params.templateId,
+    values: params.values,
+    now: params.now,
+    timezone: params.timezone,
+  });
+  try {
+    if (!frozen.template.requiresApproval) {
+      return { kind: "issued", document: await issue(frozen) };
+    }
+    return {
+      kind: "approval",
+      request: await createApprovalRequest({
+        ctx,
+        base,
+        frozen,
+        idempotencyKey: params.idempotencyKey,
+        threadId: params.threadId,
+        chatwootInstanceId: params.chatwootInstanceId,
+        conversationId: params.conversationId,
+        now: params.now,
+      }),
+    };
+  } catch (e) {
+    if (!(e instanceof KeyAnswered)) throw e;
+    if (e.by === "document") return { kind: "issued", document: await issue() };
+    const winner = await runScopedOn(base, ctx, (db) =>
+      db.documentApprovalRequest.findUniqueOrThrow({
+        where: {
+          tenantId_idempotencyKey: {
+            tenantId,
+            idempotencyKey: params.idempotencyKey,
+          },
+        },
+        select: SELECT,
+      }),
+    );
+    return { kind: "approval", request: toDto(winner) };
+  }
+}

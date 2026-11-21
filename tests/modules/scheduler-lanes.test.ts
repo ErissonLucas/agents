@@ -26,23 +26,15 @@ import {
   registerJobHandler,
   runSchedulerTick,
 } from "@/modules/scheduler/worker";
-import { POLL_DEADLINE_MS } from "@/tests/utils/poll";
+import { dbProbeFailed } from "@/tests/db-gate";
+import { POLL_DEADLINE_MS, until } from "@/tests/utils/poll";
 
-// Issue #165. Two things are asserted here, and they are the two halves of the rule in lanes.ts.
-//
-// The PARTITION, against the database rather than against the map. The map is the thing under test
-// only in the sense that the SQL is derived from it: a test that read `JOB_LANE` and counted would
-// be green on a map that is right and a filter that is wrong, which is the shape of every table that
-// was never checked against its consumer. So every kind is enqueued for real and every lane claims
-// for real, and the assertion is on which lane got which row.
-//
-// The DRAIN, because "the shared lane is concurrent" is a claim about ordering that no unit test of
-// a pure function can make. The handlers below deadlock a serial drain on purpose: the first job
-// cannot finish until the second one starts. Serially that is a hang; concurrently it is a pass.
-//
-// Both tests fence on this file's tenant. The claim is cross-tenant by design, so a second DB-backed
-// suite running at the same time is not a hypothetical: its rows fill the batch, and a deadlock test
-// whose pair never got claimed together times out exactly like a serial drain would.
+// The two halves of the rule in src/modules/scheduler/lanes.ts. The PARTITION, against the database
+// rather than the map: a test that read `JOB_LANE` and counted would pass on a right map and a wrong
+// filter, so every kind is enqueued and every lane claims for real. The DRAIN, because "the shared
+// lane is concurrent" is about ordering: the handlers below deadlock a serial drain on purpose (the
+// first job cannot finish until the second starts). Both fence on this file's tenant: the claim is
+// cross-tenant by design, and another suite's rows filling the batch would time the deadlock out.
 
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const suUrl = process.env.MIGRATION_DATABASE_URL;
@@ -60,8 +52,8 @@ if (appUrl && suUrl) {
     });
     await app.$queryRaw`SELECT 1`;
     dbUp = true;
-  } catch {
-    dbUp = false;
+  } catch (err) {
+    dbUp = dbProbeFailed(err);
   }
 }
 const appDb = app as PrismaClient;
@@ -76,6 +68,7 @@ const past = () => new Date(Date.now() - 60_000);
 // the expectation have to be changed by two separate deliberate edits.
 const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   FOLLOWUP: "shared",
+  SNOOZED_FOLLOWUP: "shared",
   FOLLOWUP_SWEEP: "shared",
   WEBHOOK_RETRY: "shared",
   RAG_INGEST: "shared",
@@ -85,12 +78,15 @@ const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   REDIRECT_FOLLOWUP: "shared",
   DEBOUNCE: "debounce",
   MEMORY_COMPACT: "compaction",
-  // Shared: the turn drains its own thread before invoking (issue #194), so the tick cadence stops
-  // deciding correctness — and the debounce lane can be switched off entirely, which would have
+  OTHER_INBOX_SUMMARY: "compaction",
+  // Shared: the turn drains its own thread before invoking, so the tick cadence does not decide
+  // correctness, and the debounce lane can be switched off entirely, which would have
   // stranded every queued message on an install that does not use debounce.
   INGEST_MESSAGE: "shared",
-  // Shared: a sweep with a cadence of minutes and one indexed query per tenant (issue #228).
+  INGEST_FALLBACK: "shared",
+  // Shared: a sweep with a cadence of minutes and one indexed query per tenant.
   DELIVERY_SWEEP: "shared",
+  RECONCILE_SWEEP: "shared",
   // Shared: the message it answers has already waited out the sweep's staleness window, so a tick's
   // wait is not what the customer feels, and the cap it needs is the shared lane's provider
   // concurrency rather than a budget independent of the turns live customers are queueing for.
@@ -101,23 +97,30 @@ const EXPECTED_LANE: Record<SchedulerJobKind, SchedulerLane> = {
   // read and one enqueue.
   HUMAN_REPLY_RECOVERY: "shared",
   SPEND_CEILING_POLL: "shared",
-  // A cap of its own, drained by the shared tick (issue #621): on the traffic share it waited behind
-  // every ingestion row armed before it, five rows a tick for the whole install.
+  OCCURRENCE_ROUND: "shared",
+  OCCURRENCE_SWEEP: "shared",
+  DASHBOARD_LOG_FACTS_BACKFILL: "shared",
+  // A lane of its own, drained by the scheduler's fast tick: on the traffic share it would wait
+  // behind every ingestion row armed before it, five rows a tick for the whole install.
   OBSERVE: "observe",
   MEDIA_TEXT_FALLBACK: "shared",
   KNOWLEDGE_SOURCE_SYNC: "shared",
   INBOUND_SWEEP: "shared",
   INBOUND_REDISPATCH: "shared",
   NOTHING_TO_ANSWER: "shared",
+  SUGGESTION_REVIEW: "shared",
+  CLIENT_ANON_SWEEP: "shared",
+  DOCUMENT_APPROVAL_EXPIRY: "shared",
+  DOCUMENT_APPROVAL_OUTCOME: "shared",
 };
 
 // Same discipline as EXPECTED_LANE, and for a sharper reason: the bound test below can only
 // exercise one costly kind end to end, so membership for the other three is asserted here or not at
-// all. Flipping RAG_INGEST in the source killed no test until this existed — and RAG_INGEST is the
-// one whose provider has NO other limiter (`embedTexts` never touches the model semaphore), so a
-// silent demotion means twenty embedding batches at once on a bulk import.
+// all. RAG_INGEST's provider has NO other limiter (`embedTexts` never touches the model semaphore),
+// so a silent demotion means twenty embedding batches at once on a bulk import.
 const EXPECTED_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   FOLLOWUP: true,
+  SNOOZED_FOLLOWUP: true,
   APPOINTMENT_REMINDER: true,
   REDIRECT_FOLLOWUP: true,
   RAG_INGEST: true,
@@ -127,40 +130,51 @@ const EXPECTED_SPENDS_PROVIDER: Record<SchedulerJobKind, boolean> = {
   FLOWLOG_SWEEP: false,
   DEBOUNCE: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   INGEST_MESSAGE: false,
+  INGEST_FALLBACK: false,
   // Reads and writes rows, emits log lines, invokes nothing: the sweep reports a stranded delivery
-  // and arms the recovery, rather than answering it itself (issue #295).
+  // and arms the recovery, rather than answering it itself.
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   // It runs the delivery path, which runs a real turn: a model call plus whatever tools it decides
   // to use. This is the reason the recovery is a kind of its own instead of work the sweep does.
   DELIVERY_RECOVERY: true,
-  // The other half of why the two recoveries are two kinds (issue #439): this one re-runs the
+  // The other half of why the two recoveries are two kinds: this one re-runs the
   // takeover and never reaches a model. Flipped to `true` it would hold a permit in the semaphore a
   // customer's turn queues on, to make two HTTP calls.
   TAKEOVER_RECOVERY: false,
-  // It reads one page of messages and arms an ingest job (issue #728). The model is spent later, by
+  // It reads one page of messages and arms an ingest job. The model is spent later, by
   // whatever turn reads the thread next, which is the whole point of the ingestion being a job.
   HUMAN_REPLY_RECOVERY: false,
   SPEND_CEILING_POLL: false,
+  OCCURRENCE_ROUND: true,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
   OBSERVE: true,
   MEDIA_TEXT_FALLBACK: false,
   KNOWLEDGE_SOURCE_SYNC: false,
   INBOUND_SWEEP: false,
   // It can run the agent's nudge turn.
   INBOUND_REDISPATCH: true,
-  // Chatwoot reads and one status write: no model (issue #895).
+  // Chatwoot reads and one status write: no model.
   NOTHING_TO_ANSWER: false,
+  SUGGESTION_REVIEW: true,
+  CLIENT_ANON_SWEEP: false,
+  DOCUMENT_APPROVAL_EXPIRY: false,
+  DOCUMENT_APPROVAL_OUTCOME: true,
 };
 
-// Same discipline again, and both of these maps were added by the change that introduced
-// INGEST_MESSAGE — the only kind that is `true` in either. A behaviour test can only exercise that
-// one end to end, so what stops a SECOND kind from being flipped is this list and nothing else, and
-// the two failures are quiet ones: a kind marked traffic-proportional silently leaves the fixed-rate
-// batch and is drained at a quarter of the rate; a kind marked delete-on-done stops leaving a
-// completed row behind, and the rows nothing sweeps are simply gone.
+// Same discipline again, for these two maps. A behaviour test exercises only INGEST_MESSAGE end to
+// end, so what stops another kind from being flipped is this list and nothing else, and the two
+// failures are quiet ones: a kind marked traffic-proportional silently leaves the fixed-rate batch
+// and is drained at a quarter of the rate; a kind marked delete-on-done stops leaving a completed
+// row behind, and the rows nothing sweeps are simply gone.
 const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   INGEST_MESSAGE: true,
+  INGEST_FALLBACK: true,
   FOLLOWUP: false,
+  SNOOZED_FOLLOWUP: false,
   FOLLOWUP_SWEEP: false,
   WEBHOOK_RETRY: false,
   DEBOUNCE: false,
@@ -170,7 +184,9 @@ const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   APPOINTMENT_REMINDER: false,
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   // One row per stranded DELIVERY, and one sweep pass can declare a whole batch lost at once — the
   // deploy that stranded them stranded every delivery in flight. Armed for `now`, they are the
   // oldest rows too, which is the shape that fills the batch and starves a fixed-rate kind.
@@ -179,11 +195,14 @@ const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   // when the process died.
   TAKEOVER_RECOVERY: true,
   // Armed by the same pass on the same rows as the takeover recovery, so the count follows the same
-  // traffic (issue #728).
+  // traffic.
   HUMAN_REPLY_RECOVERY: true,
   SPEND_CEILING_POLL: false,
-  // One row per observed CONVERSATION, which is the same shape as DEBOUNCE's, and now the same answer:
-  // with a lane of its own (issue #621) no claim that holds a fixed-rate kind ever holds it.
+  OCCURRENCE_ROUND: false,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
+  // One row per observed CONVERSATION, the same shape as DEBOUNCE's and the same answer: with a lane
+  // of its own, no claim that holds a fixed-rate kind ever holds it.
   OBSERVE: false,
   MEDIA_TEXT_FALLBACK: true,
   KNOWLEDGE_SOURCE_SYNC: false,
@@ -192,11 +211,18 @@ const EXPECTED_TRAFFIC_PROPORTIONAL: Record<SchedulerJobKind, boolean> = {
   INBOUND_REDISPATCH: true,
   // One per conversation that received a blank message.
   NOTHING_TO_ANSWER: true,
+  SUGGESTION_REVIEW: true,
+  CLIENT_ANON_SWEEP: false,
+  DOCUMENT_APPROVAL_EXPIRY: true,
+  // One per decided or expired request, and an expiry arms a whole backlog at once.
+  DOCUMENT_APPROVAL_OUTCOME: true,
 };
 
 const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   INGEST_MESSAGE: true,
+  INGEST_FALLBACK: true,
   FOLLOWUP: false,
+  SNOOZED_FOLLOWUP: false,
   FOLLOWUP_SWEEP: false,
   WEBHOOK_RETRY: false,
   DEBOUNCE: false,
@@ -206,7 +232,9 @@ const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   APPOINTMENT_REMINDER: false,
   REDIRECT_FOLLOWUP: false,
   MEMORY_COMPACT: false,
+  OTHER_INBOX_SUMMARY: false,
   DELIVERY_SWEEP: false,
+  RECONCILE_SWEEP: false,
   // The key names ONE ledger row — it has to, or a second stranded delivery would overwrite the
   // first — so nothing reuses the row and the count grows with every delivery ever stranded. The
   // record that the work happened is the ledger row, which is terminal either way.
@@ -216,6 +244,9 @@ const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   // Same key, same shape, same answer.
   HUMAN_REPLY_RECOVERY: true,
   SPEND_CEILING_POLL: false,
+  OCCURRENCE_ROUND: false,
+  OCCURRENCE_SWEEP: false,
+  DASHBOARD_LOG_FACTS_BACKFILL: false,
   OBSERVE: false,
   MEDIA_TEXT_FALLBACK: false,
   KNOWLEDGE_SOURCE_SYNC: false,
@@ -225,6 +256,10 @@ const EXPECTED_DELETE_ON_DONE: Record<SchedulerJobKind, boolean> = {
   // One row per conversation that ever got a blank message, and a finished judgement is never read
   // again.
   NOTHING_TO_ANSWER: true,
+  SUGGESTION_REVIEW: false,
+  CLIENT_ANON_SWEEP: false,
+  DOCUMENT_APPROVAL_EXPIRY: true,
+  DOCUMENT_APPROVAL_OUTCOME: true,
 };
 
 // Written out ON PURPOSE, like the tables above: derived, it would mirror whatever the source says.
@@ -233,6 +268,7 @@ const EXPECTED_DEATH_LEVEL: Record<
   "info" | "warn" | "error"
 > = {
   FOLLOWUP: "error",
+  SNOOZED_FOLLOWUP: "error",
   FOLLOWUP_SWEEP: "error",
   WEBHOOK_RETRY: "error",
   DEBOUNCE: "error",
@@ -242,29 +278,39 @@ const EXPECTED_DEATH_LEVEL: Record<
   APPOINTMENT_REMINDER: "error",
   REDIRECT_FOLLOWUP: "error",
   MEMORY_COMPACT: "error",
+  OTHER_INBOX_SUMMARY: "warn",
   INGEST_MESSAGE: "error",
+  INGEST_FALLBACK: "error",
   DELIVERY_SWEEP: "error",
-  // The only kind whose death is not an `error`, which is why writing it out matters more here than
-  // anywhere else in this file: the sweep already paged about this exact delivery at `error`, and
-  // the DEAD ledger row is still the operator's worklist. What died is the automatic second attempt.
+  RECONCILE_SWEEP: "error",
+  // The only kind whose death is not an `error` for the customer's sake, which is why writing it out
+  // matters: the delivery's own line (`announceDeadRecovery`) is the `error` that says the message went
+  // unanswered, and what died here is the automatic second attempt.
   DELIVERY_RECOVERY: "warn",
   TAKEOVER_RECOVERY: "warn",
   // `warn`, by the same rule read the other way round: the receiver already reported this loss at
-  // `error`, on the conversation, before the row ever reached the sweep (issue #720). What dies here
+  // `error`, on the conversation, before the row ever reached the sweep. What dies here
   // is the second attempt at the append, and an `error` would wake the same person about the same
   // reply twice.
   HUMAN_REPLY_RECOVERY: "warn",
   SPEND_CEILING_POLL: "error",
+  OCCURRENCE_ROUND: "warn",
+  OCCURRENCE_SWEEP: "warn",
+  DASHBOARD_LOG_FACTS_BACKFILL: "warn",
   OBSERVE: "warn",
   MEDIA_TEXT_FALLBACK: "error",
   KNOWLEDGE_SOURCE_SYNC: "warn",
-  // A sweep's death is every later strand going unretried (issue #817).
+  // A sweep's death is every later strand going unretried.
   INBOUND_SWEEP: "error",
   // Nothing announced this loss before the job died: the sender holds a 2xx and the row says nothing.
   INBOUND_REDISPATCH: "error",
   // The conversation stays pending with nobody on it, as before the job existed: this line is the
   // alert.
   NOTHING_TO_ANSWER: "warn",
+  SUGGESTION_REVIEW: "warn",
+  CLIENT_ANON_SWEEP: "error",
+  DOCUMENT_APPROVAL_EXPIRY: "warn",
+  DOCUMENT_APPROVAL_OUTCOME: "error",
 };
 
 const ALL_KINDS = Object.keys(EXPECTED_LANE) as SchedulerJobKind[];
@@ -400,20 +446,21 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
       batchSize: 20,
       tenantId,
     });
-    const timedOut = Symbol("timeout");
-    const outcome = await Promise.race([
-      tick.then(() => "finished" as const),
-      new Promise<typeof timedOut>((r) => setTimeout(() => r(timedOut), 5_000)),
-    ]);
-    expect(outcome).toBe("finished");
+    // The two handlers wait for each other, so a passing run finishes as soon as both have started;
+    // the poll deadline is only ever paid by a serial drain, which then fails the assertion.
+    let finished = false;
+    void tick.then(() => {
+      finished = true;
+    });
+    await until("the tick to finish both runs", () => finished).catch(() => {});
+    expect(finished).toBe(true);
     expect(ranA && ranB).toBe(true);
-  }, 15_000);
+  }, 30_000);
 
-  // ISSUE #621. OBSERVE used to be claimed from the traffic share, five rows a tick for the whole
-  // install, FIFO behind every ingestion row armed before it: one busy observed inbox queued its
-  // labels for half an hour. The tick now claims it on its own, up to a limit sized to the provider
-  // bound. Asserted through the tick rather than the claim function, because the call site is the
-  // half a mutation can delete without a claim-level test noticing (see the case above).
+  // NOTE: the tick claims OBSERVE on its own, up to a limit sized to the provider bound; from the
+  // traffic share it would wait FIFO behind every ingestion row, five rows a tick for the install.
+  // Asserted through the tick rather than the claim function, because the call site is the half a
+  // mutation can delete without a claim-level test noticing (see the case above).
   test("the shared tick claims OBSERVE beyond the traffic share, and only up to its own limit", async () => {
     const BOUND = 2;
     const ingestRows = 10;
@@ -443,6 +490,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     const ran = { INGEST_MESSAGE: 0, OBSERVE: 0 };
     const previous = {
       INGEST_MESSAGE: getJobHandler("INGEST_MESSAGE"),
+      INGEST_FALLBACK: getJobHandler("INGEST_FALLBACK"),
       OBSERVE: getJobHandler("OBSERVE"),
     };
     for (const kind of ["INGEST_MESSAGE", "OBSERVE"] as const) {
@@ -480,7 +528,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     });
   });
 
-  // PR review, round 1. The four rounds are the whole TICK's: the fixed batch goes through the same
+  // NOTE: the four rounds are the whole TICK's: the fixed batch goes through the same
   // provider bound, so an observe claim that ignored it would overrun the interval whenever
   // follow-ups were due, and the non-overlap guard would skip the next tick.
   test("the OBSERVE claim gives up the rounds the fixed batch's provider work already took", async () => {
@@ -543,14 +591,11 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
   });
 
   test("provider-spending kinds are bounded; the cheap ones are not", async () => {
-    // The bound the concurrent drain made necessary. Twenty due follow-ups used to be able to hold
-    // every permit in the process-wide model semaphore while a customer's reply queued behind a
-    // proactive nudge — the serial drain took at most one, and that was the only thing protecting
-    // the interactive path.
-    //
-    // The bound is INJECTED and the workload is a constant. Deriving either from
-    // AGENT_MODEL_CONCURRENCY made the test assert whatever that machine was configured to: at 400
-    // the bound is 100, the workload would be 206 rows, and claimWhere hard-caps a tick at 100.
+    // The bound a concurrent drain needs: without it, twenty due follow-ups could hold every
+    // permit in the process-wide model semaphore while a customer's reply queues behind a nudge.
+    // The bound is INJECTED and the workload is a constant: deriving either from
+    // AGENT_MODEL_CONCURRENCY would assert whatever the machine is configured to (at 400 the bound
+    // is 100, the workload 206 rows, and claimWhere hard-caps a tick at 100).
     const BOUND = 2;
     const N = 5;
 
@@ -648,7 +693,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     expect(JOB_SPENDS_PROVIDER).toEqual(EXPECTED_SPENDS_PROVIDER);
     expect(JOB_TRAFFIC_PROPORTIONAL).toEqual(EXPECTED_TRAFFIC_PROPORTIONAL);
     expect(JOB_DELETE_ON_DONE).toEqual(EXPECTED_DELETE_ON_DONE);
-    // What each kind's DEATH says to the operator (issue #356). Stated here for the same reason as
+    // NOTE: what each kind's DEATH says to the operator. Stated here for the same reason as
     // the three above, and with one more: the answers currently agree, so no behavioural test can
     // tell this table from a default. This is what says the thirteenth kind has to be asked.
     expect(JOB_DEATH_LEVEL).toEqual(EXPECTED_DEATH_LEVEL);
@@ -734,6 +779,7 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
     const previous = {
       WEBHOOK_RETRY: getJobHandler("WEBHOOK_RETRY"),
       INGEST_MESSAGE: getJobHandler("INGEST_MESSAGE"),
+      INGEST_FALLBACK: getJobHandler("INGEST_FALLBACK"),
     };
     for (const kind of ["WEBHOOK_RETRY", "INGEST_MESSAGE"] as const) {
       registerJobHandler(kind, async () => {
@@ -767,11 +813,10 @@ describe.skipIf(!dbUp)("scheduler lanes", () => {
   });
 
   test("a write that cannot reach the database is logged, and the batch still drains", async () => {
-    // The regression `allSettled` introduces if nothing reads its results: the serial loop let an
-    // infrastructure failure propagate out of the tick, where startScheduler logged it. runClaimed
-    // swallows a HANDLER's error (it fails the job instead), so a rejection here is the database
-    // being unreachable under completeJob — and the row is left CLAIMED for the reaper. Discarded,
-    // that is a job silently stuck for minutes with nothing in the log saying why.
+    // `allSettled` has to have its results read. runClaimed swallows a HANDLER's error (it
+    // fails the job instead), so a rejection here is the database being unreachable under
+    // completeJob, with the row left CLAIMED for the reaper; discarded, that is a job silently stuck
+    // for minutes with nothing in the log saying why.
     let ran = 0;
     registerJobHandler("WEBHOOK_RETRY", async () => {
       ran += 1;

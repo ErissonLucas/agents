@@ -13,7 +13,7 @@ import {
   Webhook,
   Wrench,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Badge,
@@ -45,6 +45,12 @@ import {
 import { cn } from "@/client/lib/utils";
 import { CodeToolEditModal } from "@/client/pages/resources/CodeToolEditModal";
 import {
+  DocumentStarterModal,
+  type Starter,
+  starterLocaleOf,
+} from "@/client/pages/resources/documents/DocumentStarterModal";
+import {
+  type DocumentTemplate,
   DocumentTemplateModal,
   type TemplateModalPayload,
 } from "@/client/pages/resources/documents/DocumentTemplateModal";
@@ -52,10 +58,17 @@ import { IntegrationEditModal } from "@/client/pages/resources/IntegrationEditMo
 import { McpEditModal } from "@/client/pages/resources/McpEditModal";
 import { ToolEditModal } from "@/client/pages/resources/ToolEditModal";
 import { TOOL_INSTRUCTIONS_MAX } from "@/modules/agents/text-caps";
+import { DECISION_ACTION_TOOLS } from "@/modules/decisions/config";
+import { FieldSize, SourceTokens, ToolTokens } from "./CallFloor";
 import {
   CrossInboxCaseFields,
   type CrossInboxCaseState,
 } from "./CrossInboxCaseFields";
+import { nativeToolAnchor } from "./editorTabs";
+import {
+  ResolveConversationFields,
+  type ResolveConversationState,
+} from "./ResolveConversationFields";
 import {
   SendImageFields,
   type SendImageState,
@@ -67,6 +80,11 @@ import type {
   ToolCatalog,
   ToolRefusals,
 } from "./types";
+import {
+  hasWritableAttributes,
+  WritableAttributesFields,
+  type WritableAttributesState,
+} from "./WritableAttributesFields";
 
 // Service-logo adapters so a toolpack integration shows its brand mark in the SelectableCard's
 // `icon` slot (which expects a LucideIcon). Module-level → stable identity (no remount per render).
@@ -79,6 +97,9 @@ const CalendarLogo = ((p: { className?: string }) => (
 const DriveLogo = ((p: { className?: string }) => (
   <ServiceLogo service="google_drive" className={p.className} />
 )) as unknown as LucideIcon;
+const SheetsLogo = ((p: { className?: string }) => (
+  <ServiceLogo service="google_sheets" className={p.className} />
+)) as unknown as LucideIcon;
 const GoogleLogo = ((p: { className?: string }) => (
   <ServiceLogo service="google" className={p.className} />
 )) as unknown as LucideIcon;
@@ -90,6 +111,8 @@ function integrationIcon(catalogType: string): LucideIcon {
       return CalendarLogo;
     case "GOOGLE_DRIVE":
       return DriveLogo;
+    case "GOOGLE_SHEETS":
+      return SheetsLogo;
     default:
       return catalogType.startsWith("GOOGLE_") ? GoogleLogo : Puzzle;
   }
@@ -109,22 +132,28 @@ const LABEL_TOOL = "set_labels";
 // update_kanban_task (edit the linked card's title/description/priority/dates) also takes optional
 // operator guidance, so it renders as a configurable card next to kanban_move_card.
 const UPDATE_KANBAN_TOOL = "update_kanban_task";
-// open_case_in_inbox needs a destination inbox before it is offered at all (issue #700).
+// open_case_in_inbox needs a destination inbox before it is offered at all.
 const OPEN_CASE_TOOL = "open_case_in_inbox";
-// send_image refuses every call until at least one host is allowed (issue #880).
+// send_image refuses every call until at least one host is allowed.
 const SEND_IMAGE_TOOL = "send_image";
+// resolve_conversation can write the operator's labels on close.
+const RESOLVE_TOOL = "resolve_conversation";
 
 interface Props {
-  // The agent being edited — scopes the handoff target picker to the accounts it serves.
+  // The agent being edited: scopes the handoff target picker to the accounts it serves.
   agentId: string;
   // WHETHER THIS AGENT ONLY WATCHES. A monitoring turn builds its Chatwoot client MUTED, and the
-  // assembly then drops every tool whose whole point is to put something in front of the customer:
-  // the two natives flagged `deliversToCustomer`, the document tools, and a toolpack's delivery
-  // tools. Offering those grants here would be a control that cannot fire — the same class as the
-  // retired settings this issue refused, arriving through the editor instead of the API. Grants
-  // already saved are left ALONE, so flipping the mode back returns the agent as it was
-  // (review round 30).
+  // assembly drops every tool that puts something in front of the customer (the natives flagged
+  // `deliversToCustomer`, the document tools, a toolpack's delivery tools), so offering those grants
+  // would be a control that cannot fire. Grants already saved are left ALONE, so flipping the mode
+  // back returns the agent as it was.
   observing?: boolean;
+  // A voice agent: no Documents block, a document is a file sent to the contact.
+  voice?: boolean;
+  // An agent on questions and rules: its rules fire fixed actions and no model reads a tool's
+  // description, so the fields written for that reader are not drawn. What a tool enforces on its
+  // own (grants, transfer destination, label lists, preconditions) stays.
+  decides?: boolean;
   catalog: ToolCatalog;
   grants: GrantState[];
   onChange: (grants: GrantState[]) => void;
@@ -153,6 +182,9 @@ interface Props {
   // with an empty list the tool is offered and refuses every call, so the list belongs on its card.
   sendImage: SendImageState;
   setSendImage: (v: SendImageState) => void;
+  // The labels resolve_conversation writes before it closes (agent.settings.resolveConversation).
+  resolveConversation: ResolveConversationState;
+  setResolveConversation: (v: ResolveConversationState) => void;
   // The refused note this editor draws, if the standing refusal is about one -- see ToolRefusals.
   refusals: ToolRefusals;
   setCustomAttributeInstructions: (v: string) => void;
@@ -162,12 +194,19 @@ interface Props {
   // agent.settings.setLabels.protected; see readProtectedLabels for why the guard exists.
   protectedLabels: string;
   setProtectedLabels: (v: string) => void;
-  // The labels set_labels may ADD, comma-separated, and what a title outside them meets (issue #638).
+  // The labels set_labels may ADD, comma-separated, and what a title outside them meets.
   // Persisted in agent.settings.setLabels.allowed / .outsideAllowed; see readAllowedLabels.
   allowedLabels: string;
   setAllowedLabels: (v: string) => void;
   outsideAllowedLabels: "refuse" | "accept";
   setOutsideAllowedLabels: (v: "refuse" | "accept") => void;
+  // Which labels set_labels may REMOVE. Persisted in agent.settings.setLabels.removal; see
+  // readLabelRemoval.
+  labelRemoval: "any" | "allowed";
+  setLabelRemoval: (v: "any" | "allowed") => void;
+  // The attributes set_custom_attribute may write (agent.settings.setCustomAttribute.allowed).
+  writableAttributes: WritableAttributesState;
+  setWritableAttributes: (v: WritableAttributesState) => void;
   // Operator-authored guidance for update_kanban_task (when/how to edit the card's fields), appended to
   // its model-facing description. Persisted in agent.settings.toolGuidance.update_kanban_task.
   updateKanbanTaskInstructions: string;
@@ -200,7 +239,7 @@ function Section({
   action,
   children,
 }: {
-  // Anchor id + icon (item 9): lets the Tools-tab SectionNav scroll to and highlight this block.
+  // Anchor id + icon: lets the Tools-tab SectionNav scroll to and highlight this block.
   id?: string;
   icon?: LucideIcon;
   title: string;
@@ -211,19 +250,19 @@ function Section({
   return (
     <section
       id={id}
-      className="flex scroll-mt-4 flex-col gap-3 rounded-lg border border-border bg-bg-secondary p-4"
+      className="border-border bg-bg-secondary flex scroll-mt-4 flex-col gap-3 rounded-lg border p-4"
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-start gap-2.5">
           {Icon && (
-            <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-bg-tertiary text-accent">
+            <span className="bg-bg-tertiary text-accent mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg">
               <Icon className="h-4 w-4" aria-hidden="true" />
             </span>
           )}
           <div className="min-w-0">
-            <h3 className="font-medium text-sm text-text-primary">{title}</h3>
+            <h3 className="text-text-primary text-sm font-medium">{title}</h3>
             {description && (
-              <p className="mt-0.5 text-text-muted text-xs">{description}</p>
+              <p className="text-text-muted mt-0.5 text-xs">{description}</p>
             )}
           </div>
         </div>
@@ -235,8 +274,8 @@ function Section({
 }
 
 // Same shell as Section, but the whole header is a disclosure toggle that collapses the body. Used by
-// the native-tools block (which lives last): it renders EXPANDED by default (item 15 — the built-ins
-// should be visible at a glance), but stays collapsible, with a `badge` slot that shows how many
+// the native-tools block (which lives last): it renders EXPANDED by default (the built-ins should
+// be visible at a glance), but stays collapsible, with a `badge` slot that shows how many
 // native tools are active (and a config dot) even while collapsed.
 function CollapsibleSection({
   id,
@@ -259,7 +298,7 @@ function CollapsibleSection({
   return (
     <section
       id={id}
-      className="flex scroll-mt-4 flex-col gap-3 rounded-lg border border-border bg-bg-secondary p-4"
+      className="border-border bg-bg-secondary flex scroll-mt-4 flex-col gap-3 rounded-lg border p-4"
     >
       <button
         type="button"
@@ -268,22 +307,22 @@ function CollapsibleSection({
         className="flex items-start gap-2.5 text-left"
       >
         {Icon && (
-          <span className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-bg-tertiary text-accent">
+          <span className="bg-bg-tertiary text-accent mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg">
             <Icon className="h-4 w-4" aria-hidden="true" />
           </span>
         )}
         <div className="min-w-0 flex-1">
-          <h3 className="flex flex-wrap items-center gap-2 font-medium text-sm text-text-primary">
+          <h3 className="text-text-primary flex flex-wrap items-center gap-2 text-sm font-medium">
             {title}
             {badge}
           </h3>
           {description && (
-            <p className="mt-0.5 text-text-muted text-xs">{description}</p>
+            <p className="text-text-muted mt-0.5 text-xs">{description}</p>
           )}
         </div>
         <ChevronDown
           className={cn(
-            "mt-0.5 h-4 w-4 shrink-0 text-text-muted transition-transform",
+            "text-text-muted mt-0.5 h-4 w-4 shrink-0 transition-transform",
             { "rotate-180": !collapsed },
           )}
           aria-hidden="true"
@@ -299,15 +338,19 @@ function CollapsibleSection({
 function CreateButton({
   label,
   onClick,
+  busy,
 }: {
   label: string;
   onClick: () => void;
+  // Set while opening costs a round trip (the document flow fetches its starters first).
+  busy?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-accent text-xs hover:underline"
+      disabled={busy}
+      className="text-accent flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-xs hover:underline"
     >
       <Plus className="h-3.5 w-3.5" aria-hidden="true" />
       {label}
@@ -317,7 +360,8 @@ function CreateButton({
 
 // SelectableCard (a <button>) can't nest an edit button, so the pencil is an absolutely-positioned
 // sibling overlay sitting just left of the card's check indicator. stopPropagation keeps a pencil
-// click from toggling the grant selection.
+// click from toggling the grant selection. The card's content column is padded by the pencil's width
+// so the title and badge end before it instead of running underneath.
 function EditableCard({
   onEdit,
   editLabel,
@@ -333,7 +377,7 @@ function EditableCard({
   children: React.ReactNode;
 }) {
   return (
-    <div className="relative">
+    <div className="relative [&_[data-selectable-content]]:pr-7">
       {children}
       {/* Vertically center the pencil on the card's selection check (mt-0.5 h-5): top-3.5 + an
           h-5 button put both centers at the same y. */}
@@ -345,7 +389,7 @@ function EditableCard({
           onEdit();
         }}
         aria-label={editLabel}
-        className="absolute top-3.5 right-9 flex h-5 w-5 items-center justify-center rounded text-text-muted hover:text-text-primary disabled:opacity-50"
+        className="text-text-muted hover:text-text-primary absolute top-3.5 right-9 flex h-5 w-5 items-center justify-center rounded disabled:opacity-50"
       >
         {busy ? (
           <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
@@ -369,21 +413,27 @@ function ConfigurableToolCard({
   description,
   icon: Icon,
   badge,
+  meta,
   configured,
   warning,
   children,
+  id,
 }: {
+  // An anchor a link can land on (scrolled to, its toggle focused).
+  id?: string;
   selected: boolean;
   onToggle: () => void;
   title: React.ReactNode;
   description?: React.ReactNode;
   icon?: LucideIcon;
   badge?: React.ReactNode;
-  // True when the config holds non-default content — shows a dot on the collapsed header so the
+  // The tokens this tool adds to every call (SelectableCard's slot of the same name).
+  meta?: React.ReactNode;
+  // True when the config holds non-default content: shows a dot on the collapsed header so the
   // operator knows there is hidden config worth opening.
   configured?: boolean;
   // What keeps the granted tool from working, drawn under the header whether or not the config is
-  // expanded: a tool loaded already granted starts collapsed, and a warning inside it went unseen.
+  // expanded: a tool loaded already granted starts collapsed, which would hide a warning inside it.
   warning?: React.ReactNode;
   children?: React.ReactNode;
 }) {
@@ -398,15 +448,17 @@ function ConfigurableToolCard({
   };
   return (
     <div
+      id={id}
+      data-focus-control={id ? "" : undefined}
       className={cn(
-        "overflow-hidden rounded-lg border transition-colors",
+        "scroll-mt-4 overflow-hidden rounded-lg border transition-colors",
         selected ? "border-accent" : "border-border",
       )}
     >
       <div
         className={cn(
           "flex items-stretch transition-colors",
-          selected ? "bg-accent/10" : "bg-bg-secondary",
+          selected ? "bg-accent-soft" : "bg-bg-secondary",
         )}
       >
         {/* biome-ignore lint/a11y/useSemanticElements: a styled selection card needs a button with the checkbox role, not a bare <input>. */}
@@ -432,13 +484,14 @@ function ConfigurableToolCard({
           )}
           <span className="flex min-w-0 flex-1 flex-col gap-0.5">
             <span className="flex items-center gap-2">
-              <span className="truncate font-medium text-sm text-text-primary">
+              <span className="text-text-primary truncate text-sm font-medium">
                 {title}
               </span>
               {badge}
+              {meta}
               {configured && !expanded && (
                 <span
-                  className="h-1.5 w-1.5 shrink-0 rounded-full bg-accent"
+                  className="bg-accent-solid h-1.5 w-1.5 shrink-0 rounded-full"
                   aria-hidden="true"
                 />
               )}
@@ -451,8 +504,8 @@ function ConfigurableToolCard({
             className={cn(
               "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full border transition-colors",
               selected
-                ? "border-accent bg-accent text-accent-foreground"
-                : "border-border text-transparent group-hover:border-text-muted",
+                ? "border-accent-solid bg-accent-solid text-accent-foreground"
+                : "border-border group-hover:border-text-muted text-transparent",
             )}
             aria-hidden="true"
           >
@@ -469,7 +522,7 @@ function ConfigurableToolCard({
                 ? t("editor.tools.hideConfig", "Hide settings")
                 : t("editor.tools.showConfig", "Settings")
             }
-            className="flex shrink-0 items-center self-start p-3 text-text-muted transition-colors hover:text-text-primary"
+            className="text-text-muted hover:text-text-primary flex shrink-0 items-center self-start p-3 transition-colors"
           >
             <ChevronDown
               className={cn(
@@ -482,12 +535,12 @@ function ConfigurableToolCard({
         )}
       </div>
       {selected && warning && (
-        <p className="border-border border-t px-3 py-2 text-warning text-xs">
+        <p className="border-border text-warning border-t px-3 py-2 text-xs">
           {warning}
         </p>
       )}
       {hasConfig && expanded && (
-        <div className="flex flex-col gap-4 border-border border-t bg-bg-secondary p-3">
+        <div className="border-border bg-bg-secondary flex flex-col gap-4 border-t p-3">
           {children}
         </div>
       )}
@@ -495,14 +548,11 @@ function ConfigurableToolCard({
   );
 }
 
-// Controlled editor for NATIVE / HTTP / MCP / INTEGRATION grants. RAG lives in
-// the Knowledge tab; this component preserves any RAG grant untouched.
 // WHAT A PACK OFFERS *THIS* AGENT. A watcher's turn is assembled with a muted client, and
-// `buildToolpackTools` then drops every tool whose spec declares `deliversToCustomer`. Both places
-// this editor decides a pack's tool set — the auto-grant that runs when an integration is created
-// here, and the list the operator toggles — go through this one function, because filtering only one
-// of them persists a grant nobody saw: inert while the agent is muted, live the moment the mode is
-// flipped back (review round 31).
+// `buildToolpackTools` drops every tool whose spec declares `deliversToCustomer`. Both places this
+// editor decides a pack's tool set (the auto-grant on integration create, and the list the operator
+// toggles) go through this one function: filtering only one of them persists a grant nobody saw,
+// inert while the agent is muted and live the moment the mode is flipped back.
 export function offeredPackTools<T extends { deliversToCustomer?: boolean }>(
   tools: T[],
   observing: boolean | undefined,
@@ -510,9 +560,13 @@ export function offeredPackTools<T extends { deliversToCustomer?: boolean }>(
   return observing ? tools.filter((t) => !t.deliversToCustomer) : tools;
 }
 
+// Controlled editor for NATIVE / HTTP / MCP / INTEGRATION grants. RAG lives in
+// the Knowledge tab; this component preserves any RAG grant untouched.
 export function ToolGrantsEditor({
   agentId,
   observing,
+  voice,
+  decides,
   catalog,
   grants,
   onChange,
@@ -528,6 +582,8 @@ export function ToolGrantsEditor({
   setCrossInboxCase,
   sendImage,
   setSendImage,
+  resolveConversation,
+  setResolveConversation,
   refusals,
   setCustomAttributeInstructions,
   labelInstructions,
@@ -538,6 +594,10 @@ export function ToolGrantsEditor({
   setAllowedLabels,
   outsideAllowedLabels,
   setOutsideAllowedLabels,
+  labelRemoval,
+  setLabelRemoval,
+  writableAttributes,
+  setWritableAttributes,
   updateKanbanTaskInstructions,
   setUpdateKanbanTaskInstructions,
   mcpTools,
@@ -549,7 +609,7 @@ export function ToolGrantsEditor({
   integrationCollapsed,
   setIntegrationCollapsed,
 }: Props) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { showToast } = useToast();
   // Create/edit a resource without leaving the agent editor. On save the catalog refetches; a
   // newly-created one is auto-granted to this agent (still needs the Tools-tab save to persist).
@@ -563,8 +623,23 @@ export function ToolGrantsEditor({
   // from where the decision is being made.
   const documentModal = useModalController<TemplateModalPayload>();
   const [openingDocument, setOpeningDocument] = useState<string | null>(null);
+  // The starter list is asked for when the operator opens the create flow, in the console's
+  // language, the way Components → Documents asks for it on load.
+  const starterModal = useModalController();
+  const [starters, setStarters] = useState<Starter[]>([]);
+  // The language the list on hand was loaded in. The picker only shows a list in the console's
+  // current one, so cards from a superseded language are never on screen to be picked.
+  const [startersLocale, setStartersLocale] = useState<string | null>(null);
+  const [startersError, setStartersError] = useState(false);
+  const [loadingStarters, setLoadingStarters] = useState(false);
+  // The language last ASKED for (not the one on screen: a request can be in flight), and which request
+  // is the current one. A list in another language also carries another currency, so a stale one
+  // creates a wrong template.
+  const startersAsked = useRef<string | null>(null);
+  const startersSession = useRef(0);
+  const starterLocale = starterLocaleOf(i18n.language);
   // A just-created integration is auto-granted with ALL its tools (matching the manual toggle), but
-  // its tool list only arrives once the catalog refetches — defer the grant until the instance shows
+  // its tool list only arrives once the catalog refetches: defer the grant until the instance shows
   // up in the refreshed catalog (the effect below applies it then).
   const [pendingIntegrationId, setPendingIntegrationId] = useState<
     string | null
@@ -604,8 +679,8 @@ export function ToolGrantsEditor({
   // first toggle persists an explicit allowlist (which may even become empty = no native tools).
   //
   // Intersected with the catalog's names on the way in, so a stored allowlist carrying a native that
-  // no longer exists (e.g. `run_code`, removed when code tools replaced it) does not have that stale
-  // name re-sent on the next save — the toggle rebuilds the set from this one.
+  // no longer exists (e.g. `run_code`) does not have that stale name re-sent on the next save: the
+  // toggle rebuilds the set from this one.
   const selectedNative = nativeGrant
     ? new Set(
         (nativeGrant.enabledTools ?? []).filter((n) => allNativeSet.has(n)),
@@ -616,22 +691,36 @@ export function ToolGrantsEditor({
   // (toggle + inline config) outside the simple-toggle grid below.
   const handoffEntry = catalog.native.find((n) => n.name === HANDOFF_TOOL);
   const kanbanEnabled = selectedNative.has(KANBAN_TOOL);
-  const kanbanEntry = catalog.native.find((n) => n.name === KANBAN_TOOL);
+  // On questions and rules only what a rule can fire is drawn (`DECISION_ACTION_TOOLS`); the other
+  // natives belong to an agent that answers. Their saved grants are left as they are.
+  const offeredToRules = (name: string): boolean =>
+    !decides || (DECISION_ACTION_TOOLS as readonly string[]).includes(name);
+  const kanbanEntry = offeredToRules(KANBAN_TOOL)
+    ? catalog.native.find((n) => n.name === KANBAN_TOOL)
+    : undefined;
   const attrEnabled = selectedNative.has(ATTR_TOOL);
   const attrEntry = catalog.native.find((n) => n.name === ATTR_TOOL);
   const labelEnabled = selectedNative.has(LABEL_TOOL);
   const labelEntry = catalog.native.find((n) => n.name === LABEL_TOOL);
   const updateKanbanEnabled = selectedNative.has(UPDATE_KANBAN_TOOL);
-  const updateKanbanEntry = catalog.native.find(
-    (n) => n.name === UPDATE_KANBAN_TOOL,
-  );
+  const updateKanbanEntry = offeredToRules(UPDATE_KANBAN_TOOL)
+    ? catalog.native.find((n) => n.name === UPDATE_KANBAN_TOOL)
+    : undefined;
   const openCaseEnabled = selectedNative.has(OPEN_CASE_TOOL);
-  const openCaseEntry = catalog.native.find((n) => n.name === OPEN_CASE_TOOL);
+  const openCaseEntry = offeredToRules(OPEN_CASE_TOOL)
+    ? catalog.native.find((n) => n.name === OPEN_CASE_TOOL)
+    : undefined;
   const sendImageEnabled = selectedNative.has(SEND_IMAGE_TOOL);
-  const sendImageEntry = catalog.native.find((n) => n.name === SEND_IMAGE_TOOL);
+  const sendImageEntry = offeredToRules(SEND_IMAGE_TOOL)
+    ? catalog.native.find((n) => n.name === SEND_IMAGE_TOOL)
+    : undefined;
   const sendImageNoHost = sendImageHasNoHost(sendImage);
+  const resolveEnabled = selectedNative.has(RESOLVE_TOOL);
+  const resolveEntry = offeredToRules(RESOLVE_TOOL)
+    ? catalog.native.find((n) => n.name === RESOLVE_TOOL)
+    : undefined;
 
-  // True when any ENABLED configurable native tool holds non-default config — surfaces a dot on the
+  // True when any ENABLED configurable native tool holds non-default config: surfaces a dot on the
   // collapsed section header so the operator knows hidden settings are in play. Mirrors each card's
   // own `configured` signal.
   const nativeConfigured =
@@ -644,10 +733,12 @@ export function ToolGrantsEditor({
     (labelEnabled &&
       (labelInstructions.trim() !== "" ||
         protectedLabels.trim() !== "" ||
-        allowedLabels.trim() !== "")) ||
+        allowedLabels.trim() !== "" ||
+        labelRemoval === "allowed")) ||
     (updateKanbanEnabled && updateKanbanTaskInstructions.trim() !== "") ||
     (openCaseEnabled && crossInboxCase.targetInboxId !== "") ||
-    (sendImageEnabled && !sendImageNoHost);
+    (sendImageEnabled && !sendImageNoHost) ||
+    (resolveEnabled && resolveConversation.assignLabels.length > 0);
 
   // Agents/teams + the accounts the agent serves, for the "pinned" handoff target picker. Scoped to
   // the agent (by its bound inboxes): a pinned target is account-scoped, so it is only offered when the
@@ -693,8 +784,8 @@ export function ToolGrantsEditor({
       : null;
   // KEEPING one is a different question, and the answer is the account recorded next to the target,
   // which is what the runtime reads (`prepare.ts`: a pinned target falls back to agent_choice only in
-  // the accounts it does not belong to). Counting accounts is the fallback for a target stored before
-  // that field existed.
+  // the accounts it does not belong to). Counting accounts is the fallback for a target stored with
+  // no account recorded.
   const storedPinnedAccount = handoffAccounts.find(
     (a) => Number(a.instanceId) === handoff.targetInstanceId,
   );
@@ -710,24 +801,25 @@ export function ToolGrantsEditor({
     : handoffAccounts.length === 0
       ? t(
           "editor.handoffPinnedNoInbox",
-          "Bind at least one inbox in the Channels tab first.",
+          "Attach this agent to at least one inbox in the Channels tab first, to answer or to observe it.",
         )
       : handoffAccounts.length > 1
-        ? t(
-            "editor.handoffPinnedMultiAccount",
-            "This agent serves inboxes in different Chatwoot accounts; use “Let the AI choose”.",
-          )
+        ? decides
+          ? t(
+              "editor.handoffPinnedMultiAccountDecisions",
+              "This agent serves inboxes in different Chatwoot accounts; use Chatwoot routing.",
+            )
+          : t(
+              "editor.handoffPinnedMultiAccount",
+              "This agent serves inboxes in different Chatwoot accounts; use “Let the AI choose”.",
+            )
         : undefined;
-  // Auto-switch a "pinned" target to "agent_choice" once the fetched data shows it can no longer be
-  // used ANYWHERE: the account it names is not among the agent's, or it is a legacy target with no
-  // account recorded on an agent that now serves several. Keeps the SAVED config consistent with what
-  // the UI shows and the runtime does; marks the Tools section unsaved so the operator confirms the
-  // change. No loop: after the switch mode !== "pinned".
-  //
-  // A target the runtime WOULD still use is left alone. Switching on account count alone dropped a
-  // valid pinned target — and lit the tab's unsaved dot — the moment a second account's inbox was
-  // bound, with nobody having touched the form. Only judged once accounts came back: zero of them
-  // means no inbox is bound yet, or the read failed, and neither is evidence about the target.
+  // NOTE: auto-switch a "pinned" target to "agent_choice" once the fetched data shows it can no
+  // longer be used ANYWHERE (its account is not among the agent's, or it has no account recorded and
+  // the agent serves several), and mark the Tools section unsaved. No loop: after it, mode !== "pinned".
+  // A target the runtime WOULD still use is left alone: switching on account count alone would drop
+  // a valid target (and light the unsaved dot) when a second account's inbox is bound. Only judged
+  // once accounts came back: zero means no inbox bound or a failed read, not evidence.
   useEffect(() => {
     if (
       handoffData &&
@@ -735,9 +827,10 @@ export function ToolGrantsEditor({
       !pinnedStoredUsable &&
       handoff.mode === "pinned"
     ) {
+      // Questions and rules have no model to choose: Chatwoot routing is their fallback.
       setHandoff((h) => ({
         ...h,
-        mode: "agent_choice",
+        mode: decides ? "route" : "agent_choice",
         target: "",
         targetInstanceId: null,
       }));
@@ -748,6 +841,7 @@ export function ToolGrantsEditor({
     pinnedStoredUsable,
     handoff.mode,
     setHandoff,
+    decides,
   ]);
 
   // Apply the deferred auto-grant for a just-created integration once it appears in the refreshed
@@ -773,9 +867,8 @@ export function ToolGrantsEditor({
       {
         source: "INTEGRATION",
         integrationInstanceId: inst.id,
-        // THE SAME PREDICATE THE LIST BELOW USES. Filtering only the rendering would grant a watcher
-        // a delivery tool it never saw — inert while the agent is muted, and live the moment the
-        // mode is flipped back, with nobody having chosen it (review round 31).
+        // NOTE: the same predicate the list below uses. Filtering only the rendering would grant a
+        // watcher a delivery tool it never saw, inert while muted and live once the mode flips back.
         enabledTools: offeredPackTools(inst.tools, observing).map(
           (tool) => tool.name,
         ),
@@ -814,7 +907,7 @@ export function ToolGrantsEditor({
   // The grant goes on BEFORE the refetch is awaited, and the order is the point: `selectHttp` reads
   // the `nonRag` of the render that created this callback, so anything the operator changed while
   // the catalog was in flight would be overwritten by that older list. Nothing here needs the
-  // refreshed catalog — the id is in hand — unlike the integration above, whose grant carries the
+  // refreshed catalog (the id is in hand), unlike the integration above, whose grant carries the
   // instance's tool names and therefore waits for it.
   async function onToolSaved(
     saved: { id: string; name: string },
@@ -848,7 +941,7 @@ export function ToolGrantsEditor({
     saved: { id: string; name: string },
     isNew: boolean,
   ) {
-    // Granted first, then refreshed — the reason is on `onToolSaved` above.
+    // NOTE: granted first, then refreshed; the reason is on `onToolSaved` above.
     if (isNew) selectCode(saved.id);
     await onCatalogChange();
   }
@@ -865,7 +958,7 @@ export function ToolGrantsEditor({
     saved: { id: string; name: string },
     isNew: boolean,
   ) {
-    // Granted first, then refreshed — the reason is on `onToolSaved` above.
+    // NOTE: granted first, then refreshed; the reason is on `onToolSaved` above.
     if (isNew) selectMcp(saved.id);
     await onCatalogChange();
   }
@@ -881,7 +974,7 @@ export function ToolGrantsEditor({
   // The catalog row is a projection (name, tool name, description); the modal edits the whole
   // template, so it has to be fetched. A session token because the fetch is slow enough for an
   // operator to click a second template before the first answers, and an unconditional open then
-  // shows template A's blocks under B's name — the same hazard the Components panel's reference
+  // shows template A's blocks under B's name: the same hazard the Components panel's reference
   // lookup carries (docs/modals.md).
   const documentSession = useRef(0);
 
@@ -906,11 +999,9 @@ export function ToolGrantsEditor({
       }
       documentModal.open({ template: data.template });
     } catch {
-      // MEASURED, because the usual note here is wrong for this call: a `fetch` that throws comes
-      // back through Eden as `{ error }`, so the branch above is what an offline click hits. This is
-      // the net for everything else that can throw between here and the open, and it is what keeps
-      // the `finally` reachable — without it a throw leaves the spinner turning forever. No test
-      // reaches it.
+      // NOTE: a `fetch` that throws comes back through Eden as `{ error }`, so an offline click hits
+      // the branch above. This catches anything else that throws before the open, so the `finally`
+      // still clears the spinner.
       if (session === documentSession.current) {
         showToast(
           t("editor.tools.documentOpenError", "Could not open this template."),
@@ -1007,6 +1098,59 @@ export function ToolGrantsEditor({
     );
   }
 
+  // Idempotent grant-on (used to auto-select a just-created template, vs the toggle above).
+  function selectDocument(id: string) {
+    if (hasGrant((g) => g.source === "DOCUMENT" && g.documentTemplateId === id))
+      return;
+    addGrant({ source: "DOCUMENT", documentTemplateId: id });
+  }
+
+  const loadStarters = useCallback(async (locale: string) => {
+    const session = ++startersSession.current;
+    startersAsked.current = locale;
+    setLoadingStarters(true);
+    try {
+      const { data, error: err } = await api.api.v1[
+        "document-templates"
+      ].starters.get({ query: { locale } });
+      if (session !== startersSession.current) return;
+      setStarters(data ? [...data.starters] : []);
+      setStartersLocale(locale);
+      setStartersError(!!err);
+    } catch {
+      if (session !== startersSession.current) return;
+      setStarters([]);
+      setStartersLocale(locale);
+      setStartersError(true);
+    } finally {
+      if (session === startersSession.current) setLoadingStarters(false);
+    }
+  }, []);
+
+  async function openDocumentCreate() {
+    // One session for both ways into the editor, so the last click wins. Creating drops an
+    // existing template still being fetched, and opening one while the starters load drops this.
+    const session = ++documentSession.current;
+    setOpeningDocument(null);
+    await loadStarters(starterLocale);
+    if (session !== documentSession.current) return;
+    starterModal.open();
+  }
+
+  // The operator switched language with the picker open: the list on screen is the other language's.
+  useEffect(() => {
+    if (starterModal.isOpen && startersAsked.current !== starterLocale)
+      void loadStarters(starterLocale);
+  }, [starterModal.isOpen, starterLocale, loadStarters]);
+
+  // Granted first, then refreshed (the reason is on `onToolSaved`), and opened in its editor
+  // on the body the POST answered: a template is created in order to be edited.
+  function onDocumentCreated(template: DocumentTemplate) {
+    selectDocument(template.id);
+    documentModal.open({ template });
+    void onCatalogChange();
+  }
+
   function toggleIntegration(id: string, allTools: string[]) {
     const exists = nonRag.some(
       (g) => g.source === "INTEGRATION" && g.integrationInstanceId === id,
@@ -1043,6 +1187,7 @@ export function ToolGrantsEditor({
 
   return (
     <div className="flex flex-col gap-4">
+      {/* A rule runs these too (docs/decisions.md, "Custom tools"), so questions and rules draw them. */}
       <Section
         id="tools-http"
         icon={Webhook}
@@ -1080,6 +1225,7 @@ export function ToolGrantsEditor({
                   onToggle={() => toggleHttp(td.id)}
                   icon={Webhook}
                   title={td.label}
+                  meta={<ToolTokens tool={{ name: td.name, kind: "http" }} />}
                   badge={
                     !td.enabled ? (
                       <Badge variant="secondary">
@@ -1132,6 +1278,7 @@ export function ToolGrantsEditor({
                   onToggle={() => toggleCode(ct.id)}
                   icon={Code2}
                   title={ct.label}
+                  meta={<ToolTokens tool={{ name: ct.name, kind: "code" }} />}
                   badge={
                     !ct.enabled ? (
                       <Badge variant="secondary">
@@ -1184,6 +1331,7 @@ export function ToolGrantsEditor({
                     onToggle={() => toggleMcp(m.id)}
                     icon={Plug}
                     title={m.name}
+                    meta={<SourceTokens source={{ mcp: String(m.id) }} />}
                     badge={
                       !m.enabled ? (
                         <Badge variant="secondary">
@@ -1194,7 +1342,7 @@ export function ToolGrantsEditor({
                   />
                 </EditableCard>
                 {grant && (
-                  <div className="ml-6 flex flex-col gap-2 border-border border-l pl-3">
+                  <div className="border-border ml-6 flex flex-col gap-2 border-l pl-3">
                     <div className="flex flex-wrap items-center gap-2">
                       <Button
                         variant="secondary"
@@ -1215,16 +1363,16 @@ export function ToolGrantsEditor({
                               [m.id]: !collapsed,
                             }))
                           }
-                          className="flex flex-1 items-center gap-2 rounded-md px-2 py-1 text-left transition-colors hover:bg-bg-hover"
+                          className="hover:bg-bg-hover flex flex-1 items-center gap-2 rounded-md px-2 py-1 text-left transition-colors"
                         >
                           <ChevronDown
                             className={cn(
-                              "h-4 w-4 shrink-0 text-text-muted transition-transform",
+                              "text-text-muted h-4 w-4 shrink-0 transition-transform",
                               { "rotate-180": !collapsed },
                             )}
                             aria-hidden="true"
                           />
-                          <span className="font-medium text-text-secondary text-xs">
+                          <span className="text-text-secondary text-xs font-medium">
                             {collapsed
                               ? t("editor.tools.mcpExpandList", "Show tools")
                               : t("editor.tools.mcpCollapseList", "Hide tools")}
@@ -1296,6 +1444,13 @@ export function ToolGrantsEditor({
                                 {tool.name}
                               </span>
                             }
+                            meta={
+                              <ToolTokens
+                                tool={{
+                                  mcp: { connectionId: m.id, tool: tool.name },
+                                }}
+                              />
+                            }
                             description={
                               <span className="flex flex-col gap-1.5">
                                 {tool.description && (
@@ -1324,136 +1479,157 @@ export function ToolGrantsEditor({
         )}
       </Section>
 
-      <Section
-        id="tools-integrations"
-        icon={Puzzle}
-        title={t("editor.tools.integrations", "Integrations")}
-        description={t(
-          "editor.tools.integrationsDesc",
-          "Toolpacks from activated catalog integrations.",
-        )}
-        action={
-          <CreateButton
-            label={t("editor.tools.createNew", "New")}
-            onClick={() => integrationModal.open({})}
-          />
-        }
-      >
-        {catalog.integrationInstances.length === 0 ? (
-          <p className="text-text-muted text-xs">
-            {t("editor.tools.noIntegrations", "No integrations activated yet.")}
-          </p>
-        ) : (
-          catalog.integrationInstances.map((inst) => {
-            const grant = nonRag.find(
-              (g) =>
-                g.source === "INTEGRATION" &&
-                g.integrationInstanceId === inst.id,
-            );
-            // What this agent can actually be offered from the pack. A watcher does not get the
-            // delivery tools, so granting the integration must not enable one either.
-            const offered = offeredPackTools(inst.tools, observing);
-            const allTools = offered.map((tool) => tool.name);
-            const collapsed = integrationCollapsed[inst.id] ?? true;
-            return (
-              <div key={inst.id} className="flex flex-col gap-2">
-                <EditableCard
-                  editLabel={t("common.edit", "Edit")}
-                  onEdit={() => integrationModal.open({ id: inst.id })}
-                >
-                  <SelectableCard
-                    selected={!!grant}
-                    onToggle={() => toggleIntegration(inst.id, allTools)}
-                    icon={integrationIcon(inst.catalogType)}
-                    title={inst.name}
-                    badge={
-                      <Badge variant="info">
-                        {kindLabel(inst.kind ?? inst.catalogType)}
-                      </Badge>
-                    }
-                  />
-                </EditableCard>
-                {grant && offered.length > 0 && (
-                  <div className="ml-6 flex flex-col gap-2 border-border border-l pl-3">
-                    <button
-                      type="button"
-                      aria-expanded={!collapsed}
-                      onClick={() =>
-                        setIntegrationCollapsed((prev) => ({
-                          ...prev,
-                          [inst.id]: !collapsed,
-                        }))
+      {/* An integration's toolpack is not something a rule runs. */}
+      {!decides && (
+        <Section
+          id="tools-integrations"
+          icon={Puzzle}
+          title={t("editor.tools.integrations", "Integrations")}
+          description={t(
+            "editor.tools.integrationsDesc",
+            "Toolpacks from activated catalog integrations.",
+          )}
+          action={
+            <CreateButton
+              label={t("editor.tools.createNew", "New")}
+              onClick={() => integrationModal.open({})}
+            />
+          }
+        >
+          {catalog.integrationInstances.length === 0 ? (
+            <p className="text-text-muted text-xs">
+              {t(
+                "editor.tools.noIntegrations",
+                "No integrations activated yet.",
+              )}
+            </p>
+          ) : (
+            catalog.integrationInstances.map((inst) => {
+              const grant = nonRag.find(
+                (g) =>
+                  g.source === "INTEGRATION" &&
+                  g.integrationInstanceId === inst.id,
+              );
+              // What this agent can actually be offered from the pack. A watcher does not get the
+              // delivery tools, so granting the integration must not enable one either.
+              const offered = offeredPackTools(inst.tools, observing);
+              const allTools = offered.map((tool) => tool.name);
+              const collapsed = integrationCollapsed[inst.id] ?? true;
+              return (
+                <div key={inst.id} className="flex flex-col gap-2">
+                  <EditableCard
+                    editLabel={t("common.edit", "Edit")}
+                    onEdit={() => integrationModal.open({ id: inst.id })}
+                  >
+                    <SelectableCard
+                      selected={!!grant}
+                      onToggle={() => toggleIntegration(inst.id, allTools)}
+                      icon={integrationIcon(inst.catalogType)}
+                      title={inst.name}
+                      meta={
+                        <SourceTokens
+                          source={{ integration: String(inst.id) }}
+                        />
                       }
-                      className="flex items-center gap-2 rounded-md px-2 py-1 text-left transition-colors hover:bg-bg-hover"
-                    >
-                      <ChevronDown
-                        className={cn(
-                          "h-4 w-4 shrink-0 text-text-muted transition-transform",
-                          { "rotate-180": !collapsed },
-                        )}
-                        aria-hidden="true"
-                      />
-                      <span className="font-medium text-text-secondary text-xs">
-                        {collapsed
-                          ? t(
-                              "editor.tools.integrationExpandList",
-                              "Show tools",
-                            )
-                          : t(
-                              "editor.tools.integrationCollapseList",
-                              "Hide tools",
-                            )}
-                      </span>
-                      <span className="text-text-muted text-xs">
-                        {t("editor.tools.mcpSelected", "{{count}} selected", {
-                          count: grant.enabledTools?.length ?? 0,
+                      badge={
+                        <Badge variant="info">
+                          {kindLabel(inst.kind ?? inst.catalogType)}
+                        </Badge>
+                      }
+                    />
+                  </EditableCard>
+                  {grant && offered.length > 0 && (
+                    <div className="border-border ml-6 flex flex-col gap-2 border-l pl-3">
+                      <button
+                        type="button"
+                        aria-expanded={!collapsed}
+                        onClick={() =>
+                          setIntegrationCollapsed((prev) => ({
+                            ...prev,
+                            [inst.id]: !collapsed,
+                          }))
+                        }
+                        className="hover:bg-bg-hover flex items-center gap-2 rounded-md px-2 py-1 text-left transition-colors"
+                      >
+                        <ChevronDown
+                          className={cn(
+                            "text-text-muted h-4 w-4 shrink-0 transition-transform",
+                            { "rotate-180": !collapsed },
+                          )}
+                          aria-hidden="true"
+                        />
+                        <span className="text-text-secondary text-xs font-medium">
+                          {collapsed
+                            ? t(
+                                "editor.tools.integrationExpandList",
+                                "Show tools",
+                              )
+                            : t(
+                                "editor.tools.integrationCollapseList",
+                                "Hide tools",
+                              )}
+                        </span>
+                        <span className="text-text-muted text-xs">
+                          {t("editor.tools.mcpSelected", "{{count}} selected", {
+                            count: grant.enabledTools?.length ?? 0,
+                          })}
+                        </span>
+                      </button>
+                      {!collapsed &&
+                        offered.map((tool) => {
+                          const meta = toolpackToolMeta(tool.name, t);
+                          return (
+                            <SelectableCard
+                              key={tool.name}
+                              selected={(grant.enabledTools ?? []).includes(
+                                tool.name,
+                              )}
+                              onToggle={() =>
+                                toggleIntegrationTool(inst.id, tool.name)
+                              }
+                              icon={meta.icon}
+                              title={meta.label}
+                              meta={
+                                <ToolTokens
+                                  tool={{
+                                    integration: {
+                                      instanceId: inst.id,
+                                      tool: tool.name,
+                                    },
+                                  }}
+                                />
+                              }
+                              description={
+                                <span className="flex flex-col gap-1.5">
+                                  {meta.description && (
+                                    <span>{meta.description}</span>
+                                  )}
+                                  {tool.args.length > 0 && (
+                                    <ToolArgPills
+                                      args={withToolpackArgNotes(
+                                        tool.name,
+                                        tool.args,
+                                        t,
+                                      )}
+                                    />
+                                  )}
+                                </span>
+                              }
+                            />
+                          );
                         })}
-                      </span>
-                    </button>
-                    {!collapsed &&
-                      offered.map((tool) => {
-                        const meta = toolpackToolMeta(tool.name, t);
-                        return (
-                          <SelectableCard
-                            key={tool.name}
-                            selected={(grant.enabledTools ?? []).includes(
-                              tool.name,
-                            )}
-                            onToggle={() =>
-                              toggleIntegrationTool(inst.id, tool.name)
-                            }
-                            icon={meta.icon}
-                            title={meta.label}
-                            description={
-                              <span className="flex flex-col gap-1.5">
-                                {meta.description && (
-                                  <span>{meta.description}</span>
-                                )}
-                                {tool.args.length > 0 && (
-                                  <ToolArgPills
-                                    args={withToolpackArgNotes(
-                                      tool.name,
-                                      tool.args,
-                                      t,
-                                    )}
-                                  />
-                                )}
-                              </span>
-                            }
-                          />
-                        );
-                      })}
-                  </div>
-                )}
-              </div>
-            );
-          })
-        )}
-      </Section>
+                    </div>
+                  )}
+                </div>
+              );
+            })
+          )}
+        </Section>
+      )}
 
-      {/* A DOCUMENT IS AN ATTACHMENT TO THE CUSTOMER, so the muted assembly does not build one — the
+      {/* A DOCUMENT IS AN ATTACHMENT TO THE CUSTOMER, so the muted assembly does not build one: the
           tools this section grants would exist in the console and never in the turn. */}
-      {!observing && (
+      {!observing && !voice && !decides && (
         <Section
           id="tools-documents"
           icon={FileText}
@@ -1462,12 +1638,19 @@ export function ToolGrantsEditor({
             "editor.tools.documentsDesc",
             "Templates this agent may issue and attach to a reply. Each one becomes a tool of its own.",
           )}
+          action={
+            <CreateButton
+              label={t("editor.tools.createNew", "New")}
+              busy={loadingStarters}
+              onClick={() => void openDocumentCreate()}
+            />
+          }
         >
           {catalog.documentTemplates.length === 0 ? (
             <p className="text-text-muted text-xs">
               {t(
                 "editor.tools.noDocuments",
-                "No document templates yet. Create one under Components.",
+                "No document templates yet. Create the first one with New.",
               )}
             </p>
           ) : (
@@ -1491,12 +1674,16 @@ export function ToolGrantsEditor({
                     onToggle={() => toggleDocument(tpl.id)}
                     icon={FileText}
                     title={tpl.name}
-                    badge={<Badge variant="secondary">{tpl.toolName}</Badge>}
-                    // AVAILABLE, not merely enabled. Assembly skips a template for two reasons, and an
-                    // operator who cannot see the second one grants a tool, saves, and gets no tool —
-                    // with the row saying nothing about why. The two are separate messages because the
-                    // remedies are: one is a switch on this template, the other is content this build
-                    // cannot read and has to be edited from the client that wrote it.
+                    meta={<ToolTokens tool={{ templateId: String(tpl.id) }} />}
+                    badge={
+                      <Badge variant="secondary" className="break-all">
+                        {tpl.toolName}
+                      </Badge>
+                    }
+                    // NOTE: AVAILABLE, not merely enabled. Assembly skips a template for two
+                    // reasons with different remedies (a switch on this template, or content this
+                    // build cannot read, edited from the client that wrote it), so each gets its own
+                    // message; otherwise a granted tool silently never appears.
                     description={
                       tpl.available
                         ? (tpl.description ?? undefined)
@@ -1527,20 +1714,20 @@ export function ToolGrantsEditor({
           "Built-in actions the agent can take. Selected tools are available to the agent.",
         )}
         badge={
-          <span className="flex items-center gap-1.5 font-normal text-text-muted text-xs">
+          <span className="text-text-muted flex items-center gap-1.5 text-xs font-normal">
             {t("editor.tools.nativeActiveCount", "{{count}} active", {
-              count: selectedNative.size,
+              count: [...selectedNative].filter(offeredToRules).length,
             })}
             {nativeConfigured && (
               <span
-                className="h-1.5 w-1.5 rounded-full bg-accent"
+                className="bg-accent-solid h-1.5 w-1.5 rounded-full"
                 aria-hidden="true"
               />
             )}
           </span>
         }
       >
-        {observing && (
+        {observing && !decides && (
           <p className="text-text-muted text-xs">
             {t(
               "editor.tools.observingDelivery",
@@ -1548,9 +1735,12 @@ export function ToolGrantsEditor({
             )}
           </p>
         )}
-        <div className="grid gap-2 sm:grid-cols-2">
+        {/* One column on questions and rules, where the cards below it are full width too: a
+            single card in a two-column grid would sit at half their width. */}
+        <div className={decides ? "grid gap-2" : "grid gap-2 sm:grid-cols-2"}>
           {catalog.native
             .filter((n) => !(observing && n.deliversToCustomer))
+            .filter((n) => offeredToRules(n.name))
             .filter(
               (n) =>
                 n.name !== HANDOFF_TOOL &&
@@ -1559,17 +1749,20 @@ export function ToolGrantsEditor({
                 n.name !== LABEL_TOOL &&
                 n.name !== UPDATE_KANBAN_TOOL &&
                 n.name !== OPEN_CASE_TOOL &&
-                n.name !== SEND_IMAGE_TOOL,
+                n.name !== SEND_IMAGE_TOOL &&
+                n.name !== RESOLVE_TOOL,
             )
             .map((n) => {
               const meta = nativeToolMeta(n.name, t);
               return (
                 <SelectableCard
                   key={n.name}
+                  id={nativeToolAnchor(n.name)}
                   selected={selectedNative.has(n.name)}
                   onToggle={() => toggleNative(n.name)}
                   icon={meta.icon}
                   title={meta.label}
+                  meta={<ToolTokens tool={{ name: n.name, kind: "native" }} />}
                   description={meta.description}
                 />
               );
@@ -1578,24 +1771,46 @@ export function ToolGrantsEditor({
         {handoffEntry && (
           <ConfigurableToolCard
             selected={handoffEnabled}
+            id={nativeToolAnchor(HANDOFF_TOOL)}
             onToggle={() => toggleNative(HANDOFF_TOOL)}
             icon={nativeToolMeta(HANDOFF_TOOL, t).icon}
             title={nativeToolMeta(HANDOFF_TOOL, t).label}
-            description={nativeToolMeta(HANDOFF_TOOL, t).description}
+            meta={<ToolTokens tool={{ name: HANDOFF_TOOL, kind: "native" }} />}
+            description={
+              decides
+                ? t(
+                    "editor.handoffDescDecisions",
+                    "Escalate the conversation to a human agent.",
+                  )
+                : nativeToolMeta(HANDOFF_TOOL, t).description
+            }
             configured={
               handoff.mode !== "route" ||
-              handoff.instructions.trim() !== "" ||
-              !transferWithSummary
+              (!decides &&
+                (handoff.instructions.trim() !== "" || !transferWithSummary))
+            }
+            warning={
+              decides && handoff.mode === "agent_choice" ? (
+                <p className="text-warning text-xs" role="alert">
+                  {t(
+                    "editor.handoffAgentChoiceDecisions",
+                    "This handoff is set to let the AI choose, and questions and rules have no model to choose: pick Chatwoot routing or a specific agent or team.",
+                  )}
+                </p>
+              ) : undefined
             }
           >
-            <SwitchField
-              checked={transferWithSummary}
-              onCheckedChange={setTransferWithSummary}
-              label={t(
-                "editor.transferWithSummary",
-                "Post a private summary before handing off to a human",
-              )}
-            />
+            {/* The summary is written by a model: questions and rules have none. */}
+            {!decides && (
+              <SwitchField
+                checked={transferWithSummary}
+                onCheckedChange={setTransferWithSummary}
+                label={t(
+                  "editor.transferWithSummary",
+                  "Post a private summary before handing off to a human",
+                )}
+              />
+            )}
             <FormField
               label={t("editor.handoffTarget", "Who receives the handoff")}
               group
@@ -1607,23 +1822,19 @@ export function ToolGrantsEditor({
                   "Who receives the handoff",
                 )}
                 onChange={(value) => {
-                  // Picking the mode already in force changes nothing, and must WRITE nothing.
-                  // `Dropdown` fires onChange for the current value like any other, and now that
-                  // `pinned` stays reachable while it is the mode in force, that click used to
-                  // rewrite `targetInstanceId` to `pinnedInstanceId` — null wherever the picker
-                  // cannot offer targets — which then failed the check that keeps the target and
-                  // erased the very setting the operator was looking at.
+                  // NOTE: picking the mode already in force must WRITE nothing. `Dropdown` fires
+                  // onChange for the current value too, and re-picking `pinned` would rewrite
+                  // `targetInstanceId` to `pinnedInstanceId` (null wherever the picker cannot offer
+                  // targets), which fails the keep-target check and erases the setting.
                   if (value === handoff.mode) return;
                   setHandoff({
                     ...handoff,
                     mode: value,
                     target: value === "pinned" ? handoff.target : "",
-                    // Safe without a fallback to the recorded account precisely BECAUSE of the guard
-                    // above: reaching here with `pinned` means the mode was something else, and the
-                    // item is only selectable then when the agent serves exactly one account — which
-                    // is the case where `pinnedInstanceId` is filled. A `?? handoff.targetInstanceId`
-                    // here reads as prudence and is dead code: no test can tell it apart, and a line
-                    // no test can pin is a line nobody can maintain.
+                    // NOTE: no fallback to the recorded account, BECAUSE of the guard above: reaching
+                    // here with `pinned` means the mode was something else, and the item is then
+                    // selectable only with exactly one account, where `pinnedInstanceId` is filled.
+                    // A `?? handoff.targetInstanceId` would be dead code no test can pin.
                     targetInstanceId:
                       value === "pinned" ? pinnedInstanceId : null,
                   });
@@ -1648,10 +1859,20 @@ export function ToolGrantsEditor({
                     disabled: !pinnedOfferable && !pinnedKept,
                     disabledHint: pinnedHint,
                   },
-                  {
-                    value: "agent_choice",
-                    label: t("editor.handoffAgentChoice", "Let the AI choose"),
-                  },
+                  // Not offered where no model chooses. A stored one stays visible, disabled, so the
+                  // select names it while the warning above says what to pick instead.
+                  ...(decides && handoff.mode !== "agent_choice"
+                    ? []
+                    : [
+                        {
+                          value: "agent_choice",
+                          label: t(
+                            "editor.handoffAgentChoice",
+                            "Let the AI choose",
+                          ),
+                          disabled: decides,
+                        },
+                      ]),
                 ]}
               />
             </FormField>
@@ -1716,7 +1937,7 @@ export function ToolGrantsEditor({
                   )}
               </FormField>
             )}
-            {handoff.mode === "agent_choice" && (
+            {handoff.mode === "agent_choice" && !decides && (
               <p className="text-text-muted text-xs">
                 {t(
                   "editor.handoffAgentChoiceHint",
@@ -1724,100 +1945,131 @@ export function ToolGrantsEditor({
                 )}
               </p>
             )}
-            <FormField
-              label={t("editor.handoffInstructions", "Transfer instructions")}
-              error={refusals.handoffInstructions}
-              group
-              description={t(
-                "editor.handoffInstructionsHint",
-                "Optional. Centralizes the transfer logic (when and to whom to escalate). Appended to the handoff tool description the AI reads.",
-              )}
-            >
-              <Textarea
-                value={handoff.instructions}
-                onChange={(e) =>
-                  setHandoff({ ...handoff, instructions: e.target.value })
-                }
-                rows={3}
-                maxLength={TOOL_INSTRUCTIONS_MAX}
-                placeholder={t(
-                  "editor.handoffInstructionsPlaceholder",
-                  "e.g. Only escalate after two failed attempts. Send billing issues to the Finance team.",
+            {!decides && (
+              <FormField
+                label={t("editor.handoffInstructions", "Transfer instructions")}
+                error={refusals.handoffInstructions}
+                group
+                description={t(
+                  "editor.handoffInstructionsHint",
+                  "Optional. Centralizes the transfer logic (when and to whom to escalate). Appended to the handoff tool description the AI reads.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={handoff.instructions}
+                  onChange={(e) =>
+                    setHandoff({ ...handoff, instructions: e.target.value })
+                  }
+                  rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
+                  placeholder={t(
+                    "editor.handoffInstructionsPlaceholder",
+                    "e.g. Only escalate after two failed attempts. Send billing issues to the Finance team.",
+                  )}
+                />
+                <FieldSize
+                  max={TOOL_INSTRUCTIONS_MAX}
+                  text={handoff.instructions}
+                  sentWith="toolDescription"
+                />
+              </FormField>
+            )}
           </ConfigurableToolCard>
         )}
         {kanbanEntry && (
           <ConfigurableToolCard
             selected={kanbanEnabled}
+            id={nativeToolAnchor(KANBAN_TOOL)}
             onToggle={() => toggleNative(KANBAN_TOOL)}
             icon={nativeToolMeta(KANBAN_TOOL, t).icon}
             title={nativeToolMeta(KANBAN_TOOL, t).label}
+            meta={<ToolTokens tool={{ name: KANBAN_TOOL, kind: "native" }} />}
             description={nativeToolMeta(KANBAN_TOOL, t).description}
-            configured={kanbanInstructions.trim() !== ""}
+            configured={!decides && kanbanInstructions.trim() !== ""}
           >
-            <FormField
-              label={t("editor.kanbanInstructions", "Funnel guidance")}
-              error={refusals.kanbanInstructions}
-              group
-              description={t(
-                "editor.kanbanInstructionsHint",
-                "Optional: describe your funnel and rules for moving the card; the AI already receives its steps and card data.",
-              )}
-            >
-              <Textarea
-                value={kanbanInstructions}
-                onChange={(e) => setKanbanInstructions(e.target.value)}
-                rows={3}
-                maxLength={TOOL_INSTRUCTIONS_MAX}
-                placeholder={t(
-                  "editor.kanbanInstructionsPlaceholder",
-                  'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+            {!decides && (
+              <FormField
+                label={t("editor.kanbanInstructions", "Funnel guidance")}
+                error={refusals.kanbanInstructions}
+                group
+                description={t(
+                  "editor.kanbanInstructionsHint",
+                  "Optional: describe your funnel and rules for moving the card; the AI already receives its steps and card data.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={kanbanInstructions}
+                  onChange={(e) => setKanbanInstructions(e.target.value)}
+                  rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
+                  placeholder={t(
+                    "editor.kanbanInstructionsPlaceholder",
+                    'e.g. Move to "Proposal sent" only after pricing was shared. Never skip steps.',
+                  )}
+                />
+                <FieldSize
+                  max={TOOL_INSTRUCTIONS_MAX}
+                  text={kanbanInstructions}
+                  sentWith="toolDescription"
+                />
+              </FormField>
+            )}
           </ConfigurableToolCard>
         )}
         {updateKanbanEntry && (
           <ConfigurableToolCard
             selected={updateKanbanEnabled}
+            id={nativeToolAnchor(UPDATE_KANBAN_TOOL)}
             onToggle={() => toggleNative(UPDATE_KANBAN_TOOL)}
             icon={nativeToolMeta(UPDATE_KANBAN_TOOL, t).icon}
             title={nativeToolMeta(UPDATE_KANBAN_TOOL, t).label}
+            meta={
+              <ToolTokens tool={{ name: UPDATE_KANBAN_TOOL, kind: "native" }} />
+            }
             description={nativeToolMeta(UPDATE_KANBAN_TOOL, t).description}
-            configured={updateKanbanTaskInstructions.trim() !== ""}
+            configured={!decides && updateKanbanTaskInstructions.trim() !== ""}
           >
-            <FormField
-              label={t("editor.updateKanbanInstructions", "Usage guidance")}
-              error={refusals.updateKanbanInstructions}
-              group
-              description={t(
-                "editor.updateKanbanInstructionsHint",
-                "Optional. Say when and how the agent should change the card's title, description, priority, or dates.",
-              )}
-            >
-              <Textarea
-                value={updateKanbanTaskInstructions}
-                onChange={(e) =>
-                  setUpdateKanbanTaskInstructions(e.target.value)
-                }
-                rows={3}
-                maxLength={TOOL_INSTRUCTIONS_MAX}
-                placeholder={t(
-                  "editor.updateKanbanInstructionsPlaceholder",
-                  "e.g. When the customer confirms a meeting, set the due date; keep the title as the customer's full name.",
+            {!decides && (
+              <FormField
+                label={t("editor.updateKanbanInstructions", "Usage guidance")}
+                error={refusals.updateKanbanInstructions}
+                group
+                description={t(
+                  "editor.updateKanbanInstructionsHint",
+                  "Optional. Say when and how the agent should change the card's title, description, priority, or dates.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={updateKanbanTaskInstructions}
+                  onChange={(e) =>
+                    setUpdateKanbanTaskInstructions(e.target.value)
+                  }
+                  rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
+                  placeholder={t(
+                    "editor.updateKanbanInstructionsPlaceholder",
+                    "e.g. When the customer confirms a meeting, set the due date; keep the title as the customer's full name.",
+                  )}
+                />
+                <FieldSize
+                  max={TOOL_INSTRUCTIONS_MAX}
+                  text={updateKanbanTaskInstructions}
+                  sentWith="toolDescription"
+                />
+              </FormField>
+            )}
           </ConfigurableToolCard>
         )}
         {openCaseEntry && !(observing && openCaseEntry.deliversToCustomer) && (
           <ConfigurableToolCard
             selected={openCaseEnabled}
+            id={nativeToolAnchor(OPEN_CASE_TOOL)}
             onToggle={() => toggleNative(OPEN_CASE_TOOL)}
             icon={nativeToolMeta(OPEN_CASE_TOOL, t).icon}
             title={nativeToolMeta(OPEN_CASE_TOOL, t).label}
+            meta={
+              <ToolTokens tool={{ name: OPEN_CASE_TOOL, kind: "native" }} />
+            }
             description={nativeToolMeta(OPEN_CASE_TOOL, t).description}
             configured={crossInboxCase.targetInboxId !== ""}
             warning={
@@ -1840,9 +2092,13 @@ export function ToolGrantsEditor({
           !(observing && sendImageEntry.deliversToCustomer) && (
             <ConfigurableToolCard
               selected={sendImageEnabled}
+              id={nativeToolAnchor(SEND_IMAGE_TOOL)}
               onToggle={() => toggleNative(SEND_IMAGE_TOOL)}
               icon={nativeToolMeta(SEND_IMAGE_TOOL, t).icon}
               title={nativeToolMeta(SEND_IMAGE_TOOL, t).label}
+              meta={
+                <ToolTokens tool={{ name: SEND_IMAGE_TOOL, kind: "native" }} />
+              }
               description={nativeToolMeta(SEND_IMAGE_TOOL, t).description}
               configured={!sendImageNoHost}
               warning={
@@ -1860,70 +2116,117 @@ export function ToolGrantsEditor({
               />
             </ConfigurableToolCard>
           )}
+        {resolveEntry && (
+          <ConfigurableToolCard
+            selected={resolveEnabled}
+            id={nativeToolAnchor(RESOLVE_TOOL)}
+            onToggle={() => toggleNative(RESOLVE_TOOL)}
+            icon={nativeToolMeta(RESOLVE_TOOL, t).icon}
+            title={nativeToolMeta(RESOLVE_TOOL, t).label}
+            meta={<ToolTokens tool={{ name: RESOLVE_TOOL, kind: "native" }} />}
+            description={nativeToolMeta(RESOLVE_TOOL, t).description}
+            configured={resolveConversation.assignLabels.length > 0}
+          >
+            <ResolveConversationFields
+              agentId={agentId}
+              value={resolveConversation}
+              onChange={setResolveConversation}
+            />
+          </ConfigurableToolCard>
+        )}
         {attrEntry && (
           <ConfigurableToolCard
             selected={attrEnabled}
+            id={nativeToolAnchor(ATTR_TOOL)}
             onToggle={() => toggleNative(ATTR_TOOL)}
             icon={nativeToolMeta(ATTR_TOOL, t).icon}
             title={nativeToolMeta(ATTR_TOOL, t).label}
+            meta={<ToolTokens tool={{ name: ATTR_TOOL, kind: "native" }} />}
             description={nativeToolMeta(ATTR_TOOL, t).description}
-            configured={customAttributeInstructions.trim() !== ""}
+            configured={
+              (!decides && customAttributeInstructions.trim() !== "") ||
+              hasWritableAttributes(writableAttributes)
+            }
           >
-            <FormField
-              label={t("editor.attrInstructions", "Usage guidance")}
-              error={refusals.attributeInstructions}
-              group
-              description={t(
-                "editor.attrInstructionsHint",
-                "Optional. Say which conversation, contact, or kanban card attribute the agent should set, and when.",
-              )}
-            >
-              <Textarea
-                value={customAttributeInstructions}
-                onChange={(e) => setCustomAttributeInstructions(e.target.value)}
-                rows={3}
-                maxLength={TOOL_INSTRUCTIONS_MAX}
-                placeholder={t(
-                  "editor.attrInstructionsPlaceholder",
-                  'e.g. Save the qualified budget on the contact as "orcamento"; set "lead_stage" on the card.',
+            {!decides && (
+              <FormField
+                label={t("editor.attrInstructions", "Usage guidance")}
+                error={refusals.attributeInstructions}
+                group
+                description={t(
+                  "editor.attrInstructionsHint",
+                  "Optional. Say which conversation, contact, or kanban card attribute the agent should set, and when.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={customAttributeInstructions}
+                  onChange={(e) =>
+                    setCustomAttributeInstructions(e.target.value)
+                  }
+                  rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
+                  placeholder={t(
+                    "editor.attrInstructionsPlaceholder",
+                    'e.g. Save the qualified budget on the contact as "orcamento"; set "lead_stage" on the card.',
+                  )}
+                />
+                <FieldSize
+                  max={TOOL_INSTRUCTIONS_MAX}
+                  text={customAttributeInstructions}
+                  sentWith="toolDescription"
+                />
+              </FormField>
+            )}
+            <WritableAttributesFields
+              agentId={agentId}
+              value={writableAttributes}
+              onChange={setWritableAttributes}
+            />
           </ConfigurableToolCard>
         )}
         {labelEntry && (
           <ConfigurableToolCard
             selected={labelEnabled}
+            id={nativeToolAnchor(LABEL_TOOL)}
             onToggle={() => toggleNative(LABEL_TOOL)}
             icon={nativeToolMeta(LABEL_TOOL, t).icon}
             title={nativeToolMeta(LABEL_TOOL, t).label}
+            meta={<ToolTokens tool={{ name: LABEL_TOOL, kind: "native" }} />}
             description={nativeToolMeta(LABEL_TOOL, t).description}
             configured={
-              labelInstructions.trim() !== "" ||
+              (!decides && labelInstructions.trim() !== "") ||
               protectedLabels.trim() !== "" ||
-              allowedLabels.trim() !== ""
+              allowedLabels.trim() !== "" ||
+              labelRemoval === "allowed"
             }
           >
-            <FormField
-              label={t("editor.labelInstructions", "Usage guidance")}
-              error={refusals.labelInstructions}
-              group
-              description={t(
-                "editor.labelInstructionsHint",
-                "Optional. Which labels the conversation, the contact or the card should carry, and when. The AI sees the ones standing now; write your rules here, including which of them are mutually exclusive.",
-              )}
-            >
-              <Textarea
-                value={labelInstructions}
-                onChange={(e) => setLabelInstructions(e.target.value)}
-                rows={3}
-                maxLength={TOOL_INSTRUCTIONS_MAX}
-                placeholder={t(
-                  "editor.labelInstructionsPlaceholder",
-                  'e.g. The conversation carries exactly one of "cancelamento", "compra-de-ingresso" or "outros": to swap it, name the old one in remove and the new one in add, in the same call. Do not name a label you are not changing.',
+            {!decides && (
+              <FormField
+                label={t("editor.labelInstructions", "Usage guidance")}
+                error={refusals.labelInstructions}
+                group
+                description={t(
+                  "editor.labelInstructionsHint",
+                  "Optional. Which labels the conversation, the contact or the card should carry, and when. The AI sees the ones standing now; write your rules here, including which of them are mutually exclusive.",
                 )}
-              />
-            </FormField>
+              >
+                <Textarea
+                  value={labelInstructions}
+                  onChange={(e) => setLabelInstructions(e.target.value)}
+                  rows={3}
+                  maxLength={TOOL_INSTRUCTIONS_MAX}
+                  placeholder={t(
+                    "editor.labelInstructionsPlaceholder",
+                    'e.g. The conversation carries exactly one of "category-a", "category-b" or "other": to swap it, name the old one in remove and the new one in add, in the same call. Do not name a label you are not changing.',
+                  )}
+                />
+                <FieldSize
+                  max={TOOL_INSTRUCTIONS_MAX}
+                  text={labelInstructions}
+                  sentWith="toolDescription"
+                />
+              </FormField>
+            )}
             <FormField
               label={t("editor.protectedLabels", "Labels off limits")}
               description={t(
@@ -1946,7 +2249,7 @@ export function ToolGrantsEditor({
               label={t("editor.allowedLabels", "Labels it may add")}
               description={t(
                 "editor.allowedLabelsHint",
-                "Optional, comma-separated. The only labels this agent may add; removing any label is still allowed. Empty: any label, and one the account does not have is created.",
+                "Optional, comma-separated. The only labels this agent may add. Empty: any label, and one the account does not have is created.",
               )}
             >
               <Input
@@ -1956,7 +2259,7 @@ export function ToolGrantsEditor({
                 }
                 placeholder={t(
                   "editor.allowedLabelsPlaceholder",
-                  "e.g. cancelamento, compra-de-ingresso, outros",
+                  "e.g. category-a, category-b, other",
                 )}
               />
             </FormField>
@@ -1990,19 +2293,50 @@ export function ToolGrantsEditor({
                 </Select>
               </FormField>
             )}
+            <FormField
+              label={t("editor.labelRemoval", "Labels it may remove")}
+              description={t(
+                "editor.labelRemovalHint",
+                "Only the labels it may add: removing any other is refused and counted in the logs, so another system's labels stay without being listed as off limits. With none listed, it removes none.",
+              )}
+            >
+              <Select
+                value={labelRemoval}
+                onChange={(e: React.ChangeEvent<HTMLSelectElement>) =>
+                  setLabelRemoval(
+                    e.target.value === "allowed" ? "allowed" : "any",
+                  )
+                }
+              >
+                <option value="any">
+                  {t(
+                    "editor.labelRemovalAny",
+                    "Any label, except the ones off limits",
+                  )}
+                </option>
+                <option value="allowed">
+                  {t(
+                    "editor.labelRemovalAllowed",
+                    "Only the labels it may add",
+                  )}
+                </option>
+              </Select>
+            </FormField>
           </ConfigurableToolCard>
         )}
-        <p className="text-text-muted text-xs">
-          {t(
-            "editor.tools.nativeContextNote",
-            "The conversation and contact are provided automatically — the AI only decides to use a tool and fills its specific arguments.",
-          )}
-        </p>
-        {selectedNative.size === 0 && (
+        {!decides && (
+          <p className="text-text-muted text-xs">
+            {t(
+              "editor.tools.nativeContextNote",
+              "The conversation and contact are provided automatically. The AI only decides to use a tool and fills its specific arguments.",
+            )}
+          </p>
+        )}
+        {!decides && selectedNative.size === 0 && (
           <p className="text-text-muted text-xs">
             {t(
               "editor.tools.noNativeSelected",
-              "No native tools selected — the agent can only chat.",
+              "No native tools selected. The agent can only chat.",
             )}
           </p>
         )}
@@ -2020,11 +2354,17 @@ export function ToolGrantsEditor({
         sharedNotice
         onSaved={onIntegrationSaved}
       />
-      {/* A save here changes the tool the agent sees — its name, its wording, whether it is
-          available at all — so the catalog has to be refetched, exactly like the other three. */}
+      {/* A save here changes the tool the agent sees (its name, its wording, whether it is
+          available at all), so the catalog has to be refetched, exactly like the other three. */}
       <DocumentTemplateModal
         modal={documentModal}
         onSaved={() => void onCatalogChange()}
+      />
+      <DocumentStarterModal
+        modal={starterModal}
+        starters={startersLocale === starterLocale ? starters : []}
+        startersError={startersError}
+        onCreated={onDocumentCreated}
       />
     </div>
   );
